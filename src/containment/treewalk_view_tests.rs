@@ -107,9 +107,9 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
 
 type Query = fn(&ProcessId, &dyn Kernel) -> Result<(), Error>;
 
-fn queries() -> [(&'static str, Query); 3] {
+/// The queries that take the process snapshot. `parent` does not: it reads `self` alone.
+fn children_queries() -> [(&'static str, Query); 2] {
     [
-        ("parent", |p, k| p.parent_with(k).map(|_| ())),
         ("children(No)", |p, k| p.children_with(k, Recursive::No).map(|_| ())),
         ("children(Yes)", |p, k| p.children_with(k, Recursive::Yes).map(|_| ())),
     ]
@@ -119,9 +119,9 @@ fn queries() -> [(&'static str, Query); 3] {
 /// the whole snapshot. Mutant: "the anchor is checked before the snapshot" - the failing view lands
 /// on the anchor and the error blames the wrong read.
 #[skuld::test]
-fn parent_and_children_take_the_snapshot_before_the_anchor() {
+fn children_take_the_snapshot_before_the_anchor() {
     let me = ProcessId::current();
-    for (_, query) in queries() {
+    for (_, query) in children_queries() {
         for view in VIEWS {
             let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
             let result = query(&me, &kernel);
@@ -131,16 +131,19 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 }
 
 /// The anchor failing after a good snapshot names the view that failed it (the one the failing read
-/// used, not a second look), and the pid. Mutants: "`unqueryable` re-derives the cause" (the view
-/// has recovered by then, so the error blames access); "the table read's error is dropped".
+/// used, not a second look), and the pid. `parent` reads no snapshot: its first view read is the
+/// anchor's. Mutants: "`unqueryable` re-derives the cause" (the view has recovered by then, so the
+/// error blames access); "the table read's error is dropped".
 #[skuld::test]
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
     // The `/proc` path: only a `starttime` anchor is read through the view.
     let me = ticks_id(std::process::id());
     let pid = me.pid();
-    for (_, query) in queries() {
+    let parent: (&str, Query) = ("parent", |p, k| p.parent_with(k).map(|_| ()));
+    let queries = std::iter::once((parent, 0)).chain(children_queries().map(|query| (query, 1)));
+    for ((_, query), snapshot_reads) in queries {
         for view in VIEWS {
-            let kernel = view.fail(ticks_host(pid).same_view(), 1);
+            let kernel = view.fail(ticks_host(pid).same_view(), snapshot_reads);
             let result = query(&me, &kernel);
             assert_unassessable_naming(
                 result,

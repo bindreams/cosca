@@ -568,11 +568,11 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     let (y_child, y) = live_findstr_blocker();
 
     // The root's own row is not read, only the rows that name it as a parent.
-    let stale_creator = [(root.pid(), 0), (x.pid(), root.pid()), (y.pid(), x.pid())];
+    let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
     let dropped = super::walk_from(&HostKernel, root, &stale_creator, Recursive::Yes)
         .expect("the root reads")
         .expect("the root is live");
-    let genuine = [(root.pid(), 0), (x.pid(), root.pid()), (y.pid(), root.pid())];
+    let genuine = [(x.pid(), root.pid()), (y.pid(), root.pid())];
     let kept = super::walk_from(&HostKernel, root, &genuine, Recursive::Yes)
         .expect("the root reads")
         .expect("the root is live");
@@ -615,29 +615,29 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         std::process::Command::new("cmd.exe")
             .args(["/c", "ping.exe", "-n", "30", "127.0.0.1"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null()),
+            .stdout(Stdio::piped()),
     )
     .expect("spawn the root");
     let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
-    // The root's children are its console host and its `ping`: wait for the `ping`.
-    let ping = loop {
-        assert!(
-            shell.try_wait().expect("poll the root").is_none(),
-            "the root exited before its child was listed"
-        );
-        let children = root.children(Recursive::No).expect("the root's children");
-        let is_ping = |id: &ProcessId| {
-            crate::identity::windows_fixture::image_file_name(id.pid()).is_some_and(|image| {
-                std::path::Path::new(&image)
-                    .file_name()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
-            })
-        };
-        if let Some(ping) = children.into_iter().find(is_ping) {
-            break ping.pid();
-        }
-        std::thread::yield_now();
+    // The `ping` inherits the root's output pipe and prints its banner as it starts, so the first
+    // byte read says it exists. The pipe stays open in `shell`: a closed one would end the `ping`.
+    let mut first = [0u8; 1];
+    let read = std::io::Read::read(shell.stdout.as_mut().expect("piped stdout"), &mut first).expect("read the banner");
+    assert_eq!(read, 1, "the root closed its output before its child printed");
+    // The root's children are its console host and its `ping`.
+    let is_ping = |id: &ProcessId| {
+        crate::identity::windows_fixture::image_file_name(id.pid()).is_some_and(|image| {
+            std::path::Path::new(&image)
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
+        })
     };
+    let children = root.children(Recursive::No).expect("the root's children");
+    let ping = children
+        .into_iter()
+        .find(is_ping)
+        .expect("the root has a `ping` child")
+        .pid();
     let Opened::Found(ping_handle) =
         windows_open_classified(ping, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
     else {

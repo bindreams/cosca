@@ -28,8 +28,8 @@ fn me() -> ProcessId {
     ProcessId::from_parts_for_test(SELF, Key::Pidfs(SELF_INO))
 }
 
-/// `SELF` is a child of `PARENT`; the parent started at `parent_start` and `SELF` at 2000.
-fn table(parent_start: u64) -> FakeKernel<'static> {
+/// [`table`] with no `stat` for `SELF`: the row states it.
+fn table_without_self_stat(parent_start: u64) -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .same_view()
         .on_pids(Ok(&[PARENT, SELF]))
@@ -38,7 +38,11 @@ fn table(parent_start: u64) -> FakeKernel<'static> {
         .on_pidfd_open(SELF, Ok(stand_in()))
         .on_pidfs_ino(SELF, Ok(Some(SELF_INO)))
         .on_read(&format!("{PARENT}/stat"), Ok(&stat(PARENT, 1, parent_start)))
-        .on_read(&format!("{SELF}/stat"), Ok(&stat(SELF, PARENT, 2_000)))
+}
+
+/// `SELF` is a child of `PARENT`; the parent started at `parent_start` and `SELF` at 2000.
+fn table(parent_start: u64) -> FakeKernel<'static> {
+    table_without_self_stat(parent_start).on_read(&format!("{SELF}/stat"), Ok(&stat(SELF, PARENT, 2_000)))
 }
 
 #[skuld::test]
@@ -57,22 +61,33 @@ fn a_parent_that_started_after_its_pidfs_child_is_rejected() {
     assert_eq!(me().parent_with(&table(3_000)).expect("a readable table"), None);
 }
 
-/// `self`'s `stat` is read by the snapshot and by its own read, which gives the ppid and the key: a
-/// pid gone by the second read has no parent.
+/// `self`'s own read gives the ppid and the key: a pid gone by that read has no parent.
 #[skuld::test]
 fn a_pidfs_id_whose_start_time_is_gone_has_no_parent() {
-    let kernel = table(1_000)
-        .on_read_after(&format!("{SELF}/stat"), 1, Err(libc::ENOENT))
+    let kernel = table_without_self_stat(1_000)
+        .on_read(&format!("{SELF}/stat"), Err(libc::ENOENT))
         .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Err(Errno::SRCH));
     assert_eq!(me().parent_with(&kernel).expect("gone is not an error"), None);
+}
+
+/// A pid that another process holds has no parent to name, whether or not that process can be read:
+/// its pidfd's inode is not `self`'s, so its `stat` (here refused, as under `hidepid`) is never asked
+/// about. Mutant: "the key is compared only after the whole read succeeds": the refusal is an error.
+#[skuld::test]
+fn a_recycled_pidfs_id_whose_new_holder_cannot_be_read_has_no_parent() {
+    let kernel = table_without_self_stat(1_000)
+        .on_pidfs_ino(SELF, Ok(Some(SELF_INO + 1)))
+        .on_read(&format!("{SELF}/stat"), Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
+    assert_eq!(me().parent_with(&kernel).expect("a recycled pid is not an error"), None);
 }
 
 /// A live process whose start time cannot be read (`hidepid`) is an error naming the pid, never "no
 /// parent".
 #[skuld::test]
 fn a_pidfs_id_whose_start_time_cannot_be_read_is_unassessable() {
-    let kernel = table(1_000)
-        .on_read_after(&format!("{SELF}/stat"), 1, Err(libc::EACCES))
+    let kernel = table_without_self_stat(1_000)
+        .on_read(&format!("{SELF}/stat"), Err(libc::EACCES))
         .on_signal_probe(Pid::from_raw(SELF as i32).unwrap(), Ok(()));
     match me().parent_with(&kernel) {
         Err(Error::Unassessable { detail, .. }) => {
@@ -85,19 +100,21 @@ fn a_pidfs_id_whose_start_time_cannot_be_read_is_unassessable() {
     }
 }
 
-/// The ppid `self`'s first read gives is only a number. If `self`'s read under the parent it named,
-/// which follows the parent's own, shows another ppid, the process changed parents (or its pid
-/// changed hands) and has no parent to name. `self`'s `stat` is read by the snapshot, by the ppid
-/// read, then by that second read. Mutant: "the second read's ppid is not compared with the first's":
-/// the old parent is named.
+/// `self` is read once: the ppid and the key come from that read, and a later `stat` of `self` that
+/// shows another ppid is never asked for. Mutant: "`parent` reads `self` again under the parent it
+/// found": the process is taken to have changed parents, and has none.
 #[skuld::test]
-fn an_id_whose_own_read_shows_another_ppid_has_no_parent() {
-    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 2, Ok(&stat(SELF, 1, 2_000)));
-    assert_eq!(me().parent_with(&kernel).expect("a readable table"), None);
+fn parent_reads_its_own_process_once() {
+    let kernel = table(1_000).on_read_after(&format!("{SELF}/stat"), 1, Ok(&stat(SELF, 1, 2_000)));
+    assert_eq!(
+        me().parent_with(&kernel).expect("a readable table"),
+        Some(ProcessId::from_parts_for_test(PARENT, Key::Pidfs(PARENT_INO)))
+    );
 }
 
-/// [`table`] on a host whose pidfds have no inode: the ticks are the proof, read from `stat`.
-fn ticks_table() -> FakeKernel<'static> {
+/// A host whose pidfds have no inode, so the ticks are the proof, read from `stat`: `SELF` has its
+/// `stat` and `PARENT` has none, which the row states.
+fn ticks_table_without_parent_stat() -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .same_view()
         .on_pids(Ok(&[PARENT, SELF]))
@@ -105,7 +122,6 @@ fn ticks_table() -> FakeKernel<'static> {
         .on_pidfs_ino(PARENT, Ok(None))
         .on_pidfd_open(SELF, Ok(stand_in()))
         .on_pidfs_ino(SELF, Ok(None))
-        .on_read(&format!("{PARENT}/stat"), Ok(&stat(PARENT, 1, 1_000)))
         .on_read(&format!("{SELF}/stat"), Ok(&stat(SELF, PARENT, 2_000)))
 }
 
@@ -113,27 +129,12 @@ fn ticks_me() -> ProcessId {
     ProcessId::from_parts_for_test(SELF, Key::Ticks(2_000))
 }
 
-/// The parent's number is proved again after `self`'s read: the parent's `stat` is read by the
-/// snapshot, by its own resolve, and then by that proof, which finds another start time. Mutant:
-/// "the parent is not proved again after `self`'s read": the parent is named.
+/// A parent whose number cannot be read is an error naming the parent, not `self`, whose own read
+/// succeeded. Mutant: "the error names `self` whatever left the read `Unknown`".
 #[skuld::test]
-fn a_parent_that_loses_its_number_after_the_childs_read_is_not_named() {
-    let held = ticks_table();
-    assert_eq!(
-        ticks_me().parent_with(&held).expect("a readable table"),
-        Some(ProcessId::from_parts_for_test(PARENT, Key::Ticks(1_000)))
-    );
-    let lost = ticks_table().on_read_after(&format!("{PARENT}/stat"), 2, Ok(&stat(PARENT, 1, 1_001)));
-    assert_eq!(ticks_me().parent_with(&lost).expect("a readable table"), None);
-}
-
-/// A parent whose proof after `self`'s read cannot be made is an error naming the parent, not
-/// `self`, whose own read succeeded. Mutant: "the error names `self` whatever left the read
-/// `Unknown`".
-#[skuld::test]
-fn a_parent_that_cannot_be_proved_again_is_the_subject_of_the_error() {
-    let kernel = ticks_table()
-        .on_read_after(&format!("{PARENT}/stat"), 2, Err(libc::EACCES))
+fn a_parent_that_cannot_be_read_is_the_subject_of_the_error() {
+    let kernel = ticks_table_without_parent_stat()
+        .on_read(&format!("{PARENT}/stat"), Err(libc::EACCES))
         .on_signal_probe(Pid::from_raw(PARENT as i32).unwrap(), Ok(()));
     match ticks_me().parent_with(&kernel) {
         Err(Error::Unassessable { detail, .. }) => {

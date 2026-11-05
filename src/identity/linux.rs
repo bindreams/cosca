@@ -230,9 +230,19 @@ pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCau
 }
 
 /// [`of`], and a `stat` record that is that process's own: for a `Pidfs` key the bracketed one, and
-/// for ticks the very record the ticks were read from.
-pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
+/// for ticks the very record the ticks were read from. `expected`: the key of the process the caller
+/// means. A pid whose pidfd shows another kind of key or another inode is `Gone` before its `stat`
+/// is read, so a process that cannot be read is not mistaken for the one asked about.
+pub(super) fn of_stat(
+    kernel: &dyn Kernel,
+    pid: RawPid,
+    expected: Option<Key>,
+) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
     match look(kernel, pid) {
+        Look::Pidfs(ino) if expected.is_some_and(|expected| expected != Key::Pidfs(ino)) => {
+            (Resolved::Gone, UnknownCause::default())
+        }
+        Look::Ticks if matches!(expected, Some(Key::Pidfs(_))) => (Resolved::Gone, UnknownCause::default()),
         Look::Pidfs(ino) => {
             let (stat, cause) = bracketed_stat(kernel, pid, ino);
             (stat.map(|stat| (Key::Pidfs(ino), stat)), cause)
@@ -257,8 +267,8 @@ pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u
 /// [`of_stat`] pairs with the key. A `stat` with no `starttime` is unreadable, not a start of zero;
 /// the ppid is parsed (and an unreadable one logged) only when `ask_parent`, and is then unreadable,
 /// not a parent number.
-pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -> OrderedRead {
-    let (read, cause) = of_stat(kernel, pid);
+pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
+    let (read, cause) = of_stat(kernel, pid, expected);
     let (key, stat) = match read {
         Resolved::Found(found) => found,
         Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause, ask_parent),
@@ -272,7 +282,7 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -
         log::debug!("identity: the stat of pid {pid} has no readable ppid");
         ParentRead::Unreadable
     };
-    match parse_starttime_jiffies(&stat) {
+    let read = match parse_starttime_jiffies(&stat) {
         Some(ticks) => OrderedRead {
             read: Resolved::Found((key, OrderKey(ticks))),
             parent,
@@ -283,7 +293,9 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -
             parent,
             cause: UnknownCause::default(),
         },
-    }
+    };
+    // A `ticks` key is known only from the record just read.
+    read.against(expected)
 }
 
 /// Whether the process `key` names still holds `pid`.
