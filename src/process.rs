@@ -44,7 +44,12 @@ impl Process {
     /// - [`Error::Io`]: the open failed otherwise (a `pidfd_open` error on Linux; a kqueue that
     ///   cannot be created or armed on macOS).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
-        Ok(crate::os_process::open(id)?.map(|os| Process { id, os }))
+        Self::open_with(&crate::identity::HostKernel, id)
+    }
+
+    /// [`open`](Self::open), re-verifying `id` through `kernel`.
+    pub(crate) fn open_with(kernel: &dyn crate::identity::Kernel, id: ProcessId) -> Result<Option<Process>, Error> {
+        Ok(crate::os_process::open_with(kernel, id)?.map(|os| Process { id, os }))
     }
 
     /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid;
@@ -54,10 +59,10 @@ impl Process {
         Self::open_pid_with(&crate::identity::HostKernel, pid)
     }
 
-    /// [`open_pid`](Self::open_pid), reading the pid's identity through `kernel`.
+    /// [`open_pid`](Self::open_pid), reading the pid's identity and opening it through `kernel`.
     pub(crate) fn open_pid_with(kernel: &dyn crate::identity::Kernel, pid: RawPid) -> Result<Option<Process>, Error> {
         match ProcessId::of_with(kernel, pid) {
-            (Resolved::Found(id), _) => Process::open(id),
+            (Resolved::Found(id), _) => Process::open_with(kernel, id),
             (Resolved::Gone, _) => Ok(None),
             (Resolved::Unknown, cause) => Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause)),
         }

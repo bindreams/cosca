@@ -348,7 +348,6 @@ pub(crate) fn exiting_member_command() -> std::process::Command {
 
 /// An open handle on the live process `id` names. Open it before arming a fault: opening may
 /// read what the fault forces.
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn open_live(id: crate::identity::ProcessId) -> crate::Process {
     crate::Process::open(id)
         .expect("open the live process")
@@ -375,6 +374,19 @@ pub(crate) fn release_unsignalled(mut child: std::process::Child) {
     let status = child.wait().expect("reap the member");
     assert_eq!(status.signal(), None, "the member must not have been signalled");
     assert_eq!(status.code(), Some(0), "the member must exit by itself");
+}
+
+/// `pid`'s `stat` as the kernel gives it now, except for the start time: what the pid's new owner
+/// would show.
+#[cfg(target_os = "linux")]
+pub(crate) fn stat_of_a_new_owner(pid: u32) -> Vec<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the live pid's stat");
+    let (head, tail) = stat.rsplit_once(')').expect("stat names its command in parentheses");
+    let mut fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+    // `tail` starts at field 3, the state; the start time is field 22.
+    let start: u64 = fields[19].parse().expect("the start time");
+    fields[19] = (start + 1).to_string();
+    format!("{head}) {}\n", fields.join(" ")).into_bytes()
 }
 
 /// A live [`BLOCKER_ARGV`] (`findstr`) child with piped stdin and stdout, and its identity.

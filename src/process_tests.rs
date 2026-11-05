@@ -54,6 +54,20 @@ fn open_pid_of_a_pid_that_cannot_be_queried_is_unassessable() {
     crate::test_child::release_unsignalled(child);
 }
 
+/// The open that follows the identity read goes through the same kernel: a kernel that finds no
+/// process to open makes a live pid `Ok(None)`. Mutant: "`open_pid_with` opens through `HostKernel`".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn open_pid_with_opens_through_its_kernel() {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let (child, id) = crate::test_child::live_exiting_member();
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Err(rustix::io::Errno::SRCH));
+    let opened = Process::open_pid_with(&kernel, id.pid()).expect("a process gone at the open is not an error");
+    assert!(opened.is_none());
+    crate::test_child::release_unsignalled(child);
+}
+
 #[cfg(windows)]
 #[skuld::test]
 fn open_pid_of_an_access_denied_process_is_unassessable() {
