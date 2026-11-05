@@ -59,7 +59,7 @@ fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
 #[skuld::test]
 fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     let me = ProcessId::current();
-    let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
+    let stale = me.with_other_value();
     let (child, _) = live_member();
     super::hard_kill(&crate::identity::HostKernel, stale).expect("a root that lost its pid is nothing to do");
     release(child);

@@ -278,7 +278,7 @@ fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId
 /// mechanism that does not need it (off macOS).
 #[skuld::test]
 fn root_number_answers_each_state_own_reap_and_identity_read() {
-    let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
+    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
     let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
     let group = Attached::ProcessGroup(PGID);
     // macOS trusts no number its root's handle cannot vouch for, before the mechanism matters.
@@ -358,7 +358,7 @@ fn root_number_answers_each_state_own_reap_and_identity_read() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn root_number_answers_an_unpinned_root_untrusted() {
-    let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
+    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
     for (name, attached) in [
         ("tree walk", Attached::TreeWalk(other())),
         ("group", Attached::ProcessGroup(PGID)),
@@ -407,7 +407,7 @@ fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_r
 #[skuld::test]
 fn group_number_holds_reads_own_from_the_state() {
     use super::group_number_holds;
-    let other = || ProcessId::from_parts_for_test(PGID as u32, 1);
+    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
     let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
     for read in reads() {
         let _read = crate::child::fault::force_root_reads(read);

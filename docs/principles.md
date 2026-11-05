@@ -176,11 +176,12 @@ nothing. The cleanups of a spawn that fails at its identity read and of a tokio 
 after its fork send the group nothing, whatever the root's state. These last three `warn` once that
 members of the root's process group may be left running. On macOS, which has no exact kill of a
 group, the cleanup of a group root whose spawn fails at its identity read warns the same.
-On 6.9+ a member's resend still goes by its pid when the member's own `pidfd_open` fails (`EMFILE`,
-say), right after a check of its identity. Below 6.9 and on macOS a reaper elsewhere in the process
-can reap the root between the check and a send by its number, which then reaches whoever holds it: a
-standing property of process-group and fd-marker containment. A program with such a reaper should
-use cgroup containment.
+On Linux a member's identity is told through a pidfd on every kernel (its inode on 6.9+), so a
+member whose own `pidfd_open` fails (`EMFILE`, a refusal) is not signalled: it is reported
+unassessable, and a group whose members cannot all be opened cannot be listed. Below 6.9 and on
+macOS a reaper elsewhere in the process can reap the root between the check and a send by its
+number, which then reaches whoever holds it: a standing property of process-group and fd-marker
+containment. A program with such a reaper should use cgroup containment.
 
 Where a check of a PID cannot be made atomic with its use, keep the window as small as it can be:
 check and use are two back-to-back actions. Every send by number has its own check right before it,
