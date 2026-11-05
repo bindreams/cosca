@@ -1,7 +1,6 @@
 use cosca::error::QuoteErrorKind;
 use cosca::quote::posix;
 use cosca::quote::windows;
-use cosca::Command;
 use cosca::Containment;
 
 #[skuld::test]
@@ -26,7 +25,7 @@ fn public_surface_is_usable() {
     assert_eq!(String::from_utf16(&ft).unwrap(), "prog");
 
     // Command builder is constructible from the crate root.
-    let mut cmd = Command::new();
+    let mut cmd = cosca::Command::new();
     cmd.args(["ls", "-la"]);
     let _ = cmd; // input model exercised in unit tests
 }
@@ -44,7 +43,7 @@ fn public_surface_is_usable() {
 fn containment_smoke() {
     let _warns = common::warn_watch();
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(tb)
         .args(["cosca_testbin", "read-fd", "0"])
         .stdin(cosca::Stdio::pipe())
@@ -105,6 +104,7 @@ fn spawn_public_surface_is_usable() {
     use cosca::{run, Stdio};
     // run([...]) -> output() captures; status code reachable.
     let out = run([env!("CARGO_BIN_EXE_cosca_testbin"), "echo-argv", "hi"])
+        .no_window()
         .output()
         .expect("output");
     assert!(out.status.success());

@@ -5,6 +5,8 @@
 //! integration test `tests/raw_windows_async.rs`.
 
 use std::future::Future;
+
+use crate::test_child::Console;
 use std::task::Context;
 
 use crate::child::spawn::windows_raw::WaitOutcome;
@@ -27,7 +29,7 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
     // PATH (System32), so this unit test needs no CARGO_BIN_EXE testbin.
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
-    let mut c = Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.executable("findstr")
         .args(["findstr", "/c:needle"])
         .stdin(Stdio::pipe())
@@ -71,7 +73,7 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
     use crate::error::Error;
 
-    let mut refused = Command::new();
+    let mut refused = crate::test_child::tokio_command(Console::Hidden);
     refused
         .executable("cmd")
         .args(["cmd", "/C", "exit 0"])
@@ -86,7 +88,7 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         "the refusal ran after the mutation it was supposed to precede"
     );
 
-    let mut allowed = Command::new();
+    let mut allowed = crate::test_child::tokio_command(Console::Hidden);
     allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
     let mut child = allowed
         .spawn()
@@ -106,7 +108,7 @@ async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheri
     use crate::containment::windows::observe;
     use crate::error::Error;
 
-    let mut refused = Command::new();
+    let mut refused = crate::test_child::tokio_command(Console::Hidden);
     refused
         .executable("cmd")
         .args(["cmd", "/C", "exit 0"])
@@ -137,7 +139,7 @@ fn raw_blocker() -> (Command, crate::child::spawn::fault::TeardownBlocker) {
         stdout,
         guard,
     } = crate::child::spawn::fault::teardown_blocker_parts();
-    let mut c = Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.executable(&argv[0]).args(argv);
     c.stdin(stdin).unwrap();
     c.stdout(stdout.expect("a Windows blocker nulls its stdout")).unwrap();
@@ -200,7 +202,7 @@ async fn an_async_raw_spawn_whose_create_process_fails_did_not_start() {
     let dir = tempfile::tempdir().expect("tempdir");
     let image = dir.path().join("not-a-program.exe");
     std::fs::write(&image, b"not a PE image").expect("write the image");
-    let mut c = Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.executable(&image).args(["not-a-program"]);
     let err = crate::child::spawn::failure::expect_not_started(c.spawn().expect_err("a non-PE image fails"));
     assert!(
@@ -220,19 +222,19 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bat = dir.path().join("x.bat");
     std::fs::write(&bat, b"@echo off\n").expect("write the batch file");
-    let mut batch = Command::new();
+    let mut batch = crate::test_child::tokio_command(Console::Hidden);
     batch.executable(&bat).args(["x.bat"]);
-    let mut cwd_nul = Command::new();
+    let mut cwd_nul = crate::test_child::tokio_command(Console::Hidden);
     cwd_nul
         .executable("findstr")
         .args(["findstr", "x"])
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
-    let mut line_nul = Command::new();
+    let mut line_nul = crate::test_child::tokio_command(Console::Hidden);
     line_nul.executable("findstr").args(["findstr", "a\u{0}b"]);
-    let mut oversized = Command::new();
+    let mut oversized = crate::test_child::tokio_command(Console::Hidden);
     oversized.executable("findstr").args(["findstr", "x"]);
     oversized.fd(70_000, Stdio::null()).expect("fd 70000");
-    let mut inherit_fd3 = Command::new();
+    let mut inherit_fd3 = crate::test_child::tokio_command(Console::Hidden);
     inherit_fd3.executable("findstr").args(["findstr", "x"]);
     inherit_fd3.fd(3, Stdio::inherit()).expect("fd 3");
     use crate::child::spawn::failure::{invalid_input, unsupported};

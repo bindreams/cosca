@@ -3,6 +3,7 @@
 //! once if the wait passes 1 s.
 
 use crate::error::ChildFate;
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{tracer_group, Group};
 use crate::tokio::child::child_drop_tests::released_blocker;
@@ -10,7 +11,7 @@ use crate::tokio::child::Child;
 
 /// A kill-on-drop root that only a kill or a closed stdin ends, in no containment.
 fn blocker() -> (Child, crate::tokio::ChildStdin) {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");

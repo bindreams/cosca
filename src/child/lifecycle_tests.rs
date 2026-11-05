@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 /// The `TreeDrain` variant a fully-drained tree reports on `containment`'s mechanism:
 /// `AllMembersExited` everywhere authoritative (cgroup v2, Windows job object), but
 /// `AllMarkersClosed` on macOS's advisory fd marker — see `TreeDrain`'s own doc for why the two
@@ -20,7 +22,7 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
 /// fires almost immediately, so an UNBOUNDED `wait_tree()` call below is safe — it is a real
 /// blocking wait on a genuinely-terminating event, not an indefinite one.
 fn quick_contained_child() -> crate::Child {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
@@ -163,7 +165,7 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
 /// an explicit `TreeWalk` request still drains correctly through the marker it was promoted to.
 #[skuld::test]
 fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
@@ -196,7 +198,7 @@ use std::time::Instant;
 
 /// A live, uncontained child that blocks on its piped stdin until EOF.
 fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");
     cmd.stdout(crate::Stdio::null()).expect("configure null stdout");
@@ -240,7 +242,7 @@ fn std_child_consecutive_frozen_waits_never_return_early() {
 /// kill returned.
 #[skuld::test]
 fn drop_kills_and_reaps_the_child() {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     // `more.com` exits 0 on EOF, unlike the `findstr` blocker, whose exit 1 is the kill's code.
@@ -278,7 +280,7 @@ fn drop_kills_and_reaps_the_child() {
 #[skuld::test]
 fn drop_kills_a_contained_tree() {
     use std::io::Read as _;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::CAT_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");

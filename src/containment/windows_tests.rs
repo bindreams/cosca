@@ -1,6 +1,8 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
+use crate::test_child::Console;
+
 #[skuld::test]
 fn job_handle_debug_does_not_panic() {
     // Verify the Debug impl compiles and runs cleanly for a consumed (raw == null) handle.
@@ -553,7 +555,7 @@ impl Drop for SuspendedHelper {
 
 /// Spawn a contained blocker. Whatever is injected or forced on this thread applies to it.
 fn spawn_contained_blocker() -> Result<crate::Child, crate::error::Error> {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");

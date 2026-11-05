@@ -5,6 +5,7 @@
 
 #[cfg(unix)]
 use crate::child::spawn::fault::{release_between_kill_and_wait, TeardownBlocker};
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{fault, Child};
@@ -13,7 +14,7 @@ use crate::tokio::child::{fault, Child};
 /// stdin is returned: dropping it lets the root exit. On Windows the root is `more.com`, which
 /// exits `0` on EOF, where the `findstr x` of `BLOCKER_ARGV` exits `1`, the code a kill gives.
 fn blocker() -> (Child, crate::tokio::ChildStdin) {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     #[cfg(windows)]
@@ -267,7 +268,7 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
     if !alone(fixture_path!(an_async_drop_closes_the_childs_untaken_stdout)) {
         return;
     }
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -355,7 +356,7 @@ async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
 async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::ChildStdout) {
     use ::tokio::io::AsyncReadExt as _;
 
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -553,7 +554,7 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     }
     let name = "cosca-async-drop-opted-out-armed";
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.kill_on_drop(false);
@@ -711,7 +712,7 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
         graceful: crate::graceful::GracefulMechanism::Process,
     });
 
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
@@ -773,7 +774,7 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
 async fn a_teardown_of_a_reaped_child_is_reaped_armed_or_not() {
     crate::tokio::test_runtime::assert_current_thread();
     for kill_on_drop in [true, false] {
-        let mut cmd = crate::tokio::Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("set stdout");

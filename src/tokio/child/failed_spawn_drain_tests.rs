@@ -2,6 +2,8 @@
 //! 1 s, and goes on waiting (principle 2).
 
 use std::cell::Cell;
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::child_drop_tests::linux;
@@ -19,7 +21,7 @@ use crate::containment::cgroup::test_support::FakeLeaf;
 /// `block_until_members_drained` waits with `NoWarn` (the blocking wait's hook finds no warn).
 #[skuld::test]
 async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
