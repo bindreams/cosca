@@ -4,6 +4,8 @@
 
 use std::io::Read as _;
 
+use crate::test_child::Console;
+
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::test_child::reaped_elsewhere::{foreign_reaped_group_root, kill_own_child, reap_behind};
@@ -13,7 +15,7 @@ use crate::test_groups::{pidfd_group_signal, Group};
 pub(crate) fn root_with_a_member() -> (crate::Child, Member) {
     let (stdio, started, member) = Member::pipes();
     let child = {
-        let mut cmd = crate::Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(ROOT_WITH_A_MEMBER);
         cmd.contain_with(crate::ContainMode::Session);
         cmd.stdin(stdio.stdin).expect("set stdin");
@@ -161,7 +163,7 @@ impl EmptiedGroup {
         use crate::test_child::{await_member_ready, member_command};
         // The member waits for a line on stdin, then leaves the group by `setsid`, says so, and holds
         // stderr's write end until stdin's EOF.
-        let mut cmd = crate::Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args([
             "sh",
             "-c",

@@ -10,6 +10,7 @@ use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::test_child::reaped_elsewhere::reap_behind;
+use crate::test_child::Console;
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// A session root `sh` that leaves a member in its group, says `started` and exits, as
@@ -149,7 +150,7 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
     let capture = Capture::start();
     let mark = crate::log_capture::mark();
     let spawned = {
-        let mut cmd = crate::Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(failure.argv());
         cmd.contain_with(mode);
         cmd.stdin(stdio.stdin).expect("set stdin");

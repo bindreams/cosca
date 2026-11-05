@@ -1,10 +1,11 @@
 #[cfg(target_os = "linux")]
+use crate::test_child::Console;
 use crate::test_groups::{unprivileged, Group};
-use crate::{Command, Stdio};
+use crate::Stdio;
 
 /// `/bin/sh -c script`, with all three standard streams piped.
 fn sh(script: &str) -> crate::Child {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["/bin/sh", "-c", script]);
     c.stdin(Stdio::pipe()).expect("stdin");
     c.stdout(Stdio::pipe()).expect("stdout");

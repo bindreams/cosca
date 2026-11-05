@@ -173,7 +173,7 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
     use cosca::GracefulMechanism;
 
     let (uncontained, s1) = common::spawn_blocker();
-    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
+    let (contained, s2) = common::spawn_control_on_console("control-block", &["R"], true);
     assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
     assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     common::kill_release_reap_all(vec![(uncontained, s1), (contained, s2)]);
@@ -187,7 +187,7 @@ fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
-    let (child, sock) = common::spawn_control("control-block", &["R"], true);
+    let (child, sock) = common::spawn_control_on_console("control-block", &["R"], true);
     // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
     common::kill_tree_release_reap(&child, sock);
     child.terminate().expect("already-dead must be Ok");

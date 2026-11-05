@@ -5,6 +5,8 @@
 //! exactly if the program ran. No timing is involved.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -29,7 +31,7 @@ use crate::test_groups::{namespaces, setuid, Group};
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "echo ran"]);
     cmd.stdout(Stdio::from_file(std::fs::File::from(OwnedFd::from(writer))))
         .expect("set stdout");
@@ -488,7 +490,7 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
     let mut file = tempfile::tempfile().expect("tempfile");
     let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
     let gate_write = Rc::new(RefCell::new(Some(gate_write)));
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "echo ran"]);
     for slot in [1, 2] {
         cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
