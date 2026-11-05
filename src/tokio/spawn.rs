@@ -687,9 +687,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     },
                     &mut why,
                 );
-                // The read failed, so no identity is known.
-                #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front_noting(pid, None, subtree.as_ref(), &mut why);
+                #[cfg(target_os = "macos")]
                 return Err(SpawnFailure::started(
                     fate.note(
                         crate::child::spawn::spawn_identity_error(other, cause),
@@ -699,6 +697,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                     None,
                 ));
+                // The read failed, so no identity is known.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (error, child_fate) = proc.leave_front_noting(
+                        pid,
+                        None,
+                        subtree.as_ref(),
+                        &mut why,
+                        crate::child::spawn::spawn_identity_error(other, cause),
+                        front,
+                    );
+                    return Err(SpawnFailure::started(error, child_fate, None));
+                }
             }
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
@@ -763,7 +774,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // Elsewhere the failed attach has dropped the containment: a cgroup leaf's drop kills
                 // and drains it, so a front in it is dying, and is waited for.
                 #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref());
+                {
+                    let (error, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref(), error, front);
+                    return Err(SpawnFailure::started(error, child_fate, None));
+                }
+                #[cfg(target_os = "macos")]
                 return Err(SpawnFailure::started(
                     fate.note(error, Some(front), Some(pid)),
                     child_fate,
@@ -778,7 +793,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     pid,
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
-                    "is handed to tokio's orphan reaper, which reaps it once it exits",
+                    &format!("is {}", crate::tokio::child::HANDED_TO_ORPHAN_REAPER),
                     crate::tokio::child::slow_teardown_after(),
                 );
                 // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
@@ -1068,7 +1083,10 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
     use crate::containment::AbandonedChild;
 
     match child {
-        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped | AbandonedChild::OutOfReach(_) => {
+        AbandonedChild::Ended
+        | AbandonedChild::MaybeUnreaped
+        | AbandonedChild::OutOfReach(_)
+        | AbandonedChild::Uncollected(_) => {
             debug_assert!(false, "only a Linux cgroup leaf abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
@@ -1091,12 +1109,26 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// `ended`: the handshake killed and reaped the child through its pidfd, or found it reaped. The
 /// child is then not at risk, so its fate is logged at `debug`; only an `OutOfReach` leaf still
 /// warns, of a descendant outside it. The fate of an elevation `front` the leaf found is noted on
-/// the error instead, as the spawn's other failures note it.
+/// the error instead, as the spawn's other failures note it. A child the leaf's pidfd reached and
+/// its teardown left uncollected says so, in the teardown's clause: under the failed spawn's label,
+/// or, if `ended` says the handshake ended the child through its own copy of the pidfd, after that
+/// fate, as an `OutOfReach` leaf's does. The warn is logged through
+/// [`Left::warn`](crate::child::owned::teardown::Left::warn).
 fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
     let consequence = match (child, ended) {
         (AbandonedChild::Front(_) | AbandonedChild::Ended, _) => return,
+        (AbandonedChild::Uncollected(left), ended) => {
+            let by = match ended {
+                Some(fate) => format!("{fate}, and the teardown of its cgroup v2 leaf's copy of its pidfd says"),
+                None => crate::containment::dispatch::TeardownCaller::FailedSpawn
+                    .label()
+                    .to_owned(),
+            };
+            left.warn(&format!("tokio spawn failed ({error}); {by}: {}", left.clause));
+            return;
+        }
         (AbandonedChild::OutOfReach(why), Some(fate)) => {
             log::warn!(
                 "tokio spawn failed ({error}); {fate}, and its cgroup v2 leaf's abandonment says: {why}; a \
@@ -1207,6 +1239,8 @@ fn abandoned_after_handshake(
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
         AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
+        // What the teardown established of the child it left.
+        AbandonedChild::Uncollected(left) => (error, left.remains.fate),
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }
