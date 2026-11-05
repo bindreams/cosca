@@ -147,13 +147,21 @@ impl RestrictedChild {
         // and whose pid was then handed to this fixture. Route through the crate-s own
         // stale-ppid defense (`children_of` applies the order-key rule) so only a
         // genuine child is returned.
-        let me = crate::identity::windows_identity_from_handle(self.handle, self.pid)
+        // The fixture's pid may be unopenable by pid, which its order key is read by, so the key
+        // comes from the owned handle and the pure filter walks from it.
+        let (me, me_key) = crate::identity::windows_ordered_identity_from_handle(self.handle, self.pid)
             .expect("the owned handle always yields an identity");
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let kernel = &super::HostKernel;
             let parents = crate::containment::enumerate::process_parents(kernel).expect("the process snapshot");
-            let kids = crate::containment::treewalk::children_of(kernel, me, &parents).expect("the fixture's children");
+            let kids = crate::containment::treewalk::children_of_with(
+                me,
+                me_key,
+                &parents,
+                crate::containment::treewalk::ALLOW_EQUAL_ORDER,
+                |pid, parent| crate::containment::treewalk::resolve_or_drop(kernel, pid, parent),
+            );
             if let Some(kid) = kids.first() {
                 return kid.pid();
             }

@@ -12,8 +12,8 @@
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
-//! guard) is not the key but an `OrderKey`, the start time, which on Linux a `pidfs` id reads from
-//! `/proc`.
+//! guard) is not the key but an `OrderKey`: the start time, which on Linux a `pidfs` id reads from
+//! `/proc`; on Windows the process sequence number, read on the handle the creation time is read on.
 //!
 //! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
 //! for the persist/restore round trip and what it refuses.
@@ -92,8 +92,11 @@ impl Key {
 #[cfg(target_os = "linux")]
 pub(crate) use backend::Key;
 
-/// When a process started: comparable only with keys read on this host this boot. The tree walk's
-/// PID-reuse guard orders by it. Not the identity: equal keys do not mean the same process.
+/// Where a process falls in the order of process creation: comparable only with keys read on this
+/// host this boot. The tree walk's PID-reuse guard orders by it. Not the identity: equal keys do
+/// not mean the same process. Linux: the start time in jiffies. macOS: the start time in
+/// microseconds. Windows: the `ProcessSequenceNumber`, a creation counter, so no two processes
+/// share a key and a process always follows its creator.
 ///
 /// Built only inside `identity`, by the backends' reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -211,7 +214,19 @@ impl ProcessId {
                 None => (Resolved::Unknown, UnknownCause::default()),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let _ = (kernel, parent);
+            match backend::ordered_read(pid) {
+                Resolved::Found((key, order)) => (
+                    Resolved::Found((ProcessId { pid, key }, order)),
+                    UnknownCause::default(),
+                ),
+                Resolved::Gone => (Resolved::Gone, UnknownCause::default()),
+                Resolved::Unknown => (Resolved::Unknown, UnknownCause::default()),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = parent;
             let (read, cause) = Self::of_with(kernel, pid);
@@ -227,15 +242,22 @@ impl ProcessId {
         }
     }
 
-    /// When this process started, for ordering against other processes' keys (the tree walk's
-    /// PID-reuse guard). [`Resolved::Gone`] and [`Resolved::Unknown`] mean no key could be read;
-    /// the [`UnknownCause`] says why when the read itself knows, as for [`of_with`](Self::of_with).
+    /// Where this process falls in the order of process creation (see [`OrderKey`]), for ordering
+    /// against other processes' keys (the tree walk's PID-reuse guard). [`Resolved::Gone`] and
+    /// [`Resolved::Unknown`] mean no key could be read, and a pid that another process holds now is
+    /// `Gone` on Windows, where the key is read from the process; the [`UnknownCause`] says why when
+    /// the read itself knows, as for [`of_with`](Self::of_with).
     pub(crate) fn order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
             backend::order_key(kernel, self.pid, self.key)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let _ = kernel;
+            (backend::order_key(self.pid, self.key), UnknownCause::default())
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = kernel;
             (Resolved::Found(OrderKey(self.key.raw())), UnknownCause::default())
@@ -695,6 +717,15 @@ pub(crate) fn windows_identity_from_handle(
     pid: RawPid,
 ) -> Option<ProcessId> {
     backend::windows_identity_from_handle(handle, pid)
+}
+
+/// [`windows_identity_from_handle`] with the order key of the same read.
+#[cfg(all(windows, test))]
+pub(crate) fn windows_ordered_identity_from_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: RawPid,
+) -> Option<(ProcessId, OrderKey)> {
+    backend::windows_ordered_identity_from_handle(handle, pid)
 }
 
 #[cfg(test)]

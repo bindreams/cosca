@@ -544,3 +544,98 @@ fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
         "the failure is the rights read's own: {e:?}"
     );
 }
+
+// order key =====
+
+fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
+    match id.order_key_with(&crate::identity::HostKernel).0 {
+        Resolved::Found(key) => key,
+        other => panic!("the order key of {id:?} should read, got {other:?}"),
+    }
+}
+
+/// A child of `child` (`cmd /C more` runs `more` as a child), as the process snapshot lists it, once
+/// it appears. The wait re-checks the snapshot and is ended by `child` exiting.
+fn grandchild_pid(child: &mut std::process::Child) -> u32 {
+    loop {
+        assert!(
+            child.try_wait().expect("poll the fixture").is_none(),
+            "the fixture exited before spawning its child"
+        );
+        let parents =
+            crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
+        if let Some((pid, _)) = parents.iter().find(|(_, ppid)| *ppid == child.id()) {
+            return *pid;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// The order key is the process sequence number, not the creation time that is the id's key.
+///
+/// Mutant: the order key is the id's key.
+#[skuld::test]
+fn the_order_key_is_not_the_creation_time() {
+    let me = crate::identity::ProcessId::current();
+    let (read, _) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None);
+    let Resolved::Found((id, key)) = read else {
+        panic!("our own order key must read, got {read:?}");
+    };
+    assert_eq!(id, me, "the id of the ordered read is the id of the by-pid read");
+    assert_ne!(key, crate::identity::OrderKey::for_test(me.key().raw()));
+    assert_eq!(key, order_key_of(me), "both reads of one process agree");
+}
+
+/// The fact the tree walk relies on: a process's sequence number is greater than its creator's.
+///
+/// Mutant: the order key is a value that does not grow from creator to child.
+#[skuld::test]
+fn a_child_orders_after_its_creator_and_a_grandchild_after_the_child() {
+    let mut child = spawn_blocked_child();
+    let grandchild = grandchild_pid(&mut child);
+    let me = crate::identity::ProcessId::current();
+    let child_id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the child is ours");
+    let grandchild_id = crate::identity::ProcessId::of(grandchild)
+        .found()
+        .expect("the grandchild is ours");
+    let keys = (order_key_of(me), order_key_of(child_id), order_key_of(grandchild_id));
+    end(child);
+    assert!(keys.0 < keys.1, "child {:?} after creator {:?}", keys.1, keys.0);
+    assert!(keys.1 < keys.2, "grandchild {:?} after child {:?}", keys.2, keys.1);
+}
+
+/// A pid that another process holds has no order key for the id that was read before.
+///
+/// Mutant: the order key of a recycled pid is read as the new holder's.
+#[skuld::test]
+fn the_order_key_of_a_stale_id_is_gone() {
+    let stale = crate::identity::ProcessId::current().with_other_value();
+    assert_eq!(stale.order_key_with(&crate::identity::HostKernel).0, Resolved::Gone);
+}
+
+/// The walk keeps a real child and grandchild of a real spawned root, ordered by sequence number.
+#[skuld::test]
+fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
+    let mut child = spawn_blocked_child();
+    let grandchild = grandchild_pid(&mut child);
+    let root = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the root is ours");
+    let direct = root.children(crate::Recursive::No);
+    let below_us = crate::identity::ProcessId::current().children(crate::Recursive::Yes);
+    end(child);
+    let direct = direct.expect("the root's children are enumerable");
+    assert!(
+        direct.iter().any(|id| id.pid() == grandchild),
+        "{grandchild} not among {direct:?}"
+    );
+    let below_us = below_us.expect("our descendants are enumerable");
+    for pid in [root.pid(), grandchild] {
+        assert!(
+            below_us.iter().any(|id| id.pid() == pid),
+            "{pid} not among {below_us:?}"
+        );
+    }
+}

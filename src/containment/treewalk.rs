@@ -14,8 +14,9 @@
 //!
 //! A `(pid, ppid)` snapshot is racy: a candidate's `pid` may have been recycled,
 //! or its `ppid` may name a *recycled* root pid. So a chained ppid alone does not
-//! prove descent. The candidate's [`OrderKey`] (when it started: Linux jiffies /
-//! Windows 100 ns FILETIME / macOS µs), read beside its id, must additionally order
+//! prove descent. The candidate's [`OrderKey`] (where it falls in process creation: Linux
+//! jiffies / macOS µs of its start time / Windows its process sequence number), read beside its
+//! id, must additionally order
 //! correctly against the root's: a genuine descendant was created at-or-after the
 //! root acquired its pid. The keep predicate is
 //!
@@ -42,8 +43,8 @@
 //!   `>=` is therefore safe AND catches same-jiffy immediate children that strict
 //!   `>` would silently miss under Linux's coarse 10 ms jiffy clock.
 //! - **Windows** does not reparent and recycles pids freely, so the rule stays
-//!   strict `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
-//!   indistinguishable from impossible, so strict `>` loses nothing there.
+//!   strict `>`. Sequence numbers are unique (one per process creation) and a process's exceeds
+//!   its creator's, so two processes never share a key and strict `>` loses no genuine child.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -92,7 +93,7 @@ use nix::sys::signal::Signal;
 /// Per-OS order-key rule. See the module docs for the full
 /// rationale. Linux/macOS reparent orphans → ppid is authoritative → keep
 /// same-tick children (`>=`). Windows recycles pids and never reparents → keep
-/// strict `>`.
+/// strict `>`: sequence numbers are unique, so equality never happens between two processes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const ALLOW_EQUAL_ORDER: bool = true;
 #[cfg(windows)]
