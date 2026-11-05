@@ -1054,11 +1054,12 @@ impl Drop for Child {
 impl Child {
     /// What [`Drop`] does, now, for a caller that owns the child and fails after its spawn: it says
     /// what became of the child. With [`Disposition::HandBack`], a child whose teardown could not
-    /// end it is given back too.
+    /// end it, a refused kill or an elevation front (which is sent none), is given back too if it
+    /// still runs.
     ///
-    /// A `kill_on_drop(false)` child and an elevation front (sent no kill) are left, whatever
-    /// `disposition` says. The containment is torn down as `self` drops, before this returns. On
-    /// Windows a refused root kill gets the single look, as before.
+    /// Only a `kill_on_drop(false)` child is left whatever `disposition` says. The containment is
+    /// torn down as `self` drops, before this returns. On Windows a refused root kill gets the
+    /// single look, as before.
     pub(crate) fn tear_down_or_hand_back(
         mut self,
         disposition: Disposition,
@@ -1074,11 +1075,6 @@ impl Child {
             return (fate, None);
         }
         self.kill_on_drop = false;
-        let disposition = if self.front.is_none() {
-            disposition
-        } else {
-            Disposition::Leave
-        };
         let fate = self.tear_down(TeardownCaller::FailedRun, disposition);
         let handed_back = disposition == Disposition::HandBack && matches!(fate, ChildFate::Running { .. });
         (fate, handed_back.then(|| self.into_unreaped()))

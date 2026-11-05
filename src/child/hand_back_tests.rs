@@ -189,26 +189,104 @@ fn a_job_contained_child_whose_kill_is_refused_and_look_shows_the_exit_is_not_ha
     assert!(handed_back.is_none());
 }
 
-/// An elevation front that is left running is not handed back (fronts are the next change), and is
-/// sent nothing.
-///
-/// Mutant: a front is handed back, or killed.
+/// An ordinary `cat` the test owns, reported as launched by `sudo`: a front, which is sent no kill,
+/// and the write end of its stdin.
 #[cfg(unix)]
-#[skuld::test]
-fn an_elevation_front_left_running_is_not_handed_back() {
-    use crate::child::front_kill_tests::{cat, spawn_as};
+fn a_running_front() -> (Child, std::io::PipeWriter) {
     use crate::elevation::{Backend, ElevatedVia};
 
-    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    crate::log_capture::install();
+    crate::child::front_kill_tests::spawn_as(
+        crate::child::front_kill_tests::cat(),
+        ElevatedVia::Wrapped(Backend::Sudo),
+    )
+}
+
+/// What a teardown that hands a running elevation front back leaves: the front's `Running` fate and
+/// identity in the `Unreaped`, nothing sent to it (it is `Alive` and waited for by nobody yet), the
+/// one warn saying it is handed back, and then, once released, an exit of 0, which a kill would not
+/// give.
+#[cfg(unix)]
+#[track_caller]
+fn assert_front_handed_back(
+    id: crate::identity::ProcessId,
+    mark: usize,
+    fate: ChildFate,
+    handed_back: crate::test_child::HandedBack<std::io::PipeWriter>,
+) {
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
+    assert_eq!(handed_back.unreaped().id(), Some(id));
+    assert_eq!(id.is_alive(), Liveness::Alive, "a front is sent nothing");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with(&format!(
+            "teardown after a failed run: elevation front pid {} is running and unreaped",
+            id.pid()
+        )) && warns[0].contains("handed back to the caller in the error")
+            && !warns[0].contains("left running"),
+        "{warns:?}"
+    );
+    assert!(handed_back.wait().success(), "a front is sent nothing");
+}
+
+/// An elevation front that is running is handed back, sent nothing.
+///
+/// Mutants: a front is left whatever the caller says; a front is killed; the warn says it is left.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_left_running_is_handed_back() {
+    let (child, stdin) = a_running_front();
     let id = child.id();
+    let mark = crate::log_capture::mark();
 
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
+    assert_front_handed_back(id, mark, fate, handed_back);
+}
+
+/// A caller that leaves a front gets it left, warned, and no `Unreaped`.
+///
+/// Mutant: a front is handed back whatever the caller says.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_is_left_when_the_caller_leaves_it() {
+    let (child, stdin) = a_running_front();
+    let id = child.id();
+    let mark = crate::log_capture::mark();
+
+    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
+
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
-    assert_eq!(id.is_alive(), Liveness::Alive, "a front is sent nothing");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("is left running and unreaped"),
+        "{warns:?}"
+    );
     drop(handed_back);
     crate::test_child::wait_until_zombie(id.pid());
+}
+
+/// A front that has exited when the teardown runs is reaped by the look; there is nothing to give
+/// back.
+///
+/// Mutant: a front is handed back without a look.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
+    let (child, stdin) = a_running_front();
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let mark = crate::log_capture::mark();
+
+    let (fate, handed_back) = tear_down_holding(child, (), Disposition::HandBack);
+
+    assert_eq!(fate, ChildFate::Reaped);
+    assert!(handed_back.is_none(), "the teardown handed the child back");
+    assert_eq!(warns_since(mark), Vec::<String>::new());
 }
 
 // In a cgroup (the `cgroup` group) =====
