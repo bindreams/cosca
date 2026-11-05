@@ -285,7 +285,8 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
 fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
     let (child, id) = live_member();
     let me = ProcessId::current();
-    let parents = [(id.pid(), me.pid())];
+    // `me` has a row, as a live root does in a snapshot.
+    let parents = [(me.pid(), 1), (id.pid(), me.pid())];
     let (kernel, _guard) = unreadable(id.pid());
     assert!(descendants(&kernel, me, &parents)
         .expect("a readable anchor")

@@ -4,7 +4,7 @@
 
 use super::{descendants_with, Resolution, Walk};
 use crate::error::Error;
-use crate::identity::{Key, OrderKey, ProcessId, RawPid};
+use crate::identity::{Key, OrderKey, ProcessId, RawPid, UnknownCause};
 use std::collections::HashMap;
 
 const ROOT_PID: RawPid = 100;
@@ -27,10 +27,7 @@ fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, ProcessId) -> Reso
 
 /// What the live resolver returns for a pid whose read was `Unknown`.
 fn unreadable(pid: RawPid) -> Error {
-    Error::Unassessable {
-        detail: format!("pid {pid} exists but could not be queried (access denied?)"),
-        source: None,
-    }
+    super::unqueryable_read(pid, UnknownCause::default())
 }
 
 /// Collect the member pids into a sorted Vec for order-independent comparison.
@@ -162,7 +159,7 @@ fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtre
 /// edge, as a creator always has the lower sequence number, so the stub states it.
 ///
 /// Mutant (CI runs this row; no other row pins the consts on Windows): `ORDER_AFTER_PARENT` is
-/// `false` on Windows, or `descendants_from_key` passes the flags swapped.
+/// `false` on Windows, or `walk_from` passes the flags swapped.
 #[cfg(windows)]
 #[skuld::test]
 fn on_windows_a_reused_creator_edge_is_dropped_under_the_production_consts() {
@@ -320,6 +317,33 @@ fn an_unreadable_direct_child_is_unassessed_in_the_one_level_filter_too() {
     });
     assert_eq!(unassessed(&got), [200]);
     assert_eq!(pids(got), [300]);
+}
+
+/// A pid is resolved once however many edges list it: when its first read finds it and a second
+/// would be `Unknown`, it is a member, listed once, and not unassessed. Mutant: the one-level filter
+/// resolves each duplicate edge again.
+#[skuld::test]
+fn a_duplicate_edge_is_resolved_once_in_both_filters() {
+    use super::children_of_with;
+    use std::cell::Cell;
+
+    let parents = [(200, ROOT_PID), (200, ROOT_PID)];
+    let reads = Cell::new(0);
+    let first_reads_second_does_not = |pid: RawPid, _parent: ProcessId| {
+        reads.set(reads.get() + 1);
+        if reads.get() == 1 {
+            Ok(Some(resolved(pid, ROOT_TOKEN + 5)))
+        } else {
+            Err(unreadable(pid))
+        }
+    };
+    let got = children_of_with(root(), root_key(), &parents, true, first_reads_second_does_not);
+    assert_eq!((pids(got), reads.get()), (vec![200], 1), "one level");
+
+    reads.set(0);
+    let got = descendants_with(root(), root_key(), &parents, true, false, first_reads_second_does_not);
+    assert!(got.unassessed.is_empty(), "{:?}", got.unassessed);
+    assert_eq!((pids(got), reads.get()), (vec![200], 1), "whole subtree");
 }
 
 // One-level child filter keeps only genuine direct children =====
@@ -523,7 +547,7 @@ fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_window
     );
 }
 
-/// The Windows wiring of the walk to the creator read, through `descendants_from_key` with real
+/// The Windows wiring of the walk to the creator read, through `walk_from` with real
 /// processes: `x` and `y` are both children of the root (this process). A snapshot that names `x` as
 /// `y`'s parent is a stale creator edge: `y`'s own creator is the root, so it is dropped under `x`
 /// and kept under the root. `x` is spawned first, so `y`'s key follows `x`'s and the parent-order
@@ -537,17 +561,21 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     use crate::identity::HostKernel;
     use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
 
+    use crate::Recursive;
+
     let root = ProcessId::current();
-    let root_key = super::anchor(&HostKernel, root)
-        .expect("the root reads")
-        .expect("the root is live");
     let (x_child, x) = live_findstr_blocker();
     let (y_child, y) = live_findstr_blocker();
 
-    let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
-    let dropped = super::descendants_from_key(&HostKernel, root, root_key, &stale_creator);
-    let genuine = [(x.pid(), root.pid()), (y.pid(), root.pid())];
-    let kept = super::descendants_from_key(&HostKernel, root, root_key, &genuine);
+    // The root has a row, as a live root does in a snapshot (its parent is not read).
+    let stale_creator = [(root.pid(), 0), (x.pid(), root.pid()), (y.pid(), x.pid())];
+    let dropped = super::walk_from(&HostKernel, root, &stale_creator, Recursive::Yes)
+        .expect("the root reads")
+        .expect("the root is live");
+    let genuine = [(root.pid(), 0), (x.pid(), root.pid()), (y.pid(), root.pid())];
+    let kept = super::walk_from(&HostKernel, root, &genuine, Recursive::Yes)
+        .expect("the root reads")
+        .expect("the root is live");
 
     release_findstr_unterminated(x_child);
     release_findstr_unterminated(y_child);

@@ -722,7 +722,7 @@ impl Attached {
     /// a macOS `FdMarker`'s walk and group), which the root's reap frees for reuse, so
     /// `kill_tree`/`terminate_tree` check the root first
     /// ([`crate::child::tree_call::root_number`]). `TreeWalk` checks for itself
-    /// (`treewalk::anchor`).
+    /// (`treewalk::walk_from`).
     #[cfg(unix)]
     pub(crate) fn needs_root_check(&self) -> bool {
         match self {

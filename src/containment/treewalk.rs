@@ -92,9 +92,16 @@
 //! not a member and is dropped silently. The walk returns them in [`Walk::unassessed`] beside its
 //! members, so no caller takes a short list for the whole tree: [`hard_kill`] reports `Ok(false)`,
 //! the fd marker's sweep reports itself incomplete, and `ProcessId::children` is an error.
+//!
+//! A process the walk cannot read is never taken for one that is not the root's. On Windows that
+//! includes a process it cannot open (one the caller may not query), whose creator pid is never
+//! updated: if it names the root's pid, because an earlier holder of that pid created it, the walk
+//! cannot tell it from a genuine child, so every walk from that root is incomplete for as long as it
+//! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
+use crate::Recursive;
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
@@ -296,20 +303,19 @@ fn settle_anchor(anchor: ProcessId, read: (Resolved<OrderKey>, UnknownCause)) ->
 /// `anchor`'s order key for a walk from it, read after the snapshot: also the proof that it still
 /// holds its pid, so a walk takes its edges from the snapshot only for a root that held the pid
 /// throughout. On Windows one read serves as both; elsewhere the pid is proved, then keyed (see
-/// [`ProcessId::anchor_order_key_with`] and the module docs). Pass the key to
-/// [`descendants_from_key`] or [`children_of_from_key`].
+/// [`ProcessId::anchor_order_key_with`] and the module docs). [`walk_from`] is its only caller.
 ///
 /// # Errors
 ///
 /// As [`settle_anchor`]: `Ok(None)` when `anchor` is gone or another process holds its pid now,
 /// [`Error::Unassessable`] (or `Unsupported`) when that cannot be told.
-pub(crate) fn anchor(kernel: &dyn Kernel, anchor: ProcessId) -> Result<Option<OrderKey>, Error> {
+fn anchor(kernel: &dyn Kernel, anchor: ProcessId) -> Result<Option<OrderKey>, Error> {
     settle_anchor(anchor, anchor.anchor_order_key_with(kernel))
 }
 
 /// Live descendants of `root`, whose order key is `root_key`: the pure filter wired to `kernel`'s
 /// `ProcessId::of_ordered_with` resolver and the per-OS `ALLOW_EQUAL_ORDER` rule.
-pub(crate) fn descendants_from_key(
+fn descendants_from_key(
     kernel: &dyn Kernel,
     root: ProcessId,
     root_key: OrderKey,
@@ -337,17 +343,16 @@ pub(crate) fn children_of_with(
     resolve: impl Fn(RawPid, ProcessId) -> Resolution,
 ) -> Walk {
     let mut walk = Walk::default();
-    let mut seen = std::collections::HashSet::new();
+    // Each pid is resolved once, so a duplicate edge cannot list a pid twice or be read differently.
+    let mut resolved = std::collections::HashSet::new();
     for &(pid, ppid) in parents {
-        if ppid != parent.pid() || pid == ppid {
+        if ppid != parent.pid() || pid == ppid || !resolved.insert(pid) {
             continue;
         }
         let read = match resolve(pid, parent) {
             Ok(read) => read,
             Err(why) => {
-                if !walk.unassessed.iter().any(|&(listed, _)| listed == pid) {
-                    walk.unassessed.push((pid, why));
-                }
+                walk.unassessed.push((pid, why));
                 None
             }
         };
@@ -359,16 +364,14 @@ pub(crate) fn children_of_with(
             log::debug!("treewalk: dropping impostor pid {pid} (recycled pid / stale ppid)");
             continue;
         }
-        if seen.insert(pid) {
-            walk.members.push(id);
-        }
+        walk.members.push(id);
     }
     walk
 }
 
 /// Live one-level children of `parent`, whose order key is `parent_key`: the pure filter wired to
 /// `kernel`'s `ProcessId::of_ordered_with` and the per-OS `ALLOW_EQUAL_ORDER` rule.
-pub(crate) fn children_of_from_key(
+fn children_of_from_key(
     kernel: &dyn Kernel,
     parent: ProcessId,
     parent_key: OrderKey,
@@ -377,6 +380,36 @@ pub(crate) fn children_of_from_key(
     children_of_with(parent, parent_key, parents, ALLOW_EQUAL_ORDER, |pid, parent| {
         resolve_or_drop(kernel, pid, parent)
     })
+}
+
+/// The walk from `root` over `parents`, a snapshot taken BEFORE this call: the one entry to the
+/// live walks. `depth` is `Recursive::No` for `root`'s direct children, `Yes` for its whole subtree.
+///
+/// The anchor rule is here, so no caller can walk from a root it has not proved: `root`'s order key
+/// is read now ([`anchor`], also its proof that it still holds its pid), and `Ok(None)` means it is
+/// gone or another process holds its pid, so there is nothing to walk.
+///
+/// # Errors
+///
+/// [`Error::Unassessable`] (or `Unsupported`) when the anchor's key cannot be told, and when `root`
+/// is live at the anchor but has no row in `parents`: it held its pid throughout, so the snapshot
+/// omitted it, and an empty walk would let a caller kill it and leave its descendants running.
+pub(crate) fn walk_from(
+    kernel: &dyn Kernel,
+    root: ProcessId,
+    parents: &[(RawPid, RawPid)],
+    depth: Recursive,
+) -> Result<Option<Walk>, Error> {
+    let Some(root_key) = anchor(kernel, root)? else {
+        return Ok(None);
+    };
+    if !parents.iter().any(|&(pid, _)| pid == root.pid()) {
+        return Err(root.absent_from_snapshot());
+    }
+    Ok(Some(match depth {
+        Recursive::No => children_of_from_key(kernel, root, root_key, parents),
+        Recursive::Yes => descendants_from_key(kernel, root, root_key, parents),
+    }))
 }
 
 /// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
@@ -566,7 +599,8 @@ pub(crate) fn unqueryable_read(pid: RawPid, cause: UnknownCause) -> Error {
 /// # Errors
 ///
 /// [`Error::Unassessable`] when the process snapshot cannot be taken, or `root`'s
-/// identity or order key cannot be read after it (a root that exists but cannot be queried).
+/// identity or order key cannot be read after it (a root that exists but cannot be queried), or
+/// `root` is live but has no row in the snapshot (see [`walk_from`]).
 /// Nothing is killed, the root included: killing the root first would reparent its descendants
 /// out of the ppid walk, so a retry could no longer find them. A root that no longer holds its pid
 /// is `Ok`, with nothing killed.
@@ -581,7 +615,11 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Er
     #[cfg(not(test))]
     let skip_root = false;
     let parents = crate::containment::enumerate::process_parents(kernel)?;
-    let Some(root_key) = anchor(kernel, root)? else {
+    let Some(Walk {
+        members: descendants,
+        unassessed,
+    }) = walk_from(kernel, root, &parents, Recursive::Yes)?
+    else {
         return Ok(true);
     };
     #[cfg(test)]
@@ -591,10 +629,6 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Er
     if fault::take_force_incomplete() {
         complete = false;
     }
-    let Walk {
-        members: descendants,
-        unassessed,
-    } = descendants_from_key(kernel, root, root_key, &parents);
     // A candidate that could not be read is not killed, and nor is anything under it: not complete.
     complete &= unassessed.is_empty();
     #[cfg(unix)]
@@ -660,7 +694,7 @@ pub(crate) mod fault {
     }
 
     /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill` and
-    /// `terminate` once `anchor` lets them walk, a macOS fd marker's channel 1+2) records
+    /// `terminate` once `walk_from` lets them walk, a macOS fd marker's channel 1+2) records
     /// that pid, so a test can tell a walk ran without a process having to die. The walk itself
     /// still runs.
     #[cfg(unix)]
@@ -728,7 +762,10 @@ pub(crate) mod fault {
 ///
 /// Unix: the same snapshot + identity walk with SIGTERM (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
-/// reaches the whole genuine tree just like `hard_kill`, and errors as it does (`# Errors`).
+/// reaches the whole genuine tree that the walk could assess, and errors as `hard_kill` does
+/// (`# Errors`). Unlike `hard_kill` it does not report a candidate the walk could not assess
+/// ([`Walk::unassessed`]): that candidate and its subtree are warned of and not signalled, and
+/// the result is still `Ok`.
 ///
 /// Windows: send `CTRL_BREAK_EVENT` to the root's process group (the root was
 /// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
@@ -747,13 +784,13 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
     #[cfg(unix)]
     {
         let parents = crate::containment::enumerate::process_parents(kernel)?;
-        let Some(root_key) = anchor(kernel, root)? else {
+        let Some(walk) = walk_from(kernel, root, &parents, Recursive::Yes)? else {
             return Ok(());
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
         // Best effort by contract: a candidate that could not be read was warned and is not signalled.
-        let descendants = descendants_from_key(kernel, root, root_key, &parents).members;
+        let descendants = walk.members;
         let _ = kill_by_identity(kernel, root, Signal::SIGTERM);
         for id in descendants {
             let _ = kill_by_identity(kernel, id, Signal::SIGTERM);

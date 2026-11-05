@@ -10,7 +10,6 @@ use std::os::fd::OwnedFd;
 use rustix::io::Errno;
 use rustix::process::Pid;
 
-use super::Walk;
 use crate::error::Error;
 use crate::identity::{FakeKernel, HostKernel, Kernel, Key, OrderKey, ProcessId};
 use crate::Recursive;
@@ -54,19 +53,15 @@ fn table() -> FakeKernel<'static> {
         .on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, CHILD_START)))
 }
 
-const EDGES: [(u32, u32); 1] = [(CHILD, ROOT)];
+/// The snapshot: the root has a row, as a live root does.
+const EDGES: [(u32, u32); 2] = [(ROOT, 1), (CHILD, ROOT)];
 
-/// The walk from `root` as the walks take it: the anchor's one read, then the walk from its key.
-/// Empty, not an error, for a root that is gone; an error for one that cannot be read.
-pub(super) fn walk(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Walk, Error> {
-    Ok(super::anchor(kernel, root)?
-        .map(|key| super::descendants_from_key(kernel, root, key, edges))
-        .unwrap_or_default())
-}
-
-/// The members of [`walk`].
+/// The members of the walk from `root`, whole subtree. Empty, not an error, for a root that is
+/// gone; an error for one that cannot be read.
 pub(super) fn descendants(kernel: &dyn Kernel, root: ProcessId, edges: &[(u32, u32)]) -> Result<Vec<ProcessId>, Error> {
-    walk(kernel, root, edges).map(|walk| walk.members)
+    Ok(super::walk_from(kernel, root, edges, Recursive::Yes)?
+        .unwrap_or_default()
+        .members)
 }
 
 /// [`descendants`], one level.
@@ -75,9 +70,9 @@ pub(super) fn children_of(
     parent: ProcessId,
     edges: &[(u32, u32)],
 ) -> Result<Vec<ProcessId>, Error> {
-    Ok(super::anchor(kernel, parent)?
-        .map(|key| super::children_of_from_key(kernel, parent, key, edges).members)
-        .unwrap_or_default())
+    Ok(super::walk_from(kernel, parent, edges, Recursive::No)?
+        .unwrap_or_default()
+        .members)
 }
 
 /// The resolver hands the filter the child's identity (its inode) and its key (its start time), each
@@ -160,7 +155,7 @@ fn table_with_a_grandchild() -> FakeKernel<'static> {
         .on_read(&format!("{GRAND}/stat"), Ok(&stat(GRAND, CHILD, GRAND_START)))
 }
 
-const EDGES_WITH_A_GRANDCHILD: [(u32, u32); 2] = [(CHILD, ROOT), (GRAND, CHILD)];
+const EDGES_WITH_A_GRANDCHILD: [(u32, u32); 3] = [(ROOT, 1), (CHILD, ROOT), (GRAND, CHILD)];
 
 /// The child's `ppid` names the root's number, and only the root's number: after the child's read
 /// the number may belong to a process that reaped the root and took it. So the root is proved again
@@ -193,7 +188,7 @@ fn a_grandchild_read_after_its_accepted_parents_number_changed_hands_is_dropped(
 }
 
 /// The parent-order rule is off here: `GRAND` started after the root but before its listed parent
-/// `CHILD`, and is kept, as `descendants_from_key` passes `ORDER_AFTER_PARENT`. Mutant:
+/// `CHILD`, and is kept, as `walk_from` passes `ORDER_AFTER_PARENT`. Mutant:
 /// `ORDER_AFTER_PARENT` is true off Windows.
 #[skuld::test]
 fn a_grandchild_that_started_before_its_listed_parent_is_kept_off_windows() {
@@ -223,7 +218,12 @@ fn a_child_whose_parent_cannot_be_proved_again_is_dropped() {
 #[skuld::test]
 fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is_not() {
     let unproved = || table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
-    let found = walk(&unproved(), root(), &EDGES).unwrap();
+    let walk = |kernel: &FakeKernel, depth| {
+        super::walk_from(kernel, root(), &EDGES, depth)
+            .unwrap()
+            .expect("the root is live")
+    };
+    let found = walk(&unproved(), Recursive::Yes);
     let [(pid, Error::Unassessable { detail, .. })] = &found.unassessed[..] else {
         panic!("expected one Unassessable entry, got {:?}", found.unassessed);
     };
@@ -233,15 +233,16 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
         "{detail}"
     );
     assert!(found.members.is_empty());
-    let key = super::anchor(&unproved(), root()).unwrap().expect("the root reads");
-    let children = super::children_of_from_key(&unproved(), root(), key, &EDGES);
+    let children = walk(&unproved(), Recursive::No);
     assert_eq!(children.unassessed.len(), 1, "{:?}", children.unassessed);
 
     let gone = table()
         .on_pidfd_open(CHILD, Err(Errno::SRCH))
         .on_read(&format!("{CHILD}/stat"), Err(libc::ENOENT));
-    let found = walk(&gone, root(), &EDGES).unwrap();
-    assert!(found.members.is_empty() && found.unassessed.is_empty(), "{found:?}");
+    for depth in [Recursive::Yes, Recursive::No] {
+        let found = walk(&gone, depth);
+        assert!(found.members.is_empty() && found.unassessed.is_empty(), "{found:?}");
+    }
 }
 
 /// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
@@ -379,6 +380,33 @@ fn a_root_absent_from_the_snapshot_is_unassessable_even_if_it_exits_after_its_ke
             other => panic!("expected Unassessable, got {other:?}"),
         }
     }
+}
+
+/// A root that is live at its key read and has no row in the snapshot is an error from every walk
+/// (`hard_kill` and `terminate` too, not only `children`): it held its pid throughout, so its row was
+/// omitted, and a walk that found no children would let a caller kill it and leave them running.
+/// Nothing is signalled and no walk begins. `ROOT`'s number is not in the host's table. Mutant: "a
+/// root with no row walks nothing" (`hard_kill` returns `Ok(true)` with nothing killed).
+#[skuld::test]
+fn a_live_root_with_no_row_in_the_snapshot_is_unassessable_from_every_walk_and_nothing_is_killed() {
+    let sends = crate::send_log::Capture::start();
+    let walks = super::fault::record_walks();
+    let results = [
+        super::hard_kill(&table(), root()).map(|_| ()),
+        super::terminate(&table(), root()),
+        root().children_with(&table(), Recursive::No).map(|_| ()),
+        root().children_with(&table(), Recursive::Yes).map(|_| ()),
+    ];
+    for result in results {
+        match result {
+            Err(Error::Unassessable { detail, .. }) => {
+                assert!(detail.contains(&format!("pid {ROOT} is live but absent")), "{detail}");
+            }
+            other => panic!("expected Unassessable, got {other:?}"),
+        }
+    }
+    assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk began");
+    assert!(sends.by_identity().is_empty(), "{:?}", sends.by_identity());
 }
 
 // The kill goes through the proved pidfd =====

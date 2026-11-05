@@ -1028,7 +1028,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 /// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
 /// top of `enumerate/macos.rs`), NOT by naming an unkillable real pid as `root`: an unprivileged
 /// but real identity like pid 1 cannot be used as `root` here, because the sweep's
-/// `treewalk::descendants_from_key` would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
+/// `treewalk::walk_from` would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
 /// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
 /// `inert_root()` and `pgid: None` keep every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
@@ -1049,6 +1049,47 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
         result.is_err(),
         "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
     );
+}
+
+/// A pass whose root's identity cannot be read (`identity::unreadable` refuses its by-pid read, as
+/// the OS can) skips the walk channel and is `incomplete`: not observed is not observed absent. The
+/// root is already in `seen`, so the pass signals no one, and the walk is the only source of
+/// `incomplete`. The warn names the marker handle. Mutant: the unreadable root is `Ok(None)` (a gone
+/// root), which walks nothing and reports a complete pass.
+#[skuld::test]
+fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
+    let _serialize = test_spawn_lock();
+    crate::log_capture::install();
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let prepared = install_on(&mut cmd, &[]).expect("install");
+    drop(cmd);
+    let root = inert_root();
+    let marker = super::Marker::new(prepared, root, None);
+    let (_kernel, _unreadable) = crate::identity::unreadable(root.pid());
+
+    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
+    let mut group_result: Result<(), crate::error::Error> = Ok(());
+    let mut incomplete = false;
+    let mark = crate::log_capture::mark();
+    let progressed = marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut seen,
+        &mut group_result,
+        &mut incomplete,
+        true,
+        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+    );
+
+    assert!(incomplete, "an unreadable root is not a complete walk");
+    assert!(!progressed, "nothing was signalled");
+    let warned = crate::log_capture::records_since_on_current_thread(
+        mark,
+        &format!(
+            "fd marker {:#x}: the root's descendants could not be walked",
+            marker.handle
+        ),
+    );
+    assert_eq!(warned.len(), 1, "{warned:?}");
 }
 
 use super::is_teardown_mechanism_failure;

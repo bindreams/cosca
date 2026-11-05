@@ -1364,7 +1364,7 @@ impl Marker {
 
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
         // ppid-walk descendants NOT already signalled this sweep (need THIS pass's snapshot;
-        // skipped when blind, since there is nothing to walk). `descendants` keeps only
+        // skipped when blind, since there is nothing to walk). The walk keeps only
         // processes whose order key orders at or after the root's.
         //
         // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
@@ -1382,9 +1382,8 @@ impl Marker {
             }
             if !blind {
                 let kernel = &crate::identity::HostKernel;
-                match crate::containment::treewalk::anchor(kernel, root) {
-                    Ok(Some(root_key)) => {
-                        let walk = crate::containment::treewalk::descendants_from_key(kernel, root, root_key, &parents);
+                match crate::containment::treewalk::walk_from(kernel, root, &parents, crate::Recursive::Yes) {
+                    Ok(Some(walk)) => {
                         for id in walk.members {
                             if seen.insert(id) {
                                 new_walk.push(id);

@@ -88,7 +88,7 @@ impl ProcessId {
     /// in it: it held its pid throughout, so the row was omitted. Another read of it would only
     /// ask whether it has exited since, which does not explain the missing row (and, on Windows,
     /// would turn an exit into an empty answer with its children still running).
-    fn absent_from_snapshot(&self) -> Error {
+    pub(crate) fn absent_from_snapshot(&self) -> Error {
         Error::Unassessable {
             detail: format!("pid {} is live but absent from the process snapshot", self.pid()),
             source: None,
@@ -117,15 +117,8 @@ impl ProcessId {
     pub(crate) fn children_with(&self, kernel: &dyn Kernel, recursive: Recursive) -> Result<Vec<ProcessId>, Error> {
         // Snapshot first, then the anchor (see `parent`), whose one read is also the key.
         let parents = crate::containment::enumerate::process_parents(kernel)?;
-        let Some(key) = crate::containment::treewalk::anchor(kernel, *self)? else {
+        let Some(walk) = crate::containment::treewalk::walk_from(kernel, *self, &parents, recursive)? else {
             return Ok(Vec::new());
-        };
-        if !parents.iter().any(|&(pid, _)| pid == self.pid()) {
-            return Err(self.absent_from_snapshot());
-        }
-        let walk = match recursive {
-            Recursive::No => crate::containment::treewalk::children_of_from_key(kernel, *self, key, &parents),
-            Recursive::Yes => crate::containment::treewalk::descendants_from_key(kernel, *self, key, &parents),
         };
         // A candidate the walk could not read may be a child: the list would be short, not empty.
         match walk.unassessed.into_iter().next() {
