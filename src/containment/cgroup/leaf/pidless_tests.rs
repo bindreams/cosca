@@ -7,10 +7,11 @@ use crate::child::owned::owned_tests::teardown_lines::{outcome, rows};
 use crate::child::owned::teardown::Disposition;
 
 /// `Ended` promises the child is reaped or will be, so a teardown that left it uncollected (a kill
-/// refused and the child running, a look or a wait that failed) is not `Ended`: it is out of reach,
+/// refused and the child running, a look or a wait that failed) is not `Ended`: it is `Uncollected`,
 /// and says what the teardown found, as the one warn the caller logs. A collected child is `Ended`.
 ///
-/// Mutant: every teardown of a child that never named itself answers `Ended`.
+/// Mutants: every teardown of a child that never named itself answers `Ended`; an uncollected one
+/// answers `OutOfReach`, which says it is out of its leaf's reach.
 #[skuld::test]
 fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() {
     for row in rows() {
@@ -19,7 +20,7 @@ fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() 
         if row.uncollected {
             assert_eq!(
                 answer,
-                Abandoned::OutOfReach(row.leave.clone()),
+                Abandoned::Uncollected(row.leave.clone()),
                 "{:?} {:?}",
                 row.kill,
                 row.found

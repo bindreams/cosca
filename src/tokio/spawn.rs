@@ -1083,7 +1083,10 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
     use crate::containment::AbandonedChild;
 
     match child {
-        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped | AbandonedChild::OutOfReach(_) => {
+        AbandonedChild::Ended
+        | AbandonedChild::MaybeUnreaped
+        | AbandonedChild::OutOfReach(_)
+        | AbandonedChild::Uncollected(_) => {
             debug_assert!(false, "only a Linux cgroup leaf abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
@@ -1106,12 +1109,21 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// `ended`: the handshake killed and reaped the child through its pidfd, or found it reaped. The
 /// child is then not at risk, so its fate is logged at `debug`; only an `OutOfReach` leaf still
 /// warns, of a descendant outside it. The fate of an elevation `front` the leaf found is noted on
-/// the error instead, as the spawn's other failures note it.
+/// the error instead, as the spawn's other failures note it. A child the handshake's pidfd reached
+/// and its teardown left uncollected says so, in the teardown's clause under the failed spawn's
+/// label, whatever `ended` says.
 fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
     let consequence = match (child, ended) {
         (AbandonedChild::Front(_) | AbandonedChild::Ended, _) => return,
+        (AbandonedChild::Uncollected(clause), _) => {
+            log::warn!(
+                "tokio spawn failed ({error}); {}: {clause}",
+                crate::containment::dispatch::TeardownCaller::FailedSpawn.label()
+            );
+            return;
+        }
         (AbandonedChild::OutOfReach(why), Some(fate)) => {
             log::warn!(
                 "tokio spawn failed ({error}); {fate}, and its cgroup v2 leaf's abandonment says: {why}; a \
@@ -1221,7 +1233,9 @@ fn abandoned_after_handshake(
     failure.answered_by(|error| match abandoned {
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
-        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
+        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) | AbandonedChild::Uncollected(_) => {
+            (error, ChildFate::Running { id: None })
+        }
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }

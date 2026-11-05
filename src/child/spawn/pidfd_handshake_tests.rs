@@ -1740,7 +1740,7 @@ fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name()
     let pid = cat.id();
     let mark = crate::log_capture::mark();
 
-    let fate = super::end_through_pidfd(Some(pid), pidfd, None, &mut crate::child::spawn::Diagnosis::default());
+    let fate = super::end_through_pidfd(Some(pid), pidfd, None, &mut crate::child::spawn::Diagnosis::default()).fate;
 
     assert_eq!(fate, ChildFate::Reaped);
     assert_eq!(

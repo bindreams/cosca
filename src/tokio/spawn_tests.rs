@@ -473,6 +473,45 @@ fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
     );
 }
 
+/// A child that never named itself, which the handshake's pidfd reached and its teardown left
+/// uncollected (`Uncollected`), is worded as that: the teardown's clause under the failed spawn's
+/// label, one warn. It is not worded as a child out of its cgroup v2 leaf's reach, whatever the
+/// failure was.
+///
+/// Mutant: `Uncollected` is worded as `OutOfReach`, with its hedge about the leaf.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach() {
+    use crate::child::spawn::failure::SpawnFailure;
+    use crate::containment::AbandonedChild;
+
+    crate::log_capture::install();
+    let marker = "cosca-abandoned-uncollected-probe-4e19";
+    let clause = "child could not be terminated (Operation not permitted); leaving it running";
+    let error = || Error::Io(std::io::Error::other(marker));
+    let abandon = |failure: SpawnFailure| {
+        let mark = crate::log_capture::mark();
+        let _ = super::abandoned_after_handshake(AbandonedChild::Uncollected(clause.into()), failure, None, false);
+        crate::log_capture::records_since_on_current_thread(mark, marker)
+    };
+    for failure in [
+        SpawnFailure::NotStartedUnreaped(error()),
+        SpawnFailure::NotStarted(error()),
+    ] {
+        let said = abandon(failure);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+        assert!(
+            said[0].1.contains(&format!("teardown after a failed spawn: {clause}")),
+            "{said:?}"
+        );
+        assert!(
+            !said[0].1.contains("cgroup v2 leaf") && !said[0].1.contains("nothing can reach it"),
+            "{said:?}"
+        );
+    }
+}
+
 /// When the handshake already killed and reaped the child, the abandonment does not say it is left
 /// running or unreaped: it states the handshake's answer at `debug`. Only an `OutOfReach`
 /// abandonment still warns, of a descendant outside the leaf, and says the child was reaped.

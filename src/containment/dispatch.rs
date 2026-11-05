@@ -160,6 +160,7 @@ impl Prepared {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
+                Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
@@ -209,6 +210,9 @@ pub(crate) enum AbandonedChild {
     /// It may be running where nothing can reach it: its leaf does not hold it, and it sent no
     /// handle on itself or refused its kill, as the text says.
     OutOfReach(String),
+    /// It never named itself, and the handshake's pidfd reached it, but its teardown left it
+    /// uncollected. The text is the teardown's clause, for the one warn.
+    Uncollected(String),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

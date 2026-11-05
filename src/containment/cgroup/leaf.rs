@@ -922,8 +922,15 @@ impl CgroupLeaf {
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            if let Abandoned::OutOfReach(why) = self.abandon_before_verdict(false, None, warn) {
-                log::warn!("cgroup v2: {why}");
+            match self.abandon_before_verdict(false, None, warn) {
+                Abandoned::OutOfReach(why) => log::warn!("cgroup v2: {why}"),
+                Abandoned::Uncollected(clause) => {
+                    log::warn!(
+                        "{}: {clause}",
+                        crate::containment::dispatch::TeardownCaller::FailedSpawn.label()
+                    );
+                }
+                Abandoned::Ended | Abandoned::MaybeUnreaped | Abandoned::Front(_) => {}
             }
         }
         if std::mem::replace(&mut self.abandoned, true) {
@@ -1031,9 +1038,12 @@ pub(crate) enum Abandoned {
     /// first send, before `exec` and outside the leaf — but that nothing here holds the pid to reap.
     MaybeUnreaped,
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
-    /// signal, and its leaf does not hold it; or its teardown left it uncollected. Says which, for
-    /// the caller's one warn.
+    /// signal, and its leaf does not hold it. Says which, for the caller's one warn.
     OutOfReach(String),
+    /// The child never named itself, and the handshake's pidfd reached it, but its teardown left it
+    /// uncollected (its kill refused and it running, a wait or look that failed). Says what the
+    /// teardown found: its clause, for the caller's one warn, which the failed spawn's label leads.
+    Uncollected(String),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
     Front(crate::child::spawn::FrontFate),
@@ -1043,7 +1053,7 @@ pub(crate) enum Abandoned {
 impl Abandoned {
     /// The answer for a child that never named itself, torn down through the handshake's pidfd as
     /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
-    /// a failed spawn's. One it left uncollected is [`OutOfReach`](Abandoned::OutOfReach), with the
+    /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
     /// clause as the one warn the caller logs.
     fn after_pidless_teardown(torn: &mut crate::child::owned::teardown::TeardownOutcome) -> Abandoned {
         if torn.uncollected {
@@ -1051,7 +1061,7 @@ impl Abandoned {
             let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
             let left = torn.take_warn(label);
             debug_assert!(left.is_some(), "the clause of an uncollected child is a warn");
-            return Abandoned::OutOfReach(left.unwrap_or_else(|| "its teardown left it uncollected".to_owned()));
+            return Abandoned::Uncollected(left.unwrap_or_else(|| "its teardown left it uncollected".to_owned()));
         }
         torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
         Abandoned::Ended

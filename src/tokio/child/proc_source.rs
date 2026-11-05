@@ -12,7 +12,7 @@ use crate::child::owned::teardown::TeardownOutcome;
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
-use crate::child::spawn::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
+use crate::child::spawn::held_teardown::{assert_own_pidfd_waited, tear_down_held, tear_down_pidfd, HeldTeardown};
 use crate::child::spawn::Diagnosis;
 use crate::containment::dispatch::TeardownCaller;
 use crate::error::{ChildFate, Error};
@@ -1545,9 +1545,8 @@ impl ProcSource {
         }
     }
 
-    /// What a refused teardown kill (`e`; a setuid child answers `EPERM`) leaves to do, for the two
-    /// teardowns that kill ([`reap_now`](ProcSource::reap_now),
-    /// [`teardown_through_pidfd`](ProcSource::teardown_through_pidfd)): forget tokio's handle for a
+    /// What a refused teardown kill (`e`; a setuid child answers `EPERM`) leaves to do, for
+    /// [`reap_now`](ProcSource::reap_now): forget tokio's handle for a
     /// child it shows reaped elsewhere or cannot answer for, since its drop reaps by pid; tear down
     /// again every child not shown gone (Linux: [`tear_down_forgotten`](ProcSource::tear_down_forgotten);
     /// elsewhere: release the rest to tokio's orphan queue); and warn once, with `why`, what became
@@ -1555,8 +1554,13 @@ impl ProcSource {
     /// strand a child that is ours. Consumes the backend.
     #[cfg_attr(not(unix), allow(unused_mut, reason = "only Unix forgets through `&mut self`"))]
     fn after_refused_kill(mut self, pid: u32, id: Option<ProcessId>, e: &Error, why: &mut Diagnosis) -> ChildFate {
+        // Whether its handle's look just showed the child ours: no look on its pidfd failed yet.
+        #[cfg(target_os = "linux")]
+        let shown_ours = matches!(self, ProcSource::Tokio { .. });
         #[cfg(unix)]
         let forgotten = self.forget_if_foreign_quietly(id);
+        #[cfg(target_os = "linux")]
+        let shown_ours = shown_ours && forgotten.is_none();
         #[cfg(not(unix))]
         let forgotten: Option<Forgetting> = None;
         let after = match forgotten {
@@ -1586,6 +1590,10 @@ impl ProcSource {
             matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
             "the teardown kill of an owned child failed: {e}"
         );
+        #[cfg(target_os = "linux")]
+        if let (true, Refused::TornDown(torn_down)) = (shown_ours, &after) {
+            assert_own_pidfd_waited(&torn_down.outcome);
+        }
         refused_kill_answer(&after, id)
     }
 
@@ -1602,23 +1610,16 @@ impl ProcSource {
     /// Linux teardown of a spawn whose identity check could not answer: tokio's `Child` is
     /// forgotten (its drop would reap a pid that is already collected), and the child is torn down
     /// through its pidfd, which pins it whatever any peek said, as every failed spawn's held child
-    /// is ([`tear_down_pidfd`]). Consumes the backend. A refused kill is handled as in
-    /// [`reap_now`](ProcSource::reap_now). **Invariant:** no `wait()` future for this child is in
-    /// flight.
+    /// is ([`tear_down_pidfd`]): that kills it, and answers a refused kill itself. Consumes the
+    /// backend. **Invariant:** no `wait()` future for this child is in flight.
     ///
     /// `why`: what the spawn's identity check found, if that is why the child is torn down; the
-    /// teardown's one warn carries it, and the forget's leak.
+    /// teardown's one warn carries it, and the forget's leak. The warn is the teardown's clause,
+    /// which says what became of the child.
     #[cfg(target_os = "linux")]
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("teardown_through_pidfd");
-        let killed = self.teardown_kill();
-        if let Err(e) = &killed {
-            return self.after_refused_kill(pid, id, e, why);
-        }
-        // A fixture only the kill above would end is released here.
-        #[cfg(test)]
-        crate::child::spawn::fault::run_between_kill_and_wait();
-        self.forget_deferring("is ended through its pidfd", Forgotten::Unproven, why);
+        self.forget_deferring(Forgotten::Unproven.why(), Forgotten::Unproven, why);
         let mut torn = tear_down_pidfd(
             Some(pid),
             self.take_forgotten_pidfd(),

@@ -220,7 +220,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         uncollected: true,
                         look: None,
                         clause: None,
-                        refusal: None,
                     },
                 )
             }

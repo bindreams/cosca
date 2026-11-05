@@ -529,6 +529,18 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
             && warns[0].1.contains("leaks"),
         "the failed peek is warned once, naming its own error and the leak: {warns:?}"
     );
+    // The forget's note says only what is known before the teardown (the child cannot be shown ours);
+    // what the teardown did is its own clause, which a clean one logs at `debug`.
+    assert!(
+        warns[0]
+            .1
+            .contains("cannot be shown to be ours; forgetting tokio's handle for it leaks"),
+        "the warn says why the child was forgotten: {warns:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "teardown after a failed spawn: teardown of child"),
+        "the teardown says what it did under the failed spawn's name"
+    );
     // The child was killed and reaped through its pidfd, not reaped by someone else.
     assert!(
         !warns[0].1.contains("reaped by someone else"),
@@ -563,28 +575,26 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 /// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
 /// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
 /// warns with the foreign-reap text; the refused kill and the forget warn separately.
+///
+/// This is `reap_now`'s refused-kill arm (a forced attach failure). A failed identity peek's arm
+/// (`teardown_through_pidfd`) sends no kill of its own, so it has no refused-kill row: its kill is
+/// `tear_down_pidfd`'s, whose refusal the setuid row in `tokio::spawn_tests` and `OwnedChild`'s
+/// `teardown_look` rows catch.
 #[cfg(target_os = "linux")]
-fn refused_kill_teardown(
-    attach_failure: bool,
-    armed_in_hook: Option<fn() -> Box<dyn std::any::Any>>,
-    forgotten_now: bool,
-) {
+#[skuld::test]
+async fn reap_now_after_a_refused_kill_on_a_live_child_reaps_through_the_pidfd() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::child::spawn::fault;
 
+    crate::tokio::test_runtime::assert_current_thread();
     let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
-    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
-        let (slot, armed) = (Rc::clone(&slot), Rc::clone(&armed));
-        move || {
-            *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
-            // Armed here, not before `spawn()`: the handshake's own peeks run first.
-            *armed.borrow_mut() = armed_in_hook.map(|arm| arm());
-        }
+        let slot = Rc::clone(&slot);
+        move || *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()))
     });
-    fault::set_force_attach_failure(attach_failure);
+    fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as("teardown refused", std::io::ErrorKind::PermissionDenied);
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
@@ -599,35 +609,18 @@ fn refused_kill_teardown(
     let err = cmd.spawn().err();
 
     fault::set_force_attach_failure(false);
-    drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
-    // A child the refused kill's second look forgets (it cannot be shown ours) says why, then the leak.
-    let said = if forgotten_now {
-        "teardown refused); the child cannot be shown to be ours"
-    } else {
-        "teardown refused); forgetting tokio's handle for it leaks"
-    };
     assert!(
-        crate::log_capture::contains_since(mark, said),
-        "the warn must say the kill was refused, then what became of the forget: {said}"
+        crate::log_capture::contains_since(mark, "teardown refused); forgetting tokio's handle for it leaks"),
+        "the warn must say the kill was refused, then what became of the forget"
     );
-    assert!(
-        crate::log_capture::contains_since(mark, "forgetting tokio's handle for it leaks"),
-        "the warn must say what forgetting tokio's handle leaked"
-    );
-    // The identity check that failed (when one did), the refused kill and the forget are one event:
-    // one warn, which carries the diagnosis and the leak.
+    // The refused kill and the forget are one event: one warn, which carries the leak.
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect();
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("leaks"), "{warns:?}");
-    assert_eq!(
-        warns[0].1.contains("could not be checked against its handle"),
-        armed_in_hook.is_some(),
-        "the identity diagnosis is in the one warn, and only when the check failed: {warns:?}"
-    );
     assert!(
         !crate::log_capture::contains_since(mark, "was reaped by someone else"),
         "the child was not reaped by someone else"
@@ -650,55 +643,4 @@ fn refused_kill_teardown(
     );
     let witness = slot.borrow_mut().take().expect("the hook ran");
     assert!(witness.reap().is_err(), "the child is reaped already");
-}
-
-/// `reap_now`'s refused-kill arm (a forced attach failure).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn reap_now_after_a_refused_kill_on_a_live_child_reaps_through_the_pidfd() {
-    crate::tokio::test_runtime::assert_current_thread();
-    refused_kill_teardown(true, None, false);
-}
-
-/// `teardown_through_pidfd`'s refused-kill arm (a failed identity peek).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn a_failed_identity_peek_with_a_refused_kill_reaps_through_the_pidfd() {
-    use crate::wait::exit_only::seams::force_peeks;
-
-    crate::tokio::test_runtime::assert_current_thread();
-    refused_kill_teardown(
-        false,
-        Some(|| {
-            Box::new(force_peeks([Err(std::io::Error::other(
-                "forced identity-check failure 77a1",
-            ))]))
-        }),
-        false,
-    );
-}
-
-/// As above, and the refused kill's own look at the handle cannot answer either: the child is not
-/// shown to be ours, so tokio's `Child` is forgotten in that very call, and the child, which the pidfd
-/// still pins, is torn down through it all the same, as one forgotten earlier is. The warn says why
-/// it was forgotten.
-///
-/// Mutant: a child forgotten in the refused kill's own call is left running (no teardown reap is
-/// recorded).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn a_refused_kill_of_a_child_its_handle_cannot_answer_for_is_torn_down_through_its_pidfd() {
-    use crate::wait::exit_only::seams::force_peeks;
-
-    crate::tokio::test_runtime::assert_current_thread();
-    refused_kill_teardown(
-        false,
-        Some(|| {
-            Box::new(force_peeks([
-                Err(std::io::Error::other("forced identity-check failure 77a1")),
-                Err(std::io::Error::other("forced second look failure 77a2")),
-            ]))
-        }),
-        true,
-    );
 }

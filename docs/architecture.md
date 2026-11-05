@@ -94,11 +94,12 @@ In order:
      `Ok(child)` arms are `Spawned` for tokio's `Child`: `reap_unexecuted` kills through the
      pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
      tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
-     `waitpid`s by pid. The async non-front identity and attach arms
-     (`ProcSource::reap_now_noting` and `teardown_through_pidfd`) make the first kill the
-     backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, and so does
-     `teardown_through_pidfd` after any kill, once tokio's `Child` is forgotten;
-     `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid. Apart from these,
+     `waitpid`s by pid. The async non-front attach arm and the
+     identity arms that are not unknown (`ProcSource::reap_now_noting`) make the first kill the
+     backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, once tokio's
+     `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
+     The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
+     to `tear_down`, sending no kill of its own. Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
