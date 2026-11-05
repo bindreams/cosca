@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved, UnknownCause};
+use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -59,12 +59,12 @@ impl ProcessId {
             }
         };
         let key = match self.order_key_with(kernel) {
-            Resolved::Found(key) => key,
-            Resolved::Gone => return Ok(None),
-            Resolved::Unknown => {
+            (Resolved::Found(key), _) => key,
+            (Resolved::Gone, _) => return Ok(None),
+            (Resolved::Unknown, cause) => {
                 return Err(crate::containment::treewalk::unqueryable(
                     &format!("pid {}", self.pid()),
-                    UnknownCause::default(),
+                    cause,
                 ));
             }
         };
@@ -124,10 +124,10 @@ impl ProcessId {
             self.absent_from_snapshot(kernel)?;
             return Ok(Vec::new());
         }
-        Ok(match recursive {
+        match recursive {
             Recursive::No => crate::containment::treewalk::children_of(kernel, *self, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants(kernel, *self, &parents),
-        })
+        }
     }
 }
 

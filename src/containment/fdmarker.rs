@@ -1381,9 +1381,24 @@ impl Marker {
                 new_walk.push(root);
             }
             if !blind {
-                for id in crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
-                    if seen.insert(id) {
-                        new_walk.push(id);
+                match crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
+                    Ok(found) => {
+                        for id in found {
+                            if seen.insert(id) {
+                                new_walk.push(id);
+                            }
+                        }
+                    }
+                    // Not observed is not observed absent: like a blind pass, the walk channel
+                    // is skipped and the sweep reports `incomplete`. The root (above) and the
+                    // other channels still run, and the root's descendants are not retried here.
+                    Err(e) => {
+                        log::warn!(
+                            "fd marker {:#x}: the root's descendants could not be walked ({e}) \
+                             - the ppid-walk channel is blind this pass",
+                            self.handle
+                        );
+                        *incomplete = true;
                     }
                 }
             }

@@ -134,9 +134,10 @@ impl ProcessId {
     }
 
     /// When this process started, for ordering against other processes' keys (the tree walk's
-    /// PID-reuse guard). [`Resolved::Gone`] and [`Resolved::Unknown`] mean no key could be read.
-    pub(crate) fn order_key_with(&self, _kernel: &dyn Kernel) -> Resolved<OrderKey> {
-        Resolved::Found(OrderKey(self.start.raw()))
+    /// PID-reuse guard). [`Resolved::Gone`] and [`Resolved::Unknown`] mean no key could be read;
+    /// the [`UnknownCause`] says why when the read itself knows, as for [`of_with`](Self::of_with).
+    pub(crate) fn order_key_with(&self, _kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
+        (Resolved::Found(OrderKey(self.start.raw())), UnknownCause::default())
     }
 
     /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a

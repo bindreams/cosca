@@ -175,30 +175,38 @@ pub(crate) fn descendants_with(
     result
 }
 
-/// `anchor`'s order key for a walk from it. A walk from an anchor that cannot be ordered against
-/// keeps nothing, so `None` ends it empty; it is logged at `debug`.
-fn anchor_key(kernel: &dyn Kernel, anchor: ProcessId) -> Option<OrderKey> {
+/// `anchor`'s order key for a walk from it. `Ok(None)`: the anchor is gone, so there is nothing to
+/// walk (logged at `debug`). [`Error::Unassessable`] (or `Unsupported`) when the key cannot be told:
+/// an empty walk there would let a caller kill the anchor and leave its descendants running.
+fn anchor_key(kernel: &dyn Kernel, anchor: ProcessId) -> Result<Option<OrderKey>, Error> {
     match anchor.order_key_with(kernel) {
-        Resolved::Found(key) => Some(key),
-        Resolved::Gone | Resolved::Unknown => {
-            log::debug!(
-                "treewalk: pid {pid} has no readable order key - walking nothing",
-                pid = anchor.pid()
-            );
-            None
+        (Resolved::Found(key), _) => Ok(Some(key)),
+        (Resolved::Gone, _) => {
+            log::debug!("treewalk: pid {pid} is gone - walking nothing", pid = anchor.pid());
+            Ok(None)
         }
+        (Resolved::Unknown, cause) => Err(unqueryable(&format!("pid {}", anchor.pid()), cause)),
     }
 }
 
 /// Live descendants of `root`: the pure filter wired to `kernel`'s `ProcessId::of_ordered_with`
-/// resolver and the per-OS `ALLOW_EQUAL_ORDER` rule. Empty when `root`'s order key cannot be read.
-pub(crate) fn descendants(kernel: &dyn Kernel, root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    let Some(root_key) = anchor_key(kernel, root) else {
-        return Vec::new();
+/// resolver and the per-OS `ALLOW_EQUAL_ORDER` rule.
+///
+/// # Errors
+///
+/// [`Error::Unassessable`] (or `Unsupported`) when `root`'s order key exists but cannot be read.
+/// Empty, not an error, when `root` is gone.
+pub(crate) fn descendants(
+    kernel: &dyn Kernel,
+    root: ProcessId,
+    parents: &[(RawPid, RawPid)],
+) -> Result<Vec<ProcessId>, Error> {
+    let Some(root_key) = anchor_key(kernel, root)? else {
+        return Ok(Vec::new());
     };
-    descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid| {
+    Ok(descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid| {
         resolve_or_drop(kernel, pid)
-    })
+    }))
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
@@ -233,15 +241,26 @@ pub(crate) fn children_of_with(
 }
 
 /// Live one-level children of `parent`: the pure filter wired to `kernel`'s
-/// `ProcessId::of_ordered_with` and the per-OS `ALLOW_EQUAL_ORDER` rule. Empty when `parent`'s
-/// order key cannot be read.
-pub(crate) fn children_of(kernel: &dyn Kernel, parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    let Some(parent_key) = anchor_key(kernel, parent) else {
-        return Vec::new();
+/// `ProcessId::of_ordered_with` and the per-OS `ALLOW_EQUAL_ORDER` rule.
+///
+/// # Errors
+///
+/// As [`descendants`].
+pub(crate) fn children_of(
+    kernel: &dyn Kernel,
+    parent: ProcessId,
+    parents: &[(RawPid, RawPid)],
+) -> Result<Vec<ProcessId>, Error> {
+    let Some(parent_key) = anchor_key(kernel, parent)? else {
+        return Ok(Vec::new());
     };
-    children_of_with(parent, parent_key, parents, ALLOW_EQUAL_ORDER, |pid| {
-        resolve_or_drop(kernel, pid)
-    })
+    Ok(children_of_with(
+        parent,
+        parent_key,
+        parents,
+        ALLOW_EQUAL_ORDER,
+        |pid| resolve_or_drop(kernel, pid),
+    ))
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a
@@ -400,7 +419,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Er
     if fault::take_force_incomplete() {
         complete = false;
     }
-    let descendants = descendants(kernel, root, &parents);
+    let descendants = descendants(kernel, root, &parents)?;
     #[cfg(unix)]
     {
         if !skip_root {
@@ -556,7 +575,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
         }
         #[cfg(test)]
         fault::note_walk(root.pid());
-        let descendants = descendants(kernel, root, &parents);
+        let descendants = descendants(kernel, root, &parents)?;
         let _ = kill_by_identity(kernel, root, Signal::SIGTERM);
         for id in descendants {
             let _ = kill_by_identity(kernel, id, Signal::SIGTERM);

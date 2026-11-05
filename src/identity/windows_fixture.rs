@@ -153,7 +153,10 @@ impl RestrictedChild {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let kernel = &super::HostKernel;
             let parents = crate::containment::enumerate::process_parents(kernel).expect("the process snapshot");
-            if let Some(kid) = crate::containment::treewalk::children_of(kernel, me, &parents).first() {
+            // Test fixture: like the snapshot above, an unreadable anchor panics the test rather
+            // than being retried.
+            let kids = crate::containment::treewalk::children_of(kernel, me, &parents).expect("the fixture's children");
+            if let Some(kid) = kids.first() {
                 return kid.pid();
             }
             std::thread::yield_now();
