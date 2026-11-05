@@ -51,7 +51,7 @@ fn failed_write() -> Result<(), crate::error::Error> {
 /// one warn that names both. (macOS: a refused unique-id read on a setuid child spawned without
 /// `.elevate()` is this case.)
 ///
-/// Mutant: `teardown_on_drop` warns of the refusal on its own, besides the drop's.
+/// Mutant: `tear_down` warns of the refusal on its own, besides the drop's.
 #[skuld::test]
 fn an_unknown_root_with_a_refused_kill_warns_once() {
     crate::log_capture::install();

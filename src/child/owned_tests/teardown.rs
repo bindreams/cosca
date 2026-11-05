@@ -2,32 +2,50 @@
 
 use std::process::ExitStatus;
 
-use crate::child::owned::teardown::TeardownOutcome;
+use crate::child::owned::teardown::{TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, Foreign};
-use crate::os_process::fake::{FakeProcess, ReapAnswer};
+use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
 use crate::signal::Sent;
+use crate::wait::teardown_warn::Due;
 
-const PID: u32 = 4242;
+pub(super) const PID: u32 = 4242;
 
-fn id() -> ProcessId {
+pub(super) fn id() -> ProcessId {
     ProcessId::from_parts(PID, 1)
 }
 
-fn exit() -> ExitRecord {
+/// A fake that states the pid, and nothing else.
+pub(super) fn fake() -> FakeProcess {
+    FakeProcess::new([]).with_pid(PID)
+}
+
+pub(super) fn exit() -> ExitRecord {
     ExitRecord::Status(ExitStatus::default())
 }
 
-/// What `teardown_on_drop` returned over `fake`, and the levels it logged for its child.
-fn teardown(fake: &FakeProcess) -> (TeardownOutcome, Vec<log::Level>) {
+/// What `tear_down(id, Kill, due)` returned over `fake`, and everything it logged on this thread.
+fn tear_down_logged(
+    fake: &FakeProcess,
+    id: Option<ProcessId>,
+    due: Option<Due>,
+) -> (TeardownOutcome, Vec<(log::Level, String)>) {
     crate::log_capture::install();
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
-    let torn = child.teardown_on_drop(id());
-    let levels = crate::log_capture::records_since_on_current_thread(mark, &PID.to_string())
+    let torn = child.tear_down(id, TeardownKind::Kill, due);
+    (torn, crate::log_capture::records_since_on_current_thread(mark, ""))
+}
+
+/// [`tear_down_logged`] for a child of identity [`id`] and no threshold, with the levels it logged
+/// for its child.
+fn teardown(fake: &FakeProcess) -> (TeardownOutcome, Vec<log::Level>) {
+    let (torn, records) = tear_down_logged(fake, Some(id()), None);
+    let levels = records
         .into_iter()
+        .filter(|(_, text)| text.contains(&PID.to_string()))
         .map(|(level, _)| level)
         .collect();
     (torn, levels)
@@ -35,13 +53,13 @@ fn teardown(fake: &FakeProcess) -> (TeardownOutcome, Vec<log::Level>) {
 
 /// [`teardown`] with the kill delivered and the reap after it answering `reap`.
 fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log::Level>) {
-    teardown(&FakeProcess::new([]).reaps([reap]).signals([Ok(Sent::Delivered)]))
+    teardown(&fake().reaps([reap]).signals([Ok(Sent::Delivered)]))
 }
 
 /// Turns a wait that blocks into a recorded fact: the fake's wait is fired as the block begins, so
 /// a teardown that waits where it must not fails the count instead of hanging. The count starts
 /// empty: a block an earlier test left on this thread is dropped.
-fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
+pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
     crate::wait::block_probe::take();
     let fake = fake.clone();
     crate::wait::block_probe::on_blocking(move || fake.wake())
@@ -99,8 +117,8 @@ fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_no
 #[cfg(unix)]
 #[skuld::test]
 fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-    let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(PID);
+    let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
+    let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill();
     assert_eq!(torn.fate, ChildFate::Killed);
     assert_eq!(torn.left, None);
 }
@@ -111,9 +129,9 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_reap_after_a_tree_kill_waits_for_the_exit() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
     let _fire = fire_on_block(&fake);
-    let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill(PID);
+    let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill();
     assert_eq!(torn.fate, ChildFate::Reaped);
     assert_eq!(torn.left, None);
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
@@ -126,7 +144,7 @@ fn a_reap_after_a_tree_kill_waits_for_the_exit() {
 /// Mutant: a failed wait is `Killed` whatever the kill did.
 #[skuld::test]
 fn a_failed_wait_after_a_kill_that_delivered_nothing_is_unknown() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Ok(Sent::Gone)]);
     let (torn, _) = teardown(&fake);
@@ -139,7 +157,7 @@ fn a_failed_wait_after_a_kill_that_delivered_nothing_is_unknown() {
 /// Mutants: the wait is a look at the present moment; the teardown never waits.
 #[skuld::test]
 fn teardown_after_a_delivered_kill_waits_through_try_reap() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
@@ -156,7 +174,7 @@ fn teardown_after_a_delivered_kill_waits_through_try_reap() {
 /// Mutant: the wait follows `Delivered` only.
 #[skuld::test]
 fn teardown_after_a_kill_that_found_nothing_to_signal_waits_too() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
         .signals([Ok(Sent::Gone)]);
     let _fire = fire_on_block(&fake);
@@ -175,7 +193,7 @@ fn teardown_after_a_refused_kill_looks_once_and_never_waits() {
     use std::io::ErrorKind::{InvalidInput, NotFound, Other, PermissionDenied};
 
     for kind in [PermissionDenied, NotFound, InvalidInput, Other] {
-        let fake = FakeProcess::new([])
+        let fake = fake()
             .reaps([ReapAnswer::Running])
             .signals([Err(std::io::Error::new(kind, "refused for the test"))]);
         let _fire = fire_on_block(&fake);
@@ -201,7 +219,7 @@ fn teardown_after_a_refused_kill_looks_once_and_never_waits() {
 /// Mutant: the warning is returned whenever the kill failed.
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_silently() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Reaped(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
@@ -218,7 +236,7 @@ fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_silently() {
 #[skuld::test]
 fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
     let look_error = std::io::Error::from(std::io::ErrorKind::Other).to_string();
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
@@ -238,7 +256,7 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
 /// from the look's raw OS error, which only Unix has.
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Foreign(Foreign::Gone)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, _) = teardown(&fake);
@@ -254,7 +272,7 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent(
 /// Unix).
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_silent() {
-    let fake = FakeProcess::new([])
+    let fake = fake()
         .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, levels) = teardown(&fake);
@@ -262,4 +280,151 @@ fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_silent() {
     assert_eq!(torn.left, None);
     assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
     assert_eq!(fake.looks(), 1);
+}
+
+/// A threshold that has already passed: the wait warns unless the child has exited.
+pub(super) fn due_now() -> Due {
+    Due {
+        until: crate::wait::now(),
+        after: std::time::Duration::from_secs(7),
+    }
+}
+
+/// The records that are the slow-teardown warn.
+pub(super) fn slow_warns(records: &[(log::Level, String)]) -> Vec<&String> {
+    records
+        .iter()
+        .filter(|(level, text)| *level == log::Level::Warn && text.contains("after its kill"))
+        .map(|(_, text)| text)
+        .collect()
+}
+
+/// A refused kill with no identity read leaves a running child without one.
+///
+/// Mutant: the outcome carries a made-up identity.
+#[skuld::test]
+fn a_kill_teardown_without_an_id_leaves_a_running_child_without_one() {
+    let fake = fake()
+        .reaps([ReapAnswer::Running])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (torn, _) = tear_down_logged(&fake, None, None);
+    assert_eq!(torn.fate, ChildFate::Running { id: None });
+}
+
+/// A child with no pid is named without a number.
+///
+/// Mutants: a pid is made up; the message is built with a number.
+#[skuld::test]
+fn a_pidless_child_is_named_without_a_number() {
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (torn, _) = tear_down_logged(&fake, None, None);
+    let left = torn.left.as_deref().expect("a refused kill is warned of");
+    assert!(left.contains(crate::os_process::PIDLESS_CHILD), "{left}");
+    assert!(!left.chars().any(|c| c.is_ascii_digit()), "{left}");
+}
+
+/// Without a threshold the wait is the blocking wait alone: nothing looks for the exit first.
+///
+/// Mutant: the teardown looks for the exit whatever the threshold (the empty `exited` table
+/// panics).
+#[skuld::test]
+fn a_teardown_without_a_threshold_never_looks_for_the_exit() {
+    let fake = fake()
+        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let _fire = fire_on_block(&fake);
+    let (torn, _) = tear_down_logged(&fake, Some(id()), None);
+    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(fake.looks(), 2);
+}
+
+/// A child that has not exited by the threshold is warned of once, before the wait blocks, and the
+/// wait still ends with its exit.
+///
+/// Mutants: the warn comes after the block; no warn; the wait ends at the threshold.
+#[skuld::test]
+fn a_teardown_past_its_threshold_warns_once_before_it_blocks() {
+    let fake = FakeProcess::new([Answer::Running])
+        .with_pid(PID)
+        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let _fire = fire_on_block(&fake);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Reaped);
+    let warns = slow_warns(&records);
+    assert!(
+        warns.len() == 1 && warns[0].contains(&format!("child {PID}")),
+        "{records:?}"
+    );
+    assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
+}
+
+/// A child that exits before the threshold is not warned of.
+///
+/// Mutant: the warn is not conditional on the look.
+#[skuld::test]
+fn a_wait_that_ends_before_the_threshold_does_not_warn() {
+    let fake = FakeProcess::new([Answer::Exited])
+        .with_pid(PID)
+        .reaps([ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(slow_warns(&records), Vec::<&String>::new());
+}
+
+/// A refused kill is followed by one look and never a wait, so it never looks for the exit, whatever
+/// the threshold.
+///
+/// Mutant: the refused kill's look goes through the threshold's wait (the empty `exited` table
+/// panics).
+#[skuld::test]
+fn a_refused_kill_never_looks_for_the_exit_whatever_the_threshold() {
+    let fake = fake()
+        .reaps([ReapAnswer::Running])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) });
+    assert_eq!(fake.looks(), 1);
+    assert_eq!(slow_warns(&records), Vec::<&String>::new());
+}
+
+/// A kill teardown counts as one root teardown.
+///
+/// Mutant: the count is dropped from the policy.
+#[skuld::test]
+fn a_kill_teardown_counts_one_root_teardown() {
+    let recorder = crate::child::owned::seams::record_root_teardowns();
+    let fake = fake()
+        .reaps([ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let _ = teardown(&fake);
+    assert_eq!(recorder.count(), 1);
+}
+
+/// A look at the exit that cannot be read does not stop the wait: it answers "ended" and the wait
+/// finds out. The failed look is logged at `debug`.
+///
+/// Mutant: a failed look is an exit that is never waited for, or aborts the teardown; or is dropped
+/// unlogged.
+#[skuld::test]
+fn an_unreadable_exit_look_does_not_stop_the_wait() {
+    let fake = FakeProcess::new([Answer::Err(std::io::ErrorKind::Other)])
+        .with_pid(PID)
+        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .signals([Ok(Sent::Delivered)]);
+    let _fire = fire_on_block(&fake);
+    let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
+    assert_eq!(torn.fate, ChildFate::Reaped);
+    assert_eq!(slow_warns(&records), Vec::<&String>::new());
+    assert_eq!(crate::wait::block_probe::take(), [None], "the wait still ran");
+    let cause = std::io::Error::from(std::io::ErrorKind::Other).to_string();
+    assert!(
+        records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Debug && text.contains("child 4242") && text.contains(&cause)),
+        "{records:?}"
+    );
 }
