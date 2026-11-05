@@ -132,21 +132,6 @@ pub(crate) struct ProcDir(OwnedFd);
 impl ProcDir {
     /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
     pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
-        #[cfg(test)]
-        if let Some(errno) = fault::forced_openat2_errno() {
-            return Err(ViewUnreadable::from_open_errno(errno));
-        }
-        Self::open_root()
-    }
-
-    /// [`open`](Self::open) that no test fault answers in place of: for test support that observes
-    /// the kernel while a test arms faults for the code under test.
-    #[cfg(test)]
-    pub(crate) fn open_unforced() -> Result<ProcDir, ViewUnreadable> {
-        Self::open_root()
-    }
-
-    fn open_root() -> Result<ProcDir, ViewUnreadable> {
         let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
@@ -453,7 +438,6 @@ pub(crate) mod fault {
         static PROC_VIEW_CALLS: Cell<u32> = const { Cell::new(0) };
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-        static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
     }
 
     /// Disarms every forced value on drop, even unconsumed — so a test that panics before
@@ -468,20 +452,7 @@ pub(crate) mod fault {
             PROC_VIEW_CALLS.with(|f| f.set(0));
             PROC_VIEW_FIRED_AT.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
-            FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
         }
-    }
-
-    /// Make EVERY [`ProcDir::open`](super::ProcDir::open) on THIS thread fail as its `openat2`
-    /// answering `errno`, as on a kernel older than 5.6 (`NOSYS`) or under a seccomp filter
-    /// (`PERM`), until the guard drops.
-    pub(crate) fn force_openat2_errno(errno: rustix::io::Errno) -> Forced {
-        FORCE_OPENAT2_ERRNO.with(|f| f.set(Some(errno)));
-        Forced(())
-    }
-
-    pub(crate) fn forced_openat2_errno() -> Option<rustix::io::Errno> {
-        FORCE_OPENAT2_ERRNO.with(|f| f.get())
     }
 
     /// Make every by-pid identity read of `pid`'s `stat` on THIS thread fail with `errno` (a
