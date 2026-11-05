@@ -141,8 +141,8 @@ fn spawn_treewalk_blocker() -> (cosca::Child, std::net::TcpStream) {
     (child, control)
 }
 
-/// Every query that takes the process snapshot says the refusal, and warns of it: never "no
-/// parent", never "no children".
+/// `parent` says the refusal on its own read of the process, and every query that takes the process
+/// snapshot says it and warns of it: never "no parent", never "no children".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat2_and_warned() {
@@ -160,7 +160,11 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
         });
         for (call, result) in results {
             let op = assert_unsupported_naming(result, name, call);
-            assert_eq!(op, "listing the process table", "{call} under {name}");
+            let expected = match call {
+                "parent" => format!("identifying pid {}", me.pid()),
+                _ => "listing the process table".to_owned(),
+            };
+            assert_eq!(op, expected, "{call} under {name}");
         }
         // Scoped to the snapshot's own emitter, so no other record carrying the text counts.
         let warned = format!(
@@ -172,8 +176,8 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
             .filter(|level| *level == log::Level::Warn)
             .count();
         assert_eq!(
-            warns, 3,
-            "{name}: one warn each for parent, children(No) and children(Yes)"
+            warns, 2,
+            "{name}: one warn each for children(No) and children(Yes), none for parent"
         );
     }
 }
@@ -182,8 +186,10 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snapshot() {
+    use cosca::identity::Recursive;
+
     let me = ProcessId::current();
-    let result = with_openat2_refused(libc::ENOENT, || me.parent().map(drop));
+    let result = with_openat2_refused(libc::ENOENT, || me.children(Recursive::No).map(drop));
     assert!(
         matches!(result, Err(cosca::error::Error::Unassessable { .. })),
         "{result:?}"
