@@ -163,8 +163,7 @@ impl OwnedChild {
     /// waited for when the threshold passes, and warned of.
     ///
     /// Returns the child's fate, and what it could not do for the caller's one warn. It logs
-    /// neither above `debug`, except that slow-teardown warn and, for a front it waits for, a
-    /// zombie launchd holds.
+    /// nothing above `debug`, except that slow-teardown warn.
     pub(crate) fn tear_down(&self, id: Option<ProcessId>, kind: TeardownKind<'_>, due: Option<Due>) -> TeardownOutcome {
         match kind {
             TeardownKind::Kill { disposition, tree } => self.kill_and_settle(id, disposition, tree, due),

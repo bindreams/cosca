@@ -49,8 +49,9 @@ pub(super) fn status_of_outcome(
 
 /// What became of a child after a wait, or a look at the present moment, answered `answer`
 /// (`killed`: a kill reached the child, delivered by this handle or by a containment kill that
-/// reached it). The one classification of that answer: every teardown and every `Unreaped` asks it
-/// the fate, whether the child is left uncollected, the fate of an elevation front, and what to say.
+/// reached it). The one classification of that answer, which every teardown, `finish_elevated` and
+/// `Unreaped` asks for the fate, whether the child is left uncollected, the fate of an elevation
+/// front, and what to say.
 ///
 /// | answer                       | [`fate`](Self::fate)  | [`uncollected`](Self::uncollected) | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
 /// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
