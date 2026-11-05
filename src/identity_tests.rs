@@ -143,3 +143,168 @@ fn a_process_denying_only_synchronize_exists_but_has_unknown_liveness() {
     );
     assert!(child.is_running());
 }
+
+// A candidate's parent number =====
+
+/// Who an answer's cause blames: nobody, the candidate's own read (its cause carried through), or
+/// the parent whose proof failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Nobody,
+    Candidate,
+    Parent,
+}
+
+/// What one ordered read of a candidate and the proof of its named parent say together, over the
+/// whole grid. The table is the contract: rows are (read, its parent number), columns the parent's
+/// proof. With no parent named, the read is the answer.
+///
+/// Mutants: another parent's number is hidden by a refused read or by the proof; an unreadable
+/// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
+/// then blames the candidate); an unreadable number reads as a match or as another parent's; a failed
+/// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`.
+#[skuld::test]
+fn a_candidates_read_and_its_parents_proof_give_one_answer() {
+    use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
+    const CANDIDATE: RawPid = 7;
+    const PARENT: RawPid = 100;
+    const OTHER: RawPid = 101;
+    // The candidate's own cause, as a stated marker: no cause but the parent's has a pid in it here.
+    const STATED: RawPid = 900;
+
+    let stated = || UnknownCause::default().of_parent(STATED);
+    let order = OrderKey::for_test(9);
+    let found = Resolved::Found((Key::for_test(5), order));
+
+    let nobody_gone = (Resolved::Gone, Owner::Nobody);
+    let own_gone = (Resolved::Gone, Owner::Candidate);
+    let own_found = (Resolved::Found((id(CANDIDATE, 5), order)), Owner::Candidate);
+    let own_unknown = (Resolved::Unknown, Owner::Candidate);
+    let parent_unknown = (Resolved::Unknown, Owner::Parent);
+    type Proof = fn() -> Result<(), Ordered>;
+    // The expected answer under each proof, in this order: held, gone, unknown.
+    let proofs: [(&str, Proof); 3] = [
+        ("held", || Ok(())),
+        ("gone", || Err((Resolved::Gone, UnknownCause::default()))),
+        ("unknown", || {
+            Err((Resolved::Unknown, UnknownCause::default().of_parent(PARENT)))
+        }),
+    ];
+    let table = [
+        // The parent number is another's.
+        ("found", found, "another's", ParentRead::Is(OTHER), [nobody_gone; 3]),
+        (
+            "gone",
+            Resolved::Gone,
+            "another's",
+            ParentRead::Is(OTHER),
+            [nobody_gone; 3],
+        ),
+        (
+            "unknown",
+            Resolved::Unknown,
+            "another's",
+            ParentRead::Is(OTHER),
+            [nobody_gone; 3],
+        ),
+        // The parent number is the named parent's.
+        (
+            "found",
+            found,
+            "the parent's",
+            ParentRead::Is(PARENT),
+            [own_found, nobody_gone, parent_unknown],
+        ),
+        (
+            "gone",
+            Resolved::Gone,
+            "the parent's",
+            ParentRead::Is(PARENT),
+            [own_gone; 3],
+        ),
+        (
+            "unknown",
+            Resolved::Unknown,
+            "the parent's",
+            ParentRead::Is(PARENT),
+            [own_unknown, nobody_gone, parent_unknown],
+        ),
+        // The parent number could not be read.
+        (
+            "found",
+            found,
+            "unreadable",
+            ParentRead::Unreadable,
+            [own_unknown, nobody_gone, parent_unknown],
+        ),
+        (
+            "gone",
+            Resolved::Gone,
+            "unreadable",
+            ParentRead::Unreadable,
+            [own_gone; 3],
+        ),
+        (
+            "unknown",
+            Resolved::Unknown,
+            "unreadable",
+            ParentRead::Unreadable,
+            [own_unknown, nobody_gone, parent_unknown],
+        ),
+    ];
+    let owner_of = |cause: UnknownCause| match cause.blamed_parent() {
+        None => Owner::Nobody,
+        Some(STATED) => Owner::Candidate,
+        Some(PARENT) => Owner::Parent,
+        Some(other) => panic!("a cause blaming pid {other}"),
+    };
+
+    for (read_name, read, number_name, claimed, expected) in table {
+        for ((proof_name, proof), expected) in proofs.into_iter().zip(expected) {
+            let (answer, cause) = OrderedRead {
+                read,
+                parent: claimed,
+                cause: stated(),
+            }
+            .judged(CANDIDATE, PARENT)
+            .proved(proof);
+            assert_eq!(
+                (answer, owner_of(cause)),
+                expected,
+                "a {read_name} read, its parent number {number_name}, the parent {proof_name}"
+            );
+        }
+    }
+
+    for (read_name, read, expected) in [
+        ("found", found, own_found),
+        ("gone", Resolved::Gone, own_gone),
+        ("unknown", Resolved::Unknown, own_unknown),
+    ] {
+        let (answer, cause) = OrderedRead {
+            read,
+            parent: ParentRead::NotAsked,
+            cause: stated(),
+        }
+        .unclaimed(CANDIDATE);
+        assert_eq!(
+            (answer, owner_of(cause)),
+            expected,
+            "a {read_name} read with no parent named"
+        );
+    }
+}
+
+/// A read that found no record says its parent number could not be read only if it asked for it.
+///
+/// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
+/// (a `NotAsked` that is judged against a named parent breaks the debug assertion there).
+#[skuld::test]
+fn a_missing_record_reads_the_parent_number_as_asked() {
+    use super::{OrderedRead, ParentRead, UnknownCause};
+
+    let asked = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), true);
+    assert_eq!(asked.parent, ParentRead::Unreadable);
+    let alone = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), false);
+    assert_eq!(alone.parent, ParentRead::NotAsked);
+}
