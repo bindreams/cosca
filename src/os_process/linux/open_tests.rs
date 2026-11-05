@@ -287,6 +287,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     let mark = crate::log_capture::mark();
     let own = ProcessId::current();
     let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
         .on_pidfd_open(own.pid(), Err(Errno::INVAL))
         .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
     let result = open_verified_with(&kernel, own);
@@ -529,7 +530,12 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let own = ProcessId::current();
-    let kernel = FakeKernel::over(&HostKernel).on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
+    let pidfd = pidfd_open(getpid(), PidfdFlags::empty()).expect("pidfd_open of this process");
+    let fdinfo = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(own.pid(), Ok(pidfd))
+        .on_read(&fdinfo, Ok(&fdinfo_naming(i64::from(own.pid()))))
+        .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
     let result = open_verified_with(&kernel, own);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
