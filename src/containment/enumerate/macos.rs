@@ -32,7 +32,7 @@
 //!   changing the underlying syscall.
 
 use crate::error::Error;
-use crate::identity::{RawPid, Resolved};
+use crate::identity::{Kernel, RawPid, Resolved};
 
 /// Extra pid slots asked for on top of the kernel's sizing answer, so the common case
 /// needs exactly one fill: the process set can grow between the sizing call and the fill.
@@ -377,7 +377,7 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
 /// [`Error::Unassessable`] naming the `proc_listallpids` failure when no pid list can be taken,
 /// or the count and a sample of the pids denied a ppid read: each leaves its subtree out of the
 /// edges, and a walk over them would skip it. [`snapshot`] applies its own policy to the same denial.
-pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
+pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let raw = try_all_pids().map_err(|e| {
         let detail = format!("the process snapshot could not be taken: proc_listallpids failed ({e})");
         log::warn!("enumerate::process_parents: {detail}");

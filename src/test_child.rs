@@ -376,6 +376,19 @@ pub(crate) fn release_unsignalled(mut child: std::process::Child) {
     assert_eq!(status.code(), Some(0), "the member must exit by itself");
 }
 
+/// `pid`'s `stat` as the kernel gives it now, except for the start time: what the pid's new owner
+/// would show.
+#[cfg(target_os = "linux")]
+pub(crate) fn stat_of_a_new_owner(pid: u32) -> Vec<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the live pid's stat");
+    let (head, tail) = stat.rsplit_once(')').expect("stat names its command in parentheses");
+    let mut fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+    // `tail` starts at field 3, the state; the start time is field 22.
+    let start: u64 = fields[19].parse().expect("the start time");
+    fields[19] = (start + 1).to_string();
+    format!("{head}) {}\n", fields.join(" ")).into_bytes()
+}
+
 /// A live [`BLOCKER_ARGV`] (`findstr`) child with piped stdin and stdout, and its identity.
 #[cfg(windows)]
 pub(crate) fn live_findstr_blocker() -> (std::process::Child, crate::identity::ProcessId) {

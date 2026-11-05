@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{ProcessId, RawPid, Resolved};
+use super::{HostKernel, Kernel, ProcessId, RawPid, Resolved};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -28,14 +28,19 @@ impl ProcessId {
     ///   a `/proc` that is not this pid namespace's).
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<ProcessId>, Error> {
+        self.parent_with(&HostKernel)
+    }
+
+    /// [`parent`](Self::parent), reading through `kernel`.
+    pub(crate) fn parent_with(&self, kernel: &dyn Kernel) -> Result<Option<ProcessId>, Error> {
         // Snapshot first, then the anchor: a `self` that still holds its pid after the snapshot
         // held it throughout, so the edges naming it are its own. An Unknown anchor cannot rule
         // out a recycled pid either, so it is an error.
-        let parents = crate::containment::enumerate::process_parents()?;
-        if !crate::containment::treewalk::anchor_present(*self)? {
+        let parents = crate::containment::enumerate::process_parents(kernel)?;
+        if !crate::containment::treewalk::anchor_present(kernel, *self)? {
             return Ok(None);
         }
-        let Some(ppid) = self.parent_pid_in(&parents)? else {
+        let Some(ppid) = self.parent_pid_in(kernel, &parents)? else {
             return Ok(None);
         };
         // A process is never its own parent (treewalk's convention).
@@ -43,7 +48,7 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let parent = match ProcessId::of_explained(ppid) {
+        let parent = match ProcessId::of_with(kernel, ppid) {
             (Resolved::Found(p), _) => p,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
@@ -66,17 +71,17 @@ impl ProcessId {
 
     /// `self`'s ppid in `parents`. `self` passed its anchor, so it is live: a row missing for it
     /// was omitted, not the process gone, unless it exited since (`Ok(None)`).
-    fn parent_pid_in(&self, parents: &[(RawPid, RawPid)]) -> Result<Option<RawPid>, Error> {
+    fn parent_pid_in(&self, kernel: &dyn Kernel, parents: &[(RawPid, RawPid)]) -> Result<Option<RawPid>, Error> {
         match parents.iter().find(|&&(pid, _)| pid == self.pid()) {
             Some(&(_, ppid)) => Ok(Some(ppid)),
-            None => self.absent_from_snapshot().map(|()| None),
+            None => self.absent_from_snapshot(kernel).map(|()| None),
         }
     }
 
     /// Why `self`, live at its anchor, has no row in the snapshot: it exited since (`Ok`), or its
     /// row was omitted, which is an error.
-    fn absent_from_snapshot(&self) -> Result<(), Error> {
-        if crate::containment::treewalk::anchor_present(*self)? {
+    fn absent_from_snapshot(&self, kernel: &dyn Kernel) -> Result<(), Error> {
+        if crate::containment::treewalk::anchor_present(kernel, *self)? {
             return Err(Error::Unassessable {
                 detail: format!("pid {} is live but absent from the process snapshot", self.pid()),
                 source: None,
@@ -97,18 +102,23 @@ impl ProcessId {
     ///
     /// As [`parent`](Self::parent).
     pub fn children(&self, recursive: Recursive) -> Result<Vec<ProcessId>, Error> {
+        self.children_with(&HostKernel, recursive)
+    }
+
+    /// [`children`](Self::children), reading through `kernel`.
+    pub(crate) fn children_with(&self, kernel: &dyn Kernel, recursive: Recursive) -> Result<Vec<ProcessId>, Error> {
         // Snapshot first, then the anchor (see `parent`).
-        let parents = crate::containment::enumerate::process_parents()?;
-        if !crate::containment::treewalk::anchor_present(*self)? {
+        let parents = crate::containment::enumerate::process_parents(kernel)?;
+        if !crate::containment::treewalk::anchor_present(kernel, *self)? {
             return Ok(Vec::new());
         }
         if !parents.iter().any(|&(pid, _)| pid == self.pid()) {
-            self.absent_from_snapshot()?;
+            self.absent_from_snapshot(kernel)?;
             return Ok(Vec::new());
         }
         Ok(match recursive {
-            Recursive::No => crate::containment::treewalk::children_of(*self, &parents),
-            Recursive::Yes => crate::containment::treewalk::descendants(*self, &parents),
+            Recursive::No => crate::containment::treewalk::children_of(kernel, *self, &parents),
+            Recursive::Yes => crate::containment::treewalk::descendants(kernel, *self, &parents),
         })
     }
 }

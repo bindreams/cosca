@@ -63,7 +63,7 @@ impl std::fmt::Display for Unreadable {
 /// `pid`'s `stat` through `dir`: [`PidStat::Skipped`] for the errnos that mean the pid is not
 /// there for us, [`Unreadable`] for every other. Never asks `kill(pid, 0)`.
 pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
-    let source = match read_raw(kernel, dir, pid) {
+    let source = match read_stat_file(kernel, dir, pid) {
         Ok(stat) => return Ok(PidStat::Read(stat)),
         Err(e) => e,
     };
@@ -89,55 +89,9 @@ pub(crate) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io
     kernel.read(dir, &format!("{pid}/stat"))
 }
 
-fn read_raw(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_stat_read_errno() {
-        return Err(io::Error::from_raw_os_error(errno));
-    }
-    read_stat_file(kernel, dir, pid)
-}
-
 /// Whether the checked directory still reads (`self/stat`).
 fn check_dir_answers(kernel: &dyn Kernel, dir: &ProcDir) -> io::Result<()> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_recheck_errno() {
-        return Err(io::Error::from_raw_os_error(errno));
-    }
     kernel.read(dir, "self/stat").map(drop)
-}
-
-/// Test-only seam: force the per-pid `stat` read.
-#[cfg(test)]
-pub(crate) mod fault {
-    thread_local! {
-        static STAT_READ: std::cell::Cell<Option<(i32, Option<i32>)>> = const { std::cell::Cell::new(None) };
-    }
-
-    /// Disarms [`force_stat_read`] on drop.
-    #[must_use = "dropping this immediately disarms the forced read"]
-    pub(crate) struct ForcedStatRead(());
-
-    impl Drop for ForcedStatRead {
-        fn drop(&mut self) {
-            STAT_READ.with(|f| f.set(None));
-        }
-    }
-
-    /// Make EVERY per-pid `stat` read on THIS thread fail with `errno` until the guard drops.
-    /// `recheck` is what the "does the checked directory still answer" re-read answers: `None` for
-    /// success, `Some(errno)` for that failure.
-    pub(crate) fn force_stat_read(errno: i32, recheck: Option<i32>) -> ForcedStatRead {
-        STAT_READ.with(|f| f.set(Some((errno, recheck))));
-        ForcedStatRead(())
-    }
-
-    pub(super) fn forced_recheck_errno() -> Option<i32> {
-        STAT_READ.with(|f| f.get()).and_then(|(_, recheck)| recheck)
-    }
-
-    pub(super) fn forced_stat_read_errno() -> Option<i32> {
-        STAT_READ.with(|f| f.get()).map(|(errno, _)| errno)
-    }
 }
 
 #[cfg(test)]
