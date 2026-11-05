@@ -333,6 +333,7 @@ pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool)
         Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), ask_parent),
     };
     let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
+    let read = read.map(|(key, order)| (key, Some(order)));
     let (parent, cause) = if ask_parent {
         creator_read(pid, creator_pid(handle), cause)
     } else {
@@ -403,7 +404,10 @@ fn combine(
 /// key.
 pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
     let OrderedRead { read, cause, .. } = ordered_read(pid, Some(key), false);
-    (read.map(|(_, order)| order), cause)
+    (
+        read.map(|(_, order)| order.expect("a Windows read has its order key")),
+        cause,
+    )
 }
 
 /// Build a `ProcessId` from an already-open Windows process handle and its pid, reusing the

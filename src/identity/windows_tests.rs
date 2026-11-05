@@ -548,7 +548,7 @@ fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
 // order key =====
 
 fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
-    match id.order_key_with(&crate::identity::HostKernel).0 {
+    match id.order_key().0 {
         Resolved::Found(key) => key,
         other => panic!("the order key of {id:?} should read, got {other:?}"),
     }
@@ -601,7 +601,7 @@ fn a_child_orders_after_its_creator_and_a_grandchild_after_the_child() {
 #[skuld::test]
 fn the_order_key_of_a_stale_id_is_gone() {
     let stale = crate::identity::ProcessId::current().with_other_value();
-    assert_eq!(stale.order_key_with(&crate::identity::HostKernel).0, Resolved::Gone);
+    assert_eq!(stale.order_key().0, Resolved::Gone);
 }
 
 /// Mutant: the walk drops a genuine descendant under the sequence-number order.

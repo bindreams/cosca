@@ -63,7 +63,7 @@
 //! read cannot tell that from a pid that changed hands. On Windows a candidate whose key does not
 //! follow the bound (above) is dropped as `Gone` in the same read, before the parent is proved: a
 //! process that cannot be the child is not a member the walk failed to assess. A candidate whose own
-//! read fails (no record, no order key, or a parent number that cannot be read) goes to the proof of the accepted parent
+//! read fails (no record, on Windows no sequence number, or a parent number that cannot be read) goes to the proof of the accepted parent
 //! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
 //! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
 //! warning naming the candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or
@@ -83,7 +83,7 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::error::Error;
-use crate::identity::{resolution_of, unqueryable, Kernel, OrderKey, ProcessId, RawPid, Resolution, Resolved};
+use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
@@ -245,15 +245,18 @@ pub(crate) fn descendants_with(
 /// `Ok(None)` when `anchor` is gone or another process holds its pid now (logged at `debug`):
 /// there is nothing to walk. [`Error::Unassessable`] (or `Unsupported`) when that cannot be told:
 /// an empty walk there would let a caller kill the anchor and leave its descendants running.
-fn anchor(kernel: &dyn Kernel, anchor: ProcessId) -> Result<Option<Option<OrderKey>>, Error> {
-    match anchor.anchor_bound_with(kernel) {
-        (Resolved::Found(bound), _) => Ok(Some(bound)),
-        (Resolved::Gone, _) => {
-            log::debug!("treewalk: pid {pid} is gone - walking nothing", pid = anchor.pid());
-            Ok(None)
-        }
-        (Resolved::Unknown, cause) => Err(unqueryable(&format!("pid {}", anchor.pid()), cause)),
+fn anchor(kernel: &dyn Kernel, anchor: ProcessId) -> Result<Option<AnchorProof>, Error> {
+    let proof = resolution_of("pid", anchor.pid(), anchor.anchor_bound_with(kernel))?;
+    if proof.is_none() {
+        log::debug!("treewalk: pid {pid} is gone - walking nothing", pid = anchor.pid());
     }
+    Ok(proof.map(|bound| AnchorProof { bound }))
+}
+
+/// A walk's anchor, proved to hold its pid: the bound its children follow (see
+/// [`ProcessId::anchor_bound_with`]).
+struct AnchorProof {
+    bound: Option<OrderKey>,
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
@@ -307,7 +310,7 @@ pub(crate) fn walk_from(
     parents: &[(RawPid, RawPid)],
     depth: Recursive,
 ) -> Result<Option<Walk>, Error> {
-    let Some(root_bound) = anchor(kernel, root)? else {
+    let Some(AnchorProof { bound: root_bound }) = anchor(kernel, root)? else {
         return Ok(None);
     };
     let resolve = |pid, parent, bound| resolve_or_drop(kernel, pid, parent, bound);
@@ -368,6 +371,8 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
 pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
+
+    use crate::identity::Resolved;
     // Re-verify identity at the instant of the kill. Three outcomes, not two: a denied
     // re-verify is NOT a confirmed change, and must not be logged as one.
     match ProcessId::of_with(kernel, id.pid()).0 {

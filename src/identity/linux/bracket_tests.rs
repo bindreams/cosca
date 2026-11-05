@@ -8,7 +8,7 @@ use rustix::io::Errno;
 use rustix::process::Pid;
 
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{FakeKernel, HostKernel, Key, ProcessId, Resolved};
+use crate::identity::{ticks_host, FakeKernel, HostKernel, Key, ProcessId, Resolved};
 
 const PID: u32 = 4242;
 const STAT: &str = "4242/stat";
@@ -79,11 +79,21 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
     }
 }
 
-/// A `stat` with no start time is unreadable, not a start of zero.
+/// A `Pidfs` id is the pidfd's inode: nothing off Windows orders by the start time, so a `stat`
+/// without one still gives the process, and its ppid. A `Ticks` id is the start time, which a `stat`
+/// without one does not give: `Unknown`, not a start of zero.
+///
+/// Mutant: the `Pidfs` read requires the start time (`Unknown`); the `Ticks` read takes zero for it.
 #[skuld::test]
-fn a_stat_without_a_start_time_is_unknown() {
+fn a_stat_without_a_start_time_is_a_pidfs_id_but_no_ticks_id() {
     let (kernel, _writer) = kernel_showing(b"4242 (x) S 1", 100);
-    assert_eq!(read_of(&kernel), Resolved::Unknown);
+    assert_eq!(read_of(&kernel), Resolved::Found(id(100)));
+
+    let kernel = ticks_host(PID).on_read(STAT, Ok(b"4242 (x) S 1"));
+    assert_eq!(
+        ProcessId::of_ordered_with(&kernel, PID, None, None, None).0,
+        Resolved::Unknown
+    );
 }
 
 /// How Linux's `ordered_read` reports the ppid of a `stat`, through `of_ordered_with` against a named
@@ -135,33 +145,38 @@ fn a_gone_parent_is_gone_before_a_refused_stat_is_unknown() {
     assert!(matches!(read, Resolved::Gone), "{read:?}");
 }
 
-/// A `stat` that names the parent but shows no start time is read as `Unknown`, once the parent is
-/// proved: a parent that is gone is `Gone` first, as when the start time is there, not blamed on the
-/// candidate. Mutant: the missing start time settles the read before the parent is proved.
+/// A pid whose `stat` shows no start time, as a `Ticks` id reads it (the start time is the id). The
+/// ppid it shows is `ppid`.
+fn ticks_candidate_without_a_start_time(ppid: u32) -> FakeKernel<'static> {
+    ticks_host(PID).on_read(STAT, Ok(format!("4242 (x) S {ppid}").as_bytes()))
+}
+
+/// A `Ticks` candidate that names the parent but shows no start time is read as `Unknown`, once the
+/// parent is proved: a parent that is gone is `Gone` first, as when the start time is there, not
+/// blamed on the candidate. Mutant: the missing start time settles the read before the parent is
+/// proved.
 #[skuld::test]
 fn a_gone_parent_is_gone_before_a_missing_start_time_is_unknown() {
     let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
-    let stat = b"4242 (x) S 7";
 
-    let (gone, _writer) = kernel_showing(stat, 100);
-    let gone = gone.on_pidfd_open(7, Err(Errno::SRCH));
+    let gone = ticks_candidate_without_a_start_time(7).on_pidfd_open(7, Err(Errno::SRCH));
     assert!(matches!(
         ProcessId::of_ordered_with(&gone, PID, Some(parent), None, None).0,
         Resolved::Gone
     ));
 
-    let (held, _writer) = kernel_showing(stat, 100);
     let (parent_fd, _parent_writer) = pidfd();
-    let held = held.on_pidfd_open(7, Ok(parent_fd)).on_pidfs_ino(7, Ok(Some(9)));
+    let held = ticks_candidate_without_a_start_time(7)
+        .on_pidfd_open(7, Ok(parent_fd))
+        .on_pidfs_ino(7, Ok(Some(9)));
     assert!(matches!(
         ProcessId::of_ordered_with(&held, PID, Some(parent), None, None).0,
         Resolved::Unknown
     ));
 }
 
-/// A `stat` that names another parent but shows no start time is `Gone`: the other parent settles
-/// the answer before the missing start time can make it `Unknown`. The named parent is held, so only
-/// the other parent's number can make it `Gone`.
+/// A `Pidfs` candidate that names another parent is `Gone` though its `stat` shows no start time:
+/// none is read. The named parent is held, so only the other parent's number can make it `Gone`.
 ///
 /// Mutant: a missing start time hides the other parent's number.
 #[skuld::test]

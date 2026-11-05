@@ -11,9 +11,8 @@
 //! different kinds never compare equal. It is deliberately NOT a wall-clock time: deriving
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
-//! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
-//! guard) is not the key but an `OrderKey`: the start time (on Linux a `pidfs` id reads it from
-//! `/proc`), or on Windows the process sequence number.
+//! allowed to drift and never used for identity. Only on Windows is anything ordered (the tree
+//! walk's PID-reuse guard): not by the key but by an `OrderKey`, the process sequence number.
 //!
 //! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
 //! for the persist/restore round trip and what it refuses.
@@ -95,22 +94,15 @@ impl Key {
 pub(crate) use backend::Key;
 
 /// Where a process falls in the order of process creation: comparable only with keys read on this
-/// host this boot. Where [`ORDER_AFTER_PARENT`] the tree walk's PID-reuse guard orders by it. Not
-/// the identity: equal keys do not mean the same process. Linux: the start time in jiffies. macOS:
-/// the start time in microseconds. Windows: the `ProcessSequenceNumber`, a creation counter, so no
-/// two processes share a key and a process always follows its creator.
+/// host this boot. The tree walk's PID-reuse guard orders by it where [`ORDER_AFTER_PARENT`], and
+/// only Windows reads one: the `ProcessSequenceNumber`, a creation counter, so no two processes share
+/// a key and a process always follows its creator. Not the identity.
 ///
-/// Built only inside `identity`, by the backends' reads.
+/// Built only inside `identity`, by the Windows read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OrderKey(u64);
 
 impl OrderKey {
-    /// This key as the bound it gives, where [`ORDER_AFTER_PARENT`]; `None` elsewhere, where no
-    /// read orders by it. The one place the platform decides.
-    fn bound(self) -> Option<OrderKey> {
-        ORDER_AFTER_PARENT.then_some(self)
-    }
-
     #[cfg(test)]
     pub(crate) fn for_test(v: u64) -> OrderKey {
         OrderKey(v)
@@ -121,8 +113,8 @@ impl OrderKey {
 /// `ppid`, read after the parent, is. True only on Windows, where the parent field is the creator
 /// and never updated: a `ppid` can name a pid a later process holds now, and a second read of the
 /// process shows nothing new. A process must then order strictly after its parent ([`keeps_order`]),
-/// the order key is a bound only there ([`OrderKey::bound`]), and [`ProcessId::parent`] does not
-/// read its process again. False elsewhere: reparenting updates `ppid`, so the read under the
+/// the backend reads an [`OrderKey`] only there, and [`ProcessId::parent`] does not read its process
+/// again. False elsewhere: reparenting updates `ppid`, so the read under the
 /// parent is the proof, and an order rule would drop a child whose in-tree tracer started after it
 /// (XNU's `PT_ATTACH` makes the tracer the parent).
 #[cfg(windows)]
@@ -150,16 +142,16 @@ enum ParentRead {
     Unreadable,
 }
 
-/// What a backend's one read of a process says: its key and order key, and the parent number found
-/// by the same read.
+/// What a backend's one read of a process says: its key and its order key, which is `Some` exactly
+/// where [`ORDER_AFTER_PARENT`], and the parent number found by the same read.
 struct OrderedRead {
-    read: Resolved<(Key, OrderKey)>,
+    read: Resolved<(Key, Option<OrderKey>)>,
     parent: ParentRead,
     cause: UnknownCause,
 }
 
 /// What an ordered read of a pid says: the identity and the order key it bounds its children by
-/// ([`OrderKey::bound`]), or why there is none.
+/// (`Some` only where [`ORDER_AFTER_PARENT`]), or why there is none.
 type Ordered = (Resolved<(ProcessId, Option<OrderKey>)>, UnknownCause);
 
 /// What a read of a candidate under its parent says: `Ok(None)` for one that is gone (or no longer
@@ -257,7 +249,7 @@ impl OrderedRead {
     /// The read with no parent named: the id and order key of `pid`.
     fn unclaimed(self, pid: RawPid) -> Ordered {
         (
-            self.read.map(|(key, order)| (ProcessId { pid, key }, order.bound())),
+            self.read.map(|(key, order)| (ProcessId { pid, key }, order)),
             self.cause,
         )
     }
@@ -277,13 +269,17 @@ impl OrderedRead {
             "a parent was named, so its number must be asked for"
         );
         match (claimed, read) {
-            (_, Resolved::Found((_, order))) if bound.is_some_and(|bound| !keeps_order(order, bound)) => {
+            (_, Resolved::Found((_, order)))
+                if order
+                    .zip(bound)
+                    .is_some_and(|(order, bound)| !keeps_order(order, bound)) =>
+            {
                 Judged::Settled((Resolved::Gone, UnknownCause::default()))
             }
             (ParentRead::Is(found), _) if found != parent => Judged::Settled((Resolved::Gone, UnknownCause::default())),
             (_, Resolved::Gone) => Judged::Settled((Resolved::Gone, cause)),
             (ParentRead::Is(_), Resolved::Found((key, order))) => {
-                Judged::IfParentHolds((Resolved::Found((ProcessId { pid, key }, order.bound())), cause))
+                Judged::IfParentHolds((Resolved::Found((ProcessId { pid, key }, order)), cause))
             }
             // The candidate's own failure, which a held parent lets stand.
             (_, Resolved::Found(_) | Resolved::Unknown) => Judged::IfParentHolds((Resolved::Unknown, cause)),
@@ -297,19 +293,20 @@ fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_par
     #[cfg(all(test, target_os = "macos"))]
     seams::note_by_pid_read();
     #[cfg(target_os = "linux")]
-    {
-        backend::ordered_read(kernel, pid, expected, ask_parent)
-    }
-    #[cfg(windows)]
-    {
+    let read = backend::ordered_read(kernel, pid, expected, ask_parent);
+    #[cfg(not(target_os = "linux"))]
+    let read = {
         let _ = kernel;
         backend::ordered_read(pid, expected, ask_parent)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        let _ = kernel;
-        backend::ordered_read(pid, expected, ask_parent)
-    }
+    };
+    debug_assert!(
+        match &read.read {
+            Resolved::Found((_, order)) => order.is_some() == ORDER_AFTER_PARENT,
+            _ => true,
+        },
+        "a backend reads an order key exactly where ORDER_AFTER_PARENT"
+    );
+    read
 }
 
 /// A process identity that stays unique across time: `(pid, key)`.
@@ -426,7 +423,7 @@ impl ProcessId {
             .proved(|| parent.still_held(kernel))
     }
 
-    /// The parent number and the order key ([`OrderKey::bound`]) of `self`'s own read, for
+    /// The parent number and the order key (`Some` only where [`ORDER_AFTER_PARENT`]) of `self`'s own read, for
     /// [`parent`](Self::parent)'s first read, which names no parent yet and needs the number, which
     /// [`Ordered`] does not carry. The number is only a number: the parent it names may be another
     /// process by now, and where [`ORDER_AFTER_PARENT`] the caller reads that process and orders it
@@ -440,7 +437,7 @@ impl ProcessId {
         debug_assert!(parent != ParentRead::NotAsked, "the parent number was asked for");
         match (read, parent) {
             (Resolved::Gone, _) => (Resolved::Gone, cause),
-            (Resolved::Found((_, order)), ParentRead::Is(number)) => (Resolved::Found((number, order.bound())), cause),
+            (Resolved::Found((_, order)), ParentRead::Is(number)) => (Resolved::Found((number, order)), cause),
             // The read failed, or it found no parent number in the record or on the handle.
             _ => (Resolved::Unknown, cause),
         }
@@ -452,13 +449,13 @@ impl ProcessId {
     /// `Gone`; the [`UnknownCause`] says why when the read itself knows, as for
     /// [`of_with`](Self::of_with).
     #[cfg(windows)]
-    pub(crate) fn order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
-        let _ = kernel;
+    pub(crate) fn order_key(&self) -> (Resolved<OrderKey>, UnknownCause) {
         backend::order_key(self.pid, self.key)
     }
 
     /// The proof that this process still holds its pid, for the anchor of a walk: [`Resolved::Found`]
-    /// only if it did at the read, with the bound its children must follow ([`OrderKey::bound`]).
+    /// only if it did at the read, with the bound its children must follow (`Some` only where
+    /// [`ORDER_AFTER_PARENT`]).
     /// On Windows the order key read is that proof, so the proof and the bound are one read: two
     /// could find a process that exits between them gone, and its children, which Windows does not
     /// reparent, unwalked. Elsewhere [`exists_with`](Self::exists_with) is the proof and there is no
@@ -467,8 +464,9 @@ impl ProcessId {
     pub(crate) fn anchor_bound_with(&self, kernel: &dyn Kernel) -> (Resolved<Option<OrderKey>>, UnknownCause) {
         #[cfg(windows)]
         {
-            let (read, cause) = self.order_key_with(kernel);
-            (read.map(OrderKey::bound), cause)
+            let _ = kernel;
+            let (read, cause) = self.order_key();
+            (read.map(Some), cause)
         }
         #[cfg(not(windows))]
         {

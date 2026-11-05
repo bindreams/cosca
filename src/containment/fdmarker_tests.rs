@@ -1121,7 +1121,11 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
         .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let mut root_child = crate::test_spawn::spawn(&mut root_cmd).expect("spawn the root");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut root_child = root_cmd.spawn().expect("spawn the root");
     crate::test_child::await_member_ready(&mut root_child);
     let root = crate::identity::ProcessId::of(root_child.id())
         .found()

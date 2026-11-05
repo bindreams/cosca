@@ -1,7 +1,7 @@
 //! The tree walk over `pidfs` ids (and, at the end, `ticks` ids), on a [`FakeKernel`] that states
-//! the table. A process's key
-//! (its start time, from `stat`) and its identity (its pidfd's inode) are different numbers here, so
-//! a wrapper that hands the filter one for the other fails.
+//! the table. A process's identity
+//! (its pidfd's inode) and the start time its `stat` shows are different numbers here, so a wrapper
+//! that hands the filter one for the other fails.
 //!
 //! Rows run on every Linux that has `pidfd_open`; none needs pidfs.
 
@@ -89,7 +89,7 @@ fn resolve_or_drop_hands_out_a_pidfs_id_and_no_bound() {
 }
 
 #[skuld::test]
-fn descendants_and_children_of_keep_the_child_of_a_pidfs_root_by_start_time() {
+fn descendants_and_children_of_keep_the_child_of_a_pidfs_root() {
     assert_eq!(
         descendants(&table(), root(), &EDGES).expect("a readable root"),
         vec![child()]
@@ -101,14 +101,28 @@ fn descendants_and_children_of_keep_the_child_of_a_pidfs_root_by_start_time() {
 }
 
 /// A child that started before the root, whose `ppid` names the root while the root holds its pid,
-/// is the root's child: a subreaper adopts processes older than itself, and the `ppid` read after
-/// the root was proved is authoritative where orphans are reparented. Mutant: "a Linux walk drops a
-/// candidate that started before its parent".
+/// is the root's child: the `ppid` read after the root was proved is what counts, and no order of
+/// start times is asked. Mutant: "a Linux walk drops a candidate that started before its parent".
 #[skuld::test]
 fn a_child_that_started_before_a_pidfs_root_is_still_its_child() {
     let kernel = table().on_read(&format!("{CHILD}/stat"), Ok(&stat(CHILD, ROOT, ROOT_START - 500)));
     assert_eq!(descendants(&kernel, root(), &EDGES).unwrap(), vec![child()]);
     assert_eq!(children_of(&kernel, root(), &EDGES).unwrap(), vec![child()]);
+}
+
+/// A child whose `stat` names the root but shows no start time is a member, and the walk is
+/// complete: no start time is read, so none is missing. Mutant: "a Linux read requires a start time"
+/// (the child is unassessed, and `children` errs).
+#[skuld::test]
+fn a_pidfs_child_whose_stat_shows_no_start_time_is_a_member_of_a_complete_walk() {
+    let kernel = table().on_read(&format!("{CHILD}/stat"), Ok(format!("{CHILD} (x) S {ROOT}").as_bytes()));
+    for depth in [Recursive::Yes, Recursive::No] {
+        let walk = super::walk_from(&kernel, root(), &EDGES, depth)
+            .unwrap()
+            .expect("the root is live");
+        assert_eq!(walk.members, vec![child()], "{depth:?}");
+        assert!(walk.unassessed.is_empty(), "{:?}", walk.unassessed);
+    }
 }
 
 /// A `ticks` root whose `stat`, which proves it, is gone has nothing to walk, and that is not an

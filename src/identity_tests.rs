@@ -176,11 +176,11 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
 
     let stated = || UnknownCause::default().of_parent(STATED);
     let order = OrderKey::for_test(9);
-    let found = Resolved::Found((Key::for_test(5), order));
+    let found = Resolved::Found((Key::for_test(5), Some(order)));
 
     let nobody_gone = (Resolved::Gone, Owner::Nobody);
     let own_gone = (Resolved::Gone, Owner::Candidate);
-    let own_found = (Resolved::Found((id(CANDIDATE, 5), order.bound())), Owner::Candidate);
+    let own_found = (Resolved::Found((id(CANDIDATE, 5), Some(order))), Owner::Candidate);
     let own_unknown = (Resolved::Unknown, Owner::Candidate);
     let parent_unknown = (Resolved::Unknown, Owner::Parent);
     type Proof = fn() -> Result<(), Ordered>;
@@ -348,19 +348,19 @@ fn the_keep_predicate_keeps_only_a_key_after_the_bound() {
     }
 }
 
-/// The walk's filter over a reused-creator table, through the platform's real bound: `x` is the
-/// root's child, and `y` was created by an earlier holder of `x`'s pid (its read shows `x`'s pid as
-/// its parent number) and orders before `x`. Where the order after the parent is the proof
-/// ([`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT), Windows) `y` is dropped; elsewhere its parent
-/// number is the proof and it is kept. The resolver states each pid's read and applies `judged`, the
-/// read's own rule, so only the bounds the filter hands out and the platform's decision are on test.
-/// A real stale creator needs a Windows process table: that is `treewalk_tests`' live Windows rows.
+/// The walk's filter over a reused-creator table: `x` is the root's child, and `y` was created by an
+/// earlier holder of `x`'s pid (its read shows `x`'s pid as its parent number) and orders before `x`.
+/// Where the order after the parent is the proof ([`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT),
+/// Windows) `y` is dropped; elsewhere its parent number is the proof and it is kept. The resolver
+/// states each pid's read, with an order key only where the backends read one, and applies `judged`,
+/// the read's own rule, so only the bounds the filter hands out are on test. A real stale creator
+/// needs a Windows process table: that is `treewalk_tests`' live Windows rows.
 ///
-/// Mutants: the walk or the read hands out a bound off Windows (`y` is dropped); it hands out none on
-/// Windows, or the root's rather than the accepted parent's (`y` is kept).
+/// Mutants: the walk hands out a bound off Windows (`y` is dropped); it hands out none on Windows, or
+/// the root's rather than the accepted parent's (`y` is kept).
 #[skuld::test]
 fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
-    use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause};
+    use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};
     use crate::containment::treewalk::descendants_with;
 
     const ROOT: RawPid = 100;
@@ -368,17 +368,18 @@ fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the
     const Y: RawPid = 300;
     // Each pid's order key and the parent number its read shows.
     let table = [(X, 200, ROOT), (Y, 150, X)];
+    let order_of = |order| ORDER_AFTER_PARENT.then(|| OrderKey::for_test(order));
     let resolve = |pid: RawPid, parent: ProcessId, bound| {
         let &(_, order, shown) = table.iter().find(|(p, ..)| *p == pid).expect("a stated pid");
         let read = OrderedRead {
-            read: Resolved::Found((Key::for_test(order), OrderKey::for_test(order))),
+            read: Resolved::Found((Key::for_test(order), order_of(order))),
             parent: ParentRead::Is(shown),
             cause: UnknownCause::default(),
         };
         resolution_of("pid", pid, read.judged(pid, parent.pid(), bound).proved(|| Ok(())))
     };
 
-    let root_bound = OrderKey::for_test(100).bound();
+    let root_bound = order_of(100);
     let walk = descendants_with(id(ROOT, 100), root_bound, &[(X, ROOT), (Y, X)], resolve);
 
     let members: Vec<RawPid> = walk.members.iter().map(ProcessId::pid).collect();

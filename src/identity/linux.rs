@@ -40,7 +40,7 @@ use self::proc_view::ProcDir;
 use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::{parse_ppid, parse_starttime_jiffies};
-use super::{Existence, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
+use super::{Existence, Liveness, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
 use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
@@ -263,10 +263,9 @@ pub(super) fn of_stat(
     }
 }
 
-/// The key, the order key (the `starttime`) and the parent number of `pid`, all from the `stat` that
-/// [`of_stat`] pairs with the key. A `stat` with no `starttime` is unreadable, not a start of zero;
-/// the ppid is parsed (and an unreadable one logged) only when `ask_parent`, and is then unreadable,
-/// not a parent number.
+/// The key and the parent number of `pid`, the latter from the `stat` that [`of_stat`] pairs with
+/// the key, with no order key. The ppid is parsed (and an unreadable one logged) only when
+/// `ask_parent`, and is then unreadable, not a parent number.
 pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let (read, cause) = of_stat(kernel, pid, expected);
     let (key, stat) = match read {
@@ -282,20 +281,14 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Ke
         log::debug!("identity: the stat of pid {pid} has no readable ppid");
         ParentRead::Unreadable
     };
-    let read = match parse_starttime_jiffies(&stat) {
-        Some(ticks) => OrderedRead {
-            read: Resolved::Found((key, OrderKey(ticks))),
-            parent,
-            cause,
-        },
-        None => OrderedRead {
-            read: Resolved::Unknown,
-            parent,
-            cause: UnknownCause::default(),
-        },
-    };
-    // A `ticks` key is known only from the record just read.
-    read.against(expected)
+    // No order key: nothing on Linux orders by the start time, so a `stat` without one still gives
+    // its ppid. A `ticks` key is known only from the record just read.
+    OrderedRead {
+        read: Resolved::Found((key, None)),
+        parent,
+        cause,
+    }
+    .against(expected)
 }
 
 /// Whether the process `key` names still holds `pid`.

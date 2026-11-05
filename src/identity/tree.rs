@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{keeps_order, resolution_of, HostKernel, Kernel, ProcessId};
+use super::{keeps_order, resolution_of, HostKernel, Kernel, ProcessId, ORDER_AFTER_PARENT};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -54,9 +54,16 @@ impl ProcessId {
         let Some((parent, parent_order)) = resolution_of("ppid", ppid, read)? else {
             return Ok(None);
         };
+        debug_assert!(
+            own_order.is_some() == ORDER_AFTER_PARENT && parent_order.is_some() == ORDER_AFTER_PARENT,
+            "the reads carry an order key exactly where ORDER_AFTER_PARENT"
+        );
         // Where the creator is never updated, a genuine parent started before its child.
-        if let Some((own, parent_order)) = own_order.zip(parent_order) {
-            return Ok(keeps_order(own, parent_order).then_some(parent));
+        if ORDER_AFTER_PARENT {
+            let kept = own_order
+                .zip(parent_order)
+                .is_some_and(|(own, parent)| keeps_order(own, parent));
+            return Ok(kept.then_some(parent));
         }
         // Elsewhere `self` read after the parent must still name it, and it must still hold its pid.
         let read = ProcessId::of_ordered_with(kernel, self.pid(), Some(parent), Some(self.key), None);
