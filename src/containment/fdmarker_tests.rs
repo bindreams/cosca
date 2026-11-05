@@ -40,7 +40,7 @@ use super::{holders, holds_marker, holds_marker_query, pipe_handle_of, MarkerQue
 /// A root no process holds and no process can be a child of (past `PID_MAX`), so the ppid-walk
 /// channel finds nothing and a test sees only the channels it is about.
 pub(crate) fn inert_root() -> crate::identity::ProcessId {
-    crate::identity::ProcessId::from_parts_for_test(0x7FFF_FFF0, 1)
+    crate::identity::ProcessId::from_parts_for_test(0x7FFF_FFF0, crate::identity::Key::for_test(1))
 }
 
 /// `install` on `cmd`, as the only step of its hook.
@@ -1111,7 +1111,7 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
         kill.skipped.expect("the reaped root's kill by its number is skipped")
     };
 
-    let root = crate::identity::ProcessId::from_parts_for_test(4242, 1);
+    let root = crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1));
     let rooted = skipped(marker_without_holders(root, None));
     assert!(
         rooted.contains("root pid 4242") && !rooted.contains("pgid"),

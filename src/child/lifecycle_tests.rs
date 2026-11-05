@@ -402,7 +402,7 @@ mod settlement {
     const HANDED_BACK: &str = "; handed back to the caller in the error";
 
     fn id() -> ProcessId {
-        ProcessId::from_parts(PID, 1)
+        ProcessId::from_parts_for_test(PID, crate::identity::Key::for_test(1))
     }
 
     fn failure() -> Error {

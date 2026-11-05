@@ -12,6 +12,9 @@ mod common;
 #[cfg(target_os = "linux")]
 use common::seccomp::OPENAT2_REFUSALS as REFUSALS;
 
+#[cfg(target_os = "linux")]
+use common::test_groups::{pidfd_group_signal, Group};
+
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
 #[cfg(target_os = "linux")]
 const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
@@ -44,59 +47,50 @@ fn a_seccomp_refused_openat2_leaves_current_working() {
     }
 }
 
-/// Without `openat2` there is no view, so a by-pid read of a live pid is `Unknown`, and a pid no
-/// process can hold is still `Gone`.
+/// On pidfs (Linux 6.9+) a process is told by its pidfd, which needs no `/proc` view: a by-pid read
+/// of a live pid, and the existence and liveness of an identity, answer without `openat2`, and a pid
+/// no process can hold is `Gone`. (Below 6.9 the same reads are `Unknown` without `openat2`; the
+/// unit rows in `identity::linux::read_tests` state that host.)
 ///
-/// Mutants: an unavailable `openat2` hides an `ESRCH`; a live pid reads as `Gone`.
+/// Mutants: a pidfs read asks the `/proc` view; an unavailable `openat2` hides an `ESRCH`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_seccomp_refused_openat2_makes_by_pid_reads_unknown_or_gone() {
+fn a_seccomp_refused_openat2_leaves_pidfs_by_pid_reads_working(#[fixture(pidfd_group_signal)] _group: &Group) {
     let id = ProcessId::current();
     for (errno, _) in REFUSALS {
         with_openat2_refused(errno, || {
-            assert!(
-                matches!(ProcessId::of(std::process::id()), Resolved::Unknown),
-                "{errno}"
-            );
-            assert_eq!(id.exists(), Existence::Unknown, "{errno}");
-            assert_eq!(id.is_alive(), Liveness::Unknown, "{errno}");
+            assert_eq!(ProcessId::of(std::process::id()), Resolved::Found(id), "{errno}");
+            assert_eq!(id.exists(), Existence::Present, "{errno}");
+            assert_eq!(id.is_alive(), Liveness::Alive, "{errno}");
             assert!(matches!(ProcessId::of(NO_PROCESS_CAN_HOLD), Resolved::Gone), "{errno}");
         });
     }
 }
 
-/// An open under a refused `openat2` is `Unsupported` naming it, in the policy's message shape.
-#[cfg(target_os = "linux")]
-fn assert_names_openat2(result: Result<impl std::fmt::Debug, cosca::error::Error>, errno: &str) {
-    match result {
-        Err(e @ cosca::error::Error::Unsupported { .. }) => assert_eq!(
-            e.to_string(),
-            format!("process open is not supported on linux: {}", refused_detail(errno))
-        ),
-        other => panic!("an open under an openat2 answering {errno} must be Unsupported, got {other:?}"),
-    }
-}
-
-/// `pidfd_open` succeeds, then the fdinfo check needs the `/proc` dirfd, which needs `openat2`.
+/// On pidfs the pidfd proves the identity, so an open needs no `/proc` view: it opens under a
+/// refused `openat2`. (Below 6.9 it is `Unsupported` naming `openat2`; the unit rows in
+/// `os_process::linux::open_tests` state that host.)
 ///
-/// Mutant: the success path reports an unopenable `/proc` as `Unassessable`.
+/// Mutant: the pidfs path reads the fdinfo or a `stat` through the `/proc` dirfd.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_seccomp_refused_openat2_makes_open_unsupported_naming_openat2() {
+fn a_seccomp_refused_openat2_leaves_a_pidfs_open_working(#[fixture(pidfd_group_signal)] _group: &Group) {
     let id = ProcessId::current();
-    for (errno, name) in REFUSALS {
-        with_openat2_refused(errno, || assert_names_openat2(cosca::Process::open(id), name));
+    for (errno, _) in REFUSALS {
+        let opened = with_openat2_refused(errno, || cosca::Process::open(id));
+        assert!(matches!(opened, Ok(Some(_))), "{errno}: {opened:?}");
     }
 }
 
-/// A live worker thread's tid is no thread-group leader, so `pidfd_open` refuses it (`EINVAL`
-/// before 6.16, `ENOENT` from 6.16) and the open decides by the `/proc` view, which needs
-/// `openat2`.
+/// A live worker thread's tid is no thread-group leader: on pidfs it opens only with
+/// `PIDFD_THREAD`, which proves it, and the open then names the thread, with no `/proc` view.
 ///
-/// Mutant: that arm reports an unopenable `/proc` as `Unassessable`.
+/// Mutant: the thread arm decides by the `/proc` view.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_seccomp_refused_openat2_makes_open_of_a_live_non_leader_tid_unsupported_naming_openat2() {
+fn a_seccomp_refused_openat2_leaves_the_open_of_a_live_non_leader_tid_not_a_leader(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let worker = std::thread::spawn(move || {
@@ -106,8 +100,12 @@ fn a_seccomp_refused_openat2_makes_open_of_a_live_non_leader_tid_unsupported_nam
     });
     let tid = tid_rx.recv().expect("the worker reports its tid");
     let id = ProcessId::of(tid).found().expect("the live worker's tid resolves");
-    for (errno, name) in REFUSALS {
-        with_openat2_refused(errno, || assert_names_openat2(cosca::Process::open(id), name));
+    for (errno, _) in REFUSALS {
+        let opened = with_openat2_refused(errno, || cosca::Process::open(id));
+        assert!(
+            matches!(opened, Err(cosca::error::Error::NotThreadGroupLeader { .. })),
+            "{errno}: {opened:?}"
+        );
     }
     drop(stop_tx);
     worker.join().expect("the worker ends");
