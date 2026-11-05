@@ -5,7 +5,7 @@
 //!
 //! These rows run on macOS CI only.
 
-use super::{fault, read_record, resolve_ppid, trusted_ppid, PpidRead};
+use super::{fault, read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
 use crate::identity::{Key, ProcessId, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
@@ -96,18 +96,18 @@ fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
     assert_eq!(trusted_ppid(7, 3), Some(3));
 }
 
-/// The record of launchd (pid 1, parent number `0`) gives its parent as `Some(0)`: [`Record::ppid`]
-/// hands `trusted_ppid` the pid it judges. One read of the record, so a regression fails by
-/// assertion, where `ordered_read` would re-read the `0` of a pid it took for a fork in progress
-/// forever. Pid 0's rule is `trusted_ppid`'s own row.
+/// One parent read of launchd (pid 1, parent number `0`) finds its parent `0`, not a fork in
+/// progress. One read, so a regression fails by assertion, where `ordered_read` would re-read the
+/// `0` forever. Pid 0's rule is `trusted_ppid`'s own row.
 ///
-/// Mutant: `Record::ppid` is `(raw != 0).then_some(raw)`, whatever the pid.
+/// Mutants: `Record::ppid` is `(raw != 0).then_some(raw)`, whatever the pid; `read_ppid_once` judges
+/// the record under another pid.
 #[skuld::test]
-fn the_record_of_launchd_reads_its_parent_as_zero() {
-    let Resolved::Found(launchd) = read_record(1) else {
-        panic!("launchd's record reads for any user");
-    };
-    assert_eq!(launchd.ppid(1), Some(0));
+fn one_parent_read_of_launchd_finds_its_parent_zero() {
+    assert!(
+        matches!(read_ppid_once(1), PpidRead::Found(0, _)),
+        "launchd's record reads for any user and names parent 0"
+    );
 }
 
 /// An ordered read waits out a fork-in-progress parent number only when it asks for the parent: one

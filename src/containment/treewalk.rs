@@ -78,7 +78,8 @@
 //! no order key, or a parent number that cannot be read) goes to the proof of the accepted parent
 //! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
 //! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
-//! warning naming the candidate (on Windows, naming the `NTSTATUS`). There is no parent-order rule
+//! warning naming the candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or
+//! sequence-number query). There is no parent-order rule
 //! off Windows ([`ORDER_AFTER_PARENT`] is off): a tracer is the parent of a traced child it started
 //! after.
 

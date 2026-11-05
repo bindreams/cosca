@@ -345,18 +345,17 @@ pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool)
 
 /// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives; a refused query is
 /// [`ParentRead::Unreadable`] with its `NTSTATUS` added to `cause`. A pid is a `DWORD`, so a creator
-/// wider than one is a contract violation: asserted in debug, and in release warned about and read as
-/// the largest pid, which no process holds and so is another's parent number (`Gone`), never a match.
+/// wider than one is a contract violation: asserted in debug, and in release a parent number that
+/// cannot be read, which goes to the parent's proof and the walk's warning like any other.
 fn creator_read(pid: RawPid, creator: Result<usize, NTSTATUS>, cause: UnknownCause) -> (ParentRead, UnknownCause) {
     match creator {
-        Ok(creator) => {
-            let creator = RawPid::try_from(creator).unwrap_or_else(|_| {
+        Ok(creator) => match RawPid::try_from(creator) {
+            Ok(creator) => (ParentRead::Is(creator), cause),
+            Err(_) => {
                 debug_assert!(false, "the creator pid {creator:#x} of pid {pid} is wider than a DWORD");
-                log::warn!("the creator pid {creator:#x} of pid {pid} is wider than a DWORD: read as no process");
-                RawPid::MAX
-            });
-            (ParentRead::Is(creator), cause)
-        }
+                (ParentRead::Unreadable, cause)
+            }
+        },
         Err(status) => {
             log::debug!(
                 "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \

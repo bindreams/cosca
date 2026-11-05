@@ -304,8 +304,8 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     }
 }
 
-/// A read that found no record says its parent number could not be read only if it asked for it, so
-/// that a gone parent is `Gone` and not blamed on the candidate.
+/// A read that found no record says its parent number could not be read only if it asked for it
+/// (the table above judges each `parent` value).
 ///
 /// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
 /// (a `NotAsked` that is judged against a named parent breaks the debug assertion there).
