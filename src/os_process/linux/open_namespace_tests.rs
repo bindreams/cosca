@@ -1,4 +1,4 @@
-//! `open_verified` against REAL namespace layouts, in re-exec'd children that own private
+//! `open_verified_with` against REAL namespace layouts, in re-exec'd children that own private
 //! mount or pid namespaces (see `test_child::namespaces` for the group's gating).
 
 use std::io;
@@ -22,7 +22,7 @@ use crate::test_groups::{namespaces, Group};
 /// not depend on the view (the success path proves its target through the pidfd's fdinfo), so it
 /// keeps working.
 ///
-/// Mutants: "the success path requires a `Same` `proc_view_with`" — every live `open_verified` is
+/// Mutants: "the success path requires a `Same` `proc_view_with`" — every live `open_verified_with` is
 /// then `Unassessable`; "read `status` with a plain `openat`" — the fake status is read as real.
 #[skuld::test]
 fn namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working(#[fixture(namespaces)] _group: &Group) {
@@ -35,7 +35,7 @@ fn fixture_status_mounted_over() {
         return;
     }
     ns::enter_private_mount_ns();
-    // A live foreign process: opened through `open_verified`, then killed. Its
+    // A live foreign process: opened through `open_verified_with`, then killed. Its
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
@@ -75,7 +75,7 @@ fn fixture_status_mounted_over() {
 /// from its own `getpid()`.
 ///
 /// Mutant: "ignore the fdinfo mismatch" — the outer `/proc/1` is the outer init, whose start
-/// token differs from this `ProcessId`'s, so `open_verified` answers `Ok(None)` (gone) for a live
+/// token differs from this `ProcessId`'s, so `open_verified_with` answers `Ok(None)` (gone) for a live
 /// target.
 #[skuld::test]
 fn namespaces_an_outer_procfs_is_diverged_and_unassessable(#[fixture(namespaces)] _group: &Group) {

@@ -33,7 +33,7 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
         id.pid()
     );
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
-    match pidfd_open_checked(kernel, raw) {
+    match kernel.pidfd_open(raw) {
         Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
@@ -90,7 +90,8 @@ pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
 /// Two syscalls per spawn, and no cached verdict: a cache is process-global state, and a filter
 /// can be installed after the first spawn.
 pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error> {
-    pidfd_open_checked(kernel, rustix::process::getpid())
+    kernel
+        .pidfd_open(rustix::process::getpid())
         .map(drop)
         .map_err(spawn_open_error)
 }
@@ -216,58 +217,6 @@ fn unassessable(
     Error::Unassessable {
         detail,
         source: source.or_else(|| pidfd_errno.map(std::io::Error::from)),
-    }
-}
-
-/// `pidfd_open`, with a test seam: a forced errno (see [`fault::force_pidfd_open_errno_once`])
-/// replaces the syscall once.
-#[cfg(test)]
-fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    match fault::take_forced_pidfd_open_errno() {
-        Some(errno) => Err(errno),
-        None => kernel.pidfd_open(raw),
-    }
-}
-#[cfg(not(test))]
-fn pidfd_open_checked(kernel: &dyn Kernel, raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    kernel.pidfd_open(raw)
-}
-
-#[cfg(test)]
-pub(crate) mod fault {
-    thread_local! {
-        static FORCE_PIDFD_OPEN_ERRNO: std::cell::RefCell<std::collections::VecDeque<Option<rustix::io::Errno>>> =
-            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
-    }
-
-    /// Disarms the forced errno on drop, so an unconsumed force can't leak into the next test on
-    /// this thread.
-    #[must_use = "dropping this immediately disarms the forced errno; bind it for the probe's duration"]
-    pub(crate) struct ForcedPidfdOpenErrno(());
-
-    /// Force the NEXT `pidfd_open` inside `open_verified` on THIS thread to fail with `errno`,
-    /// consumed the first time it's read.
-    pub(crate) fn force_pidfd_open_errno_once(errno: rustix::io::Errno) -> ForcedPidfdOpenErrno {
-        force_pidfd_open_script([Some(errno)])
-    }
-
-    /// Script the next `pidfd_open` calls inside `open_verified` on THIS thread, one entry per
-    /// call: `Some(errno)` fails it, `None` lets it through. Calls past the script run for real.
-    pub(crate) fn force_pidfd_open_script(
-        script: impl IntoIterator<Item = Option<rustix::io::Errno>>,
-    ) -> ForcedPidfdOpenErrno {
-        FORCE_PIDFD_OPEN_ERRNO.with(|f| *f.borrow_mut() = script.into_iter().collect());
-        ForcedPidfdOpenErrno(())
-    }
-
-    impl Drop for ForcedPidfdOpenErrno {
-        fn drop(&mut self) {
-            FORCE_PIDFD_OPEN_ERRNO.with(|f| f.borrow_mut().clear());
-        }
-    }
-
-    pub(crate) fn take_forced_pidfd_open_errno() -> Option<rustix::io::Errno> {
-        FORCE_PIDFD_OPEN_ERRNO.with(|f| f.borrow_mut().pop_front().flatten())
     }
 }
 
