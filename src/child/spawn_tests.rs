@@ -948,10 +948,13 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let pid = child.id().pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
-    let (err, fate) = super::finish_elevated(child, failed_write())
+    let (err, fate, unreaped) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_with();
+        .expect_may_have_started_parts();
     assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
+    // Not shown collected, so handed back. The forced failure reaps first, so there is nothing left
+    // to wait for.
+    unreaped.expect("the root is handed back").leak();
 
     let Error::Elevation { detail, .. } = &err else {
         panic!("got {err:?}");

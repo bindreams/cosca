@@ -114,13 +114,12 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// warns once: the unsettled root, a failed reap and any other leftover share one record, labelled
 /// `finish_elevated`.
 ///
-/// The handle is disarmed once the cleanup has handed the root back, or has settled both the tree
-/// and the root: each was killed, is gone, or was deliberately left alone (a reaped or unpinned
-/// root, a live front). A root is handed back when its kill was refused (or never sent, for a live
-/// front) and the look at it found it running or failed: it is uncollected, and the caller's. If
-/// the tree kill failed, or a reap after a delivered kill failed, and the root was not handed back,
-/// the handle stays armed, so its drop tries again; that drop does not warn of the event a second
-/// time.
+/// A root the cleanup did not show collected is handed back in the error (an `Unreaped`) and the
+/// handle is disarmed: a root whose kill was refused (or never sent, for a live front) and whose
+/// look found it running or failed, or whose reap failed after a delivered kill. The handle is also
+/// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
+/// alone (a reaped or unpinned root). Only a failed tree kill leaves the handle armed, so its drop
+/// writes the kill again; that drop does not warn of the event a second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
@@ -160,10 +159,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
-    // deliberately not signalled (an unpinned root, a live front). A refused kill, or a reap that
-    // failed, leaves it to the handle's drop to try again.
-    let mut root_settled = true;
     // Whether the cleanup left the root uncollected and still the handle's: the caller can take it.
     let mut uncollected = false;
     let pid = child.id().pid();
@@ -229,20 +224,30 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         (note.to_string(), ChildFate::Reaped)
                     }
                     Err(e) if exited_front => {
-                        root_settled = false;
-                        report
-                            .left
-                            .push(format!("could not reap the exited elevated child pid {pid}: {e}"));
+                        uncollected = !reaped_elsewhere(&e);
+                        report.left.push(format!(
+                            "could not reap the exited elevated child pid {pid}: {e}{}",
+                            if uncollected {
+                                Disposition::HandBack.handed_back_suffix()
+                            } else {
+                                ""
+                            }
+                        ));
                         (
                             format!("the elevated child had already exited, but could not be reaped ({e})"),
                             ChildFate::Killed,
                         )
                     }
                     Err(e) => {
-                        root_settled = false;
-                        report
-                            .left
-                            .push(format!("could not reap the killed elevated child pid {pid}: {e}"));
+                        uncollected = !reaped_elsewhere(&e);
+                        report.left.push(format!(
+                            "could not reap the killed elevated child pid {pid}: {e}{}",
+                            if uncollected {
+                                Disposition::HandBack.handed_back_suffix()
+                            } else {
+                                ""
+                            }
+                        ));
                         (
                             format!("the elevated child was killed but could not be reaped ({e})"),
                             ChildFate::Killed,
@@ -251,7 +256,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 }
             }
             Err(e) => {
-                root_settled = front_closed;
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
@@ -268,7 +272,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         }
     };
     let warned = report.emit(&[]);
-    // A root still running is the caller's: it is disarmed, and handed back in the error.
+    // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let mut torn = crate::child::owned::teardown::TeardownOutcome::new(fate);
     torn.uncollected = uncollected;
     let hands_back = Disposition::HandBack.hands_back(&torn);
@@ -277,7 +281,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     } else {
         root_note
     };
-    if hands_back || (tree_settled && root_settled) {
+    if hands_back || tree_settled {
         child.kill_on_drop = false;
     }
     // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
@@ -309,6 +313,12 @@ pub(crate) fn fate_of_a_look(
         Err(Some(libc::ECHILD)) => ChildFate::Gone,
         Err(_) => ChildFate::Unknown,
     }
+}
+
+/// Whether a failed wait says someone else reaped the child (`ECHILD`): it is then not ours to hand back.
+#[cfg(unix)]
+fn reaped_elsewhere(error: &Error) -> bool {
+    matches!(error, Error::Io(e) if e.raw_os_error() == Some(libc::ECHILD))
 }
 
 /// `child.wait()` after the root's kill, which a test can force to fail. The forced failure still

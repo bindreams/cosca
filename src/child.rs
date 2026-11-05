@@ -1190,7 +1190,7 @@ impl Child {
             if cgroup_only {
                 match kill.result.and_then(|()| self.cgroup_kill_reached()) {
                     // The cgroup kill ended it: reap it, sending nothing.
-                    Ok(()) => self.proc.reap_after_tree_kill(),
+                    Ok(()) => self.proc.reap_after_tree_kill(disposition),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
                     Err(e) => self.tear_down_leaf_and_look_at_front(caller, &e, disposition),
@@ -1249,10 +1249,12 @@ fn word_front(
             None
         }
         LookOutcome::LookFailed(e) => Some(format!(
-            "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
+            "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e}){}",
+            disposition.handed_back_suffix()
         )),
         LookOutcome::ReapFailed(e) => Some(format!(
-            "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e})"
+            "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e}){}",
+            disposition.handed_back_suffix()
         )),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(

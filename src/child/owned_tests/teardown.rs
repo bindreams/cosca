@@ -73,6 +73,77 @@ pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Arm
     crate::wait::block_probe::on_blocking(move || fake.wake())
 }
 
+/// `tear_down(id, Kill, no threshold)` over `fake` for a caller that does `disposition`.
+fn tear_down_as(fake: &FakeProcess, disposition: Disposition) -> TeardownOutcome {
+    OwnedChild::new(Box::new(fake.clone())).tear_down(
+        Some(id()),
+        TeardownKind::Kill {
+            disposition,
+            tree: None,
+        },
+        None,
+    )
+}
+
+/// The words a leftover has under `disposition`: a caller that hands the child back says so, and one
+/// that leaves it says nothing of that.
+#[track_caller]
+fn assert_left_says(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
+    let handed_back = disposition == Disposition::HandBack;
+    let text = torn.left.as_deref().unwrap_or_default();
+    assert!(text.contains(wanted), "{torn:?}");
+    assert_eq!(
+        text.ends_with("; handed back to the caller in the error"),
+        handed_back,
+        "{torn:?}"
+    );
+    assert!(torn.uncollected, "{torn:?}");
+}
+
+/// A reap that fails after a delivered kill leaves the child uncollected, and the leftover says it is
+/// handed back to a caller that hands it back.
+///
+/// Mutant: the leftover ignores the disposition.
+#[skuld::test]
+fn a_failed_reap_after_a_kill_is_worded_by_the_disposition() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let fake = fake()
+            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
+            .signals([Ok(Sent::Delivered)]);
+        let torn = tear_down_as(&fake, disposition);
+        assert_left_says(&torn, disposition, "the reap after the kill failed");
+    }
+}
+
+/// A refused kill whose look then fails leaves the child uncollected, and the leftover says it is
+/// handed back to a caller that hands it back.
+///
+/// Mutant: the leftover ignores the disposition.
+#[cfg(unix)]
+#[skuld::test]
+fn a_refused_kill_whose_look_failed_is_worded_by_the_disposition() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let fake = fake()
+            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
+            .signals([crate::os_process::fake::failed_signal(libc::EPERM)]);
+        let torn = tear_down_as(&fake, disposition);
+        assert_left_says(&torn, disposition, "and the look at it failed");
+    }
+}
+
+/// The reap of a child a tree kill ended, when it fails, is worded the same way.
+///
+/// Mutant: that reap's leftover ignores the disposition.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failed_reap_after_a_tree_kill_is_worded_by_the_disposition() {
+    for disposition in [Disposition::Leave, Disposition::HandBack] {
+        let fake = fake().reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
+        let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(disposition);
+        assert_left_says(&torn, disposition, "the reap after the kill failed");
+    }
+}
+
 /// A reap that fails after the kill is not dropped silently: it is returned for the caller's one
 /// warn, and logged by nobody here.
 ///
@@ -126,7 +197,7 @@ fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_no
 #[skuld::test]
 fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-    let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill();
+    let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(Disposition::Leave);
     assert_eq!(torn.fate, ChildFate::Killed);
     assert_eq!(torn.left, None);
 }
@@ -139,7 +210,7 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
 fn a_reap_after_a_tree_kill_waits_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
     let _fire = fire_on_block(&fake);
-    let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill();
+    let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill(Disposition::Leave);
     assert_eq!(torn.fate, ChildFate::Reaped);
     assert_eq!(torn.left, None);
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");

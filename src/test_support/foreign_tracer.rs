@@ -310,43 +310,62 @@ impl Tracer {
 pub(crate) enum Holder {
     /// Asleep in a `waitid` that waits.
     Blocked,
+    /// Not in such a `waitid`, and its wait for the child has warned that it is still waiting: the
+    /// wait is `OwnedChild`'s, which polls a zombie a tracer holds instead of sleeping in `waitid`.
+    Warned,
     Finished,
 }
 
-/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
-/// `WNOHANG`, or is gone. Both are conditions the thread reaches by itself, so the only exit is
-/// the condition; the pauses between reads are a backoff, not a bound. Any other shape of the
-/// file than `running` or `<nr> ...` panics with its text.
-pub(crate) fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
+/// One read of `/proc/self/task/<tid>/syscall`: `Some(Blocked)` if the thread sleeps in a `waitid`
+/// without `WNOHANG`, `Some(Finished)` if it is gone, `None` otherwise. Any other shape of the file
+/// than `running` or `<nr> ...` panics with its text.
+fn thread_state(tid: libc::pid_t) -> Option<Holder> {
     let path = format!("/proc/self/task/{tid}/syscall");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim() == "running" => None,
+        // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `-1 <sp> <pc>`.
+        Ok(text) => {
+            let mut fields = text.split_whitespace();
+            let nr: libc::c_long = fields
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{path}: no syscall number in {text:?}"));
+            if nr != libc::SYS_waitid {
+                return None;
+            }
+            // `waitid(idtype, id, infop, options, rusage)`: `options` is argument 4.
+            let options = fields
+                .nth(3)
+                .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok())
+                .unwrap_or_else(|| panic!("{path}: no waitid options in {text:?}"));
+            (options & libc::WNOHANG as u64 == 0).then_some(Holder::Blocked)
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Some(Holder::Finished),
+        Err(e) => panic!("read {path}: {e}"),
+    }
+}
+
+/// Re-reads the thread `tid` until it sleeps in a `waitid` without `WNOHANG`, or is gone, or `warned`
+/// says it has said it is still waiting. Each is a condition the thread reaches by itself, so the
+/// only exit is the condition; the pauses between reads are a backoff, not a bound. A thread that
+/// has finished is `Finished` whatever `warned` says.
+fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -> bool) -> Holder {
     let mut pause = std::time::Duration::from_micros(50);
     loop {
-        match std::fs::read_to_string(&path) {
-            Ok(text) if text.trim() == "running" => {}
-            // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `-1 <sp> <pc>`.
-            Ok(text) => {
-                let mut fields = text.split_whitespace();
-                let nr: libc::c_long = fields
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or_else(|| panic!("{path}: no syscall number in {text:?}"));
-                if nr == libc::SYS_waitid {
-                    // `waitid(idtype, id, infop, options, rusage)`: `options` is argument 4.
-                    let options = fields
-                        .nth(3)
-                        .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or_else(|| panic!("{path}: no waitid options in {text:?}"));
-                    if options & libc::WNOHANG as u64 == 0 {
-                        return Holder::Blocked;
-                    }
-                }
-            }
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return Holder::Finished,
-            Err(e) => panic!("read {path}: {e}"),
+        match thread_state(tid) {
+            Some(holder) => return holder,
+            None if warned() => return Holder::Warned,
+            None => {}
         }
         std::thread::sleep(pause);
         pause = (pause * 2).min(std::time::Duration::from_millis(5));
     }
+}
+
+/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
+/// `WNOHANG`, or is gone (see [`thread_state`]).
+pub(crate) fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
+    await_blocked_warned_or_finished(tid, || false)
 }
 
 /// Marks the [`tokio_tracee`] re-exec; the value is the driver's pid.
@@ -413,14 +432,17 @@ pub(crate) enum Names {
 }
 
 /// Runs `teardown` on a thread of its own, on which slow teardowns warn (see
-/// [`crate::tokio::child::fault::warn_slow_teardowns`]), until it sleeps in a blocking `waitid`; then
-/// has the tracer `seized` answers hand the zombie of its child back. `seized` runs once the thread
-/// has started. Asserts that the teardown blocked, that by then exactly one warn, naming the child
-/// as `names` says, said it was still waiting, and that the tracee died of a `SIGKILL`, not of its
-/// own exit once the test released its stdin. Answers what `teardown` returned.
+/// [`crate::tokio::child::fault::warn_slow_teardowns`]), until it has said it is still waiting or
+/// sleeps in a blocking `waitid`; then has the tracer `seized` answers hand the zombie of its child
+/// back. `seized` runs once the thread has started. Asserts that the teardown had not returned by
+/// then, that exactly one warn, naming the child as `names` says, said it was still waiting, and
+/// that the tracee died of a `SIGKILL`, not of its own exit once the test released its stdin.
+/// Answers what `teardown` returned.
 ///
-/// A teardown that does not warn, or whose kill sends nothing, blocks all the same and returns once
-/// the tracer has let go, so it fails an assertion here instead of hanging.
+/// A teardown whose kill sends nothing waits all the same and returns once the tracer has let go, so
+/// it fails an assertion here instead of hanging. One that does not warn fails the same way if it
+/// sleeps in a blocking `waitid`; one that polls instead (`OwnedChild`'s wait) is waited for until
+/// nextest's bound.
 #[cfg(feature = "tokio")]
 pub(crate) fn assert_warns_once_before_blocking<R: Send>(
     names: Names,
@@ -443,11 +465,16 @@ pub(crate) fn assert_warns_once_before_blocking<R: Send>(
         });
         let tid = tid_rx.recv().expect("the teardown's tid");
         let (pid, mut tracer) = seized();
-        let holder = await_blocked_or_finished(tid);
         let who = match names {
             Names::Pid => format!("child {pid}"),
             Names::Unknown => "pid unknown".to_owned(),
         };
+        let said_waiting = || {
+            crate::log_capture::records_since(mark, &who)
+                .iter()
+                .any(|text| text.contains("still waiting"))
+        };
+        let holder = await_blocked_warned_or_finished(tid, said_waiting);
         let warns: Vec<_> = crate::log_capture::records_since(mark, &who)
             .into_iter()
             .filter(|text| text.contains("still waiting"))
@@ -457,9 +484,9 @@ pub(crate) fn assert_warns_once_before_blocking<R: Send>(
         (pid, holder, warns, status, thread.join().expect("the teardown"))
     });
 
-    assert_eq!(
+    assert_ne!(
         holder,
-        Holder::Blocked,
+        Holder::Finished,
         "the teardown returned while the tracer still held child {pid}'s zombie"
     );
     assert!(

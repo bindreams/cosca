@@ -381,6 +381,16 @@ mod worded {
         );
     }
 
+    /// The suffix of a front the caller hands back; a caller that leaves it says nothing of that.
+    ///
+    /// Mutant: the wording ignores the disposition.
+    fn handed_back(disposition: Disposition) -> &'static str {
+        match disposition {
+            Disposition::Leave => "",
+            Disposition::HandBack => "; handed back to the caller in the error",
+        }
+    }
+
     #[skuld::test]
     fn a_front_that_cannot_be_looked_at_is_worded() {
         for disposition in BOTH {
@@ -389,8 +399,9 @@ mod worded {
                 Ok(None),
                 &fake().reaps([ReapAnswer::Err(io::ErrorKind::Other)]),
                 &format!(
-                    "elevation front pid 4242 could not be looked at after its cgroup's teardown ({})",
-                    cause()
+                    "elevation front pid 4242 could not be looked at after its cgroup's teardown ({}){}",
+                    cause(),
+                    handed_back(disposition)
                 ),
             );
         }
@@ -404,8 +415,9 @@ mod worded {
                 Ok(Some(&FakeReach::answering(Ok(true)))),
                 &fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]),
                 &format!(
-                    "elevation front pid 4242 was killed through its cgroup, and could not be reaped ({})",
-                    cause()
+                    "elevation front pid 4242 was killed through its cgroup, and could not be reaped ({}){}",
+                    cause(),
+                    handed_back(disposition)
                 ),
             );
         }

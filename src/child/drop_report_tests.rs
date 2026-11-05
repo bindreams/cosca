@@ -169,75 +169,108 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused_and_look_failed() {
     assert!(status.success(), "the root exits on EOF: {status:?}");
 }
 
-/// A cleanup that warned of its unknown root and then left its handle armed (the root kill was
-/// delivered, and the reap after it failed): the handle's drop retries and its kill is refused. The
-/// refusal is new, which the cleanup did not report, so the drop warns of it; the unknown root it
-/// repeats rides along.
+/// A failed spawn's cleanup whose reap fails after a delivered kill: the root is not shown
+/// collected, so it is handed back and the handle is disarmed, and the handle's drop does not retry.
 ///
-/// Mutant: the drop's report is a `debug` record whenever the cleanup warned of anything.
+/// Mutant: the cleanup leaves the handle armed and drops the root (a retry that fails leaks it).
 #[skuld::test]
-fn a_retry_that_fails_anew_warns_of_the_new_failure() {
+fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() {
     crate::log_capture::install();
     let (mut child, writer) = bare_blocker();
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
-    let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    // The first kill is scripted as delivered and sends nothing: the root runs until the writer drops.
+    // The kill is scripted as delivered and sends nothing: the root exits when released, below.
     let fake = child.proc.script_over(|f| {
-        f.peeks([err_peek(), err_peek()])
-            .signals([Ok(crate::signal::Sent::Delivered), refused()])
+        f.signals([Ok(crate::signal::Sent::Delivered)])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
 
-    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (_, fate, unreaped) = crate::child::spawn::failure::expect_handed_back(failure.into());
+    let handed_back = crate::test_child::HandedBack::new(writer, Some(unreaped));
 
-    fake.assert_peeks_exhausted();
-    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
-    assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
-    let warns = warns_since(mark);
-    assert_eq!(warns.len(), 2, "{warns:?}");
-    assert!(
-        warns[0].starts_with("finish_elevated:") && warns[0].contains("RootState::Unknown"),
-        "{warns:?}"
-    );
-    assert!(
-        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated"),
-        "the retry's own refusal is warned of: {warns:?}"
-    );
-    drop(writer);
-}
-
-/// A cleanup that warned of its unknown root and left its handle armed (the root kill was
-/// delivered, and the reap after it failed): the handle's drop retries, its kill lands, and all the
-/// drop has to say is the unknown root again, which is a `debug` record.
-///
-/// Mutant: the drop's report ignores that the cleanup already warned.
-#[skuld::test]
-fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
-    crate::log_capture::install();
-    let (mut child, writer) = bare_blocker();
-    // Released once the drop's retried kill returned: that kill is the one that lands.
-    let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
-    let teardowns = crate::child::owned::seams::record_root_teardowns();
-    let mark = crate::log_capture::mark();
-    let err_peek = || Err(std::io::Error::other("forced peek failure"));
-    // The first kill is scripted as delivered and sends nothing; the drop's kill is the real one.
-    let fake = child.proc.script_over(|f| {
-        f.peeks([err_peek(), err_peek()])
-            .signals([Ok(crate::signal::Sent::Delivered)])
-            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
-    });
-
-    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-
-    fake.assert_peeks_exhausted();
-    assert_eq!(fake.signal_calls().len(), 2, "the cleanup's kill and the retry");
-    assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
+    assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    assert_eq!(fake.signal_calls().len(), 1, "the cleanup's kill alone");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
-    // Whatever the drop says of the unknown root again is not a warn.
-    blocker.assert_killed();
+    assert!(
+        warns[0].contains("could not reap the killed elevated child")
+            && warns[0].ends_with("handed back to the caller in the error"),
+        "{warns:?}"
+    );
+    let status = handed_back.wait();
+    assert!(status.success(), "the root exits on EOF: {status:?}");
+}
+
+/// A child in a stand-in cgroup leaf whose first `cgroup.kill` write fails (a write to a directory),
+/// with the write end of its stdin, the leaf's path and its `cgroup.kill`. The leaf's own `Drop` is
+/// disarmed, so only the handle's drop may retry the kill. The directory is returned to outlive them.
+#[cfg(target_os = "linux")]
+fn child_in_a_leaf_whose_kill_fails() -> (
+    crate::Child,
+    std::io::PipeWriter,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-retry-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    let kill_file = leaf_path.join("cgroup.kill");
+    std::fs::create_dir(&kill_file).expect("make cgroup.kill a directory");
+    crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");
+    child.attached.disarm();
+    (child, writer, leaf_path, kill_file, dir)
+}
+
+/// A tree kill that fails in a cleanup that then kills the root: the tree is not settled, so the
+/// handle stays armed, and its drop writes the kill again. This is the one path that leaves the
+/// handle armed. The drop's kill fails again with what the cleanup already warned of, so the drop's
+/// record is `debug`, and the cleanup's is the one warn.
+///
+/// Mutant: the drop's report warns again of what the cleanup warned of.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
+    use crate::child::spawn::fault;
+
+    crate::log_capture::install();
+    let (child, writer, leaf_path, _kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
+    // The root is released once killed: a kill that sent nothing exits 0.
+    let reaps = fault::record_teardown_reaps();
+    let _hook = fault::set_between_kill_and_wait(move || drop(writer));
+    let mark = crate::log_capture::mark();
+
+    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    drop(err);
+
+    reaps.assert_killed();
+    let marker = crate::child::spawn::teardown_warn_marker(&leaf_path);
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &marker),
+        [log::Level::Warn],
+        "the cleanup's warn is the only one"
+    );
+    let drop_records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
+    assert!(
+        drop_records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Debug && text.contains("contained-tree teardown")),
+        "the drop retried the kill and said so at debug: {drop_records:?}"
+    );
 }
 
 /// A tree kill that fails once, in a cleanup that then kills the root: the tree is not settled, so
@@ -251,27 +284,7 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
     use crate::child::spawn::fault;
 
     crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-retry-leaf");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
-    let kill_file = leaf_path.join("cgroup.kill");
-    // A write to a directory fails: the leaf's first kill is refused.
-    std::fs::create_dir(&kill_file).expect("make cgroup.kill a directory");
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.clone(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
-    let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(stdin).expect("set stdin");
-    let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");
-    // Rule out the leaf's own `Drop`: only the handle's drop may retry.
-    child.attached.disarm();
+    let (child, writer, leaf_path, kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
     // The failure ends once the root is killed: the retry finds a file it can write. The root is
     // released there too: a kill that sent nothing exits 0.
     let reaps = fault::record_teardown_reaps();

@@ -532,7 +532,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     crate::test_child::wait_until_zombie(child.id().pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
-    let (err, fate) = crate::child::spawn::finish_elevated(
+    let (err, fate, unreaped) = crate::child::spawn::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
@@ -540,8 +540,11 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
         }),
     )
     .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with();
+    .expect_may_have_started_parts();
     assert_eq!(fate, crate::error::ChildFate::Killed, "the exit was not collected");
+    // Not shown collected, so handed back. The forced failure reaps first, so there is nothing left
+    // to wait for.
+    unreaped.expect("the front is handed back").leak();
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
     let Error::Elevation { detail, .. } = &err else {
         panic!("expected an Elevation error, got {err:?}");

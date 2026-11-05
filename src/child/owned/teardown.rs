@@ -55,6 +55,15 @@ impl Disposition {
     pub(crate) fn hands_back(self, torn: &TeardownOutcome) -> bool {
         self == Disposition::HandBack && torn.uncollected
     }
+
+    /// What a warn about an uncollected child adds when the caller hands it back: where the child
+    /// went. Nothing for a caller that leaves it.
+    pub(crate) fn handed_back_suffix(self) -> &'static str {
+        match self {
+            Disposition::Leave => "",
+            Disposition::HandBack => "; handed back to the caller in the error",
+        }
+    }
 }
 
 /// What a teardown does to the child.
@@ -184,13 +193,13 @@ impl OwnedChild {
                         crate::child::spawn::fault::record_teardown_reap(self.pid().unwrap_or(0), _status);
                         TeardownOutcome::new(ChildFate::Reaped)
                     }
-                    Err(unreaped) => self.settle_unreaped(matches!(sent, Sent::Delivered), unreaped),
+                    Err(unreaped) => self.settle_unreaped(matches!(sent, Sent::Delivered), unreaped, disposition),
                 }
             }
             Err(refused) => match tree.map(|tree| tree.reached(self)) {
                 // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
                 // follows, so the reap is the wait that kill bounds.
-                Some(Ok(true)) => self.reap_after_tree_kill(),
+                Some(Ok(true)) => self.reap_after_tree_kill(disposition),
                 // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
                 // is shown to be ending it.
                 _ => self.look_after_refused_kill(id, refused, disposition),
@@ -200,18 +209,19 @@ impl OwnedChild {
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
     /// A failed reap comes back in [`TeardownOutcome::left`], as for [`tear_down`](Self::tear_down).
-    pub(crate) fn reap_after_tree_kill(&self) -> TeardownOutcome {
+    pub(crate) fn reap_after_tree_kill(&self, disposition: Disposition) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
         match wait_to_exit(self, None, Orphaned::Quiet) {
             Ok(_) => TeardownOutcome::new(ChildFate::Reaped),
-            Err(unreaped) => self.settle_unreaped(true, unreaped),
+            Err(unreaped) => self.settle_unreaped(true, unreaped, disposition),
         }
     }
 
     /// The outcome of a root teardown whose wait after the kill reaped nothing, `delivered` or not.
-    /// Only a delivered kill says the child is dead or dying.
-    fn settle_unreaped(&self, delivered: bool, unreaped: WaitToExitError) -> TeardownOutcome {
+    /// Only a delivered kill says the child is dead or dying. A child the wait failed on is left
+    /// uncollected, and the leftover says where it goes under `disposition`.
+    fn settle_unreaped(&self, delivered: bool, unreaped: WaitToExitError, disposition: Disposition) -> TeardownOutcome {
         let pid = self.pid();
         match unreaped {
             WaitToExitError::Elsewhere(foreign) => {
@@ -236,8 +246,9 @@ impl OwnedChild {
                 uncollected: true,
                 look: None,
                 left: Some(format!(
-                    "teardown of {}: the reap after the kill failed: {e}",
-                    child_named(pid)
+                    "teardown of {}: the reap after the kill failed: {e}{}",
+                    child_named(pid),
+                    disposition.handed_back_suffix()
                 )),
             },
         }
@@ -272,7 +283,8 @@ impl OwnedChild {
                 }
             }),
             (ChildFate::Unknown, Some(failure)) => Some(format!(
-                "{who} could not be terminated ({refused}), and the look at it failed: {failure}"
+                "{who} could not be terminated ({refused}), and the look at it failed: {failure}{}",
+                disposition.handed_back_suffix()
             )),
             _ => None,
         };
