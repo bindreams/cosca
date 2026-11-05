@@ -1364,8 +1364,8 @@ impl Marker {
 
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
         // ppid-walk descendants NOT already signalled this sweep (need THIS pass's snapshot;
-        // skipped when blind, since there is nothing to walk). `descendants` keeps only
-        // processes whose order key orders at or after the root's.
+        // skipped when blind, since there is nothing to walk). The walk keeps a process whose
+        // ppid, read after the root was proved, names it.
         //
         // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
         // process and has no descendants left to walk to.
@@ -1375,20 +1375,29 @@ impl Marker {
             "a full sweep of a marker made without its root"
         );
         if let Some(root) = self.root.filter(|_| walk) {
-            #[cfg(test)]
-            crate::containment::treewalk::fault::note_walk(root.pid());
             if seen.insert(root) {
                 new_walk.push(root);
             }
             if !blind {
-                match crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
-                    Ok(found) => {
-                        for id in found {
+                let kernel = &crate::identity::HostKernel;
+                match crate::containment::treewalk::walk_from(kernel, root, &parents, crate::Recursive::Yes) {
+                    Ok(Some(walk)) => {
+                        // A walk ran: the root held its pid, as `hard_kill` and `terminate` record.
+                        #[cfg(test)]
+                        crate::containment::treewalk::fault::note_walk(root.pid());
+                        for id in walk.members {
                             if seen.insert(id) {
                                 new_walk.push(id);
                             }
                         }
+                        // A candidate that could not be read was warned and is not signalled: not
+                        // observed is not observed absent, so the sweep is incomplete.
+                        if !walk.unassessed.is_empty() {
+                            *incomplete = true;
+                        }
                     }
+                    // Gone: nothing to walk.
+                    Ok(None) => {}
                     // Not observed is not observed absent: like a blind pass, the walk channel
                     // is skipped and the sweep reports `incomplete`.
                     Err(e) => {
@@ -1587,8 +1596,8 @@ impl Marker {
     /// then re-verifies the identity once more immediately before signalling, closing the
     /// remaining window exactly as the tree walk does.
     ///
-    /// No separate order-key check: unlike the ppid-walk channel (where a stale ppid can
-    /// point at a recycled root pid, which is what `treewalk`'s order-key check defends against),
+    /// No separate ancestry check: unlike the ppid-walk channel (where a stale ppid can
+    /// point at a recycled root pid, which is what `treewalk`'s parent proof defends against),
     /// membership re-checked HERE, at signal time, is already a complete proof — `Marker.handle`
     /// names a kernel object that cannot be reissued while `self.read` is held (the module's
     /// central invariant), so a pid that currently holds an fd naming it can only be a real

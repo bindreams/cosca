@@ -38,13 +38,12 @@ fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     }
 }
 
-/// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
+/// Mutant: "`children` maps the snapshot's error to `Ok(vec![])`".
 #[skuld::test]
-fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
+fn children_over_a_failed_snapshot_are_unassessable() {
     let me = ProcessId::current();
     let forced = force_snapshot_failure();
     let results = [
-        ("parent", me.parent().map(|_| ())),
         ("children(No)", me.children(Recursive::No).map(|_| ())),
         ("children(Yes)", me.children(Recursive::Yes).map(|_| ())),
     ];
@@ -72,7 +71,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
 fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
     let me = ProcessId::current();
     let forced = force_snapshot_failure();
-    let result = me.parent();
+    let result = me.children(Recursive::No);
     drop(forced);
     let Err(Error::Unassessable {
         source: Some(source), ..

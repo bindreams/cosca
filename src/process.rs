@@ -73,7 +73,7 @@ impl Process {
                 if let Some(errno) = cause.errno() {
                     return Err(crate::os_process::linux::open::open_error(errno));
                 }
-                Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause))
+                Err(crate::identity::unqueryable(&format!("pid {pid}"), cause))
             }
         }
     }
