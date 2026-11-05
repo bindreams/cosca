@@ -1,5 +1,5 @@
 //! `pidfd_open` refused by a real seccomp filter is `Unsupported` in the policy's message shape.
-//! The unit tests force the errno through a seam; these tests make the kernel answer it.
+//! The unit tests state the errno on a `FakeKernel`; these tests make the kernel answer it.
 
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -147,6 +147,40 @@ fn a_held_process_needs_no_second_pidfd_open() {
     }
 }
 
+/// The root-only grace wait of a graceful shutdown looks through the handle the child holds: with
+/// `pidfd_open` refused from before the `SIGTERM`, it still sees the exit and surfaces no watch
+/// error. The child is contained without a cgroup, so only its root is watched. The control socket
+/// is released only afterwards, so a shutdown that sent no `SIGTERM` ends in the escalation's
+/// `SIGKILL`, not in the assertion's `SIGTERM`.
+///
+/// Mutant: the grace wait re-opens the child by its identity.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (code, name) in REFUSALS {
+        let (child, control) = common::spawn_control("control-block", &["R"], true);
+        assert!(
+            !child.containment().can_observe_drain(),
+            "{name}: the fixture must watch the root only, got {:?}",
+            child.containment()
+        );
+        let status = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
+                    child.graceful_shutdown_tree(Duration::from_secs(30))
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+        drop(control);
+        let status = status.unwrap_or_else(|e| panic!("{name}: the grace wait needs no pidfd_open: {e}"));
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
+    }
+}
+
 /// [`a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open`] for the async `Process`.
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
@@ -166,6 +200,102 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
                 .expect("the filtered thread");
         });
         common::kill_release_reap(&child, control);
+    }
+}
+
+/// Run `act` on a child of an async `control-block` fixture, on a current-thread runtime entered on
+/// a thread whose `pidfd_open` is refused with `code`. The runtime is built and the child spawned
+/// before the filter lands. `act` must fail `Unsupported` naming `process open`. The control socket
+/// is released only afterwards, so the returned status is a clean exit unless `act` ended the child.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+fn assert_async_act_refused<T: std::fmt::Debug + Send>(
+    code: i32,
+    name: &str,
+    contain: bool,
+    act: impl FnOnce(&tokio::runtime::Runtime, &mut cosca::tokio::Child) -> Result<T, Error> + Send,
+) -> std::process::ExitStatus {
+    let (result, status) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a current-thread runtime");
+                let _entered = runtime.enter();
+                let (mut child, control) =
+                    runtime.block_on(common::spawn_control_async("control-block", &["R"], contain));
+                common::seccomp::deny_pidfd_open_on_this_thread(code);
+                let result = act(&runtime, &mut child);
+                drop(control);
+                let status = runtime.block_on(child.wait()).expect("reap the child");
+                (result, status)
+            })
+            .join()
+            .expect("the filtered thread")
+    });
+    assert_refused(result, "process open", name);
+    status
+}
+
+/// The async `Child::terminate` signals by the child's identity, so a refused `pidfd_open` fails it
+/// with nothing sent: the child exits clean when its socket is released.
+///
+/// Mutant: `terminate_by_id` answers `Ok` when its open fails.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_terminate_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let status = assert_async_act_refused(code, name, false, |_, child| child.terminate());
+        assert!(
+            status.success(),
+            "{name}: nothing was sent, yet the child ended {status:?}"
+        );
+    }
+}
+
+/// The async `graceful_shutdown` terminates first, so a refused `pidfd_open` fails it before any
+/// wait and before the escalation: the child is not killed and exits clean when its socket is
+/// released.
+///
+/// Mutant: `terminate_by_id` answers `Ok` when its open fails, so the shutdown goes on to the
+/// escalation and kills the child.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_before_the_escalation_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let status = assert_async_act_refused(code, name, false, |runtime, child| {
+            runtime.block_on(child.graceful_shutdown(Duration::from_secs(30)))
+        });
+        assert!(
+            status.success(),
+            "{name}: nothing was sent, yet the child ended {status:?}"
+        );
+    }
+}
+
+/// The root-only grace wait of an async `graceful_shutdown_tree` opens the child by its identity,
+/// so a refused `pidfd_open` fails the watch: the shutdown still ends the child and reaps it, then
+/// surfaces `Unsupported` naming `process open`. The async `graceful_shutdown` and `terminate` open
+/// by identity too and fail before any wait (the two rows above), so only the tree form reaches the
+/// grace wait with `pidfd_open` refused.
+///
+/// Mutant: the grace wait's open maps its error to "gone" (`Ok(true)`).
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_grace_wait_naming_process_open() {
+    for (code, name) in REFUSALS {
+        assert_async_act_refused(code, name, true, |runtime, child| {
+            assert!(
+                !child.containment().can_observe_drain(),
+                "{name}: the fixture must watch the root only, got {:?}",
+                child.containment()
+            );
+            runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
+        });
     }
 }
 
@@ -195,50 +325,96 @@ fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
     }
 }
 
-/// The refusal is found BEFORE the fork. The filter also makes any fork fail, so a spawn that got
-/// as far as forking would fail `Io`, not `Unsupported`; and this thread ends with no child, live
-/// or zombie, and the program never ran.
-///
+/// The refusal is found BEFORE the fork, whichever `Command` spawns. The filter also makes any fork
+/// fail, so a spawn that got as far as forking would fail `Io`, not `Unsupported`; and this thread
+/// ends with no child, live or zombie, and the program never ran. `build` makes the command that
+/// writes `ran` to the file; `spawn` spawns it, on the filtered thread.
+#[cfg(target_os = "linux")]
+fn assert_refusal_found_before_any_fork<C: Send, T: std::fmt::Debug + Send>(
+    code: i32,
+    name: &str,
+    build: impl FnOnce(std::fs::File) -> C,
+    spawn: impl FnOnce(&mut C) -> Result<T, Error> + Send,
+) {
+    use std::io::Read;
+
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let mut cmd = build(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
+    let (result, waitid) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                common::seccomp::deny_pidfd_open_and_forks_on_this_thread(code);
+                let result = spawn(&mut cmd);
+                // `__WNOTHREAD`: only this thread's children. ECHILD: it has none.
+                // SAFETY: a `waitid` with no output buffer, `WNOWAIT`: it consumes nothing.
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_ALL,
+                        0,
+                        std::ptr::null_mut(),
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WNOTHREAD,
+                    )
+                };
+                (result, (rc, std::io::Error::last_os_error().raw_os_error()))
+            })
+            .join()
+            .expect("the filtered thread")
+    });
+    assert_refused(result, "spawn", name);
+    assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
+    drop(cmd);
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read to EOF");
+    assert_eq!(out, "", "{name}: the program must not have run");
+}
+
 /// Mutant: the pre-fork probe is skipped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
-    use std::io::Read;
-
     for (code, name) in REFUSALS {
-        let (mut reader, writer) = std::io::pipe().expect("pipe");
-        let mut cmd = cosca::Command::new();
-        cmd.args(["sh", "-c", "echo ran"]);
-        cmd.stdout(cosca::Stdio::from_file(std::fs::File::from(
-            std::os::fd::OwnedFd::from(writer),
-        )))
-        .expect("set stdout");
-        let (result, waitid) = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    common::seccomp::deny_pidfd_open_and_forks_on_this_thread(code);
-                    let result = cmd.spawn();
-                    // `__WNOTHREAD`: only this thread's children. ECHILD: it has none.
-                    // SAFETY: a `waitid` with no output buffer, `WNOWAIT`: it consumes nothing.
-                    let rc = unsafe {
-                        libc::waitid(
-                            libc::P_ALL,
-                            0,
-                            std::ptr::null_mut(),
-                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WNOTHREAD,
-                        )
-                    };
-                    (result, (rc, std::io::Error::last_os_error().raw_os_error()))
-                })
-                .join()
-                .expect("the filtered thread")
-        });
-        assert_refused(result, "spawn", name);
-        assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
-        drop(cmd);
-        let mut out = String::new();
-        reader.read_to_string(&mut out).expect("read to EOF");
-        assert_eq!(out, "", "{name}: the program must not have run");
+        assert_refusal_found_before_any_fork(
+            code,
+            name,
+            |stdout| {
+                let mut cmd = cosca::Command::new();
+                cmd.args(["sh", "-c", "echo ran"]);
+                cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
+                cmd
+            },
+            |cmd| cmd.spawn(),
+        );
+    }
+}
+
+/// [`a_seccomp_refused_pidfd_open_is_found_before_any_fork`] for the async spawn, which makes its
+/// own probe call. `tokio::Command::spawn` refuses outside a runtime, so the filtered thread enters
+/// one.
+///
+/// Mutant: the async spawn skips the pre-fork probe.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_seccomp_refused_pidfd_open_is_found_before_any_async_fork() {
+    for (code, name) in REFUSALS {
+        assert_refusal_found_before_any_fork(
+            code,
+            name,
+            |stdout| {
+                let mut cmd = cosca::tokio::Command::new();
+                cmd.args(["sh", "-c", "echo ran"]);
+                cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
+                cmd
+            },
+            |cmd| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a current-thread runtime");
+                let _entered = runtime.enter();
+                cmd.spawn()
+            },
+        );
     }
 }
 

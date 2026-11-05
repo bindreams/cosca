@@ -541,7 +541,7 @@ pub(crate) mod shared;
 /// Blocks until either `listener` gets a connection, or `target` exits first, never a bare,
 /// hang-forever `accept()`. The `src/` twin of `tests/common/accept.rs`'s `accept_or_die` (a
 /// separate compilation unit), built on the crate's own identity-verified exit-watch primitives
-/// (`crate::os_process::linux::open::open_verified`, `arm_proc_exit`, `wait_process_or_cancel`). The
+/// (`crate::os_process::linux::open::open_verified_with`, `arm_proc_exit`, `wait_process_or_cancel`). The
 /// `target` identity is verified when the watch is armed, so a reissued pid is reported as the
 /// target being gone, never watched.
 ///
@@ -684,7 +684,7 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
     }
 }
 
-/// Linux: a pidfd (via the crate's own [`crate::os_process::linux::open::open_verified`]) polled alongside
+/// Linux: a pidfd (via the crate's own [`crate::os_process::linux::open::open_verified_with`]) polled alongside
 /// the listener's fd in ONE `poll()` call.
 #[cfg(target_os = "linux")]
 fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
@@ -692,7 +692,8 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
 
     use rustix::event::{PollFd, PollFlags};
 
-    let Some(pidfd) = crate::os_process::linux::open::open_verified(target).expect("open a pidfd to watch the target")
+    let Some(pidfd) = crate::os_process::linux::open::open_verified_with(&crate::identity::HostKernel, target)
+        .expect("open a pidfd to watch the target")
     else {
         return WatchEvent::Died;
     };

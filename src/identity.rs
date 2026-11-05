@@ -236,9 +236,6 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::fake::FakeKernel;
 
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::pidfd_target_in;
-
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
@@ -295,7 +292,7 @@ pub(crate) mod seams {
     }
 }
 
-/// The [`proc_view_with`] and fdinfo forcing seams.
+/// The [`proc_view_with`] forcing seams.
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
 
