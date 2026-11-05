@@ -124,7 +124,8 @@ pub enum Error {
     /// An I/O error.
     ///
     /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
-    /// walk `source()` and take the first `io::Error` whose `raw_os_error()` is `Some`.
+    /// walk `source()` from this `Error` and take the first `io::Error` whose `raw_os_error()` is
+    /// `Some`.
     #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
@@ -411,7 +412,8 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code one
+    /// `io::Error` down.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
