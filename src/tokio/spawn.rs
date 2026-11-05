@@ -409,7 +409,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             .as_ref()
             .filter(|_| cmd.elevation_front().is_some())
         {
-            crate::containment::cgroup::front_placement(|| leaf.id()).not_started()?;
+            crate::containment::cgroup::front_placement(&crate::identity::HostKernel, || leaf.id()).not_started()?;
         }
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
