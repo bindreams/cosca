@@ -224,7 +224,8 @@ fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
 fn a_clean_unelevated_request_plans_a_launch() {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let mut c = crate::test_child::command(Console::Hidden);
+    // `Asked`: the plan's show command is the subject, and `no_window` would make it `SW_HIDE`.
+    let mut c = crate::test_child::command(Console::Asked);
     c.args([r"C:\Windows\System32\whoami.exe", "/all"]).elevate();
     let launch = match super::plan_runas(&c, &win_host(false)) {
         Ok(super::RunasStep::Launch(launch)) => launch,

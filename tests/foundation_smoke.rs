@@ -25,7 +25,7 @@ fn public_surface_is_usable() {
     assert_eq!(String::from_utf16(&ft).unwrap(), "prog");
 
     // Command builder is constructible from the crate root.
-    let mut cmd = common::command(common::Console::Hidden);
+    let mut cmd = cosca::Command::new();
     cmd.args(["ls", "-la"]);
     let _ = cmd; // input model exercised in unit tests
 }
@@ -104,6 +104,7 @@ fn spawn_public_surface_is_usable() {
     use cosca::{run, Stdio};
     // run([...]) -> output() captures; status code reachable.
     let out = run([env!("CARGO_BIN_EXE_cosca_testbin"), "echo-argv", "hi"])
+        .no_window()
         .output()
         .expect("output");
     assert!(out.status.success());
