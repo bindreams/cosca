@@ -9,6 +9,7 @@ use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::drop_fault;
+use super::HANDED_TO_ORPHAN_REAPER as ORPHAN_REAPER;
 use crate::child::spawn::identity_macos_tests::{has_not_exited, is_reaped, refuse_the_kill};
 use crate::child::spawn::late_report_tests::{
     assert_kill_sent, assert_one_warn, SAID_KILLED, SAID_NOT_SENT, SAID_REAPED, SAID_REFUSED_RUNNING,
@@ -20,7 +21,6 @@ use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
 
 const LEAKS: &str = "forgetting tokio's handle for it leaks";
-const ORPHAN_REAPER: &str = "handed to tokio's orphan reaper";
 
 fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();

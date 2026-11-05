@@ -186,6 +186,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     });
     force(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
+    let reaps = fault::record_teardown_reaps();
     let backend_drops = super::fault::count_backend_drops();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -209,9 +210,14 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
         .collect();
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("leaks"), "{warns:?}");
+    // A forgotten child gets no second teardown: no clause of one in the warn, and no reap recorded.
     assert!(
-        !crate::log_capture::contains_since(mark, "torn down through its pidfd"),
-        "nothing was torn down through its pidfd"
+        !warns[0].1.contains("teardown of child"),
+        "the warn carries no second teardown's clause: {warns:?}"
+    );
+    assert!(
+        reaps.recorded().is_empty(),
+        "nothing was torn down through its pidfd, so nothing was reaped by a teardown"
     );
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
     let witness = slot.borrow_mut().take().expect("the hook ran");

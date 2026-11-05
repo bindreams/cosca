@@ -1006,7 +1006,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         for (answer, fate, said) in rows {
             let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &Settlement::new(answer, true));
             assert_eq!(Some(&note), said.as_ref(), "{exited_front}");
-            assert_eq!(torn.left, said, "{exited_front}");
+            assert_eq!(torn.clause, said.map(|said| (log::Level::Warn, said)), "{exited_front}");
             assert_eq!(torn.fate, fate, "{exited_front}");
             assert!(
                 !torn.uncollected,
@@ -1017,7 +1017,11 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         let elsewhere = Settlement::new(Ok(ChildWaitOutcome::Foreign(Foreign::Gone)), true);
         let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &elsewhere);
         assert_eq!(note, format!("{who}: reaped by someone else"));
-        assert_eq!(torn.left, None, "{exited_front}: a foreign reap is not a leftover");
+        assert_eq!(
+            torn.clause,
+            Some((log::Level::Debug, format!("{who}: reaped by someone else"))),
+            "{exited_front}: a foreign reap is not a warn"
+        );
         assert_eq!(torn.fate, ChildFate::Killed);
     }
 }

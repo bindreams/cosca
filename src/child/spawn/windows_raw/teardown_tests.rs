@@ -322,7 +322,7 @@ fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
         None,
     );
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
     assert!(handle.is_reaped(), "teardown must wait for the exit it started");
     let outcome = handle.wait(None).expect("wait after teardown");
     let ChildWaitOutcome::Exited(ExitRecord::Status(status)) = outcome else {
@@ -363,9 +363,7 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
     );
     assert_eq!(torn.fate, ChildFate::Running { id: Some(id) }, "{torn:?}");
     assert!(
-        torn.left
-            .as_deref()
-            .is_some_and(|text| text.contains(&owner.pid.to_string())),
+        matches!(&torn.clause, Some((log::Level::Warn, text)) if text.contains(&owner.pid.to_string())),
         "{torn:?}"
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
@@ -404,7 +402,7 @@ fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
         None,
     );
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
 }
 
 /// A child whose exit is under way but not signalled yet, on a handle that holds
@@ -426,7 +424,7 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
         None,
     );
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert!(torn.left.is_none(), "{torn:?}");
+    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
 }
 
 /// The kill delivered nothing (the exit was under way), so, as on every OS, a failed wait shows

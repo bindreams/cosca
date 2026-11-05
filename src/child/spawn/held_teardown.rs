@@ -50,18 +50,19 @@ pub(crate) fn tear_down_held(
         due,
     } = how;
     let pid = child.pid();
-    let (front_fate, torn) = if front.is_some() {
+    let (front_fate, mut torn) = if front.is_some() {
         let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
         let torn = child.tear_down(id, TeardownKind::Look(reach), due);
         let fate = torn.look.as_ref().map(FrontFate::of_look);
-        let worded = crate::child::word_front(TeardownCaller::FailedSpawn, pid, &"its spawn failed", disposition, torn);
+        let worded = crate::child::word_front(pid, &"its spawn failed", disposition, torn);
         (fate, worded)
     } else {
         let tree = None;
         (None, child.tear_down(id, TeardownKind::Kill { disposition, tree }, due))
     };
-    if let Some(left) = &torn.left {
-        log::warn!("{}", why.fold(left));
+    // The clause at warn is the teardown's one warn; a lower one is logged on its own.
+    if let Some(left) = torn.take_warn(&format!("{}: ", TeardownCaller::FailedSpawn.label())) {
+        log::warn!("{}", why.fold(&left));
     }
     let unreaped = disposition.hands_back(&torn).then(|| Unreaped::new(child, id));
     let error = match front_fate {
@@ -75,8 +76,8 @@ pub(crate) fn tear_down_held(
 /// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
 /// [`OwnedChild`] over the pidfd. A child it could not collect (its kill refused and it still
 /// running, a look or a wait that failed) is left, which [`TeardownOutcome::uncollected`] says, not
-/// the fate; the caller owns the one warn, and logs `left` in it. With `due`, the wait for the
-/// killed child warns once it passes.
+/// the fate; the caller owns the one warn, and logs the outcome's clause in it. With `due`, the wait
+/// for the killed child warns once it passes.
 pub(crate) fn tear_down_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,

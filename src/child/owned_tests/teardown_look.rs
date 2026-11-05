@@ -88,7 +88,7 @@ fn went(torn: &TeardownOutcome) -> Went {
 #[track_caller]
 fn assert_outcome(torn: &TeardownOutcome, fate: ChildFate, went_as: Went) {
     assert_eq!((&torn.fate, went(torn)), (&fate, went_as), "{torn:?}");
-    assert_eq!(torn.left, None, "{torn:?}");
+    assert_eq!(torn.clause, None, "{torn:?}");
 }
 
 /// A front that has exited at the look is reaped, and nothing asks where it is.
@@ -251,11 +251,11 @@ fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
 /// drop's own rendering, over what `tear_down` returned.
 #[cfg(unix)]
 mod worded {
+    use super::super::teardown::warn_of;
     use super::*;
     use crate::child::lifecycle::Settlement;
     use crate::child::owned::teardown::Disposition;
     use crate::child::owned::ChildWaitOutcome;
-    use crate::containment::dispatch::TeardownCaller;
     use crate::os_process::child::ExitRecord;
 
     const WHY: &str = "the front is not in a cgroup this drop killed";
@@ -265,7 +265,7 @@ mod worded {
     const BOTH: [Disposition; 2] = [Disposition::Leave, Disposition::HandBack];
 
     /// The outcome of `tear_down` over `fake`, as the drop words it for a caller that does
-    /// `disposition`, and its debug records.
+    /// `disposition`, and what the wording logged: nothing, the caller logs the clause.
     fn worded_by_the_drop(
         disposition: Disposition,
         fake: &FakeProcess,
@@ -273,10 +273,10 @@ mod worded {
     ) -> (TeardownOutcome, Vec<(log::Level, String)>) {
         let (torn, _) = look_logged(fake, Some(id()), reach, None);
         let mark = crate::log_capture::mark();
-        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
+        let worded = crate::child::word_front(PID, &WHY, disposition, torn);
         (
             worded,
-            crate::log_capture::records_since_on_current_thread(mark, "Child::drop: "),
+            crate::log_capture::records_since_on_current_thread(mark, "elevation front pid"),
         )
     }
 
@@ -284,30 +284,27 @@ mod worded {
         io::Error::from(io::ErrorKind::Other).to_string()
     }
 
+    /// The clause is a warn that says `wanted`, for the caller's one warn.
     #[track_caller]
     fn assert_left(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
         let _fire = fire_on_block(fake);
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
-        assert_eq!(worded.left.as_deref(), Some(wanted), "{disposition:?}: {worded:?}");
-        assert_eq!(records, [], "a leftover is a warn's, not a debug line");
+        assert_eq!(warn_of(&worded), Some(wanted), "{disposition:?}: {worded:?}");
+        assert_eq!(records, [], "the wording logs nothing: the caller does");
         assert!(worded.look.is_none(), "the look is worded and used up: {worded:?}");
     }
 
+    /// The clause is a `debug` line that says `wanted`.
     #[track_caller]
     fn assert_debug(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
         let _fire = fire_on_block(fake);
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
-        assert_eq!(worded.left, None, "{disposition:?}: {worded:?}");
-        assert_eq!(records, [(log::Level::Debug, wanted.to_owned())]);
-    }
-
-    /// Nothing is said: no leftover, and no line.
-    #[track_caller]
-    fn assert_debug_none(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess) {
-        let _fire = fire_on_block(fake);
-        let (worded, records) = worded_by_the_drop(disposition, fake, reach);
-        assert_eq!(worded.left, None, "{disposition:?}: {worded:?}");
-        assert_eq!(records, []);
+        assert_eq!(
+            worded.clause,
+            Some((log::Level::Debug, wanted.to_owned())),
+            "{disposition:?}: {worded:?}"
+        );
+        assert_eq!(records, [], "the wording logs nothing: the caller does");
     }
 
     #[skuld::test]
@@ -389,12 +386,13 @@ mod worded {
         );
     }
 
-    /// The suffix of a front the caller hands back; a caller that leaves it says nothing of that.
+    /// The suffix of an uncollected front: handed back by a caller that hands it back, left unreaped
+    /// by one that leaves it.
     ///
     /// Mutant: the wording ignores the disposition.
     fn handed_back(disposition: Disposition) -> &'static str {
         match disposition {
-            Disposition::Leave => "",
+            Disposition::Leave => "; left unreaped",
             Disposition::HandBack => "; handed back to the caller in the error",
         }
     }
@@ -439,11 +437,11 @@ mod worded {
                 fate: ChildFate::Reaped,
                 uncollected: false,
                 look: Some(LookOutcome::Ended(Settlement::new(answer, true))),
-                left: None,
+                clause: None,
             };
-            let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
+            let worded = crate::child::word_front(PID, &WHY, disposition, torn);
             assert_eq!(
-                worded.left.as_deref(),
+                warn_of(&worded),
                 Some(
                     "elevation front pid 4242: reaped it after the kill; the child's exit record was unreadable \
                      (si_code 7)"
@@ -461,8 +459,8 @@ mod worded {
     fn a_front_collected_with_an_unreadable_exit_record_is_worded_without_a_hand_back() {
         for disposition in BOTH {
             let torn = child_with_an_unreadable_exit().tear_down(Some(id()), TeardownKind::Look(Ok(None)), None);
-            let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, disposition, torn);
-            let left = worded.left.expect("a leftover to say");
+            let worded = crate::child::word_front(PID, &WHY, disposition, torn);
+            let left = warn_of(&worded).expect("a warn to say");
             assert!(left.contains("reaped it;") && left.contains("unreadable"), "{left}");
             assert!(
                 !left.contains("failed") && !left.contains("handed back"),
@@ -471,17 +469,24 @@ mod worded {
         }
     }
 
-    /// A front reaped with a status needs no word.
+    /// A front reaped with a status is said at `debug` as reaped, "after the kill" only after a wait
+    /// that a kill sent elsewhere bounded.
     ///
-    /// Mutant: the wording says it.
+    /// Mutants: the clause is a warn, or missing; "after the kill" ignores the kill.
     #[skuld::test]
-    fn a_front_reaped_with_a_status_is_not_worded() {
+    fn a_front_reaped_with_a_status_is_said_at_debug() {
         for disposition in BOTH {
-            assert_debug_none(disposition, Ok(None), &fake().reaps([ReapAnswer::Reaped(exit())]));
-            assert_debug_none(
+            assert_debug(
+                disposition,
+                Ok(None),
+                &fake().reaps([ReapAnswer::Reaped(exit())]),
+                "elevation front pid 4242: reaped it",
+            );
+            assert_debug(
                 disposition,
                 Ok(Some(&FakeReach::answering(Ok(true)))),
                 &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]),
+                "elevation front pid 4242: reaped it after the kill",
             );
         }
     }
@@ -516,48 +521,26 @@ mod worded {
                 disposition,
                 Ok(None),
                 &fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]),
-                "Child::drop: elevation front pid 4242: reaped by someone else",
+                "elevation front pid 4242: reaped by someone else",
             );
             assert_debug(
                 disposition,
                 Ok(Some(&FakeReach::answering(Ok(true)))),
                 &fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]),
-                "Child::drop: elevation front pid 4242: reaped by someone else",
+                "elevation front pid 4242: reaped by someone else",
             );
         }
     }
 
-    /// A teardown after a failed run words its look under its own name, not a drop's.
-    ///
-    /// Mutant: the rendering hardcodes `Child::drop`.
-    #[skuld::test]
-    fn a_front_reaped_in_a_failed_runs_teardown_is_said_under_its_name() {
-        crate::log_capture::install();
-        let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-        let (torn, _) = look_logged(&fake, Some(id()), Ok(None), None);
-        let mark = crate::log_capture::mark();
-
-        crate::child::word_front(TeardownCaller::FailedRun, PID, &WHY, Disposition::Leave, torn);
-
-        let records = crate::log_capture::records_since_on_current_thread(mark, "elevation front pid");
-        assert_eq!(records.len(), 1, "{records:?}");
-        assert!(
-            records[0]
-                .1
-                .starts_with("teardown after a failed run: elevation front pid 4242"),
-            "{records:?}"
-        );
-    }
-
     /// A teardown that is not a front's has no look to word: the outcome is returned as it is.
     ///
-    /// Mutant: the rendering rewrites `left`.
+    /// Mutant: the rendering rewrites `clause`.
     #[skuld::test]
     fn an_outcome_with_no_look_is_returned_as_it_is() {
         let mut torn = TeardownOutcome::new(ChildFate::Reaped);
-        torn.left = Some("from the policy".to_owned());
-        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, Disposition::Leave, torn);
-        assert_eq!(worded.left.as_deref(), Some("from the policy"));
+        torn.clause = Some((log::Level::Warn, "from the policy".to_owned()));
+        let worded = crate::child::word_front(PID, &WHY, Disposition::Leave, torn);
+        assert_eq!(warn_of(&worded), Some("from the policy"));
     }
 }
 
@@ -646,7 +629,7 @@ fn a_pidless_front_is_left_running() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Running]);
     let torn = look(&fake, None);
     assert_eq!(went(&torn), Went::LeftRunning, "{torn:?}");
-    assert_eq!(torn.left, None);
+    assert_eq!(torn.clause, None);
 }
 
 /// A front waited for past the threshold is warned of once before the wait blocks; one that exits

@@ -55,7 +55,7 @@ pub(super) fn status_of_outcome(
 ///
 /// | answer                       | [`fate`](Self::fate)  | [`uncollected`](Self::uncollected) | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
 /// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
-/// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | nothing                                                     |
+/// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | debug "reaped it" ("after the kill" only if `killed`)       |
 /// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
 /// | `Foreign(Gone, Other)`       | `f.fate(killed)`      | no                                 | `Unaccounted`                    | debug "reaped by someone else"                              |
 /// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn "not ours to reap (launchd holds its zombie, ...)"     |
@@ -64,7 +64,8 @@ pub(super) fn status_of_outcome(
 /// | `DeadlinePassed`, not killed | `Running { id }`      | yes                                | `LeftUnreaped`                   | warn: the caller's running clause, or "its wait ended with no exit" for a wait with no deadline |
 /// | `DeadlinePassed`, `killed`   | none: a kill is followed by a wait with no deadline, and [`new`](Self::new) asserts it | | |                                                  |
 ///
-/// Every line leads with the caller's subject, a zombie launchd holds included.
+/// Every row has a clause, and every line leads with the caller's subject, a zombie launchd holds
+/// included. The caller logs the clause at its level or folds it into its own warn.
 ///
 /// An unreadable record means the consuming reap took the zombie: the child was collected, only its
 /// exit is lost, so it is `Reaped` whether or not a kill reached it.
@@ -130,57 +131,38 @@ impl Settlement {
         }
     }
 
-    /// What to say of the child, and at what level; the caller logs it. `subject` leads the line.
-    /// `running` is the whole line for a child still running; `None` for a wait with no deadline,
-    /// which says it ended with no exit. `disposition` adds where an uncollected child goes.
+    /// What to say of the child, and at what level: a clause for every answer, which the caller logs
+    /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
+    /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.
+    /// `disposition` adds where an uncollected child goes; `None` for a caller that says so itself.
     pub(crate) fn wording(
         &self,
         subject: &str,
         running: Option<&str>,
-        disposition: Disposition,
-    ) -> Option<(log::Level, String)> {
+        disposition: Option<Disposition>,
+    ) -> (log::Level, String) {
+        let after = if self.killed { " after the kill" } else { "" };
         match &self.answer {
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => None,
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => {
-                let after = if self.killed { " after the kill" } else { "" };
-                Some((
-                    log::Level::Warn,
-                    format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
-                ))
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => {
+                (log::Level::Debug, format!("{subject}: reaped it{after}"))
             }
-            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
-                Some((log::Level::Warn, format!("{subject}: {ORPHANED}")))
-            }
-            Ok(ChildWaitOutcome::Foreign(_)) => Some((log::Level::Debug, format!("{subject}: reaped by someone else"))),
-            Err(e) => Some((
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => (
+                log::Level::Warn,
+                format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
+            ),
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => (log::Level::Warn, format!("{subject}: {ORPHANED}")),
+            Ok(ChildWaitOutcome::Foreign(_)) => (log::Level::Debug, format!("{subject}: reaped by someone else")),
+            Err(e) => (
                 log::Level::Warn,
                 format!(
                     "{subject}: the wait failed: {e}{}",
-                    disposition.handed_back_suffix(self.uncollected())
+                    disposition.map_or("", |disposition| disposition.clause(self.uncollected()))
                 ),
-            )),
-            Ok(ChildWaitOutcome::DeadlinePassed) => Some((
+            ),
+            Ok(ChildWaitOutcome::DeadlinePassed) => (
                 log::Level::Warn,
                 running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
-            )),
-        }
-    }
-
-    /// [`wording`](Self::wording) for a caller with one warn to make: a line at warn is returned for
-    /// that warn, and a line below it is logged here, led by `log_lead`.
-    pub(crate) fn leftover(
-        &self,
-        subject: &str,
-        running: Option<&str>,
-        disposition: Disposition,
-        log_lead: &str,
-    ) -> Option<String> {
-        match self.wording(subject, running, disposition)? {
-            (log::Level::Warn, text) => Some(text),
-            (level, text) => {
-                log::log!(level, "{log_lead}{text}");
-                None
-            }
+            ),
         }
     }
 }

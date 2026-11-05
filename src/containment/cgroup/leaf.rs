@@ -1096,8 +1096,8 @@ impl CgroupLeaf {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let torn = crate::child::spawn::held_teardown::tear_down_pidfd(None, pidfd, None, warn.due());
-                if let Some(left) = torn.left {
+                let mut torn = crate::child::spawn::held_teardown::tear_down_pidfd(None, pidfd, None, warn.due());
+                if let Some(left) = torn.take_warn("") {
                     log::warn!("{left}");
                 }
                 return Abandoned::Ended;

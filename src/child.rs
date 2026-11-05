@@ -422,11 +422,10 @@ impl Child {
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
-    /// with `why`, under `caller`'s name and `disposition`.
+    /// with `why` and `disposition`.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(
         &mut self,
-        caller: TeardownCaller,
         why: &dyn std::fmt::Display,
         disposition: Disposition,
     ) -> TeardownOutcome {
@@ -451,7 +450,7 @@ impl Child {
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
         let torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
-        word_front(caller, self.id.pid(), why, disposition, torn)
+        word_front(self.id.pid(), why, disposition, torn)
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -1085,7 +1084,8 @@ impl Child {
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
     /// warn, and `disposition` words it for a child that still runs after a refused kill, and for an
-    /// elevation front left running. The outcome's `left` is empty: the warn has said it.
+    /// elevation front left running. The outcome's `clause` is empty: the warn, or a debug line, has
+    /// said it.
     fn tear_down(&mut self, caller: TeardownCaller, disposition: Disposition) -> TeardownOutcome {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
@@ -1114,7 +1114,7 @@ impl Child {
                 },
                 None,
             );
-            left.extend(torn.left.take());
+            left.extend(torn.take_warn(&format!("{}: ", caller.label())));
             if !left.is_empty() {
                 log::warn!("{}: {}", caller.label(), left.join("; "));
             }
@@ -1148,8 +1148,8 @@ impl Child {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
-                let mut torn = self.tear_down_leaf_and_look_at_front(caller, &unkillable, disposition);
-                report.left.extend(torn.left.take());
+                let mut torn = self.tear_down_leaf_and_look_at_front(&unkillable, disposition);
+                report.left.extend(torn.take_warn(&format!("{}: ", caller.label())));
                 report.emit(&self.reported);
                 return torn;
             }
@@ -1193,7 +1193,7 @@ impl Child {
                     Ok(()) => self.proc.reap_after_tree_kill(disposition),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
-                    Err(e) => self.tear_down_leaf_and_look_at_front(caller, &e, disposition),
+                    Err(e) => self.tear_down_leaf_and_look_at_front(&e, disposition),
                 }
             } else {
                 // The tree kill above may have reached the root: if the root's own kill is refused,
@@ -1203,22 +1203,20 @@ impl Child {
                     .tear_down(Some(self.id), TeardownKind::Kill { disposition, tree }, None)
             }
         };
-        report.left.extend(torn.left.take());
+        report.left.extend(torn.take_warn(&format!("{}: ", caller.label())));
         report.emit(&self.reported);
         torn
     }
 }
 
-/// What `caller` says of how its look at the elevation front `pid` (`None`: not known) went (`torn.look`): what the
-/// front's [`Settlement`](lifecycle::Settlement) words, a debug line or a leftover for its one warn
-/// (a front reaped with its status needs no word), and a leftover for any other. `why` is why the
-/// caller did not kill the front. An outcome with no look is returned as it
-/// is. A front seen running (left running, or with its place or its leaf's subtree unreadable) is
-/// worded as handed back if `disposition` says the caller hands it back, and as left otherwise; no
-/// other outcome depends on it.
+/// Words how a look at the elevation front `pid` (`None`: not known) went (`torn.look`), as the
+/// outcome's clause: the front's [`Settlement`](lifecycle::Settlement) words one it looked at, and a
+/// warn the others. `why` is why the caller did not kill the front. An outcome with no look is
+/// returned as it is. A front seen running (left running, or with its place or its leaf's subtree
+/// unreadable) is worded as handed back if `disposition` says the caller hands it back, and as left
+/// otherwise; no other outcome depends on it.
 #[cfg(unix)]
 fn word_front(
-    caller: TeardownCaller,
     pid: impl Into<Option<u32>>,
     why: &dyn std::fmt::Display,
     disposition: Disposition,
@@ -1226,7 +1224,6 @@ fn word_front(
 ) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
 
-    let label = caller.label();
     let front = pid.into().map_or_else(
         || "the elevation front (pid unknown)".to_owned(),
         |pid| format!("elevation front pid {pid}"),
@@ -1244,9 +1241,10 @@ fn word_front(
              ended it; handed back to the caller in the error"
         ),
     };
-    torn.left = match look {
-        LookOutcome::Ended(settlement) => settlement.leftover(&front, None, disposition, &format!("{label}: ")),
-        LookOutcome::LeftRunning => Some(match disposition {
+    let warn = |text| Some((log::Level::Warn, text));
+    torn.clause = match look {
+        LookOutcome::Ended(settlement) => Some(settlement.wording(&front, None, Some(disposition))),
+        LookOutcome::LeftRunning => warn(match disposition {
             Disposition::Leave => format!(
                 "{front} is left running and unreaped: {why}, and a kill of the front would orphan \
                  the elevated program"
@@ -1256,8 +1254,8 @@ fn word_front(
                  the elevated program; handed back to the caller in the error"
             ),
         }),
-        LookOutcome::PlaceUnreadable(e) => Some(unreadable(format!("where it is cannot be read ({e})"))),
-        LookOutcome::SubtreeUnreadable(e) => Some(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
+        LookOutcome::PlaceUnreadable(e) => warn(unreadable(format!("where it is cannot be read ({e})"))),
+        LookOutcome::SubtreeUnreadable(e) => warn(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
     };
     torn
 }

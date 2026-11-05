@@ -356,8 +356,19 @@ fn cgroup_drop_of_a_front_kills_it_through_the_cgroup_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     assert_eq!(teardowns.count(), 0, "the drop sends the front no kill of its own");
     assert!(reaped(&pidfd), "the drop reaps the front its cgroup kill ended");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
-    assert_eq!(warns, [], "a front the cgroup killed is not left behind");
+    let said = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    assert_said_reaped_at_debug(&said, "a front the cgroup killed is not left behind");
+}
+
+/// A drop's records about a front it reaped with its status: none above `debug`, and what is said
+/// is the reap itself.
+#[track_caller]
+fn assert_said_reaped_at_debug(said: &[(log::Level, String)], what: &str) {
+    assert!(
+        said.iter()
+            .all(|(level, text)| *level == log::Level::Debug && text.contains(": reaped it")),
+        "{what}: {said:?}"
+    );
 }
 
 /// A failed cgroup kill may leave the program running, so the front is not signalled either.
@@ -527,7 +538,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said, [], "a front reaped with its status needs no word");
+    assert_said_reaped_at_debug(&said, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
     assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
     wait_until_exited(&member);
@@ -598,7 +609,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_eq!(said, [], "a front reaped with its status needs no word");
+    assert_said_reaped_at_debug(&said, "a front reaped with its status needs no warn");
     assert!(reaped(&front), "the drop reaps the front");
     wait_until_exited(&member);
     let mut rest = Vec::new();

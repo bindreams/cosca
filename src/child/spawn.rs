@@ -210,7 +210,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 report.left.push(format!(
                     "the elevated child pid {pid} could not be terminated (it could not be verified, and may still be \
                      running){}",
-                    Disposition::HandBack.handed_back_suffix(true)
+                    Disposition::HandBack.clause(true)
                 ));
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
@@ -219,7 +219,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         fate: ChildFate::Running { id: Some(child.id()) },
                         uncollected: true,
                         look: None,
-                        left: None,
+                        clause: None,
                     },
                 )
             }
@@ -232,7 +232,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     fault::record_teardown_reap(pid, status);
                 }
                 let (note, mut torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
-                report.left.extend(torn.left.take());
+                report.left.extend(torn.take_warn("finish_elevated: "));
                 (note, torn)
             }
             Err(e) => {
@@ -243,12 +243,11 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 let mut looked = child
                     .proc
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
-                report.left.extend(looked.left.take());
+                report.left.extend(looked.take_warn("finish_elevated: "));
                 let note = match &looked.look {
-                    // The wording leads with the refusal and says what the look found as a clause.
-                    Some(LookOutcome::Ended(settlement)) => settlement
-                        .wording(&note, None, Disposition::Leave)
-                        .map_or(note, |(_, text)| text),
+                    // The wording leads with the refusal and says what the look found as a clause;
+                    // the note says where the root goes.
+                    Some(LookOutcome::Ended(settlement)) => settlement.wording(&note, None, None).1,
                     _ => note,
                 };
                 (note, looked)
@@ -306,7 +305,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
 }
 
 /// What [`finish_elevated`] says of a root its delivered kill reached, once the wait for it ended as
-/// `settlement` states: the note for the error, and the outcome, whose `left` is the cleanup's warn.
+/// `settlement` states: the note for the error, and the outcome, whose `clause` is the cleanup's.
 /// `exited_front`: the root had exited before the kill.
 #[cfg(unix)]
 fn root_after_a_delivered_kill(
@@ -320,11 +319,16 @@ fn root_after_a_delivered_kill(
     } else {
         format!("the elevated child pid {pid}")
     };
-    // The error says it as the warn does, less where the root goes: its note says that.
-    let note = match settlement.wording(&subject, None, Disposition::Leave) {
-        Some((_, text)) => text,
-        None if exited_front => "the elevated child had already exited, and was reaped".to_string(),
-        None => "the elevated child was terminated".to_string(),
+    // The error says it as the warn does, less where the root goes: its note says that. A root whose
+    // status was read has its own phrase.
+    let note = if settlement.status().is_some() {
+        if exited_front {
+            "the elevated child had already exited, and was reaped".to_string()
+        } else {
+            "the elevated child was terminated".to_string()
+        }
+    } else {
+        settlement.wording(&subject, None, None).1
     };
     let torn = TeardownOutcome::of_settlement(settlement, Some(id), &subject, None, Disposition::HandBack);
     (note, torn)

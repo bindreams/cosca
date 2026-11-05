@@ -274,7 +274,7 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
         None,
     );
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
-    assert_eq!(torn.left, None);
+    assert!(matches!(torn.clause, Some((log::Level::Debug, _))), "{torn:?}");
 }
 
 /// A send through the pidfd of a pid-less child that finds it reaped says "already gone" without a

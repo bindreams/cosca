@@ -54,13 +54,14 @@ impl Disposition {
         self == Disposition::HandBack && torn.uncollected
     }
 
-    /// What a warn about a child adds when the caller hands it back: where the child went. Nothing
-    /// for a caller that leaves it, or for a child the teardown [collected](TeardownOutcome::uncollected)
-    /// (`uncollected` false): there is none to hand back.
-    pub(crate) fn handed_back_suffix(self, uncollected: bool) -> &'static str {
+    /// What a clause about a child adds, for where the child goes: handed back by a caller that
+    /// hands it back, left unreaped by one that leaves it. Nothing for a child the teardown
+    /// [collected](TeardownOutcome::uncollected) (`uncollected` false): there is none to place.
+    pub(crate) fn clause(self, uncollected: bool) -> &'static str {
         match (self, uncollected) {
             (Disposition::HandBack, true) => "; handed back to the caller in the error",
-            _ => "",
+            (Disposition::Leave, true) => "; left unreaped",
+            (_, false) => "",
         }
     }
 }
@@ -129,24 +130,28 @@ pub(crate) struct TeardownOutcome {
     /// or the look that ended after a refused kill ([`look_after_refused_kill`](OwnedChild::look_after_refused_kill)).
     #[cfg_attr(windows, allow(dead_code, reason = "no Windows teardown looks at a front yet"))]
     pub(crate) look: Option<LookOutcome>,
-    pub(crate) left: Option<String>,
+    /// What to say of how the teardown went, and at what level: [`Settlement::wording`]'s clause for
+    /// a settled child. `None` for a teardown that settled nothing (a child it did not signal or
+    /// wait for) and for a front, which the caller words from [`look`](Self::look). The teardown
+    /// logs none of it: the caller logs it at its level or folds it into its own warn
+    /// ([`take_warn`](Self::take_warn)).
+    pub(crate) clause: Option<(log::Level, String)>,
 }
 
 impl TeardownOutcome {
-    /// A teardown that collected the child, with nothing to warn of.
+    /// A teardown that collected the child, with nothing to say.
     #[cfg(unix)]
     pub(crate) fn new(fate: ChildFate) -> TeardownOutcome {
         TeardownOutcome {
             fate,
             uncollected: false,
             look: None,
-            left: None,
+            clause: None,
         }
     }
 
-    /// The outcome `settlement` states: its fate, and whether it left the child uncollected. A line
-    /// at warn level comes back in [`left`](Self::left), and anything below is logged here.
-    /// `subject`, `running` and `disposition` word it as [`Settlement::wording`] says.
+    /// The outcome `settlement` states: its fate, whether it left the child uncollected, and its
+    /// clause. `subject`, `running` and `disposition` word it as [`Settlement::wording`] says.
     pub(crate) fn of_settlement(
         settlement: &Settlement,
         id: Option<ProcessId>,
@@ -158,7 +163,7 @@ impl TeardownOutcome {
             fate: settlement.fate(id),
             uncollected: settlement.uncollected(),
             look: None,
-            left: settlement.leftover(subject, running, disposition, ""),
+            clause: Some(settlement.wording(subject, running, Some(disposition))),
         }
     }
 
@@ -168,7 +173,19 @@ impl TeardownOutcome {
             fate,
             uncollected,
             look: Some(look),
-            left: None,
+            clause: None,
+        }
+    }
+
+    /// Takes the clause for a caller with one warn: a clause at warn comes back to fold into that
+    /// warn, and one below it is logged here at its level, led by `lead`.
+    pub(crate) fn take_warn(&mut self, lead: &str) -> Option<String> {
+        match self.clause.take()? {
+            (log::Level::Warn, text) => Some(text),
+            (level, text) => {
+                log::log!(level, "{lead}{text}");
+                None
+            }
         }
     }
 }
@@ -180,8 +197,8 @@ impl OwnedChild {
     /// a child that is visible as exited but cannot be reaped yet (a zombie a tracer holds) is still
     /// waited for when the threshold passes, and warned of.
     ///
-    /// Returns the child's fate, and what it could not do for the caller's one warn. It logs
-    /// nothing above `debug`, except that slow-teardown warn.
+    /// Returns the child's fate, and what to say of how it went ([`TeardownOutcome::clause`]). It
+    /// logs nothing but that slow-teardown warn.
     pub(crate) fn tear_down(&self, id: Option<ProcessId>, kind: TeardownKind<'_>, due: Option<Due>) -> TeardownOutcome {
         match kind {
             TeardownKind::Kill { disposition, tree } => self.kill_and_settle(id, disposition, tree, due),
@@ -222,7 +239,7 @@ impl OwnedChild {
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
-    /// A failed reap comes back in [`TeardownOutcome::left`], as for [`tear_down`](Self::tear_down).
+    /// A failed reap comes back in [`TeardownOutcome::clause`], as for [`tear_down`](Self::tear_down).
     pub(crate) fn reap_after_tree_kill(&self, disposition: Disposition) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();

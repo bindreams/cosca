@@ -102,9 +102,10 @@ In order:
      then forgets tokio's `Child`. Apart from these, only the cgroup leaf's `end_child` (both
      spawns) starts a background reaping thread, until the leaf slice. `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
-     uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A
-     teardown that cannot end a child, a refused kill or a running elevation front, hands it back
-     as `Unreaped`, in
+     uncollected, and a clause for every answer, with its level); the teardowns,
+     `finish_elevated` and `Unreaped` all ask it. A teardown logs none of the clause: the caller
+     logs it at its level or folds it into its own warn. A teardown that cannot end a child, a
+     refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
      `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.

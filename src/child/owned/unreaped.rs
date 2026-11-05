@@ -92,14 +92,13 @@ impl Drop for Unreaped {
             return;
         }
         let settlement = Settlement::new(wait_to_exit(&child, None), false);
-        // The drop's own line for a status, which the table words as nothing: it names the status.
+        // The drop's own warn for a status, which the table words at debug: it names the status.
         if let Some(status) = settlement.status() {
             log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})");
             return;
         }
         let subject = format!("{who} was dropped without wait or leak");
-        if let Some((level, text)) = settlement.wording(&subject, None, Disposition::Leave) {
-            log::log!(level, "{text}");
-        }
+        let (level, text) = settlement.wording(&subject, None, Some(Disposition::Leave));
+        log::log!(level, "{text}");
     }
 }

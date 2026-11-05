@@ -1021,9 +1021,9 @@ fn end_through_pidfd(
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> ChildFate {
-    let torn = tear_down_pidfd(pid, pidfd, None, Due::in_(warn_after));
-    if let Some(left) = &torn.left {
-        log::warn!("{}", why.fold(left));
+    let mut torn = tear_down_pidfd(pid, pidfd, None, Due::in_(warn_after));
+    if let Some(left) = torn.take_warn("") {
+        log::warn!("{}", why.fold(&left));
     }
     torn.fate
 }
