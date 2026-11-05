@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
+use crate::child::spawn::held_teardown::{tear_down_pidfd, warn_pidfd_teardown, Expect, Left, PidfdTeardown};
+#[cfg(target_os = "linux")]
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -924,12 +926,14 @@ impl CgroupLeaf {
         if self.report.is_some() {
             match self.abandon_before_verdict(false, None, warn) {
                 Abandoned::OutOfReach(why) => log::warn!("cgroup v2: {why}"),
-                Abandoned::Uncollected(clause) => {
-                    log::warn!(
-                        "{}: {clause}",
-                        crate::containment::dispatch::TeardownCaller::FailedSpawn.label()
-                    );
-                }
+                Abandoned::Uncollected(left) => warn_pidfd_teardown(
+                    format_args!(
+                        "{}: {}",
+                        crate::containment::dispatch::TeardownCaller::FailedSpawn.label(),
+                        left.clause
+                    ),
+                    &left.verdict,
+                ),
                 Abandoned::Ended | Abandoned::MaybeUnreaped | Abandoned::Front(_) => {}
             }
         }
@@ -1042,8 +1046,10 @@ pub(crate) enum Abandoned {
     OutOfReach(String),
     /// The child never named itself, and the handshake's pidfd reached it, but its teardown left it
     /// uncollected (its kill refused and it running, a wait or look that failed). Says what the
-    /// teardown found: its clause, for the caller's one warn, which the failed spawn's label leads.
-    Uncollected(String),
+    /// teardown found: its clause, for the caller's one warn, which the failed spawn's label leads,
+    /// and the fate the teardown established, for the caller to log through
+    /// [`warn_pidfd_teardown`].
+    Uncollected(Left),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
     Front(crate::child::spawn::FrontFate),
@@ -1054,14 +1060,10 @@ impl Abandoned {
     /// The answer for a child that never named itself, torn down through the handshake's pidfd as
     /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
     /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
-    /// clause as the one warn the caller logs.
-    fn after_pidless_teardown(torn: &mut crate::child::owned::teardown::TeardownOutcome) -> Abandoned {
-        if torn.uncollected {
-            // The clause of an uncollected child is at warn, which `take_warn` hands over.
-            let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
-            let left = torn.take_warn(label);
-            debug_assert!(left.is_some(), "the clause of an uncollected child is a warn");
-            return Abandoned::Uncollected(left.unwrap_or_else(|| "its teardown left it uncollected".to_owned()));
+    /// clause as the one warn the caller logs, and the teardown's verdict.
+    fn after_pidless_teardown(mut torn: PidfdTeardown) -> Abandoned {
+        if torn.outcome.uncollected {
+            return Abandoned::Uncollected(torn.left());
         }
         torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
         Abandoned::Ended
@@ -1126,8 +1128,10 @@ impl CgroupLeaf {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let mut torn = crate::child::spawn::held_teardown::tear_down_pidfd(None, pidfd, None, warn.due());
-                return Abandoned::after_pidless_teardown(&mut torn);
+                // The pidfd may be the handshake's, whose own look may have failed: no wait on it
+                // is expected to succeed.
+                let torn = tear_down_pidfd(None, pidfd, None, Expect::Anything, warn.due());
+                return Abandoned::after_pidless_teardown(torn);
             }
         }
         // Only a child that reported goes on to `exec`: one that named itself and sent no report

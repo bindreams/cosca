@@ -6,8 +6,9 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use super::held_teardown::{tear_down_held, HeldTeardown};
+use super::held_teardown::{tear_down_held, Expect, HeldTeardown, PidfdTeardown};
 use super::Diagnosis;
+use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::Disposition;
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
@@ -417,4 +418,82 @@ fn a_front_with_no_pid_is_named_as_such() {
     drop(stdin);
     drop(owned);
     crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
+}
+
+/// The teardown of the table's row `kill` and `found`, as a caller that leaves the child expects
+/// `expect` of it, and the clause its row says.
+fn teardown_of(kill: teardown_lines::Kill, found: teardown_lines::Found, expect: Expect) -> (PidfdTeardown, String) {
+    let row = teardown_lines::rows()
+        .into_iter()
+        .find(|row| row.kill == kill && row.found == found)
+        .expect("the table has the row");
+    let torn = PidfdTeardown::new(teardown_lines::outcome(&row, Disposition::Leave), expect);
+    (torn, row.leave)
+}
+
+/// The teardown whose kill was delivered and whose wait then failed: uncollected, and `Killed`, as a
+/// failed wait on a pidfd leaves it.
+fn after_a_failed_wait(expect: Expect) -> PidfdTeardown {
+    teardown_of(Kill::Delivered, Found::WaitFailed, expect).0
+}
+
+/// A failed wait on a pidfd no look failed on is a breach of the contract, asserted where the warn is
+/// logged, whoever the caller is.
+///
+/// Mutant: `warn_pidfd_teardown` asserts nothing.
+#[skuld::test]
+#[should_panic(expected = "a wait on a child's own pidfd failed")]
+fn a_failed_wait_on_a_pidfd_nothing_looked_at_breaks_the_contract() {
+    crate::log_capture::install();
+    let mut torn = after_a_failed_wait(Expect::Waited);
+    torn.say_as_failed_spawn(&mut Diagnosis::default());
+}
+
+/// A kill of a child that never ran the program is not refused: a child left running breaks the
+/// contract.
+///
+/// Mutant: `Expect::Unexecuted` asserts no more than `Expect::Waited`.
+#[skuld::test]
+#[should_panic(expected = "never ran the program was refused")]
+fn a_refused_kill_of_a_child_that_never_ran_breaks_the_contract() {
+    crate::log_capture::install();
+    let (mut torn, _) = teardown_of(Kill::Refused, Found::Running, Expect::Unexecuted);
+    torn.say_as_failed_spawn(&mut Diagnosis::default());
+}
+
+/// A caller that knows a look on the pidfd failed expects nothing of a wait on it: the same
+/// teardown is no breach.
+///
+/// Mutant: `Expect::Anything` asserts like `Expect::Waited`.
+#[skuld::test]
+fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut torn = after_a_failed_wait(Expect::Anything);
+    torn.say_as_failed_spawn(&mut Diagnosis::default());
+    assert_eq!(warns_since(mark).len(), 1);
+}
+
+/// A teardown that collected the child, said with a diagnosis still owed, is the event's one warn:
+/// the diagnosis leads it, and the clause that stands alone at `debug` says what became of the child
+/// in it, under the failed spawn's name.
+///
+/// Mutant: the clause is logged apart at `debug` and the diagnosis warns unlabelled when dropped.
+#[skuld::test]
+fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
+    crate::log_capture::install();
+    let (mut torn, clause) = teardown_of(Kill::Delivered, Found::Exited, Expect::Waited);
+    let mut why = Diagnosis::default();
+    why.add("the identity check failed");
+    let mark = crate::log_capture::mark();
+
+    torn.say_as_failed_spawn(&mut why);
+    drop(why);
+
+    assert_eq!(
+        warns_since(mark),
+        [format!(
+            "teardown after a failed spawn: the identity check failed; {clause}"
+        )]
+    );
 }

@@ -211,8 +211,9 @@ pub(crate) enum AbandonedChild {
     /// handle on itself or refused its kill, as the text says.
     OutOfReach(String),
     /// It never named itself, and the handshake's pidfd reached it, but its teardown left it
-    /// uncollected. The text is the teardown's clause, for the one warn.
-    Uncollected(String),
+    /// uncollected. Carries the teardown's clause, for the one warn, and its verdict.
+    #[cfg(target_os = "linux")]
+    Uncollected(crate::child::spawn::held_teardown::Left),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

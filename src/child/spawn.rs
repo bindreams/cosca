@@ -2213,6 +2213,12 @@ impl Diagnosis {
         }
     }
 
+    /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn is_owed(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// `text`, led by the diagnosis if it is still owed, which it then no longer is.
     pub(crate) fn fold(&mut self, text: impl std::fmt::Display) -> String {
         match self.0.take() {

@@ -99,7 +99,11 @@ In order:
      backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, once tokio's
      `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
      The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
-     to `tear_down`, sending no kill of its own. Apart from these,
+     to `tear_down`, sending no kill of its own. A teardown through a pidfd
+     (`held_teardown::tear_down_pidfd`) is told once what its caller knows of the pidfd
+     (`Expect`), and its warn is logged through `warn_pidfd_teardown`, which then asserts that
+     contract; the leaf's abandonment carries the verdict with the clause to where it is logged.
+     Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left

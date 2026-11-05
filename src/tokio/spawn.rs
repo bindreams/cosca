@@ -1083,10 +1083,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
     use crate::containment::AbandonedChild;
 
     match child {
-        AbandonedChild::Ended
-        | AbandonedChild::MaybeUnreaped
-        | AbandonedChild::OutOfReach(_)
-        | AbandonedChild::Uncollected(_) => {
+        AbandonedChild::Ended | AbandonedChild::MaybeUnreaped | AbandonedChild::OutOfReach(_) => {
             debug_assert!(false, "only a Linux cgroup leaf abandons a child as `{child:?}`");
             ChildFate::Unknown
         }
@@ -1109,18 +1106,37 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// `ended`: the handshake killed and reaped the child through its pidfd, or found it reaped. The
 /// child is then not at risk, so its fate is logged at `debug`; only an `OutOfReach` leaf still
 /// warns, of a descendant outside it. The fate of an elevation `front` the leaf found is noted on
-/// the error instead, as the spawn's other failures note it. A child the handshake's pidfd reached
-/// and its teardown left uncollected says so, in the teardown's clause under the failed spawn's
-/// label, whatever `ended` says.
+/// the error instead, as the spawn's other failures note it. A child the leaf's pidfd reached and
+/// its teardown left uncollected says so, in the teardown's clause: under the failed spawn's label,
+/// or, if `ended` says the handshake ended the child through its own copy of the pidfd, after that
+/// fate, as an `OutOfReach` leaf's does. The warn is logged through
+/// [`warn_pidfd_teardown`](crate::child::spawn::held_teardown::warn_pidfd_teardown).
 fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
     let consequence = match (child, ended) {
         (AbandonedChild::Front(_) | AbandonedChild::Ended, _) => return,
-        (AbandonedChild::Uncollected(clause), _) => {
-            log::warn!(
-                "tokio spawn failed ({error}); {}: {clause}",
-                crate::containment::dispatch::TeardownCaller::FailedSpawn.label()
+        #[cfg(target_os = "linux")]
+        (AbandonedChild::Uncollected(left), Some(fate)) => {
+            crate::child::spawn::held_teardown::warn_pidfd_teardown(
+                format_args!(
+                    "tokio spawn failed ({error}); {fate}, and the teardown of its cgroup v2 leaf's copy of its pidfd \
+                     says: {}",
+                    left.clause
+                ),
+                &left.verdict,
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        (AbandonedChild::Uncollected(left), None) => {
+            crate::child::spawn::held_teardown::warn_pidfd_teardown(
+                format_args!(
+                    "tokio spawn failed ({error}); {}: {}",
+                    crate::containment::dispatch::TeardownCaller::FailedSpawn.label(),
+                    left.clause
+                ),
+                &left.verdict,
             );
             return;
         }
@@ -1233,9 +1249,9 @@ fn abandoned_after_handshake(
     failure.answered_by(|error| match abandoned {
         AbandonedChild::Front(fate) => (fate.note(error, front, None), front_child_fate(fate)),
         // Out of the leaf's reach, and not known to be dead.
-        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) | AbandonedChild::Uncollected(_) => {
-            (error, ChildFate::Running { id: None })
-        }
+        AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
+        // What the teardown established of the child it left.
+        AbandonedChild::Uncollected(left) => (error, left.verdict.fate),
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }

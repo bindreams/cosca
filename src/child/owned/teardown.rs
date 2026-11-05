@@ -200,14 +200,28 @@ impl TeardownOutcome {
         }
     }
 
-    /// Says the clause as a failed spawn's teardown, the caller that owns the one line of it: a
-    /// clause at warn is that line, `why` (the spawn's diagnosis, if still owed) leading it, and a
-    /// lower one is logged on its own. Both lines are led by the caller's name.
+    /// The one line of a failed spawn's teardown, led by the caller's name: the clause, `why` (the
+    /// spawn's diagnosis, if still owed) leading it. It is the event's one warn if the clause is at
+    /// warn, the child is left uncollected, or `why` is owed (the diagnosis is then the warn, and
+    /// says what became of the child in it, whatever the clause's level); the caller logs the
+    /// returned line. Otherwise the clause is logged here at its level, on its own.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn failed_spawn_line(&mut self, why: &mut crate::child::spawn::Diagnosis) -> Option<String> {
+        let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
+        let (level, text) = self.clause.take()?;
+        if level == log::Level::Warn || self.uncollected || why.is_owed() {
+            return Some(format!("{label}: {}", why.fold(&text)));
+        }
+        log::log!(level, "{label}: {text}");
+        None
+    }
+
+    /// Says the clause as a failed spawn's teardown ([`failed_spawn_line`](Self::failed_spawn_line)),
+    /// logging its line at warn.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn say_as_failed_spawn(&mut self, why: &mut crate::child::spawn::Diagnosis) {
-        let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
-        if let Some(left) = self.take_warn(label) {
-            log::warn!("{label}: {}", why.fold(&left));
+        if let Some(line) = self.failed_spawn_line(why) {
+            log::warn!("{line}");
         }
     }
 }

@@ -464,7 +464,9 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 /// once (with the forget's leak), kills and reaps the child through the pidfd, and forgets tokio's `Child` (its drop
 /// would reap a collected pid).
 ///
-/// Mutants: the warn drops the error, or is a second one beside the forget's; the identity read moves before `ProcSource::new`
+/// Mutants: the warn drops the error, or is a second one beside the forget's; the teardown's clause is
+/// left out of it, or logged apart at `debug` (the warn is then unlabelled and says nothing of the
+/// child's end); the identity read moves before `ProcSource::new`
 /// (tokio's `Child` is dropped by value on the error path, so `forgets()` is 0); the failed check
 /// goes to `reap_now` (`backend_drops` is 1); the teardown only forgets the child (no teardown
 /// reap is recorded, and the child is left running); the warn calls the child reaped by someone else.
@@ -529,8 +531,9 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
             && warns[0].1.contains("leaks"),
         "the failed peek is warned once, naming its own error and the leak: {warns:?}"
     );
-    // The forget's note says only what is known before the teardown (the child cannot be shown ours);
-    // what the teardown did is its own clause, which a clean one logs at `debug`.
+    // The forget's note says what is known before the teardown (the child cannot be shown ours); the
+    // teardown's clause, whatever its level alone, says it was killed and reaped, in the same warn,
+    // which the failed spawn's name leads.
     assert!(
         warns[0]
             .1
@@ -538,8 +541,8 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
         "the warn says why the child was forgotten: {warns:?}"
     );
     assert!(
-        crate::log_capture::contains_since(mark, "teardown after a failed spawn: teardown of child"),
-        "the teardown says what it did under the failed spawn's name"
+        warns[0].1.starts_with("teardown after a failed spawn: ") && warns[0].1.contains(": reaped it after the kill"),
+        "the one warn is the failed spawn's and says the child was killed and reaped: {warns:?}"
     );
     // The child was killed and reaped through its pidfd, not reaped by someone else.
     assert!(
