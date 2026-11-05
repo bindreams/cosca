@@ -124,12 +124,13 @@ pub(crate) const ORDER_AFTER_PARENT: bool = false;
 
 /// The PID-reuse keep-predicate where [`ORDER_AFTER_PARENT`] (the crate's core safety invariant, see
 /// the tree walk's module docs): a process descends from `bound`'s owner only if its order key is
-/// strictly after it. Keys are unique there, so the strict rule loses no genuine child. The single
-/// source of this rule: [`ProcessId::of_ordered_with`]'s order bound and [`ProcessId::parent`].
-pub(crate) fn keeps_order(key: OrderKey, bound: OrderKey) -> bool {
+/// strictly after it. Keys are unique there, so the strict rule loses no genuine child. Callers go
+/// through [`keeps`].
+fn keeps_order(key: OrderKey, bound: OrderKey) -> bool {
     key > bound
 }
 
+/// The one keep rule, for [`ProcessId::of_ordered_with`]'s order bound and [`ProcessId::parent`]:
 /// [`keeps_order`] over the optional keys of a read and of its bound: with no `bound` nothing
 /// applies and the read is kept; under one, a read with no order key is not.
 pub(crate) fn keeps(order: Option<OrderKey>, bound: Option<OrderKey>) -> bool {
@@ -286,7 +287,7 @@ impl OrderedRead {
         );
         debug_assert!(
             bound.is_none() || ORDER_AFTER_PARENT,
-            "a bound is handed out only where ORDER_AFTER_PARENT, and a read there carries its key"
+            "a bound is handed out only where ORDER_AFTER_PARENT"
         );
         match (claimed, read) {
             (_, Resolved::Found((_, order))) if !keeps(order, bound) => {

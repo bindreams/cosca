@@ -1,8 +1,9 @@
-//! Pure tests for the identity-aware descendant filters. They run on every host (no live
-//! processes): synthetic `(pid, ppid)` edges plus a stub resolver closure drive the filters'
+//! Tests for the identity-aware descendant filters, run on every host. Most are pure: synthetic
+//! `(pid, ppid)` edges plus a stub resolver closure drive the filters'
 //! structure: the subtree, the dedup, the unassessed list, and what the resolver is handed. The
 //! stub applies no order rule: the rule is the read's (`identity_tests`, `keeps_order` and
-//! `judged`), whose answers the stub states.
+//! `judged`), whose answers the stub states. The anchor row reads this live process, and the
+//! Windows rows below use their own short-lived children.
 
 use super::{descendants_with, Resolution, Walk};
 use crate::error::Error;
@@ -315,25 +316,15 @@ fn the_bound_is_the_roots_bound_not_its_id_token() {
 }
 
 /// What the live anchor hands the walk as its children's bound: where the platform orders by
-/// creation (Windows) the root's order key, elsewhere none, read through `anchor` itself and not
-/// stated. Mutants: the anchor hands out a bound off Windows; it hands out none on Windows.
-#[cfg(not(windows))]
+/// creation (Windows) the root's order key, elsewhere none, read through `anchor` itself (this
+/// process, live) and not stated. Mutants: the anchor hands out a bound off Windows; it hands out
+/// none on Windows.
 #[skuld::test]
-fn the_anchor_hands_out_no_bound_off_windows() {
+fn the_anchor_hands_out_a_bound_only_on_windows() {
     let proof = super::anchor(&crate::identity::HostKernel, ProcessId::current())
         .expect("this process reads")
         .expect("this process is live");
-    assert_eq!(proof.bound, None);
-}
-
-/// As [`the_anchor_hands_out_no_bound_off_windows`], on Windows.
-#[cfg(windows)]
-#[skuld::test]
-fn the_anchor_hands_out_a_bound_on_windows() {
-    let proof = super::anchor(&crate::identity::HostKernel, ProcessId::current())
-        .expect("this process reads")
-        .expect("this process is live");
-    assert!(proof.bound.is_some());
+    assert_eq!(proof.bound.is_some(), cfg!(windows));
 }
 
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped

@@ -369,6 +369,26 @@ fn the_keep_predicate_keeps_only_a_key_after_the_bound() {
     }
 }
 
+/// The keep rule over optional keys, on every host: with no bound a read is kept, with or without
+/// an order key; under a bound a read with no order key is not, and one with a key is kept only
+/// after it.
+///
+/// Mutants: a read with no order key under a bound is kept; a missing bound drops a read.
+#[skuld::test]
+fn the_keep_rule_over_optional_keys_drops_a_keyless_read_only_under_a_bound() {
+    use super::{keeps, OrderKey};
+    let key = |k| Some(OrderKey::for_test(k));
+    for (name, order, bound, kept) in [
+        ("no bound, a key", key(5), None, true),
+        ("no bound, no key", None, None, true),
+        ("a bound, no key", None, key(1), false),
+        ("a bound, a key after it", key(5), key(1), true),
+        ("a bound, a key before it", key(1), key(5), false),
+    ] {
+        assert_eq!(keeps(order, bound), kept, "{name}");
+    }
+}
+
 /// The walk's filter over a reused-creator table: `x` is the root's child, and `y` was created by an
 /// earlier holder of `x`'s pid (its read shows `x`'s pid as its parent number) and orders before `x`.
 /// Where the order after the parent is the proof ([`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT),
@@ -422,4 +442,13 @@ fn a_missing_record_reads_the_parent_number_as_asked() {
 
     assert_eq!(ParentRead::not_read(true), ParentRead::Unreadable);
     assert_eq!(ParentRead::not_read(false), ParentRead::NotAsked);
+    #[cfg(not(windows))]
+    for asked in [true, false] {
+        let read = super::OrderedRead::missing(Resolved::Unknown, super::UnknownCause::default(), asked);
+        assert_eq!(
+            read.parent,
+            ParentRead::not_read(asked),
+            "missing passes `asked` through"
+        );
+    }
 }

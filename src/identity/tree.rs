@@ -56,8 +56,7 @@ impl ProcessId {
         };
         // Where the creator is never updated, a genuine parent started before its child.
         if ORDER_AFTER_PARENT {
-            let kept = parent_order.is_some() && keeps(own_order, parent_order);
-            return Ok(kept.then_some(parent));
+            return Ok(keeps(own_order, parent_order).then_some(parent));
         }
         // Elsewhere `self` read after the parent must still name it, and it must still hold its pid.
         let read = ProcessId::of_ordered_with(kernel, self.pid(), Some(parent), Some(self.key), None);
