@@ -31,9 +31,9 @@ fn walks() -> [(&'static str, Walk); 4] {
 
 type Query = fn(&ProcessId) -> Result<(), Error>;
 
-fn queries() -> [(&'static str, Query); 3] {
+/// The queries that list the table. `parent` does not: it reads `self` alone.
+fn queries() -> [(&'static str, Query); 2] {
     [
-        ("parent", |p| p.parent().map(|_| ())),
         ("children(No)", |p| p.children(Recursive::No).map(|_| ())),
         ("children(Yes)", |p| p.children(Recursive::Yes).map(|_| ())),
     ]
@@ -57,9 +57,9 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
     }
 }
 
-/// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
+/// Mutant: "`children` maps the snapshot's error to `Ok(vec![])`".
 #[skuld::test]
-fn parent_and_children_over_a_failed_listing_are_unassessable() {
+fn children_over_a_failed_listing_are_unassessable() {
     let me = ProcessId::current();
     for (name, query) in queries() {
         let forced = force_blind_snapshot();
@@ -91,9 +91,9 @@ fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
     }
 }
 
-/// Mutant: "`parent` / `children` ignore a denied ppid elsewhere in the table".
+/// Mutant: "`children` ignores a denied ppid elsewhere in the table".
 #[skuld::test]
-fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
+fn children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
     let (child, id) = live_member();
     let me = ProcessId::current();
     for (_, query) in queries() {
