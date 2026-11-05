@@ -562,14 +562,6 @@ fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
 #[cfg(target_os = "linux")]
 const PID: u32 = 4242;
 
-/// A kernel listing one pid, `PID`, whose `stat` read answers `errno`.
-#[cfg(target_os = "linux")]
-fn failing_stat(errno: i32) -> FakeKernel<'static> {
-    FakeKernel::over(&HostKernel)
-        .on_pids(Ok(&[PID]))
-        .on_read(&format!("{PID}/stat"), Err(errno))
-}
-
 /// The failures that mean "this pid says nothing about the group": it exited mid-scan (ENOENT,
 /// ESRCH) or `hidepid` hides it (EACCES, and EPERM while the checked directory still answers).
 /// The pgid matches nothing, so the honest answer is an empty listing. Mutant: "propagate every
@@ -578,8 +570,8 @@ fn failing_stat(errno: i32) -> FakeKernel<'static> {
 #[skuld::test]
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
-        let listed = members_with(&failing_stat(errno), i32::MAX)
-            .unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
+        let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
+        let listed = members_with(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
         assert!(listed.is_empty(), "errno {errno}: {listed:?}");
     }
 }
@@ -599,7 +591,8 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         libc::EIO,
         libc::ENOSYS,
     ] {
-        let err = members_with(&failing_stat(errno), i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
+        let err = members_with(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
         let text = err.to_string();
         assert!(
             text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
@@ -624,7 +617,8 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 #[skuld::test]
 fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
-        let kernel = failing_stat(libc::EPERM).on_read("self/stat", Err(recheck));
+        let kernel =
+            FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         let err = members_with(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
         let text = err.to_string();
         assert!(text.contains("self/stat"), "{recheck}: {text}");

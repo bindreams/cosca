@@ -65,21 +65,14 @@ fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
 
 // Per-pid stat read failures =====
 
-/// A kernel listing one pid, `PID`, whose `stat` read answers `errno`.
-fn failing_stat(errno: i32) -> FakeKernel<'static> {
-    FakeKernel::over(&HostKernel)
-        .on_pids(Ok(&[PID]))
-        .on_read(&format!("{PID}/stat"), Err(errno))
-}
-
 /// A pid that exited mid-scan (`ENOENT`, `ESRCH`) or that `hidepid` hides (`EACCES`, and `EPERM`
 /// while the checked directory still answers) is absent, and the snapshot is still a snapshot.
 /// Mutant: "fail the snapshot on every read error".
 #[skuld::test]
 fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
-        let got =
-            process_parents_with(&failing_stat(errno)).unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
+        let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
+        let got = process_parents_with(&kernel).unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
         assert!(got.is_empty(), "errno {errno}: {got:?}");
     }
 }
@@ -99,7 +92,8 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
         libc::EIO,
         libc::ENOSYS,
     ] {
-        let text = match process_parents_with(&failing_stat(errno)) {
+        let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
+        let text = match process_parents_with(&kernel) {
             Err(crate::error::Error::Unassessable { detail, source }) => {
                 assert!(source.is_some(), "errno {errno}: the read's error is the source");
                 detail
@@ -128,7 +122,8 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
 #[skuld::test]
 fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
-        let kernel = failing_stat(libc::EPERM).on_read("self/stat", Err(recheck));
+        let kernel =
+            FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         match process_parents_with(&kernel) {
             Err(crate::error::Error::Unassessable { detail, .. }) => {
                 assert!(detail.contains("self/stat"), "{recheck}: {detail}");
