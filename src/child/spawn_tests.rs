@@ -3,6 +3,9 @@
 //! Windows backend router, and that a refused spawn refuses before it touches our handle
 //! inheritance. In the library (not `tests/`) because the seam is `pub(crate)`/`#[cfg(test)]` and
 //! only reachable from within the crate. The batch gate's tests are in `spawn/batch_gate_tests.rs`.
+//!
+//! The Windows-only tests here cover teardown steps that Linux's sync spawn takes through
+//! `OwnedChild::tear_down`, whose rows are in `owned_tests` and `hand_back_tests`.
 
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
@@ -10,7 +13,7 @@ use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, setuid, Group};
 
 /// A command for a child that only a real kill ends and that the test never holds, for the macOS
 /// tests whose child is left alone: its stdin writer is leaked.
@@ -141,18 +144,12 @@ fn attach_failure_reaps_the_spawned_child() {
 /// A `kill` that fails for a child that has already exited is not a failure: the teardown goes on
 /// to reap it, as it does after any successful kill. The child here exits by itself (its stdin is
 /// already closed), so nothing but the reap can account for it in the recorder.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    #[cfg(windows)]
     cmd.args([crate::test_child::windows_more()]);
     let (reader, writer) = std::io::pipe().expect("pipe");
-    #[cfg(unix)]
-    let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-    #[cfg(windows)]
     let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
     cmd.stdin(crate::stdio::Stdio::from_file(reader))
         .expect("set stdin pipe");
@@ -184,7 +181,7 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 ///
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_failed_teardown_reap_is_logged_on_both_arms() {
     a_failed_teardown_step_is_logged_on_both_arms(
@@ -199,7 +196,7 @@ fn a_failed_teardown_reap_is_logged_on_both_arms() {
 /// spawn for as long as it runs. The reap fault is armed as a tripwire — left unconsumed, it proves
 /// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
 /// reachable without a bug.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
     use std::io::ErrorKind;
@@ -251,7 +248,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 /// A child the teardown could not kill is not left a zombie: it is handed to a detached thread
 /// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
 /// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
@@ -285,7 +282,7 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
 /// running, and the error says so, naming it; it is reaped in the background once it exits.
 ///
 /// Mutant: a refused kill reports the child reaped.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_child_whose_teardown_kill_is_refused_may_still_be_running() {
     use crate::stdio::Stdio;
@@ -316,7 +313,7 @@ fn a_child_whose_teardown_kill_is_refused_may_still_be_running() {
 
 /// Force one teardown step to fail with each marker, once per teardown arm, and check the failure
 /// is consumed, logged, `debug_assert`ed in exactly the builds that keep it, and leaks no child.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn a_failed_teardown_step_is_logged_on_both_arms(
     markers: [&'static str; 2],
     set_failure: fn(&'static str),
@@ -358,13 +355,10 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 /// keeps its credentials, so `kill(2)` refuses it with EPERM — is reaped, not left a zombie: an
 /// exited child is reaped at once, and one not yet exited is handed to the background reaper.
 /// Either way it ends reaped.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 #[skuld::test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(["true"]);
-    #[cfg(windows)]
     cmd.args(["cmd", "/C", "exit 0"]);
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     fault::set_force_attach_failure(true);
@@ -388,6 +382,56 @@ fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
         reaped.expect("the background wait must succeed");
     }
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+}
+
+/// A failed spawn whose teardown kill is refused (as a setuid-root child refuses it) hands the child
+/// back in the error, running, at both arms after the handshake: the identity read (which read none)
+/// and the attach (which read one). The warn says the child is handed back; nothing is left to a
+/// background reaper.
+///
+/// The child is a setuid-root helper that is fully root once it has written its ready byte, which
+/// is read before the teardown.
+///
+/// Mutants: a refused kill reports the child reaped, or leaves it running without handing it back;
+/// the warn says it is left.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_whose_teardown_kill_is_refused_is_handed_back(#[fixture(setuid)] _group: &Group) {
+    use crate::child::spawn::fault::SpawnPoint;
+    use crate::test_child::expect_handed_back;
+
+    crate::log_capture::install();
+    let arms: [(fn(bool), bool); 2] = [
+        (fault::set_force_identity_vanished, false),
+        (fault::set_force_attach_failure, true),
+    ];
+    for (force_arm, identified) in arms {
+        let (mut cmd, writer, until_root) = crate::test_privilege::setuid_blocker_for_a_failing_spawn();
+        // Before the identity read, once the spawn has returned: the helper has become root.
+        let _root = fault::set_at(SpawnPoint::BeforeIdentity, until_root);
+        let mark = crate::log_capture::mark();
+        force_arm(true);
+        let err = cmd.spawn().expect_err("the forced arm fails the spawn");
+        force_arm(false);
+        let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+            panic!("the seam captured the child's identity");
+        };
+
+        let (_, fate, handed_back) = expect_handed_back(err, writer);
+
+        assert_eq!(
+            fate,
+            ChildFate::Running {
+                id: identified.then_some(id)
+            }
+        );
+        assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
+        assert_eq!(handed_back.unreaped().id(), identified.then_some(id));
+        let warns = crate::log_capture::records_since_on_current_thread(mark, "handed back to the caller");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        let status = handed_back.wait();
+        assert!(status.success(), "the helper exits on EOF: {status:?}");
+    }
 }
 
 #[skuld::test]
@@ -888,24 +932,30 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let pid = child.id().pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
-    let (err, fate) = super::finish_elevated(child, failed_write())
+    let (err, fate, handed_back) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_with();
+        .expect_may_have_started_parts(());
     assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
+    // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
+    // reaped elsewhere and returns at once.
+    handed_back.unreaped();
+    drop(handed_back);
 
     let Error::Elevation { detail, .. } = &err else {
         panic!("got {err:?}");
     };
     assert!(
-        detail.contains("killed but could not be reaped") && detail.contains("cosca-finish-elevated-reap-4c1e"),
-        "the note must say the reap failed, got {detail:?}"
+        detail.contains(&format!(
+            "the elevated child pid {pid}: the wait failed: cosca-finish-elevated-reap-4c1e"
+        )),
+        "the note must say the wait failed, got {detail:?}"
     );
     assert!(
         !detail.contains("was terminated"),
         "a child that was not reaped is not reported as terminated: {detail:?}"
     );
     assert_eq!(
-        crate::log_capture::levels_since(mark, &format!("could not reap the killed elevated child pid {pid}")),
+        crate::log_capture::levels_since(mark, &format!("the elevated child pid {pid}: the wait failed")),
         [log::Level::Warn]
     );
     assert_eq!(teardown.recorded(), vec![], "a failed reap is not recorded");
@@ -913,6 +963,62 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
         fault::take_force_reap_failure().is_none(),
         "the teardown consumed the forced failure"
     );
+}
+
+/// What `finish_elevated` says of a root its delivered kill reached, by how the wait for it ended: the
+/// error's note and the cleanup's warn, led by the root's name. A debug build asserts on the reap
+/// that produces `Unreadable`, so the answers are stated.
+///
+/// Mutants: `Unreadable` is worded as a failed wait or handed back; a root reaped elsewhere is among
+/// the leftovers; a zombie launchd holds loses the root's name or is not a leftover.
+#[cfg(unix)]
+#[skuld::test]
+fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended() {
+    use crate::child::lifecycle::Settlement;
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::error::ChildFate;
+    use crate::os_process::child::{ExitRecord, Foreign};
+
+    let id = crate::identity::ProcessId::from_parts(42, 1);
+    for exited_front in [false, true] {
+        let who = if exited_front {
+            "the elevated child pid 42 (it had already exited)"
+        } else {
+            "the elevated child pid 42"
+        };
+        let rows = [
+            (
+                Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
+                ChildFate::Reaped,
+                Some(format!(
+                    "{who}: reaped it after the kill; the child's exit record was unreadable (si_code 7)"
+                )),
+            ),
+            (
+                Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
+                ChildFate::Killed,
+                Some(format!(
+                    "{who}: not ours to reap (launchd holds its zombie, because its tracer died)"
+                )),
+            ),
+        ];
+        for (answer, fate, said) in rows {
+            let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &Settlement::new(answer, true));
+            assert_eq!(Some(&note), said.as_ref(), "{exited_front}");
+            assert_eq!(torn.left, said, "{exited_front}");
+            assert_eq!(torn.fate, fate, "{exited_front}");
+            assert!(
+                !torn.uncollected,
+                "{exited_front}: collected, or not ours: nothing to hand back"
+            );
+        }
+
+        let elsewhere = Settlement::new(Ok(ChildWaitOutcome::Foreign(Foreign::Gone)), true);
+        let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &elsewhere);
+        assert_eq!(note, format!("{who}: reaped by someone else"));
+        assert_eq!(torn.left, None, "{exited_front}: a foreign reap is not a leftover");
+        assert_eq!(torn.fate, ChildFate::Killed);
+    }
 }
 
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in
@@ -1504,7 +1610,7 @@ fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
         let pid = std::rc::Rc::clone(&pid);
         move || pid.set(fault::spawn_pid())
     });
-    let _foreign_reap = fault::set_between_kill_and_wait(move || {
+    let _foreign_reap = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterDropKill, move || {
         let pid = pid.get();
         assert_ne!(pid, 0, "the spawn noted the child's pid");
         drop(writer);
