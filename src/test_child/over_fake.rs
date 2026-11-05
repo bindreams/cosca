@@ -35,7 +35,6 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
     )
 }
 
-/// An `Unreaped` over `fake`, whose identity the spawn read as `id`.
 pub(crate) fn unreaped_over(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
     Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id)
 }

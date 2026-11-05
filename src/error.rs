@@ -249,10 +249,9 @@ pub enum Error {
         wrapper_elevated: bool,
         #[source]
         source: Box<Error>,
-        /// The child itself, when the spawn could not end it and hands it to the caller. The caller
-        /// owns it: [`wait`](crate::Unreaped::wait) or [`leak`](crate::Unreaped::leak) settles it,
-        /// else its drop blocks until the child exits (in async code, take it off the runtime
-        /// thread). Then `fate` is [`ChildFate::Running`] with the child's own identity.
+        /// The child itself, when the spawn could not end it and hands it to the caller; see
+        /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is
+        /// [`ChildFate::Running`] with the child's own identity.
         unreaped: Option<Box<crate::Unreaped>>,
     },
 }

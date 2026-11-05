@@ -102,9 +102,7 @@ impl SpawnFailure {
     }
 
     /// This failure, if it says the program may have started, with the error and fate `f` makes of
-    /// its cause: for an answer that comes after the failure, from a leaf's abandonment. A child
-    /// the failure carries stays with it, so `f` must leave a fate that agrees with it:
-    /// `Error::from` asserts so.
+    /// its cause: for an answer that comes after the failure, from a leaf's abandonment.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) fn answered_by(self, f: impl FnOnce(Error) -> (Error, ChildFate)) -> SpawnFailure {
         match self {

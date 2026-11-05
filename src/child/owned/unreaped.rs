@@ -39,10 +39,7 @@ pub struct Unreaped {
 
 impl Unreaped {
     /// Own `child`, whose identity the spawn read as `id`, if it did.
-    #[allow(
-        dead_code,
-        reason = "the first spawn teardown that hands a child back lands in the next PR"
-    )]
+    #[allow(dead_code, reason = "no spawn teardown hands a child back yet")]
     pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>) -> Unreaped {
         Unreaped { child: Some(child), id }
     }

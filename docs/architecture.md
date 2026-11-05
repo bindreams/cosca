@@ -82,8 +82,7 @@ In order:
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, and `Child::drop` uses it. A spawn teardown whose kill is
-     refused hands the child back as `Unreaped`, in `Error::MayHaveStarted`; the sites do so one per
-     OS as they move onto `tear_down`, and none does yet.
+     refused hands the child back as `Unreaped`, in `Error::MayHaveStarted`.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
