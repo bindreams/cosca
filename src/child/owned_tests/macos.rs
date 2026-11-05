@@ -656,19 +656,7 @@ fn setuid_kill_of_a_root_child_is_permission_denied(#[fixture(setuid)] _group: &
 /// Mutant: as above.
 #[skuld::test]
 fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
-    let helper = crate::test_privilege::setuid::setuid_helper();
-    let mut cmd = crate::Command::new();
-    // `args` is the whole argv, program name included.
-    cmd.executable(&helper)
-        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
-    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
-    cmd.stderr(crate::Stdio::null()).expect("stderr null");
-    let mut child = cmd.spawn().expect("spawn the setuid helper");
-    let stdin = child.stdin().expect("piped stdin");
-    let mut ready = [0u8; 1];
-    std::io::Read::read_exact(&mut child.stdout().expect("piped stdout"), &mut ready).expect("ready");
-    assert_eq!(ready, *b"+");
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
     let err = child.kill().expect_err("this caller may not signal a root process");
     assert!(
         matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),

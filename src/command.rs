@@ -947,7 +947,8 @@ impl Command {
 
     /// Run to completion capturing stdout+stderr (stdin is connected to null).
     ///
-    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it.
+    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
+    /// the teardown could not kill is in the error's `unreaped`.
     pub fn output(&mut self) -> Result<crate::Output, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
@@ -955,30 +956,32 @@ impl Command {
         let mut child = self.spawn()?;
         match child.communicate(None) {
             Ok(output) => Ok(output),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, child)),
         }
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
     ///
-    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it.
+    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
+    /// the teardown could not kill is in the error's `unreaped`.
     pub fn status(&mut self) -> Result<crate::ExitStatus, Error> {
         // Force inherit so a caller who previously called .stdout(pipe()) does
         // not get a pump-free wait() that deadlocks once the pipe buffer fills.
         self.apply_default_stdin(crate::Stdio::inherit())?;
         self.stdout(crate::Stdio::inherit())?;
         self.stderr(crate::Stdio::inherit())?;
-        let mut child = self.spawn()?;
+        let child = self.spawn()?;
         match child.wait() {
             Ok(status) => Ok(status),
-            Err(e) => Err(after_the_spawn(e, &mut child)),
+            Err(e) => Err(after_the_spawn(e, child)),
         }
     }
 
     /// Run to completion capturing stdout as a UTF-8 String (stdin=null,
     /// stderr inherited). Errors on invalid UTF-8; output is verbatim (no trim).
     ///
-    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it.
+    /// Fails as [`spawn`](Self::spawn) does, and with [`Error::MayHaveStarted`] after it. A child
+    /// the teardown could not kill is in the error's `unreaped`.
     pub fn read(&mut self) -> Result<String, Error> {
         self.apply_default_stdin(crate::Stdio::null())?;
         self.stdout(crate::Stdio::pipe())?;
@@ -986,13 +989,14 @@ impl Command {
         let mut child = self.spawn()?;
         let out = match child.communicate(None) {
             Ok(out) => out,
-            Err(e) => return Err(after_the_spawn(e, &mut child)),
+            Err(e) => return Err(after_the_spawn(e, child)),
         };
         // `communicate` collected the exit.
         String::from_utf8(out.stdout).map_err(|e| {
             crate::child::spawn::after_the_spawn(
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::error::ChildFate::Reaped,
+                None,
                 child.behind_wrapper(),
             )
         })
@@ -1000,10 +1004,12 @@ impl Command {
 }
 
 /// The error of a run-to-completion helper that failed after its spawn: the program may have
-/// started, and `child` is torn down now as its drop would, which says what became of it.
-fn after_the_spawn(error: Error, child: &mut crate::Child) -> Error {
-    let fate = child.tear_down_now();
-    crate::child::spawn::after_the_spawn(error, fate, child.behind_wrapper())
+/// started, and `child` is torn down now as its drop would. The error says what became of it, and
+/// carries it when its teardown could not end it.
+fn after_the_spawn(error: Error, child: crate::Child) -> Error {
+    let behind_wrapper = child.behind_wrapper();
+    let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
 }
 
 #[cfg(test)]

@@ -319,6 +319,7 @@ pub(crate) fn spawn_raw(
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
+                None,
             ));
         }
     };
@@ -326,7 +327,7 @@ pub(crate) fn spawn_raw(
         Ok(v) => v,
         Err(e) => {
             let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id), crate::tokio::child::slow_teardown_after());
-            return Err(SpawnFailure::started(e, fate));
+            return Err(SpawnFailure::started(e, fate, None));
         }
     };
 
