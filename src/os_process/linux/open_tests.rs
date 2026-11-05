@@ -11,13 +11,13 @@ use rustix::process::{getpid, pidfd_open, PidfdFlags};
 use super::open_verified_with;
 use crate::error::Error;
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId, UNREADABLE_STATUS_REASON};
+use crate::identity::{Existence, FakeKernel, HostKernel, Key, ProcessId, UNREADABLE_STATUS_REASON};
 
 /// A pid that no live process is expected to hold; only its `pidfd_open` row exists.
 const FABRICATED: u32 = 4242;
 
 fn fabricated_id() -> ProcessId {
-    ProcessId::from_parts_for_test(FABRICATED, 1)
+    ProcessId::from_parts_for_test(FABRICATED, Key::for_test(1))
 }
 
 #[path = "open_tests/fixture.rs"]
@@ -46,9 +46,9 @@ impl LiveNonLeaderTid {
             _ = stop_rx.recv();
         });
         let tid = tid_rx.recv().expect("recv tid from the worker thread");
-        let id = ProcessId::of(tid as u32)
-            .found()
-            .expect("the live worker thread's tid resolves to an identity");
+        // The `/proc` path: the rows that use it state a host before Linux 6.9, where a thread's
+        // identity is its `starttime`.
+        let id = crate::identity::ticks_id(tid as u32);
         assert_ne!(
             id.pid(),
             std::process::id(),
@@ -229,10 +229,7 @@ fn open_verified_on_a_dead_non_leader_tid_is_gone() {
 
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Err(Errno::NOENT))
-        .on_read(
-            &format!("{}/stat", id.pid()),
-            Ok(&stat_fixture("Z", id.start_token_raw())),
-        );
+        .on_read(&format!("{}/stat", id.pid()), Ok(&stat_fixture("Z", id.key().ticks())));
     let result = open_verified_with(&kernel, id);
     assert!(
         matches!(result, Ok(None)),
@@ -254,7 +251,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     let stat = format!("{}/stat", id.pid());
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Err(Errno::INVAL))
-        .on_read(&stat, Ok(&stat_fixture("S", id.start_token_raw())))
+        .on_read(&stat, Ok(&stat_fixture("S", id.key().ticks())))
         .on_read_after(&stat, 1, Err(libc::EACCES));
     let result = open_verified_with(&kernel, id);
     match result {
@@ -279,7 +276,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
 fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let own = ProcessId::current();
+    let own = crate::identity::ticks_id(std::process::id());
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_pidfd_open(own.pid(), Err(Errno::INVAL))
@@ -417,7 +414,7 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
 /// the mounted procfs numbers it. `ProcessId::current()` is a live target, so the pidfd is real;
 /// the fake hands it out as `pidfd_open`'s answer, so that the stated path names its number.
 fn open_verified_current_with_fdinfo(fdinfo: Result<&[u8], i32>) -> Result<Option<OwnedFd>, Error> {
-    let own = ProcessId::current();
+    let own = crate::identity::ticks_id(std::process::id());
     let pidfd = pidfd_open(getpid(), PidfdFlags::empty()).expect("pidfd_open of this process");
     let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
     let kernel = FakeKernel::over(&HostKernel)
@@ -488,7 +485,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
     let stated = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(i64::from(std::process::id()))));
     assert!(matches!(stated, Ok(Some(_))), "got {stated:?}");
-    let real = open_verified_with(&HostKernel, ProcessId::current());
+    let real = open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id()));
     assert!(
         matches!(real, Ok(Some(_))),
         "the real fdinfo must match too, got {real:?}"
@@ -509,9 +506,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
     let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
     let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
-    let id = ProcessId::of(child.id())
-        .found()
-        .expect("the unreaped child has an identity");
+    let id = crate::identity::ticks_id(child.id());
     child.wait().expect("reap the child");
     let result = super::verify_pidfd_target(&HostKernel, id, pidfd);
     assert!(matches!(result, Ok(None)), "got {result:?}");
@@ -523,7 +518,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
 fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let own = ProcessId::current();
+    let own = crate::identity::ticks_id(std::process::id());
     let pidfd = pidfd_open(getpid(), PidfdFlags::empty()).expect("pidfd_open of this process");
     let fdinfo = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
     let kernel = FakeKernel::over(&HostKernel)

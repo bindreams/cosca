@@ -1,16 +1,10 @@
 #[cfg(windows)]
 use super::{Existence, Liveness};
-use super::{ProcessId, RawPid, Resolved, StartToken};
+use super::{Key, ProcessId, RawPid, Resolved};
 use std::collections::HashSet;
 
-// Build a ProcessId directly from parts (this test module can access the
-// private fields and the private StartToken). Mirrors the crate-internal,
-// test-only `ProcessId::from_parts_for_test`.
 fn id(pid: RawPid, tok: u64) -> ProcessId {
-    ProcessId {
-        pid,
-        start: StartToken::from_raw(tok),
-    }
+    ProcessId::from_parts_for_test(pid, Key::for_test(tok))
 }
 
 #[skuld::test]
@@ -68,7 +62,7 @@ fn the_host_kernel_resolves_a_live_child_through_of_with_and_exists_with() {
         live.exists_with(&super::HostKernel).0,
         crate::identity::Existence::Present
     );
-    let stale = ProcessId::from_parts_for_test(live.pid(), live.start_token_raw().wrapping_add(1));
+    let stale = live.with_other_value();
     assert_eq!(
         stale.exists_with(&super::HostKernel).0,
         crate::identity::Existence::Gone
@@ -78,23 +72,20 @@ fn the_host_kernel_resolves_a_live_child_through_of_with_and_exists_with() {
 }
 
 #[skuld::test]
-fn start_token_raw_is_stable_and_matches_reresolved() {
+fn the_key_is_stable_and_matches_reresolved() {
     let me = ProcessId::current();
     // Stable across two calls on the same identity.
-    assert_eq!(me.start_token_raw(), me.start_token_raw());
-    // Equals the token of a freshly re-resolved identity for the same pid.
+    assert_eq!(me.key(), me.key());
+    // Equals the key of a freshly re-resolved identity for the same pid.
     let again = ProcessId::of(me.pid()).found().expect("current pid resolves");
-    assert_eq!(me.start_token_raw(), again.start_token_raw());
+    assert_eq!(me.key(), again.key());
 }
 
 #[skuld::test]
 fn imposter_token_neither_exists_nor_is_alive() {
     let me = ProcessId::current();
-    // Same live PID, deliberately wrong start token => a different identity.
-    let imposter = ProcessId {
-        pid: me.pid(),
-        start: StartToken::from_raw(me.start.raw().wrapping_add(1)),
-    };
+    // Same live PID, deliberately wrong key => a different identity.
+    let imposter = me.with_other_value();
     assert_eq!(
         imposter.exists(),
         crate::identity::Existence::Gone,

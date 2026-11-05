@@ -29,6 +29,14 @@ macro_rules! in_fresh_pid_ns {
             #[fixture(cgroup)] _cgroup: &crate::test_groups::Group
         ]);
     };
+    // For a body that needs pidfs (a reused pid has an identity of its own): the entry test holds the
+    // `pidfd_group_signal` group too, whose precondition is that kernel.
+    ($test:ident, $driver:ident, $init:ident, $body:path, pidfs) => {
+        $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [
+            #[fixture(namespaces)] _group: &crate::test_groups::Group,
+            #[fixture(pidfd_group_signal)] _pidfs: &crate::test_groups::Group
+        ]);
+    };
     // For a body that also attaches a foreign tracer: the entry test holds the `tracer_group` too.
     ($test:ident, $driver:ident, $init:ident, $body:path, tracer) => {
         $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [
@@ -103,15 +111,14 @@ pub(crate) fn reuse(pid: u32) -> Child {
 
 /// What a reader of `id`'s pid finds there: the identity with `id`'s own start token if `same_tick`,
 /// else the next one.
+///
+/// A same-tick reuser is a state of a host whose ids are start times in ticks. On pidfs a reuser has
+/// its own inode, so a `same_tick` row forces a state that host cannot be in.
 pub(crate) fn reuser_id(
     id: crate::identity::ProcessId,
     same_tick: bool,
 ) -> crate::identity::Resolved<crate::identity::ProcessId> {
-    let raw = id.start_token_raw();
-    crate::identity::Resolved::Found(crate::identity::ProcessId::from_parts_for_test(
-        id.pid(),
-        if same_tick { raw } else { raw + 1 },
-    ))
+    crate::identity::Resolved::Found(if same_tick { id } else { id.with_other_value() })
 }
 
 /// [`sigusr1_and_wait`] without consuming the exit: sends `SIGUSR1`, then waits on a pidfd until the
