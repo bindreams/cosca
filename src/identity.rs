@@ -172,9 +172,8 @@ impl ProcessId {
         }
     }
 
-    /// `Err` with the verdict of an ordered read (of type `T`) that `self`, the parent it was told,
-    /// no longer holds its pid: [`Resolved::Gone`] when another process holds it, [`Resolved::Unknown`]
-    /// when that cannot be proved, with the parent blamed.
+    /// `Err(Gone)` if another process now holds `self`'s pid, `Err(Unknown)` (blaming the parent) if
+    /// that cannot be proved.
     #[cfg(any(target_os = "linux", windows))]
     fn still_held<T>(&self, kernel: &dyn Kernel) -> Result<(), (Resolved<T>, UnknownCause)> {
         match self.exists_with(kernel) {
@@ -192,8 +191,8 @@ impl ProcessId {
     /// the pid has changed hands. A number that is read does not yet name the parent, which may have
     /// been reaped and its number taken, so `parent` is then proved again: a number that no longer
     /// holds it is [`Resolved::Gone`] too, and one whose proof cannot be made is
-    /// [`Resolved::Unknown`]. On Windows a failed read of the creator is `Unknown`, never a fall back
-    /// to the process snapshot's parent. macOS checks neither.
+    /// [`Resolved::Unknown`]. On Windows a failed read of the creator is `Unknown`. macOS checks
+    /// neither.
     pub(crate) fn of_ordered_with(
         kernel: &dyn Kernel,
         pid: RawPid,

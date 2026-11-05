@@ -142,7 +142,7 @@ fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtre
 /// edge, as a creator always has the lower sequence number, so the stub states it.
 ///
 /// Mutant (CI runs this row; no other row pins the consts on Windows): `ORDER_AFTER_PARENT` is
-/// `false` on Windows, or `descendants_from_key` passes the flags swapped. 300 is kept.
+/// `false` on Windows, or `descendants_from_key` passes the flags swapped.
 #[cfg(windows)]
 #[skuld::test]
 fn on_windows_a_reused_creator_edge_is_dropped_under_the_production_consts() {
@@ -425,11 +425,35 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "and dropping it must not have touched it");
 }
 
+/// The text of `resolve_or_drop`'s warn for a candidate whose creator-pid query was refused: the
+/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the `NTSTATUS`
+/// and does not fall back to "access denied?".
+///
+/// The failed query itself is not driven through the walk: forcing one needs a hook in production
+/// code, and Windows has no `FakeKernel` methods to state it in.
+///
+/// Mutant: `into_error` drops the creator status.
+#[cfg(windows)]
+#[skuld::test]
+fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_windows() {
+    let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+    let cause = crate::identity::UnknownCause::default().with_creator_status(refused);
+    let crate::error::Error::Unassessable { detail, .. } = super::unqueryable_read(7, cause) else {
+        panic!("a refused creator query is Unassessable");
+    };
+    assert_eq!(
+        detail,
+        "pid 7 exists but its creator process id query failed: NTSTATUS 0xc0000004"
+    );
+}
+
 /// The Windows wiring of the walk to the creator read, through `descendants_from_key` with real
 /// processes: `x` and `y` are both children of the root (this process). A snapshot that names `x` as
 /// `y`'s parent is a stale creator edge: `y`'s own creator is the root, so it is dropped under `x`
-/// and kept under the root. (A real edge that breaks the parent-order rule names a creator that is
-/// not the process's, which the creator read catches first, so the stub rows pin that rule.)
+/// and kept under the root. `x` is spawned first, so `y`'s key follows `x`'s and the parent-order
+/// rule passes the edge: only the creator read drops `y`. (A real edge that breaks the rule names a
+/// creator that is not the process's, which the creator read catches first, so the stub rows pin
+/// that rule.)
 /// Mutant: `resolve_or_drop` passes no parent to the read.
 #[cfg(windows)]
 #[skuld::test]
@@ -441,18 +465,18 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     let root_key = super::anchor(&HostKernel, root)
         .expect("the root reads")
         .expect("the root is live");
-    let (y_child, y) = live_findstr_blocker();
     let (x_child, x) = live_findstr_blocker();
+    let (y_child, y) = live_findstr_blocker();
 
     let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
     let dropped = super::descendants_from_key(&HostKernel, root, root_key, &stale_creator);
-    let genuine = [(y.pid(), root.pid()), (x.pid(), root.pid())];
+    let genuine = [(x.pid(), root.pid()), (y.pid(), root.pid())];
     let kept = super::descendants_from_key(&HostKernel, root, root_key, &genuine);
 
     release_findstr_unterminated(x_child);
     release_findstr_unterminated(y_child);
     assert_eq!(dropped, vec![x]);
-    assert_eq!(kept, vec![y, x]);
+    assert_eq!(kept, vec![x, y]);
 }
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.

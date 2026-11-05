@@ -66,9 +66,8 @@
 //!
 //! # The creator read (Windows only)
 //!
-//! A snapshot row's ppid is only a number. The resolver reads the candidate again on one handle:
-//! its creator pid (`NtQueryInformationProcess` class 0, never the snapshot's
-//! `th32ParentProcessID`), its id and its order key. A candidate whose creator is not the accepted
+//! A snapshot row's ppid is only a number. The resolver reads the candidate again on one handle: its
+//! creator pid (class 0), its id and its order key. A candidate whose creator is not the accepted
 //! parent's pid is dropped, and so is one whose accepted parent no longer holds that pid when the
 //! read is done. So a descendant whose parent exits while the walk runs is dropped with its
 //! subtree: its creator pid still names the dead parent, which the read cannot tell from a pid that
