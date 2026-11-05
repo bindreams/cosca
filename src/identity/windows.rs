@@ -3,7 +3,8 @@
 //! - `start_token`: raw creation `FILETIME` (identity, NOT epoch-adjusted).
 //! - `created_at`: that 100 ns-since-1601 value converted to `SystemTime`.
 //! - `ordered_read`: the id's key and the `OrderKey` (the process sequence number, through the
-//!   private `NtQueryInformationProcess` class 92), read on one handle.
+//!   private `NtQueryInformationProcess` class 92), read on one handle; given the parent the caller
+//!   was told, also the creator pid (class 0), on the same handle.
 //! - `is_running`: authoritative "not exited" via `WaitForSingleObject(_, 0)`, which tests
 //!   the process's *signaled state* — so it flips to dead the instant the process exits,
 //!   without the object-teardown window that an existence check (`OpenProcess` succeeding)
@@ -18,14 +19,15 @@
 use std::time::{Duration, SystemTime};
 
 use windows::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{
     CloseHandle, RtlNtStatusToDosError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, NTSTATUS, STILL_ACTIVE, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    PROCESS_ACCESS_RIGHTS, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
@@ -274,38 +276,66 @@ pub(super) fn creation_token(handle: HANDLE) -> Option<Key> {
 /// crate's constants (its `MaxProcessInfoClass` is 83).
 const PROCESS_SEQUENCE_NUMBER: PROCESSINFOCLASS = PROCESSINFOCLASS(92);
 
-/// The sequence number of the process `handle` names, or the `NTSTATUS` that refused it. The
-/// handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
-fn sequence_number(handle: HANDLE) -> Result<u64, NTSTATUS> {
-    let mut sequence = 0u64;
-    // SAFETY: `handle` is live; `sequence` is the 8-byte buffer class 92 writes.
+/// `NtQueryInformationProcess` of `class` on `handle`, into `out`, or the `NTSTATUS` that refused it.
+/// The handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+///
+/// # Safety
+/// `T` must be the buffer `class` writes.
+unsafe fn query<T>(handle: HANDLE, class: PROCESSINFOCLASS, out: &mut T) -> Result<(), NTSTATUS> {
+    // SAFETY: `handle` is live; `out` is the buffer the caller says `class` writes, and its size is
+    // passed.
     let status = unsafe {
         NtQueryInformationProcess(
             handle,
-            PROCESS_SEQUENCE_NUMBER,
-            std::ptr::from_mut(&mut sequence).cast(),
-            std::mem::size_of::<u64>() as u32,
+            class,
+            std::ptr::from_mut(out).cast(),
+            std::mem::size_of::<T>() as u32,
             std::ptr::null_mut(),
         )
     };
     if status.is_ok() {
-        Ok(sequence)
+        Ok(())
     } else {
         Err(status)
     }
 }
 
+/// The sequence number of the process `handle` names, or the `NTSTATUS` that refused it. The
+/// handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+fn sequence_number(handle: HANDLE) -> Result<u64, NTSTATUS> {
+    let mut sequence = 0u64;
+    // SAFETY: class 92 writes an 8-byte count.
+    unsafe { query(handle, PROCESS_SEQUENCE_NUMBER, &mut sequence) }?;
+    Ok(sequence)
+}
+
+/// The pid of the process that created the process `handle` names
+/// (`ProcessBasicInformation.InheritedFromUniqueProcessId`), or the `NTSTATUS` that refused it.
+/// Windows never updates it: it survives its creator's exit, and the number may be another
+/// process's by then. The handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
+    let mut info = PROCESS_BASIC_INFORMATION::default();
+    // SAFETY: class 0 writes a `PROCESS_BASIC_INFORMATION`.
+    unsafe { query(handle, ProcessBasicInformation, &mut info) }?;
+    Ok(info.InheritedFromUniqueProcessId)
+}
+
 /// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
 /// so both describe the same process. `expected`: the key of the process asked about, when there
-/// is one; a pid that holds another key is [`Resolved::Gone`]. A refused sequence-number query is
-/// `Unknown` with its `NTSTATUS` as the cause.
-pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+/// is one; a pid that holds another key is [`Resolved::Gone`]. `parent`: the process the caller was
+/// told created `pid`, when it was told one; a process created by another pid is
+/// [`Resolved::Gone`]. A refused query is `Unknown` with its `NTSTATUS` as the cause.
+pub(super) fn ordered_read(
+    pid: RawPid,
+    expected: Option<Key>,
+    parent: Option<RawPid>,
+) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
         Opened::Gone => return (Resolved::Gone, UnknownCause::default()),
         Opened::Denied(_) => return (Resolved::Unknown, UnknownCause::default()),
     };
-    let read = ordered_from_handle(handle, pid, expected);
+    let read = ordered_from_handle(handle, pid, expected, parent);
     close(handle);
     read
 }
@@ -315,8 +345,39 @@ pub(super) fn ordered_from_handle(
     handle: HANDLE,
     pid: RawPid,
     expected: Option<Key>,
+    parent: Option<RawPid>,
 ) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
-    combine(pid, expected, creation_token_result(handle), sequence_number(handle))
+    let read = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
+    match parent {
+        Some(parent) => with_creator(pid, parent, creator_pid(handle), read),
+        None => read,
+    }
+}
+
+/// What the creator pid read from the handle of `pid` adds to `read`, the handle's other reads: a
+/// process created by a pid other than `parent` is [`Resolved::Gone`] whatever `read` said, as it is
+/// for another key. A refused creator query leaves a `Found` or `Unknown` read `Unknown`, with its
+/// `NTSTATUS` as the cause unless the read already had one, never a fall back to the snapshot's
+/// `th32ParentProcessID`.
+fn with_creator(
+    pid: RawPid,
+    parent: RawPid,
+    creator: Result<usize, NTSTATUS>,
+    read: (Resolved<(Key, OrderKey)>, UnknownCause),
+) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+    match creator {
+        Ok(creator) if creator != parent as usize => (Resolved::Gone, UnknownCause::default()),
+        Ok(_) => read,
+        Err(_) if matches!(read.0, Resolved::Gone) => read,
+        Err(status) => {
+            log::debug!(
+                "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \
+                 NTSTATUS {:#010x}",
+                status.0 as u32
+            );
+            (Resolved::Unknown, read.1.with_creator_status(status))
+        }
+    }
 }
 
 /// What the two reads of one handle of `pid` say together. The key is compared with `expected`
@@ -354,7 +415,7 @@ fn combine(
 /// process holds it now. The read that proves the process is still there is the one that gives the
 /// key.
 pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let (read, cause) = ordered_read(pid, Some(key));
+    let (read, cause) = ordered_read(pid, Some(key), None);
     (read.map(|(_, order)| order), cause)
 }
 
