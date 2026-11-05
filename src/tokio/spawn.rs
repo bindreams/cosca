@@ -678,7 +678,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 );
                 // The read failed, so no identity is known.
                 #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front_noting(pid, front, None, subtree.as_ref(), &mut why);
+                let (fate, child_fate) = proc.leave_front_noting(pid, None, subtree.as_ref(), &mut why);
                 return Err(SpawnFailure::started(
                     fate.note(
                         crate::child::spawn::spawn_identity_error(other, cause),
@@ -749,7 +749,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // Elsewhere the failed attach has dropped the containment: a cgroup leaf's drop kills
                 // and drains it, so a front in it is dying, and is waited for.
                 #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front(pid, front, Some(id), subtree.as_ref());
+                let (fate, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref());
                 return Err(SpawnFailure::started(
                     fate.note(error, Some(front), Some(pid)),
                     child_fate,
@@ -1138,10 +1138,6 @@ fn front_child_fate(fate: crate::child::spawn::FrontFate) -> ChildFate {
         FrontFate::Reaped => ChildFate::Reaped,
         FrontFate::LeftUnreaped => ChildFate::Running { id: None },
         FrontFate::Unaccounted | FrontFate::Unplaced => ChildFate::Unknown,
-        FrontFate::NotAFront => {
-            debug_assert!(false, "an abandoned front is a front");
-            ChildFate::Unknown
-        }
     }
 }
 

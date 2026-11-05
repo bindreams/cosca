@@ -9,6 +9,7 @@ use super::owned::ChildWaitOutcome;
 use super::Child;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign};
+use crate::os_process::PIDLESS_CHILD;
 
 /// Whether a wait that finds the child's zombie held by launchd (macOS) says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub(super) enum Orphaned {
 /// A wait's `outcome` on the child `pid` as the status `Child` answers: `Some` for an exit
 /// (`Unreadable` is `InvalidData`), `None` for a deadline that passed.
 pub(super) fn status_of_outcome(
-    pid: u32,
+    pid: Option<u32>,
     outcome: ChildWaitOutcome,
     orphaned: Orphaned,
 ) -> Result<Option<ExitStatus>, Error> {
@@ -43,8 +44,11 @@ pub(super) fn status_of_outcome(
 }
 
 /// What to say of a child whose zombie launchd holds.
-pub(super) fn orphaned_note(pid: u32) -> String {
-    format!("pid {pid}: not ours to reap (launchd holds its zombie, because its tracer died)")
+pub(super) fn orphaned_note(pid: Option<u32>) -> String {
+    format!(
+        "{}: not ours to reap (launchd holds its zombie, because its tracer died)",
+        pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("pid {pid}"))
+    )
 }
 
 /// The `ECHILD` every wait answers when the child was reaped by someone else.
@@ -103,7 +107,7 @@ impl Child {
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is
     /// a deadline that passed with the root still running.
     pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
-        status_of_outcome(self.id.pid(), self.proc.wait(deadline)?, orphaned)
+        status_of_outcome(Some(self.id.pid()), self.proc.wait(deadline)?, orphaned)
     }
 
     /// Block until the root is reaped.
