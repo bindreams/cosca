@@ -84,8 +84,8 @@ pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Resu
 }
 
 /// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`],
-/// `identity::linux::stat_by_pid`).
-pub(super) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
+/// `identity::linux::stat_by_pid`, the cgroup leaf's state read).
+pub(crate) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     kernel.read(dir, &format!("{pid}/stat"))
 }
 

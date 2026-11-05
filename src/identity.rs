@@ -236,10 +236,11 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::fake::FakeKernel;
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_view::DIVERGED_REASON;
+
 #[cfg(target_os = "linux")]
-pub(crate) use backend::proc_view::{
-    pidfd_pid_in, proc_view_with, utf8, PidfdTarget, ProcDir, ProcView, ViewUnreadable,
-};
+pub(crate) use backend::proc_view::{pidfd_pid_in, proc_view_with, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through. Carried out of the failing read, so the error describes that read

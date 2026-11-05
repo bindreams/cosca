@@ -1,7 +1,7 @@
 // Pure-parser tests for cgroup v2 path detection and cgroup.events.
 // These run on any host (including Windows) with synthetic inputs — no filesystem access.
 
-use crate::containment::cgroup::{parse_populated, parse_proc_stat_state, parse_v2_relative_path};
+use crate::containment::cgroup::{parse_populated, parse_v2_relative_path};
 
 // parse_v2_relative_path tests =====
 
@@ -122,32 +122,6 @@ fn populated_garbage_value_returns_none() {
 #[skuld::test]
 fn populated_no_trailing_newline() {
     assert_eq!(parse_populated("frozen 0\npopulated 0"), Some(false));
-}
-
-// parse_proc_stat_state tests -----
-
-/// The ordinary case: a zombie child, the state that explains "placed, then left the set".
-#[skuld::test]
-fn proc_stat_state_reads_zombie() {
-    assert_eq!(
-        parse_proc_stat_state("42 (cosca_testbin) Z 1 42 42 0 -1 4194560\n"),
-        Some('Z')
-    );
-}
-
-/// `comm` is arbitrary bytes inside parentheses: a name containing spaces AND parentheses
-/// must not shift the field index, so the scan starts after the LAST `)`.
-#[skuld::test]
-fn proc_stat_state_survives_a_hostile_comm() {
-    assert_eq!(parse_proc_stat_state("42 (weird ) name (x) R 1 42\n"), Some('R'));
-}
-
-/// Truncated or malformed input yields no state rather than a guessed one.
-#[skuld::test]
-fn proc_stat_state_malformed_is_none() {
-    assert_eq!(parse_proc_stat_state(""), None);
-    assert_eq!(parse_proc_stat_state("42 (noparen"), None);
-    assert_eq!(parse_proc_stat_state("42 (comm)"), None);
 }
 
 /// A child is in a leaf when its cgroup is the leaf's own path or nested under it — not when some

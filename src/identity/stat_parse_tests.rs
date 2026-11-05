@@ -77,6 +77,13 @@ fn rejects_truncated_stat() {
     assert_eq!(parse_state(stat), Some(b'S')); // state still readable here
 }
 
+/// Truncated or malformed input yields no state rather than a guessed one.
+#[skuld::test]
+fn parse_state_of_a_record_without_a_state_field_is_none() {
+    assert_eq!(parse_state(b""), None);
+    assert_eq!(parse_state(b"42 (comm)"), None);
+}
+
 #[skuld::test]
 fn rejects_missing_close_paren() {
     let stat = b"1 (init S 0 1";

@@ -127,46 +127,41 @@ fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::C
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 enum StateUnknown {
-    /// `/proc` belongs to an outer pid namespace, so its `<pid>` could name another process.
-    OuterProcfs,
-    /// `/proc` could not be verified to be this process's own pid namespace's.
-    ViewUnassessable(crate::identity::ViewUnreadable),
+    /// `/proc` is an outer pid namespace's, or could not be verified to be this process's own.
+    View(crate::identity::ViewUnreadable),
     /// `<pid>/stat` could not be read.
     Unreadable(std::io::Error),
     /// `<pid>/stat` has no state field.
-    Unparsable(String),
+    Unparsable(Vec<u8>),
 }
 
 #[cfg(target_os = "linux")]
 impl std::fmt::Display for StateUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OuterProcfs => f.write_str("/proc is an outer pid namespace's"),
-            Self::ViewUnassessable(why) => write!(f, "the /proc view could not be established: {why}"),
+            Self::View(why) => write!(f, "the /proc view could not be established: {why}"),
             Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
-            Self::Unparsable(stat) => write!(f, "its stat has no state field: {stat:?}"),
+            Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
         }
     }
 }
 
+/// `pid`'s state letter. Any failure, the pidfd-bracketed read's included, means the state is
+/// unknown; the leaf has no use for the finer errno policy of the scans.
 #[cfg(target_os = "linux")]
 fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
-    use crate::identity::{proc_view_with, utf8, ProcView};
-    let proc_dir = match proc_view_with(kernel) {
-        ProcView::Same(proc_dir) => proc_dir,
-        ProcView::Diverged => return Err(StateUnknown::OuterProcfs),
-        ProcView::Unassessable(why) => return Err(StateUnknown::ViewUnassessable(why)),
-    };
-    let stat = kernel
-        .read(&proc_dir, &format!("{pid}/stat"))
-        .and_then(utf8)
-        .map_err(StateUnknown::Unreadable)?;
+    let proc_dir = crate::identity::proc_view_with(kernel)
+        .into_dir()
+        .map_err(StateUnknown::View)?;
+    let stat = crate::identity::pid_stat::read_stat_file(kernel, &proc_dir, pid).map_err(StateUnknown::Unreadable)?;
     state_from_stat(stat)
 }
 
 #[cfg(target_os = "linux")]
-fn state_from_stat(stat: String) -> Result<char, StateUnknown> {
-    parse_proc_stat_state(&stat).ok_or(StateUnknown::Unparsable(stat))
+fn state_from_stat(stat: Vec<u8>) -> Result<char, StateUnknown> {
+    crate::identity::stat_parse::parse_state(&stat)
+        .map(char::from)
+        .ok_or(StateUnknown::Unparsable(stat))
 }
 
 /// What [`CgroupLeaf::drain_step`] found.

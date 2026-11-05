@@ -2,7 +2,7 @@
 
 use super::{proc_state, read_proc_state, StateUnknown};
 use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
-use crate::identity::{FakeKernel, HostKernel};
+use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON};
 use crate::test_child::namespaces as ns;
 use crate::test_child::{fixture_path, member_command};
 use crate::test_groups::{namespaces, Group};
@@ -64,8 +64,8 @@ fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
 #[skuld::test]
 fn an_unparsable_stat_is_named() {
     assert!(matches!(
-        super::state_from_stat(String::from("garbage")),
-        Err(StateUnknown::Unparsable(s)) if s == "garbage"
+        super::state_from_stat(b"garbage".to_vec()),
+        Err(StateUnknown::Unparsable(s)) if s == b"garbage"
     ));
 }
 
@@ -75,13 +75,15 @@ fn an_unparsable_stat_is_named() {
 fn no_state_is_read_when_the_view_is_diverged_or_unassessable() {
     let me = std::process::id();
     let diverged = FakeKernel::over(&HostKernel).diverged_view();
-    let why = read_proc_state(&diverged, me).expect_err("no state");
-    assert!(matches!(why, StateUnknown::OuterProcfs), "{why:?}");
+    match read_proc_state(&diverged, me).expect_err("no state") {
+        StateUnknown::View(v) => assert_eq!(v.reason, DIVERGED_REASON),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(proc_state(&diverged, handle_of(me, &pidfd_of(me))), None);
 
     let unreadable = FakeKernel::over(&HostKernel).unreadable_view();
     match read_proc_state(&unreadable, me).expect_err("no state") {
-        StateUnknown::ViewUnassessable(v) => assert_eq!(v.reason, "self/status could not be read"),
+        StateUnknown::View(v) => assert_eq!(v.reason, "self/status could not be read"),
         other => panic!("{other:?}"),
     }
     assert_eq!(proc_state(&unreadable, handle_of(me, &pidfd_of(me))), None);
@@ -108,9 +110,9 @@ fn fixture_state_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
     }
-    let outer = std::fs::read_to_string("/proc/1/stat").expect("the outer /proc/1/stat is readable by path");
+    let outer = std::fs::read("/proc/1/stat").expect("the outer /proc/1/stat is readable by path");
     assert!(
-        super::parse_proc_stat_state(&outer).is_some(),
+        crate::identity::stat_parse::parse_state(&outer).is_some(),
         "control: read by path, pid 1 has a state: {outer:?}"
     );
     assert_eq!(proc_state(&HostKernel, handle_of(1, &pidfd_of(1))), None);
