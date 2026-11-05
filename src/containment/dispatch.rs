@@ -260,10 +260,48 @@ pub(crate) enum RootView {
     Trusted,
 }
 
+/// Who tears a child down. The caller prefixes the teardown's log lines and names its own event in
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownCaller {
+    /// A `Child`'s own drop.
+    Drop,
+    /// A helper that owns the child and failed after its spawn (`Command::status`, `output`, `read`,
+    /// `SuspendedChild::resume`).
+    FailedRun,
+    /// The cleanup of an elevated spawn that cannot finish.
+    #[cfg(unix)]
+    FinishElevated,
+}
+
+impl TeardownCaller {
+    /// The prefix of the caller's log lines.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TeardownCaller::Drop => "Child::drop",
+            TeardownCaller::FailedRun => "teardown after a failed run",
+            #[cfg(unix)]
+            TeardownCaller::FinishElevated => "finish_elevated",
+        }
+    }
+
+    /// How a log line of the caller refers to its own event: a drop is "this drop", any other
+    /// teardown is "this teardown".
+    #[cfg(unix)]
+    pub(crate) fn this_event(self) -> &'static str {
+        match self {
+            TeardownCaller::Drop => "this drop",
+            TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
+        }
+    }
+}
+
 /// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DropView {
+    /// The caller's name, prefixing its log lines.
+    pub(crate) caller: TeardownCaller,
     pub(crate) root_pid: u32,
     pub(crate) root: RootView,
     /// This handle already killed the tree completely.
@@ -278,14 +316,15 @@ impl DropView {
     /// root by its start token.
     ///
     /// Reading emits no `warn`: the caller reports once, with a
-    /// [`DropReport`](crate::child::drop_report::DropReport). `label` names the caller in log lines.
+    /// [`DropReport`](crate::child::drop_report::DropReport). `caller` names itself in log lines.
     pub(crate) fn read(
-        label: &str,
+        caller: TeardownCaller,
         id: crate::identity::ProcessId,
         root: impl FnOnce() -> crate::signal::RootState,
         tree_killed: &TreeKilled,
     ) -> DropView {
         use crate::signal::RootState;
+        let label = caller.label();
         let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
         let state = root();
@@ -311,6 +350,7 @@ impl DropView {
             }
         };
         let view = DropView {
+            caller,
             root_pid,
             root,
             tree_killed: tree_killed.is_set(),
@@ -747,16 +787,17 @@ impl Attached {
             DropReach::Skip(skipped) => skipped,
         };
         let why = view.why_number_untrusted();
+        let (label, this) = (view.caller.label(), view.caller.this_event());
         let left_behind = if view.tree_killed {
             log::debug!(
-                "Child::drop: {why} and this handle already killed the tree, \
-                 so this drop does not {skipped}"
+                "{label}: {why} and this handle already killed the tree, \
+                 so {this} does not {skipped}"
             );
             None
         } else {
             // A reaped root's skip is the drop's warn; an unsettled root's is part of its state's.
             if !matches!(view.root, RootView::Reaped) {
-                log::debug!("Child::drop: {why}, so this drop does not {skipped}");
+                log::debug!("{label}: {why}, so {this} does not {skipped}");
             }
             Some(skipped)
         };
@@ -805,7 +846,8 @@ impl Attached {
                 RootNumber::Trusted => return DropReach::Kill,
                 RootNumber::GroupGone => {
                     log::debug!(
-                        "Child::drop: {why}, and its pidfd shows its process group has no member left, so nothing is sent"
+                        "{}: {why}, and its pidfd shows its process group has no member left, so nothing is sent",
+                        view.caller.label()
                     );
                     return DropReach::GroupGone;
                 }
@@ -1061,6 +1103,25 @@ pub(crate) enum RootIdentity {
     Gone,
     /// The read was refused or could not be trusted.
     Unknown,
+}
+
+/// Whether the tree kill of this mechanism reached the child. Only a cgroup leaf's `cgroup.kill` is
+/// shown to, whatever the child's credentials: its flag says the write landed, then where the child
+/// is says it was in the leaf. A signal to a group or to walked members is subject to the kernel's
+/// permission check, as the child's own kill is, so it reaches nothing that kill does not.
+#[cfg(unix)]
+impl crate::child::owned::teardown::Reach for Attached {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.subtree()?.reached(child);
+        }
+        Ok(false)
+    }
 }
 
 /// Which Unix setup action to apply to a root `Command` for a given mode.

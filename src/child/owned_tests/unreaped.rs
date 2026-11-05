@@ -198,6 +198,58 @@ fn pid_comes_from_the_child_and_id_from_the_spawn() {
     without_id.leak();
 }
 
+/// An `Unreaped` dropped while its thread panics gives the child up without waiting for it: one
+/// `warn` naming the pid and the panic, no block, and the child still runs. The stdin that ends the
+/// child stays with the test; a drop that waited anyway would close it from the blocking hook and
+/// reap the child, so a regression fails by assertion, not by a hang. The given-up child is not
+/// reaped (it has no owner left): the test closes its stdin so it exits, and the process exit
+/// collects its zombie.
+///
+/// Mutants: the drop waits though the thread is panicking (blocks, reaps, warns of the reap); it
+/// logs nothing, or twice; it kills the child.
+#[skuld::test]
+fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
+    use std::cell::RefCell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::rc::Rc;
+
+    use super::fixtures::{identity_of, spawn_std_blocker};
+    use crate::child::owned::OwnedChild;
+    use crate::identity::Liveness;
+
+    crate::log_capture::install();
+    let (child, stdin) = spawn_std_blocker();
+    let blocker_id = identity_of(&child);
+    let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let unreaped = Unreaped::new(owned, Some(blocker_id));
+    let stdin = Rc::new(RefCell::new(Some(stdin)));
+    crate::wait::block_probe::take();
+    let _end = crate::wait::block_probe::on_blocking({
+        let stdin = Rc::clone(&stdin);
+        move || drop(stdin.borrow_mut().take())
+    });
+    let mark = crate::log_capture::mark();
+
+    let outcome = catch_unwind(AssertUnwindSafe(move || {
+        let _held = unreaped;
+        panic!("the thread panics while it holds the Unreaped");
+    }));
+
+    assert!(outcome.is_err());
+    assert_eq!(crate::wait::block_probe::take(), [], "the drop did not block");
+    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    assert!(
+        matches!(
+            records.as_slice(),
+            [(log::Level::Warn, text)]
+                if text.contains(&blocker_id.pid().to_string()) && text.contains("panicking")
+        ),
+        "{records:?}"
+    );
+    assert_eq!(blocker_id.is_alive(), Liveness::Alive, "the child was given up running");
+    drop(stdin.borrow_mut().take());
+}
+
 /// A real child that is still running when its `Unreaped` drops is waited for and reaped: the drop
 /// blocks, the child exits (its stdin closes as the wait is about to block), and it is gone.
 ///

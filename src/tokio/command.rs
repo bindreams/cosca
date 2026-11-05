@@ -290,6 +290,7 @@ impl Command {
             crate::child::spawn::after_the_spawn(
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::error::ChildFate::Reaped,
+                None,
                 child.behind_wrapper(),
             )
         })
@@ -316,7 +317,7 @@ impl Command {
 /// The teardown says what became of the child.
 pub(super) async fn after_the_spawn(error: Error, child: &mut Child) -> Error {
     let fate = child.tear_down_awaiting().await;
-    crate::child::spawn::after_the_spawn(error, fate, child.behind_wrapper())
+    crate::child::spawn::after_the_spawn(error, fate, None, child.behind_wrapper())
 }
 
 #[cfg(test)]

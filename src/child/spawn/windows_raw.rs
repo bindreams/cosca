@@ -86,6 +86,7 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
+use crate::child::owned::teardown::Disposition;
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
@@ -227,6 +228,7 @@ pub(crate) fn spawn_raw(
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
+                None,
             ));
         }
     };
@@ -234,7 +236,7 @@ pub(crate) fn spawn_raw(
         Ok(v) => v,
         Err(e) => {
             let fate = raw_spawn_teardown(proc, pid, Some(id), None);
-            return Err(SpawnFailure::started(e, fate));
+            return Err(SpawnFailure::started(e, fate, None));
         }
     };
 
@@ -512,7 +514,7 @@ fn teardown_spawned(
 ) -> ChildFate {
     // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
     if let Err(refused) = child.signal(Sig::Kill) {
-        let looked = child.look_after_refused_kill(id, refused);
+        let looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
         if let Some(left) = &looked.left {
             log::warn!("raw spawn teardown: {left}");
         }

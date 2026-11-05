@@ -967,7 +967,7 @@ fn conclude<T: Spawned>(
             Err(if T::ERR_PROVES_NO_EXEC {
                 SpawnFailure::NotStarted(error)
             } else {
-                SpawnFailure::started(error, fate)
+                SpawnFailure::started(error, fate, None)
             })
         }
         // Not told to go, so it never ran the program.
