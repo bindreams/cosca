@@ -83,11 +83,21 @@ In order:
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
-     is the one kill-then-settle policy, and `Child::drop` uses it; so does every Linux spawn,
-     sync and async, from the handshake's `conclude` to the identity and attach arms
-     (`held_teardown.rs`), the async spawn's refused-kill teardown, and the cgroup leaf's
-     abandonment of a child it cannot name. The sync spawn builds the `OwnedChild` once when the
-     handshake succeeds. No Linux spawn reaps by pid or starts a thread of its own. `Settlement` is the one
+     is the one kill-then-settle policy, and `Child::drop` uses it. On Linux it also ends every
+     sync spawn failure (the handshake's `conclude`, and the identity and attach arms,
+     `held_teardown.rs`) and, in the async spawn, the failures of a child the handshake holds by
+     pidfd (`conclude`'s `(Err, Opened)` and unexecuted arms), an elevation front at the identity
+     and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
+     (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of a child it cannot
+     name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. Until the
+     async-child slice, tokio's own code ends the rest of the async spawn: `conclude`'s
+     `Ok(child)` arms (`Spawned` for tokio's `Child`: `reap_unexecuted` kills through the pidfd
+     and collects with `try_wait`, `abandon_unreported` leaves the child to tokio's orphan queue,
+     which `waitpid`s by pid), and the async non-front identity and attach arms
+     (`ProcSource::reap_now_noting`, `teardown_through_pidfd`: the kill, the wait and the
+     collect are the backend's, and only a refused kill goes on to `tear_down`). So the async Linux
+     spawn still reaps by pid in those arms. Apart from them, only the cgroup leaf's `end_child`
+     (both spawns) starts a background reaping thread, until the leaf slice. `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
      uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child,
      a refused kill or a running elevation front, hands it back as `Unreaped`, in

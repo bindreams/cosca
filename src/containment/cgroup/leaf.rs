@@ -1096,21 +1096,10 @@ impl CgroupLeaf {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let child = crate::child::owned::OwnedChild::new(Box::new(
-                    crate::os_process::linux::LinuxProcess::new(None, pidfd),
-                ));
-                let how = crate::child::spawn::held_teardown::HeldTeardown {
-                    front: None,
-                    id: None,
-                    subtree: None,
-                    disposition: crate::child::owned::teardown::Disposition::Leave,
-                    due: warn.due(),
-                };
-                crate::child::spawn::held_teardown::end_held(
-                    &child,
-                    &how,
-                    &mut crate::child::spawn::Diagnosis::default(),
-                );
+                let torn = crate::child::spawn::held_teardown::tear_down_pidfd(None, pidfd, None, warn.due());
+                if let Some(left) = torn.left {
+                    log::warn!("{left}");
+                }
                 return Abandoned::Ended;
             }
         }

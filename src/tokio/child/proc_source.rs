@@ -7,11 +7,11 @@ use std::process::ExitStatus;
 #[cfg(unix)]
 use crate::child::drop_report::Forgot;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, TeardownKind};
+use crate::child::owned::teardown::Disposition;
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
-use crate::child::spawn::held_teardown::{tear_down_held, HeldTeardown};
+use crate::child::spawn::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use crate::child::spawn::Diagnosis;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
@@ -250,7 +250,7 @@ struct TornDown {
 fn refused_kill_warning(
     pid: u32,
     e: &Error,
-    torn_down: bool,
+    torn_down: Option<&ChildFate>,
     foreign: Option<&str>,
     leak: Option<&'static str>,
     left: Option<&str>,
@@ -271,13 +271,13 @@ fn refused_kill_warning(
     text
 }
 
-/// What the warning for a refused teardown kill says became of the child: `torn_down` only when the
-/// teardown through its pidfd really took it.
-fn refused_kill_fate(torn_down: bool) -> &'static str {
-    if torn_down {
-        "it is torn down through its pidfd"
-    } else {
-        "it is not waited on"
+/// What the warning for a refused teardown kill says became of the child, from the fate the second
+/// teardown (`torn_down`, if it ran) gave it: torn down through its pidfd unless that teardown left
+/// it running too.
+fn refused_kill_fate(torn_down: Option<&ChildFate>) -> &'static str {
+    match torn_down {
+        Some(fate) if !matches!(fate, ChildFate::Running { .. }) => "it is torn down through its pidfd",
+        _ => "it is not waited on",
     }
 }
 
@@ -1300,7 +1300,7 @@ impl ProcSource {
                 why.fold(refused_kill_warning(
                     pid,
                     e,
-                    torn_down.is_some(),
+                    torn_down.as_ref().map(|t| &t.fate),
                     foreign.as_ref().map(|f| f.1.as_str()),
                     foreign.as_ref().map(|f| f.0).or(torn_down.as_ref().map(|t| t.leak)),
                     torn_down.as_ref().and_then(|t| t.left.as_deref()),
@@ -1465,11 +1465,7 @@ impl ProcSource {
                 ChildFate::Unknown,
             );
         }
-        self.forget_deferring(
-            "is an elevation front, sent nothing, and torn down through its pidfd",
-            Forgotten::Unproven,
-            why,
-        );
+        self.forget_deferring("is an elevation front, sent nothing", Forgotten::Unproven, why);
         // Nothing is handed back: tokio's `Running` waits for the async-child slice.
         let child = OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
             Some(pid),
@@ -1523,16 +1519,10 @@ impl ProcSource {
     fn tear_down_forgotten(mut self, pid: u32, id: Option<ProcessId>) -> Option<TornDown> {
         let (_, leak) = self.forget_quietly(Forgotten::Unproven)?;
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
-        let child = OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
+        let torn = tear_down_pidfd(
             Some(pid),
             self.take_forgotten_pidfd(),
-        )));
-        let torn = child.tear_down(
             id,
-            TeardownKind::Kill {
-                disposition: Disposition::Leave,
-                tree: None,
-            },
             Due::in_(super::slow_teardown_after()),
         );
         Some(TornDown {
@@ -1574,7 +1564,7 @@ impl ProcSource {
                 why.fold(refused_kill_warning(
                     pid,
                     e,
-                    torn_down.is_some(),
+                    torn_down.as_ref().map(|t| &t.fate),
                     foreign.as_ref().map(|f| f.1.as_str()),
                     foreign.as_ref().map(|f| f.0).or(torn_down.as_ref().map(|t| t.leak)),
                     torn_down.as_ref().and_then(|t| t.left.as_deref()),

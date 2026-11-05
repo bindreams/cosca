@@ -73,7 +73,7 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
-use super::held_teardown::{end_held, tear_down_held, HeldTeardown};
+use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
 use crate::child::owned::teardown::Disposition;
 use crate::child::owned::OwnedChild;
@@ -877,7 +877,7 @@ fn conclude<T: Spawned>(
     front: LeftFront,
     warn_after: Option<std::time::Duration>,
 ) -> Result<Held<T>, SpawnFailure> {
-    let teardown = |pidfd: OwnedFd| tear_down_pidfd(None, pidfd, warn_after, &mut super::Diagnosis::default());
+    let teardown = |pidfd: OwnedFd| end_through_pidfd(None, pidfd, warn_after, &mut super::Diagnosis::default());
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
         use crate::os_process::child::PeekOutcome;
         use crate::wait::exit_only::{peek, Target};
@@ -917,7 +917,7 @@ fn conclude<T: Spawned>(
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = tear_down_pidfd(None, pidfd, warn_after, &mut why);
+                let child_fate = end_through_pidfd(None, pidfd, warn_after, &mut why);
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
@@ -1012,31 +1012,26 @@ fn conclude<T: Spawned>(
     }
 }
 
-/// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
-/// [`OwnedChild`] over the pidfd. A child it could not end is left running (`Leave`) and warned of,
-/// the warn led by `why`; the fate says so. With `warn_after`, the wait for the killed child warns
-/// once it passes that long.
-fn tear_down_pidfd(
+/// [`tear_down_pidfd`] for the child `pidfd` names, whose pid is `pid` if known: a child it could
+/// not end is left running and warned of, the warn led by `why`; the fate says so. With
+/// `warn_after`, the wait for the killed child warns once it passes that long.
+fn end_through_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> ChildFate {
-    let child = OwnedChild::new(Box::new(LinuxProcess::new(pid, pidfd)));
-    let how = HeldTeardown {
-        front: None,
-        id: None,
-        subtree: None,
-        disposition: Disposition::Leave,
-        due: Due::in_(warn_after),
-    };
-    end_held(&child, &how, why).1.fate
+    let torn = tear_down_pidfd(pid, pidfd, None, Due::in_(warn_after));
+    if let Some(left) = &torn.left {
+        log::warn!("{}", why.fold(left));
+    }
+    torn.fate
 }
 
-/// [`tear_down_pidfd`] for a child that was never told to go, so it never ran the program: it
+/// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program: it
 /// has this process's credentials, and nothing but its being gone can refuse its kill.
 fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-    let fate = tear_down_pidfd(pid, pidfd, warn_after, &mut super::Diagnosis::default());
+    let fate = end_through_pidfd(pid, pidfd, warn_after, &mut super::Diagnosis::default());
     debug_assert!(
         !matches!(fate, ChildFate::Running { .. }),
         "the kill of a child that never ran the program was refused"

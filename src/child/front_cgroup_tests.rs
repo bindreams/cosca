@@ -1064,7 +1064,9 @@ pub(crate) fn failed_held_front_spawns(
 
 /// Each failure notes its front was killed by its leaf and reaped. The front is gone from the test's
 /// reach: the teardown's look or wait reaped it, and records no reap of its own;
-/// `failed_held_front_spawns` has already seen the leaf's kill end it.
+/// `failed_held_front_spawns` has already seen the leaf's kill end it. Which of the two reaps it is the
+/// kernel's timing; `owned_tests::teardown_look::a_running_front_the_kill_reached_is_waited_for_and_reaped`
+/// pins the wait.
 #[track_caller]
 pub(crate) fn assert_killed_by_the_leaf(failures: &[HeldFailure; 2]) {
     for HeldFailure { err, pid, .. } in failures {

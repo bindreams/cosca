@@ -1,5 +1,5 @@
-use super::after_refused_kill;
-use crate::error::ChildFate;
+use super::{after_refused_kill, refused_kill_warning};
+use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
@@ -17,6 +17,22 @@ fn a_refused_kill_answers_with_the_second_teardown_then_the_forgetting() {
     );
     assert_eq!(after_refused_kill(None, Some(ChildFate::Gone), id), ChildFate::Gone);
     assert_eq!(after_refused_kill(Some(ChildFate::Killed), None, id), ChildFate::Killed);
+}
+
+/// The warn for a refused teardown kill says "torn down" only of a child the second teardown ended:
+/// one it left running is not.
+///
+/// Mutant: the wording follows whether the second teardown ran, not what became of the child.
+#[skuld::test]
+fn the_refused_kill_warning_says_torn_down_only_of_a_child_that_is_not_running() {
+    let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let words = |torn_down: Option<&ChildFate>| refused_kill_warning(7, &e, torn_down, None, None, None);
+
+    assert!(words(Some(&ChildFate::Reaped)).contains("torn down through its pidfd"));
+    assert!(words(Some(&ChildFate::Killed)).contains("torn down through its pidfd"));
+    let left = words(Some(&ChildFate::Running { id: None }));
+    assert!(!left.contains("torn down"), "{left}");
+    assert!(!words(None).contains("torn down"));
 }
 
 /// Off Linux a child whose kill was refused and that is not forgotten is released to tokio's orphan

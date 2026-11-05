@@ -304,6 +304,7 @@ async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("could not be terminated"), "{warns:?}");
     assert!(warns[0].1.contains("leaving it running"), "{warns:?}");
+    assert!(!warns[0].1.contains("torn down"), "{warns:?}");
     // The helper exits once its stdin closes; the test, not a thread, reaps it.
     drop(writer);
     let status = reap(id.pid()).expect("the child is still unreaped");
