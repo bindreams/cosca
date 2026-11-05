@@ -327,7 +327,7 @@ fn classify_member(
 /// in THAT gap (not the earlier, listing-to-here gap the re-verify closes) is still possible.
 /// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
 /// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), reusing
-/// `crate::os_process::linux::open::open_verified` verbatim rather than a second implementation — the fd
+/// `crate::os_process::linux::open::open_verified_with` verbatim rather than a second implementation — the fd
 /// itself pins the identity at the kernel level, so a pid reused after `pidfd_open` cannot be
 /// hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
 /// irreducible window as `treewalk::kill_by_identity` (re-verify, then `kill(2)`): a recycled
@@ -440,14 +440,14 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 }
 
 /// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
-/// crate's own existing pidfd primitive (`os_process::linux::open::open_verified` — reused, not
+/// crate's own existing pidfd primitive (`os_process::linux::open::open_verified_with` — reused, not
 /// reimplemented, per this module's own stated preference; it already does exactly "open a
 /// pidfd for this identity, re-verifying, `Ok(None)` if already gone"). `pidfd_send_signal`
-/// on the returned fd is guaranteed to hit the SAME process `open_verified` just confirmed,
+/// on the returned fd is guaranteed to hit the SAME process `open_verified_with` just confirmed,
 /// even if the pid number is reused by something else in between — no gap remains, unlike
 /// `check_or_signal`'s plain-`kill(2)` path.
 ///
-/// **How `open_verified`'s answers map here.**
+/// **How `open_verified_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
 /// - `Error::Unsupported` (`pidfd_open` refused) and `Error::Io` (a transient `pidfd_open`
@@ -461,7 +461,7 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 ///   not about whether the kernel can open a pidfd, which no fallback resolves.
 ///
 /// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
-/// inside `open_verified`.** This looks tempting — `pidfd_open` already succeeded, so
+/// inside `open_verified_with`.** This looks tempting — `pidfd_open` already succeeded, so
 /// *something* is there — but it does not actually close the gap, for the same reason
 /// `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare pid:
 /// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
@@ -473,7 +473,7 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 /// nor a clear "gone"). The pidfd's real safety property is narrower than "identity-pinned
 /// from the moment of listing": it guarantees the target does not change identity AFTER a
 /// successful open, not that the identity was already correct AT open time — exactly the gap
-/// `open_verified`'s own `id.exists()` step exists to close, and exactly the gap `Existence::
+/// `open_verified_with`'s own `id.exists()` step exists to close, and exactly the gap `Existence::
 /// Unknown` says was NOT closed this time. Signalling anyway would reintroduce, on Linux, the
 /// identical "unrelated-process-killed" failure mode a bare-pid signal has on macOS's
 /// `Resolved::Unknown` arm — not a smaller version of it. Left as a disclosed, asymmetric gap
@@ -482,8 +482,13 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 /// and reported `Unassessable`, even though the earlier `Liveness::Unknown`-admitting gate
 /// (`classify_member`) let it through to the attempt.
 #[cfg(target_os = "linux")]
-fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, root: &GroupRoot<'_>) -> Reached {
-    match crate::os_process::linux::open::open_verified_with(&crate::identity::HostKernel, id) {
+fn check_or_signal_linux_sigkill(
+    kernel: &dyn crate::identity::Kernel,
+    pid: RawPid,
+    id: crate::identity::ProcessId,
+    root: &GroupRoot<'_>,
+) -> Reached {
+    match crate::os_process::linux::open::open_verified_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
@@ -525,7 +530,7 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId, ro
         // `Error::Unassessable`, or a variant added later: a statement about the PID itself, which
         // no kill(2) fallback resolves. Conservative, not a guess.
         Err(e) => {
-            log::warn!("containment::unix::group: open_verified for pid {}: {e}", id.pid());
+            log::warn!("containment::unix::group: open_verified_with for pid {}: {e}", id.pid());
             Reached::Unknown
         }
     }
@@ -644,7 +649,7 @@ pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::
                 // documented on it.
                 #[cfg(target_os = "linux")]
                 {
-                    check_or_signal_linux_sigkill(m.pid, id, root)
+                    check_or_signal_linux_sigkill(&crate::identity::HostKernel, m.pid, id, root)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
