@@ -42,7 +42,7 @@ pub(crate) struct Member {
 /// the same record as its pid. libproc's `proc_listpgrppids` is deliberately NOT used: it
 /// returns a COUNT where its siblings return bytes, and it carries no start time.
 #[cfg(target_os = "macos")]
-pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::kinfo::kinfo_proc;
 
     const RECORD: usize = std::mem::size_of::<kinfo_proc>();
@@ -150,7 +150,7 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
 /// (`EACCES`, or `EPERM` while the checked directory still answers).
 #[cfg(target_os = "linux")]
-pub(crate) fn members_with(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
     let proc_dir =
@@ -222,7 +222,7 @@ pub(crate) fn members_with(kernel: &dyn crate::identity::Kernel, pgid: i32) -> s
 /// unlistable rather than silently empty — an empty group would read as
 /// "teardown succeeded".
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-pub(crate) fn members(_pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, _pgid: i32) -> std::io::Result<Vec<Member>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "process-group membership is implemented only for Linux and macOS",
@@ -335,6 +335,7 @@ fn classify_member(
 /// `Process::kill` on macOS does not have it: it signals by audit token
 /// (`os_process::macos::MacProcess::signal`).
 fn check_or_signal(
+    kernel: &dyn crate::identity::Kernel,
     pid: RawPid,
     id: crate::identity::ProcessId,
     signal: Option<Signal>,
@@ -356,7 +357,7 @@ fn check_or_signal(
     if let Err(reached) = root_check_before_send(root, pid, signal) {
         return reached;
     }
-    match crate::identity::ProcessId::of(pid) {
+    match crate::identity::ProcessId::of_with(kernel, pid).0 {
         crate::identity::Resolved::Found(live) if live == id => {}
         // Gone — nothing to refuse.
         crate::identity::Resolved::Found(_) => {
@@ -516,7 +517,7 @@ fn check_or_signal_linux_sigkill(
                  kill(2) — same residual race macOS already accepts",
                 id.pid()
             );
-            check_or_signal(pid, id, Some(Signal::SIGKILL), root)
+            check_or_signal(kernel, pid, id, Some(Signal::SIGKILL), root)
         }
         Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
@@ -620,22 +621,24 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// 6.9+, once the group has no member left, it is in another group that took the number, and is not
 /// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
 /// documents.
-pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::io::Result<GroupState> {
+pub(crate) fn converge(
+    kernel: &dyn crate::identity::Kernel,
+    pgid: i32,
+    signal: Signal,
+    root: &GroupRoot<'_>,
+) -> std::io::Result<GroupState> {
     #[cfg(test)]
     let listing_pgid = fault::listed(pgid);
     #[cfg(not(test))]
     let listing_pgid = pgid;
-    #[cfg(target_os = "linux")]
-    let listed = members_with(&crate::identity::HostKernel, listing_pgid)?;
-    #[cfg(not(target_os = "linux"))]
-    let listed = members(listing_pgid)?;
+    let listed = members(kernel, listing_pgid)?;
     #[cfg(test)]
     fault::run_after_listing();
     let mut refused = Vec::new();
     let mut unassessable = Vec::new();
     for m in &listed {
         let id = crate::identity::ProcessId::from_parts(m.pid, m.token);
-        let outcome = classify_member(m.pid, id.is_alive(), || {
+        let outcome = classify_member(m.pid, id.is_alive_with(kernel), || {
             if signal == Signal::SIGKILL && excluded_from_sigkill_resend(m.pid, m.system) {
                 log::warn!(
                     "containment::unix::group: pid {pid} in process group {pgid} is excluded \
@@ -652,17 +655,17 @@ pub(crate) fn converge(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> std::
                 // documented on it.
                 #[cfg(target_os = "linux")]
                 {
-                    check_or_signal_linux_sigkill(&crate::identity::HostKernel, m.pid, id, root)
+                    check_or_signal_linux_sigkill(kernel, m.pid, id, root)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    check_or_signal(m.pid, id, Some(signal), root)
+                    check_or_signal(kernel, m.pid, id, Some(signal), root)
                 }
             } else {
-                check_or_signal(m.pid, id, None, root)
+                check_or_signal(kernel, m.pid, id, None, root)
             }
         });
-        match reconfirm_survivor(outcome, || id.is_alive()) {
+        match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {
             MemberOutcome::NotASurvivor => {}
             MemberOutcome::Survivor(pid) => refused.push(pid),
             MemberOutcome::Unassessable(pid) => unassessable.push(pid),
@@ -727,7 +730,7 @@ pub(crate) fn state(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> GroupSta
         "group::state called with a non-positive pgid ({pgid}); the real guard belongs in the \
          caller, before any signal is sent — see unix.rs::signal_group"
     );
-    match converge(pgid, signal, root) {
+    match converge(&crate::identity::HostKernel, pgid, signal, root) {
         Ok(gs) => gs,
         Err(e) => GroupState::Unlistable {
             detail: format!("process group {pgid} could not be listed after {signal}"),

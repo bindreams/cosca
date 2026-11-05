@@ -92,14 +92,22 @@ impl ProcessId {
 
     /// [`of`](Self::of), and why it was [`Resolved::Unknown`] when the read itself knows.
     pub(crate) fn of_explained(pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+        Self::of_with(&HostKernel, pid)
+    }
+
+    /// [`of_explained`](Self::of_explained) through `kernel`: the one entry to a by-pid identity
+    /// read, on every platform.
+    pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
         {
-            Self::of_with(&HostKernel, pid)
+            let (read, view) = backend::start_token_explained(kernel, pid);
+            (read.map(|start| ProcessId { pid, start }), UnknownCause { view })
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = kernel;
             let (read, cause) = start_token_explained(pid);
             (read.map(|start| ProcessId { pid, start }), cause)
         }
@@ -159,17 +167,20 @@ impl ProcessId {
     /// [`Existence::Unknown`] when the OS refuses the query — never `Gone`. For "is it still
     /// running?", use [`ProcessId::is_alive`].
     pub fn exists(&self) -> Existence {
-        self.exists_explained().0
+        self.exists_with(&HostKernel).0
     }
 
-    /// [`exists`](Self::exists), and why it was [`Existence::Unknown`] when the read itself knows.
-    pub(crate) fn exists_explained(&self) -> (Existence, UnknownCause) {
+    /// [`exists`](Self::exists) through `kernel`, and why it was [`Existence::Unknown`] when the
+    /// read itself knows; see [`of_with`](Self::of_with).
+    pub(crate) fn exists_with(&self, kernel: &dyn Kernel) -> (Existence, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
-            self.exists_with(&HostKernel)
+            let (read, view) = backend::start_token_explained(kernel, self.pid);
+            (self.existence_from(read), UnknownCause { view })
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = kernel;
             let (read, cause) = start_token_explained(self.pid);
             (self.existence_from(read), cause)
         }
@@ -198,12 +209,18 @@ impl ProcessId {
     /// equivalent transition. Confirm a process is finished by reaping it, or by
     /// `waitid(WEXITED | WNOWAIT)` — never by asking this after an exit event.
     pub fn is_alive(&self) -> Liveness {
+        self.is_alive_with(&HostKernel)
+    }
+
+    /// [`is_alive`](Self::is_alive) through `kernel`; see [`of_with`](Self::of_with).
+    pub(crate) fn is_alive_with(&self, kernel: &dyn Kernel) -> Liveness {
         #[cfg(target_os = "linux")]
         {
-            self.is_alive_with(&HostKernel)
+            backend::is_running(kernel, self.pid, self.start)
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = kernel;
             backend::is_running(self.pid, self.start)
         }
     }
@@ -232,6 +249,22 @@ pub(crate) use backend::pid_stat;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::kernel::{HostKernel, Kernel};
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) use no_reads::{HostKernel, Kernel};
+
+/// The [`Kernel`] of the platforms whose reads no test answers yet.
+#[cfg(not(target_os = "linux"))]
+mod no_reads {
+    /// What cosca asks the kernel about processes, so shared code takes one `&dyn Kernel` on every
+    /// platform. No methods yet: one enters with its first caller in the macOS or Windows backend.
+    pub(crate) trait Kernel: Sync {}
+
+    /// The real kernel.
+    pub(crate) struct HostKernel;
+
+    impl Kernel for HostKernel {}
+}
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::fake::FakeKernel;
@@ -297,29 +330,11 @@ pub(crate) mod seams {
     }
 }
 
-/// The [`proc_view_with`] forcing seams.
 #[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
+pub(crate) use backend::proc_view::openat2_refused_message;
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
-    /// [`of_explained`](Self::of_explained) through `kernel`.
-    pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
-        let (read, view) = backend::start_token_explained(kernel, pid);
-        (read.map(|start| ProcessId { pid, start }), UnknownCause { view })
-    }
-
-    /// [`exists_explained`](Self::exists_explained) through `kernel`.
-    pub(crate) fn exists_with(&self, kernel: &dyn Kernel) -> (Existence, UnknownCause) {
-        let (read, view) = backend::start_token_explained(kernel, self.pid);
-        (self.existence_from(read), UnknownCause { view })
-    }
-
-    /// [`is_alive`](Self::is_alive) through `kernel`.
-    pub(crate) fn is_alive_with(&self, kernel: &dyn Kernel) -> Liveness {
-        backend::is_running(kernel, self.pid, self.start)
-    }
-
     /// [`exists`](Self::exists), reading through the `/proc` at `proc_dir` instead of
     /// re-resolving `/proc` by path. Only meaningful when that `/proc` is known to describe
     /// this pid's namespace.
@@ -344,17 +359,28 @@ impl ProcessId {
 #[cfg(target_os = "macos")]
 pub(crate) use backend::kinfo;
 
-/// Make every by-pid identity read of `pid` on THIS thread answer `Unknown` until the guard drops:
-/// an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on macOS) for a live pid.
+/// A kernel, and a guard to hold while it is used, under which every by-pid identity read of `pid`
+/// answers `Unknown`: an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on
+/// macOS) for a live pid.
+///
+/// Linux: the returned kernel states the answer, a `stat` row for `pid` answering `EACCES`, and the
+/// guard holds nothing. That `stat` fails for every read through the kernel, a table scan's too.
+/// macOS: the kernel is the host's and the guard hooks the reads of this thread; see the macOS
+/// arm.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
-    proc_view_fault::force_identity_stat_errno(pid, libc::EACCES)
+pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
+    (
+        FakeKernel::over(&HostKernel).on_read(&format!("{pid}/stat"), Err(libc::EACCES)),
+        (),
+    )
 }
 
-/// [`force_unknown_identity`] on macOS.
+/// [`unreadable`] on macOS. The guard is what makes the reads refuse: `Kernel` has no macOS
+/// methods yet, so the thread-local `force_unknown` hook answers in the kernel's place until it
+/// drops.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
-    backend::fault::force_unknown(pid)
+pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
+    (HostKernel, backend::fault::force_unknown(pid))
 }
 
 #[cfg(all(target_os = "macos", test))]

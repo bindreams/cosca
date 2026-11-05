@@ -375,7 +375,8 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     child.wait().expect("the root sh exits once it has backgrounded cat");
 
     // The root is reaped; the only marker holder left is the orphan.
-    let parents = crate::containment::enumerate::process_parents().expect("the process snapshot");
+    let parents =
+        crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
     let ppid = parents
         .iter()
         .find(|(pid, _)| *pid == orphan_pid)
