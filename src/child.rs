@@ -81,8 +81,8 @@ pub(crate) mod group_exact_tests;
 mod drop_group_exact_tests;
 
 #[cfg(all(test, target_os = "linux"))]
-#[path = "child/kill_tree_view_tests.rs"]
-mod kill_tree_view_tests;
+#[path = "child/openat2_refused_drop_tests.rs"]
+mod openat2_refused_drop_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/drop_reaped_tests.rs"]

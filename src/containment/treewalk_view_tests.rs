@@ -6,9 +6,7 @@
 //! status.
 
 use crate::error::Error;
-use crate::identity::proc_view_fault::{
-    force_openat2_errno, force_proc_view_after, force_proc_view_once, proc_view_fired_at, ForcedView,
-};
+use crate::identity::proc_view_fault::{force_proc_view_after, force_proc_view_once, proc_view_fired_at, ForcedView};
 use crate::identity::ProcessId;
 use crate::test_child::{live_exiting_member as live_member, open_live, release_unsignalled as release};
 use crate::Recursive;
@@ -67,53 +65,6 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
                 "{name}: {result:?}"
             );
             release(child);
-        }
-    }
-}
-
-/// Without `openat2` every walk errors `Unsupported` naming the requirement, and signals nothing.
-/// Mutants: "map the snapshot's error to `Unassessable`" in `hard_kill`, `terminate`, or the
-/// snapshot itself.
-#[skuld::test]
-fn every_walk_without_openat2_is_unsupported_naming_it() {
-    for (name, walk) in walks() {
-        for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
-            let (child, id) = live_member();
-            let process = open_live(id);
-            let forced = force_openat2_errno(errno);
-            let result = walk(&process);
-            drop(forced);
-            match result {
-                Err(Error::Unsupported { detail, .. }) => {
-                    assert_eq!(detail, crate::identity::openat2_refused_message(code), "{name} {errno}")
-                }
-                other => panic!("{name} {errno}: expected Unsupported, got {other:?}"),
-            }
-            release(child);
-        }
-    }
-}
-
-/// `parent` and `children` are `Unsupported` naming `openat2`, never "none". Mutant: "map the
-/// error to `Ok(None)` / `Ok(vec![])`".
-#[skuld::test]
-fn parent_and_children_without_openat2_are_unsupported_naming_it() {
-    let me = ProcessId::current();
-    for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
-        let forced = force_openat2_errno(errno);
-        let results = [
-            ("parent", me.parent().map(|_| ())),
-            ("children(No)", me.children(Recursive::No).map(|_| ())),
-            ("children(Yes)", me.children(Recursive::Yes).map(|_| ())),
-        ];
-        drop(forced);
-        for (name, result) in results {
-            match result {
-                Err(Error::Unsupported { detail, .. }) => {
-                    assert_eq!(detail, crate::identity::openat2_refused_message(code), "{name} {errno}")
-                }
-                other => panic!("{name} {errno}: expected Unsupported, got {other:?}"),
-            }
         }
     }
 }
