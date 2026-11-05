@@ -4,6 +4,7 @@
 //! the root's state, the kill they skipped, the forget of tokio's `Child`, a signal the OS refused.
 //! [`DropReport`] composes all of it into a single `warn`, or none when nothing is worth one.
 
+use crate::child::owned::teardown::{Remains, TeardownOutcome};
 use crate::containment::dispatch::RootView;
 use crate::containment::DropView;
 use crate::error::Error;
@@ -79,6 +80,15 @@ impl<'a> DropReport<'a> {
             tree: None,
             left: Vec::new(),
         }
+    }
+
+    /// Takes `torn`'s clause into the report, led by the report's caller: a clause at warn becomes
+    /// a part of the one warn, and a lower one is logged at its level, led by the same caller
+    /// ([`TeardownOutcome::take_warn`]). What is left of `torn` is returned.
+    pub(crate) fn fold_clause(&mut self, torn: TeardownOutcome) -> Remains {
+        let (warn, remains) = torn.take_warn(self.view.caller.label());
+        self.left.extend(warn);
+        remains
     }
 
     /// Log the report: one `warn`, or nothing when there is nothing to report. `reported`: what an

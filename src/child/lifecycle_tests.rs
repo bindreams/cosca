@@ -390,8 +390,9 @@ mod settlement {
     use std::io;
     use std::process::ExitStatus;
 
-    use crate::child::lifecycle::Settlement;
-    use crate::child::owned::teardown::Disposition;
+    use crate::child::lifecycle::{Settlement, Wording};
+    use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
+    use crate::child::owned::teardown::{Disposition, TeardownOutcome};
     use crate::child::owned::ChildWaitOutcome;
     use crate::child::spawn::FrontFate;
     use crate::error::{ChildFate, Error};
@@ -399,9 +400,10 @@ mod settlement {
     use crate::os_process::child::{ExitRecord, Foreign};
 
     const PID: u32 = 4242;
-    const BOTH: [Disposition; 2] = [Disposition::Leave, Disposition::HandBack];
+    /// Every disposition a caller words a child under, and none: a caller that says where the child
+    /// goes itself.
+    const EVERY: [Option<Disposition>; 3] = [None, Some(Disposition::Leave), Some(Disposition::HandBack)];
     const RUNNING: &str = "the caller's running clause";
-    const HANDED_BACK: &str = "; handed back to the caller in the error";
 
     fn id() -> ProcessId {
         ProcessId::from_parts_for_test(PID, crate::identity::Key::for_test(1))
@@ -431,30 +433,48 @@ mod settlement {
         Ok(ChildWaitOutcome::DeadlinePassed)
     }
 
-    /// The three facts every row states besides the wording.
+    /// The three facts every row states besides the wording: the fate, whether the wording is the
+    /// warn of an uncollected child, and the fate of a front.
     #[track_caller]
     fn assert_row(settlement: &Settlement, fate: ChildFate, uncollected: bool, front: FrontFate) {
         assert_eq!(settlement.fate(Some(id())), fate, "{settlement:?}");
-        assert_eq!(settlement.uncollected(), uncollected, "{settlement:?}");
+        for disposition in EVERY {
+            assert_eq!(
+                matches!(worded_as_is(settlement, disposition), Wording::Uncollected(_)),
+                uncollected,
+                "{settlement:?} {disposition:?}"
+            );
+        }
         assert_eq!(settlement.front_fate(), front, "{settlement:?}");
     }
 
     /// What the settlement says of the child "S" under `disposition`, with the running clause
     /// [`RUNNING`].
-    fn worded(settlement: &Settlement, disposition: Disposition) -> Option<(log::Level, String)> {
+    fn worded_as_is(settlement: &Settlement, disposition: Option<Disposition>) -> Wording {
         settlement.wording("S", Some(RUNNING), disposition)
     }
 
-    /// A child that exited with a status is reaped and nothing is said, whether or not a kill reached it.
+    /// [`worded_as_is`], as its level and text.
+    fn worded(settlement: &Settlement, disposition: Option<Disposition>) -> (log::Level, String) {
+        let said = worded_as_is(settlement, disposition);
+        (said.level(), said.text().to_owned())
+    }
+
+    /// A child that exited with a status is reaped, said at `debug` as "reaped it", "after the kill"
+    /// only if a kill reached it.
     ///
-    /// Mutants: it is uncollected; it is worded.
+    /// Mutants: it is uncollected; it has no clause, or a warn; "after the kill" ignores the kill.
     #[skuld::test]
-    fn an_exit_with_a_status_is_reaped_and_silent() {
-        for killed in [false, true] {
+    fn an_exit_with_a_status_is_reaped_and_said_at_debug() {
+        for (killed, said) in [(false, "S: reaped it"), (true, "S: reaped it after the kill")] {
             let settlement = Settlement::new(exited(), killed);
             assert_row(&settlement, ChildFate::Reaped, false, FrontFate::Reaped);
-            for disposition in BOTH {
-                assert_eq!(worded(&settlement, disposition), None, "{killed}");
+            for disposition in EVERY {
+                assert_eq!(
+                    worded(&settlement, disposition),
+                    (log::Level::Debug, said.to_owned()),
+                    "{killed}"
+                );
             }
         }
     }
@@ -478,11 +498,8 @@ mod settlement {
         ] {
             let settlement = Settlement::new(unreadable(), killed);
             assert_row(&settlement, ChildFate::Reaped, false, FrontFate::Reaped);
-            for disposition in BOTH {
-                assert_eq!(
-                    worded(&settlement, disposition),
-                    Some((log::Level::Warn, said.to_owned()))
-                );
+            for disposition in EVERY {
+                assert_eq!(worded(&settlement, disposition), (log::Level::Warn, said.to_owned()));
             }
         }
     }
@@ -497,10 +514,10 @@ mod settlement {
             for (killed, fate) in [(false, ChildFate::Gone), (true, ChildFate::Killed)] {
                 let settlement = Settlement::new(foreign(foreign_reap), killed);
                 assert_row(&settlement, fate, false, FrontFate::Unaccounted);
-                for disposition in BOTH {
+                for disposition in EVERY {
                     assert_eq!(
                         worded(&settlement, disposition),
-                        Some((log::Level::Debug, "S: reaped by someone else".to_owned()))
+                        (log::Level::Debug, "S: reaped by someone else".to_owned())
                     );
                 }
             }
@@ -516,13 +533,13 @@ mod settlement {
         for (killed, fate) in [(false, ChildFate::Gone), (true, ChildFate::Killed)] {
             let settlement = Settlement::new(foreign(Foreign::Orphaned), killed);
             assert_row(&settlement, fate, false, FrontFate::Unaccounted);
-            for disposition in BOTH {
+            for disposition in EVERY {
                 assert_eq!(
                     worded(&settlement, disposition),
-                    Some((
+                    (
                         log::Level::Warn,
                         "S: not ours to reap (launchd holds its zombie, because its tracer died)".to_owned()
-                    ))
+                    )
                 );
             }
         }
@@ -536,15 +553,25 @@ mod settlement {
     fn a_failed_wait_after_a_kill_is_killed_uncollected_and_warned_of() {
         let settlement = Settlement::new(failed(), true);
         assert_row(&settlement, ChildFate::Killed, true, FrontFate::Unaccounted);
+        assert_failed_wait_worded(&settlement);
+    }
+
+    /// A failed wait is a warn that says where the uncollected child goes: nothing for a caller that
+    /// says so itself, "left unreaped" for one that leaves it, handed back for one that hands it back.
+    #[track_caller]
+    fn assert_failed_wait_worded(settlement: &Settlement) {
         let said = "S: the wait failed: cosca-wait-e5a1";
-        assert_eq!(
-            worded(&settlement, Disposition::Leave),
-            Some((log::Level::Warn, said.to_owned()))
-        );
-        assert_eq!(
-            worded(&settlement, Disposition::HandBack),
-            Some((log::Level::Warn, format!("{said}{HANDED_BACK}")))
-        );
+        for (disposition, goes) in [
+            (None, ""),
+            (Some(Disposition::Leave), LEFT),
+            (Some(Disposition::HandBack), HANDED_BACK),
+        ] {
+            assert_eq!(
+                worded(settlement, disposition),
+                (log::Level::Warn, format!("{said}{goes}")),
+                "{disposition:?}"
+            );
+        }
     }
 
     /// A wait that failed with no kill having reached the child shows nothing of what became of it:
@@ -555,15 +582,7 @@ mod settlement {
     fn a_failed_wait_without_a_kill_is_unknown_uncollected_and_warned_of() {
         let settlement = Settlement::new(failed(), false);
         assert_row(&settlement, ChildFate::Unknown, true, FrontFate::Unaccounted);
-        let said = "S: the wait failed: cosca-wait-e5a1";
-        assert_eq!(
-            worded(&settlement, Disposition::Leave),
-            Some((log::Level::Warn, said.to_owned()))
-        );
-        assert_eq!(
-            worded(&settlement, Disposition::HandBack),
-            Some((log::Level::Warn, format!("{said}{HANDED_BACK}")))
-        );
+        assert_failed_wait_worded(&settlement);
     }
 
     /// A deadline that passed, with no kill having reached the child: it is running, uncollected, a
@@ -580,11 +599,8 @@ mod settlement {
             FrontFate::LeftUnreaped,
         );
         assert_eq!(settlement.fate(None), ChildFate::Running { id: None });
-        for disposition in BOTH {
-            assert_eq!(
-                worded(&settlement, disposition),
-                Some((log::Level::Warn, RUNNING.to_owned()))
-            );
+        for disposition in EVERY {
+            assert_eq!(worded(&settlement, disposition), (log::Level::Warn, RUNNING.to_owned()));
         }
     }
 
@@ -596,10 +612,10 @@ mod settlement {
     #[skuld::test]
     fn a_deadline_that_passed_in_a_wait_with_no_deadline_says_the_wait_ended_with_no_exit() {
         let settlement = Settlement::new(passed(), false);
-        for disposition in BOTH {
+        for disposition in EVERY {
             assert_eq!(
                 settlement.wording("S", None, disposition),
-                Some((log::Level::Warn, "S: its wait ended with no exit".to_owned()))
+                Wording::Uncollected("S: its wait ended with no exit".to_owned())
             );
         }
     }
@@ -622,33 +638,42 @@ mod settlement {
         }
     }
 
-    /// A line at warn is the leftover for the caller's one warn; one below it is logged, led as the
-    /// caller says; a silent answer is neither.
+    /// A clause at warn is the outcome's warn text for the caller's one warn, and is logged by
+    /// nobody; one below it is logged at its level, led by the caller's label and a colon, and
+    /// returns nothing. Either way the clause is taken, and what is left is the fate and whether the
+    /// child is uncollected.
     ///
-    /// Mutants: a debug line is returned; a warn is logged; the lead is dropped.
+    /// Mutants: a debug clause is returned; a warn is logged; the label is dropped; the remains
+    /// lose the uncollected child.
     #[skuld::test]
-    fn a_leftover_is_the_warn_and_anything_below_is_logged() {
+    fn a_clause_at_warn_is_the_warn_and_anything_below_is_logged() {
         crate::log_capture::install();
-        let mark = crate::log_capture::mark();
-
-        let gone = Settlement::new(foreign(Foreign::Gone), false);
-        assert_eq!(gone.leftover("S", None, Disposition::Leave, "lead: "), None);
-        let logged = crate::log_capture::records_since_on_current_thread(mark, "S:");
-        assert_eq!(
-            logged,
-            vec![(log::Level::Debug, "lead: S: reaped by someone else".to_owned())]
-        );
+        let outcome = |answer| {
+            TeardownOutcome::of_settlement(&Settlement::new(answer, false), None, "S", None, Disposition::Leave)
+        };
 
         let mark = crate::log_capture::mark();
-        let failed = Settlement::new(failed(), false);
+        let (warn, remains) = outcome(foreign(Foreign::Gone)).take_warn("lead");
+        assert_eq!(warn, None);
+        assert!(!remains.uncollected);
+        let (warn, remains) = outcome(exited()).take_warn("lead");
+        assert_eq!(warn, None);
+        assert!(!remains.uncollected);
         assert_eq!(
-            failed.leftover("S", None, Disposition::Leave, "lead: ").as_deref(),
-            Some("S: the wait failed: cosca-wait-e5a1")
+            crate::log_capture::records_since_on_current_thread(mark, "S:"),
+            vec![
+                (log::Level::Debug, "lead: S: reaped by someone else".to_owned()),
+                (log::Level::Debug, "lead: S: reaped it".to_owned()),
+            ]
         );
+
+        let mark = crate::log_capture::mark();
+        let (warn, remains) = outcome(failed()).take_warn("lead");
         assert_eq!(
-            Settlement::new(exited(), false).leftover("S", None, Disposition::Leave, "lead: "),
-            None
+            warn.as_deref(),
+            Some(format!("S: the wait failed: cosca-wait-e5a1{LEFT}").as_str())
         );
+        assert!(remains.uncollected);
         assert_eq!(
             crate::log_capture::records_since_on_current_thread(mark, "S:"),
             Vec::<(log::Level, String)>::new()

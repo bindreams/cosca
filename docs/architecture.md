@@ -79,21 +79,46 @@ In order:
      graceful path sends through; `GroupRoot::new` with no `ReapHold`; its tests' hooks,
      `exit_only::seams` and `signal::seams`, which `Process::kill`'s tests share.
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
-     identity, `kill_and_reap_*`, `unique_report` and `PidfdChild` still take by handle or number
-     (`PidfdChild` now only for the async spawn and the cgroup leaf's abandonment);
+     identity, `kill_and_reap_*` and `unique_report` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
      leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
-     is the one kill-then-settle policy, and `Child::drop` uses it; so does the sync Linux spawn,
-     from the handshake's `conclude` to the identity and attach arms (`held_teardown.rs`), which
-     build the `OwnedChild` once when the handshake succeeds. `Settlement` is the one
-     classification of what a wait or look answered (the fate, whether the child is left
-     uncollected, what to say); the teardowns, `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child,
-     a refused kill or a running elevation front, hands it back as `Unreaped`, in
+     is the one kill-then-settle policy, and `Child::drop` uses it. On Linux it also ends every
+     sync spawn failure (the handshake's `conclude`, and the identity and attach arms,
+     `held_teardown.rs`) and, in the async spawn, the failures of a child the handshake holds by
+     pidfd (`conclude`'s `(Err, Opened)` and unexecuted arms), an elevation front at the identity
+     and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
+     (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of a child it cannot
+     name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. Until the
+     async-child slice, tokio's own code ends the rest of the async spawn. `conclude`'s
+     `Ok(child)` arms are `Spawned` for tokio's `Child`: `reap_unexecuted` kills through the
+     pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
+     tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
+     `waitpid`s by pid. The async non-front attach arm and the
+     identity arms that are not unknown (`ProcSource::reap_now_noting`) make the first kill the
+     backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, once tokio's
+     `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
+     The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
+     to `tear_down`, sending no kill of its own. A teardown through a pidfd
+     (`held_teardown::tear_down_pidfd`) is told once what its caller knows of the pidfd
+     (`Expect`, in `child::owned::teardown`), and its warn is logged through
+     `warn_pidfd_teardown`, which then asserts that contract; a front left to the leaf
+     (`ToLeaf`) hands the leaf its original pidfd with the `Expect`, and a child the leaf holds
+     (`LeafHeld`) hands it a copy, with `Expect::Anything` since the handshake tears down through
+     the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to where
+     it is logged.
+     Apart from these,
+     only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
+     `Settlement` is the one
+     classification of what a wait or look answered (the fate, and a clause for every answer: a
+     child left uncollected has only a warn, so no clause of one can be built at another level);
+     the teardowns,
+     `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child, a
+     refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
      `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.
-     The other spawns still tear down by themselves (async Linux, Windows, macOS).
+     Windows and macOS still tear down by themselves.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
