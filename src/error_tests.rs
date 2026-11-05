@@ -1,4 +1,5 @@
 use crate::error::{ChildFate, Error, QuoteError, QuoteErrorKind};
+use crate::test_child::over_fake::exited_unreaped;
 
 #[skuld::test]
 fn containment_error_displays_detail() {
@@ -273,6 +274,7 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
             fate,
             wrapper_elevated,
             source: Box::new(Error::Io(std::io::Error::other("cause"))),
+            unreaped: None,
         }
         .to_string()
     };
@@ -283,6 +285,47 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
     for fate in [ChildFate::Running { id: None }, ChildFate::Unknown] {
         assert!(!message(fate, true).contains(note), "{fate:?}");
     }
+}
+
+/// An error that carries the child reads, prints and matches as the same error without it.
+///
+/// Mutant: `fate` or `Display` looks at `unreaped`.
+#[skuld::test]
+fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
+    let id = crate::identity::ProcessId::current();
+    let fate = ChildFate::Running { id: Some(id) };
+    let error = |unreaped| Error::MayHaveStarted {
+        fate,
+        wrapper_elevated: false,
+        source: Box::new(Error::Io(std::io::Error::other("cause"))),
+        unreaped,
+    };
+    let with_child = error(Some(exited_unreaped(id)));
+    assert_eq!(with_child.fate(), Some(fate));
+    assert_eq!(with_child.to_string(), error(None).to_string());
+}
+
+/// A note added to the error keeps the child it carries.
+///
+/// Mutant: `with_note` rebuilds the variant without `unreaped`.
+#[skuld::test]
+fn with_note_keeps_the_unreaped_child() {
+    let id = crate::identity::ProcessId::current();
+    let error = Error::MayHaveStarted {
+        fate: ChildFate::Running { id: Some(id) },
+        wrapper_elevated: false,
+        source: Box::new(Error::Containment { detail: "x".into() }),
+        unreaped: Some(exited_unreaped(id)),
+    }
+    .with_note("front left");
+    let Error::MayHaveStarted { source, unreaped, .. } = &error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    assert_eq!(unreaped.as_ref().map(|child| child.pid()), Some(Some(id.pid())));
+    assert!(
+        matches!(**source, Error::Containment { ref detail } if detail == "x; front left"),
+        "{source:?}"
+    );
 }
 
 /// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
