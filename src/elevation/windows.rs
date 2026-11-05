@@ -256,7 +256,7 @@ pub(crate) fn shell_execute_failure(code: windows::core::HRESULT, inst_app: isiz
             detail: "the UAC elevation prompt was declined".into(),
         }),
         RunasFailure::BeforeLaunch => SpawnFailure::NotStarted(failed()),
-        RunasFailure::MayHaveLaunched => SpawnFailure::started(failed(), ChildFate::Unknown),
+        RunasFailure::MayHaveLaunched => SpawnFailure::started(failed(), ChildFate::Unknown, None),
     }
 }
 
@@ -553,6 +553,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
                     detail: "ShellExecuteEx(runas) returned no process handle".into(),
                 },
                 ChildFate::Unknown,
+                None,
             ));
         }
         OwnedHandle::from_raw_handle(info.hProcess.0 as std::os::windows::io::RawHandle)
@@ -580,6 +581,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
                 detail,
             },
             fate,
+            None,
         ));
     };
 

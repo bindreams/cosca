@@ -50,13 +50,14 @@ pub(crate) enum SpawnFailure {
 
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
-    /// backend, and that the spawn does not hand back.
-    pub(crate) fn started(cause: Error, fate: ChildFate) -> SpawnFailure {
+    /// backend. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
+    /// with its identity.
+    pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
             cause,
             fate,
             wrapper_elevated: false,
-            unreaped: None,
+            unreaped: unreaped.map(Box::new),
         }
     }
 
@@ -158,9 +159,15 @@ impl SpawnFailure {
 
 /// The error of a run-to-completion helper (`output`, `status`, `read`) that failed after its spawn
 /// succeeded: the program may have started, and `fate` says what became of its child.
-/// `behind_wrapper` is whether the child is an elevation backend.
-pub(crate) fn after_the_spawn(cause: Error, fate: ChildFate, behind_wrapper: bool) -> Error {
-    let failure = SpawnFailure::started(cause, fate);
+/// `unreaped` is the child its teardown could not end, handed back. `behind_wrapper` is whether the
+/// child is an elevation backend.
+pub(crate) fn after_the_spawn(
+    cause: Error,
+    fate: ChildFate,
+    unreaped: Option<Unreaped>,
+    behind_wrapper: bool,
+) -> Error {
+    let failure = SpawnFailure::started(cause, fate, unreaped);
     Error::from(if behind_wrapper {
         failure.behind_wrapper()
     } else {

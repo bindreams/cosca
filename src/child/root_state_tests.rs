@@ -254,7 +254,12 @@ mod linux {
         let fake = child
             .proc
             .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
-        let view = crate::containment::DropView::read("test", child.id, || child.proc.state(), &child.tree_killed);
+        let view = crate::containment::DropView::read(
+            crate::containment::dispatch::TeardownCaller::Drop,
+            child.id,
+            || child.proc.state(),
+            &child.tree_killed,
+        );
         fake.assert_peeks_exhausted();
         assert!(
             matches!(view.root, crate::containment::dispatch::RootView::Unknown(_)),

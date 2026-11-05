@@ -15,6 +15,8 @@ mod linux;
 #[cfg(target_os = "macos")]
 #[path = "owned_tests/macos.rs"]
 mod macos;
+#[path = "owned_tests/slot.rs"]
+mod slot;
 #[path = "owned_tests/states.rs"]
 mod states;
 #[path = "owned_tests/teardown.rs"]

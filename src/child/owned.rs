@@ -37,6 +37,8 @@ use crate::signal::{Sent, Sig};
 
 #[path = "owned/holder.rs"]
 mod holder;
+#[path = "owned/slot.rs"]
+pub(crate) mod slot;
 #[path = "owned/teardown.rs"]
 pub(crate) mod teardown;
 #[path = "owned/unreaped.rs"]
@@ -44,7 +46,7 @@ pub(crate) mod unreaped;
 #[path = "owned/waiting.rs"]
 mod waiting;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "owned/over.rs"]
 mod over;
 #[cfg(test)]
