@@ -1,4 +1,5 @@
-use crate::{Command, Stdio};
+use crate::test_child::Console;
+use crate::Stdio;
 
 /// A child that exits without reading its input ends the input: `communicate` returns what it
 /// printed, not an error. The input is larger than a pipe buffer, so the write is still in progress
@@ -7,7 +8,7 @@ use crate::{Command, Stdio};
 /// Mutant: a broken pipe on stdin is an `Err`.
 #[skuld::test]
 fn a_child_that_stops_reading_stdin_ends_the_input() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["cmd", "/C", "echo out& exit 3"]);
     c.stdin(Stdio::pipe()).expect("stdin");
     c.stdout(Stdio::pipe()).expect("stdout");

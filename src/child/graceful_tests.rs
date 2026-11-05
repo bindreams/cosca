@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 use super::fault as term_fault;
 use crate::wait::fault;
 
@@ -11,7 +13,7 @@ use crate::wait::fault;
 /// `Existence::Present` is not proof of life — it is zombie-inclusive on every platform — so a
 /// liveness claim goes through [`assert_still_running`].
 fn blocker() -> (crate::Child, std::io::PipeWriter) {
-    crate::test_child::held_contained_blocker(crate::Stdio::pipe())
+    crate::test_child::held_contained_blocker_on_console(crate::Stdio::pipe())
 }
 
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.
@@ -167,7 +169,7 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
 #[skuld::test]
 fn child_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -214,7 +216,7 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
     let _warns = crate::log_capture::warn_watch();
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     // `exec 3<&0` keeps the backgrounded `sh` on the real pipe (see `test_child::BLOCKER_ARGV`).
     cmd.args([
         "sh",
@@ -261,7 +263,7 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
 fn child_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
     let _warns = crate::log_capture::warn_watch();
     use std::io::Read as _;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::TERM_SURVIVOR_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -308,7 +310,7 @@ fn child_graceful_shutdown_escalates() {
 fn child_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
     let _warns = crate::log_capture::warn_watch();
     use std::io::Read as _;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::TERM_IGNORING_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -478,7 +480,9 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
 fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     use std::io::Read;
 
-    let mut cmd = crate::Command::new();
+    // Asked on Windows: the test sends a console-group break to a child that registered with the
+    // console; a unix child has no console, so the argument is moot there.
+    let mut cmd = crate::test_child::command(Console::Asked);
     #[cfg(unix)]
     {
         // `exec` keeps the signalled root `cat` itself, so the SIGTERM assertion still means what it
@@ -624,7 +628,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::{Read, Write};
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -724,7 +728,9 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("local_addr").to_string();
 
-    let mut cmd = crate::Command::new();
+    // Asked: `graceful_shutdown_tree` breaks the root's console group, which a hidden root would
+    // not be in.
+    let mut cmd = crate::test_child::command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(crate::test_child::fixture_argv(
             crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
@@ -783,7 +789,7 @@ fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_an
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(crate::test_child::fixture_argv("test_child::__no_such_test__"));
     cmd.contain();

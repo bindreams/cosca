@@ -58,7 +58,7 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
         ("glued_after_quote", format!("\"{bin}\"x")),
     ] {
         for route in ["cosca", "raw_fd3"] {
-            let mut cmd = cosca::Command::new();
+            let mut cmd = crate::common::command(crate::common::Console::Hidden);
             cmd.commandline(&line).env("COSCA_TESTBIN_MODE", "dump-argv");
             if route == "raw_fd3" {
                 cmd.fd(3, cosca::Stdio::null()).expect("map fd 3");
@@ -88,7 +88,7 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
                     Err(e) => format!("err({e})"),
                 }
             } else {
-                let mut cmd = cosca::Command::new();
+                let mut cmd = crate::common::command(crate::common::Console::Hidden);
                 cmd.arg(bin).args(args).env("COSCA_TESTBIN_MODE", "dump-argv");
                 if route == "raw_fd3" {
                     cmd.fd(3, cosca::Stdio::null()).expect("map fd 3");

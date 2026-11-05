@@ -6,6 +6,8 @@
 //! its stdin, and dies of `SIGKILL` if it was killed first.
 
 use std::io::{PipeWriter, Read as _};
+
+use crate::test_child::Console;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
@@ -36,7 +38,7 @@ pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, Pip
 }
 
 pub(crate) fn cat() -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
     cmd
 }
@@ -252,7 +254,7 @@ fn graceful_shutdown_of_a_front_that_exits_within_the_grace_returns_its_status()
 fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
     use crate::child::graceful::fault::{at, HookPoint};
     for errno in [libc::EPERM, libc::EINVAL] {
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
         cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
         let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
@@ -332,7 +334,7 @@ fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() 
 /// The escalation is the gated kill. A `cat` that ignores `SIGTERM` outlives the grace.
 #[skuld::test]
 fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     // An ignored disposition survives `exec`; `ready` says it is set.
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
@@ -703,7 +705,7 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
 /// delivered and its kill is refused, so the escalation runs.
 #[skuld::test]
 fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Pkexec));

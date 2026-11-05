@@ -47,7 +47,7 @@ fn require_unelevated() {
 #[skuld::test]
 fn posix_elevated_child_runs_as_root_and_captures_uid(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["id", "-u"])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let out = c.output().expect("elevated output");
@@ -65,7 +65,7 @@ fn posix_child_self_detects_elevation(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
     let exe = testbin();
     let exe_str = exe.clone().into_os_string();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     // The program is argv[0] alone: an elevated spawn refuses executable().
     c.args([exe_str, "is-elevated-report".into()])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
@@ -109,7 +109,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
     let slave_file = std::fs::File::from(slave);
 
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([exe.into_os_string(), "acquire-ctty-and-probe".into()]);
     // stdin = /dev/null: a buggy isatty(STDIN) probe would answer 0 here.
     c.stdin(cosca::Stdio::null()).unwrap();
@@ -133,7 +133,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
 #[skuld::test]
 fn controlling_terminal_probe_is_false_after_setsid() {
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["setsid".into(), exe.into_os_string(), "controlling-terminal".into()]);
     let s = c.read().expect("read setsid child output");
     assert_eq!(
@@ -151,7 +151,7 @@ fn posix_stdin_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
     let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
         .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["whoami"])
         .elevation_backend(cosca::elevation::Backend::Sudo)
         .elevation_auth(cosca::elevation::Auth::Stdin(cosca::elevation::Secret::new(pw)));
@@ -211,7 +211,7 @@ fn posix_askpass_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["whoami"])
         .elevation_backend(cosca::elevation::Backend::Sudo)
         .elevation_auth(cosca::elevation::Auth::Askpass(script.clone()));
@@ -237,7 +237,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang(#[fixtu
     let addr = listener.local_addr().expect("local_addr").to_string();
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([
         exe.clone().into_os_string(),
         "block-on-socket".into(),
@@ -280,7 +280,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang(#[fixtu
 fn already_elevated_inherit_spawn_reports_already_elevated(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([exe.clone().into_os_string(), "elevated-spawn-report".into()])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let reported = c.read().expect("read the elevated testbin's report");
@@ -296,7 +296,7 @@ fn windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Gro
         .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-{}.marker", std::process::id()));
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([
         exe.clone().into_os_string(),
         "write-marker".into(),
@@ -318,7 +318,7 @@ fn windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Gro
 #[skuld::test]
 async fn async_posix_elevated_child_runs_as_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.args(["id", "-u"])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let out = c.output().await.expect("async elevated output");
@@ -330,7 +330,7 @@ async fn async_posix_elevated_child_runs_as_root(#[fixture(elevation)] _group: &
 #[skuld::test]
 fn pkexec_gui_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["/usr/bin/id", "-u"])
         .elevation_backend(cosca::elevation::Backend::Pkexec)
         .elevation_auth(cosca::elevation::Auth::Gui);
@@ -348,7 +348,7 @@ fn pkexec_gui_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
 #[skuld::test]
 fn doas_non_interactive_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["id", "-u"])
         .elevation_backend(cosca::elevation::Backend::Doas)
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
@@ -412,7 +412,7 @@ fn windows_kill_of_an_elevated_child_reports_what_happened(#[fixture(elevation)]
     let addr = listener.local_addr().expect("local_addr").to_string();
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([
         exe.clone().into_os_string(),
         "block-on-socket".into(),
@@ -596,7 +596,7 @@ async fn async_windows_elevated_child_writes_admin_marker(#[fixture(elevation)] 
         .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
     let exe = testbin();
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.args([
         exe.clone().into_os_string(),
         "write-marker".into(),
@@ -626,7 +626,7 @@ async fn async_windows_kill_of_an_elevated_child_reports_what_happened(#[fixture
     let addr = listener.local_addr().expect("local_addr").to_string();
     let nonce = common::payload::fresh_nonce();
     let exe = testbin();
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.args([
         exe.clone().into_os_string(),
         "block-on-socket".into(),
@@ -673,7 +673,7 @@ async fn async_windows_kill_of_an_elevated_child_reports_what_happened(#[fixture
 #[skuld::test]
 fn gui_elevated_child_runs_as_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args(["/usr/bin/id", "-u"])
         .elevation_auth(cosca::elevation::Auth::Gui);
     c.stdin(cosca::Stdio::null()).unwrap();

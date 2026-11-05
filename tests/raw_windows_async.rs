@@ -16,7 +16,7 @@ mod common;
 #[skuld::test]
 async fn async_executable_independent_of_argv0() {
     let exe = common::testbin();
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(exe)
         .commandline("pretend-name argv0-report")
         .stdout(cosca::Stdio::pipe())
@@ -39,7 +39,7 @@ async fn async_executable_independent_of_argv0() {
 /// child's CRT; EOF (child closing fd 3 on exit) bounds the read — no timer.
 #[skuld::test]
 async fn async_fd3_pipe_out_delivers_child_bytes() {
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-fd", "3", "hi-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
@@ -58,7 +58,7 @@ async fn async_fd3_pipe_out_delivers_child_bytes() {
 /// makes it echo exactly what was written. EOF bounds both reads — no timer.
 #[skuld::test]
 async fn async_fd3_pipe_in_feeds_child() {
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "read-fd", "3"])
         .fd(3, cosca::Stdio::pipe_in())
@@ -82,7 +82,7 @@ async fn async_fd3_pipe_in_feeds_child() {
 /// (see its doc for why fd 3 delivery proves raw-backend routing).
 #[skuld::test]
 async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
@@ -105,7 +105,7 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
 async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
 
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
@@ -124,7 +124,7 @@ async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 /// fd 3 delivers the child's bytes over the async read end; EOF bounds the read — no timer.
 #[skuld::test]
 async fn async_contained_raw_child_is_in_our_job() {
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-fd", "3", "x"])
         .fd(3, cosca::Stdio::pipe_out())
@@ -147,7 +147,7 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// Mutant: `kill_tree` is a no-op.
 #[skuld::test]
 async fn async_contained_raw_child_is_killed_by_kill_tree() {
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::stdin_blocker_program())
         .args(["more"])
         .stdin(cosca::Stdio::pipe())
@@ -208,7 +208,7 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
     let decoy_program = "cosca_testbin_b2_cwd_decoy";
     std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
 
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args([
             "cosca_testbin",
@@ -276,7 +276,7 @@ fn async_raw_spawn_with_invalid_parent_std_handles_gives_the_child_null() {
 async fn async_an_unlisted_inheritable_handle_does_not_reach_the_child() {
     let (mut reader, writer) = common::inheritable_pipe();
     let value = std::os::windows::io::AsRawHandle::as_raw_handle(&writer) as usize;
-    let mut c = cosca::tokio::Command::new();
+    let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-handle", &format!("{value:x}")]);
     let mut child = c.spawn().expect("raw spawn");
@@ -300,7 +300,7 @@ async fn async_an_unlisted_inheritable_handle_does_not_reach_the_child() {
 async fn async_no_inheritable_handle_outlives_a_raw_spawn() {
     for (kind, targets) in common::inheritable::child_end_kinds() {
         let before = common::inheritable::snapshot();
-        let mut c = cosca::tokio::Command::new();
+        let mut c = common::tokio_command(common::Console::Hidden);
         c.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
         for (slot, target) in targets {
             c.fd(slot, target).unwrap();
@@ -320,7 +320,7 @@ async fn async_no_inheritable_handle_outlives_a_failed_raw_spawn() {
     let missing = format!("{}.missing", common::testbin());
     for (kind, targets) in common::inheritable::child_end_kinds() {
         let before = common::inheritable::snapshot();
-        let mut c = cosca::tokio::Command::new();
+        let mut c = common::tokio_command(common::Console::Hidden);
         c.raw_executable(&missing).args(["cosca_testbin", "exit", "0"]);
         for (slot, target) in targets {
             c.fd(slot, target).unwrap();

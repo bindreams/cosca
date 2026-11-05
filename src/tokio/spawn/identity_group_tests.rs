@@ -5,6 +5,7 @@ use crate::child::spawn::identity_group_tests::{left_running_note, Container, Fa
 use crate::error::ChildFate;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep, Route};
 use crate::test_child::member::{Member, RELEASE_FD};
+use crate::test_child::Console;
 use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// The sync `failed_spawn`'s twin.
@@ -20,7 +21,7 @@ fn failed_spawn(failure: Failure, container: Container) -> Failed {
     let capture = Capture::start();
     let mark = crate::log_capture::mark();
     let spawned = {
-        let mut cmd = crate::tokio::Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(failure.argv());
         cmd.contain_with(mode);
         cmd.stdin(stdio.stdin).expect("set stdin");

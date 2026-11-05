@@ -19,7 +19,7 @@ fn spawn_tid_reporter(mode: &str) -> (cosca::Child, std::io::PipeWriter, std::ne
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
 
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", mode, &addr])
         .env(common::ACK_ENV, "1");

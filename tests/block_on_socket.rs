@@ -48,6 +48,12 @@ impl Drop for Spawned {
 fn spawn_payload(addr: &str, nonce: &str) -> Spawned {
     let mut c = Command::new(common::testbin());
     c.args(["block-on-socket", addr, nonce]);
+    // `SharedChild` spawns the command itself, so the test helpers cannot: no window by hand.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut c,
+        common::console_flags::word(0, common::Console::Hidden),
+    );
     Spawned(SharedChild::spawn(&mut c).expect("spawn block-on-socket"))
 }
 

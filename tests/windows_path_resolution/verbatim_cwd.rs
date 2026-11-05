@@ -45,7 +45,7 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
             crate::common::output_locked(&mut std_cmd).map(|o| (o.status.success(), o.status.code(), o.stdout)),
         );
 
-        let mut cosca_cmd = cosca::Command::new();
+        let mut cosca_cmd = crate::common::command(crate::common::Console::Hidden);
         cosca_cmd.arg(bin).arg("cwd-marker").current_dir(&cwd);
         let cosca_col = finished(
             cosca_cmd
@@ -54,7 +54,7 @@ fn m21_a_verbatim_trailing_dot_current_dir(#[fixture(path_probes)] _group: &Grou
                 .map_err(into_io),
         );
 
-        let mut raw_cmd = cosca::Command::new();
+        let mut raw_cmd = crate::common::command(crate::common::Console::Hidden);
         raw_cmd.executable(bin).commandline("x cwd-marker").current_dir(&cwd);
         let raw_col = finished(
             raw_cmd

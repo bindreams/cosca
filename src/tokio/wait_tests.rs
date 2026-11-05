@@ -6,6 +6,9 @@
 
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use crate::test_child::Console;
+
 // This module is declared INSIDE src/tokio/wait.rs, so `super` is `tokio::wait` itself.
 #[cfg(unix)]
 use super::armed_deadline_seam::Armed;
@@ -923,7 +926,7 @@ async fn exited_by_id_reports_an_exit_pending_when_the_timer_wins_the_first_poll
 async fn wait_tree_deadline_reports_an_eof_pending_when_the_timer_wins_the_first_poll() {
     use std::os::fd::AsFd;
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "cat"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
@@ -954,7 +957,7 @@ async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
     crate::tokio::test_runtime::assert_current_thread();
     use std::os::fd::AsFd;
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "cat"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
@@ -1070,7 +1073,7 @@ async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
 async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
     use std::os::fd::AsFd;
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "cat"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");

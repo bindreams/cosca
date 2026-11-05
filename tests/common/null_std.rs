@@ -1,18 +1,14 @@
 //! Runs the testbin's `spawn-with-null-std` mode and checks what each grandchild received.
 
-use std::os::windows::process::CommandExt;
-
-/// `CREATE_NO_WINDOW`: the intermediate gets a console of its own whether or not the test runner
-/// has one, so the grandchildren's std handles do not depend on the runner's console.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// The `<route>=<report>` lines of `spawn-with-null-std <backend> <nulled>`.
+///
+/// `output_locked` spawns the intermediate `CREATE_NO_WINDOW`: it gets a console of its own whether
+/// or not the test runner has one, so the grandchildren's std handles do not depend on the runner's
+/// console.
 pub fn reports(backend: &str, nulled: &str) -> Vec<String> {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cmd = std::process::Command::new(super::testbin());
-    cmd.args(["spawn-with-null-std", backend, nulled])
-        .arg(dir.path())
-        .creation_flags(CREATE_NO_WINDOW);
+    cmd.args(["spawn-with-null-std", backend, nulled]).arg(dir.path());
     let out = super::output_locked(&mut cmd).expect("spawn the intermediate");
     assert!(
         out.status.success(),

@@ -6,6 +6,7 @@ use super::proc_view::{proc_view_with, ProcView};
 use crate::identity::{Existence, Liveness, ProcessId, Resolved};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_child::Console;
 use crate::test_groups::{namespaces, pidfd_group_signal, Group};
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: `/proc/1` is the outer
@@ -85,7 +86,7 @@ fn fixture_outer_procfs_inner() {
     ));
 
     // A spawn identifies its child by its pidfd, so it succeeds.
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     cmd.stdin(stdin).expect("set stdin pipe");

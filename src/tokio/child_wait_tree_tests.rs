@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 /// The `TreeDrain` variant a fully-drained tree reports on `containment`'s mechanism:
 /// `AllMembersExited` everywhere authoritative (cgroup v2, Windows job object), but
 /// `AllMarkersClosed` on macOS's advisory fd marker — see `TreeDrain`'s own doc for why the two
@@ -16,7 +18,7 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
 }
 
 fn quick_contained_cmd() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
@@ -137,7 +139,7 @@ async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree
 /// drainable fd marker regardless of the requested mode).
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
