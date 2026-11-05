@@ -477,26 +477,8 @@ fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() 
 fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
-    use std::io::Read as _;
-
     crate::log_capture::install();
-    let helper = crate::test_privilege::setuid::setuid_helper();
-    let mut cmd = Command::new();
-    // `args` is the whole argv, program name included.
-    cmd.executable(&helper)
-        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
-    cmd.stdin(Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(Stdio::pipe()).expect("stdout pipe");
-    cmd.stderr(Stdio::null()).expect("stderr null");
-    let mut child = cmd.spawn().expect("spawn the setuid helper");
-    let stdin = child.stdin().expect("piped stdin");
-    let mut ready = [0u8; 1];
-    child
-        .stdout()
-        .expect("piped stdout")
-        .read_exact(&mut ready)
-        .expect("the helper reports ready");
-    assert_eq!(ready, *b"+");
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
     let id = child.id();
     let mark = crate::log_capture::mark();
 
@@ -543,7 +525,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 
 /// `output`, `status` and `read` each say the program may have started when their pump or wait
 /// fails after the spawn, with the fate their teardown gave the child and the wrapper flag of the
-/// child.
+/// child. Pins each public method's routing through `after_the_spawn`.
 ///
 /// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
 #[skuld::test]
