@@ -148,7 +148,7 @@ impl RestrictedChild {
         // stale-ppid defense (`children_of_from_key` applies the order-key rule) so only a
         // genuine child is returned. The fixture's pid may be unopenable by pid, which is how
         // `anchor` reads the anchor's order key, so the key comes from the owned handle.
-        let (key, me_key) = super::backend::ordered_from_handle(self.handle, self.pid, None)
+        let (key, me_key) = super::backend::ordered_from_handle(self.handle, self.pid, None, None)
             .0
             .found()
             .expect("the owned handle always yields an identity");

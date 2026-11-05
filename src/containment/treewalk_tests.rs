@@ -397,14 +397,15 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     assert!(denied.is_running(), "and dropping it must not have touched it");
 }
 
-/// The Windows wiring of the parent-order rule, through `descendants_from_key` with real processes:
-/// `y` started before `x`, both after the root (this process). A snapshot that names `x` as `y`'s
-/// parent is a stale creator edge: `y` orders after the root but before its claimed parent, so it
-/// is dropped. Named the other way round, the same processes are a genuine chain. Mutants (const
-/// false on Windows; flags swapped in `descendants_from_key`) keep `y` under `x`.
+/// The Windows wiring of the walk to the creator read, through `descendants_from_key` with real
+/// processes: `x` and `y` are both children of the root (this process). A snapshot that names `x` as
+/// `y`'s parent is a stale creator edge: `y`'s own creator is the root, so it is dropped under `x`
+/// and kept under the root. (A real edge that breaks the parent-order rule names a creator that is
+/// not the process's, which the creator read catches first, so the stub rows pin that rule.)
+/// Mutant: `resolve_or_drop` passes no parent to the read.
 #[cfg(windows)]
 #[skuld::test]
-fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows() {
+fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows() {
     use crate::identity::HostKernel;
     use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
 
@@ -412,23 +413,18 @@ fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows
     let root_key = super::anchor(&HostKernel, root)
         .expect("the root reads")
         .expect("the root is live");
-    // `y` is created first, so its sequence number is the lower.
     let (y_child, y) = live_findstr_blocker();
     let (x_child, x) = live_findstr_blocker();
 
     let stale_creator = [(x.pid(), root.pid()), (y.pid(), x.pid())];
-    assert_eq!(
-        super::descendants_from_key(&HostKernel, root, root_key, &stale_creator),
-        vec![x]
-    );
-    let genuine = [(y.pid(), root.pid()), (x.pid(), y.pid())];
-    assert_eq!(
-        super::descendants_from_key(&HostKernel, root, root_key, &genuine),
-        vec![y, x]
-    );
+    let dropped = super::descendants_from_key(&HostKernel, root, root_key, &stale_creator);
+    let genuine = [(y.pid(), root.pid()), (x.pid(), root.pid())];
+    let kept = super::descendants_from_key(&HostKernel, root, root_key, &genuine);
 
     release_findstr_unterminated(x_child);
     release_findstr_unterminated(y_child);
+    assert_eq!(dropped, vec![x]);
+    assert_eq!(kept, vec![y, x]);
 }
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.

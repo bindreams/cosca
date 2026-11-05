@@ -172,14 +172,28 @@ impl ProcessId {
         }
     }
 
+    /// `Err` with the verdict of an ordered read (of type `T`) that `self`, the parent it was told,
+    /// no longer holds its pid: [`Resolved::Gone`] when another process holds it, [`Resolved::Unknown`]
+    /// when that cannot be proved, with the parent blamed.
+    #[cfg(any(target_os = "linux", windows))]
+    fn still_held<T>(&self, kernel: &dyn Kernel) -> Result<(), (Resolved<T>, UnknownCause)> {
+        match self.exists_with(kernel) {
+            (Existence::Present, _) => Ok(()),
+            (Existence::Gone, _) => Err((Resolved::Gone, UnknownCause::default())),
+            (Existence::Unknown, cause) => Err((Resolved::Unknown, cause.of_parent(self.pid))),
+        }
+    }
+
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
     ///
     /// `parent`: the process the caller was told is this one's parent. Where the read carries the
-    /// process's parent (Linux: the `stat` made with the id), a process with another parent number
-    /// now is [`Resolved::Gone`]: the pid has changed hands. A `stat` that names the parent's number
-    /// does not yet name the parent, which may have been reaped and its number taken, so `parent` is
-    /// then proved again: a number that no longer holds it is [`Resolved::Gone`] too, and one whose
-    /// proof cannot be made is [`Resolved::Unknown`]. Elsewhere neither is checked.
+    /// process's parent (Linux: the `stat` made with the id; Windows: the creator pid read on the
+    /// handle that gives the id), a process with another parent number now is [`Resolved::Gone`]:
+    /// the pid has changed hands. A number that is read does not yet name the parent, which may have
+    /// been reaped and its number taken, so `parent` is then proved again: a number that no longer
+    /// holds it is [`Resolved::Gone`] too, and one whose proof cannot be made is
+    /// [`Resolved::Unknown`]. On Windows a failed read of the creator is `Unknown`, never a fall back
+    /// to the process snapshot's parent. macOS checks neither.
     pub(crate) fn of_ordered_with(
         kernel: &dyn Kernel,
         pid: RawPid,
@@ -203,10 +217,8 @@ impl ProcessId {
                         return (Resolved::Unknown, UnknownCause::default());
                     }
                 }
-                match parent.exists_with(kernel) {
-                    (Existence::Present, _) => {}
-                    (Existence::Gone, _) => return (Resolved::Gone, UnknownCause::default()),
-                    (Existence::Unknown, cause) => return (Resolved::Unknown, cause.of_parent(parent.pid())),
+                if let Err(verdict) = parent.still_held(kernel) {
+                    return verdict;
                 }
             }
             match stat_parse::parse_starttime_jiffies(&stat) {
@@ -216,9 +228,18 @@ impl ProcessId {
         }
         #[cfg(windows)]
         {
-            let _ = (kernel, parent);
-            let (read, cause) = backend::ordered_read(pid, None);
-            (read.map(|(key, order)| (ProcessId { pid, key }, order)), cause)
+            let (read, cause) = backend::ordered_read(pid, None, parent.map(|parent| parent.pid()));
+            let found = match read {
+                Resolved::Found((key, order)) => (ProcessId { pid, key }, order),
+                Resolved::Gone => return (Resolved::Gone, cause),
+                Resolved::Unknown => return (Resolved::Unknown, cause),
+            };
+            if let Some(parent) = parent {
+                if let Err(verdict) = parent.still_held(kernel) {
+                    return verdict;
+                }
+            }
+            (Resolved::Found(found), cause)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -500,11 +521,14 @@ pub(crate) struct UnknownCause {
     #[cfg(target_os = "linux")]
     errno: Option<rustix::io::Errno>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
-    /// is why (Linux).
+    /// is why (Linux, Windows).
     parent: Option<RawPid>,
     /// The `NTSTATUS` of the refused process-sequence-number query that left the read `Unknown`.
     #[cfg(windows)]
     sequence_status: Option<windows::Win32::Foundation::NTSTATUS>,
+    /// The `NTSTATUS` of the refused creator-pid query that left the read `Unknown`.
+    #[cfg(windows)]
+    creator_status: Option<windows::Win32::Foundation::NTSTATUS>,
 }
 
 impl UnknownCause {
@@ -515,9 +539,16 @@ impl UnknownCause {
     }
 
     /// This cause, for a read that failed on proving `parent`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn of_parent(mut self, parent: RawPid) -> UnknownCause {
         self.parent = Some(parent);
+        self
+    }
+
+    /// This cause, for a read whose creator-pid query was refused with `status`.
+    #[cfg(windows)]
+    pub(crate) fn with_creator_status(mut self, status: windows::Win32::Foundation::NTSTATUS) -> UnknownCause {
+        self.creator_status = Some(status);
         self
     }
 
@@ -559,8 +590,9 @@ impl UnknownCause {
     /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
     /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
-    /// sequence-number query's `NTSTATUS`. `None` when nothing is known (or on macOS, which has no
-    /// view and no pidfd): `hidepid`, a racing exit, an access denial.
+    /// sequence-number query's `NTSTATUS`, else the refused creator-pid query's. `None` when nothing
+    /// is known (or on macOS, which has no view and no pidfd): `hidepid`, a racing exit, an access
+    /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
@@ -572,9 +604,13 @@ impl UnknownCause {
         }
         #[cfg(windows)]
         {
-            self.sequence_status.map(|status| crate::error::Error::Unassessable {
+            let refused = self
+                .sequence_status
+                .map(|status| ("process sequence number", status))
+                .or(self.creator_status.map(|status| ("creator process id", status)));
+            refused.map(|(query, status)| crate::error::Error::Unassessable {
                 detail: format!(
-                    "{subject} exists but its process sequence number query failed: NTSTATUS {:#010x}",
+                    "{subject} exists but its {query} query failed: NTSTATUS {:#010x}",
                     status.0 as u32
                 ),
                 source: None,

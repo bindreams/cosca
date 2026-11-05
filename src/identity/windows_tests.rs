@@ -715,13 +715,13 @@ fn two_failed_reads_keep_both_failures() {
     assert_eq!(cause_text(cause), None, "a key refusal alone has no status to name");
 }
 
-/// Class 92 answers for every process this caller can open: the CI pin of the private read on the
-/// runner's real process population. Read-only.
+/// `read` answers for every process this caller can open: the CI pin of a private
+/// `NtQueryInformationProcess` class (`what`) on the runner's real process population. Read-only.
 /// An elevated caller opens more, so an elevated runner covers processes an unelevated one cannot.
-///
-/// Mutant: the class is refused for a kind of process (a protected or system one).
-#[skuld::test]
-fn the_sequence_number_reads_on_every_process_that_opens() {
+fn assert_reads_on_every_process_that_opens<T>(
+    what: &str,
+    read: fn(windows::Win32::Foundation::HANDLE) -> Result<T, windows::Win32::Foundation::NTSTATUS>,
+) {
     let parents =
         crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
     let (mut opened, mut refused, mut gone) = (0usize, 0usize, 0usize);
@@ -730,7 +730,7 @@ fn the_sequence_number_reads_on_every_process_that_opens() {
         match super::open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
             Opened::Found(handle) => {
                 opened += 1;
-                if let Err(status) = super::sequence_number(handle) {
+                if let Err(status) = read(handle) {
                     failures.push(format!("pid {pid}: NTSTATUS {:#010x}", status.0 as u32));
                 }
                 super::close(handle);
@@ -739,11 +739,154 @@ fn the_sequence_number_reads_on_every_process_that_opens() {
             Opened::Gone => gone += 1,
         }
     }
-    eprintln!("sequence number read on {opened} processes; {refused} refused to open, {gone} gone");
+    eprintln!("{what} read on {opened} processes; {refused} refused to open, {gone} gone");
     assert!(opened > 0, "no process could be opened: {refused} refused, {gone} gone");
     assert!(
         failures.is_empty(),
-        "class 92 failed on {} of {opened} opened processes ({refused} refused to open): {failures:?}",
+        "{what} failed on {} of {opened} opened processes ({refused} refused to open): {failures:?}",
         failures.len()
     );
+}
+
+/// Class 92 answers for every process this caller can open.
+///
+/// Mutant: the class is refused for a kind of process (a protected or system one).
+#[skuld::test]
+fn the_sequence_number_reads_on_every_process_that_opens() {
+    assert_reads_on_every_process_that_opens("class 92", super::sequence_number);
+}
+
+/// Class 0 answers for every process this caller can open.
+///
+/// Mutant: the class is refused for a kind of process (a protected or system one).
+#[skuld::test]
+fn the_creator_pid_reads_on_every_process_that_opens() {
+    assert_reads_on_every_process_that_opens("class 0", super::creator_pid);
+}
+
+// the creator =====
+
+/// The creator pid is the pid of the process that made this one, and still is once that process has
+/// exited: Windows never reparents. The fixture shell is terminated while its `ping` lives on in the
+/// fixture's job.
+///
+/// Mutant: the creator read names the current parent, or is lost with the creator.
+#[skuld::test]
+fn the_creator_pid_survives_the_creators_exit() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_creator_pid_survives_the_creators_exit),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let shell = spawn_restricted_shell(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
+    let grandchild = shell.wait_for_child();
+    let Opened::Found(handle) = super::open_classified(grandchild, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        panic!("the grandchild is ours and openable");
+    };
+    let before = super::creator_pid(handle);
+    shell.terminate();
+    let after = super::creator_pid(handle);
+    super::close(handle);
+    assert_eq!(before, Ok(shell.pid() as usize));
+    assert_eq!(after, Ok(shell.pid() as usize));
+}
+
+/// What the creator read adds to a read of the candidate: another creator than the claimed parent is
+/// `Gone`, whatever else the reads said; a creator read that is refused leaves a read that was
+/// `Found` or `Unknown` `Unknown`, with the status as the cause unless the read had one.
+///
+/// Mutants: the creator is compared first or last in a way that lets a refused sequence number hide
+/// a mismatch; a refused creator query reads as a match; a refused creator query overwrites the
+/// sequence number's status.
+#[skuld::test]
+fn the_creator_decides_a_read_by_the_claimed_parent() {
+    use crate::identity::{OrderKey, UnknownCause};
+    let found = || {
+        (
+            Resolved::Found((Key::for_test(5), OrderKey::for_test(9))),
+            UnknownCause::default(),
+        )
+    };
+    let seq_refused = || (Resolved::Unknown, UnknownCause::of_sequence_status(REFUSED));
+
+    let (read, _) = super::with_creator(7, 100, Ok(100), found());
+    assert_eq!(read, Resolved::Found((Key::for_test(5), OrderKey::for_test(9))));
+
+    for read in [found(), seq_refused(), (Resolved::Gone, UnknownCause::default())] {
+        let (read, cause) = super::with_creator(7, 100, Ok(101), read);
+        assert_eq!(read, Resolved::Gone, "another creator is another process's child");
+        assert_eq!(cause_text(cause), None);
+    }
+
+    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), found());
+    assert_eq!(read, Resolved::Unknown);
+    let text = cause_text(cause).expect("the refusal is the cause");
+    assert!(
+        text.contains("pid 7") && text.contains("creator process id query failed: NTSTATUS 0xc0000004"),
+        "{text}"
+    );
+
+    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), seq_refused());
+    assert_eq!(read, Resolved::Unknown);
+    let text = cause_text(cause).expect("the sequence number's refusal is the cause");
+    assert!(text.contains("process sequence number query failed"), "{text}");
+
+    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), (Resolved::Gone, UnknownCause::default()));
+    assert_eq!(
+        read,
+        Resolved::Gone,
+        "a pid another process holds is gone whatever the creator said"
+    );
+    assert_eq!(cause_text(cause), None);
+}
+
+fn ordered_under(
+    pid: u32,
+    parent: crate::identity::ProcessId,
+) -> Resolved<(crate::identity::ProcessId, crate::identity::OrderKey)> {
+    crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, pid, Some(parent)).0
+}
+
+/// A live process that did not create the candidate is not its parent, though it is a real process
+/// holding a real pid: the candidate's own creator is read, not the snapshot's claim.
+///
+/// Mutant: `of_ordered_with` ignores `parent` on Windows.
+#[skuld::test]
+fn a_candidate_is_gone_under_a_parent_that_did_not_create_it() {
+    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
+    let (x_child, x) = live_findstr_blocker();
+    let (y_child, y) = live_findstr_blocker();
+    let read = ordered_under(y.pid(), x);
+    release_findstr_unterminated(y_child);
+    release_findstr_unterminated(x_child);
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// The creator's pid is right but another process holds it: the proof of the parent after the read
+/// fails.
+///
+/// Mutant: the parent is not proved again after the candidate's read.
+#[skuld::test]
+fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
+    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
+    let (child, kid) = live_findstr_blocker();
+    let read = ordered_under(kid.pid(), crate::identity::ProcessId::current().with_other_value());
+    release_findstr_unterminated(child);
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// The real parent is accepted, with the candidate's own id.
+///
+/// Mutant: the creator comparison rejects the real creator (a pid cast, a stale value).
+#[skuld::test]
+fn a_candidate_is_found_under_its_real_parent() {
+    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
+    let (child, kid) = live_findstr_blocker();
+    let read = ordered_under(kid.pid(), crate::identity::ProcessId::current());
+    release_findstr_unterminated(child);
+    let Resolved::Found((id, _)) = read else {
+        panic!("a child of this process is found under it, got {read:?}");
+    };
+    assert_eq!(id, kid);
 }
