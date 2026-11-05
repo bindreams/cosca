@@ -63,6 +63,8 @@ struct Shared {
 
 /// What calls consume and record, behind one lock so a `&FakeProcess` is `Sync`.
 struct Script {
+    /// What [`OsChild::pid`] answers. `None`: the real child's, if there is one, else no pid.
+    pid: Option<u32>,
     exits: VecDeque<Answer>,
     peeks: VecDeque<PeekAnswer>,
     reaps: VecDeque<ReapAnswer>,
@@ -96,6 +98,7 @@ impl FakeProcess {
     fn with(exits: impl IntoIterator<Item = Answer>, real: Option<Box<dyn OsChild>>) -> Self {
         Self(Arc::new(Shared {
             script: Mutex::new(Script {
+                pid: None,
                 exits: exits.into_iter().collect(),
                 peeks: VecDeque::new(),
                 reaps: VecDeque::new(),
@@ -111,6 +114,13 @@ impl FakeProcess {
             source: Source::new(),
             real,
         }))
+    }
+
+    /// Answer `pid` to [`OsChild::pid`]. Without it, a fake over a real child answers that child's,
+    /// and any other has no pid.
+    pub(crate) fn with_pid(self, pid: u32) -> Self {
+        self.script().pid = Some(pid);
+        self
     }
 
     /// Answer `peeks` to successive [`OsChild::peek`] calls.
@@ -277,6 +287,11 @@ impl OsProcess for FakeProcess {
 }
 
 impl OsChild for FakeProcess {
+    fn pid(&self) -> Option<u32> {
+        let stated = self.script().pid;
+        stated.or_else(|| self.0.real.as_ref().and_then(|real| real.pid()))
+    }
+
     fn peek(&self) -> Result<PeekOutcome, Error> {
         let scripted = {
             let mut script = self.script();

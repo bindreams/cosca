@@ -1,6 +1,6 @@
 //! The teardowns of a Windows child over a real `CREATE_SUSPENDED` process, whose calls a
 //! [`FakeProcess`] answers where a test must make the OS refuse, fail or slow down: a failed raw
-//! spawn's ([`teardown_spawned`]) and the drop's ([`OwnedChild::teardown_on_drop`]).
+//! spawn's ([`teardown_spawned`]) and the drop's ([`OwnedChild::tear_down`]).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use windows::Win32::System::Threading::{
 
 use super::proc::create_process;
 use super::teardown_spawned;
+use crate::child::owned::teardown::TeardownKind;
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -306,12 +307,12 @@ fn handle_over(owner: &Suspended, script: impl FnOnce(FakeProcess) -> FakeProces
 /// Mutants: `TerminateProcess` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`, so the process is
 /// ended with code 0 once the wait blocks; the wait after an accepted terminate dropped.
 #[skuld::test]
-fn teardown_on_drop_returns_promptly() {
+fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
     let owner = Suspended::spawn();
     let (handle, _fake) = handle_over(&owner, |fake| fake);
     // Keeps a no-op terminate from hanging the wait; see `Suspended::end_with_code_zero`.
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    let torn = handle.teardown_on_drop(owner.id());
+    let torn = handle.tear_down(Some(owner.id()), TeardownKind::Kill, None);
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert!(torn.left.is_none(), "{torn:?}");
     assert!(handle.is_reaped(), "teardown must wait for the exit it started");
@@ -334,7 +335,7 @@ fn teardown_on_drop_returns_promptly() {
 /// reads as the exit; the failed `TerminateProcess` is warned of where it is made, as well as by
 /// the caller.
 #[skuld::test]
-fn teardown_on_drop_never_blocks_on_a_handle_without_terminate() {
+fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
     let owner = Suspended::spawn();
     let id = owner.id();
     crate::log_capture::install();
@@ -344,7 +345,7 @@ fn teardown_on_drop_never_blocks_on_a_handle_without_terminate() {
     // Ends the owner's process once a wait blocks, so a teardown that waits fails the checks below
     // instead of hanging.
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    let torn = handle.teardown_on_drop(id);
+    let torn = handle.tear_down(Some(id), TeardownKind::Kill, None);
     assert_eq!(torn.fate, ChildFate::Running { id: Some(id) }, "{torn:?}");
     assert!(
         torn.left
@@ -379,7 +380,7 @@ fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
     let handle = child;
     owner.end_with_code_zero()();
     owner.wait_for_exit();
-    let torn = handle.teardown_on_drop(owner.id());
+    let torn = handle.tear_down(Some(owner.id()), TeardownKind::Kill, None);
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert!(torn.left.is_none(), "{torn:?}");
 }
@@ -394,7 +395,7 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     let (handle, _fake) = handle_over(&owner, |fake| fake);
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    let torn = handle.teardown_on_drop(owner.id());
+    let torn = handle.tear_down(Some(owner.id()), TeardownKind::Kill, None);
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert!(torn.left.is_none(), "{torn:?}");
 }
@@ -409,7 +410,7 @@ fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
     let owner = Suspended::spawn();
     let (handle, fake) = handle_over(&owner, |fake| fake.reaps([ReapAnswer::Err(KIND)]));
     crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    let torn = handle.teardown_on_drop(owner.id());
+    let torn = handle.tear_down(Some(owner.id()), TeardownKind::Kill, None);
     assert_eq!(torn.fate, ChildFate::Unknown, "{torn:?}");
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
 }

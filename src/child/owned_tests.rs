@@ -19,6 +19,8 @@ mod macos;
 mod states;
 #[path = "owned_tests/teardown.rs"]
 mod teardown;
+#[path = "owned_tests/teardown_look.rs"]
+mod teardown_look;
 #[cfg(target_os = "macos")]
 #[path = "owned_tests/traced.rs"]
 mod traced;
