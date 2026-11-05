@@ -636,6 +636,8 @@ fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
 // the two reads of one handle =====
 
 const REFUSED: windows::Win32::Foundation::NTSTATUS = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+const ACCESS_DENIED: windows::Win32::Foundation::NTSTATUS =
+    windows::Win32::Foundation::NTSTATUS(0xC000_0022_u32 as i32);
 
 fn refused_key() -> windows::core::Result<Key> {
     Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
@@ -790,105 +792,6 @@ fn the_creator_pid_survives_the_creators_exit() {
     assert_eq!(after, Ok(shell.pid() as usize));
 }
 
-/// What the creator read adds to a read of the candidate: another creator than the claimed parent is
-/// `Gone`, whatever else the reads said; a creator read that is refused leaves a read that was
-/// `Found` or `Unknown` `Unknown`, with the status as the cause unless the read had one.
-///
-/// Mutants: the creator is compared first or last in a way that lets a refused sequence number hide
-/// a mismatch; a refused creator query reads as a match; a refused creator query overwrites the
-/// sequence number's status.
-#[skuld::test]
-fn the_creator_decides_a_read_by_the_claimed_parent() {
-    use crate::identity::{OrderKey, UnknownCause};
-    let found = || {
-        (
-            Resolved::Found((Key::for_test(5), OrderKey::for_test(9))),
-            UnknownCause::default(),
-        )
-    };
-    let seq_refused = || (Resolved::Unknown, UnknownCause::of_sequence_status(REFUSED));
-
-    let (read, _) = super::with_creator(7, 100, Ok(100), found());
-    assert_eq!(read, Resolved::Found((Key::for_test(5), OrderKey::for_test(9))));
-
-    for read in [found(), seq_refused(), (Resolved::Gone, UnknownCause::default())] {
-        let (read, cause) = super::with_creator(7, 100, Ok(101), read);
-        assert_eq!(read, Resolved::Gone, "another creator is another process's child");
-        assert_eq!(cause_text(cause), None);
-    }
-
-    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), found());
-    assert_eq!(read, Resolved::Unknown);
-    let text = cause_text(cause).expect("the refusal is the cause");
-    assert!(
-        text.contains("pid 7") && text.contains("creator process id query failed: NTSTATUS 0xc0000004"),
-        "{text}"
-    );
-
-    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), seq_refused());
-    assert_eq!(read, Resolved::Unknown);
-    let text = cause_text(cause).expect("the sequence number's refusal is the cause");
-    assert!(text.contains("process sequence number query failed"), "{text}");
-
-    let (read, cause) = super::with_creator(7, 100, Err(REFUSED), (Resolved::Gone, UnknownCause::default()));
-    assert_eq!(
-        read,
-        Resolved::Gone,
-        "a pid another process holds is gone whatever the creator said"
-    );
-    assert_eq!(cause_text(cause), None);
-}
-
-fn ordered_under(
-    pid: u32,
-    parent: crate::identity::ProcessId,
-) -> Resolved<(crate::identity::ProcessId, crate::identity::OrderKey)> {
-    crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, pid, Some(parent)).0
-}
-
-/// A live process that did not create the candidate is not its parent, though it is a real process
-/// holding a real pid: the candidate's own creator is read, not the snapshot's claim.
-///
-/// Mutant: `of_ordered_with` ignores `parent` on Windows.
-#[skuld::test]
-fn a_candidate_is_gone_under_a_parent_that_did_not_create_it() {
-    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
-    let (x_child, x) = live_findstr_blocker();
-    let (y_child, y) = live_findstr_blocker();
-    let read = ordered_under(y.pid(), x);
-    release_findstr_unterminated(y_child);
-    release_findstr_unterminated(x_child);
-    assert_eq!(read, Resolved::Gone);
-}
-
-/// The creator's pid is right but another process holds it: the proof of the parent after the read
-/// fails.
-///
-/// Mutant: the parent is not proved again after the candidate's read.
-#[skuld::test]
-fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
-    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
-    let (child, kid) = live_findstr_blocker();
-    let read = ordered_under(kid.pid(), crate::identity::ProcessId::current().with_other_value());
-    release_findstr_unterminated(child);
-    assert_eq!(read, Resolved::Gone);
-}
-
-/// The real parent is accepted, with the candidate's own id.
-///
-/// Mutant: the creator comparison rejects the real creator.
-#[skuld::test]
-fn a_candidate_is_found_under_its_real_parent() {
-    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
-    let (child, kid) = live_findstr_blocker();
-    let read = ordered_under(kid.pid(), crate::identity::ProcessId::current());
-    release_findstr_unterminated(child);
-    let Resolved::Found((id, _)) = read else {
-        panic!("a child of this process is found under it, got {read:?}");
-    };
-    assert_eq!(id, kid);
-}
-
 /// The candidate's creator is the claimed parent, but the parent's pid cannot be opened to prove it
 /// still holds it: the read is `Unknown`, blaming the parent and not the candidate. The parent is a
 /// real shell that grants no query right, and the candidate is the `ping` it launched.
@@ -910,4 +813,42 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_opened_to_prove_it() {
     let (read, cause) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent));
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(shell.pid()));
+}
+
+/// A refused creator query is an unreadable parent number that carries its `NTSTATUS` in the cause;
+/// an answered one is the number, and adds nothing. (How the walk words the status is pinned in
+/// `treewalk_tests`.)
+///
+/// The query on an opened handle cannot be made to refuse here, so the row is over the function that
+/// builds the cause from its answer. Mutant: `creator_read` drops the status from the cause.
+#[skuld::test]
+fn a_refused_creator_query_puts_its_status_in_the_cause() {
+    use super::{creator_read, ParentRead};
+    use crate::identity::UnknownCause;
+
+    let (parent, cause) = creator_read(7, Err(REFUSED), UnknownCause::default());
+    assert_eq!(parent, ParentRead::Unreadable);
+    assert_eq!(cause.creator_status, Some(REFUSED));
+
+    let (parent, cause) = creator_read(7, Ok(5), UnknownCause::default());
+    assert_eq!(parent, ParentRead::Is(5));
+    assert_eq!(cause.creator_status, None);
+}
+
+/// A cause that already holds a refused sequence-number query keeps it as the error when the
+/// creator query is refused too: the sequence-number query is named first.
+///
+/// Mutant: the creator status takes precedence over the sequence status in `into_error`.
+#[skuld::test]
+fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_error() {
+    use super::{creator_read, ParentRead};
+    use crate::identity::UnknownCause;
+
+    let (parent, cause) = creator_read(7, Err(ACCESS_DENIED), UnknownCause::of_sequence_status(REFUSED));
+    assert_eq!(parent, ParentRead::Unreadable);
+    let text = cause_text(cause).expect("a refusal is the cause");
+    assert!(
+        text.contains("process sequence number query failed: NTSTATUS 0xc0000004") && !text.contains("creator"),
+        "{text}"
+    );
 }
