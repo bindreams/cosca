@@ -54,7 +54,8 @@ impl ProcessId {
         let Some((parent, parent_order)) = resolution_of("ppid", ppid, read)? else {
             return Ok(None);
         };
-        // Where the creator is never updated, a genuine parent started before its child.
+        // Where the creator is never updated, a genuine parent started before its child. Both reads
+        // carry their order keys there (asserted in `read_ordered`).
         if ORDER_AFTER_PARENT {
             return Ok(keeps(own_order, parent_order).then_some(parent));
         }

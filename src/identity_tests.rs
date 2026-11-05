@@ -383,6 +383,7 @@ fn the_keep_rule_over_optional_keys_drops_a_keyless_read_only_under_a_bound() {
         ("no bound, no key", None, None, true),
         ("a bound, no key", None, key(1), false),
         ("a bound, a key after it", key(5), key(1), true),
+        ("a bound, a key equal to it", key(1), key(1), false),
         ("a bound, a key before it", key(1), key(5), false),
     ] {
         assert_eq!(keeps(order, bound), kept, "{name}");

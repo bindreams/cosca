@@ -1,9 +1,9 @@
-//! Tests for the identity-aware descendant filters, run on every host. Most are pure: synthetic
+//! Tests for the identity-aware descendant filters. Most are pure and run on every host: synthetic
 //! `(pid, ppid)` edges plus a stub resolver closure drive the filters'
 //! structure: the subtree, the dedup, the unassessed list, and what the resolver is handed. The
-//! stub applies no order rule: the rule is the read's (`identity_tests`, `keeps_order` and
-//! `judged`), whose answers the stub states. The anchor row reads this live process, and the
-//! Windows rows below use their own short-lived children.
+//! stub applies no order rule: the rule is the read's (`identity_tests`, `keeps` and `judged`),
+//! whose answers the stub states. The anchor row reads this live process; the `cfg(windows)` rows
+//! below run only on Windows, with their own short-lived children.
 
 use super::{descendants_with, Resolution, Walk};
 use crate::error::Error;
@@ -324,7 +324,7 @@ fn the_anchor_hands_out_a_bound_only_on_windows() {
     let proof = super::anchor(&crate::identity::HostKernel, ProcessId::current())
         .expect("this process reads")
         .expect("this process is live");
-    assert_eq!(proof.bound.is_some(), cfg!(windows));
+    assert_eq!(proof.bound.is_some(), crate::identity::ORDER_AFTER_PARENT);
 }
 
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
