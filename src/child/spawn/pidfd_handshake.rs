@@ -894,8 +894,7 @@ fn conclude<T: Spawned>(
             }
             LeftFront::Here(front) if !collected => {
                 // No subtree, so the front is never waited for and no threshold applies.
-                let (fate, child_fate) =
-                    super::leave_front_through_pidfd(None, pidfd, front, None, super::NO_WAIT_WARN, None);
+                let (fate, child_fate) = super::leave_front_through_pidfd(None, pidfd, None, super::NO_WAIT_WARN, None);
                 (fate.note(error, Some(front), None), child_fate)
             }
             // The group first: it holds the root too.

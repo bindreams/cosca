@@ -94,6 +94,10 @@ impl OsProcess for MacChild {
 }
 
 impl OsChild for MacChild {
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
     /// `waitid(WNOWAIT)` by pid, checked against the unique id; a running child whose id cannot be
     /// read is an error. Touches no kqueue.
     fn peek(&self) -> Result<PeekOutcome, Error> {

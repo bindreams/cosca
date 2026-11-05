@@ -105,10 +105,10 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
         .holds(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(!subtree(HIGH, false)
-        .reached(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(subtree(HIGH, true)
-        .reached(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
 }
 
@@ -1227,4 +1227,16 @@ fn a_descriptor_that_is_no_pidfd_fails_the_pin() {
         Err(super::Unpinned::Gone(e)) => panic!("expected Failed, got Gone({e})"),
         Ok(_) => panic!("expected Failed, got a pidfd"),
     }
+}
+
+/// A subtree asked about a child with no pid cannot place it, though its kill landed: it has no
+/// number to ask `/proc` with, so whether the kill reached it is unknown, not "no".
+///
+/// Mutant: the pid-less child is taken for not reached, or asked as pid 0.
+#[skuld::test]
+fn a_subtree_asked_about_a_pidless_child_cannot_place_it() {
+    use crate::child::owned::teardown::Reach;
+
+    let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
+    assert!(subtree(HIGH, true).reached(&child).is_err());
 }

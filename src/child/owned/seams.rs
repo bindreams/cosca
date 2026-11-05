@@ -34,10 +34,10 @@ thread_local! {
     static ROOT_TEARDOWNS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// From now on every root teardown a drop starts on THIS thread ([`OwnedChild::teardown_on_drop`]:
+/// From now on every root teardown a drop starts on THIS thread ([`OwnedChild::tear_down`]:
 /// a kill and a wait) is counted. It still runs.
 ///
-/// [`OwnedChild::teardown_on_drop`]: super::OwnedChild::teardown_on_drop
+/// [`OwnedChild::tear_down`]: super::OwnedChild::tear_down
 pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
     ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
     RootTeardownRecorder(())

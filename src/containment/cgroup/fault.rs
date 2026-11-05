@@ -601,6 +601,10 @@ pub(crate) fn record_leaf_steps() {
 pub(crate) fn take_leaf_steps() -> Vec<String> {
     LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()
 }
+/// The steps recorded so far on this thread, which goes on recording.
+pub(crate) fn peek_leaf_steps() -> Vec<String> {
+    LEAF_STEPS.with(|s| s.borrow().clone()).unwrap_or_default()
+}
 pub(crate) fn record_leaf_step(step: impl FnOnce() -> String) {
     LEAF_STEPS.with(|s| {
         if let Some(steps) = s.borrow_mut().as_mut() {
