@@ -124,3 +124,22 @@ fn a_parent_that_loses_its_number_after_the_childs_read_is_not_named() {
     let lost = ticks_table().on_read_after(&format!("{PARENT}/stat"), 2, Ok(&stat(PARENT, 1, 1_001)));
     assert_eq!(ticks_me().parent_with(&lost).expect("a readable table"), None);
 }
+
+/// A parent whose proof after `self`'s read cannot be made is an error naming the parent, not
+/// `self`, whose own read succeeded. Mutant: "the error names `self` whatever left the read
+/// `Unknown`".
+#[skuld::test]
+fn a_parent_that_cannot_be_proved_again_is_the_subject_of_the_error() {
+    let kernel = ticks_table()
+        .on_read_after(&format!("{PARENT}/stat"), 2, Err(libc::EACCES))
+        .on_signal_probe(Pid::from_raw(PARENT as i32).unwrap(), Ok(()));
+    match ticks_me().parent_with(&kernel) {
+        Err(Error::Unassessable { detail, .. }) => {
+            assert!(
+                detail.contains(&format!("ppid {PARENT} exists but could not be queried")),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}

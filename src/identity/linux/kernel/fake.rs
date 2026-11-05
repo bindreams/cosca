@@ -177,12 +177,15 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// Live `pid` on a host before Linux 6.9: its pidfd opens (as a stand-in descriptor) and has no
-    /// inode of its own, so the process is told by its `/proc` `starttime`. Rows of its own that
-    /// follow replace these.
-    pub(crate) fn live_without_pidfs(self, pid: u32) -> Self {
-        let stand_in = OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null opens"));
-        self.on_pidfd_open(pid, Ok(stand_in)).on_pidfs_ino(pid, Ok(None))
+    /// Live `pid` on a host before Linux 6.9: its pidfd opens as `pidfd` and has no inode of its
+    /// own, so the process is told by its `/proc` `starttime`. Rows of its own that follow replace
+    /// these.
+    ///
+    /// `pidfd` is what a send or a pidfd proof reaches: a stand-in (`/dev/null`) fits a row that stops
+    /// before either; a row about what a proof reads of `pid`, or whom a signal hits, passes the
+    /// process's own.
+    pub(crate) fn live_without_pidfs(self, pid: u32, pidfd: OwnedFd) -> Self {
+        self.on_pidfd_open(pid, Ok(pidfd)).on_pidfs_ino(pid, Ok(None))
     }
 
     fn target(pid: u32) -> Pid {

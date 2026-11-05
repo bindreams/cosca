@@ -26,7 +26,8 @@ pub(crate) enum Via {
 
 pub(crate) type Entry = (u32, Sig, Via);
 
-/// A signal sent to a process after checking its identity: the pid and the signal number. Kept apart from [`Entry`] so the by-handle log of the drops keeps its shape.
+/// A signal sent to a process after checking its identity: the pid and the signal number. Kept
+/// apart from [`Entry`] so the by-handle log of the drops keeps its shape.
 pub(crate) type IdentityEntry = (u32, i32);
 
 /// One step of a send to a process group, in order: a check of the root, or a send.

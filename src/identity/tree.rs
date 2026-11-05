@@ -65,10 +65,12 @@ impl ProcessId {
             // `self` was replaced, exited, or has another parent now.
             (Resolved::Found(_) | Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
-                return Err(crate::containment::treewalk::unqueryable(
-                    &format!("pid {}", self.pid()),
-                    cause,
-                ));
+                // The parent's proof can be what failed, not `self`'s read.
+                let subject = match cause.blamed_parent() {
+                    Some(parent) => format!("ppid {parent}"),
+                    None => format!("pid {}", self.pid()),
+                };
+                return Err(crate::containment::treewalk::unqueryable(&subject, cause));
             }
         };
         // A genuine parent predates this child; a recycled ppid names a later-started process.

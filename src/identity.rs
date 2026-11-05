@@ -203,7 +203,7 @@ impl ProcessId {
                 match parent.exists_with(kernel) {
                     (Existence::Present, _) => {}
                     (Existence::Gone, _) => return (Resolved::Gone, UnknownCause::default()),
-                    (Existence::Unknown, cause) => return (Resolved::Unknown, cause),
+                    (Existence::Unknown, cause) => return (Resolved::Unknown, cause.of_parent(parent.pid())),
                 }
             }
             match stat_parse::parse_starttime_jiffies(&stat) {
@@ -461,9 +461,25 @@ pub(crate) struct UnknownCause {
     /// The failed `pidfd_open`, `fstatfs` or `fstat` that left the read `Unknown`.
     #[cfg(target_os = "linux")]
     errno: Option<rustix::io::Errno>,
+    /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
+    /// is why (Linux).
+    parent: Option<RawPid>,
 }
 
 impl UnknownCause {
+    /// The pid an `Unknown` ordered read blames when it is not the pid read: the parent whose proof
+    /// failed. `None` when the read's own pid is the subject.
+    pub(crate) fn blamed_parent(&self) -> Option<RawPid> {
+        self.parent
+    }
+
+    /// This cause, for a read that failed on proving `parent`.
+    #[cfg(target_os = "linux")]
+    fn of_parent(mut self, parent: RawPid) -> UnknownCause {
+        self.parent = Some(parent);
+        self
+    }
+
     /// The failed pidfd call, when one is why.
     #[cfg(target_os = "linux")]
     pub(crate) fn errno(&self) -> Option<rustix::io::Errno> {
@@ -473,7 +489,11 @@ impl UnknownCause {
     /// The cause of a read through `/proc` that `view`, when it is `Some`, left `Unknown`.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
-        UnknownCause { view, errno: None }
+        UnknownCause {
+            view,
+            errno: None,
+            parent: None,
+        }
     }
 
     /// The cause of a read that a failed pidfd call (`errno`) left `Unknown`.
@@ -482,6 +502,7 @@ impl UnknownCause {
         UnknownCause {
             view: None,
             errno: Some(errno),
+            parent: None,
         }
     }
 
@@ -590,11 +611,13 @@ pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
 }
 
 /// A kernel over the host's that states a host before Linux 6.9 for live `pid` (see
-/// [`FakeKernel::live_without_pidfs`]): for a row about the `/proc` path of a read, whatever
-/// kernel runs the suite.
+/// [`FakeKernel::live_without_pidfs`]), its pidfd a stand-in that names no process: for a row about
+/// the `/proc` path of a read, whatever kernel runs the suite. A row whose kill must pass the pidfd
+/// proof gives `live_without_pidfs` the process's own pidfd instead.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn ticks_host(pid: RawPid) -> FakeKernel<'static> {
-    FakeKernel::over(&HostKernel).live_without_pidfs(pid)
+    let stand_in = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null opens"));
+    FakeKernel::over(&HostKernel).live_without_pidfs(pid, stand_in)
 }
 
 /// The identity of live `pid` on a host before Linux 6.9: its `starttime`. A forged `Ticks` id
