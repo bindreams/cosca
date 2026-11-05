@@ -174,7 +174,6 @@ impl ProcessId {
 
     /// `Err(Gone)` if another process now holds `self`'s pid, `Err(Unknown)` (blaming the parent) if
     /// that cannot be proved.
-    #[cfg(any(target_os = "linux", windows))]
     fn still_held<T>(&self, kernel: &dyn Kernel) -> Result<(), (Resolved<T>, UnknownCause)> {
         match self.exists_with(kernel) {
             (Existence::Present, _) => Ok(()),
@@ -187,12 +186,13 @@ impl ProcessId {
     ///
     /// `parent`: the process the caller was told is this one's parent. Where the read carries the
     /// process's parent (Linux: the `stat` made with the id; Windows: the creator pid read on the
-    /// handle that gives the id), a process with another parent number now is [`Resolved::Gone`]:
-    /// the pid has changed hands. A number that is read does not yet name the parent, which may have
-    /// been reaped and its number taken, so `parent` is then proved again: a number that no longer
-    /// holds it is [`Resolved::Gone`] too, and one whose proof cannot be made is
-    /// [`Resolved::Unknown`]. On Windows a failed read of the creator is `Unknown`. macOS checks
-    /// neither.
+    /// handle that gives the id; macOS: the process-info record that gives the start key), a process
+    /// with another parent number now is [`Resolved::Gone`]: the pid has changed hands. A number that
+    /// is read does not yet name the parent, which may have been reaped and its number taken, so
+    /// `parent` is then proved again: a number that no longer holds it is [`Resolved::Gone`] too, and
+    /// one whose proof cannot be made is [`Resolved::Unknown`]. On Windows a failed read of the
+    /// creator is `Unknown`. On macOS the id is the record's key, so a read made with a parent is not
+    /// the by-pid read [`of_with`](Self::of_with) makes.
     pub(crate) fn of_ordered_with(
         kernel: &dyn Kernel,
         pid: RawPid,
@@ -242,7 +242,22 @@ impl ProcessId {
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = parent;
+            if let Some(parent) = parent {
+                let found = match backend::ppid_and_key(pid) {
+                    Resolved::Found((ppid, key)) if ppid == parent.pid() => {
+                        (ProcessId { pid, key }, OrderKey(key.raw()))
+                    }
+                    // The pid is another process's child now: it changed hands since the listing,
+                    // or the process was reparented (to launchd, when its parent exited).
+                    Resolved::Found(_) => return (Resolved::Gone, UnknownCause::default()),
+                    Resolved::Gone => return (Resolved::Gone, UnknownCause::default()),
+                    Resolved::Unknown => return (Resolved::Unknown, UnknownCause::default()),
+                };
+                if let Err(verdict) = parent.still_held(kernel) {
+                    return verdict;
+                }
+                return (Resolved::Found(found), UnknownCause::default());
+            }
             let (read, cause) = Self::of_with(kernel, pid);
             match read {
                 Resolved::Found(id) => match id.order_key_with(kernel) {
@@ -520,7 +535,7 @@ pub(crate) struct UnknownCause {
     #[cfg(target_os = "linux")]
     errno: Option<rustix::io::Errno>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
-    /// is why (Linux, Windows).
+    /// is why.
     parent: Option<RawPid>,
     /// The `NTSTATUS` of the refused process-sequence-number query that left the read `Unknown`.
     #[cfg(windows)]
@@ -538,7 +553,6 @@ impl UnknownCause {
     }
 
     /// This cause, for a read that failed on proving `parent`.
-    #[cfg(any(target_os = "linux", windows))]
     fn of_parent(mut self, parent: RawPid) -> UnknownCause {
         self.parent = Some(parent);
         self
