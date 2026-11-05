@@ -199,8 +199,8 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
-        crate::log_capture::contains_since(mark, "reap_now refused); it is not waited on"),
-        "a forgotten child was handed nowhere, and the warning must say so"
+        crate::log_capture::contains_since(mark, "reap_now refused); the child "),
+        "the warning must say why the forgotten child was forgotten, straight after the refused kill"
     );
     // The refused kill and the forget are one event: one warn, which carries the leak.
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
@@ -560,8 +560,8 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
-        crate::log_capture::contains_since(mark, "teardown refused); it is torn down through its pidfd"),
-        "the warn must say the kill was refused and the child torn down through its pidfd"
+        crate::log_capture::contains_since(mark, "teardown refused); forgetting tokio's handle for it leaks"),
+        "the warn must say the kill was refused, then what forgetting tokio's handle leaked"
     );
     // The identity check that failed (when one did), the refused kill and the forget are one event:
     // one warn, which carries the diagnosis and the leak.
