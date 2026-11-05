@@ -85,7 +85,7 @@ fn drop_se_debug_privilege(_alone: &Completion) {
 }
 
 /// The image path of process `pid`, read on a handle of its own; `None` once it is gone.
-fn image_file_name(pid: u32) -> Option<String> {
+pub(crate) fn image_file_name(pid: u32) -> Option<String> {
     use super::backend::{close, open_classified, Opened};
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(handle) => handle,
