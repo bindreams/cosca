@@ -201,12 +201,11 @@ fn pid_comes_from_the_child_and_id_from_the_spawn() {
 /// A real child that is still running when its `Unreaped` drops is waited for and reaped: the drop
 /// blocks, the child exits (its stdin closes as the wait is about to block), and it is gone.
 ///
-/// Mutant: the drop leaves the child a zombie (Unix) or open (Windows), or does not wait for it.
+/// Mutant: the drop leaves the child a zombie (Unix), or does not wait for it.
 #[skuld::test]
 fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     use super::fixtures::{identity_of, spawn_std_blocker};
     use crate::child::owned::OwnedChild;
-    use crate::identity::Existence;
 
     let (child, stdin) = spawn_std_blocker();
     let blocker_id = identity_of(&child);
@@ -215,5 +214,18 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(move || drop(stdin));
     drop(unreaped);
-    assert_eq!(blocker_id.exists(), Existence::Gone, "the drop reaped the child");
+    // A Windows process object outlives its last handle for a moment, so only Unix can ask for
+    // the reap itself; on Windows the drop's wait shows as the child having exited.
+    #[cfg(unix)]
+    assert_eq!(
+        blocker_id.exists(),
+        crate::identity::Existence::Gone,
+        "the drop reaped the child"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        blocker_id.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the drop waited for the child"
+    );
 }
