@@ -158,9 +158,10 @@ fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call
     child.wait().expect("reap the root");
 
     let mark = crate::log_capture::mark();
-    let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
+    let (fate, handed_back) =
+        crate::test_child::tear_down_holding(child, (), crate::child::owned::teardown::Disposition::HandBack);
 
-    assert!(unreaped.is_none(), "{unreaped:?}");
+    assert!(handed_back.is_none(), "the teardown handed the child back");
     assert_eq!(fate, crate::error::ChildFate::Reaped);
     let warns = crate::log_capture::records_since_on_current_thread(mark, "the root is already reaped");
     assert_eq!(warns.len(), 1, "exactly one warn, got {warns:?}");
