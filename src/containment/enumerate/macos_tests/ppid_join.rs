@@ -1,6 +1,6 @@
 //! The ppid join: `join_edges`, `process_parents`, and `ppid_of`'s failure branches.
 
-use crate::identity::Resolved;
+use crate::identity::{HostKernel, Resolved};
 
 use super::super::{join_edges, ppid_of, process_parents, push_denied_sample, DENIED_SAMPLE_CAP};
 
@@ -87,7 +87,7 @@ fn push_denied_sample_caps_at_the_limit() {
 fn parents_contains_this_process_edge() {
     let me = std::process::id();
     let parent_before = std::os::unix::process::parent_id();
-    let parents = process_parents().expect("the process snapshot");
+    let parents = process_parents(&HostKernel).expect("the process snapshot");
     let parent_after = std::os::unix::process::parent_id();
     assert!(
         parents.contains(&(me, parent_before)) || parents.contains(&(me, parent_after)),
@@ -145,7 +145,7 @@ fn ppid_of_reports_gone_for_an_unallocatable_pid() {
 #[skuld::test]
 fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
     super::super::force_blind_snapshot_for_next_call(true);
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("proc_listallpids"), "{detail}");
             assert!(source.is_some());
@@ -161,7 +161,7 @@ fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
 fn a_denied_ppid_read_is_unassessable_naming_the_count_and_a_sample() {
     let me = std::process::id() as libc::c_int;
     let _forced = super::super::fault::force_denied(&[me]);
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("1 of "), "{detail}");
             assert!(detail.contains(&format!("sample: [{me}]")), "{detail}");
@@ -189,7 +189,7 @@ fn snapshot_reports_a_denied_ppid_read_as_a_count_not_an_error() {
 #[skuld::test]
 fn a_failed_edge_allocation_is_unassessable_not_an_empty_snapshot() {
     let _forced = super::super::fault::force_join_alloc_failure();
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("edge buffer"), "{detail}");
             assert!(source.is_some());
@@ -226,7 +226,7 @@ fn a_persistent_refusal_is_a_denial_after_one_read() {
     use crate::identity::{macos_fault, PpidRead};
     let me = std::process::id() as libc::c_int;
     let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Refused]);
-    match process_parents() {
+    match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(detail.contains(&format!("sample: [{me}]")), "{detail}")
         }

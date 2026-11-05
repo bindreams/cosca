@@ -86,19 +86,18 @@ fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
 #[skuld::test]
 fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let (child, id) = live_member();
-    let forced = crate::identity::force_unknown_identity(id.pid());
+    let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
     for result in [
-        id.parent().map(|_| ()),
-        id.children(Recursive::No).map(|_| ()),
-        id.children(Recursive::Yes).map(|_| ()),
+        id.parent_with(&kernel).map(|_| ()),
+        id.children_with(&kernel, Recursive::No).map(|_| ()),
+        id.children_with(&kernel, Recursive::Yes).map(|_| ()),
     ] {
         match result {
             Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(&expected), "{detail}"),
             other => panic!("expected Unassessable, got {other:?}"),
         }
     }
-    drop(forced);
     release(child);
 }
 
@@ -109,10 +108,8 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
 fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
     let (child, id) = live_member();
     let me = std::process::id();
-    let forced = crate::identity::force_unknown_identity(me);
-    let result = id.parent();
-    drop(forced);
-    match result {
+    let (kernel, _guard) = crate::identity::unreadable(me);
+    match id.parent_with(&kernel) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(
                 detail.contains(&format!("ppid {me} exists but could not be queried")),
