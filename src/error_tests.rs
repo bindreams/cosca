@@ -183,6 +183,21 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
+/// A caller walking `source()` from an `Error::Io` built over an `io_context` error reaches the OS
+/// code: the first `io::Error` that has one is below the context wrapper, which has none.
+#[skuld::test]
+fn io_context_error_in_error_io_reaches_the_os_code_through_source() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let e = Error::Io(crate::error::io_context(
+        "could not check C:\t.exe",
+        std::io::Error::from_raw_os_error(code),
+    ));
+    let found = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+        .filter_map(|s| s.downcast_ref::<std::io::Error>())
+        .find_map(std::io::Error::raw_os_error);
+    assert_eq!(found, Some(code));
+}
+
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
 /// An I/O error keeps its kind, and its OS code as the note's `source`.
 #[cfg(unix)]
