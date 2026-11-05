@@ -599,7 +599,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         pid,
         pidfd: std::os::fd::AsFd::as_fd(&child.through.pidfd),
     };
-    let (resolved, cause, mut why) = resolve_identity(pid, &through);
+    let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid, &through);
     let id = match resolved {
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
@@ -946,7 +946,11 @@ impl LateTree {
         if prepared.mode.is_none() || !prepared.is_root {
             return tree;
         }
-        let (resolved, _, mut why) = resolve_identity(pid, &crate::wait::exit_only::Target::pid(pid, Some(unique)));
+        let (resolved, _, mut why) = resolve_identity(
+            &crate::identity::HostKernel,
+            pid,
+            &crate::wait::exit_only::Target::pid(pid, Some(unique)),
+        );
         let unshown = match resolved {
             Resolved::Found(id) => {
                 tree.id = Some(id);
@@ -2072,6 +2076,7 @@ pub(crate) fn spawn_identity_error(
 /// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`. The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
+    kernel: &dyn crate::identity::Kernel,
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
 ) -> (
@@ -2081,7 +2086,7 @@ pub(crate) fn resolve_identity(
 ) {
     use crate::identity::Resolved;
 
-    let (read, cause) = resolve_identity_unchecked(pid);
+    let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());
     };
@@ -2170,6 +2175,7 @@ impl Drop for Diagnosis {
 /// to name our child, and why it was `Unknown` when the read itself knows. Only `resolve_identity`
 /// and tests call it. A test-only fault seam (`fault`) can force the vanished or unreadable branch.
 pub(crate) fn resolve_identity_unchecked(
+    kernel: &dyn crate::identity::Kernel,
     pid: u32,
 ) -> (crate::identity::Resolved<ProcessId>, crate::identity::UnknownCause) {
     #[cfg(test)]
@@ -2186,7 +2192,7 @@ pub(crate) fn resolve_identity_unchecked(
             return (crate::identity::Resolved::Gone, Default::default());
         }
     }
-    ProcessId::of_explained(pid)
+    ProcessId::of_with(kernel, pid)
 }
 
 /// `containment::attach` for the child whose identity `id` the spawn verified, with a test-only
