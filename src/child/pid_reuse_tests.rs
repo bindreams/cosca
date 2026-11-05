@@ -2,7 +2,7 @@
 //! reused, then killed or dropped. The sync `OwnedChild` signals through its held pidfd. They pin
 //! that against a rewrite of its signal path.
 
-use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
+use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, reuser_id, sigusr1_and_wait};
 use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
 use crate::test_groups::namespaces;
 use crate::Command;
@@ -136,18 +136,6 @@ fn spawn_group_blocker() -> (crate::Child, std::io::PipeWriter) {
     (child, writer)
 }
 
-/// What a reader of `child`'s pid finds there: the identity with `child`'s own start token (a reuse
-/// in the same clock tick, which only the handle can tell apart) or with the next one (a later
-/// tick, which the number shows).
-fn reuser_id(child: &crate::Child, same_tick: bool) -> crate::identity::Resolved<crate::identity::ProcessId> {
-    let id = child.id();
-    let raw = id.start_token_raw();
-    crate::identity::Resolved::Found(crate::identity::ProcessId::from_parts_for_test(
-        id.pid(),
-        if same_tick { raw } else { raw + 1 },
-    ))
-}
-
 /// A root reaped behind its handle's back, its pid reused: `kill_tree` sends no `killpg` by the
 /// number and answers `Unassessable`, with one `warn` naming the group. The reap is foreign, so a
 /// correct call reads no number. The root's number is forced, after the reap and the reuse, to read
@@ -164,7 +152,7 @@ fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
     let pid = child.id().pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id(&child, same_tick));
+    let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), same_tick));
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -213,7 +201,7 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
     let pid = child.id().pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id(&child, false));
+    let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -254,11 +242,11 @@ fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = spawn_group_blocker();
     let pid = child.id().pid();
-    let reuser_id = reuser_id(&child, same_tick);
+    let reuser_read = reuser_id(child.id(), same_tick);
     drop(writer);
     child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id);
+    let _read = crate::child::fault::force_root_reads(reuser_read);
 
     let mark = crate::log_capture::mark();
     child
@@ -319,11 +307,11 @@ fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
     let termed = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
     let pid = child.id().pid();
-    let reuser_id = reuser_id(&child, false);
+    let reuser_read = reuser_id(child.id(), false);
     drop(writer);
     let status = child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id);
+    let _read = crate::child::fault::force_root_reads(reuser_read);
 
     let mark = crate::log_capture::mark();
     let shut_down = child
@@ -368,11 +356,11 @@ fn terminate_tree_after_own_wait_and_reuse_body() {
     let termed = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
     let pid = child.id().pid();
-    let reuser_id = reuser_id(&child, false);
+    let reuser_read = reuser_id(child.id(), false);
     drop(writer);
     child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id);
+    let _read = crate::child::fault::force_root_reads(reuser_read);
 
     let mark = crate::log_capture::mark();
     child
@@ -418,7 +406,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
     let pid = child.id().pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id(&child, false));
+    let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));
 
     let mark = crate::log_capture::mark();
     let err = child
