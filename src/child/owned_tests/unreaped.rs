@@ -47,14 +47,23 @@ fn wait_blocks_until_the_child_exits_and_returns_its_status() {
     assert_eq!(crate::log_capture::records_since_on_current_thread(mark, ""), []);
 }
 
-/// A failed `wait` is returned once; the drop of the consumed value does not wait again.
+/// A failed `wait` returns the failure once and logs nothing; the drop of the consumed value does
+/// not wait or log again.
 ///
-/// Mutant: `wait` leaves the child in the value for the drop (the one-entry table panics).
+/// Mutants: `wait` leaves the child in the value for the drop (the one-entry table panics, or the
+/// drop logs); `wait` answers another error.
 #[skuld::test]
 fn a_failed_wait_is_returned_once_and_the_drop_does_not_wait_again() {
+    crate::log_capture::install();
     let fake = fake().reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
-    let result = unreaped(&fake, Some(id())).wait();
-    assert!(result.is_err(), "{result:?}");
+    let child = unreaped(&fake, Some(id()));
+    let mark = crate::log_capture::mark();
+    let result = child.wait();
+    assert!(
+        matches!(result, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::Other),
+        "{result:?}"
+    );
+    assert_eq!(crate::log_capture::records_since_on_current_thread(mark, ""), []);
 }
 
 /// A child someone else reaped is an error, not a hang.
@@ -65,6 +74,28 @@ fn a_wait_on_a_child_reaped_elsewhere_is_an_error_and_does_not_hang() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
     let result = unreaped(&fake, Some(id())).wait();
     assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+}
+
+/// A zombie launchd holds is an error from `wait`, which has nobody else to say so: one `warn` with
+/// the launchd text.
+///
+/// Mutants: `wait` is quiet about it; it warns twice.
+#[skuld::test]
+fn a_wait_on_a_zombie_launchd_holds_is_an_error_and_warns_once() {
+    crate::log_capture::install();
+    let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Orphaned)]);
+    let child = unreaped(&fake, Some(id()));
+    let mark = crate::log_capture::mark();
+    let result = child.wait();
+    assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    assert!(
+        matches!(
+            records.as_slice(),
+            [(log::Level::Warn, text)] if text.contains(&PID.to_string()) && text.contains("launchd")
+        ),
+        "{records:?}"
+    );
 }
 
 /// The drop waits for the child, reaps it, and says so in one `warn` naming it.
@@ -168,10 +199,9 @@ fn pid_comes_from_the_child_and_id_from_the_spawn() {
 }
 
 /// A real child that is still running when its `Unreaped` drops is waited for and reaped: the drop
-/// blocks, the child exits (its stdin closes as the wait is about to block), and its pid is gone.
+/// blocks, the child exits (its stdin closes as the wait is about to block), and it is gone.
 ///
-/// Mutant: the drop leaves the child a zombie, or does not wait for it.
-#[cfg(unix)]
+/// Mutant: the drop leaves the child a zombie (Unix) or open (Windows), or does not wait for it.
 #[skuld::test]
 fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     use super::fixtures::{identity_of, spawn_std_blocker};

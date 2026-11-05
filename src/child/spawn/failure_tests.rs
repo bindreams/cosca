@@ -171,16 +171,32 @@ fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
     }));
 }
 
-/// As above, for a `Running` fate that names another identity (or none).
+/// As above, for a `Running` fate that names no identity.
 ///
 /// Mutant: `From` checks the variant of the fate and not its identity.
 #[skuld::test]
 #[cfg_attr(debug_assertions, should_panic(expected = "is `Running` with its identity"))]
-fn an_unreaped_child_whose_fate_names_another_identity_asserts_in_debug() {
+fn an_unreaped_child_whose_fate_names_no_identity_asserts_in_debug() {
     let id = crate::identity::ProcessId::current();
     drop(Error::from(SpawnFailure::MayHaveStarted {
         cause: io("attach"),
         fate: ChildFate::Running { id: None },
+        wrapper_elevated: false,
+        unreaped: Some(exited_unreaped(id)),
+    }));
+}
+
+/// As above, for a `Running` fate that names another process.
+///
+/// Mutant: `From` checks that the fate carries some identity, not the child's.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "is `Running` with its identity"))]
+fn an_unreaped_child_whose_fate_names_another_process_asserts_in_debug() {
+    let id = crate::identity::ProcessId::current();
+    let other = crate::identity::ProcessId::from_parts(id.pid() + 1, 1);
+    drop(Error::from(SpawnFailure::MayHaveStarted {
+        cause: io("attach"),
+        fate: ChildFate::Running { id: Some(other) },
         wrapper_elevated: false,
         unreaped: Some(exited_unreaped(id)),
     }));
