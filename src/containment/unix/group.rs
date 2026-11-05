@@ -143,8 +143,10 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 }
 
 /// Linux: scan the checked `/proc` (`identity::linux::proc_view_with`) and keep the entries whose
-/// `stat` field 5 is `pgid`, carrying field 22 (`starttime`) as the token. There is no narrower
-/// kernel interface for process-group membership.
+/// `stat` field 5 is `pgid`. Each such pid's identity is then made by `ProcessId::of_stat_with`,
+/// with a `stat` of its own, and kept only if that `stat` still shows `pgid`: a pid that changed
+/// hands since the scan is no member. There is no narrower kernel interface for process-group
+/// membership.
 ///
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. Without
 /// `openat2` (Linux < 5.6, or seccomp) no view can be checked: `ErrorKind::Unsupported`. A `stat`

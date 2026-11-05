@@ -81,7 +81,7 @@ impl Process {
         Process::open(ProcessId::try_current()?).map(|p| p.expect("the current process is not gone from itself"))
     }
 
-    /// The stable identity (`(pid, start_token)`).
+    /// The stable identity (`(pid, key)`).
     pub fn id(&self) -> ProcessId {
         self.id
     }

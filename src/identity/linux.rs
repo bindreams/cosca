@@ -1,6 +1,8 @@
-//! Linux process-identity backend: raw field-22 `starttime` (jiffies) from
-//! `/proc/<pid>/stat` as the start token; `is_running` via process state; `created_at` via
-//! `/proc/stat` `btime` and `_SC_CLK_TCK`.
+//! Linux process-identity backend. A process's [`Key`] is the inode of its pidfd on pidfs (6.9+),
+//! proved by opening the pid again ([`prove`]), else the raw field-22 `starttime` (jiffies) from
+//! `/proc/<pid>/stat`. `is_running` polls the pidfd, or reads the process state before 6.9;
+//! `created_at` reads the `starttime` (bracketed for a pidfs id) and uses `/proc/stat` `btime` and
+//! `_SC_CLK_TCK`.
 
 #[path = "linux/kernel.rs"]
 pub(crate) mod kernel;

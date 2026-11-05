@@ -73,7 +73,7 @@ pub enum ElevationErrorKind {
 ///
 /// No variant says anything about whether the process is running — that is
 /// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive). These are all statements
-/// about whether a start token can be *compared* on this host at all.
+/// about whether a saved token can be *compared* on this host at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecordErrorKind {
@@ -114,7 +114,8 @@ pub enum RecordErrorKind {
     /// Linux: the record carries no kind of token, so it cannot be told which this is.
     #[error("the record carries no kind of token")]
     MissingTokenKind,
-    /// This host's own boot session could not be read, so a record could neither be
+    /// This host's own boot session, or on Linux its kind of token (read from its own pidfd), could
+    /// not be read, so a record could neither be
     /// written nor checked. The only variant that is not about the record's contents; the
     /// failing path and the OS error are in the error's `detail` and `source`.
     #[error("this host's boot session could not be read")]

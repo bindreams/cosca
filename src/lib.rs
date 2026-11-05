@@ -11,26 +11,37 @@
 //!
 //! Each requirement comes from a different syscall:
 //!
-//! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
+//! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns, and to read the
+//!   identity of any process by its pid, [`ProcessId::current`](identity::ProcessId::current) and
+//!   [`to_record`](identity::ProcessId::to_record) / `restore` included. A refusal is
 //!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
-//!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not require a pidfd
+//!   [`Error::Io`](error::Error::Io) naming the syscall (an identity read that meets one is
+//!   unknown, and a member of a process group whose pidfd cannot be opened is not signalled).
+//!   `ProcessId::current` panics on either. `main` does not require a pidfd
 //!   at spawn yet ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - On Linux 6.9 and newer pidfds have an inode of their own, one per process and never reused,
+//!   which is a process's identity: `pidfd_open` by pid, then `fstat`, with no `/proc`. Before 6.9
+//!   the identity is the `starttime` in `/proc/<pid>/stat`. cosca finds out which by asking the
+//!   pidfd's filesystem, and never parses a kernel version.
 //! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
 //!   leaf reaps that way; an owned child's waits and reaps still go by pid
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's identity. A refusal is
-//!   [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`, from a by-pid identity
-//!   read, wait or kill, and from a spawn inside
+//!   checked `/proc` view uses it to read a process's start time and to list processes. Before
+//!   Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
+//!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
-//!   child runs. [`ProcessId::current`](identity::ProcessId::current)
-//!   needs only a readable `/proc/self/stat`.
+//!   child runs. On 6.9+ a by-pid identity read, an open and a spawn need no view; listing a
+//!   process group or the process table, and a start time (`created_at`, the tree walk's order),
+//!   still do. [`ProcessId::current`](identity::ProcessId::current) needs only a readable
+//!   `/proc/self/stat` before 6.9, and on 6.9+ no `/proc` at all.
 //! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
 //!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! 32-bit Linux is unsupported: cosca does not compile there. Before Linux 6.14 a 32-bit kernel gives
-//! only the low 32 bits of a pidfs inode number, so a process's identity would not be unique.
+//! only the low 32 bits of a pidfs inode number, so a process's identity (its pidfd's inode on 6.9+)
+//! would not be unique.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel

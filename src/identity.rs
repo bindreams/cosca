@@ -2,17 +2,20 @@
 //!
 //! A bare PID is unsafe: the OS recycles PIDs, so the same number can name a
 //! different process minutes later. [`ProcessId`] pairs the PID with a raw
-//! kernel *start token* — a per-process value fixed at creation — so equality
+//! kernel *key* — a per-process value fixed at creation — so equality
 //! distinguishes "the same process" from "a reused PID".
 //!
-//! The token is the RAW kernel value (Windows creation `FILETIME`, Linux
-//! `/proc` `starttime` jiffies, macOS `sysctl KERN_PROC` (`kinfo_proc`) start
-//! µs), compared exactly. It is deliberately NOT a wall-clock time: deriving
+//! The key is the RAW kernel value (Windows creation `FILETIME`, macOS `sysctl KERN_PROC`
+//! (`kinfo_proc`) start µs, Linux the inode of the process's pidfd on pidfs, 6.9+, else the `/proc`
+//! `starttime` jiffies), compared exactly. A Linux id holds one of the two kinds, and ids of
+//! different kinds never compare equal. It is deliberately NOT a wall-clock time: deriving
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
-//! allowed to drift and never used for identity.
+//! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
+//! guard) is not the key but an [`OrderKey`], the start time, which on Linux a `pidfs` id reads from
+//! `/proc`.
 //!
-//! The token is not portable across a reboot on every platform — see [`ProcessIdRecord`]
+//! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
 //! for the persist/restore round trip and what it refuses.
 
 pub(crate) mod probe;
@@ -243,17 +246,19 @@ impl ProcessId {
     }
 
     /// This process's own identity. Windows reads the current-process pseudo-handle, which
-    /// performs no access check at all; macOS reads the caller's own entry by pid, and Linux
-    /// `/proc/self/stat` (no `openat2`, no `/proc` view needed), which no `hidepid` mount or
-    /// sandbox policy hides from the task itself. Either way it is resolvable even for a
-    /// process whose own DACL would deny a foreign by-pid open.
+    /// performs no access check at all; macOS reads the caller's own entry by pid, and Linux the
+    /// inode of the process's own pidfd (6.9+), or `/proc/self/stat` before it (no `openat2`, no
+    /// `/proc` view needed), which no `hidepid` mount or sandbox policy hides from the task itself.
+    /// Either way it is resolvable even for a process whose own DACL would deny a foreign by-pid
+    /// open.
     ///
     /// # Panics
-    /// If the process cannot read its own start token: on Linux, if `/proc/self/stat` cannot
-    /// be read or has no parseable `starttime` (both hard requirements of that
-    /// backend); on Windows and macOS, if a self-directed `GetProcessTimes` / `proc_pidinfo`
-    /// fails, which has no documented cause. Infallible by design — every caller, including
-    /// `Process::current()`, relies on it.
+    /// If the process cannot read its own key: on Linux, if `pidfd_open` of itself fails (a
+    /// refusal included) or, before 6.9, if `/proc/self/stat` cannot be read or has no parseable
+    /// `starttime` (hard requirements of that backend); on Windows and macOS, if a self-directed
+    /// `GetProcessTimes` / `proc_pidinfo` fails, which has no documented cause. Infallible by
+    /// design — every caller, including `Process::current()`, relies on it (which returns the
+    /// failure as an error on Linux instead).
     pub fn current() -> ProcessId {
         #[cfg(target_os = "linux")]
         {
@@ -327,8 +332,10 @@ impl ProcessId {
     }
 
     /// Whether the process is currently *running* (has not exited). Answers out of the OS's own
-    /// exit bookkeeping — on Windows the handle's signaled state, on Unix process state /
-    /// `/proc` presence. A reused PID (different start token) is never alive.
+    /// exit bookkeeping — on Windows the handle's signaled state, on macOS process state, on Linux
+    /// the process's pidfd (6.9+: a live process whose leader thread exited is alive, though
+    /// `/proc` shows `Z`) or, before 6.9, its `/proc` state. A reused PID (different key) is never
+    /// alive.
     /// [`Liveness::Unknown`] when the OS refuses the query, or answers ambiguously — never
     /// `Dead` on a process we could not assess.
     ///
@@ -357,7 +364,8 @@ impl ProcessId {
     }
 
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
-    /// NEVER used for identity. `None` if the process is gone or unavailable.
+    /// NEVER used for identity. `None` if the process is gone or unavailable. On Linux 6.9+ the
+    /// time is read from `/proc` when asked, so a reaped process has none.
     pub fn created_at(&self) -> Option<std::time::SystemTime> {
         self.created_at_with(&HostKernel)
     }

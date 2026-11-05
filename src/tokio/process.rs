@@ -41,7 +41,7 @@ impl Process {
         crate::process::Process::current().map(Process::from)
     }
 
-    /// The stable identity (`(pid, start_token)`).
+    /// The stable identity (`(pid, key)`).
     pub fn id(&self) -> ProcessId {
         self.inner.id()
     }
