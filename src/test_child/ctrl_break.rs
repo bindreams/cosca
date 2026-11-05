@@ -79,8 +79,9 @@ pub(crate) fn member_env(addr: &str, handler: Handler, grandchild: Option<Handle
 
 /// Connects, installs its [`Handler`], writes its tag, and blocks on a read of its socket until the
 /// caller closes it (then exits 0) or something ends it. A root with [`GRANDCHILD_ENV`] set starts
-/// that grandchild after its tag, with no creation flags, so it stays in the root's console process
-/// group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
+/// that grandchild after its tag, with no creation flags (`Console::Asked`: not the test helpers'
+/// default `CREATE_NO_WINDOW`, which would give it a console of its own), so it stays in the root's
+/// console process group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
 /// the same address with tag `G`. The root holds the grandchild's process handle while it lives, so
 /// the pid stays the grandchild's.
 ///
@@ -103,7 +104,7 @@ fn fixture_ctrl_break_member() {
     }
     sock.write_all(tag.as_bytes()).expect("write the tag");
     let _grandchild = std::env::var(GRANDCHILD_ENV).ok().map(|handler| {
-        let grandchild = crate::test_spawn::spawn(
+        let grandchild = crate::test_spawn::spawn_with(
             crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
                 // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
                 .args(&member_argv()[1..])
@@ -111,6 +112,8 @@ fn fixture_ctrl_break_member() {
                 .env(HANDLER_ENV, handler)
                 .env_remove(GRANDCHILD_ENV)
                 .stdout(std::process::Stdio::null()),
+            0,
+            crate::test_spawn::console_flags::Console::Asked,
         )
         .expect("spawn the grandchild");
         sock.write_all(&grandchild.id().to_le_bytes())
