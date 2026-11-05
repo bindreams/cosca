@@ -162,7 +162,9 @@ enum Owner {
 /// Mutants: another parent's number is hidden by a refused read or by the proof; an unreadable
 /// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
 /// then blames the candidate); an unreadable number reads as a match or as another parent's; a failed
-/// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`.
+/// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`; a read before the
+/// order bound, or one with no order key under a bound, waits for the proof, or is `Unknown` when the
+/// proof fails (the proof is asked for, here a panic).
 #[skuld::test]
 fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
@@ -174,11 +176,11 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
 
     let stated = || UnknownCause::default().of_parent(STATED);
     let order = OrderKey::for_test(9);
-    let found = Resolved::Found((Key::for_test(5), order));
+    let found = Resolved::Found((Key::for_test(5), Some(order)));
 
     let nobody_gone = (Resolved::Gone, Owner::Nobody);
     let own_gone = (Resolved::Gone, Owner::Candidate);
-    let own_found = (Resolved::Found((id(CANDIDATE, 5), order)), Owner::Candidate);
+    let own_found = (Resolved::Found((id(CANDIDATE, 5), Some(order))), Owner::Candidate);
     let own_unknown = (Resolved::Unknown, Owner::Candidate);
     let parent_unknown = (Resolved::Unknown, Owner::Parent);
     type Proof = fn() -> Result<(), Ordered>;
@@ -266,12 +268,66 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
                 parent: claimed,
                 cause: stated(),
             }
-            .judged(CANDIDATE, PARENT)
+            .judged(CANDIDATE, PARENT, None)
             .proved(proof);
             assert_eq!(
                 (answer, owner_of(cause)),
                 expected,
                 "a {read_name} read, its parent number {number_name}, the parent {proof_name}"
+            );
+        }
+    }
+
+    // The bound rows: a bound is handed out only where `ORDER_AFTER_PARENT` (Windows), and `judged`
+    // asserts it.
+    #[cfg(windows)]
+    {
+        // A found read whose order key does not follow the bound is gone, whatever its parent number and
+        // before any proof: a proof that would fail is never asked for. A key that follows it, or none
+        // bound, leaves the table's answer. An equal key does not follow it.
+        for (key_name, bound, follows) in [("before", 10, false), ("equal to", 9, false), ("after", 8, true)] {
+            for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
+                let judged = |bound| {
+                    OrderedRead {
+                        read: found,
+                        parent: claimed,
+                        cause: stated(),
+                    }
+                    .judged(CANDIDATE, PARENT, bound)
+                };
+                let held: Proof = || Ok(());
+                let (answer, cause) = if follows {
+                    judged(Some(OrderKey::for_test(bound))).proved(held)
+                } else {
+                    judged(Some(OrderKey::for_test(bound))).proved(|| panic!("the parent's proof is asked for"))
+                };
+                let (unbound, unbound_cause) = judged(None).proved(held);
+                let expected = if follows {
+                    (unbound, owner_of(unbound_cause))
+                } else {
+                    nobody_gone
+                };
+                assert_eq!(
+                    (answer, owner_of(cause)),
+                    expected,
+                    "a read whose key is {key_name} the bound, its parent number {claimed:?}"
+                );
+            }
+        }
+
+        // Where a bound applies, a found read with no order key is not kept, as `ProcessId::parent` has it.
+        for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
+            let (answer, cause) = OrderedRead {
+                read: Resolved::Found((Key::for_test(5), None)),
+                parent: claimed,
+                cause: stated(),
+            }
+            .judged(CANDIDATE, PARENT, Some(OrderKey::for_test(8)))
+            .proved(|| panic!("the parent's proof is asked for"));
+            assert_eq!(
+                (answer, owner_of(cause)),
+                nobody_gone,
+                "a read with no order key under a bound, its parent number {claimed:?}"
             );
         }
     }
@@ -295,16 +351,105 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     }
 }
 
+/// The keep-predicate is strict: a key after the bound is kept, one before it (a stale-creator
+/// impostor) or equal to it is not. `judged` applies it to the candidate's key, and `ProcessId::parent`
+/// to the key of `self` against its parent's, where [`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT).
+///
+/// Mutants: `>=` for `>` (the equal row); `<` for `>`.
+#[skuld::test]
+fn the_keep_predicate_keeps_only_a_key_after_the_bound() {
+    use super::{keeps_order, OrderKey};
+    let bound = OrderKey::for_test(1_000);
+    for (name, key, kept) in [
+        ("after", 1_005, true),
+        ("equal to", 1_000, false),
+        ("before", 999, false),
+    ] {
+        assert_eq!(keeps_order(OrderKey::for_test(key), bound), kept, "{name}");
+    }
+}
+
+/// The keep rule over optional keys, on every host: with no bound a read is kept, with or without
+/// an order key; under a bound a read with no order key is not, and one with a key is kept only
+/// after it.
+///
+/// Mutants: a read with no order key under a bound is kept; a missing bound drops a read.
+#[skuld::test]
+fn the_keep_rule_over_optional_keys_drops_a_keyless_read_only_under_a_bound() {
+    use super::{keeps, OrderKey};
+    let key = |k| Some(OrderKey::for_test(k));
+    for (name, order, bound, kept) in [
+        ("no bound, a key", key(5), None, true),
+        ("no bound, no key", None, None, true),
+        ("a bound, no key", None, key(1), false),
+        ("a bound, a key after it", key(5), key(1), true),
+        ("a bound, a key equal to it", key(1), key(1), false),
+        ("a bound, a key before it", key(1), key(5), false),
+    ] {
+        assert_eq!(keeps(order, bound), kept, "{name}");
+    }
+}
+
+/// The walk's filter over a reused-creator table: `x` is the root's child, and `y` was created by an
+/// earlier holder of `x`'s pid (its read shows `x`'s pid as its parent number) and orders before `x`.
+/// Where the order after the parent is the proof ([`ORDER_AFTER_PARENT`](super::ORDER_AFTER_PARENT),
+/// Windows) `y` is dropped; elsewhere its parent number is the proof and it is kept. The resolver
+/// states each pid's read, with an order key only where the backends read one, and applies `judged`,
+/// the read's own rule, so only the bounds the filter hands out are on test. A real stale creator
+/// needs a Windows process table: that is `treewalk_tests`' live Windows rows.
+///
+/// The root's bound is stated here, so what the anchor hands out off Windows is not on test; the
+/// row pins how the filter passes bounds down.
+///
+/// Mutants: the walk hands out no bound on Windows, or the root's rather than the accepted parent's
+/// (`y` is kept).
+#[skuld::test]
+fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
+    use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};
+    use crate::containment::treewalk::descendants_with;
+
+    const ROOT: RawPid = 100;
+    const X: RawPid = 200;
+    const Y: RawPid = 300;
+    // Each pid's order key and the parent number its read shows.
+    let table = [(X, 200, ROOT), (Y, 150, X)];
+    let order_of = |order| ORDER_AFTER_PARENT.then(|| OrderKey::for_test(order));
+    let resolve = |pid: RawPid, parent: ProcessId, bound| {
+        let &(_, order, shown) = table.iter().find(|(p, ..)| *p == pid).expect("a stated pid");
+        let read = OrderedRead {
+            read: Resolved::Found((Key::for_test(order), order_of(order))),
+            parent: ParentRead::Is(shown),
+            cause: UnknownCause::default(),
+        };
+        resolution_of("pid", pid, read.judged(pid, parent.pid(), bound).proved(|| Ok(())))
+    };
+
+    let root_bound = order_of(100);
+    let walk = descendants_with(id(ROOT, 100), root_bound, &[(X, ROOT), (Y, X)], resolve);
+
+    let members: Vec<RawPid> = walk.members.iter().map(ProcessId::pid).collect();
+    let expected: &[RawPid] = if cfg!(windows) { &[X] } else { &[X, Y] };
+    assert_eq!(members, expected);
+    assert!(walk.unassessed.is_empty());
+}
+
 /// A read that found no record says its parent number could not be read only if it asked for it.
 ///
-/// Mutant: `missing` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
+/// Mutant: `not_read` reads `Unreadable` for a read that did not ask, or `NotAsked` for one that did
 /// (a `NotAsked` that is judged against a named parent breaks the debug assertion there).
 #[skuld::test]
 fn a_missing_record_reads_the_parent_number_as_asked() {
-    use super::{OrderedRead, ParentRead, UnknownCause};
+    use super::ParentRead;
 
-    let asked = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), true);
-    assert_eq!(asked.parent, ParentRead::Unreadable);
-    let alone = OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), false);
-    assert_eq!(alone.parent, ParentRead::NotAsked);
+    assert_eq!(ParentRead::not_read(true), ParentRead::Unreadable);
+    assert_eq!(ParentRead::not_read(false), ParentRead::NotAsked);
+    #[cfg(not(windows))]
+    for asked in [true, false] {
+        let read = super::OrderedRead::missing(Resolved::Unknown, super::UnknownCause::default(), asked);
+        assert_eq!(
+            read.parent,
+            ParentRead::not_read(asked),
+            "missing passes `asked` through"
+        );
+    }
 }
