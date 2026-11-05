@@ -1,5 +1,6 @@
 use super::{Classify, SpawnFailure};
 use crate::error::{ChildFate, Error};
+use crate::test_child::over_fake::exited_unreaped;
 
 // Compile-fail shape, see the `failure` module doc.
 static_assertions::assert_not_impl_any!(SpawnFailure: From<Error>, From<std::io::Error>);
@@ -127,19 +128,6 @@ fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
     }
 }
 
-/// A child over a fake that has exited, so dropping it waits for nothing.
-fn unreaped_child(id: crate::identity::ProcessId) -> Box<crate::child::Unreaped> {
-    use crate::os_process::child::ExitRecord;
-    use crate::os_process::fake::{FakeProcess, ReapAnswer};
-
-    let exit = ExitRecord::Status(std::process::ExitStatus::default());
-    let fake = FakeProcess::new([])
-        .with_pid(id.pid())
-        .reaps([ReapAnswer::Reaped(exit)]);
-    let child = crate::child::owned::OwnedChild::new(Box::new(fake));
-    Box::new(crate::child::Unreaped::new(child, Some(id)))
-}
-
 /// A failure that carries a child keeps it through `map`, `behind_wrapper` and the conversion to
 /// an `Error`; a failure built by `started` carries none.
 ///
@@ -151,7 +139,7 @@ fn a_failure_carries_its_unreaped_child_through_map_behind_wrapper_and_from() {
         cause: io("attach"),
         fate: ChildFate::Running { id: Some(id) },
         wrapper_elevated: false,
-        unreaped: Some(unreaped_child(id)),
+        unreaped: Some(exited_unreaped(id)),
     };
     let error = Error::from(failure.map(|_| io("mapped")).behind_wrapper());
     let Error::MayHaveStarted {
@@ -179,7 +167,7 @@ fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
         cause: io("attach"),
         fate: ChildFate::Reaped,
         wrapper_elevated: false,
-        unreaped: Some(unreaped_child(id)),
+        unreaped: Some(exited_unreaped(id)),
     }));
 }
 
@@ -194,7 +182,7 @@ fn an_unreaped_child_whose_fate_names_another_identity_asserts_in_debug() {
         cause: io("attach"),
         fate: ChildFate::Running { id: None },
         wrapper_elevated: false,
-        unreaped: Some(unreaped_child(id)),
+        unreaped: Some(exited_unreaped(id)),
     }));
 }
 

@@ -3,19 +3,14 @@
 
 use super::teardown::{exit, fake, fire_on_block, id, PID};
 use crate::child::owned::unreaped::Unreaped;
-use crate::child::owned::OwnedChild;
 use crate::error::Error;
-use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::PIDLESS_CHILD;
+use crate::test_child::over_fake::unreaped_over as unreaped;
 
 // `Error` carries an `Unreaped`, and users move errors across threads.
 static_assertions::assert_impl_all!(Unreaped: Send, Sync);
-
-fn unreaped(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
-    Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id)
-}
 
 /// What dropping an `Unreaped` over a child that runs and then answers `reap` logged on this
 /// thread, and the timeouts of the blocks it made.
@@ -180,6 +175,7 @@ fn pid_comes_from_the_child_and_id_from_the_spawn() {
 #[skuld::test]
 fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     use super::fixtures::{identity_of, spawn_std_blocker};
+    use crate::child::owned::OwnedChild;
     use crate::identity::Existence;
 
     let (child, stdin) = spawn_std_blocker();

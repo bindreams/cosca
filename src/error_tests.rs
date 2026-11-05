@@ -1,4 +1,5 @@
 use crate::error::{ChildFate, Error, QuoteError, QuoteErrorKind};
+use crate::test_child::over_fake::exited_unreaped;
 
 #[skuld::test]
 fn containment_error_displays_detail() {
@@ -286,19 +287,6 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
     }
 }
 
-/// A child over a fake that has exited, so dropping it waits for nothing.
-fn unreaped_child(id: crate::identity::ProcessId) -> Box<crate::child::owned::unreaped::Unreaped> {
-    use crate::os_process::child::ExitRecord;
-    use crate::os_process::fake::{FakeProcess, ReapAnswer};
-
-    let exit = ExitRecord::Status(std::process::ExitStatus::default());
-    let fake = FakeProcess::new([])
-        .with_pid(id.pid())
-        .reaps([ReapAnswer::Reaped(exit)]);
-    let child = crate::child::owned::OwnedChild::new(Box::new(fake));
-    Box::new(crate::child::owned::unreaped::Unreaped::new(child, Some(id)))
-}
-
 /// An error that carries the child reads, prints and matches as the same error without it.
 ///
 /// Mutant: `fate` or `Display` looks at `unreaped`.
@@ -312,7 +300,7 @@ fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
         source: Box::new(Error::Io(std::io::Error::other("cause"))),
         unreaped,
     };
-    let with_child = error(Some(unreaped_child(id)));
+    let with_child = error(Some(exited_unreaped(id)));
     assert_eq!(with_child.fate(), Some(fate));
     assert_eq!(with_child.to_string(), error(None).to_string());
 }
@@ -327,7 +315,7 @@ fn with_note_keeps_the_unreaped_child() {
         fate: ChildFate::Running { id: Some(id) },
         wrapper_elevated: false,
         source: Box::new(Error::Containment { detail: "x".into() }),
-        unreaped: Some(unreaped_child(id)),
+        unreaped: Some(exited_unreaped(id)),
     }
     .with_note("front left");
     let Error::MayHaveStarted { source, unreaped, .. } = &error else {
