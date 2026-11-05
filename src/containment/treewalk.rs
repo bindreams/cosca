@@ -46,7 +46,7 @@
 //!   indistinguishable from impossible, so strict `>` loses nothing there.
 
 use crate::error::Error;
-use crate::identity::{Existence, ProcessId, RawPid, Resolved, UnknownCause};
+use crate::identity::{Existence, Kernel, ProcessId, RawPid, Resolved, UnknownCause};
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
@@ -65,8 +65,8 @@ pub(crate) enum KillOutcome {
 /// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
 /// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
-pub(crate) fn resolve_or_drop(pid: RawPid) -> Option<ProcessId> {
-    match ProcessId::of(pid) {
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<ProcessId> {
+    match ProcessId::of_with(kernel, pid).0 {
         Resolved::Found(id) => Some(id),
         Resolved::Gone => None,
         Resolved::Unknown => {
@@ -107,7 +107,7 @@ pub(crate) fn keeps_token(token: u64, anchor: u64, allow_equal: bool) -> bool {
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
 /// identity via `resolve` and keeps it ONLY if its start token orders correctly
 /// against the root's per `allow_equal` (see module docs). `resolve` is injected
-/// so the filter is pure: live code passes `ProcessId::of`, tests pass a stub.
+/// so the filter is pure: live code passes `ProcessId::of_with`, tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
@@ -173,10 +173,10 @@ pub(crate) fn descendants_with(
     result
 }
 
-/// Live descendants of `root`: the pure filter wired to the host's
-/// `ProcessId::of` resolver and per-OS `ALLOW_EQUAL_TOKEN` rule.
-pub(crate) fn descendants(root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    descendants_with(root, parents, ALLOW_EQUAL_TOKEN, resolve_or_drop)
+/// Live descendants of `root`: the pure filter wired to `kernel`'s `ProcessId::of_with` resolver
+/// and the per-OS `ALLOW_EQUAL_TOKEN` rule.
+pub(crate) fn descendants(kernel: &dyn Kernel, root: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
+    descendants_with(root, parents, ALLOW_EQUAL_TOKEN, |pid| resolve_or_drop(kernel, pid))
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
@@ -210,21 +210,21 @@ pub(crate) fn children_of_with(
     out
 }
 
-/// Live one-level children of `parent`: the pure filter wired to `ProcessId::of` and the
-/// per-OS `ALLOW_EQUAL_TOKEN` rule.
-pub(crate) fn children_of(parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
-    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, resolve_or_drop)
+/// Live one-level children of `parent`: the pure filter wired to `kernel`'s `ProcessId::of_with`
+/// and the per-OS `ALLOW_EQUAL_TOKEN` rule.
+pub(crate) fn children_of(kernel: &dyn Kernel, parent: ProcessId, parents: &[(RawPid, RawPid)]) -> Vec<ProcessId> {
+    children_of_with(parent, parents, ALLOW_EQUAL_TOKEN, |pid| resolve_or_drop(kernel, pid))
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a
 /// recycled pid. Already-gone (`None`, or `ESRCH`) is success. Best-effort.
 #[cfg(unix)]
-pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     // Re-verify identity at the instant of the kill. Three outcomes, not two: a denied
     // re-verify is NOT a confirmed change, and must not be logged as one.
-    match ProcessId::of(id.pid()) {
+    match ProcessId::of_with(kernel, id.pid()).0 {
         Resolved::Found(live) if live == id => {}
         Resolved::Found(_) | Resolved::Gone => {
             log::debug!(
@@ -325,8 +325,8 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// have that process's children mistaken for its own descendants. `Ok(false)`: gone or recycled,
 /// so there is nothing to walk. [`Error::Unassessable`] (or `Unsupported`) when it cannot be
 /// told, naming the read's cause.
-pub(crate) fn anchor_present(root: ProcessId) -> Result<bool, Error> {
-    match root.exists_explained() {
+pub(crate) fn anchor_present(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
+    match root.exists_with(kernel) {
         (Existence::Present, _) => Ok(true),
         (Existence::Gone, _) => Ok(false),
         (Existence::Unknown, cause) => Err(unqueryable(&format!("pid {}", root.pid()), cause)),
@@ -355,14 +355,14 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 ///
 /// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
 /// kill, so members may be left running.
-pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
+pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
     #[cfg(not(test))]
     let skip_root = false;
-    let parents = crate::containment::enumerate::process_parents()?;
-    if !anchor_present(root)? {
+    let parents = crate::containment::enumerate::process_parents(kernel)?;
+    if !anchor_present(kernel, root)? {
         return Ok(true);
     }
     #[cfg(test)]
@@ -372,14 +372,14 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
     if fault::take_force_incomplete() {
         complete = false;
     }
-    let descendants = descendants(root, &parents);
+    let descendants = descendants(kernel, root, &parents);
     #[cfg(unix)]
     {
         if !skip_root {
-            complete &= kill_by_identity(root, Signal::SIGKILL) != KillOutcome::NotAttempted;
+            complete &= kill_by_identity(kernel, root, Signal::SIGKILL) != KillOutcome::NotAttempted;
         }
         for id in descendants {
-            complete &= kill_by_identity(id, Signal::SIGKILL) != KillOutcome::NotAttempted;
+            complete &= kill_by_identity(kernel, id, Signal::SIGKILL) != KillOutcome::NotAttempted;
         }
     }
     #[cfg(windows)]
@@ -392,7 +392,7 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (root, descendants, skip_root);
+    let _ = (kernel, root, descendants, skip_root);
     Ok(complete)
 }
 
@@ -519,29 +519,30 @@ pub(crate) mod fault {
 /// # Errors
 ///
 /// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
-pub(crate) fn terminate(root: ProcessId) -> Result<(), Error> {
+pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Error> {
     #[cfg(unix)]
     {
-        let parents = crate::containment::enumerate::process_parents()?;
-        if !anchor_present(root)? {
+        let parents = crate::containment::enumerate::process_parents(kernel)?;
+        if !anchor_present(kernel, root)? {
             return Ok(());
         }
         #[cfg(test)]
         fault::note_walk(root.pid());
-        let descendants = descendants(root, &parents);
-        let _ = kill_by_identity(root, Signal::SIGTERM);
+        let descendants = descendants(kernel, root, &parents);
+        let _ = kill_by_identity(kernel, root, Signal::SIGTERM);
         for id in descendants {
-            let _ = kill_by_identity(id, Signal::SIGTERM);
+            let _ = kill_by_identity(kernel, id, Signal::SIGTERM);
         }
         Ok(())
     }
     #[cfg(windows)]
     {
+        let _ = kernel;
         crate::containment::windows::terminate(root.pid())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = root;
+        let _ = (kernel, root);
         Ok(())
     }
 }

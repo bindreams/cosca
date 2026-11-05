@@ -81,14 +81,35 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
 }
 
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
+#[cfg_attr(
+    not(any(unix, feature = "tokio")),
+    allow(dead_code, reason = "Windows opens by `open_with`, except in the async drive")
+)]
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
+    open_with(&crate::identity::HostKernel, id)
+}
+
+/// [`open`] through `kernel`: the one entry to the open, on every platform. Only Linux's
+/// [`Kernel`](crate::identity::Kernel) has methods yet; elsewhere `kernel` is not consulted.
+pub(crate) fn open_with(
+    kernel: &dyn crate::identity::Kernel,
+    id: ProcessId,
+) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(linux::open::open_verified_with(&crate::identity::HostKernel, id)?
-        .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>));
+    {
+        Ok(linux::open::open_verified_with(kernel, id)?
+            .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>))
+    }
     #[cfg(windows)]
-    return Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
+    {
+        let _ = kernel;
+        Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>))
+    }
     #[cfg(target_os = "macos")]
-    return Ok(macos::MacProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
+    {
+        let _ = kernel;
+        Ok(macos::MacProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>))
+    }
 }
 
 /// Hard-kill the held process. Already gone: `Ok`.

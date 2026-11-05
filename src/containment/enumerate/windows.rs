@@ -11,11 +11,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 
 use crate::error::Error;
-use crate::identity::RawPid;
+use crate::identity::{Kernel, RawPid};
 
 /// A failed or interrupted snapshot is [`Error::Unassessable`] naming the Win32 call and its
 /// code: a partial list would read as "no descendants" to the tree walk.
-pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
+pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
 
     // Process32FirstW/NextW signal end-of-enumeration with ERROR_NO_MORE_FILES.

@@ -72,10 +72,6 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
 /// only when `kill(pid, 0)` says so ([`resolve_unreadable`]); a whole-table scan has the other
 /// policy (`pid_stat::read_in_scan`).
 fn stat_by_pid(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
-    #[cfg(test)]
-    if let Some(errno) = proc_view::fault::forced_identity_stat_errno(pid) {
-        return resolve_unreadable(kernel, pid, std::io::Error::from_raw_os_error(errno));
-    }
     match pid_stat::read_stat_file(kernel, proc_dir, pid) {
         Ok(bytes) => Resolved::Found(bytes),
         Err(e) => resolve_unreadable(kernel, pid, e),
