@@ -935,7 +935,7 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 /// `Unpinned` or `Unknown`; a tokio backend forgotten as reaped elsewhere counted as its own reap;
 /// the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
-/// without `anchor_present`.
+/// without `anchor`.
 #[skuld::test]
 fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
     #[cfg(target_os = "linux")]

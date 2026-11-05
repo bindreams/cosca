@@ -603,7 +603,7 @@ fn the_order_key_of_a_stale_id_is_gone() {
     assert_eq!(stale.order_key_with(&crate::identity::HostKernel).0, Resolved::Gone);
 }
 
-/// The walk keeps a real child and grandchild of a real spawned root, ordered by sequence number.
+/// Mutant: the walk drops a genuine descendant under the sequence-number order.
 #[skuld::test]
 fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
     let Some(done) = crate::test_own_process::own_process(
@@ -633,28 +633,90 @@ fn the_walk_keeps_a_real_child_and_grandchild_of_a_real_spawned_root() {
     }
 }
 
-/// A failed sequence-number query reaches the caller as that query's failure, with its status.
+// the two reads of one handle =====
+
+const REFUSED: windows::Win32::Foundation::NTSTATUS = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
+
+fn refused_key() -> windows::core::Result<Key> {
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+    )))
+}
+
+/// The error text of a read's cause, for the subject `pid 7`.
+fn cause_text(cause: crate::identity::UnknownCause) -> Option<String> {
+    cause.into_error("pid 7").map(|e| e.to_string())
+}
+
+/// Both reads answered: the id's key and the order key, from one handle.
 ///
-/// Mutant: the error of a failed class-92 query reads as the generic "access denied?" one.
+/// Mutant: the order key is the key.
 #[skuld::test]
-fn a_failed_sequence_number_query_names_its_status() {
-    let cause =
-        crate::identity::UnknownCause::of_sequence_status(windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32));
-    let err = crate::containment::treewalk::unqueryable("pid 7", cause);
+fn two_good_reads_are_the_key_and_the_sequence_number() {
+    let key = Key::for_test(5);
+    for expected in [None, Some(key)] {
+        let (read, cause) = super::combine(7, expected, Ok(key), Ok(9));
+        assert_eq!(read, Resolved::Found((key, crate::identity::OrderKey::for_test(9))));
+        assert_eq!(cause_text(cause), None);
+    }
+}
+
+/// A refused sequence-number query on the process asked about is `Unknown`, with its status.
+///
+/// Mutant: the refusal reads as the generic "access denied?" one.
+#[skuld::test]
+fn a_refused_sequence_number_on_the_expected_process_is_unknown_with_its_status() {
+    let key = Key::for_test(5);
+    for expected in [None, Some(key)] {
+        let (read, cause) = super::combine(7, expected, Ok(key), Err(REFUSED));
+        assert_eq!(read, Resolved::Unknown);
+        let text = cause_text(cause).expect("the refusal is the cause");
+        assert!(
+            text.contains("pid 7") && text.contains("process sequence number query failed: NTSTATUS 0xc0000004"),
+            "{text}"
+        );
+    }
+}
+
+/// Another process's key is `Gone` whatever the sequence-number query said: a recycled pid whose
+/// new holder refuses the query is not an unreadable root.
+///
+/// Mutant: the sequence-number result is looked at before the key.
+#[skuld::test]
+fn another_processs_key_is_gone_whether_or_not_its_sequence_number_reads() {
+    let (read, cause) = super::combine(7, Some(Key::for_test(5)), Ok(Key::for_test(6)), Err(REFUSED));
+    assert_eq!(read, Resolved::Gone);
+    assert_eq!(cause_text(cause), None);
+    let (read, _) = super::combine(7, Some(Key::for_test(5)), Ok(Key::for_test(6)), Ok(9));
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// A key that cannot be read leaves nothing to compare: `Unknown`. When the sequence-number query
+/// was refused too, the cause keeps its status and the log keeps the key's failure.
+///
+/// Mutant: the second failure is dropped.
+#[skuld::test]
+fn two_failed_reads_keep_both_failures() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (read, cause) = super::combine(70_007, Some(Key::for_test(5)), refused_key(), Err(REFUSED));
+    assert_eq!(read, Resolved::Unknown);
     assert!(
-        matches!(err, crate::error::Error::Unassessable { .. }),
-        "an unqueryable process is Unassessable: {err:?}"
+        cause_text(cause).is_some_and(|t| t.contains("NTSTATUS 0xc0000004")),
+        "the sequence-number refusal is the cause"
     );
-    let text = err.to_string();
     assert!(
-        text.contains("pid 7") && text.contains("process sequence number query failed: NTSTATUS 0xc0000004"),
-        "{text}"
+        crate::log_capture::contains_since(mark, "GetProcessTimes failed on an opened handle for pid 70007"),
+        "the key's failure is logged"
     );
+
+    let (read, cause) = super::combine(70_008, None, refused_key(), Ok(9));
+    assert_eq!(read, Resolved::Unknown);
+    assert_eq!(cause_text(cause), None, "a key refusal alone has no status to name");
 }
 
 /// Class 92 answers for every process this caller can open: the CI pin of the private read on the
-/// runner's real process population. Read-only: it opens each process in the snapshot with
-/// `PROCESS_QUERY_LIMITED_INFORMATION` and queries it, and signals, suspends and modifies nothing.
+/// runner's real process population. Read-only.
 /// An elevated caller opens more, so an elevated runner covers processes an unelevated one cannot.
 ///
 /// Mutant: the class is refused for a kind of process (a protected or system one).

@@ -118,19 +118,19 @@ impl ProcessId {
 
     /// [`children`](Self::children), reading through `kernel`.
     pub(crate) fn children_with(&self, kernel: &dyn Kernel, recursive: Recursive) -> Result<Vec<ProcessId>, Error> {
-        // Snapshot first, then the anchor (see `parent`).
+        // Snapshot first, then the anchor (see `parent`), whose one read is also the key.
         let parents = crate::containment::enumerate::process_parents(kernel)?;
-        if !crate::containment::treewalk::anchor_present(kernel, *self)? {
+        let Some(key) = crate::containment::treewalk::anchor(kernel, *self)? else {
             return Ok(Vec::new());
-        }
+        };
         if !parents.iter().any(|&(pid, _)| pid == self.pid()) {
             self.absent_from_snapshot(kernel)?;
             return Ok(Vec::new());
         }
-        match recursive {
-            Recursive::No => crate::containment::treewalk::children_of(kernel, *self, &parents),
-            Recursive::Yes => crate::containment::treewalk::descendants(kernel, *self, &parents),
-        }
+        Ok(match recursive {
+            Recursive::No => crate::containment::treewalk::children_of_from_key(kernel, *self, key, &parents),
+            Recursive::Yes => crate::containment::treewalk::descendants_from_key(kernel, *self, key, &parents),
+        })
     }
 }
 

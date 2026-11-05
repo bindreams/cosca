@@ -13,8 +13,7 @@
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
 //! guard) is not the key but an `OrderKey`: the start time (on Linux a `pidfs` id reads it from
-//! `/proc`), or on Windows the process sequence number, read on the handle the creation time is
-//! read on.
+//! `/proc`), or on Windows the process sequence number.
 //!
 //! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
 //! for the persist/restore round trip and what it refuses.
@@ -218,7 +217,7 @@ impl ProcessId {
         #[cfg(windows)]
         {
             let _ = (kernel, parent);
-            let (read, cause) = backend::ordered_read(pid);
+            let (read, cause) = backend::ordered_read(pid, None);
             (read.map(|(key, order)| (ProcessId { pid, key }, order)), cause)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -256,6 +255,26 @@ impl ProcessId {
         {
             let _ = kernel;
             (Resolved::Found(OrderKey(self.key.raw())), UnknownCause::default())
+        }
+    }
+
+    /// [`order_key_with`](Self::order_key_with) as the proof that this process still holds its pid,
+    /// for the anchor of a walk: [`Resolved::Found`] only if it did at the read. On Windows the key
+    /// read is that proof, so the proof and the key are one read: two could find a process that
+    /// exits between them gone, and its children, which Windows does not reparent, unwalked.
+    /// Elsewhere [`exists_with`](Self::exists_with) proves it and the key follows.
+    pub(crate) fn anchor_order_key_with(&self, kernel: &dyn Kernel) -> (Resolved<OrderKey>, UnknownCause) {
+        #[cfg(windows)]
+        {
+            self.order_key_with(kernel)
+        }
+        #[cfg(not(windows))]
+        {
+            match self.exists_with(kernel) {
+                (Existence::Present, _) => self.order_key_with(kernel),
+                (Existence::Gone, cause) => (Resolved::Gone, cause),
+                (Existence::Unknown, cause) => (Resolved::Unknown, cause),
+            }
         }
     }
 
@@ -469,9 +488,8 @@ pub(crate) use backend::proc_view::{
 };
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
-/// `/proc` view it went through or the failed pidfd call; on Windows, the `NTSTATUS` of the refused
-/// sequence-number query. Carried out of the failing read, so the error describes that read
-/// and not a second look at a view that may have recovered.
+/// `/proc` view it went through or the failed pidfd call. Carried out of the failing read, so the
+/// error describes that read and not a second look at a view that may have recovered.
 #[derive(Debug, Default)]
 pub(crate) struct UnknownCause {
     #[cfg(target_os = "linux")]
@@ -736,15 +754,6 @@ pub(crate) fn windows_identity_from_handle(
     pid: RawPid,
 ) -> Option<ProcessId> {
     backend::windows_identity_from_handle(handle, pid)
-}
-
-/// [`windows_identity_from_handle`] with the order key of the same read.
-#[cfg(all(windows, test))]
-pub(crate) fn windows_ordered_identity_from_handle(
-    handle: windows::Win32::Foundation::HANDLE,
-    pid: RawPid,
-) -> Option<(ProcessId, OrderKey)> {
-    backend::windows_ordered_identity_from_handle(handle, pid)
 }
 
 #[cfg(test)]

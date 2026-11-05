@@ -17,6 +17,8 @@ use crate::test_child::{
 use crate::test_groups::{pidfd_group_signal, Group};
 use crate::Recursive;
 
+use super::treewalk_pidfs_tests::{children_of, descendants};
+
 /// An identity for this process's pid that this process no longer holds: its children are the
 /// children of the pid's new owner.
 fn stale_root() -> ProcessId {
@@ -218,6 +220,23 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     release(child);
 }
 
+/// The warn names why the read failed when the read knows, so an unreadable view is not reported as
+/// access. Mutant: "`resolve_or_drop` drops the cause": the warn says "access denied?".
+#[skuld::test]
+fn the_warn_for_a_dropped_pid_names_the_cause_of_its_read() {
+    crate::log_capture::install();
+    let (child, id) = live_member();
+    let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
+    let mark = crate::log_capture::mark();
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
+    let warned =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].1.contains(View::Unreadable.cause()), "{warned:?}");
+    assert!(!warned[0].1.contains("access denied?"), "{warned:?}");
+    release(child);
+}
+
 /// Mutants: "`descendants` resolves through `HostKernel`", "`children_of` resolves through
 /// `HostKernel`": the unreadable child is found.
 #[skuld::test]
@@ -226,10 +245,10 @@ fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
     let me = ProcessId::current();
     let parents = [(id.pid(), me.pid())];
     let (kernel, _guard) = unreadable(id.pid());
-    assert!(super::descendants(&kernel, me, &parents)
+    assert!(descendants(&kernel, me, &parents)
         .expect("a readable anchor")
         .is_empty());
-    assert!(super::children_of(&kernel, me, &parents)
+    assert!(children_of(&kernel, me, &parents)
         .expect("a readable anchor")
         .is_empty());
     release(child);
