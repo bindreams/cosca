@@ -1514,10 +1514,10 @@ impl ProcSource {
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
-    /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
+    /// seam's "leave it alive" form, which replaces the kill so the child is really left alone.
     fn teardown_kill(&self) -> Result<Sent, Error> {
         #[cfg(test)]
-        if let Some((marker, kind, _)) = crate::child::spawn::fault::take_force_kill_failure() {
+        if let Some((marker, kind)) = crate::child::spawn::fault::take_force_kill_failure() {
             return Err(Error::Io(std::io::Error::new(kind, marker)));
         }
         self.signal(Sig::Kill)

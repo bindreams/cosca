@@ -18,17 +18,23 @@ use std::sync::Arc;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::child::owned::teardown::Disposition;
+use crate::child::owned::OwnedChild;
+use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
-    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, ParentStd, SpawnFailure,
+    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, Diagnosis, ParentStd,
+    SpawnFailure,
 };
 use crate::command::Command;
-use crate::error::{win32_io_error, Error};
+use crate::error::{win32_io_error, ChildFate, Error};
 use crate::identity::{windows_terminate_held, Termination};
 use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel};
+use crate::os_process::windows::WindowsProcess;
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
 use crate::tokio::stdio::OwnedStd;
+use crate::wait::teardown_warn::Due;
 
 use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
@@ -315,7 +321,7 @@ pub(crate) fn spawn_raw(
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, None, crate::tokio::child::slow_teardown_after());
+            let fate = raw_spawn_teardown(proc, pid, None);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
@@ -326,7 +332,7 @@ pub(crate) fn spawn_raw(
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id), crate::tokio::child::slow_teardown_after());
+            let fate = raw_spawn_teardown(proc, pid, Some(id));
             return Err(SpawnFailure::started(e, fate, None));
         }
     };
@@ -339,6 +345,22 @@ pub(crate) fn spawn_raw(
         fd_pipes,
         owned_std,
     ))
+}
+
+/// Kills and reaps a just-spawned child whose attach or identity read failed, so a failed spawn
+/// never leaks a running process, and answers its fate. The wait for the killed child blocks this
+/// thread, and warns once it passes [`slow_teardown_after`](crate::tokio::child::slow_teardown_after).
+/// A child whose kill was refused is left running, warned of, until the async child owns its teardown.
+fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::ProcessId>) -> ChildFate {
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
+    let (fate, _) = tear_down_failed_spawn(
+        owned,
+        id,
+        Disposition::Leave,
+        Due::in_(crate::tokio::child::slow_teardown_after()),
+        &mut Diagnosis::default(),
+    );
+    fate
 }
 
 /// The raw backend's resolved stdio ends: the child's handle ends (0/1/2 + fd >= 3) keyed by slot,

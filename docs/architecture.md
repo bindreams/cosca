@@ -89,7 +89,11 @@ In order:
      pidfd (`conclude`'s `(Err, Opened)` and unexecuted arms), an elevation front at the identity
      and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
      (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of a child it cannot
-     name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. Until the
+     name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
+     ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`), in
+     the async raw spawn too; a refused kill comes back in the sync spawn's failure as an
+     `Unreaped`, and the async raw spawn leaves the child, warned. Both spawns build their
+     `OwnedChild` once, right after the process is created. Until the
      async-child slice, tokio's own code ends the rest of the async spawn. `conclude`'s
      `Ok(child)` arms are `Spawned` for tokio's `Child`: `reap_unexecuted` kills through the
      pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to

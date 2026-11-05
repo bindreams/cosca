@@ -1,12 +1,16 @@
 //! Windows: a failed async spawn's teardown warns once when its wait for the process it terminated
 //! passes its threshold, and keeps waiting until the process is gone (principle 2). No test can make
-//! `TerminateProcess` slow, so the seam `fault::set_late_exit` makes the one check of the exit find it
-//! late; the wait after it is real and ends at once. The unoverridden look is tested against real
-//! handles in `windows_teardown_tests` and `proc_tests`.
+//! `TerminateProcess` slow. The std spawn's row (`ProcSource::reap_now`) makes the seam
+//! `fault::set_late_exit` find the one check of the exit late; the wait after it is real and ends at
+//! once. The raw rows (`OwnedChild::tear_down`) refuse the kill as an exit under way and use a zero
+//! threshold, so the child is really running at the first look, and close its stdin once the wait
+//! blocks. The unoverridden look is tested against real handles in `windows_teardown_tests` and
+//! `proc_tests`.
 //!
-//! The process ends only by `TerminateProcess`, or by its stdin closing. The teardown's thread drops
-//! the stdin writer once the kill returned (`teardown_blocker_parts`), so a kill that sent nothing
-//! leaves a process that exits `0`, and the test fails on `assert_killed` instead of hanging.
+//! In the std row the process ends only by `TerminateProcess`, or by its stdin closing. The teardown's
+//! thread drops the stdin writer once the kill returned (`teardown_blocker_parts`), so a kill that
+//! sent nothing leaves a process that exits `0`, and the test fails on `assert_killed` instead of
+//! hanging.
 
 use crate::child::spawn::fault;
 use crate::error::ChildFate;
@@ -17,9 +21,9 @@ fn warns_since(mark: usize) -> Vec<String> {
     crate::log_capture::records_since(mark, "still waiting")
 }
 
-/// A command for the `more.com` blocker of `teardown_blocker_parts`, through the raw backend when
-/// `raw` (`executable` routes it there), and the guard that releases it after the teardown's kill.
-fn blocker_command(raw: bool) -> (crate::tokio::Command, fault::TeardownBlocker) {
+/// A command for the `more.com` blocker of `teardown_blocker_parts`, and the guard that releases it
+/// after the teardown's kill.
+fn blocker_command() -> (crate::tokio::Command, fault::TeardownBlocker) {
     let fault::TeardownBlockerParts {
         argv,
         stdin,
@@ -27,9 +31,6 @@ fn blocker_command(raw: bool) -> (crate::tokio::Command, fault::TeardownBlocker)
         guard,
     } = fault::teardown_blocker_parts();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-    if raw {
-        cmd.executable(&argv[0]);
-    }
     cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
     if let Some(stdout) = stdout {
@@ -59,11 +60,36 @@ fn teardown_with_a_late_exit(mut cmd: crate::tokio::Command, force: fn(bool)) ->
 /// Mutant: `reap_now` waits for the process handle with no warn.
 #[skuld::test]
 async fn a_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
-    let (cmd, guard) = blocker_command(false);
+    let (cmd, guard) = blocker_command();
     let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_attach_failure);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
     guard.assert_killed();
+}
+
+/// Fails a spawn of a blocker through the raw backend with `force`, with a zero threshold and the
+/// kill refused as an exit under way, so the child is still running when the teardown first looks
+/// and nothing but its stdin closing ends it: closed once the wait blocks, which is after the warn.
+/// Answers the teardown's fate and warns.
+fn raw_teardown_with_an_exit_under_way(force: fn(bool)) -> (ChildFate, Vec<String>) {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin pipe");
+    cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout");
+    let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
+    let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
+    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    force(true);
+    let spawned = cmd.spawn();
+    force(false);
+    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        spawned.expect_err("the forced failure fails the spawn"),
+    );
+    (fate, warns_since(mark))
 }
 
 /// The teardown of a spawn through the raw backend (`raw_spawn_teardown`).
@@ -71,11 +97,9 @@ async fn a_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
 /// Mutants: the raw teardown waits with no warn; the async raw spawn hands it no threshold.
 #[skuld::test]
 async fn a_raw_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
-    let (cmd, guard) = blocker_command(true);
-    let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_attach_failure);
+    let (fate, warns) = raw_teardown_with_an_exit_under_way(fault::set_force_attach_failure);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
-    guard.assert_killed();
 }
 
 /// As above, for the raw backend's other teardown: the identity read fails, so no identity is known.
@@ -83,11 +107,9 @@ async fn a_raw_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
 /// Mutant: the async raw spawn hands the identity-failure teardown no threshold.
 #[skuld::test]
 async fn a_raw_teardown_after_a_failed_identity_read_warns_once_past_its_threshold() {
-    let (cmd, guard) = blocker_command(true);
-    let (fate, warns) = teardown_with_a_late_exit(cmd, fault::set_force_identity_vanished);
+    let (fate, warns) = raw_teardown_with_an_exit_under_way(fault::set_force_identity_vanished);
     assert_eq!(warns.len(), 1, "one warn, and the wait goes on: {warns:?}");
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
-    guard.assert_killed();
 }
 
 /// A running blocker and a handle to it.
