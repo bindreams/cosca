@@ -168,9 +168,9 @@ impl Settlement {
 /// choose: its clause is a warn, so a clause that is not cannot be built for it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Wording {
-    /// Reaped by this process, or shown reaped elsewhere ([`Settlement::uncollected`] false).
+    /// Reaped by this process, or shown reaped elsewhere.
     Collected(log::Level, String),
-    /// Still this process's ([`Settlement::uncollected`]); the text is a warn.
+    /// Still this process's: neither reaped by it nor shown reaped elsewhere; the text is a warn.
     Uncollected(String),
 }
 

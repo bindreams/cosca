@@ -29,14 +29,14 @@ fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() 
             Expect::Waited
         };
         let torn = PidfdTeardown::new(outcome, expect);
-        let fate = torn.outcome.fate();
+        let remains = torn.outcome.remains();
         let answer = Abandoned::after_pidless_teardown(torn);
         if row.uncollected {
             assert_eq!(
                 answer,
                 Abandoned::Uncollected(Left {
                     clause: row.leave.clone(),
-                    fate,
+                    remains,
                     expect,
                 }),
                 "{:?} {:?}",

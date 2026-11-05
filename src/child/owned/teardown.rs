@@ -157,9 +157,13 @@ pub(crate) struct Remains {
 }
 
 impl Remains {
-    /// The remains of a child that was collected.
+    /// The remains of a child that was collected: `fate` is not [`Running`](ChildFate::Running).
     #[cfg(unix)]
     pub(crate) fn collected(fate: ChildFate) -> Remains {
+        debug_assert!(
+            !matches!(fate, ChildFate::Running { .. }),
+            "a running child is not collected"
+        );
         Remains {
             fate,
             uncollected: false,
@@ -168,9 +172,14 @@ impl Remains {
 }
 
 impl TeardownOutcome {
-    /// A teardown that collected the child, with nothing to say.
+    /// A teardown that collected the child, with nothing to say: `fate` is not
+    /// [`Running`](ChildFate::Running).
     #[cfg(unix)]
     pub(crate) fn collected(fate: ChildFate) -> TeardownOutcome {
+        debug_assert!(
+            !matches!(fate, ChildFate::Running { .. }),
+            "a running child is not collected"
+        );
         TeardownOutcome {
             fate,
             said: None,
@@ -250,15 +259,14 @@ impl TeardownOutcome {
         self.said.as_ref()
     }
 
-    /// Splits an outcome that left the child uncollected into its fate and its warn; any other is
-    /// given back.
+    /// Takes the warn of an outcome that left the child uncollected; any other is given back.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "only the Linux spawn hands an uncollected child on")
     )]
-    pub(crate) fn into_uncollected(self) -> Result<(ChildFate, String), TeardownOutcome> {
+    pub(crate) fn into_uncollected(self) -> Result<String, TeardownOutcome> {
         match self.said {
-            Some(Wording::Uncollected(warn)) => Ok((self.fate, warn)),
+            Some(Wording::Uncollected(warn)) => Ok(warn),
             said => Err(TeardownOutcome { said, ..self }),
         }
     }
@@ -358,10 +366,25 @@ impl PidfdTeardown {
     /// the place that logs it. Any other teardown is given back.
     pub(crate) fn uncollected(self) -> Result<Left, PidfdTeardown> {
         let expect = self.expect;
+        let remains = self.outcome.remains();
         self.outcome
             .into_uncollected()
-            .map(|(fate, clause)| Left { clause, fate, expect })
+            .map(|clause| Left {
+                clause,
+                remains,
+                expect,
+            })
             .map_err(|outcome| PidfdTeardown { outcome, expect })
+    }
+
+    /// Says the teardown as a failed spawn's
+    /// ([`failed_spawn_line`](TeardownOutcome::failed_spawn_line)): its warn, if it has one, is
+    /// logged through [`warn_pidfd_teardown`], which asserts the teardown's contract with its caller.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn say_as_failed_spawn(self, why: &mut crate::child::spawn::Diagnosis) -> Remains {
+        let (line, remains) = self.outcome.failed_spawn_line(why);
+        warn_pidfd_teardown(line.as_deref(), &remains, self.expect);
+        remains
     }
 
     /// Logs `line` through [`warn_pidfd_teardown`], as this teardown came out, for a caller that
@@ -388,7 +411,7 @@ impl PidfdTeardown {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Left {
     pub(crate) clause: String,
-    pub(crate) fate: ChildFate,
+    pub(crate) remains: Remains,
     pub(crate) expect: Expect,
 }
 
@@ -399,11 +422,7 @@ pub(crate) struct Left {
 impl Left {
     /// Logs `line` through [`warn_pidfd_teardown`]: the teardown left the child uncollected.
     pub(crate) fn warn(&self, line: &str) {
-        let remains = Remains {
-            fate: self.fate,
-            uncollected: true,
-        };
-        warn_pidfd_teardown(Some(line), &remains, self.expect);
+        warn_pidfd_teardown(Some(line), &self.remains, self.expect);
     }
 }
 
@@ -415,7 +434,7 @@ impl Left {
     not(target_os = "linux"),
     allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
 )]
-pub(crate) fn warn_pidfd_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
+fn warn_pidfd_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
     let Remains { fate, uncollected } = *remains;
     if let Some(line) = line {
         log::warn!("{line}");

@@ -5,7 +5,7 @@
 use std::os::fd::OwnedFd;
 
 use super::{Diagnosis, FrontFate};
-use crate::child::owned::teardown::{warn_pidfd_teardown, Disposition, Expect, Kill, PidfdTeardown, Reach, Remains};
+use crate::child::owned::teardown::{Disposition, Expect, Kill, PidfdTeardown, Reach};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::Subtree;
 use crate::elevation::front::Front;
@@ -69,24 +69,11 @@ pub(crate) fn tear_down_held(
     (error, remains.fate, unreaped)
 }
 
-impl PidfdTeardown {
-    /// Says the teardown as a failed spawn's
-    /// ([`failed_spawn_line`](crate::child::owned::teardown::TeardownOutcome::failed_spawn_line)): its
-    /// warn, if it has one, goes through [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown),
-    /// which asserts the teardown's contract with its caller.
-    pub(crate) fn say_as_failed_spawn(self, why: &mut Diagnosis) -> Remains {
-        let (line, remains) = self.outcome.failed_spawn_line(why);
-        warn_pidfd_teardown(line.as_deref(), &remains, self.expect);
-        remains
-    }
-}
-
 /// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
 /// [`OwnedChild`] over the pidfd. A child it could not collect (its kill refused and it still
 /// running, a look or a wait that failed) is left, which the outcome's `uncollected` says, not the
-/// fate; the caller owns the one warn, and logs it through
-/// [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown), or says it with
-/// [`PidfdTeardown::say_as_failed_spawn`]. `expect`: see [`Expect`]. With `due`, the wait for the
+/// fate; the caller owns the one warn, and says it with [`PidfdTeardown::say_as_failed_spawn`], or
+/// logs its own line through [`PidfdTeardown::warn`]. `expect`: see [`Expect`]. With `due`, the wait for the
 /// killed child warns once it passes.
 pub(crate) fn tear_down_pidfd(
     pid: Option<u32>,

@@ -421,8 +421,9 @@ impl Child {
 
     /// A drop's end for an elevation front it cannot be sure its cgroup kill reached: its leaf is
     /// torn down (killed through, with a failed kill retried, drained, removed), and then the front
-    /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
-    /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
+    /// is looked at through [`look_at_front`](OwnedChild::look_at_front), which waits for it only if
+    /// its place says the kill reached it. A front is never killed through [`tear_down`](OwnedChild::tear_down):
+    /// that would orphan its program. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
     /// with `why` and `disposition`.
     #[cfg(unix)]
@@ -1223,7 +1224,6 @@ fn word_front(
     disposition: Disposition,
     look: FrontLook,
 ) -> TeardownOutcome {
-    use crate::child::lifecycle::Wording;
     use crate::child::owned::teardown::LookOutcome;
 
     let front = pid.into().map_or_else(
@@ -1243,10 +1243,12 @@ fn word_front(
         ),
     };
     // A front seen running is still this process's.
-    let warn = Wording::Uncollected;
-    let said = match look {
-        LookOutcome::Ended(settlement) => settlement.wording(&front, None, Some(disposition)),
-        LookOutcome::LeftRunning => warn(match disposition {
+    let left = |warn: String| TeardownOutcome::left_uncollected(fate, warn);
+    match look {
+        LookOutcome::Ended(settlement) => {
+            TeardownOutcome::new(fate, settlement.wording(&front, None, Some(disposition)))
+        }
+        LookOutcome::LeftRunning => left(match disposition {
             Disposition::Leave => format!(
                 "{front} is left running and unreaped: {why}, and a kill of the front would orphan \
                  the elevated program"
@@ -1257,10 +1259,9 @@ fn word_front(
                 Disposition::HandBack.suffix(true)
             ),
         }),
-        LookOutcome::PlaceUnreadable(e) => warn(unreadable(format!("where it is cannot be read ({e})"))),
-        LookOutcome::SubtreeUnreadable(e) => warn(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
-    };
-    TeardownOutcome::new(fate, said)
+        LookOutcome::PlaceUnreadable(e) => left(unreadable(format!("where it is cannot be read ({e})"))),
+        LookOutcome::SubtreeUnreadable(e) => left(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
+    }
 }
 
 fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader> {

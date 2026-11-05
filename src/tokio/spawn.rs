@@ -1113,7 +1113,7 @@ fn abandoned_fate(child: crate::containment::AbandonedChild) -> ChildFate {
 /// its teardown left uncollected says so, in the teardown's clause: under the failed spawn's label,
 /// or, if `ended` says the handshake ended the child through its own copy of the pidfd, after that
 /// fate, as an `OutOfReach` leaf's does. The warn is logged through
-/// [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown).
+/// [`Left::warn`](crate::child::owned::teardown::Left::warn).
 fn warn_for_abandoned(child: &crate::containment::AbandonedChild, error: &Error, ended: Option<ChildFate>) {
     use crate::containment::AbandonedChild;
 
@@ -1240,7 +1240,7 @@ fn abandoned_after_handshake(
         // Out of the leaf's reach, and not known to be dead.
         AbandonedChild::MaybeUnreachable | AbandonedChild::OutOfReach(_) => (error, ChildFate::Running { id: None }),
         // What the teardown established of the child it left.
-        AbandonedChild::Uncollected(left) => (error, left.fate),
+        AbandonedChild::Uncollected(left) => (error, left.remains.fate),
         AbandonedChild::Ended | AbandonedChild::MaybeUnreaped => (error, ChildFate::Unknown),
     })
 }
