@@ -246,6 +246,10 @@ pub enum Error {
     /// child they could not kill: a failed release may leave its thread frozen, so waiting for it
     /// could block for ever.
     ///
+    /// A failed sync spawn hands back a child it could not end in the same way on Linux, when the
+    /// identity read or the attach fails after the handshake, and on every Unix when the elevation
+    /// backend's password write fails. The other failed spawns leave such a child running and warn.
+    ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
     MayHaveStarted {
