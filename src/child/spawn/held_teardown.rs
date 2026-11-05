@@ -73,9 +73,10 @@ pub(crate) fn tear_down_held(
 }
 
 /// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
-/// [`OwnedChild`] over the pidfd. A child it could not end is left running, which the outcome says;
-/// the caller owns the one warn, and logs `left` in it. With `due`, the wait for the killed child
-/// warns once it passes.
+/// [`OwnedChild`] over the pidfd. A child it could not collect (its kill refused and it still
+/// running, a look or a wait that failed) is left, which [`TeardownOutcome::uncollected`] says, not
+/// the fate; the caller owns the one warn, and logs `left` in it. With `due`, the wait for the
+/// killed child warns once it passes.
 pub(crate) fn tear_down_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,

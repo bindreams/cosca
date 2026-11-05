@@ -1,4 +1,4 @@
-use super::{after_refused_kill, refused_kill_warning};
+use super::{refused_kill_answer, refused_kill_warning, Forgetting, TornDown};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
@@ -12,27 +12,82 @@ use crate::test_child::Console;
 fn a_refused_kill_answers_with_the_second_teardown_then_the_forgetting() {
     let id = Some(ProcessId::current());
     assert_eq!(
-        after_refused_kill(Some(ChildFate::Reaped), Some(ChildFate::Gone), id),
+        refused_kill_answer(Some(ChildFate::Reaped), Some(ChildFate::Gone), id),
         ChildFate::Reaped
     );
-    assert_eq!(after_refused_kill(None, Some(ChildFate::Gone), id), ChildFate::Gone);
-    assert_eq!(after_refused_kill(Some(ChildFate::Killed), None, id), ChildFate::Killed);
+    assert_eq!(refused_kill_answer(None, Some(ChildFate::Gone), id), ChildFate::Gone);
+    assert_eq!(
+        refused_kill_answer(Some(ChildFate::Killed), None, id),
+        ChildFate::Killed
+    );
 }
 
-/// The warn for a refused teardown kill says "torn down" only of a child the second teardown ended:
-/// one it left running is not.
+/// The warn for a refused teardown kill words what became of the child from what the second
+/// teardown's outcome says, for every fate that teardown can give: "torn down through its pidfd"
+/// only of a child it reaped; a child it left uncollected (still running, its look failed, its wait
+/// failed) is "left uncollected", and one found reaped by someone else is that. The outcome's `left`
+/// and the forget's leak follow.
 ///
-/// Mutant: the wording follows whether the second teardown ran, not what became of the child.
+/// Mutant: the wording follows whether the second teardown ran, or only whether its fate is
+/// `Running`, or ignores `uncollected`.
 #[skuld::test]
-fn the_refused_kill_warning_says_torn_down_only_of_a_child_that_is_not_running() {
+fn the_refused_kill_warning_words_every_fate_the_second_teardown_gives() {
     let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    let words = |torn_down: Option<&ChildFate>| refused_kill_warning(7, &e, torn_down, None, None, None);
+    let torn = |fate, uncollected, left: Option<&str>| TornDown {
+        fate,
+        uncollected,
+        leak: "a pidfd",
+        left: left.map(str::to_owned),
+    };
+    let id = Some(ProcessId::current());
+    let rows = [
+        (
+            torn(ChildFate::Reaped, false, None),
+            "it is torn down through its pidfd",
+        ),
+        (torn(ChildFate::Killed, true, None), "it is left uncollected"),
+        (torn(ChildFate::Killed, false, None), "it was reaped by someone else"),
+        (torn(ChildFate::Gone, false, None), "it was reaped by someone else"),
+        (torn(ChildFate::Unknown, true, None), "it is left uncollected"),
+        (torn(ChildFate::Running { id }, true, None), "it is left uncollected"),
+    ];
+    for (torn_down, clause) in rows {
+        let text = refused_kill_warning(7, &e, None, Some(&torn_down));
+        assert!(
+            text.starts_with(&format!("teardown kill of child 7 failed ({e}); {clause}")),
+            "{:?} (uncollected: {}): {text}",
+            torn_down.fate,
+            torn_down.uncollected
+        );
+        assert!(
+            text.contains("forgetting tokio's handle for it leaks a pidfd"),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("torn down"),
+            clause.contains("torn down"),
+            "{:?}: {text}",
+            torn_down.fate
+        );
+    }
 
-    assert!(words(Some(&ChildFate::Reaped)).contains("torn down through its pidfd"));
-    assert!(words(Some(&ChildFate::Killed)).contains("torn down through its pidfd"));
-    let left = words(Some(&ChildFate::Running { id: None }));
-    assert!(!left.contains("torn down"), "{left}");
-    assert!(!words(None).contains("torn down"));
+    let left = torn(ChildFate::Running { id }, true, Some("leaving it running"));
+    assert!(refused_kill_warning(7, &e, None, Some(&left)).ends_with("; leaving it running"));
+
+    // No second teardown ran: the child was forgotten, or released.
+    let forgotten = Forgetting {
+        leak: "a zombie",
+        why: "was reaped by someone else".to_owned(),
+        fate: ChildFate::Gone,
+    };
+    let text = refused_kill_warning(7, &e, Some(&forgotten), None);
+    assert_eq!(
+        text,
+        format!(
+            "teardown kill of child 7 failed ({e}); it is not waited on; the child was reaped by someone \
+             else; forgetting tokio's handle for it leaks a zombie"
+        )
+    );
 }
 
 /// Off Linux a child whose kill was refused and that is not forgotten is released to tokio's orphan
@@ -43,8 +98,8 @@ fn the_refused_kill_warning_says_torn_down_only_of_a_child_that_is_not_running()
 #[skuld::test]
 fn a_refused_kill_with_no_other_answer_leaves_the_child_running() {
     let id = Some(ProcessId::current());
-    assert_eq!(after_refused_kill(None, None, id), ChildFate::Running { id });
-    assert_eq!(after_refused_kill(None, None, None), ChildFate::Running { id: None });
+    assert_eq!(refused_kill_answer(None, None, id), ChildFate::Running { id });
+    assert_eq!(refused_kill_answer(None, None, None), ChildFate::Running { id: None });
 }
 
 /// On Linux every child that is not forgotten is torn down again through its pidfd, so no answer from
@@ -59,7 +114,7 @@ fn a_refused_kill_with_no_other_answer_leaves_the_child_running() {
 )]
 fn a_refused_kill_with_no_other_answer_asserts_on_linux() {
     let id = Some(ProcessId::current());
-    assert_eq!(after_refused_kill(None, None, id), ChildFate::Running { id });
+    assert_eq!(refused_kill_answer(None, None, id), ChildFate::Running { id });
 }
 
 /// `exit_visible_by` waits, so it refuses to run inside an async drop's bounded section, before it
