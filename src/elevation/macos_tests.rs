@@ -1,4 +1,6 @@
 use std::ffi::{OsStr, OsString};
+
+use crate::test_child::Console;
 use std::path::Path;
 
 use super::{build_rewrite, build_shell_command, reject_structural_gui_config, wrap_do_shell_script};
@@ -30,7 +32,7 @@ fn build(c: &mut Command, arg_max: Option<usize>) -> Result<(Command, crate::ele
 }
 
 fn gui_cmd() -> Command {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["/usr/bin/id", "-u"])
         .elevation_auth(crate::elevation::Auth::Gui);
     c
@@ -212,7 +214,7 @@ fn a_plain_argv_command_is_accepted() {
 
 #[skuld::test]
 fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["mytool", "--apply"])
         .elevation_auth(crate::elevation::Auth::Gui);
     assert_rejected(&c, "absolute");
@@ -222,11 +224,11 @@ fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
 fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     // `/usr/bin/id` must be accepted and `C:\tool.exe` rejected on EVERY host —
     // `Path::is_absolute` gets both backwards on Windows.
-    let mut ok = Command::new();
+    let mut ok = crate::test_child::command(Console::Hidden);
     ok.args(["/usr/bin/id"]).elevation_auth(crate::elevation::Auth::Gui);
     assert!(gate(&ok).is_ok());
 
-    let mut windows_style = Command::new();
+    let mut windows_style = crate::test_child::command(Console::Hidden);
     windows_style
         .args([r"C:\tool.exe"])
         .elevation_auth(crate::elevation::Auth::Gui);
@@ -301,7 +303,7 @@ fn stdout_and_stderr_may_be_captured_because_they_carry_the_relay() {
 
 #[skuld::test]
 fn a_commandline_command_is_rejected() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.commandline("id -u").elevation_auth(crate::elevation::Auth::Gui);
     assert_rejected(&c, "argv");
 }
@@ -311,11 +313,11 @@ fn an_empty_command_is_rejected() {
     // BOTH internal spellings of "no program", which are separately reachable: a
     // fresh Command is `CommandInput::Empty`, while `.args([])` takes the `_ =>`
     // arm of `Command::args` and yields `CommandInput::Argv(vec![])`.
-    let mut fresh = Command::new();
+    let mut fresh = crate::test_child::command(Console::Hidden);
     fresh.elevation_auth(crate::elevation::Auth::Gui);
     assert_rejected(&fresh, "program");
 
-    let mut empty_argv = Command::new();
+    let mut empty_argv = crate::test_child::command(Console::Hidden);
     empty_argv
         .args::<[&str; 0], &str>([])
         .elevation_auth(crate::elevation::Auth::Gui);
@@ -332,7 +334,7 @@ fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
     // Not as "not absolute": the leading-slash test cannot even run on an OsStr
     // with no byte form, so the gate must surface the real reason.
     use std::os::windows::ffi::OsStringExt;
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([OsString::from_wide(&[0xD800])])
         .elevation_auth(crate::elevation::Auth::Gui);
     let e = gate(&c).unwrap_err();
@@ -345,7 +347,7 @@ fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
 #[skuld::test]
 fn argv0_yields_that_program_and_the_remaining_args() {
     // Pin the returned pair, not merely the absence of a rejection.
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["/usr/bin/id", "-u", "-r"])
         .elevation_auth(crate::elevation::Auth::Gui);
     let launch = super::program_and_args(&c).expect("an argv program");
@@ -412,7 +414,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     crate::log_capture::install();
 
     let mark = crate::log_capture::mark();
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([LOUD]).elevation_auth(crate::elevation::Auth::Gui);
     c.kill_on_drop(true);
     let _ = build(&mut c, None).unwrap();
@@ -423,7 +425,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
 
     // Opting out is the quiet path — no warning to ignore.
     let mark = crate::log_capture::mark();
-    let mut quiet = Command::new();
+    let mut quiet = crate::test_child::command(Console::Hidden);
     quiet.args([QUIET]).elevation_auth(crate::elevation::Auth::Gui);
     quiet.kill_on_drop(false);
     let _ = build(&mut quiet, None).unwrap();
@@ -560,7 +562,7 @@ fn both_quoting_layers_survive_a_real_osascript_round_trip() {
     argv.extend(nasty.iter().map(OsString::from));
     let script = crate_script_without_the_privilege_clause(OsStr::new("/bin/sh"), &argv);
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([
         OsString::from("/usr/bin/osascript"),
         OsString::from("-e"),
@@ -602,7 +604,7 @@ fn the_administrator_script_compiles() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out_path = dir.path().join("script.scpt");
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([
         OsString::from("/usr/bin/osacompile"),
         OsString::from("-o"),
@@ -640,7 +642,7 @@ do shell script \"{body}\" without altering line endings
 end timeout"
     );
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([
         OsString::from("/usr/bin/osascript"),
         OsString::from("-e"),

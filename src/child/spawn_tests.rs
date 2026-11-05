@@ -12,6 +12,7 @@ use super::fault;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, pidfd_group_signal, setuid, Group};
 
@@ -19,7 +20,7 @@ use crate::test_groups::{cgroup, pidfd_group_signal, setuid, Group};
 /// tests whose child is left alone: its stdin writer is leaked.
 #[cfg(target_os = "macos")]
 fn blocker() -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::test_child::leaked_writer_stdin())
         .expect("set stdin pipe");
@@ -36,7 +37,7 @@ pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
         stdout,
         guard,
     } = fault::teardown_blocker_parts();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
     if let Some(stdout) = stdout {
@@ -50,7 +51,7 @@ pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 #[cfg(unix)]
 fn blocker_with_held_stdin() -> (Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin pipe");
     (cmd, writer)
@@ -147,7 +148,7 @@ fn attach_failure_reaps_the_spawned_child() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args([crate::test_child::windows_more()]);
     let (reader, writer) = std::io::pipe().expect("pipe");
     let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
@@ -252,7 +253,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 #[skuld::test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
@@ -286,7 +287,7 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
 #[skuld::test]
 fn a_child_whose_teardown_kill_is_refused_may_still_be_running() {
     use crate::stdio::Stdio;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
@@ -358,7 +359,7 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 #[cfg(windows)]
 #[skuld::test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cmd", "/C", "exit 0"]);
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     fault::set_force_attach_failure(true);
@@ -436,7 +437,7 @@ fn a_child_whose_teardown_kill_is_refused_is_handed_back(#[fixture(setuid)] _gro
 
 #[skuld::test]
 fn spawn_unelevated_runs_a_plain_child() {
-    let mut c = crate::command::Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     c.args(["true"]);
     #[cfg(windows)]
@@ -450,7 +451,7 @@ fn spawn_unelevated_runs_a_plain_child() {
 // is gated on `elevation_request().enabled`, so a plain command never routes through it.
 #[skuld::test]
 fn non_elevated_spawn_skips_the_elevation_branch() {
-    let mut c = crate::command::Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     c.args(["true"]);
     #[cfg(windows)]
@@ -465,7 +466,7 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
     // DETERMINISTIC (no ambient-privilege branch): the honest config gate now runs BEFORE
     // the already-elevated short-circuit, so a piped elevated child is
     // Unsupported whether or not the runner is elevated — never a UAC prompt, never a hang.
-    let mut c = crate::command::Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["whoami"]).elevate();
     c.stdout(crate::stdio::Stdio::pipe()).unwrap();
     assert!(matches!(
@@ -486,7 +487,7 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
 fn an_elevated_executable_or_raw_executable_is_refused_by_spawn() {
     let program = r"C:\no-such-dir\tool";
     for setter in ["executable", "raw_executable"] {
-        let mut c = crate::command::Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         match setter {
             "executable" => c.executable(program),
             _ => c.raw_executable(program),
@@ -519,14 +520,14 @@ fn an_elevated_executable_or_raw_executable_is_refused_by_spawn() {
 fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     use crate::stdio::Stdio;
 
-    let mut argv_only = Command::new();
+    let mut argv_only = crate::test_child::command(Console::Hidden);
     argv_only.args(["cmd", "/C", "exit 0"]);
     assert!(
         !super::routes_to_raw_backend(&argv_only),
         "an argv-only command stays on the std path"
     );
 
-    let mut exe_only = Command::new();
+    let mut exe_only = crate::test_child::command(Console::Hidden);
     exe_only.executable("cmd").args(["cmd", "/C", "exit 0"]);
     assert!(super::routes_to_raw_backend(&exe_only), "an executable() routes to raw");
 
@@ -534,14 +535,14 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     // variant-agnostic, so this holds today — the case exists to stop it being "tightened" to
     // `Search` only. That would send `raw_executable()` down the std path, where std resolves a
     // bare name itself, breaking the no-resolution contract at the one backend that honours it.
-    let mut raw_exe_only = Command::new();
+    let mut raw_exe_only = crate::test_child::command(Console::Hidden);
     raw_exe_only.raw_executable("cmd").args(["cmd", "/C", "exit 0"]);
     assert!(
         super::routes_to_raw_backend(&raw_exe_only),
         "a raw_executable() routes to raw too"
     );
 
-    let mut high_fd_only = Command::new();
+    let mut high_fd_only = crate::test_child::command(Console::Hidden);
     high_fd_only.args(["cmd", "/C", "exit 0"]);
     high_fd_only.fd(3, Stdio::pipe_out()).unwrap();
     assert!(
@@ -550,7 +551,7 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
          std path's fd >= 3 collection is unix-only, so it would be dropped in silence"
     );
 
-    let mut both = Command::new();
+    let mut both = crate::test_child::command(Console::Hidden);
     both.executable("cmd").args(["cmd", "/C", "exit 0"]);
     both.fd(3, Stdio::pipe_out()).unwrap();
     assert!(super::routes_to_raw_backend(&both));
@@ -621,7 +622,7 @@ fn cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixtu
 fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
-    let mut refused = Command::new();
+    let mut refused = crate::test_child::command(Console::Hidden);
     refused
         .executable("cmd")
         .args(["cmd", "/C", "exit 0"])
@@ -635,7 +636,7 @@ fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         "the refusal ran after the mutation it was supposed to precede"
     );
 
-    let mut allowed = Command::new();
+    let mut allowed = crate::test_child::command(Console::Hidden);
     allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
     let child = allowed
         .spawn()
@@ -654,7 +655,7 @@ fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
 fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
-    let mut refused = Command::new();
+    let mut refused = crate::test_child::command(Console::Hidden);
     refused
         .executable("cmd")
         .args(["cmd", "/C", "exit 0"])
@@ -683,7 +684,7 @@ fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
 fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
-    let mut refused = Command::new();
+    let mut refused = crate::test_child::command(Console::Hidden);
     refused
         .args(["cmd", "/C", "exit 0"])
         .contain()
@@ -700,7 +701,7 @@ fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
         "the refusal ran after the mutation it was supposed to precede"
     );
 
-    let mut allowed = Command::new();
+    let mut allowed = crate::test_child::command(Console::Hidden);
     allowed.args(["cmd", "/C", "exit 0"]).contain();
     let child = allowed
         .spawn()
@@ -1206,7 +1207,7 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
 fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
     use crate::child::spawn::identity_macos_tests::{ran_marker, RAN_ARGV};
     let (stdout, reader) = ran_marker();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(RAN_ARGV);
     cmd.stdout(stdout).expect("set stdout");
     let forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
@@ -1336,7 +1337,7 @@ fn macos_failed_spawn_closes_our_pipe_ends(
     tree_walk: bool,
     expected: ChildFate,
 ) {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("piped stdin");
     if tree_walk {
@@ -1504,7 +1505,7 @@ const MISSING_PROGRAM: &str = "cosca-no-such-program-142";
 /// Mutant: a failed `std` spawn answers that the program may have started.
 #[skuld::test]
 fn a_failed_exec_did_not_start_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args([MISSING_PROGRAM]);
     let err = expect_not_started(cmd.spawn().expect_err("a missing program fails the spawn"));
     assert!(
@@ -1518,7 +1519,7 @@ fn a_failed_exec_did_not_start_the_program() {
 /// Mutant: stdio resolution answers that the program may have started.
 #[skuld::test]
 fn a_refused_stdio_setup_did_not_start_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdout(crate::stdio::Stdio::merge(crate::stdio::Fd::STDERR))
         .expect("stdout");
@@ -1535,13 +1536,13 @@ fn a_refused_stdio_setup_did_not_start_the_program() {
 #[cfg(unix)]
 #[skuld::test]
 fn run_to_completion_failures_after_the_spawn_may_have_started() {
-    let mut missing = Command::new();
+    let mut missing = crate::test_child::command(Console::Hidden);
     missing.args([MISSING_PROGRAM]);
     expect_not_started(missing.read().expect_err("a missing program fails"));
     expect_not_started(missing.output().expect_err("a missing program fails"));
     expect_not_started(missing.status().expect_err("a missing program fails"));
 
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["printf", "\\377"]);
     let (err, fate) = expect_may_have_started_with(cmd.read().expect_err("invalid UTF-8 fails `read`"));
     assert_eq!(fate, ChildFate::Reaped, "`read` collected the exit");
@@ -1556,7 +1557,11 @@ fn run_to_completion_failures_after_the_spawn_may_have_started() {
 /// Mutant: building the `std` command answers that the program may have started.
 #[skuld::test]
 fn a_command_with_no_program_did_not_start() {
-    let err = expect_not_started(Command::new().spawn().expect_err("no program, no spawn"));
+    let err = expect_not_started(
+        crate::test_child::command(Console::Hidden)
+            .spawn()
+            .expect_err("no program, no spawn"),
+    );
     assert!(matches!(err, Error::Io(_)), "{err:?}");
 }
 
@@ -1566,7 +1571,7 @@ fn a_command_with_no_program_did_not_start() {
 #[cfg(unix)]
 #[skuld::test]
 fn an_elevation_refused_for_its_shape_did_not_start() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["/bin/sh", "-c", "true"]).elevate();
     cmd.fd(3, crate::stdio::Stdio::null()).expect("fd 3");
     let err = expect_not_started(cmd.spawn().expect_err("fd >= 3 is refused under elevation"));
@@ -1580,7 +1585,7 @@ fn an_elevation_refused_for_its_shape_did_not_start() {
 #[skuld::test]
 fn a_handshake_that_cannot_open_did_not_start() {
     let _armed = super::pidfd_handshake::fault::fail_done_fd(rustix::io::Errno::MFILE);
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
     assert!(
@@ -1600,7 +1605,7 @@ fn a_handshake_that_cannot_open_did_not_start() {
 #[skuld::test]
 fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     // The hook reaps the zombie the kill made, so the teardown's own reap finds `ECHILD`. The

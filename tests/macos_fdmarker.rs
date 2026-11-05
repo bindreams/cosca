@@ -23,7 +23,7 @@ const WOULD_LOSE_MARKER_LOG_NEEDLE: &str = "will lose the marker at its next";
 fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
         .env(common::ACK_ENV, "1")
@@ -167,7 +167,7 @@ fn dropping_a_marked_child_kills_the_reparented_orphan() {
 #[cfg(feature = "tokio")]
 async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Member, Member) {
     let (listener, addr) = common::bind_async_listener();
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
         .env(common::ACK_ENV, "1")
@@ -234,7 +234,7 @@ async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_sp
 fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
         .env(common::ACK_ENV, "1")
@@ -294,7 +294,7 @@ fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let mut child = cosca::Command::new()
+    let mut child = common::command(common::Console::Hidden)
         .executable(testbin())
         .args(["cosca_testbin", "control-block-mixed-cloexec-marker", &addr, "R"])
         .env(common::ACK_ENV, "1")

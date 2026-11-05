@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use super::{accept_or_die, ack, fixture_argv};
+use super::{accept_or_die, ack, fixture_argv, Console};
 
 pub(crate) mod console_less;
 pub(crate) mod nested;
@@ -79,8 +79,9 @@ pub(crate) fn member_env(addr: &str, handler: Handler, grandchild: Option<Handle
 
 /// Connects, installs its [`Handler`], writes its tag, and blocks on a read of its socket until the
 /// caller closes it (then exits 0) or something ends it. A root with [`GRANDCHILD_ENV`] set starts
-/// that grandchild after its tag, with no creation flags, so it stays in the root's console process
-/// group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
+/// that grandchild after its tag, with no creation flags (`Console::Asked`: not the test helpers'
+/// default `CREATE_NO_WINDOW`, which would give it a console of its own), so it stays in the root's
+/// console process group, and then writes the grandchild's pid (4 bytes, little-endian). The grandchild connects to
 /// the same address with tag `G`. The root holds the grandchild's process handle while it lives, so
 /// the pid stays the grandchild's.
 ///
@@ -103,7 +104,7 @@ fn fixture_ctrl_break_member() {
     }
     sock.write_all(tag.as_bytes()).expect("write the tag");
     let _grandchild = std::env::var(GRANDCHILD_ENV).ok().map(|handler| {
-        let grandchild = crate::test_spawn::spawn(
+        let grandchild = crate::test_spawn::spawn_with(
             crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
                 // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
                 .args(&member_argv()[1..])
@@ -111,6 +112,8 @@ fn fixture_ctrl_break_member() {
                 .env(HANDLER_ENV, handler)
                 .env_remove(GRANDCHILD_ENV)
                 .stdout(std::process::Stdio::null()),
+            0,
+            crate::test_spawn::console_flags::Console::Asked,
         )
         .expect("spawn the grandchild");
         sock.write_all(&grandchild.id().to_le_bytes())
@@ -176,7 +179,7 @@ pub(crate) fn spawn_member(
     configure: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(member_argv());
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
@@ -249,7 +252,7 @@ fn gui_testbin() -> std::path::PathBuf {
 /// ones, so [`GracefulMechanism::ConsoleGroup`](crate::GracefulMechanism) is what the child reports.
 pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Asked);
     // `args` is the whole argv, program name included.
     cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
@@ -264,7 +267,7 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
 #[cfg(feature = "tokio")]
 pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Asked);
     cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
@@ -325,7 +328,7 @@ pub(crate) fn spawn_member_async(
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(member_argv());
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
@@ -408,7 +411,7 @@ pub(crate) fn report_done(report: &mut TcpStream) {
 /// command last. Passes only if the reporter wrote [`DONE`] and exited 0.
 pub(crate) fn drive_reporter(test: &str, addr_env: &str, configure: impl FnOnce(&mut crate::Command)) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
         .args(fixture_argv(test))
         .env(addr_env, addr)

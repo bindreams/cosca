@@ -385,7 +385,7 @@ mod linux {
 mod macos {
     use super::super::root_state_tests::warns_since;
     use crate::os_process::child::{Foreign, PeekOutcome};
-    use crate::tokio::Command;
+    use crate::test_child::Console;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
 
     /// A failed spawn's teardown whose wait finds the zombie held by launchd (its tracer died)
@@ -397,7 +397,7 @@ mod macos {
     async fn reap_now_warns_once_for_an_orphaned_zombie_during_its_wait() {
         crate::log_capture::install();
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(crate::ContainMode::TreeWalk);

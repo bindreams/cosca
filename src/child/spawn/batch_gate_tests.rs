@@ -2,8 +2,10 @@
 //! refusal, the refusal's advice, and an exhaustive comparison against the rule it replaced. The
 //! component-level oracle is in `batch_gate/oracle_tests.rs`.
 
+#[cfg(windows)]
 use crate::command::Command;
 use crate::error::Error;
+use crate::test_child::Console;
 
 /// Why `is_batch_program` does not spell out the as-written reading beside the stream reading: the
 /// stream reading subsumes it.
@@ -527,11 +529,11 @@ fn the_refusal_advises_a_route_that_is_not_itself_refused() {
 
     #[cfg(windows)]
     {
-        let mut looped = Command::new();
+        let mut looped = crate::test_child::command(Console::Hidden);
         looped.commandline("x.bat --flag");
         crate::child::spawn::build_std_command(&looped).expect_err("commandline() alone is still gated");
 
-        let mut advised = Command::new();
+        let mut advised = crate::test_child::command(Console::Hidden);
         advised
             .executable("cmd.exe")
             .commandline(r#"cmd.exe /c "x.bat" --flag"#);
@@ -717,7 +719,7 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([script.as_os_str()]);
     let child = c.spawn().expect("a .bat this host can run must not be refused");
     assert_eq!(
@@ -738,7 +740,7 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
 /// by the very misattribution the gate exists to prevent.
 #[skuld::test]
 fn the_std_backend_judges_the_program_token_the_caller_named() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
     // An `Ok`, or the `Unsupported` batch refusal, panics in the helper.
     let msg = invalid_input_message(crate::child::spawn::build_std_command(&c));
@@ -758,7 +760,7 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
 /// crate for this one to be leaning on.
 #[skuld::test]
 fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
     invalid_input_message(crate::child::spawn::build_std_command(&c));
 }
@@ -946,12 +948,12 @@ fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
 fn std_routed(args: &[&str], lines: &[&str]) -> Vec<(String, Command)> {
     let mut out = Vec::new();
     for &n in args {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args([n]);
         out.push((format!("args([{n:?}])"), c));
     }
     for &l in lines {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.commandline(l);
         out.push((format!("commandline({l:?})"), c));
     }

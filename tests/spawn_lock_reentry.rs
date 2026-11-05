@@ -20,7 +20,7 @@ fn discarding_the_test_guard_is_linted() {
 fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
     let outer = cosca::test_spawn_lock();
     let unwound = std::panic::catch_unwind(|| {
-        let mut cmd = cosca::Command::new();
+        let mut cmd = common::command(common::Console::Hidden);
         // The panic is at lock acquisition, before the program runs.
         let exe = std::env::current_exe().expect("this test binary's path");
         cmd.executable(&exe).args([exe.as_os_str(), "--list".as_ref()]);

@@ -5,7 +5,6 @@
 //! from the absence of an event.
 
 use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::CommandExt;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
@@ -17,10 +16,12 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetThreadId, GetThreadTimes, OpenProcess, OpenThread, ResumeThread, SuspendThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE,
+    TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_QUERY_LIMITED_INFORMATION,
     THREAD_SUSPEND_RESUME,
 };
+
+use crate::test_spawn::console_flags::Console;
 
 use crate::containment::windows::JobHandle;
 
@@ -31,9 +32,8 @@ pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0);
-    crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended blocker")
+        .stderr(std::process::Stdio::null());
+    crate::test_spawn::spawn_with(&mut cmd, CREATE_SUSPENDED.0, Console::Hidden).expect("spawn a suspended blocker")
 }
 
 /// What [`spawn_suspended_releasable`]'s child exits with when it runs to its end. No kill leaves
@@ -51,9 +51,9 @@ pub(crate) fn spawn_suspended_releasable() -> std::process::Child {
         .arg(format!("more >nul & exit {RELEASED_EXIT_CODE}"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0);
-    crate::test_spawn::spawn(&mut cmd).expect("spawn a suspended releasable child")
+        .stderr(std::process::Stdio::null());
+    crate::test_spawn::spawn_with(&mut cmd, CREATE_SUSPENDED.0, Console::Hidden)
+        .expect("spawn a suspended releasable child")
 }
 
 /// Lets a [`spawn_suspended_releasable`] child run to its end by itself: closes its stdin and
