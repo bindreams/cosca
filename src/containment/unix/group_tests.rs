@@ -353,7 +353,7 @@ fn pid1_uid() -> u32 {
     0
 }
 
-/// Mutant: the forced errno is not consumed (no fallback, so no line).
+/// Mutant: the stated errno is ignored (no fallback, so no line).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_refused_pidfd_open_falls_back_to_kill_naming_process_open() {
@@ -366,10 +366,13 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_process_open() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
-    let reached =
-        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
-    drop(forced);
+    let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::PERM));
+    let reached = super::check_or_signal_linux_sigkill(
+        &kernel,
+        child.pid(),
+        id,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
 
     assert!(matches!(reached, super::Reached::Yes), "got {reached:?}");
     let lines = crate::log_capture::records_since_on_current_thread(mark, "pidfd unavailable");
@@ -402,10 +405,13 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
-    let reached =
-        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
-    drop(forced);
+    let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
+    let reached = super::check_or_signal_linux_sigkill(
+        &kernel,
+        child.pid(),
+        id,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
 
     assert!(matches!(reached, super::Reached::Yes), "got {reached:?}");
     let lines = crate::log_capture::records_since_on_current_thread(mark, "pidfd unavailable");
@@ -441,9 +447,8 @@ fn the_by_number_fallback_resends_only_after_a_check_of_the_root() {
     let resend = |check: &dyn crate::containment::RootCheck| {
         let root = crate::containment::GroupRoot::new(None, check);
         let capture = Capture::start();
-        let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
-        let reached = super::check_or_signal_linux_sigkill(child.pid(), id, &root);
-        drop(forced);
+        let kernel = crate::identity::FakeKernel::new().on_pidfd_open(child.pid(), Err(rustix::io::Errno::MFILE));
+        let reached = super::check_or_signal_linux_sigkill(&kernel, child.pid(), id, &root);
         (reached, capture.group_steps())
     };
 
@@ -493,10 +498,14 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     let id = ProcessId::of(tid).found().expect("the live worker's tid resolves");
     let mark = crate::log_capture::mark();
 
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let reached =
-        super::check_or_signal_linux_sigkill(child.pid(), id, &crate::containment::GroupRoot::trusted_for_test());
-    drop(forced);
+    let kernel = crate::identity::FakeKernel::over(&crate::identity::HostKernel)
+        .on_pidfd_open(tid, Err(rustix::io::Errno::NOENT));
+    let reached = super::check_or_signal_linux_sigkill(
+        &kernel,
+        child.pid(),
+        id,
+        &crate::containment::GroupRoot::trusted_for_test(),
+    );
 
     assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");
     assert_eq!(
