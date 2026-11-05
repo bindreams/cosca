@@ -30,6 +30,7 @@ mod lifecycle;
 
 #[path = "child/suspended.rs"]
 pub(crate) mod suspended;
+pub use owned::unreaped::Unreaped;
 pub use suspended::SuspendedChild;
 
 #[path = "child/graceful.rs"]
@@ -252,7 +253,7 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        self.wait_root_unbounded()
+        Ok(lifecycle::wait_to_exit(&self.proc, None, lifecycle::Orphaned::Warn)?)
     }
 
     /// Return the exit status if the child has already exited.
