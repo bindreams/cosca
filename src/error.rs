@@ -438,7 +438,7 @@ impl Error {
     }
 
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
-    #[cfg(feature = "tokio")]
+    #[cfg(any(feature = "tokio", target_os = "macos"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
         match self {
             Error::Io(e) => e.raw_os_error(),
