@@ -957,13 +957,13 @@ pub(crate) type MemberTerm = (Option<u32>, crate::send_log::Via, i32);
 /// route is the syscall's own, and a pidfd's pid is read from its fdinfo.
 pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u32, signo: i32) {
     use crate::containment::unix::Sys;
-    use crate::identity::{pidfd_target_in, HostKernel, PidfdTarget, ProcDir};
+    use crate::identity::{pidfd_pid_in, HostKernel, PidfdTarget, ProcDir};
     use crate::send_log::Via;
     let entry = match sys {
         Sys::Pidfd(pidfd, _) => {
             // A recorder takes no fault armed for the code under test: it opens and reads past the seams.
             let pid = ProcDir::open_unforced()
-                .and_then(|dir| pidfd_target_in(&HostKernel, &dir, pidfd))
+                .and_then(|dir| pidfd_pid_in(&HostKernel, &dir, pidfd))
                 .map_err(|why| log::debug!("record_member_term: the pidfd's pid was not read: {why}"))
                 .ok()
                 .and_then(|target| match target {

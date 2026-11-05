@@ -1,11 +1,24 @@
-//! Tests for `open_verified`'s `EINVAL`/`ENOENT` arm (reaped process-group leader). On >= 6.16 the
-//! real syscall returns `ESRCH` for that case and never reaches the arm, so each real-syscall test
-//! has a forced-errno twin. The live non-leader tid case lives in `tests/linux_pidfd_wait.rs`.
+//! Tests for `open_verified_with`. On >= 6.16 the real syscall answers `ESRCH` for a reaped
+//! process-group leader and never reaches the `EINVAL`/`ENOENT` arm, so each real-syscall test has a
+//! twin that states the `pidfd_open` answer on a `FakeKernel`. The real live non-leader tid case lives
+//! in `tests/linux_pidfd_wait.rs`.
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
+use rustix::io::Errno;
+use rustix::process::{getpid, pidfd_open, PidfdFlags};
+
+use super::open_verified_with;
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, PidfdTarget, ProcessId};
+use crate::identity::stat_parse::stat_fixture;
+use crate::identity::{Existence, FakeKernel, HostKernel, ProcessId};
+
+/// A pid that no live process is expected to hold; only its `pidfd_open` row exists.
+const FABRICATED: u32 = 4242;
+
+fn fabricated_id() -> ProcessId {
+    ProcessId::from_parts_for_test(FABRICATED, 1)
+}
 
 #[path = "open_tests/fixture.rs"]
 mod fixture;
@@ -79,10 +92,10 @@ fn exited_through_open_reports_exited_for_a_reaped_pgid_leader() {
     fixture.release_and_confirm_m_exited();
 }
 
-/// Twin of the test above with `pidfd_open` forced to `EINVAL`, so the `INVAL`/`NOENT` arm runs on
-/// any kernel.
+/// Twin of the test above with `pidfd_open` stated to answer `EINVAL`, so the `INVAL`/`NOENT` arm
+/// runs on any kernel.
 #[skuld::test]
-fn exited_through_open_reports_exited_for_a_reaped_pgid_leader_with_forced_einval() {
+fn open_verified_is_gone_for_a_reaped_pgid_leader_when_pidfd_open_says_einval() {
     let (l_id, fixture) = build_reaped_pgid_leader();
     assert_eq!(
         l_id.exists(),
@@ -90,56 +103,52 @@ fn exited_through_open_reports_exited_for_a_reaped_pgid_leader_with_forced_einva
         "a reaped leader must read Gone even while its pid number stays a live PGID"
     );
 
-    let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-    let result = crate::test_child::exited_through_open(l_id, None);
-    drop(forced);
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(l_id.pid(), Err(Errno::INVAL));
+    let result = open_verified_with(&kernel, l_id);
     assert!(
-        matches!(result, Ok(true)),
-        "a forced EINVAL on a reaped group leader whose group lives on must report exited \
-         (Ok(true)), not {result:?}"
+        matches!(result, Ok(None)),
+        "an EINVAL on a reaped group leader whose group lives on must be gone (Ok(None)), not {result:?}"
     );
 
     fixture.release_and_confirm_m_exited();
 }
 
-/// A reaped leader is exited whatever `/proc` view this process has: `kill(pid, 0)` answering
-/// `ESRCH` needs no `/proc`.
+/// A reaped leader is gone whatever `/proc` view this process has: `kill(pid, 0)` answering `ESRCH`
+/// needs no `/proc`.
 #[skuld::test]
-fn exited_through_open_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
-
+fn open_verified_is_gone_for_a_reaped_pgid_leader_whatever_the_proc_view() {
     let (l_id, fixture) = build_reaped_pgid_leader();
-    for view in [ForcedView::Diverged, ForcedView::Unassessable] {
-        let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-        let forced_view = force_proc_view_once(view);
-        let result = crate::test_child::exited_through_open(l_id, None);
-        drop(forced_view);
-        drop(forced_errno);
+    let refused = || FakeKernel::over(&HostKernel).on_pidfd_open(l_id.pid(), Err(Errno::INVAL));
+    for (view, kernel) in [
+        ("diverged", refused().diverged_view()),
+        ("unreadable", refused().unreadable_view()),
+    ] {
+        let result = open_verified_with(&kernel, l_id);
         assert!(
-            matches!(result, Ok(true)),
-            "a reaped leader is exited under a {view:?} view, got {result:?}"
+            matches!(result, Ok(None)),
+            "a reaped leader is gone under a {view} view, got {result:?}"
         );
     }
 
     fixture.release_and_confirm_m_exited();
 }
 
-/// A live non-leader tid with `pidfd_open` forced to `ENOENT` is `NotThreadGroupLeader` carrying
-/// the pid and the errno, not exited.
+/// A live non-leader tid whose `pidfd_open` answers `EINVAL` (< 6.16) or `ENOENT` (>= 6.16) is
+/// `NotThreadGroupLeader` carrying the pid and the errno, not gone.
 #[skuld::test]
-fn exited_through_open_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
+fn open_verified_on_a_live_non_leader_tid_is_not_thread_group_leader_whichever_errno() {
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
 
-    let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let result = crate::test_child::exited_through_open(id, None);
-    drop(forced);
-    match result {
-        Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
-            assert_eq!(pid, id.pid());
-            assert_eq!(source.raw_os_error(), Some(libc::ENOENT));
+    for errno in [Errno::INVAL, Errno::NOENT] {
+        let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Err(errno));
+        match open_verified_with(&kernel, id) {
+            Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
+                assert_eq!(pid, id.pid());
+                assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
+            }
+            other => panic!("{errno} on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
         }
-        other => panic!("a forced ENOENT on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
     }
 }
 
@@ -184,72 +193,76 @@ fn assert_unassessable_with_cause(
 /// A live non-leader tid under a DIVERGED view: `Unassessable` naming the view and the
 /// `pidfd_open` errno, never a raw errno (a bare `NotFound` from `ENOENT` on 6.16+ reads as "gone").
 #[skuld::test]
-fn exited_through_open_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
-
+fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
     crate::log_capture::install();
     let worker = LiveNonLeaderTid::spawn();
     let marker = format!("pid {} identity could not be confirmed", worker.id.pid());
     let mark = crate::log_capture::mark();
-    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let forced_view = force_proc_view_once(ForcedView::Diverged);
-    let result = crate::test_child::exited_through_open(worker.id, None);
-    drop(forced_view);
-    drop(forced_errno);
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(worker.id.pid(), Err(Errno::NOENT))
+        .diverged_view();
+    let result = open_verified_with(&kernel, worker.id).map(|fd| fd.is_some());
     assert_unassessable_with_cause(result, &["outer pid namespace", "pidfd_open: "], true, &marker, mark);
 }
 
 /// Twin for a view that could not be established: the reason is in the message.
 #[skuld::test]
-fn exited_through_open_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
-    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
-
+fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
     crate::log_capture::install();
     let worker = LiveNonLeaderTid::spawn();
     let marker = format!("pid {} identity could not be confirmed", worker.id.pid());
     let mark = crate::log_capture::mark();
-    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-    let forced_view = force_proc_view_once(ForcedView::Unassessable);
-    let result = crate::test_child::exited_through_open(worker.id, None);
-    drop(forced_view);
-    drop(forced_errno);
-    assert_unassessable_with_cause(result, &["forced by a test", "pidfd_open: "], true, &marker, mark);
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(worker.id.pid(), Err(Errno::INVAL))
+        .unreadable_view();
+    let result = open_verified_with(&kernel, worker.id).map(|fd| fd.is_some());
+    assert_unassessable_with_cause(
+        result,
+        &["self/status could not be read", "pidfd_open: "],
+        true,
+        &marker,
+        mark,
+    );
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads
-/// `Present` but `Dead`: exited, not an error. Both answers are forced here; the real ptrace
-/// fixture is in `tests/linux_pidfd_wait.rs`.
+/// `Present` but `Dead`: gone, not an error. Its `stat` is stated here; the real ptrace fixture is
+/// in `tests/linux_pidfd_wait.rs`.
 #[skuld::test]
-fn exited_through_open_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
+fn open_verified_on_a_dead_non_leader_tid_is_gone() {
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
 
-    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
-    let forced_alive = super::fault::force_alive_once(Liveness::Dead);
-    let result = crate::test_child::exited_through_open(id, None);
-    drop(forced_alive);
-    drop(forced_errno);
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(id.pid(), Err(Errno::NOENT))
+        .on_read(
+            &format!("{}/stat", id.pid()),
+            Ok(&stat_fixture("Z", id.start_token_raw())),
+        );
+    let result = open_verified_with(&kernel, id);
     assert!(
-        matches!(result, Ok(true)),
-        "a Present but Dead non-leader tid must report exited (Ok(true)), not {result:?}"
+        matches!(result, Ok(None)),
+        "a Present but Dead non-leader tid must be gone (Ok(None)), not {result:?}"
     );
 }
 
 /// The `INVAL`/`NOENT` arm's liveness check refused: `Unassessable` carrying the errno and one
-/// `warn`, never exited.
+/// `warn`, never gone. The existence check reads the `stat` first and finds the process; the
+/// liveness check's read, the second, is refused.
 #[skuld::test]
-fn exited_through_open_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
+fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     crate::log_capture::install();
     let worker = LiveNonLeaderTid::spawn();
     let id = worker.id;
     let marker = format!("pid {} identity could not be confirmed", id.pid());
     let mark = crate::log_capture::mark();
 
-    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-    let forced_alive = super::fault::force_alive_once(Liveness::Unknown);
-    let result = crate::test_child::exited_through_open(id, None);
-    drop(forced_alive);
-    drop(forced_errno);
+    let stat = format!("{}/stat", id.pid());
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(id.pid(), Err(Errno::INVAL))
+        .on_read(&stat, Ok(&stat_fixture("S", id.start_token_raw())))
+        .on_read_after(&stat, 1, Err(libc::EACCES));
+    let result = open_verified_with(&kernel, id);
     match result {
         Err(Error::Unassessable {
             source: Some(source), ..
@@ -265,18 +278,18 @@ fn exited_through_open_is_unassessable_when_the_einval_arms_liveness_is_unknown(
     );
 }
 
-/// The `Unknown` branch of the `INVAL`/`NOENT` arm can't be produced for real, so both the errno
-/// and the exists() answer are forced. Unknown must be `Unassessable` carrying the errno + one
-/// warn, never exited.
+/// The `Unknown` branch of the `INVAL`/`NOENT` arm can't be produced for real, so the errno and the
+/// refused `stat` are stated. Unknown must be `Unassessable` carrying the errno + one warn, never
+/// gone.
 #[skuld::test]
 fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
-    let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current());
-    drop(forced_exists);
-    drop(forced_errno);
+    let own = ProcessId::current();
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(own.pid(), Err(Errno::INVAL))
+        .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
+    let result = open_verified_with(&kernel, own);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["existence query"],
@@ -284,36 +297,6 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
         UNASSESSABLE,
         mark,
     );
-}
-
-/// Twin for the post-open re-verify: a real pidfd on a live child, `exists()` forced `Unknown`.
-/// `Unassessable` with no errno (`pidfd_open` succeeded) + one warn, never exited.
-#[skuld::test]
-fn exited_through_open_is_unassessable_when_the_post_open_exists_is_unknown() {
-    use crate::containment::cgroup::test_support::{block_on, fork_running};
-
-    crate::log_capture::install();
-    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
-    let gate_r_fd = gate_r.as_raw_fd();
-    let child = fork_running(|| block_on(gate_r_fd));
-    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
-    let marker = format!("pid {} identity could not be confirmed", id.pid());
-    let mark = crate::log_capture::mark();
-
-    let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = crate::test_child::exited_through_open(id, None);
-    drop(forced_exists);
-    assert!(
-        matches!(result, Err(Error::Unassessable { source: None, .. })),
-        "Existence::Unknown after a successful pidfd_open must be Unassessable, not {result:?}"
-    );
-    assert_eq!(
-        crate::log_capture::levels_since(mark, &marker),
-        vec![log::Level::Warn],
-        "the Unassessable verdict must be logged once, at warn"
-    );
-
-    drop(gate_w); // EOF releases the child; `child` then kills and reaps it
 }
 
 /// A panic between building the fixture and releasing it must still tear down `L` and `M`.
@@ -435,16 +418,22 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
     reap(child);
 }
 
-/// The SUCCESS path with the pidfd's fdinfo `Pid:` forced: the target's pid as the mounted
-/// procfs numbers it. `ProcessId::current()` is a live target, so `pidfd_open` really succeeds.
-///
-fn open_verified_current_with_fdinfo(
-    answer: Result<PidfdTarget, i32>,
-) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
-    let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
-    let result = super::open_verified(ProcessId::current());
-    drop(forced);
-    result
+/// The SUCCESS path with the fdinfo of this process's own pidfd stated: its `Pid:` is the target as
+/// the mounted procfs numbers it. `ProcessId::current()` is a live target, so the pidfd is real;
+/// the fake hands it out as `pidfd_open`'s answer, so that the stated path names its number.
+fn open_verified_current_with_fdinfo(fdinfo: Result<&[u8], i32>) -> Result<Option<OwnedFd>, Error> {
+    let own = ProcessId::current();
+    let pidfd = pidfd_open(getpid(), PidfdFlags::empty()).expect("pidfd_open of this process");
+    let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(own.pid(), Ok(pidfd))
+        .on_read(&path, fdinfo);
+    open_verified_with(&kernel, own)
+}
+
+/// An fdinfo whose `Pid:` line says `pid` (`-1`: the target was reaped).
+fn fdinfo_naming(pid: i64) -> Vec<u8> {
+    format!("Pid:\t{pid}\n").into_bytes()
 }
 
 /// A pidfd whose fdinfo `Pid:` is not `id.pid()` (another pid, or `0` = invisible) describes a
@@ -455,7 +444,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
     let own = std::process::id();
     for named in [0, own + 1] {
         let mark = crate::log_capture::mark();
-        let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(named)));
+        let result = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(i64::from(named))));
         assert_unassessable_with_cause(
             result.map(|fd| fd.is_some()),
             &["outer pid namespace", &format!("numbers the target {named}")],
@@ -472,9 +461,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
 #[skuld::test]
 fn an_unassessable_verdict_ends_with_what_the_open_left_undone() {
     crate::log_capture::install();
-    let forced = crate::identity::proc_view_fault::force_fdinfo_once(Ok(PidfdTarget::Pid(0)));
-    let result = super::open_verified(ProcessId::current());
-    drop(forced);
+    let result = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(0)));
     match result {
         Err(e @ Error::Unassessable { .. }) => assert!(
             e.to_string()
@@ -504,20 +491,20 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 /// through the same `/proc` dirfd.
 #[skuld::test]
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
-    let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())));
-    assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
-    let unforced = super::open_verified(ProcessId::current());
+    let stated = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(i64::from(std::process::id()))));
+    assert!(matches!(stated, Ok(Some(_))), "got {stated:?}");
+    let real = open_verified_with(&HostKernel, ProcessId::current());
     assert!(
-        matches!(unforced, Ok(Some(_))),
-        "the real fdinfo must match too, got {unforced:?}"
+        matches!(real, Ok(Some(_))),
+        "the real fdinfo must match too, got {real:?}"
     );
 }
 
-/// A pidfd whose fdinfo says `Reaped` (forced): the target is gone, so `Ok(None)`, not `Unassessable`.
+/// A pidfd whose fdinfo says `Reaped`: the target is gone, so `Ok(None)`, not `Unassessable`.
 /// Mutant: "`Reaped` is `Unassessable`".
 #[skuld::test]
 fn open_verified_reports_gone_when_the_pidfds_fdinfo_says_the_target_was_reaped() {
-    let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Reaped));
+    let result = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(-1)));
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -531,7 +518,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
         .found()
         .expect("the unreaped child has an identity");
     child.wait().expect("reap the child");
-    let result = super::verify_pidfd_target(id, pidfd);
+    let result = super::verify_pidfd_target(&HostKernel, id, pidfd);
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -541,9 +528,9 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
 fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let forced = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current());
-    drop(forced);
+    let own = ProcessId::current();
+    let kernel = FakeKernel::over(&HostKernel).on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
+    let result = open_verified_with(&kernel, own);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["existence query"],
@@ -553,41 +540,29 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     );
 }
 
-// `pidfd_open` refusals =====
+// `pidfd_open` answers =====
+//
+// A fake with only a `pidfd_open` row, and a fabricated id: an answer that decides the open on its
+// own reads nothing else, and a fake with no other row panics if it does.
 
-/// A live child that blocks until the returned gate drops and is killed and reaped when the first
-/// value drops.
-fn live_child() -> (
-    crate::containment::cgroup::test_support::KillOnDrop,
-    std::io::PipeWriter,
-    ProcessId,
-) {
-    use crate::containment::cgroup::test_support::{block_on, fork_running};
-
-    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
-    let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
-    let child = fork_running(|| block_on(gate_r_fd));
-    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
-    (child, gate_w, id)
+/// `ESRCH` is the answer for a reaped process (6.16 and later also for a reaped process-group
+/// leader): gone, with nothing else read.
+#[skuld::test]
+fn open_verified_is_gone_when_pidfd_open_says_esrch() {
+    let id = fabricated_id();
+    let kernel = FakeKernel::new().on_pidfd_open(id.pid(), Err(Errno::SRCH));
+    let result = open_verified_with(&kernel, id);
+    assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
-/// `open` on a live child with `pidfd_open` forced to `errno`, and the error it answers.
-///
-/// `open` must be zero-wait: an unconsumed forced errno then fails the assertion instead of
-/// hanging on the live child.
-fn refused_with(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result<(), Error>) -> Error {
-    let (_child, _gate, id) = live_child();
-    let forced = super::fault::force_pidfd_open_errno_once(errno);
-    let result = open(id);
-    drop(forced);
-    match result {
+/// The error `open_verified_with` answers when `pidfd_open` answers `errno`.
+fn refused_with(errno: Errno) -> Error {
+    let id = fabricated_id();
+    let kernel = FakeKernel::new().on_pidfd_open(id.pid(), Err(errno));
+    match open_verified_with(&kernel, id) {
         Err(e) => e,
-        Ok(()) => panic!("a pidfd_open answering {errno} must fail the operation, but it succeeded"),
+        Ok(_) => panic!("a pidfd_open answering {errno} must fail the open, but it succeeded"),
     }
-}
-
-fn open_op(id: ProcessId) -> Result<(), Error> {
-    super::open_verified(id).map(drop)
 }
 
 /// Every refusal is `Unsupported` in the policy's message shape.
@@ -597,12 +572,12 @@ fn open_op(id: ProcessId) -> Result<(), Error> {
 #[skuld::test]
 fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {
     for (errno, name) in [
-        (rustix::io::Errno::NOSYS, "ENOSYS"),
-        (rustix::io::Errno::PERM, "EPERM"),
-        (rustix::io::Errno::ACCESS, "EACCES"),
-        (rustix::io::Errno::NODEV, "ENODEV"),
+        (Errno::NOSYS, "ENOSYS"),
+        (Errno::PERM, "EPERM"),
+        (Errno::ACCESS, "EACCES"),
+        (Errno::NODEV, "ENODEV"),
     ] {
-        let err = refused_with(errno, open_op);
+        let err = refused_with(errno);
         assert!(matches!(&err, Error::Unsupported { platform: "linux", .. }), "{err:?}");
         assert_eq!(
             err.to_string(),
@@ -614,20 +589,15 @@ fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {
     }
 }
 
-/// Every act by id goes through the one open, so each names it.
+/// The open names itself as the operation: every act by id goes through it, so none keeps a name
+/// of its own (`tests/linux_pidfd_refused.rs` drives the acts).
 ///
-/// Mutant: an act keeps an operation name of its own.
+/// Mutant: the open names another operation.
 #[skuld::test]
 fn an_unsupported_open_names_process_open() {
-    let wait = refused_with(rustix::io::Errno::PERM, |id| {
-        crate::test_child::exited_through_open(id, Some(std::time::Duration::ZERO)).map(drop)
-    });
-    let terminate = refused_with(rustix::io::Errno::PERM, crate::os_process::terminate_by_id);
-    for err in [wait, terminate] {
-        assert!(
-            err.to_string().starts_with("process open is not supported on linux: "),
-            "{err}"
-        );
+    match refused_with(Errno::PERM) {
+        Error::Unsupported { op, .. } => assert_eq!(op, "process open"),
+        other => panic!("a refused pidfd_open must be Unsupported, got {other:?}"),
     }
 }
 
@@ -638,11 +608,11 @@ fn an_unsupported_open_names_process_open() {
 #[skuld::test]
 fn a_transient_pidfd_open_failure_stays_io_naming_the_syscall() {
     for (errno, text, code) in [
-        (rustix::io::Errno::MFILE, "Too many open files", libc::EMFILE),
-        (rustix::io::Errno::NFILE, "Too many open files in system", libc::ENFILE),
-        (rustix::io::Errno::NOMEM, "Cannot allocate memory", libc::ENOMEM),
+        (Errno::MFILE, "Too many open files", libc::EMFILE),
+        (Errno::NFILE, "Too many open files in system", libc::ENFILE),
+        (Errno::NOMEM, "Cannot allocate memory", libc::ENOMEM),
     ] {
-        match refused_with(errno, open_op) {
+        match refused_with(errno) {
             Error::Io(e) => {
                 assert_eq!(e.to_string(), format!("pidfd_open: {text} (os error {code})"));
                 let source = std::error::Error::source(&e).expect("the OS error is kept as the source");

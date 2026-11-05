@@ -83,7 +83,7 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
 /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(linux::open::open_verified(id)?
+    return Ok(linux::open::open_verified_with(&crate::identity::HostKernel, id)?
         .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>));
     #[cfg(windows)]
     return Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>));
