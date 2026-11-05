@@ -494,10 +494,10 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    // On a kernel before 6.19 a task leaves its cgroup before it can be collected, so a front the
-    // leaf's kill ended may still read as running at the look: the look awaits its end. Only once
-    // the kill was written, or a kill that failed would hang the look; `assert_killed` and the
-    // steps below fail on the missing write instead.
+    // Before Linux 6.19 a task leaves its cgroup before it can be collected, so a front the leaf's
+    // kill ended may still read as running at the look: the look awaits its end, but only once the
+    // kill was written. A failed kill would otherwise hang the look; the assertions below fail on
+    // the missing write instead.
     let awaited = Arc::new(AtomicBool::new(false));
     crate::containment::cgroup::fault::record_leaf_steps();
     child.proc.script_over(|fake| fake).on_look({
@@ -519,7 +519,10 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
-    assert!(awaited.load(Ordering::SeqCst), "the look came after the leaf's kill");
+    assert!(
+        awaited.load(Ordering::SeqCst),
+        "some look came after the leaf's kill was written, and awaited the front's end"
+    );
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
