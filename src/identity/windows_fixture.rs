@@ -40,9 +40,9 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
@@ -84,6 +84,34 @@ fn drop_se_debug_privilege(_alone: &Completion) {
     adjusted.expect("AdjustTokenPrivileges(SeDebugPrivilege, SE_PRIVILEGE_REMOVED)");
 }
 
+/// The image path of process `pid`, read on a handle of its own; `None` once it is gone.
+fn image_file_name(pid: u32) -> Option<String> {
+    use super::backend::{close, open_classified, Opened};
+    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Opened::Found(handle) => handle,
+        Opened::Gone => return None,
+        Opened::Denied(e) => panic!("fixture: the job member {pid} cannot be opened: {e}"),
+    };
+    // 32 767 UTF-16 units and a terminator: the longest path Windows has.
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `handle` is a live handle with the query right, and `len` is `buffer`'s length in units.
+    let read = unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut len) };
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is live and owned here.
+    unsafe { GetExitCodeProcess(handle, &mut exit_code) }.expect("GetExitCodeProcess on an owned handle");
+    close(handle);
+    match read {
+        Ok(()) => Some(String::from_utf16_lossy(&buffer[..len as usize])),
+        // The query fails on a process that has exited since it was listed. The fixture's
+        // processes never exit with 259 (`is_running`).
+        Err(e) if exit_code == STILL_ACTIVE.0 as u32 => {
+            panic!("fixture: the image of the live job member {pid} cannot be read: {e}")
+        }
+        Err(_) => None,
+    }
+}
+
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
 const NO_ACE: u32 = u32::MAX;
 
@@ -94,9 +122,7 @@ pub(crate) struct RestrictedChild {
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
     /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `ping.exe` it launched
-    /// ran on for an hour. That orphan is not just a leak: `wait_for_child` reads a
-    /// host-wide `(pid, ppid)` snapshot, where a stranded grandchild whose dead parent pid
-    /// Windows later recycles onto a new fixture shell is a candidate the order-key rule must drop.
+    /// ran on for an hour. `wait_for_child` reads this job's members.
     job: HANDLE,
     pid: u32,
 }
@@ -138,28 +164,31 @@ impl RestrictedChild {
         );
     }
 
-    /// The pid of this fixture's first child, once the shell has spawned it. Polls the
-    /// `(pid, ppid)` snapshot the crate already builds — bounded by the child's appearance,
-    /// which `cmd /c` guarantees, and asserted rather than timed out.
+    /// The pid of the `ping.exe` this fixture's shell launched, once it exists.
+    ///
+    /// Reads the fixture's job, not the process tree: the job lists exactly the processes
+    /// created under the shell, so a pre-existing orphan whose creator pid was recycled onto
+    /// this shell is not in it. The job also holds the console host (`conhost.exe`) the shell
+    /// was given, listed before `ping`, so the child is the member whose image is `ping.exe`.
+    /// Nothing opens the shell, which may grant us no query right (`spawn_restricted_shell`
+    /// with `PROCESS_SYNCHRONIZE`); the members are opened by pid, and they are not
+    /// DACL-restricted.
+    ///
+    /// No event announces the child (a job's completion messages are not guaranteed to be
+    /// delivered), so this re-reads the live member list until `cmd /c` has created it.
     pub(crate) fn wait_for_child(&self) -> u32 {
-        // Windows never reparents and recycles pids from a small dense table, so a raw
-        // `ppid == self.pid` scan can match a pre-existing orphan whose real parent exited
-        // and whose pid was then handed to this fixture. Route through the crate's own
-        // stale-ppid defense (`children_of_from_key` applies the order-key rule) so only a
-        // genuine child is returned. The fixture's pid may be unopenable by pid, which is how
-        // `anchor` reads the anchor's order key, so the key comes from the owned handle.
-        let (key, me_key) = super::backend::ordered_from_handle(self.handle, self.pid, None)
-            .0
-            .found()
-            .expect("the owned handle always yields an identity");
-        let me = super::ProcessId::from_parts_for_test(self.pid, key);
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
-            let kernel = &super::HostKernel;
-            let parents = crate::containment::enumerate::process_parents(kernel).expect("the process snapshot");
-            let kids = crate::containment::treewalk::children_of_from_key(kernel, me, me_key, &parents);
-            if let Some(kid) = kids.first() {
-                return kid.pid();
+            let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
+            for pid in members.into_iter().filter(|&pid| pid != self.pid) {
+                let is_ping = image_file_name(pid).is_some_and(|image| {
+                    std::path::Path::new(&image)
+                        .file_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
+                });
+                if is_ping {
+                    return pid;
+                }
             }
             std::thread::yield_now();
         }
