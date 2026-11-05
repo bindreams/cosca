@@ -179,6 +179,11 @@ impl OwnedChild {
         crate::os_process::child::adopt_std(child, id).map(OwnedChild::new)
     }
 
+    /// The child's pid, if its spawn learned it; see [`OsChild::pid`].
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.os.pid()
+    }
+
     /// The OS object that names the child, borrowed from `self`.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn os_handle(&self) -> crate::os_process::child::OsHandle<'_> {

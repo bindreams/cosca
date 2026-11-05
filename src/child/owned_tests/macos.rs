@@ -265,6 +265,10 @@ impl OsProcess for SharedMac {
 }
 
 impl OsChild for SharedMac {
+    fn pid(&self) -> Option<u32> {
+        self.0.pid()
+    }
+
     fn peek(&self) -> Result<PeekOutcome, Error> {
         self.0.peek()
     }

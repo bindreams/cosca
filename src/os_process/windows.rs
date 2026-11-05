@@ -171,6 +171,10 @@ impl OsProcess for WindowsProcess {
 }
 
 impl OsChild for WindowsProcess {
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
     fn peek(&self) -> Result<PeekOutcome, Error> {
         debug_assert!(self.has_synchronize, "a child's handle can be waited on");
         exit_only::peek(&Target::Handle(self.handle.as_handle())).map_err(Error::Io)
