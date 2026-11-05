@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::parse::{is_at_or_under, parse_v2_relative_path};
+use crate::child::owned::teardown::Reach;
 
 /// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
 /// The request is the same 32 bits under glibc's `unsigned long` and musl's `int`.
@@ -286,11 +287,22 @@ impl Subtree {
 
     /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
     /// only then does the task's exit follow, so only then may it be waited for.
-    pub(crate) fn reached(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
         if !self.killed.load(Ordering::Relaxed) {
             return Ok(false);
         }
         self.holds(pid, pidfd)
+    }
+}
+
+impl Reach for Subtree {
+    /// [`Subtree::reached_by`], asked with the child's pid and pidfd. A child with no pid cannot be placed: it
+    /// has no number to ask `/proc` with, so whether the kill reached it is not known.
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+        match child.pid() {
+            Some(pid) => self.reached_by(pid, child.pidfd()),
+            None => Err(io::Error::other("the child's pid is not known, so it cannot be placed")),
+        }
     }
 }
 

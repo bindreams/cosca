@@ -13,13 +13,13 @@ pub(crate) mod open;
 
 #[derive(Debug)]
 pub(crate) struct LinuxProcess {
-    pid: u32,
+    pid: Option<u32>,
     pidfd: OwnedFd,
 }
 
 impl LinuxProcess {
-    /// A process named by `pidfd`, which was opened while `pid` was provably it.
-    pub(crate) fn new(pid: u32, pidfd: OwnedFd) -> Self {
+    /// A process named by `pidfd`, which was opened while `pid` (if known) was provably it.
+    pub(crate) fn new(pid: Option<u32>, pidfd: OwnedFd) -> Self {
         Self { pid, pidfd }
     }
 }
@@ -43,6 +43,10 @@ impl OsProcess for LinuxProcess {
 }
 
 impl OsChild for LinuxProcess {
+    fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     fn peek(&self) -> Result<PeekOutcome, Error> {
         exit_only::linux::peek(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
     }
