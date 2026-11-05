@@ -22,3 +22,14 @@ fn host_signal_probe_is_ok_for_this_process_and_esrch_for_i32_max() {
         Err(Errno::SRCH)
     );
 }
+
+#[skuld::test]
+fn host_pidfd_open_opens_this_process_and_says_esrch_for_i32_max() {
+    assert!(HostKernel.pidfd_open(getpid()).is_ok());
+    assert_eq!(
+        HostKernel
+            .pidfd_open(Pid::from_raw(i32::MAX).expect("a positive number"))
+            .map(drop),
+        Err(Errno::SRCH)
+    );
+}

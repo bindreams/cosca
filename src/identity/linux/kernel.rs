@@ -5,13 +5,18 @@
 //! `&HostKernel`. Reads no test answers for stay raw until a test needs them.
 
 use std::io;
+use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
-use rustix::process::{test_kill_process, Pid};
+use rustix::process::{pidfd_open, test_kill_process, Pid, PidfdFlags};
 
 use super::proc_view::{ProcDir, ViewUnreadable};
 
 pub(crate) trait Kernel: Sync {
+    /// `pidfd_open(target, 0)`. The caller decides what is a pidfd target; the kernel is asked only
+    /// about one.
+    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno>;
+
     /// `ProcDir::open`: `openat2` of `/proc`, proven procfs's root.
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable>;
 
@@ -28,6 +33,10 @@ pub(crate) trait Kernel: Sync {
 pub(crate) struct HostKernel;
 
 impl Kernel for HostKernel {
+    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
+        pidfd_open(target, PidfdFlags::empty())
+    }
+
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
         ProcDir::open()
     }
