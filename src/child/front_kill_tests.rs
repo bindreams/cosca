@@ -195,23 +195,28 @@ fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
         let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
         let id = child.id();
         let pid = id.pid();
-        let (detail, fate) = failed_password_write_detail(child);
+        let (detail, fate, handed_back) = failed_password_write_detail(child, stdin);
         assert_eq!(
             fate,
             crate::error::ChildFate::Running { id: Some(id) },
-            "a live front is left"
+            "a live front is handed back"
         );
+        assert_eq!(handed_back.unreaped().pid(), Some(pid));
         assert!(detail.contains("could not be terminated"), "{detail}");
         assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
-        drop(stdin);
-        assert_reaped_unsignalled(pid);
+        let status = handed_back.wait();
+        assert!(status.success(), "the front was signalled: {status:?}");
     }
 }
 
 /// The `detail` of the error the sync `finish_elevated` returns for `child` after a failed
-/// password write, and its fate.
-pub(crate) fn failed_password_write_detail(child: crate::Child) -> (String, crate::error::ChildFate) {
-    let (err, fate) = crate::child::spawn::finish_elevated(
+/// password write, its fate, and the child it handed back, if it did, with `release` (what lets the
+/// front exit; `()`: nothing).
+pub(crate) fn failed_password_write_detail<R>(
+    child: crate::Child,
+    release: R,
+) -> (String, crate::error::ChildFate, crate::test_child::HandedBack<R>) {
+    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
@@ -219,11 +224,11 @@ pub(crate) fn failed_password_write_detail(child: crate::Child) -> (String, crat
         }),
     )
     .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with();
+    .expect_may_have_started_parts(release);
     let Error::Elevation { detail, .. } = err else {
         panic!("expected an Elevation error, got {err:?}");
     };
-    (detail, fate)
+    (detail, fate, handed_back)
 }
 
 /// A front that exits on its `SIGTERM` within the grace is not escalated against: its status is
@@ -293,7 +298,8 @@ fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exited() {
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     assert!(reap(pid).is_some(), "the test reaps the front itself");
-    let (detail, fate) = failed_password_write_detail(child);
+    let (detail, fate, handed_back) = failed_password_write_detail(child, ());
+    assert!(handed_back.is_none(), "a front someone else reaped is not handed back");
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(
         detail.contains("the elevated child had already exited, and was reaped by someone else"),
@@ -396,7 +402,7 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     let id = child.id();
     let pid = id.pid();
-    let (err, fate) = crate::child::spawn::finish_elevated(
+    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
@@ -404,12 +410,13 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         }),
     )
     .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with();
+    .expect_may_have_started_parts(stdin);
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
-        "a live front is left"
+        "a live front is handed back"
     );
+    assert_eq!(handed_back.unreaped().pid(), Some(pid));
     assert_eq!(
         groups.killed(),
         Vec::<i32>::new(),
@@ -419,14 +426,20 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(detail.contains("could not be terminated"), "{detail}");
+    assert!(detail.contains("it is handed back to the caller"), "{detail}");
     assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
-    drop(stdin);
-    assert_reaped_unsignalled(pid);
+    // Released: the front exits by itself, unsignalled.
+    let status = handed_back.wait();
+    assert!(status.success(), "the front was signalled: {status:?}");
 }
 
-/// The fate of the `finish_elevated` a failed password write runs for a live sudo front `child`.
-fn failed_password_write_fate(child: crate::Child) -> crate::error::ChildFate {
-    crate::child::spawn::finish_elevated(
+/// The fate of the `finish_elevated` a failed password write runs for a live sudo front `child`,
+/// and the front it handed back, if it did.
+fn failed_password_write_fate<R>(
+    child: crate::Child,
+    release: R,
+) -> (crate::error::ChildFate, crate::test_child::HandedBack<R>) {
+    let (_, fate, handed_back) = crate::child::spawn::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
@@ -434,21 +447,22 @@ fn failed_password_write_fate(child: crate::Child) -> crate::error::ChildFate {
         }),
     )
     .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with()
-    .1
+    .expect_may_have_started_parts(release);
+    (fate, handed_back)
 }
 
-/// A live front is left running, and its fate names it by its identity.
+/// A live front is handed back, running, and its fate names it by its identity.
 ///
-/// Mutant: the refused kill's fate is `Unknown`, or carries no identity.
+/// Mutant: the refused kill's fate is `Unknown`, or carries no identity; the front is not handed back.
 #[skuld::test]
-fn a_failed_password_write_leaves_a_live_front_running_and_names_it() {
+fn a_failed_password_write_hands_back_a_live_front_and_names_it() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     let id = child.id();
-    let fate = failed_password_write_fate(child);
+    let (fate, handed_back) = failed_password_write_fate(child, stdin);
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
-    drop(stdin);
-    assert_reaped_unsignalled(id.pid());
+    assert_eq!(handed_back.unreaped().id(), Some(id));
+    let status = handed_back.wait();
+    assert!(status.success(), "the front was signalled: {status:?}");
 }
 
 /// A live front, refused its kill, that exits and is reaped by someone else before the failure's
@@ -467,7 +481,9 @@ fn a_live_front_reaped_elsewhere_after_the_refused_kill_is_gone() {
         let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
         assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
     });
-    assert_eq!(failed_password_write_fate(child), crate::error::ChildFate::Gone);
+    let (fate, handed_back) = failed_password_write_fate(child, ());
+    assert!(handed_back.is_none(), "a front someone else reaped is not handed back");
+    assert_eq!(fate, crate::error::ChildFate::Gone);
 }
 
 /// A failed password write whose front had already exited says so, not that it terminated the
@@ -518,7 +534,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     crate::test_child::wait_until_zombie(child.id().pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
-    let (err, fate) = crate::child::spawn::finish_elevated(
+    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
@@ -526,14 +542,18 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
         }),
     )
     .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with();
+    .expect_may_have_started_parts(());
     assert_eq!(fate, crate::error::ChildFate::Killed, "the exit was not collected");
+    // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
+    // reaped elsewhere and returns at once.
+    handed_back.unreaped();
+    drop(handed_back);
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
     let Error::Elevation { detail, .. } = &err else {
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(
-        detail.contains("the elevated child had already exited, but could not be reaped"),
+        detail.contains("(it had already exited): the wait failed: forced reap failure"),
         "{detail}"
     );
     assert!(!detail.contains("killed"), "{detail}");
@@ -575,12 +595,13 @@ fn terminate_of_a_live_sudo_front_is_sent() {
 
 /// Spawns of a `cat` marked as an elevation-derived `sudo` front, in `contain` mode if any, that fail
 /// after their fork: once in the attach, once in the identity check. Returns each failure with the
-/// child's pid. The failed spawn closes the `cat`'s stdin, so a front left alone exits 0.
+/// child's pid and the child it handed back, if it did. The failed spawn closes the `cat`'s stdin, so
+/// a front left alone exits 0.
 #[cfg(target_os = "linux")]
 pub(crate) fn failed_front_spawns(
     contain: Option<ContainMode>,
     spawn: impl Fn(&mut Command) -> Result<(), Error>,
-) -> [(Error, u32); 2] {
+) -> [(Error, u32, crate::test_child::HandedBack<()>); 2] {
     use crate::child::spawn::fault;
     // Each arm, and whether it comes after the identity read, which then names the front.
     let arms: [(fn(bool), bool); 2] = [
@@ -600,9 +621,8 @@ pub(crate) fn failed_front_spawns(
         let err = spawn(&mut cmd);
         force_arm(false);
         // Both arms come after `exec`.
-        let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-            err.expect_err("the forced arm fails the spawn"),
-        );
+        let (err, fate, handed_back) =
+            crate::test_child::expect_may_have_started_parts(err.expect_err("the forced arm fails the spawn"), ());
         let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
             panic!("the seam must capture a resolved identity");
         };
@@ -615,7 +635,7 @@ pub(crate) fn failed_front_spawns(
             }
         };
         assert_eq!(fate, expected, "{err}");
-        (err, id.pid())
+        (err, id.pid(), handed_back)
     })
 }
 
@@ -641,8 +661,8 @@ pub(crate) fn reap(pid: u32) -> Option<std::process::ExitStatus> {
 /// carry the front's fate in their text, `fate`.
 #[cfg(target_os = "linux")]
 #[track_caller]
-pub(crate) fn assert_noted(failures: &[(Error, u32); 2], fate: &str) {
-    let [(attach, attach_pid), (identity, identity_pid)] = failures;
+pub(crate) fn assert_noted(failures: &[(Error, u32, crate::test_child::HandedBack<()>); 2], fate: &str) {
+    let [(attach, attach_pid, _), (identity, identity_pid, _)] = failures;
     assert!(
         matches!(attach, Error::Containment { .. }),
         "the attach failure keeps its variant: {attach:?}"
@@ -659,14 +679,21 @@ pub(crate) fn assert_noted(failures: &[(Error, u32); 2], fate: &str) {
 }
 
 /// A spawn that fails after its fork sends an elevation front nothing (a kill would orphan the
-/// program), leaves it unreaped, and says so on the error it would have returned anyway.
+/// program), hands it back in the error, and says so on the error it would have returned anyway.
+///
+/// Mutants: the front is left running and dropped; the note says it is left unreaped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
+fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
     let failures = failed_front_spawns(None, |cmd| cmd.spawn().map(drop));
-    assert_noted(&failures, "the elevated program may be running; it is left unreaped");
-    for (_, pid) in &failures {
-        let status = reap(*pid).expect("the front must be left unreaped");
+    assert_noted(
+        &failures,
+        "the elevated program may be running; it is handed back to the caller",
+    );
+    for (_, pid, handed_back) in failures {
+        assert_eq!(handed_back.unreaped().pid(), Some(pid));
+        // The failed spawn closed the front's stdin, so it exits by itself, unsignalled.
+        let status = handed_back.wait();
         assert!(status.success(), "the teardown signalled the front: {status:?}");
     }
 }
