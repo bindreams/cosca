@@ -610,3 +610,155 @@ fn round_check_exits_when_it_fires_while_panicking() {
         "the exit names its site and cause on stderr:\n{stderr}"
     );
 }
+
+#[cfg(target_os = "linux")]
+mod pidfd_exit_visible {
+    use std::os::fd::AsFd as _;
+    use std::time::{Duration, Instant};
+
+    use super::super::{pidfd_exit_visible_by, PidfdExit};
+    use crate::test_groups::{tracer_group, Group};
+    use crate::test_support::foreign_tracer::{self, EXIT};
+
+    fn blocker() -> std::process::Child {
+        let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+        foreign_tracer::allow_any_tracer(&mut cmd);
+        crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker")
+    }
+
+    /// Mutant: answer `true` for a running child, or `false` for a zombie; or return before the
+    /// deadline.
+    #[skuld::test]
+    fn pidfd_exit_visible_by_is_true_for_a_zombie_and_false_at_the_deadline_for_a_running_child() {
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        let until = Instant::now() + Duration::from_millis(30);
+        assert!(!pidfd_exit_visible_by(pidfd.as_fd(), until));
+        assert!(
+            Instant::now() >= until,
+            "a running child is reported before the deadline"
+        );
+        child.kill().expect("kill");
+        crate::test_child::wait_until_zombie(child.id());
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), far));
+        child.wait().expect("reap");
+    }
+
+    /// A pidfd poll that fails is not an answer: the peeks decide until the deadline, so a running
+    /// child is still `false` at it, and no block is armed. Runs in a re-exec'd process with
+    /// `RLIMIT_NOFILE` at 0, which makes the kernel refuse every `poll(2)` with `EINVAL`.
+    ///
+    /// Mutant: answer `true` at once after a failed poll; or look at the child with a block again.
+    #[skuld::test]
+    fn a_failed_poll_leaves_the_peek_to_decide_until_the_deadline() {
+        crate::test_child::run_fixture(crate::test_child::fixture_path!(
+            fixture_a_failed_poll_leaves_the_peek_to_decide
+        ));
+    }
+
+    #[skuld::test]
+    fn fixture_a_failed_poll_leaves_the_peek_to_decide() {
+        if !crate::test_child::is_fixture_reexec() {
+            return;
+        }
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `before` is a valid out-pointer.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) }, 0);
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: before.rlim_max,
+        };
+        // SAFETY: lowers this fixture process's own soft limit; it is put back below.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) }, 0);
+        assert!(
+            crate::os_process::poll::is_readable(pidfd.as_fd()).is_err(),
+            "the precondition: poll fails"
+        );
+        crate::wait::block_probe::take();
+        let until = Instant::now() + Duration::from_millis(30);
+        assert!(!pidfd_exit_visible_by(pidfd.as_fd(), until));
+        assert!(Instant::now() >= until, "reported before the deadline");
+        assert!(
+            crate::wait::block_probe::take().is_empty(),
+            "no block after a failed poll"
+        );
+        // SAFETY: puts back the limit read above.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &before) }, 0);
+        child.kill().expect("kill");
+        crate::test_child::wait_until_zombie(child.id());
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), far));
+        child.wait().expect("reap");
+    }
+
+    /// A child someone else reaped is visible at once, even past the deadline: the look is the one
+    /// the deadline cannot cut short.
+    ///
+    /// Mutant: a foreign reap is read as a running child (the look rechecks and answers `false`).
+    #[skuld::test]
+    fn a_child_reaped_by_someone_else_is_visible_at_once() {
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), Instant::now()));
+    }
+
+    /// A peek that fails is left to the wait that follows, so the answer is `true` at once, even
+    /// past the deadline, for a child that runs.
+    ///
+    /// Mutant: a failed peek is read as a running child (the look rechecks and answers `false`).
+    #[skuld::test]
+    fn a_peek_that_fails_is_visible_at_once() {
+        use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        let forced = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), Instant::now()));
+        assert_peeks_exhausted();
+        drop(forced);
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+    }
+
+    /// A zombie a foreign tracer holds turns the pidfd readable and shows no exit to a peek: it is
+    /// not visible until the tracer lets go, and the peek is repeated until then.
+    ///
+    /// Mutant: a readable pidfd is taken as the exit; a peek that finds nothing ends the look; or the
+    /// look blocks on the readable pidfd, which returns at once, instead of pausing.
+    #[skuld::test]
+    fn a_zombie_a_tracer_holds_is_visible_only_once_the_tracer_lets_go(#[fixture(tracer_group)] _group: &Group) {
+        use crate::os_process::drive::{Step, Waitable as _};
+
+        let mut child = blocker();
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+        let mut tracer = foreign_tracer::spawn_helper(child.id());
+        child.kill().expect("kill");
+        assert!(
+            crate::os_process::poll::poll_readable(pidfd.as_fd(), None).expect("poll"),
+            "the pidfd turns readable at the zombie"
+        );
+        assert!(
+            matches!(PidfdExit::new(pidfd.as_fd()).look().expect("look"), Step::Recheck),
+            "a readable pidfd with no visible exit is looked at again, not blocked on"
+        );
+        let until = Instant::now() + Duration::from_millis(30);
+        assert!(
+            !pidfd_exit_visible_by(pidfd.as_fd(), until),
+            "the tracer still holds it"
+        );
+        assert!(Instant::now() >= until, "reported before the deadline");
+        tracer.send(EXIT);
+        tracer.finish();
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(pidfd_exit_visible_by(pidfd.as_fd(), far), "the tracer let go");
+        child.wait().expect("reap");
+    }
+}

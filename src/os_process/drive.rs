@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use backon::{BackoffBuilder as _, ExponentialBackoff, ExponentialBuilder};
+
 use super::{open, Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -57,12 +59,27 @@ pub(crate) trait Waitable {
     type Output;
     /// Done, or what to wait on. The [`WaitFor`] borrows `self` until the loop has waited on it.
     fn look(&mut self) -> Result<Step<'_, Self::Output>, Error>;
+    /// Called for [`Step::Recheck`], with the next step of the backoff, already cut to the time
+    /// remaining.
+    fn pause(&mut self, d: Duration);
+    /// Called when the block a [`Step::Wait`] asked for fails with `e`. The default ends the loop
+    /// with `e`; a `Waitable` that can still decide by looking again returns `Ok`, and `run` looks.
+    fn block_failed(&mut self, e: Error) -> Result<(), Error> {
+        Err(e)
+    }
 }
 
 /// What a [`Waitable::look`] found.
 pub(crate) enum Step<'a, T> {
     Done(T),
     Wait(WaitFor<'a>),
+    /// Nothing will signal the change (a tracer holds the zombie, or the OS is still finishing the
+    /// exit): look again after a [`Waitable::pause`]. Only Linux's pidfd look produces it today.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux produces Recheck so far")
+    )]
+    Recheck,
 }
 
 /// How [`run`] ended.
@@ -73,20 +90,46 @@ pub(crate) enum RunOutcome<T> {
     DeadlinePassed,
 }
 
-/// The one synchronous wait loop: look; if not done, block on what the look returned and look
-/// again. `deadline` is absolute (from [`absolute`]); `None` waits for ever. A look made at or after
-/// the deadline is the final one: it starts no block, and a look that is not done ends the loop with
-/// [`RunOutcome::DeadlinePassed`].
+/// The schedule of pauses for [`Step::Recheck`]: 1 ms, doubling, at most 50 ms, never ending, no
+/// jitter.
+fn backoff() -> ExponentialBackoff {
+    ExponentialBuilder::new()
+        .with_min_delay(Duration::from_millis(1))
+        .with_factor(2.0)
+        .with_max_delay(Duration::from_millis(50))
+        .without_max_times()
+        .build()
+}
+
+/// The one synchronous wait loop: look; if not done, block on what the look returned (or pause, for
+/// a recheck) and look again. `deadline` is absolute (from [`absolute`]); `None` waits for ever. A
+/// look made at or after the deadline is the final one: it starts no block and no pause, and a look
+/// that is not done ends the loop with [`RunOutcome::DeadlinePassed`].
+///
+/// A pause is the next step of one backoff, cut to the time remaining; the backoff starts over after
+/// every block. A failed block goes to [`Waitable::block_failed`], which ends the loop with the error
+/// unless it is survived.
 pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
+    let mut steps = backoff();
     loop {
-        // Read before the look: a look made at or after the deadline is the final one.
         let final_look = remaining(deadline) == Some(Duration::ZERO);
         match w.look()? {
             Step::Done(out) => return Ok(RunOutcome::Done(out)),
-            Step::Wait(_) if final_look => return Ok(RunOutcome::DeadlinePassed),
+            Step::Wait(_) | Step::Recheck if final_look => return Ok(RunOutcome::DeadlinePassed),
             Step::Wait(wait_for) => {
                 if remaining(deadline) != Some(Duration::ZERO) {
-                    block(&wait_for, deadline)?;
+                    let blocked = block(&wait_for, deadline);
+                    steps = backoff();
+                    if let Err(e) = blocked {
+                        w.block_failed(e)?;
+                    }
+                }
+            }
+            Step::Recheck => {
+                let left = remaining(deadline);
+                if left != Some(Duration::ZERO) {
+                    let step = steps.next().expect("a backoff without a cap never ends");
+                    w.pause(left.map_or(step, |left| step.min(left)));
                 }
             }
         }
@@ -104,6 +147,10 @@ impl Waitable for ProcessExit<'_> {
             Exit::Exited => Step::Done(()),
             Exit::Running(wait_for) => Step::Wait(wait_for),
         })
+    }
+
+    fn pause(&mut self, _d: Duration) {
+        debug_assert!(false, "OsProcess::exited never asks for a recheck");
     }
 }
 
