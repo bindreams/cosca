@@ -87,7 +87,7 @@ fn testbin_isatty_fd_reports_zero_for_a_pipe() {
 #[skuld::test]
 fn executable_independent_of_argv0_on_windows() {
     let exe = common::testbin();
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(exe)
         .commandline("pretend-name argv0-report")
         .stdout(cosca::Stdio::pipe())
@@ -107,7 +107,7 @@ fn executable_independent_of_argv0_on_windows() {
 /// wide buffer); the raw backend rejects it up front as an `Io` error.
 #[skuld::test]
 fn embedded_nul_in_commandline_is_rejected() {
-    let e = cosca::Command::new()
+    let e = common::command(common::Console::Hidden)
         .executable(common::testbin())
         .commandline("a\u{0}b")
         .spawn()
@@ -123,7 +123,7 @@ fn embedded_nul_in_commandline_is_rejected() {
 /// wide `lpCurrentDirectory`).
 #[skuld::test]
 fn embedded_nul_in_cwd_is_rejected() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .commandline("x argv0-report")
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
@@ -139,19 +139,19 @@ fn embedded_nul_in_cwd_is_rejected() {
 /// program is only its argv.
 #[skuld::test]
 fn an_empty_current_dir_fails_on_both_backends() {
-    let mut exe = cosca::Command::new();
+    let mut exe = common::command(common::Console::Hidden);
     exe.executable(common::testbin())
         .commandline("x exit 0")
         .current_dir("");
-    let mut raw_exe = cosca::Command::new();
+    let mut raw_exe = common::command(common::Console::Hidden);
     raw_exe
         .raw_executable(common::testbin())
         .commandline("x exit 0")
         .current_dir("");
-    let mut fd3 = cosca::Command::new();
+    let mut fd3 = common::command(common::Console::Hidden);
     fd3.args([common::testbin(), "exit", "0"]).current_dir("");
     fd3.fd(3, cosca::Stdio::null()).unwrap();
-    let mut std_backend = cosca::Command::new();
+    let mut std_backend = common::command(common::Console::Hidden);
     std_backend.args([common::testbin(), "exit", "0"]).current_dir("");
     let kind = |mut cmd: cosca::Command| match cmd.spawn() {
         Err(cosca::error::Error::Io(e)) => e.kind(),
@@ -172,7 +172,7 @@ fn batch_script_via_executable_is_unsupported() {
     let dir = tempfile::tempdir().unwrap();
     let bat = dir.path().join("x.bat");
     std::fs::write(&bat, b"@echo off\n").unwrap();
-    let e = cosca::Command::new()
+    let e = common::command(common::Console::Hidden)
         .executable(&bat)
         .commandline("x.bat")
         .spawn()
@@ -183,9 +183,9 @@ fn batch_script_via_executable_is_unsupported() {
 #[cfg(windows)]
 /// A token routed raw by fd 3, via `executable()` and via argv[0].
 fn raw_routed(token: &std::path::Path) -> [(&'static str, cosca::Command); 2] {
-    let mut exe = cosca::Command::new();
+    let mut exe = common::command(common::Console::Hidden);
     exe.executable(token).args(["x", "write-fd", "3", "ok"]);
-    let mut argv0 = cosca::Command::new();
+    let mut argv0 = common::command(common::Console::Hidden);
     argv0.args([token.as_os_str(), "write-fd".as_ref(), "3".as_ref(), "ok".as_ref()]);
     for c in [&mut exe, &mut argv0] {
         c.fd(3, cosca::Stdio::null()).unwrap();
@@ -260,7 +260,7 @@ fn a_nul_bearing_program_token_is_refused_as_a_nul_on_either_side_of_the_batch_r
     };
 
     for token in [nul_token(r"C:\tools\x", ".bat"), nul_token(r"C:\tools\x.bat", "junk")] {
-        let e = cosca::Command::new()
+        let e = common::command(common::Console::Hidden)
             .executable(&token)
             .commandline("x")
             .spawn()
@@ -283,7 +283,7 @@ fn a_nul_bearing_program_token_is_refused_as_a_nul_on_either_side_of_the_batch_r
 /// closing fd 3 on exit) bounds the read; no timer.
 #[skuld::test]
 fn fd3_pipe_out_delivers_child_bytes() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-fd", "3", "hi-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
@@ -300,7 +300,7 @@ fn fd3_pipe_out_delivers_child_bytes() {
 /// parent's write end (EOF) makes the child echo exactly what was written. EOF bounds both reads.
 #[skuld::test]
 fn fd3_pipe_in_feeds_child() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "read-fd", "3"])
         .fd(3, cosca::Stdio::pipe_in())
@@ -322,7 +322,7 @@ fn fd3_pipe_in_feeds_child() {
 /// the hardened `inherit_end` arm.
 #[skuld::test]
 fn inherit_on_fd3_is_unsupported() {
-    let e = cosca::Command::new()
+    let e = common::command(common::Console::Hidden)
         .executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(3, cosca::Stdio::inherit())
@@ -338,7 +338,7 @@ fn inherit_on_fd3_is_unsupported() {
 #[skuld::test]
 fn fd3_file_is_not_a_tty() {
     let f = tempfile::tempfile().expect("tempfile");
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "isatty-fd", "3"])
         .fd(3, cosca::Stdio::from_file(f))
@@ -358,7 +358,7 @@ fn fd3_file_is_not_a_tty() {
 /// still returns 0). Deterministic `CharDev` coverage without allocating a real console.
 #[skuld::test]
 fn fd3_nul_is_a_char_device() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "isatty-fd", "3"])
         .fd(3, cosca::Stdio::null())
@@ -382,7 +382,7 @@ fn fd3_nul_is_a_char_device() {
 /// up front (before any allocation), as `Unsupported`.
 #[skuld::test]
 fn oversized_fd_is_unsupported() {
-    let e = cosca::Command::new()
+    let e = common::command(common::Console::Hidden)
         .executable(common::testbin())
         .args(["cosca_testbin", "exit", "0"])
         .fd(70_000, cosca::Stdio::null())
@@ -400,7 +400,7 @@ fn oversized_fd_is_unsupported() {
 /// is itself proof this went through the raw backend.
 #[skuld::test]
 fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
@@ -422,7 +422,7 @@ fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
 fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
 
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
     let mut s = String::new();
@@ -441,7 +441,7 @@ fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 /// bounds the read and the final `wait` returns; no timer.
 #[skuld::test]
 fn contained_raw_child_is_in_our_job() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-fd", "3", "x"])
         .fd(3, cosca::Stdio::pipe_out())
@@ -466,7 +466,7 @@ fn contained_raw_child_is_in_our_job() {
 /// Mutant: `kill_tree` is a no-op.
 #[skuld::test]
 fn contained_raw_child_is_killed_by_kill_tree() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::stdin_blocker_program())
         .args(["more"])
         .stdin(cosca::Stdio::pipe())
@@ -494,7 +494,7 @@ fn contained_raw_child_is_killed_by_kill_tree() {
 /// wires containment only when requested; without it the child is a lone process.
 #[skuld::test]
 fn uncontained_raw_child_has_no_containment() {
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .commandline("x argv0-report")
         .stdout(cosca::Stdio::pipe())
@@ -547,7 +547,7 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let decoy_program = "cosca_testbin_b2_cwd_decoy";
     std::fs::copy(common::testbin(), dir.path().join(format!("{decoy_program}.exe"))).unwrap();
 
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args([
             "cosca_testbin",
@@ -576,7 +576,7 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
 fn an_unlisted_inheritable_handle_does_not_reach_the_child() {
     let (mut reader, writer) = common::inheritable_pipe();
     let value = std::os::windows::io::AsRawHandle::as_raw_handle(&writer) as usize;
-    let mut c = cosca::Command::new();
+    let mut c = common::command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-handle", &format!("{value:x}")]);
     let child = c.spawn().expect("raw spawn");
@@ -597,7 +597,7 @@ fn an_unlisted_inheritable_handle_does_not_reach_the_child() {
 fn no_inheritable_handle_outlives_a_raw_spawn() {
     for (kind, targets) in common::inheritable::child_end_kinds() {
         let before = common::inheritable::snapshot();
-        let mut c = cosca::Command::new();
+        let mut c = common::command(common::Console::Hidden);
         c.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
         for (slot, target) in targets {
             c.fd(slot, target).unwrap();
@@ -619,7 +619,7 @@ fn no_inheritable_handle_outlives_a_failed_raw_spawn() {
     let missing = format!("{}.missing", common::testbin());
     for (kind, targets) in common::inheritable::child_end_kinds() {
         let before = common::inheritable::snapshot();
-        let mut c = cosca::Command::new();
+        let mut c = common::command(common::Console::Hidden);
         c.raw_executable(&missing).args(["cosca_testbin", "exit", "0"]);
         for (slot, target) in targets {
             c.fd(slot, target).unwrap();

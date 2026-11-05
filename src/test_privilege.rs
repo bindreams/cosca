@@ -21,7 +21,7 @@ mod setuid_protocol_tests;
 /// # Panics
 /// As [`setuid::setuid_helper`] does.
 pub(crate) fn setuid_blocker_command() -> crate::Command {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
     // `args` is the whole argv, program name included.
     cmd.executable(setuid::setuid_helper())
         .args(["cosca_testbin", "setuid-stdin-block", "root"]);

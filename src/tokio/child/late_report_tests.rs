@@ -4,6 +4,8 @@
 //! end the child.
 
 use std::cell::Cell;
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::drop_fault;
@@ -22,7 +24,7 @@ const ORPHAN_REAPER: &str = "handed to tokio's orphan reaper";
 
 fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     (cmd, writer)
@@ -306,7 +308,7 @@ async fn macos_tokio_spawn_of_a_late_contained_child_kills_its_tree() {
     use crate::child::spawn::late_report_tests::{tree_pipes, TREE_ARGV};
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(TREE_ARGV).contain();
     for (fd, end) in ends {
         cmd.fd(fd, end).expect("set the fd");
@@ -356,7 +358,7 @@ fn macos_tokio_spawn_that_pipes_a_slot_with_fds_0_and_1_closed_adopts_its_child(
         .enable_all()
         .build()
         .unwrap();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(RAN_ARGV);
     cmd.stdin(null_stdio()).expect("set stdin");
     cmd.stdout(crate::stdio::Stdio::pipe_out()).expect("pipe stdout");

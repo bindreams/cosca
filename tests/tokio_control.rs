@@ -251,7 +251,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     // The Windows non-escalation discriminator (this is the only Windows entry into the async process wait):
     // BOTH members ignore CTRL_BREAK, so after poll-once + drop the root can only be dead if
     // something escalated — being alive proves the cancelled graceful sent nothing further.
-    let (mut child, root, grand) = common::spawn_tree_async("spawn-grandchild-ignore-break", |cmd| {
+    let (mut child, root, grand) = common::spawn_tree_async_on_console("spawn-grandchild-ignore-break", |cmd| {
         common::contain_without_cgroup_async(cmd);
         cmd.env(common::ECHO_HELD_ENV, "1");
     })
@@ -382,9 +382,9 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
 async fn async_graceful_mechanism_matches_the_sync_surface() {
     let _warns = common::warn_watch();
     let (mut uncontained, s1) = common::spawn_blocker_async().await;
-    let (mut contained, s2) = common::spawn_control_async("control-block", &["R"], true).await;
+    let (mut contained, s2) = common::spawn_control_async_on_console("control-block", &["R"], true).await;
     let (sync_uncontained, s3) = common::spawn_blocker();
-    let (sync_contained, s4) = common::spawn_control("control-block", &["R"], true);
+    let (sync_contained, s4) = common::spawn_control_on_console("control-block", &["R"], true);
     assert_eq!(
         uncontained.graceful_mechanism(),
         sync_uncontained.graceful_mechanism(),
@@ -410,7 +410,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     // `kill()` that did nothing exits 0 and fails `assert_killed`.
     let argv = [common::stdin_blocker_program()];
     let (mut async_reaped, async_stdin) = {
-        let mut cmd = cosca::tokio::Command::new();
+        let mut cmd = common::tokio_command(common::Console::Hidden);
         cmd.args(&argv);
         cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(cosca::Stdio::null()).expect("set stdout null");
@@ -419,7 +419,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         (child, stdin)
     };
     let (sync_reaped, sync_stdin) = {
-        let mut cmd = cosca::Command::new();
+        let mut cmd = common::command(common::Console::Hidden);
         cmd.args(&argv);
         cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(cosca::Stdio::null()).expect("set stdout null");

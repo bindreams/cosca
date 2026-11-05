@@ -1,12 +1,13 @@
 //! Async twin of `child/spawn/placement_reuse_tests.rs`.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use crate::child::spawn::fault;
 use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
 use crate::test_groups::{cgroup, namespaces};
-use crate::tokio::Command;
 
 /// Mutant: the attach is given `pidfd_open(pid)` for the backend's pidfd.
 fn tokio_attach_after_foreign_reap_and_reuse_waits_on_the_held_pidfd_body() {
@@ -16,7 +17,7 @@ fn tokio_attach_after_foreign_reap_and_reuse_waits_on_the_held_pidfd_body() {
         .expect("current_thread runtime");
     runtime.block_on(async {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain();

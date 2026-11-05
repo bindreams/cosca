@@ -19,6 +19,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 use crate::identity::{ProcessId, Resolved};
 use crate::test_child::reaped_elsewhere::kill_own_child;
 #[cfg(target_os = "linux")]
@@ -637,7 +639,7 @@ fn cat_pid(line: &str) -> u32 {
 /// Runs one sync cell and returns what it sent.
 fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     use std::io::{BufRead as _, Read as _};
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     mechanism.configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), mechanism.containment(), "{mechanism:?}");
@@ -772,7 +774,7 @@ fn finish_teardown(
 #[cfg(feature = "tokio")]
 async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     use ::tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     mechanism.configure(cmd.as_sync_mut());
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), mechanism.containment(), "{mechanism:?}");
