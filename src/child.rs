@@ -1075,8 +1075,7 @@ impl Child {
         }
         self.kill_on_drop = false;
         let fate = self.tear_down(TeardownCaller::FailedRun, disposition);
-        let handed_back = disposition == Disposition::HandBack && matches!(fate, ChildFate::Running { .. });
-        (fate, handed_back.then(|| self.into_unreaped()))
+        (fate, disposition.hands_back(&fate).then(|| self.into_unreaped()))
     }
 
     /// The root, as an [`Unreaped`]. `self` has already torn its containment down by dropping.

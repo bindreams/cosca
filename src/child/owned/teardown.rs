@@ -47,6 +47,15 @@ pub(crate) enum Disposition {
     HandBack,
 }
 
+impl Disposition {
+    /// Whether the caller hands back a child whose teardown ended with `fate`: it does under
+    /// [`HandBack`](Disposition::HandBack) when the child still runs. The one rule of every
+    /// hand-back; the caller owns the child and builds the [`Unreaped`](crate::Unreaped).
+    pub(crate) fn hands_back(self, fate: &ChildFate) -> bool {
+        self == Disposition::HandBack && matches!(fate, ChildFate::Running { .. })
+    }
+}
+
 /// What a teardown does to the child.
 pub(crate) enum TeardownKind<'a> {
     /// Kill it, then settle it as the module doc says. `tree` says whether a kill already sent
@@ -161,10 +170,9 @@ impl OwnedChild {
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
                 match wait_to_exit(self, due, Orphaned::Quiet) {
                     Ok(_status) => {
+                        // An unknown pid records as 0.
                         #[cfg(test)]
-                        if let Some(pid) = self.pid() {
-                            crate::child::spawn::fault::record_teardown_reap(pid, _status);
-                        }
+                        crate::child::spawn::fault::record_teardown_reap(self.pid().unwrap_or(0), _status);
                         TeardownOutcome::new(ChildFate::Reaped)
                     }
                     Err(unreaped) => self.settle_unreaped(matches!(sent, Sent::Delivered), unreaped),
