@@ -12,7 +12,7 @@
 //! wall-clock from boot time drifts under NTP and would silently break
 //! `Eq`/`Hash`. The human-facing wall-clock lives in `created_at()`,
 //! allowed to drift and never used for identity. What orders processes (the tree walk's PID-reuse
-//! guard) is not the key but an [`OrderKey`], the start time, which on Linux a `pidfs` id reads from
+//! guard) is not the key but an `OrderKey`, the start time, which on Linux a `pidfs` id reads from
 //! `/proc`.
 //!
 //! The key is not portable across a reboot on every platform — see [`ProcessIdRecord`]
