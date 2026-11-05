@@ -183,45 +183,68 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
-/// A caller walking `source()` from an `Error::Io` built over an `io_context` error reaches the OS
-/// code: the first `io::Error` that has one is below the context wrapper, which has none.
+/// `Error::raw_os_error` finds the OS code of an `Error::Io` wherever the walk from it first meets
+/// one: on the `io::Error` itself, or below the context and the note cosca added. Any other variant
+/// has none.
+#[cfg(any(unix, feature = "tokio"))]
 #[skuld::test]
-fn io_context_error_in_error_io_reaches_the_os_code_through_source() {
+fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || std::io::Error::from_raw_os_error(code);
+    let context = || crate::error::io_context("pidfd_open", os());
+
+    assert_eq!(Error::Io(os()).raw_os_error(), Some(code), "bare");
+    assert_eq!(Error::Io(context()).raw_os_error(), Some(code), "io_context");
+    assert_eq!(
+        Error::Io(context()).with_note("while tearing down").raw_os_error(),
+        Some(code),
+        "io_context and a note"
+    );
+    assert_eq!(
+        Error::Io(std::io::Error::other("no code")).raw_os_error(),
+        None,
+        "no code anywhere"
+    );
+    assert_eq!(
+        Error::Containment { detail: "d".into() }.raw_os_error(),
+        None,
+        "not an Error::Io"
+    );
+}
+
+/// An `Error::Io` built over an `io_context` error has the OS code of the context's source.
+#[cfg(any(unix, feature = "tokio"))]
+#[skuld::test]
+fn io_context_error_in_error_io_reaches_the_os_code() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(crate::error::io_context(
         "could not check C:\\t.exe",
         std::io::Error::from_raw_os_error(code),
     ));
-    assert_eq!(os_codes_below(&e), [None, Some(code)]);
+    assert_eq!(e.raw_os_error(), Some(code));
 }
 
-/// A note on an `Error::Io` puts its own `io::Error`, which has no code, above the original one.
+/// A note on an `Error::Io` leaves the OS code of the original error.
+#[cfg(any(unix, feature = "tokio"))]
 #[skuld::test]
-fn a_noted_error_io_has_the_os_code_one_io_error_down() {
+fn a_noted_error_io_has_the_os_code_of_the_original() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(std::io::Error::from_raw_os_error(code)).with_note("while tearing down");
-    assert_eq!(os_codes_below(&e), [None, Some(code)]);
+    assert_eq!(e.raw_os_error(), Some(code));
 }
 
 /// A note on an `io_context` error, the shape the unix spawn teardowns produce, leaves the OS code
 /// under both wrappers.
+#[cfg(any(unix, feature = "tokio"))]
 #[skuld::test]
-fn a_note_on_a_context_error_io_leaves_the_os_code_under_both() {
+fn a_note_on_a_context_error_io_has_the_os_code_of_the_original() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(crate::error::io_context(
         "pidfd_open",
         std::io::Error::from_raw_os_error(code),
     ))
     .with_note("while tearing down");
-    assert_eq!(os_codes_below(&e), [None, None, Some(code)]);
-}
-
-/// The `raw_os_error()` of each `io::Error` reached by walking `source()` from `e`, outermost first.
-fn os_codes_below(e: &Error) -> Vec<Option<i32>> {
-    std::iter::successors(std::error::Error::source(e), |s| s.source())
-        .filter_map(|s| s.downcast_ref::<std::io::Error>())
-        .map(std::io::Error::raw_os_error)
-        .collect()
+    assert_eq!(e.raw_os_error(), Some(code));
 }
 
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.

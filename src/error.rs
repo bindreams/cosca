@@ -125,7 +125,7 @@ pub enum Error {
     ///
     /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
     /// walk `source()` from this `Error` and take the first `io::Error` whose `raw_os_error()` is
-    /// `Some`.
+    /// `Some`. The crate's own `Error::raw_os_error` does this walk.
     #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
@@ -401,19 +401,23 @@ impl Error {
         }
     }
 
-    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
+    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it: the
+    /// first `io::Error` from the wrapped one down its `source()` chain that has one, since
+    /// [`io_context`] and [`with_note`](Error::with_note) put a code-less `io::Error` above it.
+    /// `None` for any other variant.
     #[cfg(any(unix, feature = "tokio"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
-        match self {
-            Error::Io(e) => e.raw_os_error(),
-            _ => None,
-        }
+        let Error::Io(e) = self else {
+            return None;
+        };
+        std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |s| s.source())
+            .find_map(|s| s.downcast_ref::<std::io::Error>()?.raw_os_error())
     }
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), so the OS code stays where the
-    /// walk on [`Error::Io`] finds it.
+    /// original error as the [`source`](std::error::Error::source), so the OS code stays where
+    /// `Error::raw_os_error`, the walk described on [`Error::Io`], finds it.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
