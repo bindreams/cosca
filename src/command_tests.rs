@@ -378,16 +378,10 @@ fn executable_path_is_variant_agnostic() {
 
 // A failure after the spawn reports what became of the child =====
 
-/// A live blocker whose stdin this test holds, and that writer.
 #[cfg(unix)]
-fn held_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
-    let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(stdin).expect("set stdin");
-    cmd.kill_on_drop(kill_on_drop);
-    (cmd.spawn().expect("spawn"), writer)
-}
+use crate::test_child::held_uncontained_blocker as held_blocker;
+#[cfg(unix)]
+use crate::test_groups::setuid;
 
 /// A run-to-completion helper that fails after its spawn kills and reaps the child, as its drop
 /// would, and says so.
@@ -396,13 +390,18 @@ fn held_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
 #[cfg(unix)]
 #[skuld::test]
 fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
-    let (mut child, writer) = held_blocker(true);
+    let (child, writer) = held_blocker(true);
+    let id = child.id();
     // Released after the kill: a kill that sent nothing exits 0.
     let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
     teardown.assert_killed();
     assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
-    assert_eq!(child.id().is_alive(), crate::identity::Liveness::Dead, "{error}");
+    assert!(
+        matches!(error, crate::error::Error::MayHaveStarted { unreaped: None, .. }),
+        "{error}"
+    );
+    assert_eq!(id.is_alive(), crate::identity::Liveness::Dead, "{error}");
 }
 
 /// A child `kill_on_drop(false)` keeps is left alone, and the failure names it.
@@ -411,16 +410,20 @@ fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
-    let (mut child, writer) = held_blocker(false);
+    let (child, writer) = held_blocker(false);
     let id = child.id();
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
     assert_eq!(
         error.fate(),
         Some(crate::error::ChildFate::Running { id: Some(id) }),
         "{error}"
     );
+    assert!(
+        matches!(error, crate::error::Error::MayHaveStarted { unreaped: None, .. }),
+        "the caller chose to keep this child: {error}"
+    );
+    assert_eq!(id.is_alive(), crate::identity::Liveness::Alive, "{error}");
     drop(writer);
-    child.wait().expect("the child exits once its stdin closes");
 }
 
 /// A child that opted out of the teardown and had its exit collected is reaped, not running.
@@ -429,10 +432,10 @@ fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_failure_after_the_spawn_does_not_call_a_collected_child_running() {
-    let (mut child, writer) = held_blocker(false);
+    let (child, writer) = held_blocker(false);
     drop(writer);
     child.wait().expect("the child exits once its stdin closes");
-    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
     assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
 }
 
@@ -446,9 +449,9 @@ fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() 
     use crate::elevation::{Backend, ElevatedVia};
     let note = "an elevated program behind it may still run";
     // Each writer is released after the kill: a kill that sent nothing exits 0.
-    let (mut plain, w1) = held_blocker(true);
+    let (plain, w1) = held_blocker(true);
     let teardown = crate::child::spawn::fault::release_at_drop_kill(w1);
-    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain);
+    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), plain);
     assert!(!plain.to_string().contains(note), "{plain}");
     teardown.assert_killed();
     drop(teardown);
@@ -458,27 +461,60 @@ fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() 
     wrapped.set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
         Backend::Sudo,
     )));
-    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
+    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), wrapped);
     teardown.assert_killed();
     assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
     assert!(wrapped.to_string().contains(note), "{wrapped}");
 }
 
+/// A run-to-completion helper whose child refuses the kill of its teardown (a setuid-root process
+/// the caller may not signal) hands the child back in the error, running, with the same identity.
+///
+/// Mutants: the child is left running and dropped; the fate is `Unknown`; the warn says the child
+/// is left running.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
+    #[fixture(setuid)] _group: &crate::test_groups::Group,
+) {
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
+    let id = child.id();
+    let mark = crate::log_capture::mark();
+
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
+
+    let crate::error::Error::MayHaveStarted { fate, unreaped, .. } = error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    let handed_back = crate::test_child::HandedBack::new(stdin, unreaped.map(|unreaped| *unreaped));
+
+    assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
+    assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
+    assert_eq!(id.is_alive(), crate::identity::Liveness::Alive);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "handed back to the caller");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let status = handed_back.wait();
+    assert!(status.success(), "the helper exits on EOF: {status:?}");
+}
+
 // A run-to-completion helper that fails after its spawn =====
 
 /// The answer of a run-to-completion helper that failed after its spawn: the program may have
-/// started, the fate is `fate`, the wrapper flag is `wrapper`, and the cause is the seam's.
+/// started, the fate is `fate`, no child is handed back, the wrapper flag is `wrapper`, and the cause
+/// is the seam's.
 #[track_caller]
 fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error::ChildFate, wrapper: bool) {
     let crate::error::Error::MayHaveStarted {
         fate: got,
         wrapper_elevated,
         source,
-        ..
+        unreaped,
     } = &error
     else {
         panic!("expected MayHaveStarted, got {error:?}");
     };
+    assert!(unreaped.is_none(), "a reaped child is not handed back: {error:?}");
     assert_eq!(*got, fate, "{error}");
     assert_eq!(*wrapper_elevated, wrapper, "{error}");
     assert!(
@@ -489,7 +525,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 
 /// `output`, `status` and `read` each say the program may have started when their pump or wait
 /// fails after the spawn, with the fate their teardown gave the child and the wrapper flag of the
-/// child.
+/// child. Pins each public method's routing through `after_the_spawn`.
 ///
 /// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
 #[skuld::test]

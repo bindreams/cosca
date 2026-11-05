@@ -243,6 +243,66 @@ pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
     })
 }
 
+/// A live [`BLOCKER_ARGV`] child with no containment, and the write end of its stdin, which the
+/// test holds. `kill_on_drop` is the command's.
+pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
+    let (stdin, writer) = held_writer_stdin();
+    let mut cmd = crate::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.kill_on_drop(kill_on_drop);
+    (cmd.spawn().expect("spawn"), writer)
+}
+
+/// The child a teardown handed back, if it did, and what lets it exit (`release`: the stdin's write
+/// end, a thread to resume). `release` drops first, so a failed assertion ends the test instead of
+/// hanging in the [`Unreaped`](crate::Unreaped)'s drop. [`tear_down_holding`] builds it from a teardown;
+/// [`new`](HandedBack::new) is for a result that came back through an error.
+pub(crate) struct HandedBack<R> {
+    release: R,
+    unreaped: Option<crate::Unreaped>,
+}
+
+impl<R> HandedBack<R> {
+    pub(crate) fn new(release: R, unreaped: Option<crate::Unreaped>) -> HandedBack<R> {
+        HandedBack { release, unreaped }
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.unreaped.is_none()
+    }
+
+    /// The handed-back child; panics when the teardown handed none back.
+    #[track_caller]
+    pub(crate) fn unreaped(&self) -> &crate::Unreaped {
+        self.unreaped.as_ref().expect("the teardown handed the child back")
+    }
+
+    /// Release the child and wait for it to exit.
+    #[track_caller]
+    pub(crate) fn wait(self) -> std::process::ExitStatus {
+        let HandedBack { release, unreaped } = self;
+        drop(release);
+        unreaped
+            .expect("the teardown handed the child back")
+            .wait()
+            .expect("the handed-back child exits once released")
+    }
+}
+
+/// [`Child::tear_down_or_hand_back`](crate::Child::tear_down_or_hand_back) with `disposition`, the
+/// only way a test calls it: `release` moves into the [`HandedBack`] with the result, so no
+/// assertion runs while an [`Unreaped`](crate::Unreaped) is live and its releaser is a separate
+/// local that drops after it.
+pub(crate) fn tear_down_holding<R>(
+    child: crate::Child,
+    release: R,
+    disposition: crate::child::owned::teardown::Disposition,
+) -> (crate::error::ChildFate, HandedBack<R>) {
+    let (fate, unreaped) = child.tear_down_or_hand_back(disposition);
+    (fate, HandedBack::new(release, unreaped))
+}
+
 fn held_blocker(
     stdout: crate::Stdio,
     contain: impl FnOnce(&mut crate::Command),
