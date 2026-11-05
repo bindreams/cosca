@@ -961,8 +961,7 @@ pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u3
     use crate::send_log::Via;
     let entry = match sys {
         Sys::Pidfd(pidfd, _) => {
-            // A recorder takes no fault armed for the code under test: it opens and reads past the seams.
-            let pid = ProcDir::open_unforced()
+            let pid = ProcDir::open()
                 .and_then(|dir| pidfd_pid_in(&HostKernel, &dir, pidfd))
                 .map_err(|why| log::debug!("record_member_term: the pidfd's pid was not read: {why}"))
                 .ok()

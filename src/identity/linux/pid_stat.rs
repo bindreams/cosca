@@ -84,8 +84,8 @@ pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Resu
 }
 
 /// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`],
-/// `identity::linux::stat_by_pid`).
-pub(super) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
+/// `identity::linux::stat_by_pid`, the cgroup leaf's state read).
+pub(crate) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     kernel.read(dir, &format!("{pid}/stat"))
 }
 
@@ -93,10 +93,6 @@ fn read_raw(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>>
     #[cfg(test)]
     if let Some(errno) = fault::forced_stat_read_errno() {
         return Err(io::Error::from_raw_os_error(errno));
-    }
-    #[cfg(test)]
-    if let Some(bytes) = fault::forced_stat_bytes() {
-        return Ok(bytes);
     }
     read_stat_file(kernel, dir, pid)
 }
@@ -115,7 +111,6 @@ fn check_dir_answers(kernel: &dyn Kernel, dir: &ProcDir) -> io::Result<()> {
 pub(crate) mod fault {
     thread_local! {
         static STAT_READ: std::cell::Cell<Option<(i32, Option<i32>)>> = const { std::cell::Cell::new(None) };
-        static STAT_BYTES: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Disarms [`force_stat_read`] on drop.
@@ -125,18 +120,7 @@ pub(crate) mod fault {
     impl Drop for ForcedStatRead {
         fn drop(&mut self) {
             STAT_READ.with(|f| f.set(None));
-            STAT_BYTES.with(|f| f.borrow_mut().take());
         }
-    }
-
-    /// Make EVERY per-pid `stat` read on THIS thread succeed with `bytes` until the guard drops.
-    pub(crate) fn force_stat_bytes(bytes: &[u8]) -> ForcedStatRead {
-        STAT_BYTES.with(|f| *f.borrow_mut() = Some(bytes.to_vec()));
-        ForcedStatRead(())
-    }
-
-    pub(super) fn forced_stat_bytes() -> Option<Vec<u8>> {
-        STAT_BYTES.with(|f| f.borrow().clone())
     }
 
     /// Make EVERY per-pid `stat` read on THIS thread fail with `errno` until the guard drops.

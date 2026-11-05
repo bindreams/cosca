@@ -78,6 +78,12 @@ fn rejects_truncated_stat() {
 }
 
 #[skuld::test]
+fn parse_state_of_a_record_without_a_state_field_is_none() {
+    assert_eq!(parse_state(b""), None);
+    assert_eq!(parse_state(b"42 (comm)"), None);
+}
+
+#[skuld::test]
 fn rejects_missing_close_paren() {
     let stat = b"1 (init S 0 1";
     assert_eq!(parse_starttime_jiffies(stat), None);

@@ -25,7 +25,7 @@ pub(crate) fn parse_starttime_jiffies(stat: &[u8]) -> Option<u64> {
 }
 
 /// Field 3 (process state) as its single state character, e.g. `b'R'`, `b'Z'`.
-pub(super) fn parse_state(stat: &[u8]) -> Option<u8> {
+pub(crate) fn parse_state(stat: &[u8]) -> Option<u8> {
     tail(stat)?.split_whitespace().next()?.bytes().next()
 }
 

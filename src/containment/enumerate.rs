@@ -26,7 +26,14 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 /// ([`Error::Unsupported`] on Linux without `openat2`). An empty `Ok` means the host has no
 /// processes: a walk over a failed snapshot would find no descendants and skip every kill and wait.
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
-    backend::process_parents()
+    #[cfg(target_os = "linux")]
+    {
+        backend::process_parents_with(&crate::identity::HostKernel)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        backend::process_parents()
+    }
 }
 
 /// Every listable pid plus the `(pid, ppid)` edges plus the denied-ppid-read count, from one

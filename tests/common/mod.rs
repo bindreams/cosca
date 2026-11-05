@@ -537,6 +537,17 @@ pub fn contain_without_cgroup_async(cmd: &mut cosca::tokio::Command) -> &mut cos
 /// is alive). `contain` applies [`contain_without_cgroup`]. This is the canonical form; `tests/lifecycle.rs`
 /// now calls this instead of keeping its own copy.
 pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child, TcpStream) {
+    spawn_control_with(mode, extra, contain, |_| {})
+}
+
+/// [`spawn_control`] with the command further configured by `configure` (a containment mode, say)
+/// before the spawn; the sync twin of [`spawn_control_async_with`].
+pub fn spawn_control_with(
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::Command),
+) -> (cosca::Child, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
@@ -547,6 +558,7 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     if contain {
         contain_without_cgroup(&mut cmd);
     }
+    configure(&mut cmd);
     let mut child = cmd.spawn().expect("spawn control child");
     let mut sock = accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
