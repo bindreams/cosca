@@ -539,7 +539,7 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
 async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
     let mut child = std_blocker_with_stdout();
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
-    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+    let stale = real.with_other_value();
 
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
     let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);

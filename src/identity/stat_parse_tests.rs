@@ -1,9 +1,8 @@
-use super::super::StartToken;
 use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture};
 use crate::identity::Liveness;
 
-fn tok(v: u64) -> StartToken {
-    StartToken::from_raw(v)
+fn tok(v: u64) -> u64 {
+    v
 }
 
 // After the comm field's LAST ')', the whitespace-split tail starts at field 3
