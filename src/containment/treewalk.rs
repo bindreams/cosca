@@ -150,8 +150,8 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
 /// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
 /// the edge names, and keeps it ONLY if its key orders correctly
-/// against `root_key` per `allow_equal` (see module docs). With `parent_order` the bar is the
-/// accepted parent's key instead (the root's is implied). `resolve` is injected
+/// against `root_key` per `allow_equal` (see module docs). With `parent_order` it must order
+/// after the accepted parent's key instead (the root's is implied). `resolve` is injected
 /// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
@@ -200,10 +200,10 @@ pub(crate) fn descendants_with(
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
             };
-            // With the parent-order rule the accepted parent's key is the bar: it already ordered
-            // after the root's, so the root's is implied.
-            let bar = if parent_order { parent_key } else { root_key };
-            if !keeps_order(key, bar, allow_equal) {
+            // With the parent-order rule the candidate must follow the accepted parent's key: it
+            // already ordered after the root's, so the root's is implied.
+            let must_follow = if parent_order { parent_key } else { root_key };
+            if !keeps_order(key, must_follow, allow_equal) {
                 log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");
                 continue;
             }
