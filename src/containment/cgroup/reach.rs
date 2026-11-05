@@ -319,7 +319,10 @@ fn dying_in(text: &str) -> Option<u64> {
 /// errno, and any other error is `Io`.
 ///
 /// `Err` is the spawn's refusal.
-pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Result<(), crate::error::Error> {
+pub(crate) fn front_placement(
+    kernel: &dyn crate::identity::Kernel,
+    leaf_id: impl FnOnce() -> io::Result<u64>,
+) -> Result<(), crate::error::Error> {
     use std::os::fd::AsFd;
 
     if let Err(e) = leaf_id() {
@@ -348,7 +351,7 @@ pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Resu
             )))
         }
     }
-    untraceable_cgroup_readable().map_err(refusal)
+    untraceable_cgroup_readable(kernel).map_err(refusal)
 }
 
 /// The spawn's refusal for `why` the cgroup of a process this one may not trace is unreadable,
@@ -898,8 +901,8 @@ fn log_probe_end(pid: libc::pid_t, end: ProbeEnd) {
 }
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
-fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
-    let proc_dir = match crate::identity::proc_view_with(&crate::identity::HostKernel) {
+fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(), Unreadable> {
+    let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(Unreadable::View(

@@ -2,14 +2,18 @@
 
 use super::{proc_state, read_proc_state, StateUnknown};
 use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
-use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+use crate::identity::{FakeKernel, HostKernel};
 use crate::test_child::namespaces as ns;
 use crate::test_child::{fixture_path, member_command};
 use crate::test_groups::{namespaces, Group};
 
 #[skuld::test]
 fn a_live_process_has_a_state_under_the_ordinary_view() {
-    assert!(proc_state(handle_of(std::process::id(), &pidfd_of(std::process::id()))).is_some());
+    assert!(proc_state(
+        &HostKernel,
+        handle_of(std::process::id(), &pidfd_of(std::process::id()))
+    )
+    .is_some());
 }
 
 /// Mutant: "the state is the field after the state" (`Z` becomes the next field).
@@ -34,9 +38,9 @@ fn an_unreaped_exited_child_is_a_zombie() {
         let err = std::io::Error::last_os_error();
         assert_eq!(err.raw_os_error(), Some(libc::EINTR), "waitid: {err}");
     }
-    assert_eq!(read_proc_state(child.id()).ok(), Some('Z'));
+    assert_eq!(read_proc_state(&HostKernel, child.id()).ok(), Some('Z'));
     assert_eq!(
-        proc_state(handle_of(child.id(), &pidfd_of(child.id()))),
+        proc_state(&HostKernel, handle_of(child.id(), &pidfd_of(child.id()))),
         Some('Z'),
         "its pidfd says it exited"
     );
@@ -47,8 +51,11 @@ fn an_unreaped_exited_child_is_a_zombie() {
 #[skuld::test]
 fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
     let pid = u32::MAX - 1;
-    assert_eq!(proc_state(handle_of(pid, &pidfd_of(std::process::id()))), None);
-    let Err(StateUnknown::Unreadable(e)) = read_proc_state(pid) else {
+    assert_eq!(
+        proc_state(&HostKernel, handle_of(pid, &pidfd_of(std::process::id()))),
+        None
+    );
+    let Err(StateUnknown::Unreadable(e)) = read_proc_state(&HostKernel, pid) else {
         panic!("expected Unreadable");
     };
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
@@ -66,24 +73,18 @@ fn an_unparsable_stat_is_named() {
 /// the same cause".
 #[skuld::test]
 fn no_state_is_read_when_the_view_is_diverged_or_unassessable() {
-    for (view, wanted) in [
-        (ForcedView::Diverged, "outer"),
-        (ForcedView::Unassessable, "unassessable"),
-    ] {
-        let _forced = force_proc_view_once(view);
-        let why = read_proc_state(std::process::id()).expect_err("no state");
-        match (wanted, &why) {
-            ("outer", StateUnknown::OuterProcfs) => {}
-            ("unassessable", StateUnknown::ViewUnassessable(v)) => assert_eq!(v.reason, "forced by a test"),
-            _ => panic!("{view:?}: {why:?}"),
-        }
-        let _forced = force_proc_view_once(view);
-        assert_eq!(
-            proc_state(handle_of(std::process::id(), &pidfd_of(std::process::id()))),
-            None,
-            "{view:?}"
-        );
+    let me = std::process::id();
+    let diverged = FakeKernel::over(&HostKernel).diverged_view();
+    let why = read_proc_state(&diverged, me).expect_err("no state");
+    assert!(matches!(why, StateUnknown::OuterProcfs), "{why:?}");
+    assert_eq!(proc_state(&diverged, handle_of(me, &pidfd_of(me))), None);
+
+    let unreadable = FakeKernel::over(&HostKernel).unreadable_view();
+    match read_proc_state(&unreadable, me).expect_err("no state") {
+        StateUnknown::ViewUnassessable(v) => assert_eq!(v.reason, "self/status could not be read"),
+        other => panic!("{other:?}"),
     }
+    assert_eq!(proc_state(&unreadable, handle_of(me, &pidfd_of(me))), None);
 }
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: `/proc/1` is the outer
@@ -112,7 +113,7 @@ fn fixture_state_inner() {
         super::parse_proc_stat_state(&outer).is_some(),
         "control: read by path, pid 1 has a state: {outer:?}"
     );
-    assert_eq!(proc_state(handle_of(1, &pidfd_of(1))), None);
+    assert_eq!(proc_state(&HostKernel, handle_of(1, &pidfd_of(1))), None);
 }
 
 /// A file mounted over a child's `stat` is not read.
@@ -133,7 +134,7 @@ fn fixture_state_overmount() {
     crate::test_child::await_member_ready(child.0.as_mut().expect("child"));
     let pid = child.0.as_ref().expect("child").id();
     assert!(
-        proc_state(handle_of(pid, &pidfd_of(pid))).is_some(),
+        proc_state(&HostKernel, handle_of(pid, &pidfd_of(pid))).is_some(),
         "the member has a state before the mount"
     );
     let scratch = tempfile::tempdir().expect("tempdir");
@@ -141,7 +142,7 @@ fn fixture_state_overmount() {
     let zeros = ["0"; 16].join(" ");
     std::fs::write(&fake, format!("{pid} (fake) Z 1 1 {zeros} 1 0\n")).expect("write the fake stat");
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
-    assert_eq!(proc_state(handle_of(pid, &pidfd_of(pid))), None);
+    assert_eq!(proc_state(&HostKernel, handle_of(pid, &pidfd_of(pid))), None);
 }
 
 /// Kills and reaps the child when dropped, so a failing assertion cannot leak it.
@@ -173,7 +174,7 @@ fn a_pidfd_that_cannot_be_polled_gives_no_state() {
         pid: std::process::id(),
         pidfd,
     };
-    assert_eq!(proc_state(child), None);
+    assert_eq!(proc_state(&HostKernel, child), None);
 }
 
 /// A thread-group leader that exits while other threads run reads `Z` in `/proc` with the pidfd
@@ -203,11 +204,11 @@ fn a_thread_group_whose_leader_exited_has_no_state() {
     }
 
     assert_eq!(
-        read_proc_state(pid).ok(),
+        read_proc_state(&HostKernel, pid).ok(),
         Some('Z'),
         "control: /proc shows the leader's state"
     );
-    assert_eq!(proc_state(handle_of(pid, &pidfd)), None);
+    assert_eq!(proc_state(&HostKernel, handle_of(pid, &pidfd)), None);
 
     // Ends the group: the thread reads EOF and exits the process.
     drop(child.stdin.take());
@@ -242,7 +243,7 @@ fn fixture_leader_exits() {
     let sent = unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR2) };
     assert_eq!(sent, 0, "tgkill: {}", std::io::Error::last_os_error());
     // The leader is a zombie only once it has exited, which this thread cannot otherwise observe.
-    while super::read_proc_state(pid).ok() != Some('Z') {
+    while super::read_proc_state(&HostKernel, pid).ok() != Some('Z') {
         std::thread::yield_now();
     }
     eprintln!("{LEADER_EXITED}");
