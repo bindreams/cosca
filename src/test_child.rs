@@ -331,21 +331,21 @@ pub(crate) fn expect_handed_back<R>(
     (cause, fate, handed_back)
 }
 
-/// `tear_down_held` (the sync spawn's teardown of the child it holds after the handshake) with a
-/// default diagnosis, its handed-back child in a [`HandedBack`] with `release`.
+/// `tear_down_held` (the sync spawn's teardown of the child it holds after the handshake) with the
+/// diagnosis `why`, its handed-back child in a [`HandedBack`] with `release`. The child has a pid.
 #[cfg(target_os = "linux")]
 pub(crate) fn tear_down_held_holding<R>(
     child: crate::child::owned::OwnedChild,
-    pid: u32,
     front: Option<crate::elevation::front::Front>,
     id: Option<crate::identity::ProcessId>,
     subtree: Option<&crate::containment::cgroup::Subtree>,
+    why: &mut crate::child::spawn::Diagnosis,
     release: R,
     error: crate::error::Error,
 ) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
-    let mut why = crate::child::spawn::Diagnosis::default();
+    let pid = child.pid().expect("the held child has a pid");
     let (error, fate, unreaped) =
-        crate::child::spawn::held_teardown::tear_down_held(child, pid, front, id, subtree, &mut why, error);
+        crate::child::spawn::held_teardown::tear_down_held(child, pid, front, id, subtree, why, error);
     (error, fate, HandedBack::new(release, unreaped))
 }
 
