@@ -63,6 +63,16 @@
 //! The rule also drops a genuine descendant whose creator exited and whose creator's pid now belongs
 //! to a later in-tree process, with its subtree: from the snapshot alone it cannot be told from a
 //! stale-creator impostor.
+//!
+//! # The creator read (Windows only)
+//!
+//! A snapshot row's ppid is only a number. The resolver reads the candidate again on one handle: its
+//! creator pid (class 0), its id and its order key. A candidate whose creator is not the accepted
+//! parent's pid is dropped, and so is one whose accepted parent no longer holds that pid when the
+//! read is done. So a descendant whose parent exits while the walk runs is dropped with its
+//! subtree: its creator pid still names the dead parent, which the read cannot tell from a pid that
+//! changed hands. A creator read that fails leaves the candidate unproved, and it is dropped with a
+//! warning that names the `NTSTATUS`.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -86,11 +96,12 @@ pub(crate) enum KillOutcome {
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
 ///
 /// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
-/// `pid` carries its parent (Linux: the `stat` the id was made with), a candidate is dropped when
-/// its parent's number is another now, which means the pid changed hands since the snapshot or the
-/// same process was orphaned and is no longer in the tree; and when its parent's number no longer
-/// holds `parent`, which means the parent was reaped and its number taken by a process whose own
-/// children the candidate could be. Elsewhere the listing has nothing to check it against.
+/// `pid` carries its parent (Linux: the `stat` the id was made with; Windows: the creator pid read
+/// on the handle that gives the id), a candidate is dropped when its parent's number is another now,
+/// which means the pid changed hands since the snapshot or the same process was orphaned and is no
+/// longer in the tree; and when its parent's number no longer holds `parent`, which means the parent
+/// was reaped and its number taken by a process whose own children the candidate could be. On macOS
+/// the listing has nothing to check it against.
 pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Option<(ProcessId, OrderKey)> {
     match ProcessId::of_ordered_with(kernel, pid, Some(parent)) {
         (Resolved::Found(read), _) => Some(read),
