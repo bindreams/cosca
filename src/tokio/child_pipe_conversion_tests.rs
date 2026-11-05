@@ -19,7 +19,7 @@ use super::{Child, OsResources};
 fn a_child_without_a_process() -> Child {
     Child {
         os: OsResources::default(),
-        id: ProcessId::from_parts_for_test(1, 0),
+        id: ProcessId::from_parts_for_test(1, crate::identity::Key::for_test(0)),
         kill_on_drop: false,
         containment: Containment::None,
         tree_killed: Default::default(),
