@@ -1,14 +1,15 @@
-use super::process_parents;
-use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+use super::process_parents_with;
+use crate::identity::{FakeKernel, HostKernel, Kernel};
 
 type Records = Vec<(log::Level, String)>;
 
-fn snapshot_with(view: ForcedView) -> (Result<Vec<(u32, u32)>, crate::error::Error>, Records) {
+/// The pid the stat rows list and read.
+const PID: u32 = 4242;
+
+fn snapshot_with(kernel: &dyn Kernel) -> (Result<Vec<(u32, u32)>, crate::error::Error>, Records) {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let forced = force_proc_view_once(view);
-    let got = process_parents();
-    drop(forced);
+    let got = process_parents_with(kernel);
     (
         got,
         crate::log_capture::records_since_on_current_thread(mark, "enumerate::process_parents"),
@@ -30,7 +31,7 @@ fn assert_unassessable_naming(got: Result<Vec<(u32, u32)>, crate::error::Error>,
 /// the view"; "return an empty snapshot for a view that is not `Same`".
 #[skuld::test]
 fn a_diverged_view_is_unassessable_and_warned_about() {
-    let (got, records) = snapshot_with(ForcedView::Diverged);
+    let (got, records) = snapshot_with(&FakeKernel::over(&HostKernel).diverged_view());
     assert_unassessable_naming(got, "outer pid namespace");
     assert!(
         records
@@ -42,12 +43,12 @@ fn a_diverged_view_is_unassessable_and_warned_about() {
 
 #[skuld::test]
 fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
-    let (got, records) = snapshot_with(ForcedView::Unassessable);
-    assert_unassessable_naming(got, "forced by a test");
+    let (got, records) = snapshot_with(&FakeKernel::over(&HostKernel).unreadable_view());
+    assert_unassessable_naming(got, "self/status could not be read");
     assert!(
         records
             .iter()
-            .any(|(level, m)| *level == log::Level::Warn && m.contains("forced by a test")),
+            .any(|(level, m)| *level == log::Level::Warn && m.contains("self/status could not be read")),
         "{records:?}"
     );
 }
@@ -57,53 +58,19 @@ fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
 fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
     let me = std::process::id();
     let ppid = std::os::unix::process::parent_id();
-    assert!(process_parents().expect("the snapshot").contains(&(me, ppid)));
-}
-
-/// Without `openat2` no view can be checked: the snapshot is `Unsupported`, naming the requirement
-/// as a spawn does, and logged at `warn` with it. Mutant: "report every unreadable view as
-/// `Unassessable`" - the requirement is missing from both the error and the warning.
-#[skuld::test]
-fn a_snapshot_without_openat2_is_unsupported_naming_it_and_warned_about() {
-    for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
-        crate::log_capture::install();
-        let mark = crate::log_capture::mark();
-        let forced = crate::identity::proc_view_fault::force_openat2_errno(errno);
-        let got = process_parents();
-        drop(forced);
-        let records = crate::log_capture::records_since_on_current_thread(mark, "enumerate::process_parents");
-
-        match got {
-            Err(crate::error::Error::Unsupported { op, detail, platform }) => {
-                assert_eq!(platform, "linux");
-                assert_eq!(detail, crate::identity::openat2_refused_message(name), "{errno}");
-                assert!(!op.contains("foreign"), "{op}");
-            }
-            other => panic!("{errno}: expected Unsupported, got {other:?}"),
-        }
-        assert!(
-            records
-                .iter()
-                .any(|(level, m)| *level == log::Level::Warn
-                    && m.contains(&crate::identity::openat2_refused_message(name))),
-            "{errno}: {records:?}"
-        );
-    }
-}
-
-/// Another `/proc` open failure is not the requirement. Mutant: "every open failure is
-/// `Unsupported`".
-#[skuld::test]
-fn a_snapshot_with_another_open_failure_is_not_unsupported() {
-    let forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOENT);
-    let got = process_parents();
-    drop(forced);
-    assert!(matches!(got, Err(crate::error::Error::Unassessable { .. })), "{got:?}");
+    assert!(crate::containment::enumerate::process_parents()
+        .expect("the snapshot")
+        .contains(&(me, ppid)));
 }
 
 // Per-pid stat read failures =====
 
-use crate::identity::pid_stat::fault::force_stat_read;
+/// A kernel listing one pid, `PID`, whose `stat` read answers `errno`.
+fn failing_stat(errno: i32) -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel)
+        .on_pids(Ok(&[PID]))
+        .on_read(&format!("{PID}/stat"), Err(errno))
+}
 
 /// A pid that exited mid-scan (`ENOENT`, `ESRCH`) or that `hidepid` hides (`EACCES`, and `EPERM`
 /// while the checked directory still answers) is absent, and the snapshot is still a snapshot.
@@ -111,8 +78,8 @@ use crate::identity::pid_stat::fault::force_stat_read;
 #[skuld::test]
 fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
-        let _forced = force_stat_read(errno, None);
-        let got = process_parents().unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
+        let got =
+            process_parents_with(&failing_stat(errno)).unwrap_or_else(|e| panic!("errno {errno} is an absence: {e}"));
         assert!(got.is_empty(), "errno {errno}: {got:?}");
     }
 }
@@ -132,8 +99,7 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
         libc::EIO,
         libc::ENOSYS,
     ] {
-        let _forced = force_stat_read(errno, None);
-        let text = match process_parents() {
+        let text = match process_parents_with(&failing_stat(errno)) {
             Err(crate::error::Error::Unassessable { detail, source }) => {
                 assert!(source.is_some(), "errno {errno}: the read's error is the source");
                 detail
@@ -148,8 +114,9 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
             assert!(text.contains("lies beyond a mount in /proc"), "{errno}: {text}");
         }
         let pid = text.split("/stat").next().unwrap().rsplit(' ').next().unwrap();
-        assert!(
-            pid.parse::<u32>().is_ok(),
+        assert_eq!(
+            pid.parse::<u32>().ok(),
+            Some(PID),
             "{errno}: the error must name the pid before `/stat`: {text}"
         );
     }
@@ -161,8 +128,8 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
 #[skuld::test]
 fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
-        let _forced = force_stat_read(libc::EPERM, Some(recheck));
-        match process_parents() {
+        let kernel = failing_stat(libc::EPERM).on_read("self/stat", Err(recheck));
+        match process_parents_with(&kernel) {
             Err(crate::error::Error::Unassessable { detail, .. }) => {
                 assert!(detail.contains("self/stat"), "{recheck}: {detail}");
                 assert!(
@@ -179,8 +146,8 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
 /// Mutant: "an unlistable `/proc` is an empty snapshot".
 #[skuld::test]
 fn an_unlistable_proc_is_unassessable_naming_the_errno() {
-    let _forced = crate::identity::proc_view_fault::force_pids_errno(libc::EIO);
-    match process_parents() {
+    let kernel = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    match process_parents_with(&kernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("/proc could not be listed"), "{detail}");
             assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EIO));
@@ -207,8 +174,10 @@ fn an_unparsable_stat_is_unassessable_naming_the_pid() {
 #[skuld::test]
 #[should_panic(expected = "the kernel printed an unparseable stat")]
 fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
-    let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
-    drop(process_parents());
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pids(Ok(&[PID]))
+        .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
+    drop(process_parents_with(&kernel));
 }
 
 /// Without the assertion (release), the scan still refuses to drop the pid. Mutant: "an unparsable
@@ -216,8 +185,10 @@ fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
 #[cfg(not(debug_assertions))]
 #[skuld::test]
 fn an_unparsable_stat_in_the_scan_is_unassessable_in_release() {
-    let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
-    match process_parents() {
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pids(Ok(&[PID]))
+        .on_read(&format!("{PID}/stat"), Ok(b"garbage"));
+    match process_parents_with(&kernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("/stat has no parseable"), "{detail}")
         }

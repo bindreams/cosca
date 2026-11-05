@@ -1,6 +1,7 @@
 use rustix::io::Errno;
 use rustix::process::{getpid, Pid};
 
+use super::fake::FakeKernel;
 use super::{HostKernel, Kernel};
 
 #[skuld::test]
@@ -11,6 +12,25 @@ fn host_kernel_reads_a_file_under_the_proc_it_opens() {
     assert!(
         text.starts_with(&format!("{} ", std::process::id())),
         "self/stat names this process: {text:?}"
+    );
+}
+
+#[skuld::test]
+fn host_pids_lists_this_process() {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    let pids = HostKernel.pids(&dir).expect("/proc lists");
+    assert!(pids.contains(&std::process::id()), "{pids:?}");
+}
+
+#[skuld::test]
+fn fake_pids_row_answers_without_the_host() {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    let listed = FakeKernel::new().on_pids(Ok(&[7]));
+    assert_eq!(listed.pids(&dir).expect("the row lists"), vec![7]);
+    let refused = FakeKernel::new().on_pids(Err(libc::EIO));
+    assert_eq!(
+        refused.pids(&dir).expect_err("the row refuses").raw_os_error(),
+        Some(libc::EIO)
     );
 }
 

@@ -213,10 +213,6 @@ impl ProcDir {
 
     /// The pids listed under this `/proc`: its decimal-named entries.
     pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
-        #[cfg(test)]
-        if let Some(errno) = fault::forced_pids_errno() {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
         let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
         collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
     }
@@ -456,7 +452,6 @@ pub(crate) mod fault {
         static FORCE_PROC_VIEW_SKIP: Cell<u32> = const { Cell::new(0) };
         static PROC_VIEW_CALLS: Cell<u32> = const { Cell::new(0) };
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
-        static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
     }
@@ -472,7 +467,6 @@ pub(crate) mod fault {
             FORCE_PROC_VIEW_SKIP.with(|f| f.set(0));
             PROC_VIEW_CALLS.with(|f| f.set(0));
             PROC_VIEW_FIRED_AT.with(|f| f.set(None));
-            FORCE_PIDS_ERRNO.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
         }
@@ -488,17 +482,6 @@ pub(crate) mod fault {
 
     pub(crate) fn forced_openat2_errno() -> Option<rustix::io::Errno> {
         FORCE_OPENAT2_ERRNO.with(|f| f.get())
-    }
-
-    /// Make EVERY [`ProcDir::pids`](super::ProcDir::pids) on THIS thread fail with `errno` until
-    /// the guard drops.
-    pub(crate) fn force_pids_errno(errno: i32) -> Forced {
-        FORCE_PIDS_ERRNO.with(|f| f.set(Some(errno)));
-        Forced(())
-    }
-
-    pub(crate) fn forced_pids_errno() -> Option<i32> {
-        FORCE_PIDS_ERRNO.with(|f| f.get())
     }
 
     /// Make every by-pid identity read of `pid`'s `stat` on THIS thread fail with `errno` (a

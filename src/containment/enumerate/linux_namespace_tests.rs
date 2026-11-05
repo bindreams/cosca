@@ -1,7 +1,7 @@
 //! `process_parents` against REAL namespace layouts, in re-exec'd children (see
 //! `test_child::namespaces` for the group's gating).
 
-use super::process_parents;
+use crate::containment::enumerate::process_parents;
 use crate::test_child::namespaces as ns;
 use crate::test_child::{await_member_ready, fixture_path, member_command};
 use crate::test_groups::{namespaces, Group};

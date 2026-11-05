@@ -22,6 +22,8 @@ pub(crate) struct FakeKernel<'a> {
     reads: Vec<(String, usize, Result<Vec<u8>, i32>)>,
     /// How many times each path has been read.
     read_counts: Mutex<Vec<(String, usize)>>,
+    /// The listing of any `/proc`: the pids, or a raw errno.
+    pids: Option<Result<Vec<u32>, i32>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     pidfd_opens: Vec<(Pid, PidfdRow)>,
 }
@@ -42,6 +44,7 @@ impl<'a> FakeKernel<'a> {
             open_proc: None,
             reads: Vec::new(),
             read_counts: Mutex::new(Vec::new()),
+            pids: None,
             signal_probes: Vec::new(),
             pidfd_opens: Vec::new(),
         }
@@ -65,6 +68,12 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn on_read_after(mut self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
         self.reads
             .push((path.to_owned(), earlier_reads, answer.map(<[u8]>::to_vec)));
+        self
+    }
+
+    /// Listing any `/proc` answers `answer`: the pids, or a raw errno.
+    pub(crate) fn on_pids(mut self, answer: Result<&[u32], i32>) -> Self {
+        self.pids = Some(answer.map(<[u32]>::to_vec));
         self
     }
 
@@ -153,6 +162,14 @@ impl Kernel for FakeKernel<'_> {
             Some((_, _, Ok(bytes))) => Ok(bytes.clone()),
             Some((_, _, Err(errno))) => Err(io::Error::from_raw_os_error(*errno)),
             None => self.real(&format!("read of {path}")).read(dir, path),
+        }
+    }
+
+    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+        match &self.pids {
+            Some(Ok(pids)) => Ok(pids.clone()),
+            Some(Err(errno)) => Err(io::Error::from_raw_os_error(*errno)),
+            None => self.real("pids").pids(dir),
         }
     }
 

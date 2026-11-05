@@ -24,6 +24,9 @@ pub(crate) trait Kernel: Sync {
     /// `thread-self/fdinfo/<fd>`.
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>>;
 
+    /// The numeric entries of `dir` (`ProcDir::pids`).
+    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>>;
+
     /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
     /// kernel is asked only about one.
     fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
@@ -43,6 +46,10 @@ impl Kernel for HostKernel {
 
     fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
         dir.read(path)
+    }
+
+    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+        dir.pids()
     }
 
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
