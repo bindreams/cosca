@@ -3,12 +3,13 @@
 
 use crate::child::spawn::fault::{release_at_drop_kill, release_between_kill_and_wait};
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd as assert_through_the_pidfd, Capture};
+use crate::test_child::Console;
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// A root that leads its own group (a session), blocked on a pipe whose write end is returned.
 fn group_root() -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);

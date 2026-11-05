@@ -11,6 +11,8 @@
 //! answer left over must not reach the drop.
 
 use std::io::{BufRead as _, BufReader};
+
+use crate::test_child::Console;
 use std::time::Duration;
 
 use crate::error::Error;
@@ -20,7 +22,7 @@ use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
 #[cfg(feature = "tokio")]
 use crate::wait::exit_only::seams::{force_peek_once, Forced};
-use crate::{Command, ContainMode};
+use crate::ContainMode;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
 pub(crate) fn warns_since(mark: usize) -> Vec<String> {
@@ -33,7 +35,7 @@ pub(crate) fn warns_since(mark: usize) -> Vec<String> {
 
 fn blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(mode);
@@ -88,7 +90,7 @@ pub(crate) fn group_blocker() -> (crate::Child, std::io::PipeWriter) {
 /// started it. Neither exits on its own, so the holders do not change under a sweep.
 pub(crate) fn session_tree() -> (crate::Child, std::io::PipeWriter, u32) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);
     cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
@@ -655,7 +657,7 @@ fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
 #[skuld::test]
 fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let mut child = cmd.spawn().expect("spawn");

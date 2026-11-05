@@ -5,6 +5,7 @@
 use crate::child::spawn::failure::{expect_may_have_started_with, expect_not_started};
 use crate::child::spawn::fault;
 use crate::error::{ChildFate, Error};
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::Command;
@@ -17,7 +18,7 @@ fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
         stdout,
         guard,
     } = fault::teardown_blocker_parts();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
     if let Some(stdout) = stdout {
@@ -29,7 +30,7 @@ fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 // A child only a real kill ends, its stdin writer leaked — see `child::spawn_tests::blocker`.
 #[cfg(target_os = "linux")]
 fn blocker() -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::test_child::leaked_writer_stdin())
         .expect("set stdin pipe");
@@ -121,7 +122,7 @@ async fn attach_failure_reaps_the_spawned_child() {
 async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     use crate::test_child::{cwd_and_path_tools, CWD_TOOL_EXIT};
     let (cwd, on_path) = cwd_and_path_tools();
-    let mut c = Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.raw_executable("tool")
         .args(["tool"])
         .current_dir(cwd.path())
@@ -191,7 +192,7 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         let (stdin, reaps) = (Stdio::pipe_in(), fault::record_teardown_reaps());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
-                let mut cmd = crate::tokio::Command::new();
+                let mut cmd = crate::test_child::tokio_command(Console::Hidden);
                 cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
                 cmd.stdin(stdin).unwrap().stdout(Stdio::null()).unwrap();
                 // The attach, except on macOS, where it cannot fail: the identity check's failure
@@ -514,7 +515,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[
         // Its stdin is released as the spawn's cleanup is about to wait for it, so a kill that sent
         // nothing lets it exit by itself, and the `SIGKILL` check below fails, instead of the wait hanging.
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin pipe");
         let _released = cgroup_fault::set_before_exit_wait(move || drop(writer));
@@ -769,7 +770,7 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio(#[fixture(cgro
 /// The sync command `spawn_uncommitted` takes: a [`blocker`] on `stdin` with `kill_on_drop(false)`.
 #[cfg(target_os = "linux")]
 fn opted_out_blocker(stdin: crate::stdio::Stdio) -> crate::command::Command {
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin pipe");
     cmd.kill_on_drop(false);
@@ -785,7 +786,7 @@ fn opted_out_teardown_blocker() -> (crate::command::Command, fault::TeardownBloc
         stdout: _,
         guard,
     } = fault::teardown_blocker_parts();
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
     cmd.kill_on_drop(false);
@@ -1150,7 +1151,7 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
     crate::tokio::test_runtime::assert_current_thread();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin pipe");
     cmd.contain_with(crate::ContainMode::Session);
@@ -1198,7 +1199,7 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
 /// Mutant: stdio resolution answers that the program may have started.
 #[skuld::test]
 async fn a_refused_stdio_setup_did_not_start_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdout(crate::stdio::Stdio::merge(crate::stdio::Fd::STDERR))
         .expect("stdout");
@@ -1214,7 +1215,7 @@ async fn a_refused_stdio_setup_did_not_start_the_program() {
 /// Mutant: a failed tokio spawn answers that the program did not start.
 #[skuld::test]
 async fn a_failed_exec_may_have_started_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
     // Linux's handshake finds std had collected the child whose exec failed. Elsewhere nothing holds
@@ -1238,7 +1239,7 @@ async fn a_failed_exec_may_have_started_the_program() {
 #[cfg(unix)]
 #[skuld::test]
 async fn run_to_completion_failures_after_the_spawn_may_have_started() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["printf", "\\377"]);
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         cmd.read().await.expect_err("invalid UTF-8 fails `read`"),
@@ -1255,7 +1256,7 @@ async fn run_to_completion_failures_after_the_spawn_may_have_started() {
 /// Mutant: the refusal answers that the program may have started.
 #[skuld::test]
 fn a_spawn_outside_a_runtime_did_not_start_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     expect_not_started(cmd.spawn().expect_err("no runtime, no spawn"));
 }
@@ -1265,7 +1266,11 @@ fn a_spawn_outside_a_runtime_did_not_start_the_program() {
 /// Mutant: building the `std` command answers that the program may have started.
 #[skuld::test]
 async fn a_command_with_no_program_did_not_start() {
-    let err = expect_not_started(Command::new().spawn().expect_err("no program, no spawn"));
+    let err = expect_not_started(
+        crate::test_child::tokio_command(Console::Hidden)
+            .spawn()
+            .expect_err("no program, no spawn"),
+    );
     assert!(matches!(err, Error::Io(_)), "{err:?}");
 }
 
@@ -1275,7 +1280,7 @@ async fn a_command_with_no_program_did_not_start() {
 #[cfg(unix)]
 #[skuld::test]
 async fn an_elevation_refused_for_its_shape_did_not_start() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["/bin/sh", "-c", "true"]).elevate();
     cmd.fd(3, crate::stdio::Stdio::null()).expect("fd 3");
     let err = expect_not_started(cmd.spawn().expect_err("fd >= 3 is refused under elevation"));
@@ -1289,7 +1294,7 @@ async fn an_elevation_refused_for_its_shape_did_not_start() {
 #[skuld::test]
 async fn a_handshake_that_cannot_open_did_not_start() {
     let _armed = crate::child::spawn::pidfd_handshake::fault::fail_done_fd(rustix::io::Errno::MFILE);
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
     assert!(
@@ -1304,7 +1309,7 @@ async fn a_handshake_that_cannot_open_did_not_start() {
 #[cfg(windows)]
 #[skuld::test]
 async fn a_refused_creation_flag_did_not_start_the_program() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cmd", "/C", "exit 0"])
         .contain()
         .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
@@ -1360,7 +1365,7 @@ fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
 async fn a_tokio_spawn_failing_after_the_fork_leaves_the_child_running_and_says_so() {
     crate::tokio::test_runtime::assert_current_thread();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let error = {
@@ -1417,7 +1422,7 @@ fn a_front_the_leaf_found_is_answered_by_what_became_of_it() {
 async fn an_elevated_executable_or_raw_executable_is_refused_by_the_async_spawn() {
     let program = r"C:\no-such-dir\tool";
     for setter in ["executable", "raw_executable"] {
-        let mut c = crate::tokio::Command::new();
+        let mut c = crate::test_child::tokio_command(Console::Hidden);
         match setter {
             "executable" => c.executable(program),
             _ => c.raw_executable(program),

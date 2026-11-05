@@ -8,6 +8,8 @@
 
 use static_assertions::assert_impl_all;
 
+use crate::test_child::Console;
+
 use super::SuspendedChild;
 #[cfg(not(windows))]
 use crate::error::Error;
@@ -18,7 +20,7 @@ assert_impl_all!(SuspendedChild: Send);
 /// inside and outside a runtime.
 #[cfg(not(windows))]
 fn assert_spawn_suspended_is_refused() {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.kill_on_drop(false);
 
@@ -53,6 +55,7 @@ mod on_windows {
         OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
+    use super::Console;
     use crate::containment::windows::fault::{force_next, Step};
     use crate::error::{ChildFate, Error};
     use crate::test_frozen::{limit_flags, InitialThread, Remote};
@@ -65,7 +68,7 @@ mod on_windows {
     /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> Command {
         let more = crate::test_child::windows_more();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args([&more]);
         if raw {
             cmd.executable(&more);
@@ -73,14 +76,13 @@ mod on_windows {
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
         cmd.stderr(crate::Stdio::null()).expect("stderr null");
-        cmd.no_window();
         cmd
     }
 
     /// [`blocker`] with `findstr x`: it prints the matching line, and exits 1 on input with no
     /// match.
     fn findstr_blocker(raw: bool) -> Command {
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
             cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
@@ -88,7 +90,6 @@ mod on_windows {
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
         cmd.stderr(crate::Stdio::null()).expect("stderr null");
-        cmd.no_window();
         cmd
     }
 
@@ -351,7 +352,7 @@ mod on_windows {
         use ::tokio::io::AsyncReadExt as _;
         const MISSING: &str = "cosca-49-no-such-file.txt";
         for raw in BACKENDS {
-            let mut cmd = Command::new();
+            let mut cmd = crate::test_child::tokio_command(Console::Hidden);
             cmd.args(["findstr", "x", MISSING]);
             if raw {
                 cmd.executable("findstr");
@@ -359,7 +360,6 @@ mod on_windows {
             cmd.stdin(crate::Stdio::null()).expect("stdin null");
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
-            cmd.no_window();
             let mut child = cmd
                 .spawn_suspended()
                 .expect("spawn suspended")
@@ -442,12 +442,12 @@ mod on_windows {
         }
         for raw in BACKENDS {
             for kill_on_drop in [true, false] {
-                let mut cmd = Command::new();
+                let mut cmd = crate::test_child::tokio_command(Console::Hidden);
                 cmd.args(["cosca-49-no-such-program.exe"]);
                 if raw {
                     cmd.executable("cosca-49-no-such-program.exe");
                 }
-                cmd.no_window().kill_on_drop(kill_on_drop);
+                cmd.kill_on_drop(kill_on_drop);
                 let plain = cmd.spawn().expect_err("there is no such program");
 
                 let err = cmd.spawn_suspended().expect_err("there is no such program");

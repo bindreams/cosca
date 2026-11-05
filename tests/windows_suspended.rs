@@ -48,7 +48,7 @@ const BACKENDS: [&str; 2] = ["argv", "executable"];
 #[cfg(windows)]
 /// A windowless testbin command running `mode <addr> extra...` through `backend`.
 fn testbin_command(backend: &str, mode: &str, addr: &str, extra: &[&str]) -> cosca::Command {
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     match backend {
         "argv" => {
             cmd.args([testbin(), mode, addr]);
@@ -61,14 +61,13 @@ fn testbin_command(backend: &str, mode: &str, addr: &str, extra: &[&str]) -> cos
     cmd.args(extra);
     cmd.env(ACK_ENV, "1");
     silence(&mut cmd);
-    cmd.no_window();
     cmd
 }
 
 #[cfg(all(windows, feature = "tokio"))]
 /// [`testbin_command`] for the async builder.
 fn testbin_command_async(backend: &str, mode: &str, addr: &str, extra: &[&str]) -> cosca::tokio::Command {
-    let mut cmd = cosca::tokio::Command::new();
+    let mut cmd = common::tokio_command(common::Console::Hidden);
     match backend {
         "argv" => {
             cmd.args([testbin(), mode, addr]);
@@ -81,7 +80,6 @@ fn testbin_command_async(backend: &str, mode: &str, addr: &str, extra: &[&str]) 
     cmd.args(extra);
     cmd.env(ACK_ENV, "1");
     silence_async(&mut cmd);
-    cmd.no_window();
     cmd
 }
 

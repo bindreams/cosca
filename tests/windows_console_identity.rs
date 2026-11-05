@@ -11,8 +11,6 @@
 
 #[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
@@ -68,9 +66,10 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(argv_head)
         .args(["report-console-identity", addr.as_str(), me.as_str()])
-        .env(common::ACK_ENV, "1")
-        .creation_flags(flags);
-    let mut child = common::spawn_locked(&mut cmd).expect("spawn identity probe child");
+        .env(common::ACK_ENV, "1");
+    // `Asked`: the flag word is the subject, so no `CREATE_NO_WINDOW` joins it.
+    let mut child = common::spawn_locked_with(&mut cmd, flags, common::console_flags::Console::Asked)
+        .expect("spawn identity probe child");
     let sock = common::accept_or_die(&listener, &mut child);
     let report = read_report_line(&sock);
     Probe { child, sock, report }
@@ -288,7 +287,7 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let me = std::process::id().to_string();
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Asked);
     cmd.args([
         env!("CARGO_BIN_EXE_cosca_testbin"),
         "report-console-identity",

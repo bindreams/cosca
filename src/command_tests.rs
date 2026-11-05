@@ -1,6 +1,7 @@
 use crate::command::{Command, CommandInput, ExecutableSpec};
 use crate::containment::Nesting;
 use crate::stdio::{Direction, ResolvedStdio, Stdio};
+use crate::test_child::Console;
 use crate::{ContainMode, Fd};
 use std::ffi::OsString;
 use std::path::Path;
@@ -14,28 +15,28 @@ fn argv(cmd: &Command) -> Vec<String> {
 
 #[skuld::test]
 fn new_is_empty() {
-    let cmd = Command::new();
+    let cmd = crate::test_child::command(Console::Hidden);
     assert!(matches!(cmd.input(), CommandInput::Empty));
     assert!(cmd.executable_path().is_none());
 }
 
 #[skuld::test]
 fn args_sets_and_extends_argv() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["git", "status"]).args(["--short"]);
     assert_eq!(argv(&cmd), ["git", "status", "--short"]);
 }
 
 #[skuld::test]
 fn arg_appends_one() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.arg("echo").arg("hi");
     assert_eq!(argv(&cmd), ["echo", "hi"]);
 }
 
 #[skuld::test]
 fn commandline_sets_string_source() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.commandline(r#"git "status""#);
     match cmd.input() {
         CommandInput::CommandLine(s) => assert_eq!(s, &OsString::from(r#"git "status""#)),
@@ -45,21 +46,21 @@ fn commandline_sets_string_source() {
 
 #[skuld::test]
 fn commandline_then_args_switches_source_and_discards() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.commandline("ignored string").args(["real", "argv"]);
     assert_eq!(argv(&cmd), ["real", "argv"]);
 }
 
 #[skuld::test]
 fn args_then_commandline_switches_to_string() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["a", "b"]).commandline("c d");
     assert!(matches!(cmd.input(), CommandInput::CommandLine(_)));
 }
 
 #[skuld::test]
 fn executable_overrides_load_path_independently_of_argv() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/busybox").args(["sh", "-c", "echo hi"]);
     assert_eq!(cmd.executable_path(), Some(Path::new("/bin/busybox")));
     assert_eq!(argv(&cmd), ["sh", "-c", "echo hi"]);
@@ -67,7 +68,7 @@ fn executable_overrides_load_path_independently_of_argv() {
 
 #[skuld::test]
 fn stdout_shorthand_records_resolved_pipe_out() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["x"]);
     cmd.stdout(Stdio::pipe()).unwrap();
     let fds = cmd.fds();
@@ -79,7 +80,7 @@ fn stdout_shorthand_records_resolved_pipe_out() {
 
 #[skuld::test]
 fn stdin_pipe_infers_in() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.stdin(Stdio::pipe()).unwrap();
     assert!(matches!(
         cmd.fds().get(&Fd::STDIN),
@@ -89,13 +90,13 @@ fn stdin_pipe_infers_in() {
 
 #[skuld::test]
 fn bare_pipe_on_fd3_errs_at_attach() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     assert!(cmd.fd(3, Stdio::pipe()).is_err());
 }
 
 #[skuld::test]
 fn explicit_pipe_out_on_fd3_attaches() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.fd(3, Stdio::pipe_out()).unwrap();
     assert!(matches!(
         cmd.fds().get(&Fd::from(3)),
@@ -109,7 +110,7 @@ fn explicit_pipe_out_on_fd3_attaches() {
 /// and would do nothing at all in release).
 #[skuld::test]
 fn fd_rejects_negative_slot_with_invalid_input() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     let err = cmd.fd(-1, Stdio::null()).expect_err("a negative fd must be rejected");
     match err {
         crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
@@ -123,7 +124,7 @@ fn fd_rejects_negative_slot_with_invalid_input() {
 /// would overflow on it. Also must be an explicit `Err`, not a panic.
 #[skuld::test]
 fn fd_rejects_i32_min_slot_with_invalid_input() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     let err = cmd.fd(i32::MIN, Stdio::null()).expect_err("i32::MIN must be rejected");
     match err {
         crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
@@ -133,7 +134,7 @@ fn fd_rejects_i32_min_slot_with_invalid_input() {
 
 #[skuld::test]
 fn kill_on_drop_defaults_true_and_toggles() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     assert!(cmd.kill_on_drop_flag());
     cmd.kill_on_drop(false);
     assert!(!cmd.kill_on_drop_flag());
@@ -141,7 +142,7 @@ fn kill_on_drop_defaults_true_and_toggles() {
 
 #[skuld::test]
 fn fd_last_set_wins_for_same_slot() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.stdout(Stdio::pipe()).unwrap();
     cmd.stdout(Stdio::null()).unwrap();
     assert!(matches!(cmd.fds().get(&Fd::STDOUT), Some(ResolvedStdio::Null)));
@@ -149,21 +150,21 @@ fn fd_last_set_wins_for_same_slot() {
 
 #[skuld::test]
 fn inherit_resolves_through_builder() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.stderr(Stdio::inherit()).unwrap();
     assert!(matches!(cmd.fds().get(&Fd::STDERR), Some(ResolvedStdio::Inherit)));
 }
 
 #[skuld::test]
 fn null_resolves_through_builder() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.stdin(Stdio::null()).unwrap();
     assert!(matches!(cmd.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
 }
 
 #[skuld::test]
 fn merge_resolves_through_builder() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.stderr(Stdio::merge(Fd::STDOUT)).unwrap();
     assert!(matches!(
         cmd.fds().get(&Fd::STDERR),
@@ -174,7 +175,7 @@ fn merge_resolves_through_builder() {
 #[skuld::test]
 fn env_ops_recorded_in_order() {
     use crate::command::EnvOp;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.env_clear();
     cmd.env("A", "1");
     cmd.env_remove("B");
@@ -190,21 +191,21 @@ fn env_ops_recorded_in_order() {
 
 #[skuld::test]
 fn envs_empty_iterator_records_nothing() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.envs::<_, &str, &str>([]);
     assert!(cmd.env_ops().is_empty());
 }
 
 #[skuld::test]
 fn cwd_recorded() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.current_dir("/tmp");
     assert_eq!(cmd.cwd(), Some(Path::new("/tmp")));
 }
 
 #[skuld::test]
 fn contain_records_strongest_request() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.contain();
     let req = cmd.contain_request();
     assert_eq!(req.mode, Some(ContainMode::Strongest));
@@ -213,12 +214,12 @@ fn contain_records_strongest_request() {
 
 #[skuld::test]
 fn uncontained_by_default() {
-    assert_eq!(Command::new().contain_request().mode, None);
+    assert_eq!(crate::test_child::command(Console::Hidden).contain_request().mode, None);
 }
 
 #[skuld::test]
 fn contain_with_and_nesting_recorded() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.contain_with(ContainMode::TreeWalk).nesting(Nesting::Opaque);
     let req = cmd.contain_request();
     assert_eq!(req.mode, Some(ContainMode::TreeWalk));
@@ -227,7 +228,7 @@ fn contain_with_and_nesting_recorded() {
 
 #[skuld::test]
 fn elevate_enables_with_defaults() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["id", "-u"]).elevate();
     let req = c.elevation_request();
     assert!(req.enabled);
@@ -237,7 +238,7 @@ fn elevate_enables_with_defaults() {
 
 #[skuld::test]
 fn elevation_overrides_apply_and_enable() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.arg("id")
         .elevation_backend(crate::elevation::Backend::Doas)
         .elevation_auth(crate::elevation::Auth::NonInteractive);
@@ -249,7 +250,7 @@ fn elevation_overrides_apply_and_enable() {
 
 #[skuld::test]
 fn command_without_elevate_is_disabled() {
-    let c = Command::new();
+    let c = crate::test_child::command(Console::Hidden);
     assert!(!c.elevation_request().enabled);
 }
 
@@ -260,7 +261,7 @@ fn command_without_elevate_is_disabled() {
 // convenience methods, a regression this pins at the builder level (no live spawn needed).
 #[skuld::test]
 fn default_stdin_is_not_forced_when_auth_stdin_reserves_fd0() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["id"])
         .elevation_auth(crate::elevation::Auth::Stdin(crate::elevation::Secret::new("pw")));
     c.apply_default_stdin(Stdio::null()).unwrap();
@@ -272,7 +273,7 @@ fn default_stdin_is_not_forced_when_auth_stdin_reserves_fd0() {
 
 #[skuld::test]
 fn default_stdin_is_forced_without_auth_stdin() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["id"]);
     c.apply_default_stdin(Stdio::null()).unwrap();
     assert!(matches!(c.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
@@ -280,7 +281,7 @@ fn default_stdin_is_forced_without_auth_stdin() {
 
 #[skuld::test]
 fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
-    let mut derived = crate::Command::new();
+    let mut derived = crate::test_child::command(Console::Hidden);
     assert!(!derived.fd_marker_suppressed(), "a fresh command suppresses nothing");
     derived.suppress_fd_marker();
     assert!(derived.fd_marker_suppressed());
@@ -292,7 +293,7 @@ fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
 /// and only the lowering differs (a creation flag / a show-command / nothing at all).
 #[skuld::test]
 fn no_window_is_recorded_on_every_platform() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Asked);
     assert!(!cmd.flags_request().no_window, "the default requests nothing");
     cmd.no_window();
     assert!(cmd.flags_request().no_window);
@@ -301,7 +302,7 @@ fn no_window_is_recorded_on_every_platform() {
 #[cfg(windows)]
 #[skuld::test]
 fn detached_and_raw_flags_are_recorded() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     let before = *cmd.flags_request();
     assert!(!before.detached);
     assert_eq!(before.raw, 0);
@@ -318,7 +319,7 @@ fn detached_and_raw_flags_are_recorded() {
 #[cfg(windows)]
 #[skuld::test]
 fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.creation_flags(0x0000_0040);
     assert_eq!(cmd.flags_request().raw, 0x0000_0040);
     cmd.creation_flags(0x0000_0080);
@@ -338,11 +339,11 @@ fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
 /// "load exactly this", and both contracts cannot coexist.
 #[skuld::test]
 fn executable_records_search_and_raw_executable_records_exact() {
-    let mut a = Command::new();
+    let mut a = crate::test_child::command(Console::Hidden);
     a.executable("helper");
     assert!(matches!(a.executable_spec(), Some(ExecutableSpec::Search(p)) if p == Path::new("helper")));
 
-    let mut b = Command::new();
+    let mut b = crate::test_child::command(Console::Hidden);
     b.raw_executable("helper");
     assert!(matches!(b.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("helper")));
 }
@@ -352,11 +353,11 @@ fn executable_records_search_and_raw_executable_records_exact() {
 /// carrying both intents.
 #[skuld::test]
 fn last_executable_setter_wins_in_either_order() {
-    let mut a = Command::new();
+    let mut a = crate::test_child::command(Console::Hidden);
     a.executable("search-me").raw_executable("exact-me");
     assert!(matches!(a.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("exact-me")));
 
-    let mut b = Command::new();
+    let mut b = crate::test_child::command(Console::Hidden);
     b.raw_executable("exact-me").executable("search-me");
     assert!(matches!(b.executable_spec(), Some(ExecutableSpec::Search(p)) if p == Path::new("search-me")));
 }
@@ -367,11 +368,11 @@ fn last_executable_setter_wins_in_either_order() {
 /// resolve need to special-case `Exact`.
 #[skuld::test]
 fn executable_path_is_variant_agnostic() {
-    let mut a = Command::new();
+    let mut a = crate::test_child::command(Console::Hidden);
     a.executable("/bin/busybox");
     assert_eq!(a.executable_path(), Some(Path::new("/bin/busybox")));
 
-    let mut b = Command::new();
+    let mut b = crate::test_child::command(Console::Hidden);
     b.raw_executable("/bin/busybox");
     assert_eq!(b.executable_path(), Some(Path::new("/bin/busybox")));
 }
@@ -531,7 +532,7 @@ fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     use crate::error::ChildFate;
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(seams::pretend_wrapper);
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         let _pump = seams::fail_the_next_pump();
         assert_failed_after_the_spawn(
@@ -563,7 +564,7 @@ fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
 fn read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag() {
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(crate::child::spawn::failure::seams::pretend_wrapper);
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(["printf", "\\377"]);
         let error = cmd.read().expect_err("invalid UTF-8 fails `read`");
         let crate::error::Error::MayHaveStarted {

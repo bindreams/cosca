@@ -29,7 +29,9 @@ mod restore_mode_tests {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_more_exits_zero_when_its_stdin_closes() {
-    let mut cmd = crate::Command::new();
+    use super::Console;
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args([super::windows_more()]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
