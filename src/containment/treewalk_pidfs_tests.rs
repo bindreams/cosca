@@ -214,11 +214,8 @@ const KILLED_INO: u64 = 77;
 /// The child is the pidfd's real target, so a signal sent through it is observable.
 fn live_child_in_a_table() -> (std::process::Child, ProcessId, FakeKernel<'static>) {
     use std::process::{Command, Stdio};
-    let child = Command::new("cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("cat spawns");
+    let child =
+        crate::test_spawn::spawn(Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null())).expect("cat spawns");
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(crate::child::front_cgroup_tests::pidfd_of(pid)))
