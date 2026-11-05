@@ -16,11 +16,11 @@
 use nix::sys::signal::Signal;
 
 use crate::containment::GroupRoot;
-use crate::identity::RawPid;
+use crate::identity::{ProcessId, RawPid};
 
-/// One process-group member as the listing found it, carrying the start token needed to
-/// re-verify later that a check still lands on the SAME process (`converge`, below) rather
-/// than a zombie or a pid recycled onto someone else.
+/// One process-group member as the listing found it, carrying the identity (built from the
+/// same record that named the pid) needed to re-verify later that a check still lands on the
+/// SAME process (`converge`, below) rather than a zombie or a pid recycled onto someone else.
 ///
 /// `system`: xnu's own `P_SYSTEM` flag (see `identity::kinfo::P_SYSTEM`), read directly from
 /// the same `kinfo_proc` record the listing already fetched — no second syscall. Always
@@ -29,8 +29,7 @@ use crate::identity::RawPid;
 /// specifically xnu's `killpg1` behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Member {
-    pub(crate) pid: RawPid,
-    pub(crate) token: u64,
+    pub(crate) id: ProcessId,
     pub(crate) system: bool,
 }
 
@@ -129,12 +128,14 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
         return Ok(buf
             .iter()
             .map(|k| Member {
-                pid: k.kp_proc.p_pid as RawPid,
-                // SAFETY: the kernel's KERN_PROC copy always fills `p_starttime`
-                // (see `identity::macos::token_of_kinfo`, the same formula).
-                token: unsafe {
-                    k.kp_proc.p_un.p_starttime.tv_sec as u64 * 1_000_000 + k.kp_proc.p_un.p_starttime.tv_usec as u64
-                },
+                id: ProcessId::from_parts(
+                    k.kp_proc.p_pid as RawPid,
+                    // SAFETY: the kernel's KERN_PROC copy always fills `p_starttime`
+                    // (see `identity::macos::token_of_kinfo`, the same formula).
+                    unsafe {
+                        k.kp_proc.p_un.p_starttime.tv_sec as u64 * 1_000_000 + k.kp_proc.p_un.p_starttime.tv_usec as u64
+                    },
+                ),
                 system: k.kp_proc.p_flag & crate::identity::kinfo::P_SYSTEM != 0,
             })
             .collect());
@@ -209,8 +210,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             continue;
         };
         out.push(Member {
-            pid,
-            token,
+            id: ProcessId::from_parts(pid, token),
             system: false,
         });
     }
@@ -637,15 +637,15 @@ pub(crate) fn converge(
     let mut refused = Vec::new();
     let mut unassessable = Vec::new();
     for m in &listed {
-        let id = crate::identity::ProcessId::from_parts(m.pid, m.token);
-        let outcome = classify_member(m.pid, id.is_alive_with(kernel), || {
-            if signal == Signal::SIGKILL && excluded_from_sigkill_resend(m.pid, m.system) {
+        let id = m.id;
+        let outcome = classify_member(id.pid(), id.is_alive_with(kernel), || {
+            if signal == Signal::SIGKILL && excluded_from_sigkill_resend(id.pid(), m.system) {
                 log::warn!(
                     "containment::unix::group: pid {pid} in process group {pgid} is excluded \
                      from the SIGKILL resend (mirrors xnu's own killpg1 exclusion for init/ \
                      P_SYSTEM) and reported unassessable, not cleared, since it was never \
                      actually reached",
-                    pid = m.pid
+                    pid = id.pid()
                 );
                 return Reached::Unknown;
             }
@@ -655,14 +655,14 @@ pub(crate) fn converge(
                 // documented on it.
                 #[cfg(target_os = "linux")]
                 {
-                    check_or_signal_linux_sigkill(kernel, m.pid, id, root)
+                    check_or_signal_linux_sigkill(kernel, id.pid(), id, root)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    check_or_signal(kernel, m.pid, id, Some(signal), root)
+                    check_or_signal(kernel, id.pid(), id, Some(signal), root)
                 }
             } else {
-                check_or_signal(kernel, m.pid, id, None, root)
+                check_or_signal(kernel, id.pid(), id, None, root)
             }
         });
         match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {
