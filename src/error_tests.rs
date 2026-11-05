@@ -196,6 +196,11 @@ fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
     assert_eq!(Error::Io(os()).raw_os_error(), Some(code), "bare");
     assert_eq!(Error::Io(context()).raw_os_error(), Some(code), "io_context");
     assert_eq!(
+        Error::Io(os()).with_note("while tearing down").raw_os_error(),
+        Some(code),
+        "a note"
+    );
+    assert_eq!(
         Error::Io(context()).with_note("while tearing down").raw_os_error(),
         Some(code),
         "io_context and a note"
@@ -213,8 +218,7 @@ fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
 }
 
 /// Where the OS code sits below an `Error::Io`: its own `source()` is the wrapper cosca added, which
-/// has no code, and the code is on the error the wrapper holds. A return to `#[error(transparent)]`
-/// would skip the wrapper and fail these.
+/// has no code, and the code is on the error the wrapper holds.
 #[skuld::test]
 fn an_error_io_over_io_context_has_the_code_one_io_error_down() {
     let code = if cfg!(windows) { 5 } else { 13 };
@@ -379,10 +383,7 @@ fn io_error_displays_the_wrapped_message_unchanged() {
     assert_eq!(Error::Io(inner).to_string(), expected);
 }
 
-/// The `raw_os_error()` of each `io::Error` reached by walking `source()` from `e`, outermost first.
+/// The `raw_os_error()` of each of `e`'s [`Error::io_errors`].
 fn codes_down(e: &Error) -> Vec<Option<i32>> {
-    std::iter::successors(std::error::Error::source(e), |s| s.source())
-        .filter_map(|s| s.downcast_ref::<std::io::Error>())
-        .map(std::io::Error::raw_os_error)
-        .collect()
+    e.io_errors().map(std::io::Error::raw_os_error).collect()
 }

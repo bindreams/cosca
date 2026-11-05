@@ -402,16 +402,23 @@ impl Error {
     }
 
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it: the
-    /// first `io::Error` from the wrapped one down its `source()` chain that has one, since
-    /// [`io_context`] and [`with_note`](Error::with_note) put a code-less `io::Error` above it.
-    /// `None` for any other variant.
+    /// first of [`io_errors`](Error::io_errors) that has one. `None` for any other variant.
     #[cfg(any(unix, feature = "tokio"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
-        let Error::Io(e) = self else {
-            return None;
+        self.io_errors().find_map(std::io::Error::raw_os_error)
+    }
+
+    /// The `io::Error`s down an [`Error::Io`]'s `source()` chain, outermost first; none for any
+    /// other variant. The first is the wrapped `io::Error` itself (its `source()`); under
+    /// [`io_context`] and [`with_note`](Error::with_note) that one is a code-less wrapper and the
+    /// OS error comes below it.
+    #[cfg(any(unix, feature = "tokio", test))]
+    pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
+        let start = match self {
+            Error::Io(_) => std::error::Error::source(self),
+            _ => None,
         };
-        std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |s| s.source())
-            .find_map(|s| s.downcast_ref::<std::io::Error>()?.raw_os_error())
+        std::iter::successors(start, |s| s.source()).filter_map(|s| s.downcast_ref::<std::io::Error>())
     }
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
