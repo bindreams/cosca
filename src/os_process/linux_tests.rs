@@ -260,9 +260,7 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let pidfd = crate::wait::exit_only::open_own_child(id.pid(), Some(id))
-        .expect("pidfd_open")
-        .expect("the child is not reaped");
+    let pidfd = crate::child::front_cgroup_tests::pidfd_of(id.pid());
     // std's `Child` neither kills nor reaps on drop; the pidfd is all that is left of it.
     drop(child);
     let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
@@ -287,9 +285,7 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let pidfd = crate::wait::exit_only::open_own_child(id.pid(), Some(id))
-        .expect("pidfd_open")
-        .expect("the child is not reaped");
+    let pidfd = crate::child::front_cgroup_tests::pidfd_of(id.pid());
     let os = LinuxProcess::new(None, pidfd);
     assert_eq!(os.signal(Sig::Kill).expect("kill"), Sent::Delivered);
     child.wait().expect("reap the killed child");
@@ -303,4 +299,55 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
             .contains(&format!("to {}: ", crate::os_process::PIDLESS_CHILD)),
         "{said:?}"
     );
+}
+
+/// A pidfd that does not name one of our children is refused. The pidfd of our parent stands in
+/// for the pidfd a reused number would open: the confirming `waitid` answers `ECHILD` to it.
+///
+/// Mutant: `adopt_pidfd` adopts the pidfd it opened without the confirming `waitid`.
+#[skuld::test]
+fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
+    use crate::identity::{FakeKernel, HostKernel};
+    use crate::os_process::child::adopt_pidfd;
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("the live child has an identity");
+    // SAFETY: `getppid` takes no arguments and cannot fail.
+    let parent = unsafe { libc::getppid() } as u32;
+    let kernel =
+        FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Ok(crate::child::front_cgroup_tests::pidfd_of(parent)));
+    let error = match adopt_pidfd(&kernel, id) {
+        Ok(_) => panic!("adopted a pidfd that is not our child"),
+        Err(refused) => refused,
+    };
+    let crate::error::Error::Io(e) = &error else {
+        panic!("a pidfd that is not our child is an io error: {error:?}")
+    };
+    assert_eq!(e.raw_os_error(), Some(libc::ECHILD), "{e:?}");
+    drop(stdin);
+    child
+        .wait()
+        .expect("the child was never adopted, so it is still ours to reap");
+}
+
+/// A child that has exited and not been reaped is still ours: it is adopted, and left unreaped.
+///
+/// Mutant: the confirming `waitid` refuses an exit record.
+#[skuld::test]
+fn adopting_an_exited_unreaped_child_succeeds_and_reaps_nothing() {
+    use crate::os_process::child::{adopt_std, TryReapOutcome};
+
+    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    drop(child.stdin.take());
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("the live child has an identity");
+    wait_until_zombie(id.pid());
+    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }

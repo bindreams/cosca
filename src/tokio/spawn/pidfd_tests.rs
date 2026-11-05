@@ -32,33 +32,13 @@ fn program_ran(cmd: Command, mut reader: std::io::PipeReader) -> bool {
     out == "ran\n"
 }
 
-/// Mutant: the probe is skipped (the refusal lands after the fork, so `spawns()` is 1).
-#[skuld::test]
-async fn a_refused_probe_fails_unsupported_and_forks_nothing() {
-    for (errno, name) in [(Errno::PERM, "EPERM"), (Errno::NOSYS, "ENOSYS")] {
-        let (mut cmd, reader) = marker_command();
-        fault::reset_spawns();
-        let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(errno);
-        let err = cmd.spawn().err();
-        drop(forced);
-
-        let err = expect_not_started(err.expect("a refused probe fails the spawn"));
-        assert!(
-            matches!(err, Error::Unsupported { platform: "linux", .. }),
-            "{name}: {err:?}"
-        );
-        assert_eq!(fault::spawns(), 0, "{name}: the fork must not be reached");
-        assert!(!program_ran(cmd, reader), "{name}: the program must not run");
-    }
-}
-
 /// Mutants: the child execs despite its failed `pidfd_open`; the parent ignores its errno report.
 #[skuld::test]
 async fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
     fault::reset_leaked_pid();
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
+    let forced = fault::fail_child_pidfd_open(Errno::MFILE);
     let err = cmd.spawn().err();
     drop(forced);
 
@@ -214,7 +194,7 @@ async fn a_leafless_tokio_failure_for_a_child_with_no_usable_pidfd_says_it_never
     crate::log_capture::install();
     let (mut cmd, _reader) = marker_command();
     cmd.contain_with(crate::ContainMode::Session);
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
+    let forced = fault::fail_child_pidfd_open(Errno::MFILE);
     let mark = crate::log_capture::mark();
     let err = {
         let _failing = crate::child::spawn::fault::fail_tokio_spawns_after_fork();

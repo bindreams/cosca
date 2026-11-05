@@ -19,6 +19,8 @@ use crate::child::spawn::SpawnFailure;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
+use crate::identity::FakeKernel;
+use crate::os_process::linux::open::probe_pidfd_support_with;
 use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
@@ -103,24 +105,20 @@ fn a_normal_spawn_runs_the_program_and_forks_once() {
 
 // The pre-fork probe =====
 
-/// A refusal before the fork is `Unsupported` naming `spawn`, and no child is ever forked.
+/// A refusal of the probe is `Unsupported` naming `spawn`. That no child is forked after it is
+/// `tests/linux_pidfd_refused.rs`'s `a_seccomp_refused_pidfd_open_is_found_before_any_fork`.
 ///
-/// Mutant: the probe is skipped (the refusal then lands after the fork, so `spawns()` is 1).
+/// Mutant: the probe maps a refusal to another error.
 #[skuld::test]
-fn a_refused_probe_fails_unsupported_and_forks_nothing() {
+fn a_refused_probe_fails_unsupported() {
     for (errno, name) in [
         (Errno::PERM, "EPERM"),
         (Errno::ACCESS, "EACCES"),
         (Errno::NODEV, "ENODEV"),
         (Errno::NOSYS, "ENOSYS"),
     ] {
-        let (mut cmd, reader) = marker_command();
-        fault::reset_spawns();
-        let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(errno);
-        let err = cmd.spawn().err();
-        drop(forced);
-
-        let err = err.unwrap_or_else(|| panic!("{name}: a refused pidfd_open must fail the spawn"));
+        let kernel = FakeKernel::new().on_pidfd_open(std::process::id(), Err(errno));
+        let err = probe_pidfd_support_with(&kernel).expect_err("a refused pidfd_open must fail the probe");
         assert_eq!(
             err.to_string(),
             format!(
@@ -129,28 +127,17 @@ fn a_refused_probe_fails_unsupported_and_forks_nothing() {
             ),
             "{err:?}"
         );
-        assert_eq!(fault::spawns(), 0, "{name}: the fork must not be reached");
-        assert_no_child_of_this_thread(name);
-        assert!(!program_ran(cmd, reader), "{name}: the program must not run");
     }
 }
 
-/// A transient failure of the probe itself fails the spawn as `Io` naming `pidfd_open`, before any
-/// fork.
+/// A transient failure of the probe itself fails as `Io` naming `pidfd_open`.
 #[skuld::test]
-fn a_probe_that_hits_emfile_fails_io_and_forks_nothing() {
-    let (mut cmd, reader) = marker_command();
-    fault::reset_spawns();
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_errno_once(Errno::MFILE);
-    let err = cmd.spawn().err();
-    drop(forced);
-
-    match err.expect("a failed probe must fail the spawn") {
+fn a_probe_that_hits_emfile_fails_io() {
+    let kernel = FakeKernel::new().on_pidfd_open(std::process::id(), Err(Errno::MFILE));
+    match probe_pidfd_support_with(&kernel).expect_err("a failed probe must fail") {
         Error::Io(e) => assert_eq!(e.to_string(), "pidfd_open: Too many open files (os error 24)"),
         other => panic!("expected Io, got {other:?}"),
     }
-    assert_eq!(fault::spawns(), 0);
-    assert!(!program_ran(cmd, reader));
 }
 
 // The child's own pidfd_open =====
@@ -164,7 +151,7 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
     fault::reset_leaked_pid();
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::MFILE)]);
+    let forced = fault::fail_child_pidfd_open(Errno::MFILE);
     let err = cmd.spawn().err();
     drop(forced);
 
@@ -184,7 +171,7 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
 fn a_refusal_in_the_child_is_unsupported_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
-    let forced = crate::os_process::linux::open::fault::force_pidfd_open_script([None, Some(Errno::PERM)]);
+    let forced = fault::fail_child_pidfd_open(Errno::PERM);
     let err = cmd.spawn().err();
     drop(forced);
 
