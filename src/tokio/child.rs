@@ -23,6 +23,7 @@ use std::process::ExitStatus;
 use crate::child::ParentEnd;
 #[cfg(target_os = "linux")]
 use crate::containment::cgroup::Waiting;
+use crate::containment::dispatch::TeardownCaller;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -329,9 +330,12 @@ impl Child {
     /// What this child's own handle and the root's number say about the root, for a cleanup that
     /// decides on both. Logs nothing about an unsettled root: the caller does, once.
     #[cfg(unix)]
-    pub(super) fn read_root_view(&self, label: &str) -> crate::containment::DropView {
+    pub(super) fn read_root_view(
+        &self,
+        caller: crate::containment::dispatch::TeardownCaller,
+    ) -> crate::containment::DropView {
         crate::containment::DropView::read(
-            label,
+            caller,
             self.id,
             || {
                 self.os
@@ -1480,15 +1484,16 @@ impl Child {
 /// [tokio#4301]: https://github.com/tokio-rs/tokio/issues/4301
 impl Drop for Child {
     fn drop(&mut self) {
-        _ = self.tear_down();
+        _ = self.tear_down(TeardownCaller::Drop);
     }
 }
 
 impl Child {
     /// What [`Drop`] does, now, and what it did with the child; the drop then does nothing more. For
-    /// a sync caller that must say what became of the child: a failed resume.
-    pub(crate) fn tear_down_now(&mut self) -> crate::error::ChildFate {
-        let fate = self.tear_down();
+    /// a sync caller that must say what became of the child: a failed resume. `caller` prefixes the
+    /// teardown's log lines.
+    pub(crate) fn tear_down_now(&mut self, caller: TeardownCaller) -> crate::error::ChildFate {
+        let fate = self.tear_down(caller);
         self.kill_on_drop = false;
         fate
     }
@@ -1499,7 +1504,7 @@ impl Child {
     /// mid-teardown, or with an exit or drain that cannot be watched, it finishes as the drop does
     /// (see `Reaping`, `Draining`).
     pub(crate) async fn tear_down_awaiting(&mut self) -> crate::error::ChildFate {
-        let teardown = self.signal_for_teardown();
+        let teardown = self.signal_for_teardown(TeardownCaller::FailedRun);
         // Before the waits, so the handle's own drop does nothing more if this future is dropped.
         self.kill_on_drop = false;
         match teardown {
@@ -1534,8 +1539,8 @@ impl Child {
     /// The drop's teardown: signal (when armed), then, on Unix, wait for what the signals reached
     /// (see [`Settle`]), and release. Answers what became of the child. A second call finds the
     /// resources already taken, and does nothing.
-    fn tear_down(&mut self) -> crate::error::ChildFate {
-        match self.signal_for_teardown() {
+    fn tear_down(&mut self, caller: TeardownCaller) -> crate::error::ChildFate {
+        match self.signal_for_teardown(caller) {
             Teardown::Done(fate) => fate,
             #[cfg(unix)]
             Teardown::Waits(signalled) => self.settle(signalled),
@@ -1559,7 +1564,7 @@ impl Child {
     /// The teardown's signals (when armed), inside the bounded section. A teardown that waits for
     /// nothing is finished there. An armed one whose kill landed leaves the section, and hands its
     /// waits, report and release to the caller.
-    fn signal_for_teardown(&mut self) -> Teardown {
+    fn signal_for_teardown(&mut self, caller: TeardownCaller) -> Teardown {
         use crate::error::ChildFate;
         // Enforced in debug builds: nothing in it may wait for an exit or a drain. Declared before
         // `os`, so a panic in the signals unwinds through the resources while still inside it.
@@ -1578,7 +1583,7 @@ impl Child {
         let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, self.id.pid()));
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
-            "Child::drop",
+            caller,
             self.id,
             || {
                 os.proc
@@ -1631,6 +1636,8 @@ impl Child {
         let signalled = Signalled {
             os,
             signals,
+            #[cfg(not(unix))]
+            caller,
             own_reap,
             #[cfg(unix)]
             forgotten,
@@ -1658,6 +1665,8 @@ impl Child {
         let Signalled {
             os,
             mut signals,
+            #[cfg(not(unix))]
+            caller,
             own_reap,
             #[cfg(unix)]
             forgotten,
@@ -1689,7 +1698,7 @@ impl Child {
         let tree_failed = signals.tree.is_some();
         #[cfg(unix)]
         {
-            let mut report = crate::child::drop_report::DropReport::new("Child::drop", &view);
+            let mut report = crate::child::drop_report::DropReport::new(&view);
             report.front = front_left.as_ref();
             report.skipped = signals.skipped;
             report.forgot = signals.forgot;
@@ -1702,7 +1711,7 @@ impl Child {
         let tree_failed = false;
         #[cfg(not(unix))]
         if !signals.left.is_empty() {
-            log::warn!("Child::drop: {}", signals.left.join("; "));
+            log::warn!("{}: {}", caller.label(), signals.left.join("; "));
         }
         (os, signals.fate, tree_failed)
     }
@@ -1742,6 +1751,9 @@ impl Drop for Reaping<'_> {
 struct Signalled {
     os: OsResources,
     signals: DropSignals,
+    /// Who tore the child down: it names itself in the report. On Unix the root view holds it.
+    #[cfg(not(unix))]
+    caller: TeardownCaller,
     /// This handle had collected the root's status before the teardown.
     own_reap: bool,
     /// What an earlier forgetting recorded of the child.
