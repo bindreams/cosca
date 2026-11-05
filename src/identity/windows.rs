@@ -3,8 +3,8 @@
 //! - `start_token`: raw creation `FILETIME` (identity, NOT epoch-adjusted).
 //! - `created_at`: that 100 ns-since-1601 value converted to `SystemTime`.
 //! - `ordered_read`: the id's key and the `OrderKey` (the process sequence number, through the
-//!   private `NtQueryInformationProcess` class 92), read on one handle; given the parent the caller
-//!   was told, also the creator pid (class 0), on the same handle.
+//!   private `NtQueryInformationProcess` class 92), read on one handle; when asked, also the
+//!   creator pid (class 0), on the same handle.
 //! - `is_running`: authoritative "not exited" via `WaitForSingleObject(_, 0)`, which tests
 //!   the process's *signaled state* — so it flips to dead the instant the process exits,
 //!   without the object-teardown window that an existence check (`OpenProcess` succeeding)
@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
-use super::{Key, Liveness, OrderKey, RawPid, Resolved, UnknownCause};
+use super::{Key, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, UnknownCause};
 
 /// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
 const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
@@ -322,62 +322,51 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 
 /// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
 /// so both describe the same process. `expected`: the key of the process asked about, when there
-/// is one; a pid that holds another key is [`Resolved::Gone`]. `parent`: the process the caller was
-/// told created `pid`, when it was told one; a process created by another pid is
-/// [`Resolved::Gone`]. A refused query is `Unknown` with its `NTSTATUS` as the cause.
-pub(super) fn ordered_read(
-    pid: RawPid,
-    expected: Option<Key>,
-    parent: Option<RawPid>,
-) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
+/// is one; a pid that holds another key is [`Resolved::Gone`]. `ask_parent`: also read the creator
+/// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
+/// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause, and does not touch a read
+/// that did not ask. A refused query is `Unknown` with its `NTSTATUS` as the cause.
+pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(h) => h,
-        Opened::Gone => return (Resolved::Gone, UnknownCause::default()),
-        Opened::Denied(_) => return (Resolved::Unknown, UnknownCause::default()),
-    };
-    let read = ordered_from_handle(handle, pid, expected, parent);
-    close(handle);
-    read
-}
-
-/// [`ordered_read`] on an open handle of `pid` with `PROCESS_QUERY_LIMITED_INFORMATION`.
-pub(super) fn ordered_from_handle(
-    handle: HANDLE,
-    pid: RawPid,
-    expected: Option<Key>,
-    parent: Option<RawPid>,
-) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
-    let read = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
-    match parent {
-        Some(parent) => with_creator(pid, parent, creator_pid(handle), read),
-        None => read,
-    }
-}
-
-/// What the creator pid read from the handle of `pid` adds to `read`, the handle's other reads: a
-/// process created by a pid other than `parent` is [`Resolved::Gone`] whatever `read` said, as it is
-/// for another key. A refused creator query leaves a `Found` or `Unknown` read `Unknown`, with its
-/// `NTSTATUS` as the cause unless the read already had one, never a fall back to the snapshot's
-/// `th32ParentProcessID`.
-fn with_creator(
-    pid: RawPid,
-    parent: RawPid,
-    creator: Result<usize, NTSTATUS>,
-    read: (Resolved<(Key, OrderKey)>, UnknownCause),
-) -> (Resolved<(Key, OrderKey)>, UnknownCause) {
-    match creator {
-        Ok(creator) if creator != parent as usize => (Resolved::Gone, UnknownCause::default()),
-        Ok(_) => read,
-        Err(_) if matches!(read.0, Resolved::Gone) => read,
-        Err(status) => {
-            log::debug!(
-                "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \
-                 NTSTATUS {:#010x}",
-                status.0 as u32
-            );
-            (Resolved::Unknown, read.1.with_creator_status(status))
+        // No handle, so no creator: a read that asked is told it could not read it.
+        Opened::Gone => {
+            return OrderedRead {
+                read: Resolved::Gone,
+                parent: ParentRead::Unreadable,
+                cause: UnknownCause::default(),
+            }
         }
-    }
+        Opened::Denied(_) => {
+            return OrderedRead {
+                read: Resolved::Unknown,
+                parent: ParentRead::Unreadable,
+                cause: UnknownCause::default(),
+            }
+        }
+    };
+    let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
+    let (parent, cause) = if ask_parent {
+        match creator_pid(handle).map(RawPid::try_from) {
+            Ok(Ok(creator)) => (ParentRead::Is(creator), cause),
+            Ok(Err(_)) => {
+                log::debug!("the creator pid of pid {pid} is not a pid");
+                (ParentRead::Unreadable, cause)
+            }
+            Err(status) => {
+                log::debug!(
+                    "NtQueryInformationProcess(ProcessBasicInformation) failed on an opened handle for pid {pid}: \
+                     NTSTATUS {:#010x}",
+                    status.0 as u32
+                );
+                (ParentRead::Unreadable, cause.with_creator_status(status))
+            }
+        }
+    } else {
+        (ParentRead::NotAsked, cause)
+    };
+    close(handle);
+    OrderedRead { read, parent, cause }
 }
 
 /// What the two reads of one handle of `pid` say together. The key is compared with `expected`
@@ -415,7 +404,7 @@ fn combine(
 /// process holds it now. The read that proves the process is still there is the one that gives the
 /// key.
 pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let (read, cause) = ordered_read(pid, Some(key), None);
+    let OrderedRead { read, cause, .. } = ordered_read(pid, Some(key), false);
     (read.map(|(_, order)| order), cause)
 }
 

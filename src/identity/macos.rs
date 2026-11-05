@@ -14,7 +14,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::{Key, Liveness, RawPid, Resolved};
+use super::{Key, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, UnknownCause};
 
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
@@ -499,17 +499,66 @@ pub(crate) mod ppid_fault {
     }
 }
 
-pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
+/// What one read of a process's record says: its start key, and its parent pid when the record's
+/// is trusted ([`trusted_ppid`]; `None` is a `fork()` still filling it in).
+struct Record {
+    key: Key,
+    ppid: Option<RawPid>,
+}
+
+/// One read of `pid`'s record, the one read behind the by-pid start key and the parent pid:
+/// `proc_pidinfo` first, and when it misses (libproc-invisible: gone, a ZOMBIE, or EPERM-hidden)
+/// the sysctl, which alone resolves the latter two and distinguishes an empty reply (gone) from a
+/// failure (unknown). The key and the parent pid are of the one record.
+fn read_record(pid: RawPid) -> Resolved<Record> {
+    if let Some(info) = bsd_info(pid) {
+        return Resolved::Found(Record {
+            key: token_of_bsd(&info),
+            ppid: trusted_ppid(pid, info.pbi_ppid),
+        });
+    }
+    kinfo::kinfo(pid).map(|info| Record {
+        key: token_of_kinfo(&info),
+        ppid: trusted_ppid(pid, info.e_ppid() as RawPid),
+    })
+}
+
+/// A by-pid identity read of `pid`: `read`, unless a test forces the OS's refusal.
+fn by_pid<T>(pid: RawPid, read: impl FnOnce() -> Resolved<T>) -> Resolved<T> {
     #[cfg(test)]
     if fault::is_unknown(pid) {
         return Resolved::Unknown;
     }
-    if let Some(info) = bsd_info(pid) {
-        return Resolved::Found(token_of_bsd(&info));
+    #[cfg(not(test))]
+    let _ = pid;
+    read()
+}
+
+pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
+    by_pid(pid, || read_record(pid).map(|record| record.key))
+}
+
+/// The key, the order key (the start time, which is the key's value) and the parent pid of `pid`,
+/// from one record. A parent pid still being filled in by `fork()` is waited for ([`ppid_of`]): the
+/// process is the candidate of a walk, which needs it.
+pub(super) fn ordered_read(pid: RawPid) -> OrderedRead {
+    match by_pid(pid, || ppid_and_key(pid)) {
+        Resolved::Found((ppid, key)) => OrderedRead {
+            read: Resolved::Found((key, OrderKey(key.raw()))),
+            parent: ParentRead::Is(ppid),
+            cause: UnknownCause::default(),
+        },
+        Resolved::Gone => OrderedRead {
+            read: Resolved::Gone,
+            parent: ParentRead::Unreadable,
+            cause: UnknownCause::default(),
+        },
+        Resolved::Unknown => OrderedRead {
+            read: Resolved::Unknown,
+            parent: ParentRead::Unreadable,
+            cause: UnknownCause::default(),
+        },
     }
-    // libproc-invisible: gone, a ZOMBIE, or EPERM-hidden - only sysctl resolves the latter
-    // two, and it distinguishes an empty reply (gone) from a failure (unknown).
-    kinfo::kinfo(pid).map(|info| token_of_kinfo(&info))
 }
 
 /// Whether a raw ppid value read from the kernel for `pid` is trustworthy - shared by BOTH
@@ -553,7 +602,7 @@ fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
 pub(crate) enum PpidRead {
     /// The parent pid and the start key, both from the one record the parent pid was read from.
     Found(RawPid, Key),
-    /// Both reads reported an untrusted `e_ppid == 0` ([`trusted_ppid`]): `fork()` has not
+    /// The record reported an untrusted `e_ppid == 0` ([`trusted_ppid`]): `fork()` has not
     /// finished. Transient.
     Forking,
     /// The fallback positively confirmed the pid does not exist.
@@ -563,24 +612,15 @@ pub(crate) enum PpidRead {
     Refused,
 }
 
-/// One attempt: `proc_pidinfo` first (the same primary read [`bsd_info`] makes), the sysctl
-/// fallback on a miss - the shape [`start_token`] already uses for its own libproc miss. An
-/// untrusted `0` from the primary falls through to the fallback exactly like any other miss.
+/// One attempt: [`read_record`], whose parent pid is trusted or the attempt is `Forking`.
 fn read_ppid_once(pid: RawPid) -> PpidRead {
     #[cfg(test)]
     if let Some(read) = fault::next_ppid_read(pid) {
         return read;
     }
-    if let Some(info) = bsd_info(pid) {
-        if let Some(ppid) = trusted_ppid(pid, info.pbi_ppid) {
-            return PpidRead::Found(ppid, token_of_bsd(&info));
-        }
-    }
-    match kinfo::kinfo(pid) {
-        Resolved::Found(info) => match trusted_ppid(pid, info.e_ppid() as RawPid) {
-            Some(ppid) => PpidRead::Found(ppid, token_of_kinfo(&info)),
-            None => PpidRead::Forking,
-        },
+    match read_record(pid) {
+        Resolved::Found(Record { key, ppid: Some(ppid) }) => PpidRead::Found(ppid, key),
+        Resolved::Found(Record { ppid: None, .. }) => PpidRead::Forking,
         Resolved::Gone => PpidRead::Gone,
         Resolved::Unknown => PpidRead::Refused,
     }
@@ -606,7 +646,7 @@ fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) 
 ///
 /// `Unknown` is only a PERSISTENT refusal: the sysctl fallback answering `EPERM`/`EACCES` (a
 /// sandbox), which a re-read would not change. The other cause is transient, so it is not
-/// `Unknown`: both reads reporting the untrusted `e_ppid == 0` of a `fork()` in progress
+/// `Unknown`: a record reporting the untrusted `e_ppid == 0` of a `fork()` in progress
 /// ([`trusted_ppid`]) is re-read, with a growing pause, until it resolves. That re-checks a
 /// deterministic condition - a fork always finishes - so it has neither a count cap nor a
 /// deadline; the pid exiting meanwhile ends it as `Gone`. `Gone` is only returned when the

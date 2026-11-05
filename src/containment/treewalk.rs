@@ -8,11 +8,11 @@
 //! down from the root, and kills each *genuine* descendant by identity. It is
 //! best-effort and reports as [`crate::containment::Containment::TreeWalk`]: it
 //! misses reparented orphans (a child whose parent exited before the walk read the
-//! child, so its ppid no longer chains to the root) and broker-spawned escapes. On Windows it also
+//! child, so its ppid no longer chains to the root; and, on Linux and macOS, which read the
+//! candidate's parent again, a descendant whose parent exits while the walk runs, with its subtree,
+//! because its record names its new parent by then) and broker-spawned escapes. On Windows it also
 //! misses a genuine descendant whose creator exited and whose creator's pid now belongs to a later
-//! in-tree process, with its subtree (see the parent-order rule below). On macOS it also misses a
-//! descendant whose parent exits while the walk runs, with its subtree: its record names launchd
-//! by the time it is read (see the parent read below).
+//! in-tree process, with its subtree (see the parent-order rule below).
 //!
 //! # The PID-reuse / stale-ppid defense (the order-key rule)
 //!

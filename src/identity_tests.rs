@@ -143,3 +143,58 @@ fn a_process_denying_only_synchronize_exists_but_has_unknown_liveness() {
     );
     assert!(child.is_running());
 }
+
+// A candidate's parent number =====
+
+/// What the parent number a read found says about the read, before the parent is proved again:
+/// another number is `Gone` whatever the rest of the read said, an unreadable one leaves a found or
+/// unknown read `Unknown`, and the named parent's number leaves a found read for the proof.
+///
+/// Mutants: a refused read of anything else hides another parent's number; an unreadable number
+/// reads as a match, or as another parent's; an unreadable number turns a `Gone` read `Unknown`.
+#[skuld::test]
+fn a_candidates_parent_number_decides_its_read() {
+    use super::{OrderKey, OrderedRead, ParentRead, UnknownCause};
+    const PARENT: RawPid = 100;
+    let found = || Resolved::Found((Key::for_test(5), OrderKey::for_test(9)));
+    let read = |read, parent| OrderedRead {
+        read,
+        parent,
+        cause: UnknownCause::default(),
+    };
+    let candidate = id(7, 5);
+    let order = OrderKey::for_test(9);
+
+    let (settled, _) = read(found(), ParentRead::Is(PARENT))
+        .judged(7, PARENT)
+        .expect("the named parent leaves the read for the proof");
+    assert_eq!(settled, Resolved::Found((candidate, order)));
+
+    for (what, rest) in [
+        ("found", found()),
+        ("unknown", Resolved::Unknown),
+        ("gone", Resolved::Gone),
+    ] {
+        let Err((settled, cause)) = read(rest, ParentRead::Is(PARENT + 1)).judged(7, PARENT) else {
+            panic!("another parent's number settles a {what} read");
+        };
+        assert_eq!(settled, Resolved::Gone, "another parent over a {what} read");
+        assert!(cause.into_error("pid 7").is_none());
+    }
+
+    for (what, rest, answer) in [
+        ("found", found(), Resolved::Unknown),
+        ("unknown", Resolved::Unknown, Resolved::Unknown),
+        ("gone", Resolved::Gone, Resolved::Gone),
+    ] {
+        let Err((settled, _)) = read(rest, ParentRead::Unreadable).judged(7, PARENT) else {
+            panic!("an unreadable parent number settles a {what} read");
+        };
+        assert_eq!(settled, answer, "an unreadable parent over a {what} read");
+    }
+
+    let Err((settled, _)) = read(Resolved::Unknown, ParentRead::Is(PARENT)).judged(7, PARENT) else {
+        panic!("an unknown read stays unknown");
+    };
+    assert_eq!(settled, Resolved::Unknown);
+}

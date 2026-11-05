@@ -1,7 +1,9 @@
 //! `ppid_of`'s two kinds of `Unknown`: the transient fork-in-progress window is re-read until it
-//! resolves, and only the persistent sysctl refusal is `Unknown`.
+//! resolves, and only the persistent sysctl refusal is `Unknown`, also when a walk's candidate is
+//! read under a parent. The rows for a candidate and its parent that run on every platform are in
+//! `identity::tree_tests`.
 
-use super::{resolve_ppid, PpidRead};
+use super::{fault, resolve_ppid, PpidRead};
 use crate::identity::{Key, ProcessId, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
@@ -64,47 +66,17 @@ fn a_refused_sysctl_is_unknown_after_one_read() {
     assert_eq!(count(), 1);
 }
 
-fn ordered_under(pid: u32, parent: ProcessId) -> Resolved<(ProcessId, crate::identity::OrderKey)> {
-    ProcessId::of_ordered_with(&crate::identity::HostKernel, pid, Some(parent)).0
-}
-
-/// A live process that did not fork the candidate is not its parent, though it is a real process
-/// holding a real pid: the candidate's own record is read, not the listing's claim.
+/// A candidate whose record cannot be read for its parent (the sysctl is refused) is `Unknown`,
+/// blaming the candidate and not the parent: not `Gone`, which would drop a live process from the
+/// walk, and not a match.
 ///
-/// Mutant: `of_ordered_with` ignores `parent` on macOS.
+/// Mutant: `of_ordered_with` reads a refused parent read as `Gone` or as the named parent.
 #[skuld::test]
-fn a_candidate_is_gone_under_a_parent_that_did_not_fork_it() {
-    let (x_child, x) = live_exiting_member();
-    let (y_child, y) = live_exiting_member();
-    let read = ordered_under(y.pid(), x);
-    release_unsignalled(y_child);
-    release_unsignalled(x_child);
-    assert_eq!(read, Resolved::Gone);
-}
-
-/// The record names the right parent pid, but another process holds it: the proof of the parent
-/// after the read fails.
-///
-/// Mutant: the parent is not proved again after the candidate's read.
-#[skuld::test]
-fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
+fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     let (child, kid) = live_exiting_member();
-    let read = ordered_under(kid.pid(), ProcessId::current().with_other_value());
+    let _forced = fault::force_ppid_reads(kid.pid(), &[PpidRead::Refused]);
+    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
     release_unsignalled(child);
-    assert_eq!(read, Resolved::Gone);
-}
-
-/// The real parent is accepted, with the id and order key of the record that named it.
-///
-/// Mutant: the parent comparison rejects the real parent, or the id is not the record's key.
-#[skuld::test]
-fn a_candidate_is_found_under_its_real_parent() {
-    let (child, kid) = live_exiting_member();
-    let read = ordered_under(kid.pid(), ProcessId::current());
-    release_unsignalled(child);
-    let Resolved::Found((id, order)) = read else {
-        panic!("a child of this process is found under it, got {read:?}");
-    };
-    assert_eq!(id, kid);
-    assert_eq!(order, crate::identity::OrderKey::for_test(kid.key().raw()));
+    assert_eq!(read, Resolved::Unknown);
+    assert_eq!(cause.blamed_parent(), None);
 }

@@ -109,6 +109,68 @@ impl OrderKey {
     }
 }
 
+/// The candidate's own parent number, as one ordered read found it: in the record or on the handle
+/// that gave the candidate's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentRead {
+    /// The read was not asked for it (Windows reads it only then).
+    NotAsked,
+    /// The parent number the read found.
+    Is(RawPid),
+    /// The read asked and could not find it.
+    Unreadable,
+}
+
+/// What a backend's one read of a process says: its key and order key, and the parent number found
+/// by the same read.
+struct OrderedRead {
+    read: Resolved<(Key, OrderKey)>,
+    parent: ParentRead,
+    cause: UnknownCause,
+}
+
+/// What an ordered read of a pid says: the identity and order key, or why there is none.
+type Ordered = (Resolved<(ProcessId, OrderKey)>, UnknownCause);
+
+impl OrderedRead {
+    /// The read with no parent named: the id and order key of `pid`.
+    fn unclaimed(self, pid: RawPid) -> Ordered {
+        (
+            self.read.map(|(key, order)| (ProcessId { pid, key }, order)),
+            self.cause,
+        )
+    }
+
+    /// The read for `pid`, whose caller was told `parent` created it. A parent number that is
+    /// another's is [`Resolved::Gone`] whatever the rest of the read said: the pid has changed
+    /// hands, and a refused read of anything else cannot hide that. Otherwise a read that is
+    /// [`Gone`](Resolved::Gone) or [`Unknown`](Resolved::Unknown) stays so, and a parent number that
+    /// could not be read leaves a found one [`Unknown`](Resolved::Unknown). `Err`: that is the
+    /// answer. `Ok`: the read is found and names `parent`, whose number does not yet prove it is
+    /// still the parent.
+    fn judged(self, pid: RawPid, parent: RawPid) -> Result<Ordered, Ordered> {
+        let OrderedRead {
+            read,
+            parent: claimed,
+            cause,
+        } = self;
+        debug_assert!(
+            claimed != ParentRead::NotAsked,
+            "a parent was named, so its number must be asked for"
+        );
+        match (claimed, read) {
+            (ParentRead::Is(found), _) if found != parent => Err((Resolved::Gone, UnknownCause::default())),
+            (_, Resolved::Gone) => Err((Resolved::Gone, cause)),
+            (_, Resolved::Unknown) | (ParentRead::Unreadable | ParentRead::NotAsked, _) => {
+                Err((Resolved::Unknown, cause))
+            }
+            (ParentRead::Is(_), Resolved::Found((key, order))) => {
+                Ok((Resolved::Found((ProcessId { pid, key }, order)), cause))
+            }
+        }
+    }
+}
+
 /// A process identity that stays unique across time: `(pid, key)`.
 /// `Eq`/`Hash` are over the pair, so a recycled PID never compares equal to the
 /// original process.
@@ -184,90 +246,32 @@ impl ProcessId {
 
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
     ///
-    /// `parent`: the process the caller was told is this one's parent. Where the read carries the
-    /// process's parent (Linux: the `stat` made with the id; Windows: the creator pid read on the
-    /// handle that gives the id; macOS: the process-info record that gives the start key), a process
-    /// with another parent number now is [`Resolved::Gone`]: the pid has changed hands. A number that
-    /// is read does not yet name the parent, which may have been reaped and its number taken, so
-    /// `parent` is then proved again: a number that no longer holds it is [`Resolved::Gone`] too, and
-    /// one whose proof cannot be made is [`Resolved::Unknown`]. On Windows a failed read of the
-    /// creator is `Unknown`. On macOS the id is the record's key, so a read made with a parent is not
-    /// the by-pid read [`of_with`](Self::of_with) makes.
-    pub(crate) fn of_ordered_with(
-        kernel: &dyn Kernel,
-        pid: RawPid,
-        parent: Option<ProcessId>,
-    ) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
+    /// `parent`: the process the caller was told is this one's parent. Each backend's read carries
+    /// the process's parent number from the record or handle that gives the id (Linux: the `stat`;
+    /// Windows: the creator pid; macOS: the process-info record), and a process with another parent
+    /// number now is [`Resolved::Gone`] whatever else the read said: the pid has changed hands, or the
+    /// process was reparented. A number that is read does not yet name the parent, which may have been
+    /// reaped and its number taken, so `parent` is then proved again: a number that no longer holds it
+    /// is [`Resolved::Gone`] too, and one whose proof cannot be made is [`Resolved::Unknown`]. A parent
+    /// number that cannot be read is `Unknown`.
+    pub(crate) fn of_ordered_with(kernel: &dyn Kernel, pid: RawPid, parent: Option<ProcessId>) -> Ordered {
+        #[cfg(all(test, target_os = "macos"))]
+        seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
-        {
-            let (read, cause) = Self::of_stat_with(kernel, pid);
-            let (id, stat) = match read {
-                Resolved::Found(found) => found,
-                Resolved::Gone => return (Resolved::Gone, cause),
-                Resolved::Unknown => return (Resolved::Unknown, cause),
-            };
-            if let Some(parent) = parent {
-                match stat_parse::parse_ppid(&stat) {
-                    Some(ppid) if ppid == parent.pid() => {}
-                    Some(_) => return (Resolved::Gone, UnknownCause::default()),
-                    // A `stat` with no ppid says nothing about who the parent is.
-                    None => {
-                        log::debug!("identity: the stat of pid {pid} has no readable ppid");
-                        return (Resolved::Unknown, UnknownCause::default());
-                    }
-                }
-                if let Err(verdict) = parent.still_held(kernel) {
-                    return verdict;
-                }
-            }
-            match stat_parse::parse_starttime_jiffies(&stat) {
-                Some(ticks) => (Resolved::Found((id, OrderKey(ticks))), cause),
-                None => (Resolved::Unknown, UnknownCause::default()),
-            }
-        }
+        let read = backend::ordered_read(kernel, pid);
         #[cfg(windows)]
-        {
-            let (read, cause) = backend::ordered_read(pid, None, parent.map(|parent| parent.pid()));
-            let found = match read {
-                Resolved::Found((key, order)) => (ProcessId { pid, key }, order),
-                Resolved::Gone => return (Resolved::Gone, cause),
-                Resolved::Unknown => return (Resolved::Unknown, cause),
-            };
-            if let Some(parent) = parent {
-                if let Err(verdict) = parent.still_held(kernel) {
-                    return verdict;
-                }
-            }
-            (Resolved::Found(found), cause)
-        }
+        let read = backend::ordered_read(pid, None, parent.is_some());
         #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            if let Some(parent) = parent {
-                let found = match backend::ppid_and_key(pid) {
-                    Resolved::Found((ppid, key)) if ppid == parent.pid() => {
-                        (ProcessId { pid, key }, OrderKey(key.raw()))
-                    }
-                    // The pid is another process's child now: it changed hands since the listing,
-                    // or the process was reparented (to launchd, when its parent exited).
-                    Resolved::Found(_) => return (Resolved::Gone, UnknownCause::default()),
-                    Resolved::Gone => return (Resolved::Gone, UnknownCause::default()),
-                    Resolved::Unknown => return (Resolved::Unknown, UnknownCause::default()),
-                };
-                if let Err(verdict) = parent.still_held(kernel) {
-                    return verdict;
-                }
-                return (Resolved::Found(found), UnknownCause::default());
-            }
-            let (read, cause) = Self::of_with(kernel, pid);
-            match read {
-                Resolved::Found(id) => match id.order_key_with(kernel) {
-                    (Resolved::Found(key), _) => (Resolved::Found((id, key)), cause),
-                    (Resolved::Gone, cause) => (Resolved::Gone, cause),
-                    (Resolved::Unknown, cause) => (Resolved::Unknown, cause),
-                },
-                Resolved::Gone => (Resolved::Gone, cause),
-                Resolved::Unknown => (Resolved::Unknown, cause),
-            }
+        let read = backend::ordered_read(pid);
+        let Some(parent) = parent else {
+            return read.unclaimed(pid);
+        };
+        match read.judged(pid, parent.pid()) {
+            Ok(found) => match parent.still_held(kernel) {
+                Ok(()) => found,
+                Err(verdict) => verdict,
+            },
+            Err(settled) => settled,
         }
     }
 

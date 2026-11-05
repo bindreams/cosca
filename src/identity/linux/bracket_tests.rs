@@ -94,9 +94,9 @@ fn a_stat_without_a_start_time_gives_no_key() {
     assert!(matches!(id(100).order_key_with(&kernel).0, Resolved::Unknown));
 }
 
-/// `of_ordered_with` against a named parent: a `stat` that shows another parent's number is a pid
-/// that changed hands (`Gone`); one whose ppid cannot be read says nothing about it (`Unknown`).
-/// Mutant: "an unreadable ppid is `Gone`".
+/// How Linux's `ordered_read` reports the ppid of a `stat`, through `of_ordered_with` against a named
+/// parent: the number shown is another parent's (`Gone`, the pid changed hands), or none can be read
+/// from it (`Unknown`). What the shared step does with each is the row in `identity_tests`. Mutant: "an unreadable ppid is read as a number".
 #[skuld::test]
 fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
     let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
