@@ -85,7 +85,8 @@ impl SuspendedChild {
     ///
     /// [`Error::MayHaveStarted`] when the resume failed or only partly happened (a thread that
     /// something else also suspended stays suspended). The child is then torn down and the error's
-    /// `fate` says how. A child killed by something else *before* the call is this error too.
+    /// `fate` says how. A child whose kill is refused, and which still runs, comes back in the
+    /// error's `unreaped`. A child killed by something else *before* the call is this error too.
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,
@@ -98,13 +99,15 @@ impl SuspendedChild {
                 Ok(child)
             }
             Err(e) => {
-                let fate = child.tear_down_now();
+                let behind_wrapper = child.behind_wrapper();
+                let (fate, unreaped) = child.tear_down_or_hand_back();
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
                         detail: format!("could not resume the frozen child: {e}"),
                     },
                     fate,
-                    child.behind_wrapper(),
+                    unreaped,
+                    behind_wrapper,
                 ))
             }
         }

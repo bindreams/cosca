@@ -237,7 +237,10 @@ pub enum Error {
     /// `Command::output`, `status` and `read`, sync and tokio, return this variant for every
     /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
     /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
-    /// was collected (`Reaped`).
+    /// was collected (`Reaped`). When the sync methods' teardown cannot kill the child and it still
+    /// runs, they return it in `unreaped`; the tokio methods leave it running. So does
+    /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) for the frozen child it could not
+    /// kill.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]

@@ -46,7 +46,7 @@ pub(crate) mod unreaped;
 #[path = "owned/waiting.rs"]
 mod waiting;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "owned/over.rs"]
 mod over;
 #[cfg(test)]

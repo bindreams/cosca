@@ -2,7 +2,7 @@
 
 use std::process::ExitStatus;
 
-use crate::child::owned::teardown::{TeardownKind, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -35,7 +35,7 @@ fn tear_down_logged(
     crate::log_capture::install();
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
-    let torn = child.tear_down(id, TeardownKind::Kill, due);
+    let torn = child.tear_down(id, TeardownKind::Kill(Disposition::Leave), due);
     (torn, crate::log_capture::records_since_on_current_thread(mark, ""))
 }
 
@@ -181,6 +181,41 @@ fn teardown_after_a_kill_that_found_nothing_to_signal_waits_too() {
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
+}
+
+/// The `left` text of a teardown whose kill is refused and whose child still runs, under `disposition`.
+fn left_of_a_refused_kill_of_a_running_child(disposition: Disposition) -> String {
+    let fake = fake()
+        .reaps([ReapAnswer::Running])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let child = OwnedChild::new(Box::new(fake));
+    let torn = child.tear_down(Some(id()), TeardownKind::Kill(disposition), None);
+    assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{torn:?}");
+    torn.left.expect("a refused kill of a running child is warned of")
+}
+
+/// A child to be handed back says so, and does not say it is left running.
+///
+/// Mutants: the text ignores the disposition; it drops the child or the refusal.
+#[skuld::test]
+fn a_refused_kill_of_a_child_to_be_handed_back_says_so() {
+    let refusal = std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string();
+    let left = left_of_a_refused_kill_of_a_running_child(Disposition::HandBack);
+    assert!(
+        left.contains(&PID.to_string()) && left.contains(&refusal) && left.contains("handed back to the caller"),
+        "{left}"
+    );
+    assert!(!left.contains("leaving it running"), "{left}");
+}
+
+/// A child to be left says so.
+///
+/// Mutant: the text always says the child is handed back.
+#[skuld::test]
+fn a_refused_kill_of_a_child_to_be_left_says_it_is_left_running() {
+    let left = left_of_a_refused_kill_of_a_running_child(Disposition::Leave);
+    assert!(left.contains("leaving it running"), "{left}");
+    assert!(!left.contains("handed back"), "{left}");
 }
 
 /// A kill that failed, whatever the error, is followed by one look and no wait, and a child still

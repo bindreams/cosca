@@ -251,7 +251,7 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
 /// Mutant: a pid is required to signal or to settle the child.
 #[skuld::test]
 fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
-    use crate::child::owned::teardown::TeardownKind;
+    use crate::child::owned::teardown::{Disposition, TeardownKind};
     use crate::error::ChildFate;
     use crate::os_process::linux::LinuxProcess;
 
@@ -265,7 +265,7 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     drop(child);
     let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
     assert_eq!(owned.pid(), None);
-    let torn = owned.tear_down(None, TeardownKind::Kill, None);
+    let torn = owned.tear_down(None, TeardownKind::Kill(Disposition::Leave), None);
     assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
     assert_eq!(torn.left, None);
 }

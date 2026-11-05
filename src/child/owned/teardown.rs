@@ -35,10 +35,21 @@ use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
 
+/// What the caller does with a child that still runs after its kill was refused. It words the
+/// teardown's warn; the caller does what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// The child is left running.
+    Leave,
+    /// The child goes back to the caller as an [`Unreaped`](crate::Unreaped).
+    HandBack,
+}
+
 /// What a teardown does to the child.
 pub(crate) enum TeardownKind<'a> {
-    /// Kill it, then settle it as the module doc says.
-    Kill,
+    /// Kill it, then settle it as the module doc says. A child that still runs after a refused kill
+    /// is treated as the disposition says.
+    Kill(Disposition),
     /// An elevation front: sent nothing, and looked at. The reach says whether a kill sent
     /// elsewhere reached it. `Ok(None)`: there is no such kill, so a running front is always left.
     /// `Err`: the subtree that kill went through could not be read, so whether it reached the front
@@ -124,12 +135,12 @@ impl OwnedChild {
     /// zombie launchd holds.
     pub(crate) fn tear_down(&self, id: Option<ProcessId>, kind: TeardownKind<'_>, due: Option<Due>) -> TeardownOutcome {
         match kind {
-            TeardownKind::Kill => self.kill_and_settle(id, due),
+            TeardownKind::Kill(disposition) => self.kill_and_settle(id, disposition, due),
             TeardownKind::Look(reach) => self.look_at_front(id, reach, due),
         }
     }
 
-    fn kill_and_settle(&self, id: Option<ProcessId>, due: Option<Due>) -> TeardownOutcome {
+    fn kill_and_settle(&self, id: Option<ProcessId>, disposition: Disposition, due: Option<Due>) -> TeardownOutcome {
         #[cfg(test)]
         super::seams::note_root_teardown();
         match self.signal(Sig::Kill) {
@@ -147,7 +158,7 @@ impl OwnedChild {
                     Err(unreaped) => self.settle_unreaped(matches!(sent, Sent::Delivered), unreaped),
                 }
             }
-            Err(refused) => self.look_after_refused_kill(id, refused),
+            Err(refused) => self.look_after_refused_kill(id, refused, disposition),
         }
     }
 
@@ -195,8 +206,13 @@ impl OwnedChild {
     }
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
-    /// identity, if the caller read one.
-    pub(crate) fn look_after_refused_kill(&self, id: Option<ProcessId>, refused: Error) -> TeardownOutcome {
+    /// identity, if the caller read one. A child still running is worded as `disposition` says.
+    pub(crate) fn look_after_refused_kill(
+        &self,
+        id: Option<ProcessId>,
+        refused: Error,
+        disposition: Disposition,
+    ) -> TeardownOutcome {
         let pid = self.pid();
         let who = child_named(pid);
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS: the
@@ -211,9 +227,12 @@ impl OwnedChild {
             }
         };
         let left = match (&fate, look_failure) {
-            (ChildFate::Running { .. }, _) => {
-                Some(format!("{who} could not be terminated ({refused}); leaving it running"))
-            }
+            (ChildFate::Running { .. }, _) => Some(match disposition {
+                Disposition::Leave => format!("{who} could not be terminated ({refused}); leaving it running"),
+                Disposition::HandBack => {
+                    format!("{who} could not be terminated ({refused}); handed back to the caller in the error")
+                }
+            }),
             (ChildFate::Unknown, Some(failure)) => Some(format!(
                 "{who} could not be terminated ({refused}), and the look at it failed: {failure}"
             )),

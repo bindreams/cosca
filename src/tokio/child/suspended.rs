@@ -86,6 +86,7 @@ impl SuspendedChild {
                         detail: format!("could not resume the frozen child: {e}"),
                     },
                     fate,
+                    None,
                     child.behind_wrapper(),
                 ))
             }

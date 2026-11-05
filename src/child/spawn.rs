@@ -259,6 +259,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             detail: format!("{write_err}; {root_note}{tree_note}"),
         },
         fate,
+        None,
     ))
 }
 
@@ -651,6 +652,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -692,6 +694,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -726,6 +729,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -1373,6 +1377,7 @@ fn abandon_unadopted(
                     FrontFate::LeftUnreaped.note(error, front, Some(pid)),
                     // The id was reported, but no `ProcessId` was read from it.
                     ChildFate::Running { id: None },
+                    None,
                 );
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
@@ -1381,7 +1386,7 @@ fn abandon_unadopted(
             let tail = done.zombie_tail();
             let fate = done.warn(pid, tail);
             drop(child);
-            SpawnFailure::started(error, fate)
+            SpawnFailure::started(error, fate, None)
         }
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.
@@ -1389,6 +1394,7 @@ fn abandon_unadopted(
             SpawnFailure::started(
                 FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid)),
                 fate,
+                None,
             )
         }
     }
@@ -3216,6 +3222,7 @@ pub(crate) mod fault {
                 "forced post-fork spawn failure (test seam) for child {pid}"
             ))),
             crate::error::ChildFate::Unknown,
+            None,
         ))
     }
 

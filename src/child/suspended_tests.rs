@@ -400,6 +400,40 @@ mod on_windows {
         teardown.assert_reaps_killed();
     }
 
+    /// A failed resume whose teardown cannot kill the frozen child hands it back, still frozen.
+    ///
+    /// Mutant: `resume` leaves the child running and drops it.
+    #[skuld::test]
+    fn a_failed_resume_of_a_child_whose_kill_is_refused_hands_it_back() {
+        let (mut cmd, writer) = held_blocker(false);
+        let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let id = frozen.id();
+        let thread = InitialThread::of(id.pid());
+        frozen
+            .child
+            .proc
+            .script_over(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]));
+        let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+
+        let err = frozen.resume().expect_err("the resume was forced to fail");
+        drop(forced);
+
+        let Error::MayHaveStarted {
+            fate,
+            unreaped: Some(unreaped),
+            ..
+        } = err
+        else {
+            panic!("expected MayHaveStarted around the child, got {err:?}");
+        };
+        assert_eq!(fate, ChildFate::Running { id: Some(id) });
+        assert_eq!(unreaped.id(), Some(id));
+        // The frozen thread runs and the blocker's stdin closes, so the blocker exits.
+        drop(ResumeOnDrop(thread));
+        drop(writer);
+        unreaped.wait().expect("the handed-back child exits");
+    }
+
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.

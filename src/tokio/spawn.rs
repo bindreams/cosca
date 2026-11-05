@@ -591,19 +591,29 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // An elevation front is sent nothing: forgotten and left unreaped, as for an unverified one.
             Unadoptable::Late(_) if front.is_some() => {
                 proc.leave_late_front(pid);
-                SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
+                SpawnFailure::started(
+                    left.note(error, front, Some(pid)),
+                    ChildFate::Running { id: None },
+                    None,
+                )
             }
             // Its id came late: torn down through it, as the sync spawn does.
-            Unadoptable::Late(unique) => SpawnFailure::started(error, proc.reap_unreported(pid, unique, prepared)),
+            Unadoptable::Late(unique) => {
+                SpawnFailure::started(error, proc.reap_unreported(pid, unique, prepared), None)
+            }
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {
                 proc.forget_because("is an elevation front, sent nothing, and left unreaped");
-                SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
+                SpawnFailure::started(
+                    left.note(error, front, Some(pid)),
+                    ChildFate::Running { id: None },
+                    None,
+                )
             }
             // With no id the backend neither signals nor waits by pid: the child is forgotten, with
             // a warning naming it, and left running.
-            Unadoptable::Unverified => SpawnFailure::started(error, proc.reap_now(pid, None)),
+            Unadoptable::Unverified => SpawnFailure::started(error, proc.reap_now(pid, None), None),
         });
     }
     // The pidfd the handshake opened, which the backend just built holds. Were it ever gone, the child
@@ -615,6 +625,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         return Err(SpawnFailure::started(
             crate::child::spawn::spawn_identity_error(Resolved::Unknown, Default::default()),
             fate,
+            None,
         ));
     };
     #[cfg(test)]
@@ -686,6 +697,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                         Some(pid),
                     ),
                     child_fate,
+                    None,
                 ));
             }
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
@@ -702,6 +714,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 return Err(SpawnFailure::started(
                     crate::child::spawn::spawn_identity_error(other, cause),
                     child_fate,
+                    None,
                 ));
             }
             // macOS: nothing pins the pid, so a child the handle still cannot show ours is
@@ -717,6 +730,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 child_fate,
+                None,
             ));
         }
     };
@@ -753,6 +767,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 return Err(SpawnFailure::started(
                     fate.note(error, Some(front), Some(pid)),
                     child_fate,
+                    None,
                 ));
             }
             // macOS: killed and reaped through its verified unique id, as the sync spawn does, and
@@ -779,7 +794,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // attach never leaks a live/suspended process.
             #[cfg(not(target_os = "macos"))]
             let child_fate = proc.reap_now(pid, Some(id));
-            return Err(SpawnFailure::started(error, child_fate));
+            return Err(SpawnFailure::started(error, child_fate, None));
         }
     };
 
@@ -960,6 +975,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             detail: format!("{write_err}; {root_note}{tree_note}"),
         },
         fate,
+        None,
     ))
 }
 
@@ -1153,9 +1169,9 @@ fn abandoned_failure(
     warn_for_abandoned(&abandoned, &error, None);
     match abandoned {
         crate::containment::AbandonedChild::Front(fate) => {
-            SpawnFailure::started(fate.note(error, front, None), front_child_fate(fate))
+            SpawnFailure::started(fate.note(error, front, None), front_child_fate(fate), None)
         }
-        other => SpawnFailure::started(error, abandoned_fate(other)),
+        other => SpawnFailure::started(error, abandoned_fate(other), None),
     }
 }
 

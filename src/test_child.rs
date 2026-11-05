@@ -243,6 +243,17 @@ pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
     })
 }
 
+/// A live [`BLOCKER_ARGV`] child with no containment, and the write end of its stdin, which the
+/// test holds. `kill_on_drop` is the command's.
+pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
+    let (stdin, writer) = held_writer_stdin();
+    let mut cmd = crate::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.kill_on_drop(kill_on_drop);
+    (cmd.spawn().expect("spawn"), writer)
+}
+
 fn held_blocker(
     stdout: crate::Stdio,
     contain: impl FnOnce(&mut crate::Command),
