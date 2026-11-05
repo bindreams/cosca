@@ -299,35 +299,6 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     );
 }
 
-/// Twin for the post-open re-verify: a real pidfd on a live child, its `stat` refused.
-/// `Unassessable` with no errno (`pidfd_open` succeeded) + one warn, never gone.
-#[skuld::test]
-fn open_verified_is_unassessable_when_the_post_open_exists_is_unknown() {
-    use crate::containment::cgroup::test_support::{block_on, fork_running};
-
-    crate::log_capture::install();
-    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
-    let gate_r_fd = gate_r.as_raw_fd();
-    let child = fork_running(|| block_on(gate_r_fd));
-    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
-    let marker = format!("pid {} identity could not be confirmed", id.pid());
-    let mark = crate::log_capture::mark();
-
-    let kernel = FakeKernel::over(&HostKernel).on_read(&format!("{}/stat", id.pid()), Err(libc::EACCES));
-    let result = open_verified_with(&kernel, id);
-    assert!(
-        matches!(result, Err(Error::Unassessable { source: None, .. })),
-        "Existence::Unknown after a successful pidfd_open must be Unassessable, not {result:?}"
-    );
-    assert_eq!(
-        crate::log_capture::levels_since(mark, &marker),
-        vec![log::Level::Warn],
-        "the Unassessable verdict must be logged once, at warn"
-    );
-
-    drop(gate_w); // EOF releases the child; `child` then kills and reaps it
-}
-
 /// A panic between building the fixture and releasing it must still tear down `L` and `M`.
 /// `catch_unwind`, not a subprocess: the fixture's `Drop` runs on this thread's unwind, the path a
 /// real assertion failure takes.

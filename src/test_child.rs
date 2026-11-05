@@ -234,9 +234,7 @@ pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (cr
     held_blocker(stdout, |cmd| _ = contain_without_cgroup(cmd))
 }
 
-/// A spawned [`BLOCKER_ARGV`] child with piped stdin, shaped by `contain` (which may leave it
-/// uncontained), and the write end of its stdin.
-pub(crate) fn held_blocker(
+fn held_blocker(
     stdout: crate::Stdio,
     contain: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, std::io::PipeWriter) {
