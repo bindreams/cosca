@@ -93,7 +93,7 @@ pub use graceful::GracefulMechanism;
 pub use stdio::{Fd, Stdio};
 
 mod child;
-pub use child::{Child, SuspendedChild};
+pub use child::{Child, SuspendedChild, Unreaped};
 
 // Lets `tests/common/locked.rs`, which names `cosca::test_spawn_lock`, compile into the lib's tests.
 #[cfg(test)]

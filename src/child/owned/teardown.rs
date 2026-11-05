@@ -27,13 +27,13 @@ use std::io;
 use std::process::ExitStatus;
 
 use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{orphaned_note, status_of_outcome, Orphaned};
+use crate::child::lifecycle::{orphaned_note, status_of_outcome, wait_to_exit, Orphaned, WaitToExitError};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
-use crate::wait::teardown_warn::{wait_warning, Due};
+use crate::wait::teardown_warn::Due;
 
 /// What a teardown does to the child.
 pub(crate) enum TeardownKind<'a> {
@@ -88,8 +88,7 @@ pub(crate) enum LookOutcome {
 #[derive(Debug)]
 pub(crate) struct TeardownOutcome {
     pub(crate) fate: ChildFate,
-    /// How the look at an elevation front ([`TeardownKind::Look`]) went; `None` for a child killed,
-    /// and for a front whose wait ended at a deadline an unbounded wait cannot reach.
+    /// How the look at an elevation front ([`TeardownKind::Look`]) went; `None` for a child killed.
     #[cfg_attr(windows, allow(dead_code, reason = "no Windows teardown looks at a front yet"))]
     pub(crate) look: Option<LookOutcome>,
     pub(crate) left: Option<String>,
@@ -115,16 +114,6 @@ impl TeardownOutcome {
     }
 }
 
-/// How a blocking wait after a kill ended without an exit status.
-enum Unreaped {
-    /// Someone else reaped the child.
-    Elsewhere(Foreign),
-    /// The wait, or the read of the exit, failed.
-    Failed(Error),
-    /// The wait ended at a deadline, which an unbounded wait cannot do.
-    Deadline,
-}
-
 impl OwnedChild {
     /// Best-effort teardown, the one entry point: do what `kind` says, then settle the child. `id`
     /// is the child's identity, if the caller read one. `due` is the threshold of the slow-teardown
@@ -147,7 +136,7 @@ impl OwnedChild {
             Ok(sent) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-                match self.wait_after_kill(due, Orphaned::Quiet) {
+                match wait_to_exit(self, due, Orphaned::Quiet) {
                     Ok(_status) => {
                         #[cfg(test)]
                         if let Some(pid) = self.pid() {
@@ -168,60 +157,18 @@ impl OwnedChild {
     pub(crate) fn reap_after_tree_kill(&self) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        match self.wait_after_kill(None, Orphaned::Quiet) {
+        match wait_to_exit(self, None, Orphaned::Quiet) {
             Ok(_) => TeardownOutcome::new(ChildFate::Reaped),
             Err(unreaped) => self.settle_unreaped(true, unreaped),
         }
     }
 
-    /// The blocking wait that follows a kill. With `due`, it first watches for the exit until the
-    /// threshold, and warns once if the child has not exited by then. `orphaned` says whether a
-    /// zombie launchd holds is warned of here.
-    fn wait_after_kill(&self, due: Option<Due>, orphaned: Orphaned) -> Result<ExitStatus, Unreaped> {
-        let pid = self.pid();
-        let outcome = wait_warning(
-            self,
-            due,
-            // A look that cannot read the exit ends the watch: the wait finds out.
-            |child, until| {
-                child.exited_by(Some(until)).unwrap_or_else(|e| {
-                    log::debug!(
-                        "the look at {} for the exit failed ({e}); the wait finds out",
-                        child_named(child.pid())
-                    );
-                    true
-                })
-            },
-            |after| crate::child::spawn::warn_still_waiting(pid, after),
-            |child| child.wait(None),
-        )
-        .map_err(Unreaped::Failed)?;
-        match (outcome, status_of_outcome(pid, outcome, orphaned)) {
-            (ChildWaitOutcome::Foreign(foreign), _) => Err(Unreaped::Elsewhere(foreign)),
-            (_, Ok(Some(status))) => Ok(status),
-            (_, Ok(None)) => {
-                debug_assert!(false, "an unbounded wait ended at a deadline");
-                Err(Unreaped::Deadline)
-            }
-            (_, Err(e)) => Err(Unreaped::Failed(e)),
-        }
-    }
-
     /// The outcome of a root teardown whose wait after the kill reaped nothing, `delivered` or not.
     /// Only a delivered kill says the child is dead or dying.
-    fn settle_unreaped(&self, delivered: bool, unreaped: Unreaped) -> TeardownOutcome {
+    fn settle_unreaped(&self, delivered: bool, unreaped: WaitToExitError) -> TeardownOutcome {
         let pid = self.pid();
-        let failed = |left: Option<String>| TeardownOutcome {
-            fate: if delivered {
-                ChildFate::Killed
-            } else {
-                ChildFate::Unknown
-            },
-            look: None,
-            left,
-        };
         match unreaped {
-            Unreaped::Elsewhere(foreign) => {
+            WaitToExitError::Elsewhere(foreign) => {
                 log::debug!(
                     "teardown of {}: it was reaped elsewhere before the reap after the kill",
                     child_named(pid)
@@ -232,11 +179,18 @@ impl OwnedChild {
                     left: (foreign == Foreign::Orphaned).then(|| orphaned_note(pid)),
                 }
             }
-            Unreaped::Failed(e) => failed(Some(format!(
-                "teardown of {}: the reap after the kill failed: {e}",
-                child_named(pid)
-            ))),
-            Unreaped::Deadline => failed(None),
+            WaitToExitError::Failed(e) => TeardownOutcome {
+                fate: if delivered {
+                    ChildFate::Killed
+                } else {
+                    ChildFate::Unknown
+                },
+                look: None,
+                left: Some(format!(
+                    "teardown of {}: the reap after the kill failed: {e}",
+                    child_named(pid)
+                )),
+            },
         }
     }
 
@@ -302,16 +256,15 @@ impl OwnedChild {
                     Ok(true) => {
                         #[cfg(test)]
                         crate::child::spawn::fault::run_between_kill_and_wait();
-                        match self.wait_after_kill(due, Orphaned::Warn) {
+                        match wait_to_exit(self, due, Orphaned::Warn) {
                             Ok(status) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status)),
                             // The kill landed first: delivered, so `Killed`.
-                            Err(Unreaped::Elsewhere(foreign)) => {
+                            Err(WaitToExitError::Elsewhere(foreign)) => {
                                 TeardownOutcome::of_front(foreign.fate(true), LookOutcome::ReapedElsewhere)
                             }
-                            Err(Unreaped::Failed(e)) => {
+                            Err(WaitToExitError::Failed(e)) => {
                                 TeardownOutcome::of_front(ChildFate::Killed, LookOutcome::ReapFailed(e))
                             }
-                            Err(Unreaped::Deadline) => TeardownOutcome::new(ChildFate::Killed),
                         }
                     }
                 }

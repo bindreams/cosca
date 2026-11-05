@@ -5,11 +5,12 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use super::owned::ChildWaitOutcome;
+use super::owned::{ChildWaitOutcome, OwnedChild};
 use super::Child;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign};
-use crate::os_process::PIDLESS_CHILD;
+use crate::os_process::{child_named, PIDLESS_CHILD};
+use crate::wait::teardown_warn::{wait_warning, Due};
 
 /// Whether a wait that finds the child's zombie held by launchd (macOS) says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,66 @@ pub(super) fn status_of_outcome(
             Err(Error::Io(echild()))
         }
         ChildWaitOutcome::DeadlinePassed => Ok(None),
+    }
+}
+
+/// How [`wait_to_exit`] ended without a status.
+pub(super) enum WaitToExitError {
+    /// Someone else reaped the child.
+    Elsewhere(Foreign),
+    /// The wait, or the read of the exit, failed.
+    Failed(Error),
+}
+
+impl From<WaitToExitError> for Error {
+    /// A child reaped elsewhere is `ECHILD`, as every wait answers it.
+    fn from(error: WaitToExitError) -> Error {
+        match error {
+            WaitToExitError::Elsewhere(_) => Error::Io(echild()),
+            WaitToExitError::Failed(e) => e,
+        }
+    }
+}
+
+/// Block until `proc` is reaped, and return its status. The wait has no deadline.
+///
+/// With `due`, it first watches for the exit until the threshold, and warns once if the child has
+/// not exited by then. `orphaned` says whether a zombie launchd holds is warned of here.
+pub(super) fn wait_to_exit(
+    proc: &OwnedChild,
+    due: Option<Due>,
+    orphaned: Orphaned,
+) -> Result<ExitStatus, WaitToExitError> {
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("a wait for a child's exit");
+    let pid = proc.pid();
+    let outcome = wait_warning(
+        proc,
+        due,
+        // A look that cannot read the exit ends the watch: the wait finds out.
+        |child, until| {
+            child.exited_by(Some(until)).unwrap_or_else(|e| {
+                log::debug!(
+                    "the look at {} for the exit failed ({e}); the wait finds out",
+                    child_named(child.pid())
+                );
+                true
+            })
+        },
+        |after| crate::child::spawn::warn_still_waiting(pid, after),
+        |child| child.wait(None),
+    )
+    .map_err(WaitToExitError::Failed)?;
+    match (outcome, status_of_outcome(pid, outcome, orphaned)) {
+        (ChildWaitOutcome::Foreign(foreign), _) => Err(WaitToExitError::Elsewhere(foreign)),
+        (_, Ok(Some(status))) => Ok(status),
+        (_, Ok(None)) => {
+            debug_assert!(false, "an unbounded wait ended with no exit");
+            Err(WaitToExitError::Failed(Error::Io(io::Error::other(
+                "an unbounded wait ended with no exit",
+            ))))
+        }
+        (_, Err(e)) => Err(WaitToExitError::Failed(e)),
     }
 }
 
@@ -108,17 +169,6 @@ impl Child {
     /// a deadline that passed with the root still running.
     pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
         status_of_outcome(Some(self.id.pid()), self.proc.wait(deadline)?, orphaned)
-    }
-
-    /// Block until the root is reaped.
-    pub(super) fn wait_root_unbounded(&self) -> Result<ExitStatus, Error> {
-        match self.wait_root(None, Orphaned::Warn)? {
-            Some(status) => Ok(status),
-            None => {
-                debug_assert!(false, "an unbounded wait ended with no exit");
-                Err(Error::Io(io::Error::other("an unbounded wait ended with no exit")))
-            }
-        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
