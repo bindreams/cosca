@@ -221,6 +221,11 @@ fn io_context_error_in_error_io_reaches_the_os_code() {
         "could not check C:\\t.exe",
         std::io::Error::from_raw_os_error(code),
     ));
+    assert_eq!(
+        first_source_io(&e).raw_os_error(),
+        None,
+        "the wrapper is the first source"
+    );
     assert_eq!(e.raw_os_error(), Some(code));
 }
 
@@ -230,6 +235,11 @@ fn io_context_error_in_error_io_reaches_the_os_code() {
 fn a_noted_error_io_has_the_os_code_of_the_original() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = Error::Io(std::io::Error::from_raw_os_error(code)).with_note("while tearing down");
+    assert_eq!(
+        first_source_io(&e).raw_os_error(),
+        None,
+        "the wrapper is the first source"
+    );
     assert_eq!(e.raw_os_error(), Some(code));
 }
 
@@ -244,6 +254,11 @@ fn a_note_on_a_context_error_io_has_the_os_code_of_the_original() {
         std::io::Error::from_raw_os_error(code),
     ))
     .with_note("while tearing down");
+    assert_eq!(
+        first_source_io(&e).raw_os_error(),
+        None,
+        "the wrapper is the first source"
+    );
     assert_eq!(e.raw_os_error(), Some(code));
 }
 
@@ -378,4 +393,12 @@ fn io_error_displays_the_wrapped_message_unchanged() {
     let inner = std::io::Error::other("disk on fire");
     let expected = inner.to_string();
     assert_eq!(Error::Io(inner).to_string(), expected);
+}
+
+/// The `io::Error` that `e`'s own `source()` returns: the one `Error::Io` wraps.
+#[cfg(any(unix, feature = "tokio"))]
+fn first_source_io(e: &Error) -> &std::io::Error {
+    std::error::Error::source(e)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("Error::Io's source is its io::Error")
 }
