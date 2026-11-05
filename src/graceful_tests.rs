@@ -66,7 +66,7 @@ fn signal_hands_the_process_mechanism_to_the_roots_closure_as_a_term() {
     let mut sent = Vec::new();
     super::signal(
         GracefulMechanism::Process,
-        crate::identity::ProcessId::from_parts(0x7fff_fffe, 1),
+        crate::identity::ProcessId::from_parts_for_test(0x7fff_fffe, crate::identity::Key::for_test(1)),
         |sig| {
             sent.push(sig);
             Ok(())

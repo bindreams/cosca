@@ -1,17 +1,18 @@
 //! A spawn whose child's identity cannot be read because the checked `/proc` view is
-//! unavailable says so, and does not leak the child.
+//! unavailable says so, and does not leak the child. On pidfs the identity needs no view.
 
 use super::spawn_tests::teardown_blocker;
 use crate::error::Error;
+use crate::test_groups::{pidfd_group_signal, Group};
 use crate::test_seccomp::{deny_openat2_on_this_thread, OPENAT2_REFUSALS};
 
-/// The kernel refuses `openat2` (a real seccomp filter): the spawn fails `Unsupported` naming it,
-/// and the pidfd pins the child, so it is killed and reaped.
+/// The kernel refuses `openat2` (a real seccomp filter): on pidfs the spawn identifies its child by
+/// the pidfd it holds and needs no `/proc` view, so it succeeds. (Below Linux 6.9 it fails
+/// `Unsupported` naming `openat2`; `the_error_names_the_view_the_read_failed_on` states that host.)
 ///
-/// Mutant: `spawn_identity_error` reports every `Unknown` as the OS refusing (`Unassessable` that
-/// names no cause).
+/// Mutant: the spawn reads its child's identity through the `/proc` view.
 #[skuld::test]
-fn a_spawn_where_openat2_is_refused_is_unsupported_naming_it_and_reaps_the_child() {
+fn a_spawn_where_openat2_is_refused_succeeds_on_pidfs(#[fixture(pidfd_group_signal)] _group: &Group) {
     for (errno, name) in OPENAT2_REFUSALS {
         // The hooks `teardown_blocker` arms are thread-local.
         std::thread::scope(|scope| {
@@ -19,24 +20,12 @@ fn a_spawn_where_openat2_is_refused_is_unsupported_naming_it_and_reaps_the_child
                 .spawn(|| {
                     let (mut cmd, teardown) = teardown_blocker();
                     deny_openat2_on_this_thread(errno);
-                    let err = cmd.spawn().err();
-
-                    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-                        err.expect("a spawn without openat2 must fail"),
-                    );
-                    assert_eq!(
-                        fate,
-                        crate::error::ChildFate::Reaped,
-                        "{name}: the pidfd pins the child, so it is reaped"
-                    );
-                    match err {
-                        Error::Unsupported { detail, platform, .. } => {
-                            assert_eq!(platform, "linux");
-                            assert_eq!(detail, crate::identity::openat2_refused_message(name), "{name}");
-                        }
-                        other => panic!("{name}: expected Unsupported, got {other:?}"),
-                    }
-                    teardown.assert_killed();
+                    let child = cmd
+                        .spawn()
+                        .unwrap_or_else(|e| panic!("{name}: a pidfs spawn needs no openat2: {e}"));
+                    child.kill().expect("kill the child");
+                    child.wait().expect("reap the child");
+                    drop(teardown);
                 })
                 .join()
                 .expect("the filtered thread")
@@ -49,9 +38,10 @@ fn a_spawn_where_openat2_is_refused_is_unsupported_naming_it_and_reaps_the_child
 /// "`spawn_identity_error` asks the view again".
 #[skuld::test]
 fn the_error_names_the_view_the_read_failed_on() {
-    use crate::identity::{FakeKernel, HostKernel, ProcessId, UnknownCause};
+    use crate::identity::{ProcessId, UnknownCause};
 
-    let kernel = FakeKernel::over(&HostKernel).open_proc_fails(rustix::io::Errno::NOSYS);
+    // The `/proc` path: the view is only read where pidfds have no inode of their own.
+    let kernel = crate::identity::ticks_host(std::process::id()).open_proc_fails(rustix::io::Errno::NOSYS);
     let (read, cause) = ProcessId::of_with(&kernel, std::process::id());
     match crate::child::spawn::spawn_identity_error(read, cause) {
         Error::Unsupported { detail, .. } => {

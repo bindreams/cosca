@@ -71,7 +71,7 @@ fn one_open_serves_look_signal_and_wait() {
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (mut child, id) = blocker();
     let sends = crate::send_log::Capture::start();
-    let other = ProcessId::from_parts_for_test(id.pid(), id.start_token_raw() + 1);
+    let other = id.with_other_value();
     assert!(open(other).unwrap().is_none(), "a wrong start token opens nothing");
     terminate_by_id(other).unwrap();
     assert_eq!(sends.by_identity(), vec![], "nothing may be sent to a stranger");
@@ -260,7 +260,7 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
 #[skuld::test]
 fn pid_zero_is_refused_unassessable() {
     let p = MacProcess {
-        id: ProcessId::from_parts_for_test(0, 1),
+        id: ProcessId::from_parts_for_test(0, crate::identity::Key::for_test(1)),
         unique: 1,
         idversion: std::sync::atomic::AtomicI32::new(1),
         watch: ExitWatch::new(super::kqueue::Kqueue::new().unwrap()),
@@ -287,7 +287,7 @@ fn pid_zero_is_refused_unassessable() {
 /// is pinned by `identity::probe::probe_tests::signal_target_is_the_guard_for_real_signals`.
 #[skuld::test]
 fn a_pid_zero_identity_never_reaches_kill() {
-    let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
+    let bogus = crate::identity::ProcessId::from_parts_for_test(0, crate::identity::Key::for_test(1));
     // The pid holds `kernel_task`, not the process this identity names: nothing opens.
     assert!(
         open(bogus).expect("a pid-0 identity resolves to a stranger").is_none(),
