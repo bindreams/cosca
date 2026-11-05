@@ -2740,7 +2740,7 @@ fn leave_unadopted_front_noting(
 }
 
 /// [`teardown_through_pidfd`] for an elevation front: sent nothing, reaped now only if it has
-/// exited (see [`teardown_unadopted_or_front`]). `warn`: see
+/// exited (see [`leave_unadopted_front_noting`]). `warn`: see
 /// [`leave_front_through_pidfd_noting`].
 #[cfg(target_os = "linux")]
 pub(crate) fn leave_front_through_pidfd(
