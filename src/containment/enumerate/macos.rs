@@ -11,7 +11,7 @@
 //!   between the snapshot and the query, or a sandbox denies the fallback's own sysctl
 //!   (EPERM/EACCES there is a DESIGNED, persistent `Unknown`, not a second EPERM gap). An
 //!   `e_ppid == 0` mid fork() on both reads is transient and never surfaces: `ppid_of` re-reads
-//!   it until it resolves (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
+//!   it until it resolves (pids 0 and 1 excepted — see `identity::macos::trusted_ppid`'s doc).
 //! - A failed snapshot, or a pid denied its ppid read, is `Error::Unassessable` from
 //!   `process_parents`, never an empty or partial list: a tree walk over one skips the subtree.
 //!   [`snapshot`] is the other consumer (the fd-marker sweep): it reports a failure as an empty
