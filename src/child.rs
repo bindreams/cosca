@@ -1055,9 +1055,8 @@ impl Child {
     /// end it is given back too.
     ///
     /// A `kill_on_drop(false)` child and an elevation front (sent no kill) are left, whatever
-    /// `disposition` says. The containment is torn down as `self` drops, before this returns. A
-    /// Windows Job Object is closed then too and its `KILL_ON_JOB_CLOSE` kills the child, so a
-    /// contained child is handed back there only when the Job's own kill failed first.
+    /// `disposition` says. The containment is torn down as `self` drops, before this returns. On
+    /// Windows a refused root kill gets the single look, as before.
     pub(crate) fn tear_down_or_hand_back(
         mut self,
         disposition: Disposition,

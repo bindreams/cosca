@@ -1490,9 +1490,10 @@ impl Drop for Child {
 
 impl Child {
     /// What [`Drop`] does, now, and what it did with the child; the drop then does nothing more. For
-    /// a sync caller that must say what became of the child: a failed resume.
-    pub(crate) fn tear_down_now(&mut self) -> crate::error::ChildFate {
-        let fate = self.tear_down(TeardownCaller::Drop);
+    /// a sync caller that must say what became of the child: a failed resume. `caller` prefixes the
+    /// teardown's log lines.
+    pub(crate) fn tear_down_now(&mut self, caller: TeardownCaller) -> crate::error::ChildFate {
+        let fate = self.tear_down(caller);
         self.kill_on_drop = false;
         fate
     }

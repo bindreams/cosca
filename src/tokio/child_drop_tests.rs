@@ -782,7 +782,7 @@ async fn a_teardown_of_a_reaped_child_is_reaped_armed_or_not() {
         drop(child.stdin().expect("piped stdin"));
         child.wait().await.expect("the child exits once its stdin closes");
         assert_eq!(
-            child.tear_down_now(),
+            child.tear_down_now(crate::containment::dispatch::TeardownCaller::Drop),
             crate::error::ChildFate::Reaped,
             "kill_on_drop={kill_on_drop}"
         );
