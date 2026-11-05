@@ -48,6 +48,7 @@ pub mod inheritable;
 #[cfg(windows)]
 pub mod windows_reparse;
 
+pub mod console_flags;
 mod locked;
 pub use locked::*;
 

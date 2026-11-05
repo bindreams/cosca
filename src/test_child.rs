@@ -1,4 +1,8 @@
 //! Test-only child processes shared across the crate's unit tests.
+//!
+//! On Windows these spawn through [`crate::test_spawn`] or build their `Command` with `no_window()`,
+//! so a child opens no console window; a test of the console-group signals takes an `_on_console`
+//! helper.
 
 skuld::default_labels!(crate::test_harness::ROOT);
 
@@ -35,6 +39,8 @@ use crate::test_own_process;
 mod kevent_eintr;
 
 // Blocker fixtures =====
+
+use crate::test_spawn::console_flags::Console;
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
 /// `findstr x` on Windows. Every fixture that needs a child "still alive at some later check"
@@ -215,9 +221,16 @@ pub(crate) fn contain_without_cgroup_async(cmd: &mut crate::tokio::Command) -> &
     cmd.contain()
 }
 
-/// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin.
+/// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin. On Windows it has
+/// a windowless console of its own, which a `CTRL_BREAK` from this process cannot reach: a test
+/// of the graceful signals takes [`held_contained_blocker_on_console`].
 pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
-    held_blocker(stdout, |cmd| _ = cmd.contain())
+    held_blocker(stdout, Console::Hidden, |cmd| _ = cmd.contain())
+}
+
+/// [`held_contained_blocker`] on this process's console, for a test of the graceful signals.
+pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+    held_blocker(stdout, Console::Asked, |cmd| _ = cmd.contain())
 }
 
 /// A live [`held_contained_blocker`] with a null stdout and its identity.
@@ -231,14 +244,14 @@ pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::ident
 /// [`held_contained_blocker`], contained by [`contain_without_cgroup`].
 #[cfg(unix)]
 pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
-    held_blocker(stdout, |cmd| _ = contain_without_cgroup(cmd))
+    held_blocker(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup(cmd))
 }
 
 /// A spawned [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) [`BLOCKER_ARGV`] child with a
 /// null stdout, and the write end of its stdin.
 #[cfg(target_os = "linux")]
 pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
-    held_blocker(crate::Stdio::null(), |cmd| {
+    held_blocker(crate::Stdio::null(), Console::Hidden, |cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     })
 }
@@ -305,10 +318,14 @@ pub(crate) fn tear_down_holding<R>(
 
 fn held_blocker(
     stdout: crate::Stdio,
+    console: Console,
     contain: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();
     cmd.args(BLOCKER_ARGV.iter().copied());
+    if console.hides_window() {
+        cmd.no_window();
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(stdout).expect("set stdout");
     contain(&mut cmd);
@@ -318,9 +335,17 @@ fn held_blocker(
 }
 
 /// Async twin of [`held_contained_blocker`].
-#[cfg(feature = "tokio")]
+#[cfg(all(unix, feature = "tokio"))]
 pub(crate) fn held_contained_blocker_async(stdout: crate::Stdio) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, |cmd| _ = cmd.contain())
+    held_blocker_async(stdout, Console::Hidden, |cmd| _ = cmd.contain())
+}
+
+/// Async twin of [`held_contained_blocker_on_console`].
+#[cfg(feature = "tokio")]
+pub(crate) fn held_contained_blocker_on_console_async(
+    stdout: crate::Stdio,
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    held_blocker_async(stdout, Console::Asked, |cmd| _ = cmd.contain())
 }
 
 /// Async twin of [`held_contained_blocker_without_cgroup`].
@@ -328,13 +353,13 @@ pub(crate) fn held_contained_blocker_async(stdout: crate::Stdio) -> (crate::toki
 pub(crate) fn held_contained_blocker_without_cgroup_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, |cmd| _ = contain_without_cgroup_async(cmd))
+    held_blocker_async(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup_async(cmd))
 }
 
 /// Async twin of [`held_treewalk_blocker`].
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 pub(crate) fn held_treewalk_blocker_async() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(crate::Stdio::null(), |cmd| {
+    held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     })
 }
@@ -342,10 +367,14 @@ pub(crate) fn held_treewalk_blocker_async() -> (crate::tokio::Child, crate::toki
 #[cfg(feature = "tokio")]
 fn held_blocker_async(
     stdout: crate::Stdio,
+    console: Console,
     contain: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     let mut cmd = crate::tokio::Command::new();
     cmd.args(BLOCKER_ARGV.iter().copied());
+    if console.hides_window() {
+        cmd.no_window();
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(stdout).expect("set stdout");
     contain(&mut cmd);
@@ -1358,8 +1387,22 @@ pub(crate) fn windows_more() -> std::path::PathBuf {
 /// real kill or the caller closing the pipe (exit 0). Stdout is nulled because `more` echoes.
 #[cfg(windows)]
 pub(crate) fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
+    windows_blocker_with(Console::Hidden)
+}
+
+/// [`windows_blocker`] on this process's console, for a test of the graceful signals.
+#[cfg(windows)]
+pub(crate) fn windows_blocker_on_console() -> (crate::Child, std::io::PipeWriter) {
+    windows_blocker_with(Console::Asked)
+}
+
+#[cfg(windows)]
+fn windows_blocker_with(console: Console) -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();
     cmd.args([windows_more()]);
+    if console.hides_window() {
+        cmd.no_window();
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain();
@@ -1373,8 +1416,27 @@ pub(crate) fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
 pub(crate) fn windows_blocker_async(
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    windows_blocker_async_with(Console::Hidden, configure)
+}
+
+/// [`windows_blocker_async`] on this process's console, for a test of the graceful signals.
+#[cfg(all(windows, feature = "tokio"))]
+pub(crate) fn windows_blocker_on_console_async(
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    windows_blocker_async_with(Console::Asked, configure)
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+fn windows_blocker_async_with(
+    console: Console,
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     let mut cmd = crate::tokio::Command::new();
     cmd.args([windows_more()]);
+    if console.hides_window() {
+        cmd.no_window();
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     configure(&mut cmd);
@@ -1539,23 +1601,23 @@ fn fixture_survives_group_signal() {
     let Some(addr) = std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    use std::os::windows::process::CommandExt;
-
     // CREATE_NEW_PROCESS_GROUP (winbase.h). A scalar flag, so a raw constant needs no
-    // `windows`-crate import: `std::os::windows::process::CommandExt::creation_flags` takes it
-    // as a plain `u32`.
+    // `windows`-crate import: the creation word is a plain `u32`.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    // `Asked`: the grandchild stays on this process's console, in a group of its own, which is the
+    // isolation the fixture exists for.
     #[allow(
         clippy::zombie_processes,
         reason = "the grandchild must outlive us; containment kills it"
     )]
-    let _survivor = crate::test_spawn::spawn(
+    let _survivor = crate::test_spawn::spawn_with(
         crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
             .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
             .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .stdout(std::process::Stdio::null()),
+        CREATE_NEW_PROCESS_GROUP,
+        Console::Asked,
     )
     .expect("spawn a grandchild the group signal cannot reach");
 }

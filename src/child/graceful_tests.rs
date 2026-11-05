@@ -11,7 +11,7 @@ use crate::wait::fault;
 /// `Existence::Present` is not proof of life — it is zombie-inclusive on every platform — so a
 /// liveness claim goes through [`assert_still_running`].
 fn blocker() -> (crate::Child, std::io::PipeWriter) {
-    crate::test_child::held_contained_blocker(crate::Stdio::pipe())
+    crate::test_child::held_contained_blocker_on_console(crate::Stdio::pipe())
 }
 
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.

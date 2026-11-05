@@ -7,7 +7,7 @@ use crate::wait::fault;
 
 /// Async twin of `child::graceful_tests::blocker`.
 fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    crate::test_child::held_contained_blocker_async(crate::Stdio::pipe())
+    crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe())
 }
 
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.
@@ -708,7 +708,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 #[cfg(windows)]
 #[skuld::test]
 async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
-    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
         cmd.contain();
     });
     assert_eq!(
@@ -745,7 +745,7 @@ async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
 #[skuld::test]
 async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
         cmd.contain();
     });
     let id = child.id();
@@ -789,7 +789,7 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
     const GRACE: Duration = Duration::from_secs(30);
-    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     });
     assert_eq!(
@@ -849,7 +849,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
 #[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
-    let (mut child, stdin) = crate::test_child::windows_blocker_async(|_| {});
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|_| {});
     assert_eq!(
         child.graceful_mechanism(),
         crate::graceful::GracefulMechanism::None,
