@@ -191,8 +191,14 @@ impl ProcessId {
                 Resolved::Unknown => return (Resolved::Unknown, cause),
             };
             if let Some(parent) = parent {
-                if stat_parse::parse_ppid(&stat) != Some(parent.pid()) {
-                    return (Resolved::Gone, UnknownCause::default());
+                match stat_parse::parse_ppid(&stat) {
+                    Some(ppid) if ppid == parent.pid() => {}
+                    Some(_) => return (Resolved::Gone, UnknownCause::default()),
+                    // A `stat` with no ppid says nothing about who the parent is.
+                    None => {
+                        log::debug!("identity: the stat of pid {pid} has no readable ppid");
+                        return (Resolved::Unknown, UnknownCause::default());
+                    }
                 }
                 match parent.exists_with(kernel) {
                     (Existence::Present, _) => {}

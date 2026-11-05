@@ -94,6 +94,31 @@ fn a_stat_without_a_start_time_gives_no_key() {
     assert!(matches!(id(100).order_key_with(&kernel).0, Resolved::Unknown));
 }
 
+/// `of_ordered_with` against a named parent: a `stat` that shows another parent's number is a pid
+/// that changed hands (`Gone`); one whose ppid cannot be read says nothing about it (`Unknown`).
+/// Mutant: "an unreadable ppid is `Gone`".
+#[skuld::test]
+fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
+    let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
+    let with_ppid = |ppid: &str| {
+        let stat = String::from_utf8(stat_fixture("S", 777))
+            .expect("a fixture is text")
+            .replacen(" S 1 ", &format!(" S {ppid} "), 1);
+        kernel_showing(stat.as_bytes(), 100)
+    };
+
+    let (another, _writer) = with_ppid("8");
+    assert!(matches!(
+        ProcessId::of_ordered_with(&another, PID, Some(parent)).0,
+        Resolved::Gone
+    ));
+    let (unreadable, _writer) = with_ppid("x");
+    assert!(matches!(
+        ProcessId::of_ordered_with(&unreadable, PID, Some(parent)).0,
+        Resolved::Unknown
+    ));
+}
+
 /// A `Ticks` id's key is its ticks, and nothing is read: a kernel with no rows panics on a read.
 #[skuld::test]
 fn a_ticks_ids_order_key_is_its_ticks_with_no_read() {

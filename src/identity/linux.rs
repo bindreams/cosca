@@ -356,7 +356,13 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness
                 }
             },
             Proof::Lost => Liveness::Dead,
-            Proof::Unknown(_) => Liveness::Unknown,
+            Proof::Unknown(cause) => {
+                log::debug!(
+                    "the pidfd of pid {pid} could not be opened or proved: {:?}",
+                    cause.errno()
+                );
+                Liveness::Unknown
+            }
         },
     }
 }
