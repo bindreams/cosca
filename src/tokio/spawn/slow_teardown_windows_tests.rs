@@ -10,6 +10,7 @@
 
 use crate::child::spawn::fault;
 use crate::error::ChildFate;
+use crate::test_child::Console;
 
 /// The "still waiting" warns logged since `mark`.
 fn warns_since(mark: usize) -> Vec<String> {
@@ -25,7 +26,7 @@ fn blocker_command(raw: bool) -> (crate::tokio::Command, fault::TeardownBlocker)
         stdout,
         guard,
     } = fault::teardown_blocker_parts();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     if raw {
         cmd.executable(&argv[0]);
     }

@@ -259,7 +259,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixtu
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
 
-    let mut cmd = cosca::Command::new();
+    let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-setuid", &addr, helper]);
     // The setuid helper outlives this test (it exits on EOF after `drop(priv_sock)`, and cannot be

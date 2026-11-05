@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::test_child::Console;
+
 use crate::child::front_kill_tests::{assert_refused_by, assert_unkillable_front, report};
 use crate::containment::unix::fault::record_kill_group;
 use crate::elevation::{Backend, ElevatedVia};
@@ -23,7 +25,7 @@ pub(super) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (Child, ChildStdin
 }
 
 pub(super) fn cat() -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cat"]);
     cmd
 }
@@ -259,7 +261,7 @@ async fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_noth
 #[skuld::test]
 async fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
     use tokio::io::AsyncReadExt as _;
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     // An ignored disposition survives `exec`; `ready` says it is set.
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe()).expect("stdout pipe");
@@ -448,7 +450,7 @@ async fn a_spawn_failing_after_its_fork_leaves_an_elevation_front_running_and_sa
     use crate::child::front_kill_tests::reap;
     use crate::child::spawn::fault;
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
@@ -490,7 +492,7 @@ async fn a_spawn_failing_after_its_fork_leaves_an_elevation_front_running_and_sa
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_front_whose_exec_fails_is_not_noted() {
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["true".to_owned(), "x".repeat(256 * 1024)]);
     cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
         Backend::Sudo,
@@ -519,7 +521,7 @@ async fn a_front_reaped_elsewhere_before_its_identity_read_is_gone() {
     use crate::child::spawn::fault;
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::command::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
     cmd.stdin(stdin).expect("stdin");
     cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(

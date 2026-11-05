@@ -6,13 +6,14 @@ use crate::containment::cgroup::test_support::alone;
 use crate::containment::Nesting;
 #[cfg(target_os = "linux")]
 use crate::test_child::fixture_path;
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::tokio::child::child_drop_tests::linux::{Ended, Pidfd};
 use crate::ContainMode;
 
 #[skuld::test]
 fn contain_with_and_nesting_recorded() {
-    let mut cmd = super::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.contain_with(ContainMode::TreeWalk).nesting(Nesting::Opaque);
     let req = cmd.inner.contain_request();
     assert_eq!(req.mode, Some(ContainMode::TreeWalk));
@@ -26,7 +27,7 @@ fn contain_with_and_nesting_recorded() {
 #[skuld::test]
 fn run_to_completion_futures_are_send() {
     fn assert_send<T: Send>(_: T) {}
-    let mut cmd = super::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     assert_send(cmd.status());
     assert_send(cmd.output());
     assert_send(cmd.read());
@@ -34,7 +35,7 @@ fn run_to_completion_futures_are_send() {
 
 #[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
-    let mut c = super::Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.args(["id", "-u"]).elevation_backend(crate::elevation::Backend::Sudo);
     // command_tests is a child module of tokio::command, so it can read the private inner.
     let req = c.inner.elevation_request();
@@ -45,7 +46,7 @@ fn tokio_elevate_forwards_to_inner_request() {
 #[cfg(unix)]
 #[skuld::test]
 async fn tokio_child_elevation_is_none_without_elevate() {
-    let mut c = super::Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.args(["true"]);
     let child = c.spawn().expect("spawn");
     assert!(child.elevation().is_none());
@@ -62,7 +63,7 @@ fn tokio_raw_executable_records_an_exact_spec() {
     use crate::command::ExecutableSpec;
     use std::path::Path;
 
-    let mut c = super::Command::new();
+    let mut c = crate::test_child::tokio_command(Console::Hidden);
     c.raw_executable("helper");
     assert!(
         matches!(c.inner.executable_spec(), Some(ExecutableSpec::Exact(p)) if p == Path::new("helper")),
@@ -72,7 +73,7 @@ fn tokio_raw_executable_records_an_exact_spec() {
 
     // And the sibling setter still records Search through the same wrapper, so the two are not
     // accidentally wired to the same inner method.
-    let mut s = super::Command::new();
+    let mut s = crate::test_child::tokio_command(Console::Hidden);
     s.executable("helper");
     assert!(matches!(s.inner.executable_spec(), Some(ExecutableSpec::Search(_))));
 }
@@ -83,7 +84,7 @@ fn tokio_raw_executable_records_an_exact_spec() {
 #[cfg(unix)]
 fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = super::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
@@ -281,7 +282,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
 #[cfg(unix)]
 fn releasable_root() -> (super::Command, crate::child::spawn::fault::TeardownBlocker) {
     let (gate, release) = crate::test_child::held_writer_stdin();
-    let mut cmd = super::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", "exec cat <&4 4<&-"]);
     cmd.fd(4, gate).expect("set the root's release pipe");
     (cmd, crate::child::spawn::fault::release_between_kill_and_wait(release))
@@ -292,7 +293,7 @@ fn releasable_root() -> (super::Command, crate::child::spawn::fault::TeardownBlo
 /// pinned by `child_drop_tests::a_kill_on_drop_drop_of_a_live_blocker_returns`.
 #[cfg(windows)]
 fn releasable_root() -> (super::Command, Released) {
-    let mut cmd = super::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     (cmd, Released)
 }
@@ -365,7 +366,7 @@ async fn read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag() {
     crate::tokio::test_runtime::assert_current_thread();
     for wrapper in [false, true] {
         let _wrapper = wrapper.then(crate::child::spawn::failure::seams::pretend_wrapper);
-        let mut cmd = super::Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(["printf", "\\377"]);
         let error = cmd.read().await.expect_err("invalid UTF-8 fails `read`");
         let crate::error::Error::MayHaveStarted {

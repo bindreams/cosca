@@ -5,6 +5,8 @@
 
 use ::tokio::io::AsyncBufReadExt as _;
 
+use crate::test_child::Console;
+
 use crate::child::unpinned_public_tests::{
     assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned, sorted, warns_since,
     Untrusted, BOTH,
@@ -13,13 +15,12 @@ use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
-use crate::tokio::Command;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left};
 use crate::ContainMode;
 
 pub(super) fn blocker(mode: ContainMode) -> (crate::tokio::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(mode);
@@ -74,7 +75,7 @@ pub(super) fn group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
 /// started it. Neither exits on its own, so the holders do not change under a sweep.
 pub(super) async fn session_tree() -> (crate::tokio::Child, std::io::PipeWriter, u32) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);
     cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
@@ -576,7 +577,7 @@ async fn kill_tree_reads_the_root_once_for_its_backstop() {
 async fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() {
     crate::tokio::test_runtime::assert_current_thread();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let mut child = cmd.spawn().expect("spawn");

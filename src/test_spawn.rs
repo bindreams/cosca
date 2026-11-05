@@ -8,9 +8,19 @@
 //!
 //! Never call these while already holding `spawn_lock`, or from a `cosca::Command` spawn: the lock
 //! is not reentrant, and re-entry panics.
+//!
+//! On Windows every child spawned here is `CREATE_NO_WINDOW`, so a test run from a process with no
+//! console opens no window. A test that needs a console or its own flags spawns through
+//! [`spawn_with`], and replaces whatever `creation_flags` the command already had.
 
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+#[path = "../tests/common/console_flags.rs"]
+pub(crate) mod console_flags;
 
 thread_local! {
     static BETWEEN_SPAWN_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -49,6 +59,20 @@ pub(crate) fn held_by_this_thread() -> bool {
 
 /// [`Command::spawn`] under `spawn_lock`.
 pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Child> {
+    #[cfg(windows)]
+    cmd.creation_flags(console_flags::word(0, console_flags::Console::Hidden));
+    spawn_held(cmd)
+}
+
+/// [`spawn`] with `flags` as the creation word, plus `CREATE_NO_WINDOW` unless `console` is
+/// [`Asked`](console_flags::Console::Asked).
+#[cfg(windows)]
+pub(crate) fn spawn_with(cmd: &mut Command, flags: u32, console: console_flags::Console) -> io::Result<Child> {
+    cmd.creation_flags(console_flags::word(flags, console));
+    spawn_held(cmd)
+}
+
+fn spawn_held(cmd: &mut Command) -> io::Result<Child> {
     let _held = Held::take();
     #[allow(clippy::disallowed_methods, reason = "`_held` is spawn_lock")]
     cmd.spawn()
@@ -81,6 +105,8 @@ pub(crate) fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
 /// `tokio::process::Command::spawn` under `spawn_lock`.
 #[cfg(feature = "tokio")]
 pub(crate) fn spawn_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<::tokio::process::Child> {
+    #[cfg(windows)]
+    cmd.creation_flags(console_flags::word(0, console_flags::Console::Hidden));
     let _held = Held::take();
     #[allow(clippy::disallowed_methods, reason = "`_held` is spawn_lock")]
     cmd.spawn()

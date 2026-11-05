@@ -12,6 +12,7 @@ use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
 use crate::send_log::Capture;
 use crate::signal::Sig;
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::drop_fault;
@@ -29,7 +30,7 @@ const SESSION_CONTAINMENT: Containment = Containment::FdMarker;
 const SESSION_CONTAINMENT: Containment = Containment::Session;
 
 fn session(argv: &[&str]) -> Command {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(argv.iter().copied());
     cmd.contain_with(ContainMode::Session);
     cmd
@@ -153,7 +154,7 @@ async fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_r
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["true"]);
     cmd.contain_with(ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
@@ -184,7 +185,7 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
@@ -490,7 +491,7 @@ async fn drop_after_terminate_tree_and_wait_still_warns() {
 async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(ContainMode::TreeWalk);
@@ -523,7 +524,7 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
     use ::tokio::io::AsyncReadExt as _;
 
     crate::log_capture::install();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     // The `cat` is in a shell that prints `eof` if the `cat` ends by itself, as it does on EOF. A
     // `cat` a kill ended exits by a signal, so the `&&` prints no `eof`.
     cmd.args([
@@ -586,7 +587,7 @@ async fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[
     use ::tokio::io::AsyncReadExt as _;
 
     crate::log_capture::install();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -650,7 +651,7 @@ async fn cgroup_async_drop_alone_kills_the_members_and_removes_the_leaf(#[fixtur
     crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",
@@ -736,7 +737,7 @@ async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_b
     // `exec 3<&0` because `sh` points a background job's stdin at /dev/null otherwise. The `cat`
     // reads the stdin pipe, which the test holds, and holds stderr's write end: stderr reaches EOF
     // exactly when the `cat` is gone.
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", "exec 3<&0; cat <&3 3<&- >/dev/null & echo started; exit 0"]);
     cmd.contain_with(ContainMode::Strongest);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -774,7 +775,7 @@ async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_b
 /// before the attach has no identity to walk from, which would make a "no walk" assertion vacuous.
 #[cfg(target_os = "macos")]
 async fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.contain_with(mode);

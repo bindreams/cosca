@@ -9,6 +9,7 @@ use crate::elevation::pkexec::PkexecVersion;
 use crate::elevation::plan::Host;
 use crate::elevation::{ArgvRefusals, Auth, Backend, Secret};
 use crate::error::Error;
+use crate::test_child::Console;
 use crate::Stdio;
 
 /// Each backend a host can plan, as `(name, backend, auth, host, the words it refuses in)`.
@@ -74,7 +75,7 @@ fn assert_refused(setter: &str, set: fn(&mut Command, &str), programs: &[&str]) 
         for (name, backend, auth, host, words) in backends(elevated) {
             for &program in programs {
                 for &(fault, apply) in FAULTS {
-                    let mut c = Command::new();
+                    let mut c = crate::test_child::command(Console::Hidden);
                     c.args([program, "-u"])
                         .elevation_backend(backend)
                         .elevation_auth(auth.clone());

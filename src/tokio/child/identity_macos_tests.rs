@@ -1,6 +1,8 @@
 //! The macOS async spawn's identity check, twin of `child::spawn::identity_macos_tests`.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::{drop_fault, fault as backend_fault};
@@ -16,7 +18,7 @@ use crate::wait::exit_only::seams::force_peek_once;
 
 fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     (cmd, writer)
@@ -198,7 +200,7 @@ async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_progr
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdout, reader) = ran_marker();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(RAN_ARGV);
     cmd.stdout(stdout).expect("set stdout");
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
@@ -354,7 +356,7 @@ async fn macos_tokio_treewalk_attach_reads_nothing_by_pid() {
     crate::tokio::test_runtime::assert_current_thread();
     // The sync command, which the async spawn takes: only it can suppress the fd marker.
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::TreeWalk);

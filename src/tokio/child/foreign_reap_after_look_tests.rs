@@ -5,12 +5,13 @@
 use crate::child::foreign_reap_after_look_tests::{
     assert_nothing_by_number, assert_reaped_elsewhere, reaped_after_the_look,
 };
+use crate::test_child::Console;
 
 /// A zombie root leading its own group (its fd marker suppressed on macOS): unreaped at the look.
 fn zombie_group_root() -> crate::tokio::Child {
     // The sync command, which the async spawn takes: only it can suppress the fd marker.
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);

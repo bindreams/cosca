@@ -2,7 +2,7 @@
 //! drop and the failed-spawn cleanup act on that answer, not on the root's start token alone.
 
 use crate::signal::RootState;
-use crate::Command;
+use crate::test_child::Console;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
 fn warns_since(mark: usize) -> Vec<String> {
@@ -20,7 +20,10 @@ fn warns_since(mark: usize) -> Vec<String> {
 #[skuld::test]
 fn state_after_own_wait_is_reaped_without_a_warn() {
     crate::log_capture::install();
-    let mut child = Command::new().args(["true"]).spawn().expect("spawn");
+    let mut child = crate::test_child::command(Console::Hidden)
+        .args(["true"])
+        .spawn()
+        .expect("spawn");
     child.wait().expect("wait");
 
     let mark = crate::log_capture::mark();
@@ -47,7 +50,7 @@ mod linux {
 
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::Session);
@@ -289,7 +292,7 @@ mod macos {
     /// A tree-walk child: the walk names no marker holder, so the only sends are the root's own.
     fn walked_blocker() -> (crate::Child, std::io::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::TreeWalk);
@@ -392,7 +395,7 @@ mod macos {
     /// marker like any member but is not pinned by this process.
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
-        let mut cmd = Command::new();
+        let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::Session);

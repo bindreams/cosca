@@ -15,6 +15,8 @@
 //! just the ones in this file.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use crate::test_child::Console;
 use std::time::{Duration, Instant};
 
 use super::{arm, block_until_drained, drain_kqueue, probe, DrainOutcome};
@@ -57,7 +59,7 @@ fn never_allocated_fd() -> BorrowedFd<'static> {
 /// than report `MembersRemain`. A real holder in ANOTHER process is what "the write end is
 /// open" is supposed to mean here.
 fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", script]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
@@ -128,7 +130,7 @@ fn drain_kqueue_reports_spurious_for_an_armed_empty_pipe() {
 fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
     let queued = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::from_file(std::fs::File::from(OwnedFd::from(marker_w))))
@@ -355,7 +357,7 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     // normal state for a non-interactive `-c` script) — without `0<&0`, this exact fd
     // plumbing produces a `cat` that reads immediate EOF and exits, never becoming the
     // long-lived orphan the test needs; WITH it, the orphan survives and holds the marker.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "cat 0<&0 >/dev/null & echo $! >&4"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -409,7 +411,7 @@ fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
     // spawn. The root closes its own fd 3 copy right after backgrounding (`exec 3>&-`) so it is
     // never itself a third holder, then `wait`s for both children instead of exiting — nothing
     // here depends on reparenting, unlike the orphan test above.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args([
         "sh",
         "-c",
@@ -458,7 +460,7 @@ fn small_bytes_from_a_member_are_not_a_drain() {
     // "suppressed" from "delivered but harmless"). The child
     // signals readiness on a SEPARATE report pipe right after writing to fd 3, so the ordering
     // ("the write already happened") is real synchronization, not assumed.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -501,7 +503,7 @@ fn note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp() {
     // program order — nothing is awaited. A real child (not a bare in-process pipe) holds the
     // write end: `arm` itself refuses a write end this process retains, so proving "arm even
     // succeeds here" needs a holder `write_end_check` reports as `Clear`, not `HeldByUs`.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -627,7 +629,7 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     // stay below the NOTE_LOWAT clamp, so this resolves via the real EOF from `drop(stdin)`,
     // not via `drain_kqueue`'s discard branch — the test below this one is what exercises that
     // branch, through a write that forces genuine backpressure.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh")
         .args(["sh", "-c", "echo noise >&3; echo ready >&4; exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -717,7 +719,7 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     let queued_before = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
     // The at-clamp precondition is enforced by the readiness probe below.
 
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     // Moves `marker_w` in: this test's own copy is gone before `arm` runs.
