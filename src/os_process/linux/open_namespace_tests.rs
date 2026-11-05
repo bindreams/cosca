@@ -13,8 +13,7 @@ use rustix::process::Pid;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{
-    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ProcessId, ViewUnreadable,
-    UNREADABLE_STATUS_REASON,
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ViewUnreadable, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
@@ -42,9 +41,10 @@ fn fixture_status_mounted_over() {
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
-    let id = ProcessId::of(child.id())
-        .found()
-        .expect("the live child has an identity");
+    // The `/proc` path, as the rows below: the identity is the `starttime`.
+    let id = crate::identity::ticks_id(child.id());
+    // Read now as well: a read through the view is `Unknown` once a file is mounted below `/proc`.
+    let own_id = crate::identity::ticks_id(std::process::id());
     let scratch = tempfile::tempdir().expect("tempdir");
     let status = scratch.path().join("status");
     std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
@@ -57,7 +57,7 @@ fn fixture_status_mounted_over() {
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
-    let own = super::open_verified_with(&HostKernel, ProcessId::current());
+    let own = super::open_verified_with(&HostKernel, own_id);
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
     match proc_view_with(&HostKernel) {
@@ -107,8 +107,14 @@ fn fixture_pid_ns_inner() {
     let view = proc_view_with(&HostKernel);
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
+    // This process's `Ticks` id, from the `stat` the kernel resolves `self` to for the reader: a
+    // by-pid read cannot make it, since the outer `/proc/1` is another process.
+    let stat = std::fs::read("/proc/self/stat").expect("read own stat");
+    let ticks = crate::identity::stat_parse::parse_starttime_jiffies(&stat).expect("own starttime parses");
+    let own = crate::identity::ProcessId::from_parts_for_test(1, crate::identity::Key::Ticks(ticks));
+
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
-    match super::open_verified_with(&HostKernel, ProcessId::current()) {
+    match super::open_verified_with(&HostKernel, own) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
             assert!(
@@ -177,8 +183,12 @@ impl<'a> PauseKernel<'a> {
 }
 
 impl Kernel for PauseKernel<'_> {
-    fn pidfd_open(&self, target: Pid) -> Result<OwnedFd, Errno> {
-        self.inner.pidfd_open(target)
+    fn pidfd_open(&self, target: Pid, flags: rustix::process::PidfdFlags) -> Result<OwnedFd, Errno> {
+        self.inner.pidfd_open(target, flags)
+    }
+
+    fn pidfs_ino(&self, fd: std::os::fd::BorrowedFd<'_>) -> Result<Option<u64>, Errno> {
+        self.inner.pidfs_ino(fd)
     }
 
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
@@ -238,7 +248,10 @@ fn fixture_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(pid));
-    let result = super::open_verified_with(&PauseKernel::new(&HostKernel, pid, hook), ProcessId::current());
+    let result = super::open_verified_with(
+        &PauseKernel::new(&HostKernel, pid, hook),
+        crate::identity::ticks_id(std::process::id()),
+    );
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -294,7 +307,10 @@ fn fixture_stat_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(pid));
-    let result = super::open_verified_with(&PauseKernel::new(&HostKernel, pid, hook), ProcessId::current());
+    let result = super::open_verified_with(
+        &PauseKernel::new(&HostKernel, pid, hook),
+        crate::identity::ticks_id(std::process::id()),
+    );
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -341,7 +357,7 @@ fn fixture_tmpfs_at_proc() {
         return;
     }
     ns::enter_private_mount_ns();
-    let id = ProcessId::current();
+    let id = crate::identity::ticks_id(std::process::id());
     ns::mount_tmpfs(std::path::Path::new("/proc"));
     let opened = ProcDir::open();
     assert!(

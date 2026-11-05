@@ -6,18 +6,22 @@
 //! A live root must come out of every failing walk unsignalled: [`release`] proves it by its exit
 //! status.
 
+use crate::child::front_cgroup_tests::pidfd_of;
 use crate::error::Error;
-use crate::identity::{unreadable, FakeKernel, HostKernel, Kernel, ProcessId, UNREADABLE_STATUS_REASON};
+use crate::identity::{
+    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, ProcessId, UNREADABLE_STATUS_REASON,
+};
 use crate::test_child::{
     live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
 };
+use crate::test_groups::{pidfd_group_signal, Group};
 use crate::Recursive;
 
 /// An identity for this process's pid that this process no longer holds: its children are the
 /// children of the pid's new owner.
 fn stale_root() -> ProcessId {
     let me = ProcessId::current();
-    ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1))
+    me.with_other_value()
 }
 
 fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
@@ -129,11 +133,12 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 /// has recovered by then, so the error blames access); "the table read's error is dropped".
 #[skuld::test]
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
-    let me = ProcessId::current();
+    // The `/proc` path: only a `starttime` anchor is read through the view.
+    let me = ticks_id(std::process::id());
     let pid = me.pid();
     for (_, query) in queries() {
         for view in VIEWS {
-            let kernel = view.fail(FakeKernel::over(&HostKernel).same_view(), 1);
+            let kernel = view.fail(ticks_host(pid).same_view(), 1);
             let result = query(&me, &kernel);
             assert_unassessable_naming(
                 result,
@@ -205,7 +210,7 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid()), None);
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
     let warned =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
     assert_eq!(warned.len(), 1, "{warned:?}");
@@ -231,18 +236,48 @@ fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
 }
 
 /// A kill re-verifies through the kernel: a pid it cannot read is not signalled and counts as
-/// not attempted; one it shows with another start time is already gone. Mutant:
-/// "`kill_by_identity` re-verifies through `HostKernel`": the member is signalled.
+/// not attempted; one it shows with another start time is already gone. The member's own pidfd
+/// passes the proof's fdinfo check, so the `stat` is what the row is about. Mutants:
+/// "`kill_by_identity` re-verifies through `HostKernel`": the member is signalled; "the re-verify
+/// ignores the start time": `Terminated` for the new owner.
 #[skuld::test]
 fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_process() {
     let (child, id) = live_member();
-    let (unreadable_kernel, _guard) = unreadable(id.pid());
+    // The `/proc` path: a `starttime` id is re-verified by its `stat`.
+    let id = ticks_id(id.pid());
+    let pid = id.pid();
+    let unreadable_kernel = FakeKernel::over(&HostKernel)
+        .live_without_pidfs(pid, pidfd_of(pid))
+        .on_read(&format!("{pid}/stat"), Err(libc::EACCES));
     assert_eq!(
         super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM),
         super::KillOutcome::NotAttempted
     );
-    let new_owner =
-        FakeKernel::over(&HostKernel).on_read(&format!("{}/stat", id.pid()), Ok(&stat_of_a_new_owner(id.pid())));
+    let new_owner = FakeKernel::over(&HostKernel)
+        .live_without_pidfs(pid, pidfd_of(pid))
+        .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
+    assert_eq!(
+        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
+        super::KillOutcome::AlreadyGone
+    );
+    release(child);
+}
+
+/// The same re-verify of a `pidfs` id asks the kernel's pidfd: a pid it cannot open is not
+/// signalled and counts as not attempted; one it opens to another inode is already gone.
+#[skuld::test]
+fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_another_process(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let (child, id) = live_member();
+    let pid = id.pid();
+    let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
+    let refusing = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
+    assert_eq!(
+        super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM),
+        super::KillOutcome::NotAttempted
+    );
+    let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
     assert_eq!(
         super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
         super::KillOutcome::AlreadyGone
@@ -251,17 +286,18 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
 }
 
 /// The root's `stat` is read three times: by the snapshot, by the anchor, and by the kill's
-/// re-verify, which finds another start time. Nothing is signalled. Mutant: "the walk's kill
-/// re-verifies through `HostKernel`".
+/// re-verify, which finds another start time. Nothing is signalled. The root's own pidfd passes the
+/// proof's fdinfo check, so the `stat` is what the row is about. Mutants: "the walk's kill
+/// re-verifies through `HostKernel`"; "the kill ignores a start time that differs".
 #[skuld::test]
 fn every_walk_re_verifies_its_kill_through_its_kernel() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
-        let kernel = FakeKernel::over(&HostKernel).on_read_after(
-            &format!("{}/stat", id.pid()),
-            2,
-            Ok(&stat_of_a_new_owner(id.pid())),
-        );
+        // The `/proc` path, as above.
+        let id = ticks_id(id.pid());
+        let kernel = FakeKernel::over(&HostKernel)
+            .live_without_pidfs(id.pid(), pidfd_of(id.pid()))
+            .on_read_after(&format!("{}/stat", id.pid()), 2, Ok(&stat_of_a_new_owner(id.pid())));
         let result = walk(&kernel, id);
         assert!(result.is_ok(), "{name}: {result:?}");
         release(child);
@@ -318,24 +354,50 @@ fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, sign
 
 /// The descendant's `stat` is read by the snapshot, then by the walk's resolve of it, then by the
 /// kill's re-verify, which the kernel refuses or shows as another start time. Only the root is
-/// signalled. Mutants: "`descendants` resolves through `HostKernel`" (the re-verify becomes the
+/// signalled. Each member's own pidfd passes the proof's fdinfo check, so the `stat` is what the
+/// row is about. Mutants: "`descendants` resolves through `HostKernel`" (the re-verify becomes the
 /// second read, which the row lets through), "the descendant loop's kill re-verifies through
-/// `HostKernel`", each in `hard_kill` and in `terminate`: the descendant is signalled.
+/// `HostKernel`", "the kill ignores a start time that differs", each in `hard_kill` and in
+/// `terminate`: the descendant is signalled.
 #[skuld::test]
 fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
     for ((name, walk), signo) in id_walks().into_iter().zip([libc::SIGKILL, libc::SIGTERM]) {
         for shows_a_new_owner in [false, true] {
             let (child, root, descendant) = live_member_with_descendant();
+            // The `/proc` path: the walk's ids are `starttime` ids.
+            let root = ticks_id(root.pid());
             let new_owner = stat_of_a_new_owner(descendant.pid());
             let answer = if shows_a_new_owner {
                 Ok(new_owner.as_slice())
             } else {
                 Err(libc::EACCES)
             };
-            let kernel = FakeKernel::over(&HostKernel).on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
+            let kernel = FakeKernel::over(&HostKernel)
+                .live_without_pidfs(root.pid(), pidfd_of(root.pid()))
+                .live_without_pidfs(descendant.pid(), pidfd_of(descendant.pid()))
+                .on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
             let result = walk(&kernel, root);
             assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
             release_with_a_signalled_root(name, child, signo);
         }
     }
+}
+
+/// The candidate's own `stat` names its parent, and the walk accepts it only under the parent the
+/// snapshot gave it: a pid that exited and was reused since the snapshot, by a process of another
+/// parent, is dropped. Mutants: "the resolver ignores the parent", "the resolver always drops".
+#[skuld::test]
+fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
+    const PID: u32 = 4242;
+    use crate::identity::Key;
+
+    let stat = crate::identity::stat_parse::stat_fixture("S", 777);
+    let kernel = ticks_host(PID)
+        .same_view()
+        .on_read(&format!("{PID}/stat"), Ok(&stat))
+        .on_read("1/stat", Ok(&crate::identity::stat_parse::stat_fixture("S", 5)));
+    let parent = |pid| ProcessId::from_parts_for_test(pid, Key::for_test(5));
+    // `stat_fixture` shows parent 1.
+    assert!(super::resolve_or_drop(&kernel, PID, parent(99)).is_none());
+    assert!(super::resolve_or_drop(&kernel, PID, parent(1)).is_some());
 }

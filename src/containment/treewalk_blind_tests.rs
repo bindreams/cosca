@@ -136,7 +136,7 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
         ("terminate", |id| super::terminate(&crate::identity::HostKernel, id)),
     ];
     let me = ProcessId::current();
-    let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
+    let stale = me.with_other_value();
     for (name, walk) in walks {
         let (child, _) = live_member();
         let result = walk(stale);

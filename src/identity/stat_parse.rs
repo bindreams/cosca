@@ -45,10 +45,10 @@ pub(crate) fn parse_pgrp(stat: &[u8]) -> Option<u32> {
 /// starttime token must match `start` (reject a reused PID) AND the state must not be zombie
 /// ('Z') or dead ('X'/'x'). An unparseable record is `Unknown` — we read the file, so the
 /// process is there; we just could not read its state. Pure, so it is host-testable.
-pub(super) fn running_from_stat(stat: &[u8], start: super::StartToken) -> super::Liveness {
+pub(super) fn running_from_stat(stat: &[u8], ticks: u64) -> super::Liveness {
     use super::Liveness;
     match parse_starttime_jiffies(stat) {
-        Some(j) if super::StartToken::from_raw(j) == start => {}
+        Some(j) if j == ticks => {}
         Some(_) => return Liveness::Dead, // reused PID
         None => return Liveness::Unknown, // unparseable — not evidence of death
     }

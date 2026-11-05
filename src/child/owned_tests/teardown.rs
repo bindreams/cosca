@@ -15,7 +15,7 @@ use crate::wait::teardown_warn::Due;
 pub(super) const PID: u32 = 4242;
 
 pub(super) fn id() -> ProcessId {
-    ProcessId::from_parts(PID, 1)
+    ProcessId::from_parts_for_test(PID, crate::identity::Key::for_test(1))
 }
 
 /// A fake that states the pid, and nothing else.

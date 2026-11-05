@@ -21,7 +21,7 @@ fn current_opens_and_is_alive() {
 #[skuld::test]
 fn open_of_a_recycled_identity_is_none() {
     let real = ProcessId::current();
-    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
+    let stale = real.with_other_value();
     assert!(Process::open(stale)
         .expect("a stale identity is not an error")
         .is_none());
@@ -54,17 +54,22 @@ fn open_pid_of_a_pid_that_cannot_be_queried_is_unassessable() {
     crate::test_child::release_unsignalled(child);
 }
 
-/// The open that follows the identity read goes through the same kernel: a kernel that finds no
-/// process to open makes a live pid `Ok(None)`. Mutant: "`open_pid_with` opens through `HostKernel`".
+/// The open that follows the identity read goes through the same kernel: a kernel whose pidfd for
+/// the pid has an inode of its own (not the real process's) opens a handle, which the real kernel
+/// would find to be another process. Mutant: "`open_pid_with` opens through `HostKernel`": the
+/// proof fails and the pid is `Ok(None)`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn open_pid_with_opens_through_its_kernel() {
     use crate::identity::{FakeKernel, HostKernel};
 
     let (child, id) = crate::test_child::live_exiting_member();
-    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Err(rustix::io::Errno::SRCH));
-    let opened = Process::open_pid_with(&kernel, id.pid()).expect("a process gone at the open is not an error");
-    assert!(opened.is_none());
+    let (stand_in, _writer) = std::io::pipe().expect("a pipe");
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(id.pid(), Ok(stand_in.into()))
+        .on_pidfs_ino(id.pid(), Ok(Some(77)));
+    let opened = Process::open_pid_with(&kernel, id.pid()).expect("the open is not an error");
+    assert!(opened.is_some(), "the kernel's pidfd is the process");
     crate::test_child::release_unsignalled(child);
 }
 
