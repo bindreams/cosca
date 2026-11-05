@@ -132,3 +132,7 @@ impl ProcessId {
 #[cfg(test)]
 #[path = "tree_tests.rs"]
 mod tree_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tree_pidfs_tests.rs"]
+mod tree_pidfs_tests;

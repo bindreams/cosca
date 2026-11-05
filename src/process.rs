@@ -64,13 +64,21 @@ impl Process {
         match ProcessId::of_with(kernel, pid) {
             (Resolved::Found(id), _) => Process::open_with(kernel, id),
             (Resolved::Gone, _) => Ok(None),
-            (Resolved::Unknown, cause) => Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause)),
+            (Resolved::Unknown, cause) => {
+                // A pidfd call that failed is the open's own failure: a refusal is `Unsupported`
+                // naming the open, as for `open`.
+                #[cfg(target_os = "linux")]
+                if let Some(errno) = cause.errno() {
+                    return Err(crate::os_process::linux::open::open_error(errno));
+                }
+                Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause))
+            }
         }
     }
 
     /// An open handle on this process itself. Errors as for [`open`](Self::open).
     pub fn current() -> Result<Process, Error> {
-        Process::open(ProcessId::current()).map(|p| p.expect("the current process is not gone from itself"))
+        Process::open(ProcessId::try_current()?).map(|p| p.expect("the current process is not gone from itself"))
     }
 
     /// The stable identity (`(pid, start_token)`).

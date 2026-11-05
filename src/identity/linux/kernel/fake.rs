@@ -28,10 +28,13 @@ pub(crate) struct FakeKernel<'a> {
     /// A pid, the flags the row answers (`None`: any), and the answer.
     pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
     /// A pid, the path whose earlier read the row waits for (`None`: no wait), and the answer.
-    pidfs_inos: Vec<(Pid, Option<String>, Result<Option<u64>, Errno>)>,
+    pidfs_inos: Vec<PidfsRow>,
     /// The descriptors this kernel has handed out, so that `pidfs_ino` can tell whose they are.
     opened: Mutex<Vec<Opened>>,
 }
+
+/// A `pidfs_ino` row: the pid, the path whose earlier read it waits for, and the answer.
+type PidfsRow = (Pid, Option<String>, Result<Option<u64>, Errno>);
 
 /// A pidfd this kernel opened: its number, the pid, and how many times each path had been read then.
 struct Opened {
@@ -172,6 +175,14 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn on_pidfs_ino_after_read(mut self, pid: u32, path: &str, answer: Result<Option<u64>, Errno>) -> Self {
         self.pidfs_inos.push((Self::target(pid), Some(path.to_owned()), answer));
         self
+    }
+
+    /// Live `pid` on a host before Linux 6.9: its pidfd opens (as a stand-in descriptor) and has no
+    /// inode of its own, so the process is told by its `/proc` `starttime`. Rows of its own that
+    /// follow replace these.
+    pub(crate) fn live_without_pidfs(self, pid: u32) -> Self {
+        let stand_in = OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null opens"));
+        self.on_pidfd_open(pid, Ok(stand_in)).on_pidfs_ino(pid, Ok(None))
     }
 
     fn target(pid: u32) -> Pid {

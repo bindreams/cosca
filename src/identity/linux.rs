@@ -12,10 +12,6 @@ pub(crate) mod proc_view;
 pub(crate) mod prove;
 
 #[cfg(test)]
-#[path = "linux/fault.rs"]
-pub(crate) mod fault;
-
-#[cfg(test)]
 #[path = "linux/bracket_tests.rs"]
 mod bracket_tests;
 
@@ -176,23 +172,81 @@ impl Key {
     }
 }
 
-/// The identity of `pid`, and the unusable `/proc` view behind an `Unknown`, when that is why.
-pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCause) {
-    let (stat, view) = read_stat_explained(kernel, pid);
-    (ticks_from(pid, stat).map(Key::Ticks), UnknownCause::of_view(view))
+/// What a pidfd opened for a pid says about which kind of [`Key`] it has.
+enum Look {
+    /// The process's pidfd has this inode on pidfs.
+    Pidfs(u64),
+    /// This host's pidfds have no inode of their own (before Linux 6.9): `/proc` says.
+    Ticks,
+    /// No process holds the pid.
+    Gone,
+    /// The open or the inode read failed in a way that says nothing about the pid.
+    Unknown(UnknownCause),
 }
 
-/// [`of`], and a `stat` record that is that process's own.
-pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
-    let (stat, view) = read_stat_explained(kernel, pid);
-    let bytes = match &stat {
-        Resolved::Found(bytes) => bytes.clone(),
-        _ => Vec::new(),
+/// Opens `pid` and asks its pidfd which kind of key the process has.
+///
+/// A pid that neither open takes with `EINVAL` is a reaped group leader whose number lives on as a
+/// process-group id (6.12), or a kernel with no `PIDFD_THREAD` (before 6.9). Which one is a fact
+/// about the host, so the host's own pidfd is asked: on pidfs the pid is no task (`Gone`, and
+/// `/proc` is not read, so a process that takes the number meanwhile is not misread as ticks), and
+/// elsewhere `/proc` says.
+fn look(kernel: &dyn Kernel, pid: RawPid) -> Look {
+    let Some(target) = prove::target(pid) else {
+        return Look::Gone;
     };
-    (
-        ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)),
-        UnknownCause::of_view(view),
-    )
+    match prove::open(kernel, target) {
+        Ok(opened) => match kernel.pidfs_ino(opened.fd.as_fd()) {
+            Ok(Some(ino)) => Look::Pidfs(ino),
+            Ok(None) => Look::Ticks,
+            Err(e) => Look::Unknown(prove::cause(e)),
+        },
+        Err(Errno::SRCH) => Look::Gone,
+        Err(Errno::INVAL) => match own_pidfs_ino(kernel) {
+            Ok(Some(_)) => Look::Gone,
+            Ok(None) => Look::Ticks,
+            Err(e) => Look::Unknown(prove::cause(e)),
+        },
+        Err(e) => Look::Unknown(prove::cause(e)),
+    }
+}
+
+/// The identity of `pid`: its pidfd's inode on pidfs, else its `starttime` ticks; and what made it
+/// `Unknown`, when the read knows.
+pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCause) {
+    match look(kernel, pid) {
+        Look::Pidfs(ino) => (Resolved::Found(Key::Pidfs(ino)), UnknownCause::default()),
+        Look::Gone => (Resolved::Gone, UnknownCause::default()),
+        Look::Unknown(cause) => (Resolved::Unknown, cause),
+        Look::Ticks => {
+            let (stat, view) = read_stat_explained(kernel, pid);
+            (ticks_from(pid, stat).map(Key::Ticks), UnknownCause::of_view(view))
+        }
+    }
+}
+
+/// [`of`], and a `stat` record that is that process's own: for a `Pidfs` key the bracketed one, and
+/// for ticks the very record the ticks were read from.
+pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
+    match look(kernel, pid) {
+        Look::Pidfs(ino) => {
+            let (stat, cause) = bracketed_stat(kernel, pid, ino);
+            (stat.map(|stat| (Key::Pidfs(ino), stat)), cause)
+        }
+        Look::Gone => (Resolved::Gone, UnknownCause::default()),
+        Look::Unknown(cause) => (Resolved::Unknown, cause),
+        Look::Ticks => {
+            let (stat, view) = read_stat_explained(kernel, pid);
+            let bytes = match &stat {
+                Resolved::Found(bytes) => bytes.clone(),
+                _ => Vec::new(),
+            };
+            (
+                ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)),
+                UnknownCause::of_view(view),
+            )
+        }
+    }
 }
 
 /// Whether the process `key` names still holds `pid`.
@@ -232,10 +286,6 @@ fn existence_of_ticks(read: Resolved<u64>, ticks: u64) -> Existence {
 
 /// `pid`'s `starttime` ticks from `stat`: RAW jiffies, NOT converted to wall-clock.
 fn ticks_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<u64> {
-    #[cfg(test)]
-    if let Some(aliased) = fault::on_read(pid, matches!(stat, Resolved::Found(_))) {
-        return Resolved::Found(aliased.raw());
-    }
     match stat {
         Resolved::Found(stat) => match parse_starttime_jiffies(&stat) {
             Some(j) => Resolved::Found(j),
@@ -325,21 +375,31 @@ fn liveness_of(stat: Resolved<Vec<u8>>, ticks: u64) -> Liveness {
 
 /// Our own key.
 ///
-/// `ProcessId` is the pair `(std::process::id(), key)`. Under an outer namespace's `/proc`
-/// (`unshare --pid --fork` without `--mount-proc`: `getpid()` is 1, `/proc/1` is another
-/// process) `/proc/<getpid()>` names someone else, but the kernel resolves `self` for the reader.
-/// A plain read, so it needs neither `openat2` nor a `/proc` view; the by-pid re-reads
-/// (`exists()`/`is_alive()`) then answer `Unknown`, never `Gone`/`Dead` for the running caller.
+/// `ProcessId` is the pair `(std::process::id(), key)`. On pidfs it is the inode of the process's
+/// own pidfd, which names the process whatever `/proc` the caller sees. Where pidfds have none, it
+/// is read from `/proc/self/stat`: under an outer namespace's `/proc` (`unshare --pid --fork`
+/// without `--mount-proc`: `getpid()` is 1, `/proc/1` is another process) `/proc/<getpid()>` names
+/// someone else, but the kernel resolves `self` for the reader. A plain read, so it needs neither
+/// `openat2` nor a `/proc` view; the by-pid re-reads (`exists()`/`is_alive()`) then answer
+/// `Unknown`, never `Gone`/`Dead` for the running caller.
 ///
-/// `hidepid` never hides a task from itself, so a failure here is not a foreign-pid outcome: it
-/// is logged at `error`, and [`ProcessId::current`](super::ProcessId::current) panics on it.
-pub(super) fn current_key(_kernel: &dyn Kernel) -> Resolved<Key> {
-    match std::fs::read("/proc/self/stat") {
-        Ok(stat) => ticks_from(std::process::id(), Resolved::Found(stat)).map(Key::Ticks),
-        Err(e) => {
-            log::error!("own start token unreadable: /proc/self/stat: {e}");
-            Resolved::Unknown
+/// `hidepid` never hides a task from itself, so a failure here is not a foreign-pid outcome:
+/// [`ProcessId::current`](super::ProcessId::current) panics on it. That includes a kernel or filter
+/// that refuses `pidfd_open` to the process itself, which is the error [`Process::open`] gives (an
+/// `Unsupported` for a refusal).
+pub(super) fn current_key(kernel: &dyn Kernel) -> Result<Key, Error> {
+    match own_pidfs_ino(kernel) {
+        Ok(Some(ino)) => Ok(Key::Pidfs(ino)),
+        Ok(None) => {
+            let stat = std::fs::read("/proc/self/stat").map_err(Error::Io)?;
+            match ticks_from(std::process::id(), Resolved::Found(stat)) {
+                Resolved::Found(ticks) => Ok(Key::Ticks(ticks)),
+                _ => Err(Error::Io(std::io::Error::other(
+                    "/proc/self/stat has no parseable starttime",
+                ))),
+            }
         }
+        Err(e) => Err(crate::os_process::linux::open::open_error(e)),
     }
 }
 

@@ -469,15 +469,14 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 /// **How `open_verified_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
-/// - `Error::Unsupported` (`pidfd_open` refused) and `Error::Io` (a transient `pidfd_open`
-///   failure, or a `poll` failure) fall back to `check_or_signal`'s plain `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
-///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
-/// - `Error::Unassessable` (identity denied by `id.exists()` or `id.is_alive()`, or the pid
-///   overflows the pidfd interface) is `Reached::Unknown`: a statement about the pid's identity,
-///   not about whether the kernel can open a pidfd, which no fallback resolves.
+/// - `Error::Unsupported` (`pidfd_open` refused), `Error::Io` (a transient `pidfd_open` failure,
+///   or a `poll` failure) and `Error::Unassessable` (identity denied, or the pid overflows the
+///   pidfd interface) are `Reached::Unknown`, with no fallback to `kill(2)`: the member's identity
+///   is told through a pidfd on every kernel, so without one nothing proves that its pid still
+///   names the listed member, and a bare pid is never signalled on a guess.
 ///
 /// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
 /// inside `open_verified_with`.** This looks tempting — `pidfd_open` already succeeded, so
@@ -503,7 +502,6 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(
     kernel: &dyn crate::identity::Kernel,
-    pid: RawPid,
     id: crate::identity::ProcessId,
     root: &GroupRoot<'_>,
 ) -> Reached {
@@ -530,14 +528,6 @@ fn check_or_signal_linux_sigkill(
                 }
             },
         },
-        Err(e @ (crate::error::Error::Unsupported { .. } | crate::error::Error::Io(_))) => {
-            log::debug!(
-                "containment::unix::group: pidfd unavailable ({e}) for pid {}; falling back to \
-                 kill(2) — same residual race macOS already accepts",
-                id.pid()
-            );
-            check_or_signal(kernel, pid, id, Some(Signal::SIGKILL), root)
-        }
         Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
                 "containment::unix::group: pid {} is a live thread, not a thread-group leader, so it \
@@ -674,7 +664,7 @@ pub(crate) fn converge(
                 // documented on it.
                 #[cfg(target_os = "linux")]
                 {
-                    check_or_signal_linux_sigkill(kernel, id.pid(), id, root)
+                    check_or_signal_linux_sigkill(kernel, id, root)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {

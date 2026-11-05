@@ -148,15 +148,17 @@ fn a_held_process_needs_no_second_pidfd_open() {
 }
 
 /// The root-only grace wait of a graceful shutdown looks through the handle the child holds: with
-/// `pidfd_open` refused from before the `SIGTERM`, it still sees the exit and surfaces no watch
-/// error. The child is contained without a cgroup, so only its root is watched. The control socket
-/// is released only afterwards, so a shutdown that sent no `SIGTERM` ends in the escalation's
-/// `SIGKILL`, not in the assertion's `SIGTERM`.
+/// `pidfd_open` refused from before the `SIGTERM`, it still sees the exit. The child is contained
+/// without a cgroup, so only its root is watched. The group's sweep after it lists the group, which
+/// needs a pidfd for each member's identity, and says so: `Unassessable` naming the refusal. The
+/// control socket is released only afterwards, so a shutdown that sent no `SIGTERM` ends in the
+/// escalation's `SIGKILL`, not in the assertion's `SIGTERM`.
 ///
-/// Mutant: the grace wait re-opens the child by its identity.
+/// Mutant: the grace wait re-opens the child by its identity (the error then comes from the wait).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
+fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
+    use std::error::Error as _;
     use std::os::unix::process::ExitStatusExt;
 
     for (code, name) in REFUSALS {
@@ -166,7 +168,7 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
             "{name}: the fixture must watch the root only, got {:?}",
             child.containment()
         );
-        let status = std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
@@ -176,7 +178,17 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
                 .expect("the filtered thread")
         });
         drop(control);
-        let status = status.unwrap_or_else(|e| panic!("{name}: the grace wait needs no pidfd_open: {e}"));
+        match result {
+            Err(e @ Error::Unassessable { .. }) => {
+                let cause = e.source().map(ToString::to_string).unwrap_or_default();
+                assert!(
+                    cause.contains(&format!("pidfd_open answered {name}")),
+                    "{name}: the group sweep names the refusal: {e:?}"
+                );
+            }
+            other => panic!("{name}: expected the group sweep to be Unassessable, got {other:?}"),
+        }
+        let status = child.wait().expect("reap the root");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
 }
@@ -215,7 +227,20 @@ fn assert_async_act_refused<T: std::fmt::Debug + Send>(
     contain: bool,
     act: impl FnOnce(&tokio::runtime::Runtime, &mut cosca::tokio::Child) -> Result<T, Error> + Send,
 ) -> std::process::ExitStatus {
-    let (result, status) = std::thread::scope(|scope| {
+    let (result, status) = async_act_under_refusal(code, contain, act);
+    assert_refused(result, "process open", name);
+    status
+}
+
+/// [`assert_async_act_refused`] without the assertion: the result of `act` and the child's status.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+fn async_act_under_refusal<T: std::fmt::Debug + Send>(
+    code: i32,
+    contain: bool,
+    act: impl FnOnce(&tokio::runtime::Runtime, &mut cosca::tokio::Child) -> Result<T, Error> + Send,
+) -> (Result<T, Error>, std::process::ExitStatus) {
+    std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -233,9 +258,7 @@ fn assert_async_act_refused<T: std::fmt::Debug + Send>(
             })
             .join()
             .expect("the filtered thread")
-    });
-    assert_refused(result, "process open", name);
-    status
+    })
 }
 
 /// The async `Child::terminate` signals by the child's identity, so a refused `pidfd_open` fails it
@@ -276,19 +299,19 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_before_the_escalation_
     }
 }
 
-/// The root-only grace wait of an async `graceful_shutdown_tree` opens the child by its identity,
-/// so a refused `pidfd_open` fails the watch: the shutdown still ends the child and reaps it, then
-/// surfaces `Unsupported` naming `process open`. The async `graceful_shutdown` and `terminate` open
-/// by identity too and fail before any wait (the two rows above), so only the tree form reaches the
-/// grace wait with `pidfd_open` refused.
+/// The async `graceful_shutdown_tree` of a child contained as a process group ends the child, then
+/// cannot list the group, because a member's identity is made by opening its pidfd: with
+/// `pidfd_open` refused it surfaces `Unassessable` naming the refusal, never "no member left".
 ///
-/// Mutant: the grace wait's open maps its error to "gone" (`Ok(true)`).
+/// Mutant: the sweep treats a group it could not list as empty (`Ok`).
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 #[skuld::test]
-fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_grace_wait_naming_process_open() {
+fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_naming_the_refusal() {
+    use std::error::Error as _;
+
     for (code, name) in REFUSALS {
-        assert_async_act_refused(code, name, true, |runtime, child| {
+        let (result, _status) = async_act_under_refusal(code, true, |runtime, child| {
             assert!(
                 !child.containment().can_observe_drain(),
                 "{name}: the fixture must watch the root only, got {:?}",
@@ -296,6 +319,16 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_grace_wait_namin
             );
             runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
         });
+        match result {
+            Err(e @ Error::Unassessable { .. }) => {
+                let cause = e.source().map(ToString::to_string).unwrap_or_default();
+                assert!(
+                    cause.contains(&format!("pidfd_open answered {name}")),
+                    "{name}: the refusal is the cause: {e:?}"
+                );
+            }
+            other => panic!("{name}: expected Unassessable, got {other:?}"),
+        }
     }
 }
 

@@ -4,7 +4,7 @@
 
 use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, reuser_id, sigusr1_and_wait};
 use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAPED_ELSEWHERE};
-use crate::test_groups::namespaces;
+use crate::test_groups::{namespaces, pidfd_group_signal};
 use crate::Command;
 
 fn spawn_blocker() -> (crate::Child, std::io::PipeWriter) {
@@ -58,8 +58,9 @@ in_fresh_pid_ns!(
 /// A child reaped behind its back, and its pid reused by a stranger, after the spawn verified the
 /// child's identity and before it attached the containment. The attach takes the verified identity
 /// and reads nothing by pid, so the tree-walk root is the child itself and `kill_tree` reaches no
-/// one: the stranger's start token is its own (aliased to differ from the child's, as a reuse in a
-/// later clock tick has it, since the tick it really started in may match).
+/// one: the stranger's pidfd has an inode of its own, so a read of the root by pid finds another
+/// identity. Runs where that is true: Linux 6.9+ (the `pidfd_group_signal` group), in the fresh pid
+/// namespace the macro makes.
 ///
 /// Mutant: the attach re-reads the root by pid.
 fn treewalk_root_is_the_verified_identity_body() {
@@ -67,8 +68,6 @@ fn treewalk_root_is_the_verified_identity_body() {
     use std::rc::Rc;
 
     use crate::child::spawn::fault;
-    use crate::identity::fault::alias_token;
-    use crate::identity::{ProcessId, Resolved};
 
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -77,20 +76,12 @@ fn treewalk_root_is_the_verified_identity_body() {
     cmd.contain_with(crate::ContainMode::TreeWalk);
 
     let stranger = Rc::new(RefCell::new(None));
-    let alias: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeAttach, {
-        let (stranger, alias) = (Rc::clone(&stranger), Rc::clone(&alias));
+        let stranger = Rc::clone(&stranger);
         move || {
             let pid = fault::spawn_pid();
-            let Resolved::Found(id) = ProcessId::of(pid) else {
-                panic!("the child must be readable before it is reaped")
-            };
             drop(writer);
-            let reuser = reap_behind_and_reuse(pid);
-            // A reuse in a later clock tick, whichever tick the reuser really started in.
-            let token = id.with_other_value().key();
-            *alias.borrow_mut() = Some(Box::new(alias_token(reuser.id(), token)));
-            *stranger.borrow_mut() = Some(reuser);
+            *stranger.borrow_mut() = Some(reap_behind_and_reuse(pid));
         }
     });
     let child = match cmd.spawn() {
@@ -119,7 +110,8 @@ in_fresh_pid_ns!(
     namespaces_sync_treewalk_root_is_the_verified_identity,
     fixture_sync_treewalk_root_driver,
     fixture_sync_treewalk_root_init,
-    treewalk_root_is_the_verified_identity_body
+    treewalk_root_is_the_verified_identity_body,
+    pidfs
 );
 
 // Tree signals after a reap and a reuse =====

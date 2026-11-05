@@ -78,7 +78,7 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
 
 /// The error for a `pidfd_open` that failed with `errno` for a reason that says nothing about the
 /// target: a refusal is [`Error::Unsupported`], anything else [`Error::Io`].
-fn open_error(errno: rustix::io::Errno) -> Error {
+pub(crate) fn open_error(errno: rustix::io::Errno) -> Error {
     match refusal_name(errno) {
         Some(name) => pidfd_open_unsupported(OP_NAME, name),
         None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),

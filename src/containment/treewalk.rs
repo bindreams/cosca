@@ -610,6 +610,10 @@ mod treewalk_tests;
 #[path = "treewalk_view_tests.rs"]
 mod treewalk_view_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "treewalk_pidfs_tests.rs"]
+mod treewalk_pidfs_tests;
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "treewalk_blind_tests.rs"]
 mod treewalk_blind_tests;

@@ -29,6 +29,14 @@ macro_rules! in_fresh_pid_ns {
             #[fixture(cgroup)] _cgroup: &crate::test_groups::Group
         ]);
     };
+    // For a body that needs pidfs (a reused pid has an identity of its own): the entry test holds the
+    // `pidfd_group_signal` group too, whose precondition is that kernel.
+    ($test:ident, $driver:ident, $init:ident, $body:path, pidfs) => {
+        $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [
+            #[fixture(namespaces)] _group: &crate::test_groups::Group,
+            #[fixture(pidfd_group_signal)] _pidfs: &crate::test_groups::Group
+        ]);
+    };
     // For a body that also attaches a foreign tracer: the entry test holds the `tracer_group` too.
     ($test:ident, $driver:ident, $init:ident, $body:path, tracer) => {
         $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [

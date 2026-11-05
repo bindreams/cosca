@@ -5,7 +5,7 @@ use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
 use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 use crate::test_child::namespaces as ns;
 use crate::test_child::{fixture_path, member_command};
-use crate::test_groups::{namespaces, Group};
+use crate::test_groups::{namespaces, pidfd_group_signal, Group};
 
 #[skuld::test]
 fn a_live_process_has_a_state_under_the_ordinary_view() {
@@ -215,6 +215,52 @@ fn a_thread_group_whose_leader_exited_has_no_state() {
     assert_eq!(proc_state(&HostKernel, handle_of(pid, &pidfd)), None);
 
     // Ends the group: the thread reads EOF and exits the process.
+    drop(child.stdin.take());
+    child.wait().expect("reap the fixture");
+}
+
+/// The same group, asked of its identity: `/proc` shows the leader `Z`, but the process has not
+/// exited, and its pidfd, which is what a `pidfs` id is proved and polled by, says so. The fixture
+/// announces only once `/proc` shows the leader `Z` (the real condition, so the assertion cannot
+/// pass for want of waiting).
+///
+/// Mutant: `is_alive` reads the state letter from `/proc` (`Dead`, #905).
+#[skuld::test]
+fn a_thread_group_whose_leader_exited_is_alive_to_its_pidfs_identity(
+    #[fixture(pidfd_group_signal)] _group: &crate::test_groups::Group,
+) {
+    use std::io::BufRead;
+
+    use crate::identity::{Existence, Liveness, ProcessId, Resolved};
+
+    let mut cmd = crate::test_child::fixture_command(fixture_path!(fixture_leader_exits));
+    cmd.stdin(std::process::Stdio::piped());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the fixture");
+    let pid = child.id();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("piped stderr"));
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        let read = stderr.read_line(&mut line).expect("read the fixture");
+        seen.push_str(&line);
+        assert_ne!(read, 0, "the fixture ended before its leader exited: {seen}");
+        if line.trim() == LEADER_EXITED {
+            break;
+        }
+    }
+
+    assert_eq!(
+        read_proc_state(&HostKernel, pid).ok(),
+        Some('Z'),
+        "control: /proc shows the leader's state"
+    );
+    let Resolved::Found(id) = ProcessId::of(pid) else {
+        panic!("a live group has an identity")
+    };
+    assert!(id.pidfs_ino().is_some(), "a pidfs host makes pidfs ids");
+    assert_eq!(id.exists(), Existence::Present);
+    assert_eq!(id.is_alive(), Liveness::Alive);
+
     drop(child.stdin.take());
     child.wait().expect("reap the fixture");
 }

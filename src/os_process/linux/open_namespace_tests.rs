@@ -13,8 +13,7 @@ use rustix::process::Pid;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{
-    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ProcessId, ViewUnreadable,
-    UNREADABLE_STATUS_REASON,
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ViewUnreadable, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
@@ -42,9 +41,8 @@ fn fixture_status_mounted_over() {
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
-    let id = ProcessId::of(child.id())
-        .found()
-        .expect("the live child has an identity");
+    // The `/proc` path, as the rows below: the identity is the `starttime`.
+    let id = crate::identity::ticks_id(child.id());
     let scratch = tempfile::tempdir().expect("tempdir");
     let status = scratch.path().join("status");
     std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
@@ -57,7 +55,7 @@ fn fixture_status_mounted_over() {
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
-    let own = super::open_verified_with(&HostKernel, ProcessId::current());
+    let own = super::open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id()));
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
     match proc_view_with(&HostKernel) {
@@ -108,7 +106,7 @@ fn fixture_pid_ns_inner() {
     assert!(matches!(view, ProcView::Diverged), "got {view:?}");
 
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
-    match super::open_verified_with(&HostKernel, ProcessId::current()) {
+    match super::open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id())) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
             assert!(
@@ -242,7 +240,10 @@ fn fixture_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(pid));
-    let result = super::open_verified_with(&PauseKernel::new(&HostKernel, pid, hook), ProcessId::current());
+    let result = super::open_verified_with(
+        &PauseKernel::new(&HostKernel, pid, hook),
+        crate::identity::ticks_id(std::process::id()),
+    );
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -298,7 +299,10 @@ fn fixture_stat_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(pid));
-    let result = super::open_verified_with(&PauseKernel::new(&HostKernel, pid, hook), ProcessId::current());
+    let result = super::open_verified_with(
+        &PauseKernel::new(&HostKernel, pid, hook),
+        crate::identity::ticks_id(std::process::id()),
+    );
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -345,7 +349,7 @@ fn fixture_tmpfs_at_proc() {
         return;
     }
     ns::enter_private_mount_ns();
-    let id = ProcessId::current();
+    let id = crate::identity::ticks_id(std::process::id());
     ns::mount_tmpfs(std::path::Path::new("/proc"));
     let opened = ProcDir::open();
     assert!(

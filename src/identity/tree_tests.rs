@@ -86,6 +86,9 @@ fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
 #[skuld::test]
 fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let (child, id) = live_member();
+    // The `/proc` path: the anchor's `starttime` is its identity, so a refused `stat` is a refused
+    // identity. (A pidfs anchor's identity needs no `/proc`; see `tree_pidfs_tests`.)
+    let id = crate::identity::ticks_id(id.pid());
     let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
     for result in [

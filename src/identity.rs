@@ -256,16 +256,38 @@ impl ProcessId {
     /// `Process::current()`, relies on it.
     pub fn current() -> ProcessId {
         #[cfg(target_os = "linux")]
-        let read = backend::current_key(&HostKernel);
+        {
+            Self::try_current().expect(
+                "a process must be able to read its own identity (Linux: pidfd_open of itself, and \
+                 /proc/self/stat below 6.9, must work)",
+            )
+        }
         #[cfg(not(target_os = "linux"))]
-        let read = backend::current_token();
-        let key = read.found().expect(
-            "a process must be able to read its own identity (Linux: pidfd_open of itself, and /proc/self/stat \
-             below 6.9, must work)",
-        );
-        ProcessId {
-            pid: std::process::id(),
-            key,
+        {
+            let key = backend::current_token()
+                .found()
+                .expect("a process must be able to read its own identity");
+            ProcessId {
+                pid: std::process::id(),
+                key,
+            }
+        }
+    }
+
+    /// [`current`](Self::current), with the error it would panic on. On Linux that is a
+    /// `pidfd_open` of the process itself that fails, as an open of it would: `Unsupported` when
+    /// refused. Elsewhere nothing fails.
+    pub(crate) fn try_current() -> Result<ProcessId, crate::error::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            backend::current_key(&HostKernel).map(|key| ProcessId {
+                pid: std::process::id(),
+                key,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self::current())
         }
     }
 
@@ -466,9 +488,6 @@ fn start_token_explained(pid: RawPid) -> (Resolved<Key>, UnknownCause) {
     (backend::start_token(pid), UnknownCause::default())
 }
 
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::fault;
-
 /// macOS test seams.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) mod seams {
@@ -544,10 +563,25 @@ pub(crate) use backend::kinfo;
 /// arm.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
-    (
-        FakeKernel::over(&HostKernel).on_read(&format!("{pid}/stat"), Err(libc::EACCES)),
-        (),
-    )
+    (ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES)), ())
+}
+
+/// A kernel over the host's that states a host before Linux 6.9 for live `pid` (see
+/// [`FakeKernel::live_without_pidfs`]): for a row about the `/proc` path of a read, whatever
+/// kernel runs the suite.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn ticks_host(pid: RawPid) -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel).live_without_pidfs(pid)
+}
+
+/// The identity of live `pid` on a host before Linux 6.9: its `starttime`. A forged `Ticks` id
+/// would not be the process's own, so this reads it.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
+    ProcessId::of_with(&ticks_host(pid), pid)
+        .0
+        .found()
+        .expect("a live pid has a starttime")
 }
 
 /// [`unreadable`] on macOS. The guard is what makes the reads refuse: `Kernel` has no macOS
