@@ -215,6 +215,7 @@ pub(crate) fn spawn_raw(
     };
     let raw_handle = proc.as_raw_handle();
     let (resolved, cause, _) = resolve_identity(
+        &crate::identity::HostKernel,
         pid,
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
     );
