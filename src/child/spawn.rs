@@ -232,9 +232,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     fault::record_teardown_reap(pid, status);
                 }
                 let (note, mut torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
-                report
-                    .left
-                    .extend(torn.take_warn(crate::containment::dispatch::TeardownCaller::FinishElevated.label()));
+                report.fold_clause(&mut torn);
                 (note, torn)
             }
             Err(e) => {
@@ -245,9 +243,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 let mut looked = child
                     .proc
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
-                report
-                    .left
-                    .extend(looked.take_warn(crate::containment::dispatch::TeardownCaller::FinishElevated.label()));
+                report.fold_clause(&mut looked);
                 (root_after_a_refused_kill(note, &looked), looked)
             }
         }
@@ -282,7 +278,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     }
     let warned = report.emit(&[]);
     let root_note = if hands_back {
-        format!("{root_note}; it is handed back to the caller")
+        format!("{root_note}{}", Disposition::HandBack.suffix(true))
     } else {
         root_note
     };
@@ -333,15 +329,19 @@ fn root_after_a_delivered_kill(
 }
 
 /// What [`finish_elevated`] says of a root whose kill was refused, which `refusal` states, once the
-/// one look at it found what `looked` says. A root found collected says what happened, as the
-/// delivered-kill note does ("had already exited, and was reaped"); another answer is worded as
-/// [`Settlement::wording`] words it, after the refusal; a root still running is the refusal alone.
-/// The note says where the root goes: the clause does not.
+/// one look at it found what `looked` says. A root the look collected is said as the look showed
+/// it ("it has exited, and was reaped": nothing shows it exited before the refused kill), with an
+/// unreadable exit record appended; another answer is worded as [`Settlement::wording`] words it,
+/// after the refusal; a root still running is the refusal alone. The note says where the root goes:
+/// the clause does not.
 #[cfg(unix)]
 fn root_after_a_refused_kill(refusal: String, looked: &TeardownOutcome) -> String {
     match &looked.look {
-        Some(LookOutcome::Ended(settlement)) if settlement.status().is_some() => {
-            format!("{refusal}: it had already exited, and was reaped")
+        Some(LookOutcome::Ended(settlement)) if matches!(settlement.fate(None), ChildFate::Reaped) => {
+            let unreadable = settlement
+                .unreadable_record()
+                .map_or(String::new(), |why| format!("; {why}"));
+            format!("{refusal}: it has exited, and was reaped{unreadable}")
         }
         Some(LookOutcome::Ended(settlement)) => settlement.wording(&refusal, None, None).1,
         _ => refusal,

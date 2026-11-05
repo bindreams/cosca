@@ -268,7 +268,10 @@ fn the_diagnosis_leads_the_one_warn_of_the_teardown() {
 
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{front:?}: {warns:?}");
-        assert!(warns[0].starts_with("diagnosis 7c2e; "), "{front:?}: {warns:?}");
+        assert!(
+            warns[0].starts_with("teardown after a failed spawn: diagnosis 7c2e; "),
+            "{front:?}: {warns:?}"
+        );
         handed_back.wait();
     }
 }
@@ -407,7 +410,10 @@ fn a_front_with_no_pid_is_named_as_such() {
     assert!(error.contains("the spawned child is what sudo left"), "{error}");
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].starts_with("the elevation front (pid unknown)"), "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed spawn: the elevation front (pid unknown)"),
+        "{warns:?}"
+    );
     drop(stdin);
     drop(owned);
     crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");

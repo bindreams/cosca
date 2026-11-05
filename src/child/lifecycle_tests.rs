@@ -391,6 +391,7 @@ mod settlement {
     use std::process::ExitStatus;
 
     use crate::child::lifecycle::Settlement;
+    use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
     use crate::child::owned::teardown::{Disposition, TeardownOutcome};
     use crate::child::owned::ChildWaitOutcome;
     use crate::child::spawn::FrontFate;
@@ -403,12 +404,6 @@ mod settlement {
     /// goes itself.
     const EVERY: [Option<Disposition>; 3] = [None, Some(Disposition::Leave), Some(Disposition::HandBack)];
     const RUNNING: &str = "the caller's running clause";
-    const HANDED_BACK: &str = "; handed back to the caller in the error";
-    /// Where a child goes that a caller leaves; Windows has no zombies to leave unreaped.
-    #[cfg(unix)]
-    const LEFT: &str = "; left unreaped";
-    #[cfg(windows)]
-    const LEFT: &str = "; not waited on";
 
     fn id() -> ProcessId {
         ProcessId::from_parts_for_test(PID, crate::identity::Key::for_test(1))
@@ -564,29 +559,6 @@ mod settlement {
                 "{disposition:?}"
             );
         }
-    }
-
-    /// Unix: a child a caller leaves after a failed wait is said to be left unreaped, which it is: a
-    /// zombie once it exits.
-    ///
-    /// Mutant: the wording is the Windows one, or says nothing of where the child goes.
-    #[cfg(unix)]
-    #[skuld::test]
-    fn a_failed_wait_of_a_child_left_says_left_unreaped_on_unix() {
-        let (_, said) = Settlement::new(failed(), true).wording("S", None, Some(Disposition::Leave));
-        assert_eq!(said, "S: the wait failed: cosca-wait-e5a1; left unreaped");
-    }
-
-    /// Windows: there are no zombies, so a child a caller leaves after a failed wait is said to be not
-    /// waited on, and never to be left unreaped.
-    ///
-    /// Mutant: the wording is the Unix one.
-    #[cfg(windows)]
-    #[skuld::test]
-    fn a_failed_wait_of_a_child_left_says_not_waited_on_on_windows() {
-        let (_, said) = Settlement::new(failed(), true).wording("S", None, Some(Disposition::Leave));
-        assert_eq!(said, "S: the wait failed: cosca-wait-e5a1; not waited on");
-        assert!(!said.contains("unreaped"), "{said}");
     }
 
     /// A wait that failed with no kill having reached the child shows nothing of what became of it:

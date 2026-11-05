@@ -1027,12 +1027,14 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
 }
 
 /// What `finish_elevated` says of a root whose kill was refused, by what the one look at it found
-/// (the outcomes `look_after_refused_kill` builds over a child 42): a root found exited says so as
-/// the delivered-kill note does, and the others are worded as `Settlement` words them, after the
-/// refusal. The note is the error's: `Error::Elevation` detail.
+/// (the outcomes `look_after_refused_kill` builds over a child 42): a root the look collected says
+/// what the look showed, "it has exited, and was reaped", whether or not its exit record was
+/// readable (an unreadable one is appended), and the others are worded as `Settlement` words them,
+/// after the refusal. The note is the error's: `Error::Elevation` detail.
 ///
 /// Mutants: a collected root reads "reaped it" after the refusal, with no word of its having
-/// exited; a root still running is worded as one that ended.
+/// exited; it says it had already exited before the refusal, which nothing shows; an unreadable
+/// record changes the wording; a root still running is worded as one that ended.
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() {
@@ -1045,7 +1047,7 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
     let rows = [
         (
             ReapAnswer::Reaped(ExitRecord::Status(Default::default())),
-            format!("{}: it had already exited, and was reaped", refusal()),
+            format!("{}: it has exited, and was reaped", refusal()),
         ),
         (
             ReapAnswer::Foreign(Foreign::Gone),
@@ -1074,7 +1076,7 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
     assert_eq!(
         super::root_after_a_refused_kill(refusal(), &unreadable),
         format!(
-            "{}: reaped it; the child's exit record was unreadable (si_code 7)",
+            "{}: it has exited, and was reaped; the child's exit record was unreadable (si_code 7)",
             refusal()
         )
     );

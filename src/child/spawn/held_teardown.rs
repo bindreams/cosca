@@ -8,7 +8,6 @@ use super::{Diagnosis, FrontFate};
 use crate::child::owned::teardown::{Disposition, Reach, TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::Subtree;
-use crate::containment::dispatch::TeardownCaller;
 use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
@@ -60,10 +59,7 @@ pub(crate) fn tear_down_held(
         let tree = None;
         (None, child.tear_down(id, TeardownKind::Kill { disposition, tree }, due))
     };
-    // The clause at warn is the teardown's one warn; a lower one is logged on its own.
-    if let Some(left) = torn.take_warn(TeardownCaller::FailedSpawn.label()) {
-        log::warn!("{}", why.fold(&left));
-    }
+    torn.say_as_failed_spawn(why);
     let unreaped = disposition.hands_back(&torn).then(|| Unreaped::new(child, id));
     let error = match front_fate {
         Some(fate) if unreaped.is_some() => fate.note_handed_back(error, front, pid),

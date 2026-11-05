@@ -86,15 +86,17 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-use crate::child::owned::teardown::Disposition;
-use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::child::lifecycle::Settlement;
+use crate::child::owned::teardown::{Disposition, TeardownOutcome};
+use crate::child::owned::OwnedChild;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    ParentStd, PipeOwnership, SpawnFailure,
+    Diagnosis, ParentStd, PipeOwnership, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
 use crate::error::{win32_io_error, ChildFate, Error};
+use crate::os_process::child_named;
 use crate::os_process::windows::WindowsProcess;
 use crate::signal::Sig;
 use crate::stdio::{Fd, ResolvedStdio};
@@ -515,10 +517,7 @@ fn teardown_spawned(
     // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
     if let Err(refused) = child.signal(Sig::Kill) {
         let mut looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
-        let label = "raw spawn teardown";
-        if let Some(left) = looked.take_warn(label) {
-            log::warn!("{label}: {left}");
-        }
+        looked.say_as_failed_spawn(&mut Diagnosis::default());
         return looked.fate;
     }
     // A fixture only that kill would end is released here.
@@ -533,24 +532,15 @@ fn teardown_spawned(
     );
     // The kill was delivered, or the child's exit was already under way: either way it is dead or
     // dying.
-    match waited {
-        Ok(ChildWaitOutcome::Exited(_record)) => {
-            #[cfg(test)]
-            if let crate::os_process::child::ExitRecord::Status(status) = _record {
-                crate::child::spawn::fault::record_teardown_reap(pid, status);
-            }
-            ChildFate::Reaped
-        }
-        Ok(ChildWaitOutcome::Foreign(foreign)) => foreign.fate(true),
-        Ok(ChildWaitOutcome::DeadlinePassed) => {
-            debug_assert!(false, "an unbounded wait ended at a deadline");
-            ChildFate::Killed
-        }
-        Err(e) => {
-            log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
-            ChildFate::Killed
-        }
+    let settlement = Settlement::new(waited, true);
+    #[cfg(test)]
+    if let Some(status) = settlement.status() {
+        crate::child::spawn::fault::record_teardown_reap(pid, status);
     }
+    let subject = format!("teardown of {}", child_named(Some(pid)));
+    let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, None, Disposition::Leave);
+    torn.say_as_failed_spawn(&mut Diagnosis::default());
+    torn.fate
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

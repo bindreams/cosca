@@ -21,6 +21,8 @@ mod slot;
 mod states;
 #[path = "owned_tests/teardown.rs"]
 mod teardown;
+#[path = "owned_tests/teardown_lines.rs"]
+pub(crate) mod teardown_lines;
 #[path = "owned_tests/teardown_look.rs"]
 mod teardown_look;
 #[cfg(target_os = "macos")]

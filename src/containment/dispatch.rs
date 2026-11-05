@@ -269,8 +269,15 @@ pub(crate) enum TeardownCaller {
     /// A helper that owns the child and failed after its spawn (`Command::status`, `output`, `read`,
     /// `SuspendedChild::resume`).
     FailedRun,
-    /// The sync spawn's teardown of the child it holds, when its identity read or its attach fails.
-    #[cfg(target_os = "linux")]
+    /// A spawn's teardown of the child it holds, when its identity read or its attach fails (sync
+    /// or async), and the cleanup of a child the handshake abandons.
+    #[cfg_attr(
+        not(any(target_os = "linux", windows, feature = "tokio")),
+        allow(
+            dead_code,
+            reason = "only the Linux and Windows spawns and the async spawn tear a child down"
+        )
+    )]
     FailedSpawn,
     /// The cleanup of an elevated spawn that cannot finish.
     #[cfg(unix)]
@@ -283,7 +290,6 @@ impl TeardownCaller {
         match self {
             TeardownCaller::Drop => "Child::drop",
             TeardownCaller::FailedRun => "teardown after a failed run",
-            #[cfg(target_os = "linux")]
             TeardownCaller::FailedSpawn => "teardown after a failed spawn",
             #[cfg(unix)]
             TeardownCaller::FinishElevated => "finish_elevated",
@@ -296,9 +302,7 @@ impl TeardownCaller {
     pub(crate) fn this_event(self) -> &'static str {
         match self {
             TeardownCaller::Drop => "this drop",
-            #[cfg(target_os = "linux")]
-            TeardownCaller::FailedSpawn => "this teardown",
-            TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
+            TeardownCaller::FailedSpawn | TeardownCaller::FailedRun | TeardownCaller::FinishElevated => "this teardown",
         }
     }
 }

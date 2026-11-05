@@ -92,72 +92,6 @@ pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Arm
     crate::wait::block_probe::on_blocking(move || fake.wake())
 }
 
-/// `tear_down(id, Kill, no threshold)` over `fake` for a caller that does `disposition`.
-fn tear_down_as(fake: &FakeProcess, disposition: Disposition) -> TeardownOutcome {
-    OwnedChild::new(Box::new(fake.clone())).tear_down(
-        Some(id()),
-        TeardownKind::Kill {
-            disposition,
-            tree: None,
-        },
-        None,
-    )
-}
-
-/// Where a child goes that a caller leaves: Unix leaves a zombie unreaped, and Windows has none, so
-/// the child is not waited on.
-#[cfg(unix)]
-pub(super) const LEFT: &str = "; left unreaped";
-#[cfg(windows)]
-pub(super) const LEFT: &str = "; not waited on";
-
-/// The words a warn clause has under `disposition`: a caller that hands the child back says so, and
-/// one that leaves it says it is [`LEFT`].
-#[track_caller]
-fn assert_left_says(torn: &TeardownOutcome, disposition: Disposition, wanted: &str) {
-    let text = warn_of(torn).unwrap_or_default();
-    assert!(text.contains(wanted), "{torn:?}");
-    let (goes, other) = match disposition {
-        Disposition::HandBack => ("; handed back to the caller in the error", LEFT),
-        Disposition::Leave => (LEFT, "handed back"),
-    };
-    assert!(text.ends_with(goes), "{torn:?}");
-    assert!(!text.contains(other), "{torn:?}");
-    assert!(torn.uncollected, "{torn:?}");
-}
-
-/// A reap that fails after a delivered kill leaves the child uncollected, and the leftover says it is
-/// handed back to a caller that hands it back.
-///
-/// Mutant: the leftover ignores the disposition.
-#[skuld::test]
-fn a_failed_reap_after_a_kill_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake()
-            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
-            .signals([Ok(Sent::Delivered)]);
-        let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "the wait failed");
-    }
-}
-
-/// A refused kill whose look then fails leaves the child uncollected, and the leftover says it is
-/// handed back to a caller that hands it back.
-///
-/// Mutant: the leftover ignores the disposition.
-#[cfg(unix)]
-#[skuld::test]
-fn a_refused_kill_whose_look_failed_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake()
-            .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
-            .signals([crate::os_process::fake::failed_signal(libc::EPERM)]);
-        let torn = tear_down_as(&fake, disposition);
-        assert_left_says(&torn, disposition, "could not be terminated");
-        assert_left_says(&torn, disposition, "the wait failed");
-    }
-}
-
 /// A leftover about a child whose reap consumed the zombie but read no exit record: the child is
 /// collected, so a caller that hands children back has none to hand back, and the leftover does not
 /// say it did.
@@ -223,19 +157,6 @@ fn a_refused_kill_whose_look_found_the_exit_record_unreadable_leaves_nothing_unc
         assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
         assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
-    }
-}
-
-/// The reap of a child a tree kill ended, when it fails, is worded the same way.
-///
-/// Mutant: that reap's leftover ignores the disposition.
-#[cfg(unix)]
-#[skuld::test]
-fn a_failed_reap_after_a_tree_kill_is_worded_by_the_disposition() {
-    for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let fake = fake().reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
-        let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(disposition);
-        assert_left_says(&torn, disposition, "the wait failed");
     }
 }
 

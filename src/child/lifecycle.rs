@@ -131,6 +131,16 @@ impl Settlement {
         }
     }
 
+    /// Why the child's exit record could not be read, if it could not: the child was reaped, and
+    /// only its exit is lost.
+    #[cfg(unix)]
+    pub(crate) fn unreadable_record(&self) -> Option<String> {
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Some(unreadable(*si_code)),
+            _ => None,
+        }
+    }
+
     /// What to say of the child, and at what level: a clause for every answer, which the caller logs
     /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
     /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.

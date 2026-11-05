@@ -392,8 +392,8 @@ mod worded {
     /// Mutant: the wording ignores the disposition.
     fn handed_back(disposition: Disposition) -> &'static str {
         match disposition {
-            Disposition::Leave => super::super::teardown::LEFT,
-            Disposition::HandBack => "; handed back to the caller in the error",
+            Disposition::Leave => crate::child::owned::owned_tests::teardown_lines::LEFT,
+            Disposition::HandBack => crate::child::owned::owned_tests::teardown_lines::HANDED_BACK,
         }
     }
 

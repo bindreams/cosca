@@ -432,7 +432,10 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(detail.contains("could not be terminated"), "{detail}");
-    assert!(detail.contains("it is handed back to the caller"), "{detail}");
+    assert!(
+        detail.contains(crate::child::owned::owned_tests::teardown_lines::HANDED_BACK),
+        "{detail}"
+    );
     assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
     // Released: the front exits by itself, unsignalled.
     let status = handed_back.wait();

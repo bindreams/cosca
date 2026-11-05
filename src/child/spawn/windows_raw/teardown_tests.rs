@@ -249,6 +249,13 @@ fn raw_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait() {
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect::<Vec<_>>();
     assert_eq!(warned.len(), 1, "one warn for one refusal: {warned:?}");
+    assert!(
+        warned[0].1.starts_with(&format!(
+            "teardown after a failed spawn: child {} could not be terminated",
+            owner.pid
+        )),
+        "{warned:?}"
+    );
 }
 
 /// A failed spawn's teardown whose kill fails on a child that has exited collects it from the look
@@ -286,6 +293,8 @@ fn raw_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_silen
 fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
     let owner = Suspended::spawn();
     let (child, fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let fate = teardown_spawned(&child, owner.pid, None, None);
     assert_eq!(fate, ChildFate::Killed);
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
@@ -293,6 +302,20 @@ fn raw_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
         owner.wait_for_exit().code(),
         Some(1),
         "the teardown's kill must have ended it"
+    );
+    // Said as every teardown says a failed wait, under the failed spawn's name.
+    let warns = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string());
+    assert_eq!(
+        warns,
+        [(
+            log::Level::Warn,
+            format!(
+                "teardown after a failed spawn: teardown of child {}: the wait failed: {}{}",
+                owner.pid,
+                crate::child::owned::owned_tests::teardown_lines::wait_error(),
+                crate::child::owned::owned_tests::teardown_lines::LEFT
+            )
+        )]
     );
 }
 

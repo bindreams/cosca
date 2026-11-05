@@ -72,7 +72,7 @@ impl Disposition {
 const LEFT: &str = if cfg!(unix) {
     "; left unreaped"
 } else {
-    "; not waited on"
+    "; nothing waits for it"
 };
 
 /// What a teardown does to the child.
@@ -199,6 +199,17 @@ impl TeardownOutcome {
             }
         }
     }
+
+    /// Says the clause as a failed spawn's teardown, the caller that owns the one line of it: a
+    /// clause at warn is that line, `why` (the spawn's diagnosis, if still owed) leading it, and a
+    /// lower one is logged on its own. Both lines are led by the caller's name.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn say_as_failed_spawn(&mut self, why: &mut crate::child::spawn::Diagnosis) {
+        let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
+        if let Some(left) = self.take_warn(label) {
+            log::warn!("{label}: {}", why.fold(&left));
+        }
+    }
 }
 
 impl OwnedChild {
@@ -278,7 +289,7 @@ impl OwnedChild {
         // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
         let running = match disposition {
             Disposition::Leave => format!("{subject}; leaving it running"),
-            Disposition::HandBack => format!("{subject}{}", disposition.suffix(true)),
+            Disposition::HandBack => format!("{subject}{}", Disposition::HandBack.suffix(true)),
         };
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
         if settlement.ended() {

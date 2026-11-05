@@ -14,6 +14,7 @@ use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
 use crate::child::spawn::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use crate::child::spawn::Diagnosis;
+use crate::containment::dispatch::TeardownCaller;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
@@ -304,7 +305,7 @@ fn refused_kill_warning(pid: u32, e: &Error, after: &Refused) -> String {
         #[cfg(target_os = "macos")]
         Refused::Released => text.push_str(&format!("; it is {HANDED_TO_ORPHAN_REAPER}")),
         #[cfg(windows)]
-        Refused::Released => text.push_str("; it is not waited on"),
+        Refused::Released => text.push_str(crate::child::owned::teardown::Disposition::Leave.suffix(true)),
     }
     text
 }
@@ -1556,7 +1557,11 @@ impl ProcSource {
                 Refused::Released
             }
         };
-        log::warn!("{}", why.fold(refused_kill_warning(pid, e, &after)));
+        log::warn!(
+            "{}: {}",
+            TeardownCaller::FailedSpawn.label(),
+            why.fold(refused_kill_warning(pid, e, &after))
+        );
         // `EPERM` is a setuid child refusing the kill, reachable without a bug: it alone is not
         // asserted.
         debug_assert!(
