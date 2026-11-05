@@ -100,9 +100,9 @@ fn parents_contains_this_process_edge() {
 /// The EPERM gap the module docs traced is now CLOSED for this case: pid 1 (launchd) is
 /// guaranteed to exist and, outside a root process, guaranteed to be owned by a different
 /// (root) user - a deterministic trigger for the sysctl fallback without spawning a
-/// cross-uid process. Its real ppid is 0 (the kernel) on every macOS version - the one case
+/// cross-uid process. Its real ppid is 0 (the kernel) on every macOS version - a case
 /// `identity::macos::trusted_ppid`'s "`e_ppid == 0` is never trusted" rule exempts by pid
-/// rather than discards (see that function's doc).
+/// (with pid 0's) rather than discards (see that function's doc).
 ///
 /// The precondition assertion is load-bearing, not decoration: the whole point of this test
 /// is that the FALLBACK resolves pid 1, but whether the fallback is even reached depends
@@ -210,9 +210,16 @@ fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
 /// an error. Mutant: "transient counted as denied".
 #[skuld::test]
 fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
-    use crate::identity::{macos_fault, PpidRead};
+    use crate::identity::{macos_fault, Key, PpidRead};
     let me = std::process::id() as libc::c_int;
-    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(1)]);
+    let _forced = macos_fault::force_ppid_reads(
+        me as u32,
+        &[
+            PpidRead::Forking,
+            PpidRead::Forking,
+            PpidRead::Found(1, Key::for_test(1)),
+        ],
+    );
     let (edges, denied, _) = join_edges(&[me]).expect("edge buffer");
     assert_eq!(denied, 0);
     assert_eq!(edges, [(me as u32, 1)]);
