@@ -2,9 +2,10 @@
 //! real parent). The handle is opened from a `ProcessId`, never a bare pid, and every act through
 //! it (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reaches that process or reports it gone,
 //! never a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-//! `graceful_shutdown_tree`) walk by identity: they check each member, then send by number, with
-//! the window principle 4 describes. The root is signalled the same way, by number after an
-//! identity check, until the containment boundary takes the held handle. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
+//! `graceful_shutdown_tree`) walk by identity and signal each member, the root included (not
+//! through this handle, until the containment boundary takes it), through a pidfd proved to name it
+//! on Linux, or a handle on Windows. On macOS they check each member, then send by number, with the
+//! window principle 4 describes. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
 //! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
 
@@ -20,8 +21,9 @@ mod graceful;
 /// An open handle on a process, held since [`open`](Self::open). Acts through the handle
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-/// `graceful_shutdown_tree`) check each member's identity, then send by number, the root included
-/// (not through this handle) until the containment boundary takes it. Not `Clone`: open the
+/// `graceful_shutdown_tree`) signal each member, the root included (not through this handle, until
+/// the containment boundary takes it), through a pidfd proved to name it on Linux, or a handle on
+/// Windows; on macOS they check its identity, then send by number. Not `Clone`: open the
 /// [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
@@ -64,16 +66,24 @@ impl Process {
         match ProcessId::of_with(kernel, pid) {
             (Resolved::Found(id), _) => Process::open_with(kernel, id),
             (Resolved::Gone, _) => Ok(None),
-            (Resolved::Unknown, cause) => Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause)),
+            (Resolved::Unknown, cause) => {
+                // A pidfd call that failed is the open's own failure: a refusal is `Unsupported`
+                // naming the open, as for `open`.
+                #[cfg(target_os = "linux")]
+                if let Some(errno) = cause.errno() {
+                    return Err(crate::os_process::linux::open::open_error(errno));
+                }
+                Err(crate::containment::treewalk::unqueryable(&format!("pid {pid}"), cause))
+            }
         }
     }
 
     /// An open handle on this process itself. Errors as for [`open`](Self::open).
     pub fn current() -> Result<Process, Error> {
-        Process::open(ProcessId::current()).map(|p| p.expect("the current process is not gone from itself"))
+        Process::open(ProcessId::try_current()?).map(|p| p.expect("the current process is not gone from itself"))
     }
 
-    /// The stable identity (`(pid, start_token)`).
+    /// The stable identity (`(pid, key)`).
     pub fn id(&self) -> ProcessId {
         self.id
     }

@@ -26,7 +26,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
-use super::{Liveness, RawPid, Resolved, StartToken};
+use super::{Key, Liveness, RawPid, Resolved};
 
 /// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
 const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
@@ -252,17 +252,17 @@ pub(crate) mod fault {
 /// Read the creation FILETIME of an open process handle as a raw token, preserving the
 /// failure. `creation_token` is this with the error dropped.
 // SAFETY: `handle` must be a live process handle with QUERY_LIMITED rights.
-pub(crate) fn creation_token_result(handle: HANDLE) -> windows::core::Result<StartToken> {
+pub(crate) fn creation_token_result(handle: HANDLE) -> windows::core::Result<Key> {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
     unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }?;
     let ft = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-    Ok(StartToken::from_raw(ft))
+    Ok(Key::from_raw(ft))
 }
 
-pub(super) fn creation_token(handle: HANDLE) -> Option<StartToken> {
+pub(super) fn creation_token(handle: HANDLE) -> Option<Key> {
     creation_token_result(handle).ok()
 }
 
@@ -271,13 +271,13 @@ pub(super) fn creation_token(handle: HANDLE) -> Option<StartToken> {
 /// force dropping a live elevated child).
 pub(crate) fn windows_identity_from_handle(handle: HANDLE, pid: RawPid) -> Option<crate::identity::ProcessId> {
     let start = creation_token(handle)?;
-    Some(crate::identity::ProcessId { pid, start })
+    Some(crate::identity::ProcessId { pid, key: start })
 }
 
 /// This process's own start token, read from the pseudo-handle. `GetCurrentProcess` performs
 /// NO access check, so unlike a by-pid open this cannot be denied — which matters for a
 /// process whose own DACL is restricted (AppContainer, low integrity).
-pub(super) fn current_token() -> Resolved<StartToken> {
+pub(super) fn current_token() -> Resolved<Key> {
     // SAFETY: the pseudo-handle is always valid and must not be closed.
     match creation_token(unsafe { GetCurrentProcess() }) {
         Some(t) => Resolved::Found(t),
@@ -287,7 +287,7 @@ pub(super) fn current_token() -> Resolved<StartToken> {
     }
 }
 
-pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
+pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
     // PROCESS_QUERY_LIMITED_INFORMATION is the weakest mask that can read the creation time,
     // and it is not universally granted to an unelevated caller — a failure here is
     // classified rather than treated as absence.
@@ -310,14 +310,14 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
     }
 }
 
-pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
+pub(super) fn created_at(start: Key) -> Option<SystemTime> {
     let unix_100ns = start.raw().checked_sub(EPOCH_DIFF_100NS)?;
     let secs = unix_100ns / 10_000_000;
     let nanos = (unix_100ns % 10_000_000) * 100;
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos as u32))
 }
 
-pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
+pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     // `SYNCHRONIZE` is asked for and dropped when refused: `QUERY_LIMITED` alone still rejects a
     // reused pid and still lets `GetExitCodeProcess` prove an exit.
     let (opened, granted) = open_dropping_refused(pid, &[PROCESS_SYNCHRONIZE]);

@@ -10,7 +10,7 @@ use super::signal_probe;
 use crate::error::Error;
 use crate::identity::probe::SignalProbe;
 use crate::identity::stat_parse::stat_fixture;
-use crate::identity::{Existence, FakeKernel, HostKernel, Liveness, ProcessId, Resolved};
+use crate::identity::{ticks_host, ticks_id, Existence, FakeKernel, Key, Liveness, ProcessId, Resolved};
 
 /// Above `PID_MAX_LIMIT` (2^22) yet a valid positive `kill` target, so `kill(pid, 0)` answers `ESRCH`.
 pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
@@ -18,13 +18,14 @@ pub(super) const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
 /// [`NO_PROCESS_CAN_HOLD`] as the kill target the kernel is asked about.
 const NO_PROCESS_CAN_HOLD_TARGET: Pid = Pid::from_raw(i32::MAX).unwrap();
 
-/// The kernels that leave a live pid unanswerable, over the real one: a diverged view, a
-/// `self/status` that cannot be read, and no `/proc` to open (descriptor exhaustion).
-fn unavailable_views() -> [(&'static str, FakeKernel<'static>); 3] {
+/// The kernels that leave live `pid` unanswerable on a host before Linux 6.9, where `/proc` tells
+/// the process: a diverged view, a `self/status` that cannot be read, and no `/proc` to open
+/// (descriptor exhaustion). (On pidfs the pidfd tells, and no view is asked.)
+fn unavailable_views(pid: u32) -> [(&'static str, FakeKernel<'static>); 3] {
     [
-        ("diverged", FakeKernel::over(&HostKernel).diverged_view()),
-        ("unassessable", FakeKernel::over(&HostKernel).unreadable_view()),
-        ("no /proc", FakeKernel::over(&HostKernel).open_proc_fails(Errno::MFILE)),
+        ("diverged", ticks_host(pid).diverged_view()),
+        ("unassessable", ticks_host(pid).unreadable_view()),
+        ("no /proc", ticks_host(pid).open_proc_fails(Errno::MFILE)),
     ]
 }
 
@@ -32,7 +33,7 @@ fn unavailable_views() -> [(&'static str, FakeKernel<'static>); 3] {
 /// live process resolves.
 #[skuld::test]
 fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
-    for (name, kernel) in unavailable_views() {
+    for (name, kernel) in unavailable_views(std::process::id()) {
         let (got, cause) = ProcessId::of_with(&kernel, std::process::id());
         assert!(matches!(got, Resolved::Unknown), "{name}: got {got:?}");
         assert!(
@@ -46,7 +47,7 @@ fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
 /// `Gone` whatever `/proc` shows. Mutant: "an unavailable view is always Unknown".
 #[skuld::test]
 fn of_a_pid_no_process_can_hold_is_gone_whatever_the_view() {
-    for (name, kernel) in unavailable_views() {
+    for (name, kernel) in unavailable_views(NO_PROCESS_CAN_HOLD) {
         let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD_TARGET, Err(Errno::SRCH));
         let got = ProcessId::of_with(&kernel, NO_PROCESS_CAN_HOLD).0;
         assert!(matches!(got, Resolved::Gone), "{name}: got {got:?}");
@@ -56,8 +57,8 @@ fn of_a_pid_no_process_can_hold_is_gone_whatever_the_view() {
 /// Mutant: "`exists`/`is_alive` map an unavailable view to `Gone`/`Dead`".
 #[skuld::test]
 fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailable() {
-    let id = ProcessId::current();
-    for (name, kernel) in unavailable_views() {
+    let id = ticks_id(std::process::id());
+    for (name, kernel) in unavailable_views(std::process::id()) {
         assert_eq!(id.exists_with(&kernel).0, Existence::Unknown, "{name}");
         assert_eq!(id.is_alive_with(&kernel), Liveness::Unknown, "{name}");
     }
@@ -66,8 +67,8 @@ fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailab
 /// Mutant: "`exists`/`is_alive` ask `/proc` only, so an unavailable view hides an `ESRCH`".
 #[skuld::test]
 fn exists_and_is_alive_are_gone_and_dead_for_a_pid_no_process_can_hold_whatever_the_view() {
-    let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, 1);
-    for (name, kernel) in unavailable_views() {
+    let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, Key::for_test(1));
+    for (name, kernel) in unavailable_views(NO_PROCESS_CAN_HOLD) {
         let kernel = kernel.on_signal_probe(NO_PROCESS_CAN_HOLD_TARGET, Err(Errno::SRCH));
         assert_eq!(id.exists_with(&kernel).0, Existence::Gone, "{name}");
         assert_eq!(id.is_alive_with(&kernel), Liveness::Dead, "{name}");
@@ -93,7 +94,7 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
         (libc::EACCES, Err(Errno::PERM), false),
     ];
     for (errno, probe, gone) in cases {
-        let kernel = FakeKernel::over(&HostKernel)
+        let kernel = ticks_host(PID)
             .same_view()
             .on_read(&format!("{PID}/stat"), Err(errno))
             .on_signal_probe(Pid::from_raw(PID as i32).unwrap(), probe);
@@ -103,11 +104,11 @@ fn a_stat_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
             _ => panic!("stat {errno}, kill {probe:?}: got {got:?}"),
         }
     }
-    let found = FakeKernel::over(&HostKernel)
+    let found = ticks_host(PID)
         .same_view()
         .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 424242)));
     match ProcessId::of_with(&found, PID).0 {
-        Resolved::Found(id) => assert_eq!(id.start_token_raw(), 424242),
+        Resolved::Found(id) => assert_eq!(id.key(), Key::for_test(424242)),
         other => panic!("a readable stat must resolve, got {other:?}"),
     }
 }
@@ -134,7 +135,7 @@ fn cause_error_of_live_read(kernel: &FakeKernel<'_>) -> Option<Error> {
 /// the reason".
 #[skuld::test]
 fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
-    let kernel = FakeKernel::over(&HostKernel).open_proc_fails(Errno::NOSYS);
+    let kernel = ticks_host(std::process::id()).open_proc_fails(Errno::NOSYS);
     let err = cause_error_of_live_read(&kernel).expect("no openat2 is an error");
     assert_eq!(
         err.to_string(),
@@ -149,7 +150,7 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
 /// Mutant: "the cause is replaced by the generic refusal".
 #[skuld::test]
 fn the_error_for_a_diverged_view_carries_the_view() {
-    let kernel = FakeKernel::over(&HostKernel).diverged_view();
+    let kernel = ticks_host(std::process::id()).diverged_view();
     let err = cause_error_of_live_read(&kernel).expect("a diverged view is an error");
     assert!(
         matches!(&err, Error::Unassessable { detail, .. }
@@ -161,59 +162,11 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
 #[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {
-    let kernel = FakeKernel::over(&HostKernel)
+    let kernel = ticks_host(4242)
         .same_view()
         .on_read("4242/stat", Err(libc::ENOENT))
         .on_signal_probe(Pid::from_raw(4242).unwrap(), Ok(()));
     let (got, cause) = ProcessId::of_with(&kernel, 4242);
     assert!(matches!(got, Resolved::Unknown), "got {got:?}");
     assert!(cause.into_error("the spawned child").is_none());
-}
-
-/// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`.
-#[skuld::test]
-fn alias_token_aliases_only_a_found_stat() {
-    use super::fault::alias_token;
-    use super::start_token_from;
-    use crate::identity::StartToken;
-
-    const PID: u32 = 4242;
-    let aliased = StartToken::from_raw(7);
-    let _armed = alias_token(PID, aliased);
-
-    assert!(matches!(start_token_from(PID, Resolved::Gone), Resolved::Gone));
-    assert!(matches!(start_token_from(PID, Resolved::Unknown), Resolved::Unknown));
-    match start_token_from(PID, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => assert_eq!(t, aliased, "a found stat answers the alias"),
-        other => panic!("a found stat must resolve, got {other:?}"),
-    }
-    // Another pid is untouched.
-    match start_token_from(PID + 1, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => assert_eq!(t, StartToken::from_raw(424242)),
-        other => panic!("got {other:?}"),
-    }
-}
-
-/// Dropping the guard ends the alias, and only its own pid's. Mutant: `AliasGuard::drop` removes
-/// nothing, or every pid's alias.
-#[skuld::test]
-fn dropping_the_alias_guard_ends_that_alias_only() {
-    use super::fault::alias_token;
-    use super::start_token_from;
-    use crate::identity::StartToken;
-
-    let read = |pid| match start_token_from(pid, Resolved::Found(stat_fixture("S", 424242))) {
-        Resolved::Found(t) => t,
-        other => panic!("a found stat must resolve, got {other:?}"),
-    };
-    let first = alias_token(4343, StartToken::from_raw(1));
-    let _second = alias_token(4344, StartToken::from_raw(2));
-    assert_eq!(read(4343), StartToken::from_raw(1));
-    drop(first);
-    assert_eq!(
-        read(4343),
-        StartToken::from_raw(424242),
-        "the dropped guard's alias is gone"
-    );
-    assert_eq!(read(4344), StartToken::from_raw(2), "another pid's alias stays armed");
 }
