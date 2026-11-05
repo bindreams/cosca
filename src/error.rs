@@ -249,6 +249,10 @@ pub enum Error {
         wrapper_elevated: bool,
         #[source]
         source: Box<Error>,
+        /// The child itself, when the spawn could not end it and hands it to the caller; see
+        /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is
+        /// [`ChildFate::Running`] with the child's own identity.
+        unreaped: Option<Box<crate::Unreaped>>,
     },
 }
 
@@ -275,7 +279,8 @@ pub enum ChildFate {
     Killed,
     /// The child may still be running: cosca left it alone (an elevation front, which it never
     /// signals, a child it could not show to be its own, or one `kill_on_drop(false)` keeps) or
-    /// could not kill it.
+    /// could not kill it. A child it could not kill may come back to the caller: see the `unreaped`
+    /// field of [`Error::MayHaveStarted`].
     ///
     /// `id` is its identity when the spawn had read one, and `None` when the failure came before
     /// that read (an identity that could not be read, or a macOS report that never came). It is an
@@ -457,10 +462,12 @@ impl Error {
                 fate,
                 wrapper_elevated,
                 source,
+                unreaped,
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
                 source: Box::new(source.with_note(note)),
+                unreaped,
             },
             Error::Quote(e) => {
                 debug_assert!(
