@@ -29,7 +29,10 @@ impl ProcessId {
         self.parent_with(&HostKernel)
     }
 
-    /// [`parent`](Self::parent), reading through `kernel`.
+    /// [`parent`](Self::parent), reading through `kernel`. `self` is read a second time, under the
+    /// parent, after the parent's read: where an orphan is reparented (Linux, macOS), a `ppid` that
+    /// still names the parent then proves the read was of the real parent and not of a later holder
+    /// of its pid, which the at-or-after order rule alone passes when created in `self`'s tick.
     pub(crate) fn parent_with(&self, kernel: &dyn Kernel) -> Result<Option<ProcessId>, Error> {
         // `self`'s parent number is not in the process table: a live process may have no row
         // (Toolhelp omits an exited process whose handle is held), so it comes from `self`'s own
@@ -57,8 +60,17 @@ impl ProcessId {
                 ));
             }
         };
-        // `ppid` is only a number: the parent may have exited since `self`'s read and its number
-        // been taken. That holder started after `self`, so the rule below rejects it.
+        // `ppid` is only a number: `self`'s own read must still name it after the parent was read,
+        // and the parent must still hold it after that read.
+        match ProcessId::of_ordered_with(kernel, self.pid(), Some(parent)) {
+            (Resolved::Found((read, _)), _) if read == *self => {}
+            // `self` was replaced, exited, or has another parent now.
+            (Resolved::Found(_) | Resolved::Gone, _) => return Ok(None),
+            // The parent's proof can be what failed, not `self`'s read.
+            (Resolved::Unknown, cause) => {
+                return Err(crate::containment::treewalk::unqueryable_read(self.pid(), cause));
+            }
+        }
         // A genuine parent predates this child; a recycled ppid names a later-started process.
         Ok(
             crate::containment::treewalk::keeps_order(key, parent_key, crate::containment::treewalk::ALLOW_EQUAL_ORDER)
