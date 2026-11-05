@@ -3,14 +3,15 @@
 
 use std::future::Future;
 
+use crate::test_child::Console;
+
 use crate::send_log::{Capture, Via};
 use crate::signal::RootState;
-use crate::tokio::Command;
 
 /// A blocker that exited and was reaped by a foreign `waitpid`, behind tokio's back.
 async fn foreign_reaped_blocker() -> crate::tokio::Child {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = cmd.spawn().expect("spawn");

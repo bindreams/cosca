@@ -4,6 +4,8 @@
 //! are forced to find it running.
 
 use std::cell::{Cell, RefCell};
+
+use crate::test_child::Console;
 use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
@@ -17,7 +19,7 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let forced = Rc::new(RefCell::new(None));

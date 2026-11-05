@@ -5,6 +5,9 @@
 
 use std::io::Read as _;
 
+#[cfg(feature = "tokio")]
+use super::Console;
+
 /// A session root `sh` that leaves a member in its group, says `started`, and blocks holding neither
 /// the member's stdin nor stderr. The member reads stdin through fd 3 (`sh` points a background
 /// job's stdin at `/dev/null` otherwise) and, at its end of file, says `survived` on stderr. The
@@ -143,7 +146,7 @@ pub(crate) fn releasable_root_with_a_member_contained(
 ) -> (crate::tokio::Child, Member, std::io::PipeWriter) {
     let (stdio, started, member) = Member::pipes();
     let child = {
-        let mut cmd = crate::tokio::Command::new();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(RELEASABLE_ROOT_WITH_A_MEMBER);
         cmd.fd(4, stdio.release).expect("set the root's release pipe");
         contain(&mut cmd);

@@ -28,8 +28,8 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 #[cfg(windows)]
@@ -78,7 +78,7 @@ impl Suspended {
                     None,
                     None,
                     false,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                     Some(env.as_ptr().cast()),
                     None,
                     &si,

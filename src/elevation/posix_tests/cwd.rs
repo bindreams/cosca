@@ -7,12 +7,13 @@ use crate::elevation::pkexec::PkexecVersion;
 use crate::elevation::plan::{BackendSet, Host, Os};
 use crate::elevation::{Auth, Backend, ElevatedVia};
 use crate::error::Error;
+use crate::test_child::Console;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// `tool -x` under sudo, in `cwd` when given.
 fn argv0_tool(cwd: Option<&str>) -> Command {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args(["tool", "-x"])
         .elevation_backend(Backend::Sudo)
         .elevation_auth(Auth::NonInteractive);
@@ -57,7 +58,7 @@ pub(super) fn every_backend_host() -> Host {
 
 /// `path` as the whole argv.
 fn argv0(path: &str) -> Command {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.args([path]);
     c
 }
@@ -94,7 +95,7 @@ fn pkexec_refuses_a_leading_dash_program() {
             elevated,
             ..every_backend_host()
         };
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.args(["-x", "y"]);
         let mut c = under(c, Backend::Pkexec);
         match rewrite_with_host(&mut c, &host) {

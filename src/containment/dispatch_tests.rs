@@ -2,6 +2,7 @@
 // These test pure functions directly — no process-env mutation required.
 
 use super::is_nested;
+use crate::test_child::Console;
 
 /// Without the marker the process is the root (not nested).
 #[skuld::test]
@@ -214,7 +215,7 @@ fn sync_kill_tree_backstop_is_load_bearing() {
     use super::super::treewalk::fault;
     #[cfg(target_os = "macos")]
     use crate::containment::fdmarker::fault;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["cat"]);
     #[cfg(windows)]
@@ -248,7 +249,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     use super::super::treewalk::fault;
     #[cfg(target_os = "macos")]
     use crate::containment::fdmarker::fault;
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["cat"]);
     #[cfg(windows)]
@@ -469,7 +470,7 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
     // A real holder in a separate process, mirroring marker_eof_tests.rs's
     // spawn_marker_holder: the marker's write end lives in the child, not in-process, so
     // wait_drained observes a genuinely open, then genuinely closed, write end.
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");

@@ -5,6 +5,7 @@ skuld::default_labels!(crate::test_harness::ROOT);
 
 use crate::command::Command;
 use crate::error::Error;
+use crate::test_child::Console;
 use crate::test_child::{cwd_and_path_tools, CWD_TOOL_EXIT, PATH_TOOL_EXIT};
 
 fn exit_code(c: &mut Command) -> Option<i32> {
@@ -14,7 +15,7 @@ fn exit_code(c: &mut Command) -> Option<i32> {
 #[skuld::test]
 fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     let (cwd, on_path) = cwd_and_path_tools();
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.raw_executable("tool")
         .args(["tool"])
         .current_dir(cwd.path())
@@ -26,7 +27,7 @@ fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 fn a_bare_exact_name_missing_from_the_childs_cwd_is_not_found_on_path() {
     let (_cwd, on_path) = cwd_and_path_tools();
     let empty = tempfile::tempdir().expect("tempdir");
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.raw_executable("tool")
         .args(["tool"])
         .current_dir(empty.path())
@@ -42,7 +43,7 @@ fn an_exact_name_that_names_no_file_is_refused_on_posix() {
     let (cwd, on_path) = cwd_and_path_tools();
     std::fs::create_dir(cwd.path().join("dir")).expect("mkdir");
     for n in ["", ".", "..", "dir/", "tool/..", "/"] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.raw_executable(n)
             .args(["tool"])
             .current_dir(cwd.path())
@@ -58,7 +59,7 @@ fn an_exact_name_that_names_no_file_is_refused_on_posix() {
 #[skuld::test]
 fn a_bare_search_name_still_loads_the_file_on_path() {
     let (cwd, on_path) = cwd_and_path_tools();
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.executable("tool")
         .args(["tool"])
         .current_dir(cwd.path())
@@ -70,7 +71,7 @@ fn a_bare_search_name_still_loads_the_file_on_path() {
 #[skuld::test]
 fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
     let (cwd, on_path) = cwd_and_path_tools();
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.raw_executable("tool")
         .commandline("tool")
         .current_dir(cwd.path())
@@ -130,7 +131,7 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
         report(&format!("precondition: std's ./tool gave {std_code:?}"));
         std::process::exit(PRECONDITION_FAILED);
     }
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.raw_executable("tool").args(["tool"]);
     if let Some(dir) = std::env::var_os(FIXTURE_CURRENT_DIR_ENV) {
         c.current_dir(dir);
@@ -218,9 +219,9 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
         Err(Error::Io(e)) => e.kind(),
         other => panic!("expected Io, got {other:?}"),
     };
-    let mut exact = Command::new();
+    let mut exact = crate::test_child::command(Console::Hidden);
     exact.raw_executable("tool").args(["tool"]).current_dir("");
-    let mut search = Command::new();
+    let mut search = crate::test_child::command(Console::Hidden);
     search
         .executable(cwd.path().join("tool"))
         .args([cwd.path().join("tool")])
@@ -235,7 +236,7 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
 #[skuld::test]
 fn a_relative_exact_program_hands_std_no_current_dir() {
     for dir in ["sub", "/work"] {
-        let mut c = Command::new();
+        let mut c = crate::test_child::command(Console::Hidden);
         c.raw_executable("tool").args(["tool"]).current_dir(dir);
         let std_cmd = crate::child::spawn::build_std_command(&c).expect("build");
         assert_eq!(std_cmd.get_current_dir(), None, "{dir}");
@@ -247,7 +248,7 @@ fn a_relative_exact_program_hands_std_no_current_dir() {
 /// is left for the child to read at the fork.
 #[skuld::test]
 fn a_search_programs_relative_cwd_is_passed_through() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.executable("tool").args(["tool"]).current_dir("sub");
     let std_cmd = crate::child::spawn::build_std_command(&c).expect("build");
     assert_eq!(std_cmd.get_current_dir(), Some(std::path::Path::new("sub")));
@@ -259,7 +260,7 @@ fn a_search_programs_relative_cwd_is_passed_through() {
 /// path. `sh` reading its script from stdin reports `argv[0]` as `$0`.
 #[skuld::test]
 fn an_exact_program_with_an_empty_argv_gets_the_written_name_as_argv0() {
-    let mut c = Command::new();
+    let mut c = crate::test_child::command(Console::Hidden);
     c.raw_executable("sh").args(Vec::<&str>::new()).current_dir("/bin");
     c.stdin(crate::Stdio::pipe()).expect("stdin");
     c.stdout(crate::Stdio::pipe()).expect("stdout");

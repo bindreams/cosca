@@ -21,6 +21,7 @@ use crate::identity::ProcessId;
 use crate::os_process::child::ExitRecord;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::windows::WindowsProcess;
+use crate::test_spawn::console_flags::NO_WINDOW;
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
 
@@ -41,7 +42,7 @@ impl Suspended {
             &mut si,
             None,
             &None,
-            EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
+            EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0 | NO_WINDOW,
         )
         .expect("spawn suspended");
         Suspended {

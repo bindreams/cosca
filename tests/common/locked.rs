@@ -11,13 +11,37 @@
 //! hold the guard for its whole body cannot use them and calls the raw method under its own guard
 //! with an `#[allow]` that says so.
 //!
+//! On Windows every child spawned here is `CREATE_NO_WINDOW`, so a test run from a process with no
+//! console opens no window. A test that needs a console or its own flags spawns through
+//! [`spawn_locked_with`], and replaces whatever `creation_flags` the command already had.
+//!
 //! This file is also compiled into the library's tests (`src/test_spawn_tests`), which run the
 //! spawn-window scenario against these exact wrappers.
 
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+#[cfg(windows)]
+use super::console_flags;
+
 /// [`Command::spawn`] under `cosca::test_spawn_lock()`.
 pub fn spawn_locked(cmd: &mut Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    cmd.creation_flags(console_flags::word(0, console_flags::Console::Hidden));
+    spawn_held(cmd)
+}
+
+/// [`spawn_locked`] with `flags` as the creation word, plus `CREATE_NO_WINDOW` unless `console` is
+/// [`Asked`](console_flags::Console::Asked).
+#[cfg(windows)]
+pub fn spawn_locked_with(cmd: &mut Command, flags: u32, console: console_flags::Console) -> std::io::Result<Child> {
+    cmd.creation_flags(console_flags::word(flags, console));
+    spawn_held(cmd)
+}
+
+fn spawn_held(cmd: &mut Command) -> std::io::Result<Child> {
     let _guard = cosca::test_spawn_lock();
     #[allow(clippy::disallowed_methods, reason = "`_guard` is spawn_lock")]
     cmd.spawn()
@@ -38,6 +62,8 @@ pub fn status_locked(cmd: &mut Command) -> std::io::Result<ExitStatus> {
 /// `tokio::process::Command::spawn` under `cosca::test_spawn_lock()`.
 #[cfg(feature = "tokio")]
 pub fn spawn_locked_tokio(cmd: &mut ::tokio::process::Command) -> std::io::Result<::tokio::process::Child> {
+    #[cfg(windows)]
+    cmd.creation_flags(console_flags::word(0, console_flags::Console::Hidden));
     let _guard = cosca::test_spawn_lock();
     #[allow(clippy::disallowed_methods, reason = "`_guard` is spawn_lock")]
     cmd.spawn()

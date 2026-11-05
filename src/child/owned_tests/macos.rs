@@ -4,6 +4,8 @@
 //! The `exit_only` backend's own tests are in `wait::exit_only::macos_tests`.
 
 use std::sync::Arc;
+
+use crate::test_child::Console;
 use std::time::{Duration, Instant};
 
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
@@ -140,7 +142,7 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (_sibling, _sibling_stdin) = spawn_std_blocker();
     use std::io::Read as _;
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     // Prints `eof` only if `cat` ends of its own accord, as it does on EOF once the writer is
     // released. The kill ends the shell first; `cat` outlives it until the release, and prints nothing.
     cmd.args(["sh", "-c", "cat; echo eof"]);
@@ -553,7 +555,7 @@ fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
 fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let mut child = cmd.spawn().expect("spawn");

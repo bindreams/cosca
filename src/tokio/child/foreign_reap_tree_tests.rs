@@ -7,12 +7,13 @@ use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, kill_own_child, reap_behind, warns_since,
     MAY_STILL_RUN, REAPED_ELSEWHERE,
 };
+use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// A `sleep` in its own session: `Attached::ProcessGroup`, or on macOS an fd marker with a group.
 fn session_sleep() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sleep", "300"]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd
@@ -21,7 +22,7 @@ fn session_sleep() -> crate::tokio::Command {
 /// Async twin of the sync `session_cat`.
 #[cfg(target_os = "linux")]
 fn session_cat() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["cat"]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -162,7 +163,7 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_p
 /// a kill ends it before its stdin closes.
 #[cfg(target_os = "linux")]
 fn term_ignoring_session_cat() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(["sh", "-c", r#"trap "" TERM; echo ready; exec cat"#]);
     cmd.contain_with(crate::ContainMode::Session);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
@@ -443,7 +444,7 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     #[cfg(target_os = "macos")]
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
@@ -524,7 +525,7 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_
     let killed = record_kill_group();
     let termed = record_term_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
@@ -588,7 +589,7 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_its_
 ) {
     crate::tokio::test_runtime::assert_current_thread();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
@@ -628,7 +629,7 @@ async fn escaped_holder_tree(
     crate::tokio::ChildStderr,
 ) {
     use ::tokio::io::AsyncBufReadExt as _;
-    let mut cmd = crate::tokio::Command::new();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args([
         "sh",
         "-c",

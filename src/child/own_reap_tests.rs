@@ -3,6 +3,8 @@
 //! number still names the root's group. The recorders replace `killpg` with a record.
 
 use std::cell::RefCell;
+
+use crate::test_child::Console;
 use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ type Wait = JoinHandle<Result<std::process::ExitStatus, crate::error::Error>>;
 /// A zombie root leading its own group (its fd marker suppressed on macOS).
 fn zombie_group_root() -> Arc<crate::Child> {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::Command::new();
+    let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
