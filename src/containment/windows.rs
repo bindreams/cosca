@@ -747,7 +747,7 @@ pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::R
 /// of any completion-port message. Grows the buffer and retries (no bound on retries: a job
 /// that keeps growing needs an ever-larger buffer, but capping this would silently under-report
 /// live membership rather than fail loudly).
-fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
+pub(crate) fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
     let mut capacity: usize = 64;
     loop {
         let buf_len = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + capacity.saturating_sub(1) * size_of::<usize>();

@@ -124,6 +124,17 @@ fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
     release(child);
 }
 
+/// A spawned child's parent is this process: `parent` reads the child again under the parent it
+/// found, which on Linux and Windows must name that parent. Mutant: the check of the child's own
+/// parent rejects the real one.
+#[skuld::test]
+fn the_parent_of_a_spawned_child_is_the_current_process() {
+    let (child, kid) = live_member();
+    let parent = kid.parent().expect("the parent is readable");
+    release(child);
+    assert_eq!(parent, Some(ProcessId::current()));
+}
+
 /// A spawned child is among the current process's direct children, by identity.
 #[skuld::test]
 fn children_of_the_current_process_contain_a_spawned_child() {
