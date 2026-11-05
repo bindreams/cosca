@@ -22,8 +22,9 @@
 //! An elevation front is sent nothing: a kill of it would orphan the elevated program. One look at
 //! the present moment collects it if it has exited. A running front is waited for only if
 //! [`Reach::reached`] says a kill sent elsewhere (a cgroup leaf's) reached it, since that kill bounds
-//! the wait; otherwise it is left. [`TeardownOutcome::look`] says how it went, as data: the caller
-//! knows why the front was not killed, and words it.
+//! the wait; otherwise it is left running. [`TeardownOutcome::look`] says how it went, as data: the
+//! caller knows why the front was not killed and whether it hands a running front back
+//! ([`Disposition`]), and words it.
 
 use std::io;
 use std::process::ExitStatus;
@@ -37,9 +38,9 @@ use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
 
-/// What the caller does with a child that still runs after its kill was refused: `Leave` it
-/// running, or `HandBack` it as an [`Unreaped`](crate::Unreaped). It words the teardown's warn; the
-/// caller does what it says.
+/// What the caller does with a child that still runs after its kill was refused, or after it was
+/// sent none (an elevation front): `Leave` it running, or `HandBack` it as an
+/// [`Unreaped`](crate::Unreaped). It words the warn of the event; the caller does what it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Leave,
@@ -88,13 +89,14 @@ pub(crate) enum LookOutcome {
     LookFailed(Error),
     /// A kill sent elsewhere ended it, and the reap failed.
     ReapFailed(Error),
-    /// It is running and no kill reached it: it is left running and unreaped.
+    /// It is running and no kill reached it: it is left running and unreaped, or handed back by a
+    /// caller that does ([`Disposition::HandBack`]).
     LeftRunning,
-    /// Where it is could not be read, so whether a kill reached it is not known: it is left
-    /// unreaped.
+    /// It is running and where it is could not be read, so whether a kill reached it is not known:
+    /// it is left unreaped, or handed back by a caller that does ([`Disposition::HandBack`]).
     PlaceUnreadable(io::Error),
-    /// The subtree the kill went through could not be read, so whether it reached the front is not
-    /// known: it is left unreaped.
+    /// It is running and the subtree the kill went through could not be read, so whether it reached
+    /// the front is not known: it is left unreaped, or handed back as above.
     SubtreeUnreadable(io::Error),
 }
 
@@ -277,15 +279,17 @@ impl OwnedChild {
             Ok(Some(status)) => TeardownOutcome::of_front(ChildFate::Reaped, LookOutcome::Reaped(status)),
             Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::LookFailed(e)),
             Ok(None) => {
-                let left_running = || TeardownOutcome::of_front(ChildFate::Running { id }, LookOutcome::LeftRunning);
+                // The look saw it running; an unreadable reach leaves open only whether the kill
+                // reached it.
+                let running = |look| TeardownOutcome::of_front(ChildFate::Running { id }, look);
                 let reach = match reach {
-                    Err(e) => return TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::SubtreeUnreadable(e)),
-                    Ok(None) => return left_running(),
+                    Err(e) => return running(LookOutcome::SubtreeUnreadable(e)),
+                    Ok(None) => return running(LookOutcome::LeftRunning),
                     Ok(Some(reach)) => reach,
                 };
                 match reach.reached(self) {
-                    Ok(false) => left_running(),
-                    Err(e) => TeardownOutcome::of_front(ChildFate::Unknown, LookOutcome::PlaceUnreadable(e)),
+                    Ok(false) => running(LookOutcome::LeftRunning),
+                    Err(e) => running(LookOutcome::PlaceUnreadable(e)),
                     // Dying: its kill is pending, so this wait ends. Nobody else reports a zombie
                     // launchd holds.
                     Ok(true) => {
