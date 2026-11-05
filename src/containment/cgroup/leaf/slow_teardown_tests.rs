@@ -14,6 +14,7 @@ use std::os::unix::process::ExitStatusExt as _;
 
 use super::super::{fault, HANDLE_PIDFD, HANDLE_PROC_DIR, TAG_INTENT};
 use super::{Abandoned, CgroupLeaf, TeardownWarn, WarnAfter};
+use crate::child::owned::teardown::Expect;
 use crate::child::spawn::fault as spawn_fault;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing, Names};
@@ -27,7 +28,7 @@ use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing,
 fn assert_abandonment_warns_once<W: TeardownWarn + Send>(
     names: Names,
     intent: fn(&CgroupLeaf, u32, &OwnedFd),
-    handshake: fn(OwnedFd) -> Option<OwnedFd>,
+    handshake: fn(OwnedFd) -> Option<(OwnedFd, Expect)>,
     warn: fn() -> W,
 ) -> W {
     let mut child = foreign_tracer::blocker();
@@ -120,5 +121,10 @@ fn an_abandoned_child_named_by_its_proc_directory_is_waited_for_with_a_warn(#[fi
 /// Mutant: the abandonment tears it down with no warn.
 #[skuld::test]
 fn an_abandoned_child_the_handshake_holds_is_waited_for_with_a_warn(#[fixture(tracer_group)] _group: &Group) {
-    assert_abandonment_warns_once(Names::Unknown, |_, _, _| {}, Some, slow);
+    assert_abandonment_warns_once(
+        Names::Unknown,
+        |_, _, _| {},
+        |pidfd| Some((pidfd, Expect::Waited)),
+        slow,
+    );
 }

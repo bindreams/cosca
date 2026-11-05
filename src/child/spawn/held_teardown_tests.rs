@@ -6,10 +6,10 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use super::held_teardown::{tear_down_held, Expect, HeldTeardown, PidfdTeardown};
+use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
-use crate::child::owned::teardown::Disposition;
+use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
@@ -496,4 +496,42 @@ fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
             "teardown after a failed spawn: the identity check failed; {clause}"
         )]
     );
+}
+
+/// A teardown that left its child uncollected with a clause below warn breaks the table's contract
+/// (every uncollected row is at warn): the line is not promoted to a warn, and the assertion in
+/// [`warn_pidfd_teardown`](crate::child::owned::teardown::warn_pidfd_teardown) fires.
+///
+/// Mutant: `failed_spawn_line` promotes a clause of an uncollected child to a warn, or the assertion
+/// is dropped.
+#[skuld::test]
+#[should_panic(expected = "the clause of an uncollected child is a warn")]
+fn an_uncollected_child_whose_clause_is_below_warn_breaks_the_contract() {
+    crate::log_capture::install();
+    let mut outcome = TeardownOutcome::new(ChildFate::Running { id: None });
+    outcome.uncollected = true;
+    outcome.clause = Some((log::Level::Debug, "a clause below warn".to_owned()));
+    PidfdTeardown::new(outcome, Expect::Anything).say_as_failed_spawn(&mut Diagnosis::default());
+}
+
+/// A child left uncollected is never answered `Killed`: a failed wait after a delivered kill leaves it
+/// ours, and `Killed` would read as ended. A child the teardown collected keeps the fate it has.
+///
+/// Mutant: the answer is the teardown's fate whatever `uncollected` says, or `Running` for every
+/// uncollected child.
+#[skuld::test]
+fn an_uncollected_child_is_answered_running_not_killed() {
+    let uncollected = after_a_failed_wait(Expect::Anything);
+    assert_eq!(uncollected.outcome.fate, ChildFate::Killed);
+    assert!(uncollected.outcome.uncollected);
+    assert_eq!(uncollected.answered_fate(), ChildFate::Running { id: None });
+
+    let mut killed = TeardownOutcome::new(ChildFate::Killed);
+    killed.clause = Some((log::Level::Debug, "reaped by someone else".to_owned()));
+    assert_eq!(
+        PidfdTeardown::new(killed, Expect::Anything).answered_fate(),
+        ChildFate::Killed
+    );
+    let (unknown, _) = teardown_of(Kill::Refused, Found::WaitFailed, Expect::Anything);
+    assert_eq!(unknown.answered_fate(), unknown.outcome.fate);
 }

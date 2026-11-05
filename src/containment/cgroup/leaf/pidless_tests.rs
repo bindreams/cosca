@@ -4,8 +4,7 @@
 
 use super::Abandoned;
 use crate::child::owned::owned_tests::teardown_lines::{outcome, rows};
-use crate::child::owned::teardown::Disposition;
-use crate::child::spawn::held_teardown::{Expect, Left, PidfdTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, Left, PidfdTeardown};
 
 /// `Ended` promises the child is reaped or will be, so a teardown that left it uncollected (a kill
 /// refused and the child running, a look or a wait that failed) is not `Ended`: it is `Uncollected`,
@@ -16,15 +15,16 @@ use crate::child::spawn::held_teardown::{Expect, Left, PidfdTeardown};
 #[skuld::test]
 fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() {
     for row in rows() {
-        let torn = PidfdTeardown::new(outcome(&row, Disposition::Leave), Expect::Anything);
-        let verdict = torn.verdict();
+        let torn = PidfdTeardown::new(outcome(&row, Disposition::Leave), Expect::Waited);
+        let fate = torn.outcome.fate;
         let answer = Abandoned::after_pidless_teardown(torn);
         if row.uncollected {
             assert_eq!(
                 answer,
                 Abandoned::Uncollected(Left {
                     clause: row.leave.clone(),
-                    verdict
+                    fate,
+                    expect: Expect::Waited,
                 }),
                 "{:?} {:?}",
                 row.kill,

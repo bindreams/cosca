@@ -202,14 +202,15 @@ impl TeardownOutcome {
 
     /// The one line of a failed spawn's teardown, led by the caller's name: the clause, `why` (the
     /// spawn's diagnosis, if still owed) leading it. It is the event's one warn if the clause is at
-    /// warn, the child is left uncollected, or `why` is owed (the diagnosis is then the warn, and
-    /// says what became of the child in it, whatever the clause's level); the caller logs the
-    /// returned line. Otherwise the clause is logged here at its level, on its own.
+    /// warn or `why` is owed (the diagnosis is then the warn, and says what became of the child in
+    /// it, whatever the clause's level); the caller logs the returned line. Otherwise the clause is
+    /// logged here at its level, on its own. A child left uncollected always has a clause at warn
+    /// (see [`Settlement`]'s table).
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn failed_spawn_line(&mut self, why: &mut crate::child::spawn::Diagnosis) -> Option<String> {
         let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
         let (level, text) = self.clause.take()?;
-        if level == log::Level::Warn || self.uncollected || why.is_owed() {
+        if level == log::Level::Warn || why.is_owed() {
             return Some(format!("{label}: {}", why.fold(&text)));
         }
         log::log!(level, "{label}: {text}");
@@ -224,6 +225,126 @@ impl TeardownOutcome {
             log::warn!("{line}");
         }
     }
+}
+
+/// What the caller of a teardown through a pidfd knows about the pidfd, which decides what the
+/// teardown may come to. Stated once, where the pidfd is handed over.
+///
+/// Only the Linux spawn tears a child down through a pidfd and produces these.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Expect {
+    /// An earlier look on the pidfd failed, or may have, so a wait on it may fail too: any outcome
+    /// stands.
+    Anything,
+    /// No earlier look on the pidfd failed, so a wait on it does not: a child the teardown left
+    /// uncollected is one whose kill was refused, and still running.
+    Waited,
+    /// As [`Waited`](Expect::Waited), and the child never ran the program, so it has this process's
+    /// credentials: nothing but its being gone can refuse its kill, and the teardown collects it.
+    Unexecuted,
+}
+
+/// What a teardown through a pidfd came to, and what its caller expected of it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+#[derive(Debug)]
+pub(crate) struct PidfdTeardown {
+    pub(crate) outcome: TeardownOutcome,
+    pub(crate) expect: Expect,
+}
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+impl PidfdTeardown {
+    pub(crate) fn new(outcome: TeardownOutcome, expect: Expect) -> PidfdTeardown {
+        PidfdTeardown { outcome, expect }
+    }
+
+    /// What a failed spawn answers of the child: the teardown's fate, but a child left uncollected is
+    /// never `Killed`. `Killed` says the child is dead or dying, and a failed wait that left it ours
+    /// cannot show that, while [`SpawnFailure::ended_child`](crate::child::spawn::failure::SpawnFailure)
+    /// counts `Killed` as ended.
+    pub(crate) fn answered_fate(&self) -> ChildFate {
+        match self.outcome.fate {
+            ChildFate::Killed if self.outcome.uncollected => ChildFate::Running { id: None },
+            fate => fate,
+        }
+    }
+
+    /// Takes the clause of a teardown that left its child uncollected, for the caller that logs the
+    /// warn.
+    pub(crate) fn left(&mut self) -> Left {
+        let clause = self.outcome.clause.take().map(|(_, clause)| clause);
+        Left {
+            clause: clause.unwrap_or_else(|| "its teardown left it uncollected".to_owned()),
+            fate: self.outcome.fate,
+            expect: self.expect,
+        }
+    }
+
+    /// Logs `line` through [`warn_pidfd_teardown`], as this teardown came out.
+    pub(crate) fn warn(&self, line: Option<&str>) {
+        warn_pidfd_teardown(line, self.outcome.fate, self.outcome.uncollected, self.expect);
+    }
+}
+
+/// A pidfd teardown that left its child uncollected, as an abandonment hands it on to the place that
+/// logs it: the clause for the caller's one warn, and what [`warn_pidfd_teardown`] reads of the
+/// teardown.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Left {
+    pub(crate) clause: String,
+    pub(crate) fate: ChildFate,
+    pub(crate) expect: Expect,
+}
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+impl Left {
+    /// Logs `line` through [`warn_pidfd_teardown`]: the teardown left the child uncollected.
+    pub(crate) fn warn(&self, line: &str) {
+        warn_pidfd_teardown(Some(line), self.fate, true, self.expect);
+    }
+}
+
+/// The one place the warn of a pidfd teardown is logged: `line`, then the teardown's contract,
+/// asserted after the warn so that a panic does not lose it. A child the teardown left uncollected
+/// always has a warn (see [`Settlement`]'s table), so no teardown breaks its contract unasserted.
+/// `uncollected` and `fate` are the teardown's ([`TeardownOutcome`]); `expect` is its caller's.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+)]
+pub(crate) fn warn_pidfd_teardown(line: Option<&str>, fate: ChildFate, uncollected: bool, expect: Expect) {
+    if let Some(line) = line {
+        log::warn!("{line}");
+    }
+    debug_assert!(
+        line.is_some() || !uncollected,
+        "the clause of an uncollected child is a warn"
+    );
+    debug_assert!(
+        !uncollected || expect == Expect::Anything || matches!(fate, ChildFate::Running { .. }),
+        "a wait on a child's own pidfd failed: {fate:?}"
+    );
+    debug_assert!(
+        expect != Expect::Unexecuted || !matches!(fate, ChildFate::Running { .. }),
+        "the kill of a child that never ran the program was refused"
+    );
 }
 
 impl OwnedChild {

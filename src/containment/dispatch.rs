@@ -134,7 +134,8 @@ impl Prepared {
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
     /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the
-    /// pidfd its handshake left for a child the leaf cannot name.
+    /// pidfd its handshake left for a child the leaf cannot name, with what the handshake expects
+    /// of a teardown through it.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
@@ -147,7 +148,7 @@ impl Prepared {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        #[cfg(target_os = "linux")] handshake: Option<std::os::fd::OwnedFd>,
+        #[cfg(target_os = "linux")] handshake: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Expect)>,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -211,9 +212,9 @@ pub(crate) enum AbandonedChild {
     /// handle on itself or refused its kill, as the text says.
     OutOfReach(String),
     /// It never named itself, and the handshake's pidfd reached it, but its teardown left it
-    /// uncollected. Carries the teardown's clause, for the one warn, and its verdict.
-    #[cfg(target_os = "linux")]
-    Uncollected(crate::child::spawn::held_teardown::Left),
+    /// uncollected. Carries the teardown's clause, for the one warn, and what its warn asserts. Only
+    /// a Linux leaf produces it.
+    Uncollected(crate::child::owned::teardown::Left),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.
     Front(crate::child::spawn::FrontFate),

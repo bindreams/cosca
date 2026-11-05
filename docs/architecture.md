@@ -101,8 +101,10 @@ In order:
      The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
      to `tear_down`, sending no kill of its own. A teardown through a pidfd
      (`held_teardown::tear_down_pidfd`) is told once what its caller knows of the pidfd
-     (`Expect`), and its warn is logged through `warn_pidfd_teardown`, which then asserts that
-     contract; the leaf's abandonment carries the verdict with the clause to where it is logged.
+     (`Expect`, in `child::owned::teardown`), and its warn is logged through
+     `warn_pidfd_teardown`, which then asserts that contract; the handshake hands the leaf its
+     pidfd copy with the `Expect`, and the leaf's abandonment carries it with the clause (`Left`)
+     to where it is logged.
      Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one

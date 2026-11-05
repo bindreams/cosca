@@ -1,13 +1,13 @@
 #[cfg(target_os = "linux")]
 use super::TornDown;
 use super::{refused_kill_answer, refused_kill_warning, Forgetting, Refused};
-use crate::child::owned::owned_tests::teardown_lines::{self, PID};
+#[cfg(any(target_os = "linux", windows))]
+use crate::child::owned::owned_tests::teardown_lines;
+use crate::child::owned::owned_tests::teardown_lines::PID;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, TeardownKind, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown, TeardownKind, TeardownOutcome};
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
-#[cfg(target_os = "linux")]
-use crate::child::spawn::held_teardown::{Expect, PidfdTeardown};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
@@ -40,7 +40,7 @@ fn second_teardown(kill: Result<Sent, std::io::Error>, reap: ReapAnswer, id: Opt
 fn torn_down(outcome: TeardownOutcome) -> Refused {
     Refused::TornDown(TornDown {
         torn: PidfdTeardown::new(outcome, Expect::Waited),
-        leak: "a pidfd",
+        leak: Some("a pidfd"),
         why: None,
     })
 }
@@ -59,9 +59,10 @@ fn a_refused_kill_answers_from_what_became_of_the_child() {
             refused_kill_answer(&torn_down(second_teardown(Ok(Sent::Delivered), exit(), id)), id),
             ChildFate::Reaped
         );
+        // Killed, and the wait failed: uncollected, so not answered as ended (`Killed`).
         assert_eq!(
             refused_kill_answer(&torn_down(second_teardown(Ok(Sent::Delivered), failed(), id)), id),
-            ChildFate::Killed
+            ChildFate::Running { id: None }
         );
         // Refused again, and still running at the look: left, with the identity the spawn read.
         let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
@@ -124,6 +125,61 @@ fn a_released_child_is_worded_as_a_child_left() {
         format!("teardown kill of child 7 failed ({e}){}", teardown_lines::LEFT)
     );
     assert!(!text.contains("orphan"), "{text}");
+}
+
+/// A refused kill of a backend already forgotten as not shown to be ours still holds the child's
+/// pidfd, so Linux tears the child down through it, as for one it forgets now: killed, reaped, and
+/// said in the one warn, which leaks nothing of its own. The child is a real one, ours.
+///
+/// Mutant: the case answers without a teardown, leaving the child running and its pidfd closed
+/// unused; or panics.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd() {
+    let mut child =
+        crate::test_spawn::spawn(&mut crate::test_child::held_std_killable_blocker()).expect("spawn the child");
+    let pid = child.id();
+    let pidfd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("pidfd_open");
+    let proc = super::ProcSource::Foreign {
+        stdin: None,
+        stdout: None,
+        stderr: None,
+        fate: super::Forgotten::Unproven,
+        pid: Some(pid),
+        pidfd: super::PinnedPidfd(Some(pidfd)),
+    };
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let e = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let fate = proc.after_refused_kill(
+        pid,
+        Some(ProcessId::current()),
+        &e,
+        &mut crate::child::spawn::Diagnosis::default(),
+    );
+    assert_eq!(fate, ChildFate::Reaped);
+    reaps.assert_killed();
+    let already_reaped = child
+        .wait()
+        .expect_err("the teardown reaped the child through its pidfd");
+    assert_eq!(already_reaped.raw_os_error(), Some(libc::ECHILD));
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(
+        warns,
+        vec![format!(
+            "teardown after a failed spawn: teardown kill of child {pid} failed ({e}); tokio's handle for it was \
+             already forgotten; teardown of child {pid}: reaped it after the kill"
+        )]
+    );
 }
 
 /// The warn for a refused teardown kill carries every row's clause of the table, whatever its level.

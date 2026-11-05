@@ -73,9 +73,10 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
-use super::held_teardown::{tear_down_held, tear_down_pidfd, Expect, HeldTeardown, PidfdTeardown};
+use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
 use crate::child::owned::teardown::Disposition;
+use crate::child::owned::teardown::{Expect, PidfdTeardown};
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
@@ -277,8 +278,9 @@ impl Drop for ShutOnDrop<'_> {
 
 /// Where a child spawned for a cgroup leaf leaves the handshake's pidfd, or a copy of it, when its
 /// spawn fails after its fork: for the leaf's abandonment, which uses it for a child the leaf cannot
-/// name (see [`Handshake::leaving_front`]).
-pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<OwnedFd>>>;
+/// name (see [`Handshake::leaving_front`]). It goes with the [`Expect`] of a teardown through it,
+/// which the handshake knows and the leaf does not.
+pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<(OwnedFd, Expect)>>>;
 
 /// Who answers for a child whose spawn failed after its fork, when that child is an elevation
 /// front (see [`Handshake::leaving_front`]).
@@ -896,7 +898,7 @@ fn conclude<T: Spawned>(
             |pidfd: OwnedFd| end_through_pidfd(None, pidfd, expect, warn_after, &mut super::Diagnosis::default());
         match front {
             LeftFront::ToLeaf(leaf) => {
-                leaf.set(Some(pidfd));
+                leaf.set(Some((pidfd, expect)));
                 (error, ChildFate::Unknown)
             }
             LeftFront::Here(front) if !collected => {
@@ -919,19 +921,17 @@ fn conclude<T: Spawned>(
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why)
-                    .outcome
-                    .fate;
+                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why).answered_fate();
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
                 match pidfd.try_clone() {
-                    Ok(copy) => leaf.set(Some(copy)),
+                    Ok(copy) => leaf.set(Some((copy, expect))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
-                (error, teardown(pidfd).outcome.fate)
+                (error, teardown(pidfd).answered_fate())
             }
-            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).outcome.fate),
+            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).answered_fate()),
         }
     };
     // A failed spawn that dropped a child it never told to go, with nothing holding it. std's
@@ -1043,8 +1043,7 @@ fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time
         warn_after,
         &mut super::Diagnosis::default(),
     )
-    .outcome
-    .fate
+    .answered_fate()
 }
 
 /// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran

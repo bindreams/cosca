@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
-use crate::child::spawn::held_teardown::{tear_down_pidfd, warn_pidfd_teardown, Expect, Left, PidfdTeardown};
+use crate::child::owned::teardown::{Expect, Left, PidfdTeardown};
+#[cfg(target_os = "linux")]
+use crate::child::spawn::held_teardown::tear_down_pidfd;
 #[cfg(target_os = "linux")]
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
@@ -926,14 +928,11 @@ impl CgroupLeaf {
         if self.report.is_some() {
             match self.abandon_before_verdict(false, None, warn) {
                 Abandoned::OutOfReach(why) => log::warn!("cgroup v2: {why}"),
-                Abandoned::Uncollected(left) => warn_pidfd_teardown(
-                    format_args!(
-                        "{}: {}",
-                        crate::containment::dispatch::TeardownCaller::FailedSpawn.label(),
-                        left.clause
-                    ),
-                    &left.verdict,
-                ),
+                Abandoned::Uncollected(left) => left.warn(&format!(
+                    "{}: {}",
+                    crate::containment::dispatch::TeardownCaller::FailedSpawn.label(),
+                    left.clause
+                )),
                 Abandoned::Ended | Abandoned::MaybeUnreaped | Abandoned::Front(_) => {}
             }
         }
@@ -1047,8 +1046,7 @@ pub(crate) enum Abandoned {
     /// The child never named itself, and the handshake's pidfd reached it, but its teardown left it
     /// uncollected (its kill refused and it running, a wait or look that failed). Says what the
     /// teardown found: its clause, for the caller's one warn, which the failed spawn's label leads,
-    /// and the fate the teardown established, for the caller to log through
-    /// [`warn_pidfd_teardown`].
+    /// and what its warn asserts, for the caller to log through [`Left::warn`].
     Uncollected(Left),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
@@ -1108,7 +1106,7 @@ impl CgroupLeaf {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        handshake: Option<OwnedFd>,
+        handshake: Option<(OwnedFd, Expect)>,
         warn: &mut dyn TeardownWarn,
     ) -> Abandoned {
         let Some(channel) = self.report.take() else {
@@ -1118,9 +1116,16 @@ impl CgroupLeaf {
         self.abandoned = true;
         let mut received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
-        // The handshake's pidfd names the child where its intent named it by no handle.
+        // The pidfd of a child that never ran the program, from its own report: nothing looked at
+        // it, and nothing but its being gone can refuse its kill.
+        let mut expect = Expect::Unexecuted;
+        // The handshake's pidfd names the child where its intent named it by no handle, and the
+        // handshake says what it expects of a teardown through it.
         if received.pidfd.is_none() && received.proc_dir.is_none() {
-            received.pidfd = handshake;
+            if let Some((pidfd, handed)) = handshake {
+                received.pidfd = Some(pidfd);
+                expect = handed;
+            }
         }
         // A child that never named itself never reached the point where it could run the program:
         // it is no front, and the handshake's pidfd alone can reap it.
@@ -1128,9 +1133,7 @@ impl CgroupLeaf {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                // The pidfd may be the handshake's, whose own look may have failed: no wait on it
-                // is expected to succeed.
-                let torn = tear_down_pidfd(None, pidfd, None, Expect::Anything, warn.due());
+                let torn = tear_down_pidfd(None, pidfd, None, expect, warn.due());
                 return Abandoned::after_pidless_teardown(torn);
             }
         }

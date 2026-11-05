@@ -1554,8 +1554,10 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
         ChildFate::Unknown,
         "the leaf's abandonment answers, not the handshake"
     );
-    let stashed = left.take().expect("the pidfd is left for the leaf");
+    let (stashed, expect) = left.take().expect("the pidfd is left for the leaf");
     assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
+    // The peek of the running front succeeded, so a wait on its pidfd is expected to.
+    assert_eq!(expect, crate::child::owned::teardown::Expect::Waited);
     // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
     // reaped before this wait.
     drop(cat.stdin.take());
