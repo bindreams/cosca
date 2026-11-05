@@ -136,6 +136,34 @@ fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtre
     }
 }
 
+/// Windows runs the walk with its own consts, `ALLOW_EQUAL_ORDER` and `ORDER_AFTER_PARENT`, and
+/// the table above is the reused-creator edge: the creator read passes it (the candidate's creator
+/// pid is its accepted parent's pid), so only the order rule drops it. Nothing real reaches this
+/// edge, as a creator always has the lower sequence number, so the stub states it.
+///
+/// Mutant (CI runs this row; no other row pins the consts on Windows): `ORDER_AFTER_PARENT` is
+/// `false` on Windows, or `descendants_from_key` passes the flags swapped. 300 is kept.
+#[cfg(windows)]
+#[skuld::test]
+fn on_windows_a_reused_creator_edge_is_dropped_under_the_production_consts() {
+    use super::{ALLOW_EQUAL_ORDER, ORDER_AFTER_PARENT};
+    let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
+    let tokens = HashMap::from([
+        (200u32, ROOT_TOKEN + 10),
+        (300u32, ROOT_TOKEN + 5), // after the root, before its accepted parent
+        (400u32, ROOT_TOKEN + 20),
+    ]);
+    let got = descendants_with(
+        root(),
+        root_key(),
+        &parents,
+        ALLOW_EQUAL_ORDER,
+        ORDER_AFTER_PARENT,
+        resolver(&tokens),
+    );
+    assert_eq!(pids(got), [200]);
+}
+
 /// A real chain, each key after its parent's, is kept under every setting.
 #[skuld::test]
 fn a_chain_whose_keys_each_follow_their_parents_is_kept_under_both_settings() {

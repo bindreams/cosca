@@ -94,9 +94,7 @@ pub(crate) struct RestrictedChild {
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
     /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `ping.exe` it launched
-    /// ran on for an hour. That orphan is not just a leak: `wait_for_child` reads a
-    /// host-wide `(pid, ppid)` snapshot, where a stranded grandchild whose dead parent pid
-    /// Windows later recycles onto a new fixture shell is a candidate the order-key rule must drop.
+    /// ran on for an hour. `wait_for_child` reads this job's members.
     job: HANDLE,
     pid: u32,
 }
@@ -138,28 +136,29 @@ impl RestrictedChild {
         );
     }
 
-    /// The pid of this fixture's first child, once the shell has spawned it. Polls the
-    /// `(pid, ppid)` snapshot the crate already builds — bounded by the child's appearance,
-    /// which `cmd /c` guarantees, and asserted rather than timed out.
+    /// The pid of this fixture's first child, once the shell has spawned it.
+    ///
+    /// Reads the fixture's job, not the process tree: the job lists exactly the processes
+    /// created under the shell, so a pre-existing orphan whose creator pid was recycled onto
+    /// this shell is not in it. Nothing opens the shell, which may grant us no query right
+    /// (`spawn_restricted_shell` with `PROCESS_SYNCHRONIZE`); the child is the one process
+    /// opened, and it is not DACL-restricted. A member is the child when its creator pid, read on
+    /// its own handle, is the shell's.
+    ///
+    /// No event announces the child (a job's completion messages are not guaranteed to be
+    /// delivered), so this re-reads the live member list until `cmd /c` has created it. The
+    /// condition is deterministic and has no cap.
     pub(crate) fn wait_for_child(&self) -> u32 {
-        // Windows never reparents and recycles pids from a small dense table, so a raw
-        // `ppid == self.pid` scan can match a pre-existing orphan whose real parent exited
-        // and whose pid was then handed to this fixture. Route through the crate's own
-        // stale-ppid defense (`children_of_from_key` applies the order-key rule) so only a
-        // genuine child is returned. The fixture's pid may be unopenable by pid, which is how
-        // `anchor` reads the anchor's order key, so the key comes from the owned handle.
-        let (key, me_key) = super::backend::ordered_from_handle(self.handle, self.pid, None, None)
-            .0
-            .found()
-            .expect("the owned handle always yields an identity");
-        let me = super::ProcessId::from_parts_for_test(self.pid, key);
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
-            let kernel = &super::HostKernel;
-            let parents = crate::containment::enumerate::process_parents(kernel).expect("the process snapshot");
-            let kids = crate::containment::treewalk::children_of_from_key(kernel, me, me_key, &parents);
-            if let Some(kid) = kids.first() {
-                return kid.pid();
+            let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
+            for pid in members.into_iter().filter(|&pid| pid != self.pid) {
+                match super::backend::ordered_read(pid, None, Some(self.pid)).0 {
+                    super::Resolved::Found(_) => return pid,
+                    // Not created by the shell, or already gone.
+                    super::Resolved::Gone => {}
+                    super::Resolved::Unknown => panic!("fixture: the job member {pid} cannot be read"),
+                }
             }
             std::thread::yield_now();
         }
