@@ -1364,8 +1364,8 @@ impl Marker {
 
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
         // ppid-walk descendants NOT already signalled this sweep (need THIS pass's snapshot;
-        // skipped when blind, since there is nothing to walk). `descendants` applies the
-        // crate's own token guard against the root.
+        // skipped when blind, since there is nothing to walk). `descendants` keeps only
+        // processes whose order key orders at or after the root's.
         //
         // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
         // process and has no descendants left to walk to.
@@ -1381,9 +1381,23 @@ impl Marker {
                 new_walk.push(root);
             }
             if !blind {
-                for id in crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
-                    if seen.insert(id) {
-                        new_walk.push(id);
+                match crate::containment::treewalk::descendants(&crate::identity::HostKernel, root, &parents) {
+                    Ok(found) => {
+                        for id in found {
+                            if seen.insert(id) {
+                                new_walk.push(id);
+                            }
+                        }
+                    }
+                    // Not observed is not observed absent: like a blind pass, the walk channel
+                    // is skipped and the sweep reports `incomplete`.
+                    Err(e) => {
+                        log::warn!(
+                            "fd marker {:#x}: the root's descendants could not be walked ({e}) \
+                             - the ppid-walk channel is blind this pass",
+                            self.handle
+                        );
+                        *incomplete = true;
                     }
                 }
             }
@@ -1573,8 +1587,8 @@ impl Marker {
     /// then re-verifies the identity once more immediately before signalling, closing the
     /// remaining window exactly as the tree walk does.
     ///
-    /// No separate start-token order guard: unlike the ppid-walk channel (where a stale ppid can
-    /// point at a recycled root pid, which is what `treewalk`'s token guard defends against),
+    /// No separate order-key check: unlike the ppid-walk channel (where a stale ppid can
+    /// point at a recycled root pid, which is what `treewalk`'s order-key check defends against),
     /// membership re-checked HERE, at signal time, is already a complete proof — `Marker.handle`
     /// names a kernel object that cannot be reissued while `self.read` is held (the module's
     /// central invariant), so a pid that currently holds an fd naming it can only be a real
