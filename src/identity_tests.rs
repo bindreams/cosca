@@ -163,8 +163,8 @@ enum Owner {
 /// number, a missing record or a missing order key settles `Unknown` before the proof (a gone parent
 /// then blames the candidate); an unreadable number reads as a match or as another parent's; a failed
 /// proof blames the candidate or answers `Gone`; a `Gone` read becomes `Unknown`; a read before the
-/// order bound waits for the proof, or is `Unknown` when the proof fails (the proof is asked for, here
-/// a panic).
+/// order bound, or has no order key under a bound, waits for the proof, or is `Unknown` when the proof
+/// fails (the proof is asked for, here a panic).
 #[skuld::test]
 fn a_candidates_read_and_its_parents_proof_give_one_answer() {
     use super::{OrderKey, Ordered, OrderedRead, ParentRead, UnknownCause};
@@ -311,6 +311,22 @@ fn a_candidates_read_and_its_parents_proof_give_one_answer() {
         }
     }
 
+    // Where a bound applies, a found read with no order key is not kept, as `ProcessId::parent` has it.
+    for claimed in [ParentRead::Is(PARENT), ParentRead::Is(OTHER), ParentRead::Unreadable] {
+        let (answer, cause) = OrderedRead {
+            read: Resolved::Found((Key::for_test(5), None)),
+            parent: claimed,
+            cause: stated(),
+        }
+        .judged(CANDIDATE, PARENT, Some(OrderKey::for_test(8)))
+        .proved(|| panic!("the parent's proof is asked for"));
+        assert_eq!(
+            (answer, owner_of(cause)),
+            nobody_gone,
+            "a read with no order key under a bound, its parent number {claimed:?}"
+        );
+    }
+
     for (read_name, read, expected) in [
         ("found", found, own_found),
         ("gone", Resolved::Gone, own_gone),
@@ -356,8 +372,11 @@ fn the_keep_predicate_keeps_only_a_key_after_the_bound() {
 /// the read's own rule, so only the bounds the filter hands out are on test. A real stale creator
 /// needs a Windows process table: that is `treewalk_tests`' live Windows rows.
 ///
-/// Mutants: the walk hands out a bound off Windows (`y` is dropped); it hands out none on Windows, or
-/// the root's rather than the accepted parent's (`y` is kept).
+/// The root's bound is stated here, so what the anchor hands out off Windows is not on test; the
+/// row pins how the filter passes bounds down.
+///
+/// Mutants: the walk hands out no bound on Windows, or the root's rather than the accepted parent's
+/// (`y` is kept).
 #[skuld::test]
 fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
     use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};

@@ -55,8 +55,8 @@
 //! # The parent read (every platform)
 //!
 //! A snapshot row's ppid is only a number. The resolver reads the candidate again, and its parent
-//! number, id and order key all come from that one read, so they describe the same process. A candidate
-//! whose parent number is not the accepted parent's pid is dropped, and so is one whose accepted
+//! number and id (on Windows, also the order key) all come from that one read, so they describe the
+//! same process. A candidate whose parent number is not the accepted parent's pid is dropped, and so is one whose accepted
 //! parent no longer holds that pid when the read is done. So a descendant whose parent exits while
 //! the walk runs is dropped with its subtree: Linux and macOS reparent it, so its record names its
 //! new parent; Windows never updates the creator pid, which still names the dead parent, and the

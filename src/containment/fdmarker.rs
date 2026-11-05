@@ -1365,7 +1365,7 @@ impl Marker {
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
         // ppid-walk descendants NOT already signalled this sweep (need THIS pass's snapshot;
         // skipped when blind, since there is nothing to walk). The walk keeps a process whose
-        // ppid, read after the root was proved, names it (on Windows, one that also follows it).
+        // ppid, read after the root was proved, names it.
         //
         // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
         // process and has no descendants left to walk to.

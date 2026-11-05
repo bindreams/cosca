@@ -269,10 +269,9 @@ impl OrderedRead {
             "a parent was named, so its number must be asked for"
         );
         match (claimed, read) {
+            // As `parent_with`: where a bound applies, a read with no order key is not kept either.
             (_, Resolved::Found((_, order)))
-                if order
-                    .zip(bound)
-                    .is_some_and(|(order, bound)| !keeps_order(order, bound)) =>
+                if bound.is_some_and(|bound| !order.is_some_and(|order| keeps_order(order, bound))) =>
             {
                 Judged::Settled((Resolved::Gone, UnknownCause::default()))
             }

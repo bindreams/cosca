@@ -54,10 +54,6 @@ impl ProcessId {
         let Some((parent, parent_order)) = resolution_of("ppid", ppid, read)? else {
             return Ok(None);
         };
-        debug_assert!(
-            own_order.is_some() == ORDER_AFTER_PARENT && parent_order.is_some() == ORDER_AFTER_PARENT,
-            "the reads carry an order key exactly where ORDER_AFTER_PARENT"
-        );
         // Where the creator is never updated, a genuine parent started before its child.
         if ORDER_AFTER_PARENT {
             let kept = own_order

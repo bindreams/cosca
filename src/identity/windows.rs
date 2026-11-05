@@ -326,21 +326,44 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 /// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
 /// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause ([`creator_read`]).
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
-    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-        Opened::Found(h) => h,
+    let handle = match open_for_ordered_read(pid) {
+        Ok(handle) => handle,
         // No handle, so no creator: a read that asked is told it could not read it.
-        Opened::Gone => return OrderedRead::missing(Resolved::Gone, UnknownCause::default(), ask_parent),
-        Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), ask_parent),
+        Err(read) => return OrderedRead::missing(read, UnknownCause::default(), ask_parent),
     };
+    let (read, parent, cause) = read_on(handle, pid, expected, ask_parent);
+    OrderedRead {
+        read: read.map(|(key, order)| (key, Some(order))),
+        parent,
+        cause,
+    }
+}
+
+/// The handle [`ordered_read`] reads on; otherwise why there is none ([`Resolved::Gone`] or
+/// [`Resolved::Unknown`]).
+fn open_for_ordered_read(pid: RawPid) -> Result<HANDLE, Resolved<std::convert::Infallible>> {
+    match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Opened::Found(handle) => Ok(handle),
+        Opened::Gone => Err(Resolved::Gone),
+        Opened::Denied(_) => Err(Resolved::Unknown),
+    }
+}
+
+/// The reads of [`ordered_read`] on `handle`, which it closes.
+fn read_on(
+    handle: HANDLE,
+    pid: RawPid,
+    expected: Option<Key>,
+    ask_parent: bool,
+) -> (Resolved<(Key, OrderKey)>, ParentRead, UnknownCause) {
     let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
-    let read = read.map(|(key, order)| (key, Some(order)));
     let (parent, cause) = if ask_parent {
         creator_read(pid, creator_pid(handle), cause)
     } else {
         (ParentRead::NotAsked, cause)
     };
     close(handle);
-    OrderedRead { read, parent, cause }
+    (read, parent, cause)
 }
 
 /// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives; a refused query is
@@ -403,11 +426,12 @@ fn combine(
 /// process holds it now. The read that proves the process is still there is the one that gives the
 /// key.
 pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let OrderedRead { read, cause, .. } = ordered_read(pid, Some(key), false);
-    (
-        read.map(|(_, order)| order.expect("a Windows read has its order key")),
-        cause,
-    )
+    let handle = match open_for_ordered_read(pid) {
+        Ok(handle) => handle,
+        Err(read) => return (read.map(|never| match never {}), UnknownCause::default()),
+    };
+    let (read, _, cause) = read_on(handle, pid, Some(key), false);
+    (read.map(|(_, order)| order), cause)
 }
 
 /// Build a `ProcessId` from an already-open Windows process handle and its pid, reusing the
