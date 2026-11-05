@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::identity::ProcessId;
+use crate::identity::{HostKernel, ProcessId, Resolved};
 #[cfg(unix)]
 use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release};
 #[cfg(windows)]
@@ -88,6 +88,7 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let (child, id) = live_member();
     // The `/proc` path: the anchor's `starttime` is its identity, so a refused `stat` is a refused
     // identity. (A pidfs anchor's identity needs no `/proc`; see `tree_pidfs_tests`.)
+    #[cfg(target_os = "linux")]
     let id = crate::identity::ticks_id(id.pid());
     let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
@@ -125,7 +126,7 @@ fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
 }
 
 /// A spawned child's parent is this process: `parent` reads the child again under the parent it
-/// found, which on Linux and Windows must name that parent. Mutant: the check of the child's own
+/// found, which must name that parent on every platform. Mutant: the check of the child's own
 /// parent rejects the real one.
 #[skuld::test]
 fn the_parent_of_a_spawned_child_is_the_current_process() {
@@ -133,6 +134,55 @@ fn the_parent_of_a_spawned_child_is_the_current_process() {
     let parent = kid.parent().expect("the parent is readable");
     release(child);
     assert_eq!(parent, Some(ProcessId::current()));
+}
+
+/// A live process that did not create the candidate is not its parent, though it is a real process
+/// holding a real pid: the candidate's own parent number is read, not the listing's claim.
+///
+/// Mutant: `of_ordered_with` ignores `parent`.
+#[skuld::test]
+fn a_candidate_is_gone_under_a_parent_that_did_not_create_it() {
+    let (x_child, x) = live_member();
+    let (y_child, y) = live_member();
+    let (read, _) = ProcessId::of_ordered_with(&HostKernel, y.pid(), Some(x));
+    release(y_child);
+    release(x_child);
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// The candidate's parent number is right but another process holds it: the proof of the parent
+/// after the read fails.
+///
+/// Mutant: the parent is not proved again after the candidate's read.
+#[skuld::test]
+fn a_candidate_is_gone_under_the_right_parent_pid_with_another_key() {
+    let (child, kid) = live_member();
+    let (read, _) = ProcessId::of_ordered_with(&HostKernel, kid.pid(), Some(ProcessId::current().with_other_value()));
+    release(child);
+    assert_eq!(read, Resolved::Gone);
+}
+
+/// The candidate's parent number is right but its parent cannot be proved: `Unknown`, blaming the
+/// parent and not the candidate. Windows has its own row, in `windows_tests`, whose parent is a
+/// process that grants no query right.
+///
+/// Mutant: an unprovable parent reads as held (`Found`) or as gone, or blames the candidate.
+#[cfg(unix)]
+#[skuld::test]
+fn a_candidate_is_unknown_when_its_parent_cannot_be_proved() {
+    let (child, kid) = live_member();
+    let me = std::process::id();
+    // On Linux the parent is a `ticks` id: a `pidfs` id is proved by its pidfd, without `/proc`, so
+    // a refused `stat` would not make its proof fail.
+    #[cfg(target_os = "linux")]
+    let parent = crate::identity::ticks_id(me);
+    #[cfg(not(target_os = "linux"))]
+    let parent = ProcessId::current();
+    let (kernel, _guard) = crate::identity::unreadable(me);
+    let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), Some(parent));
+    release(child);
+    assert_eq!(read, Resolved::Unknown);
+    assert_eq!(cause.blamed_parent(), Some(me));
 }
 
 /// A spawned child is among the current process's direct children, by identity.
