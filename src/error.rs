@@ -81,8 +81,9 @@ pub enum RecordErrorKind {
     #[error("unknown record format version")]
     UnknownVersion,
     /// The record was written on a different OS. Start tokens are not comparable across
-    /// platforms — Linux's are boot-relative jiffies, Windows's and macOS's are absolute
-    /// timestamps — so a cross-platform comparison is meaningless, not merely wrong.
+    /// platforms — Linux's are per-boot values (a pidfd inode or boot-relative jiffies), Windows's
+    /// and macOS's are absolute timestamps — so a cross-platform comparison is meaningless, not
+    /// merely wrong.
     #[error("the record was written on a different platform")]
     ForeignPlatform,
     /// The record's pid cannot name a single process on this platform: zero anywhere, or
@@ -91,8 +92,9 @@ pub enum RecordErrorKind {
     /// rejected up front rather than left to fail — or, worse, succeed — later.
     #[error("the record's pid cannot name a single process")]
     InvalidPid,
-    /// Linux: the record was written in a different boot session, where the jiffy counter
-    /// started over. The saved token would alias onto an unrelated process.
+    /// Linux: the record was written in a different boot session, where the token's counter (the
+    /// pidfd inodes, the jiffies) started over. The saved token would alias onto an unrelated
+    /// process.
     #[error("the record was written in a different boot session")]
     ForeignBootSession,
     /// Linux: the record carries no boot identifier, so its boot session cannot be checked.

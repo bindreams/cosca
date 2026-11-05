@@ -7,8 +7,8 @@
 //! teardown it takes a `(pid, ppid)` snapshot of the host, walks the ppid chain
 //! down from the root, and kills each *genuine* descendant by identity. It is
 //! best-effort and reports as [`crate::containment::Containment::TreeWalk`]: it
-//! misses reparented orphans (a child whose parent already exited, so its ppid no
-//! longer chains to the root) and broker-spawned escapes.
+//! misses reparented orphans (a child whose parent exited before the walk read the
+//! child, so its ppid no longer chains to the root) and broker-spawned escapes.
 //!
 //! # The PID-reuse / stale-ppid defense (the order-key rule)
 //!
@@ -66,11 +66,14 @@ pub(crate) enum KillOutcome {
 /// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
 ///
-/// `ppid` is the parent the snapshot gave `pid`. Where the read of `pid` carries its parent (Linux:
-/// the `stat` the id was made with), a candidate with another parent now is dropped: the pid has
-/// changed hands since the snapshot. Elsewhere the listing has nothing to check it against.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, ppid: RawPid) -> Option<(ProcessId, OrderKey)> {
-    match ProcessId::of_ordered_with(kernel, pid, Some(ppid)).0 {
+/// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
+/// `pid` carries its parent (Linux: the `stat` the id was made with), a candidate is dropped when
+/// its parent's number is another now, which means the pid changed hands since the snapshot or the
+/// same process was orphaned and is no longer in the tree; and when its parent's number no longer
+/// holds `parent`, which means the parent was reaped and its number taken by a process whose own
+/// children the candidate could be. Elsewhere the listing has nothing to check it against.
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Option<(ProcessId, OrderKey)> {
+    match ProcessId::of_ordered_with(kernel, pid, Some(parent)).0 {
         Resolved::Found(read) => Some(read),
         Resolved::Gone => None,
         Resolved::Unknown => {
@@ -109,7 +112,8 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
-/// identity and order key via `resolve(pid, ppid)` and keeps it ONLY if its key orders correctly
+/// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
+/// the edge names, and keeps it ONLY if its key orders correctly
 /// against `root_key` per `allow_equal` (see module docs). `resolve` is injected
 /// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
@@ -119,17 +123,17 @@ pub(crate) fn descendants_with(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid, RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let keep = |key: OrderKey| keeps_order(key, root_key, allow_equal);
 
     // BFS over the ppid forest. `frontier` holds pids whose children we still
-    // need to visit; it starts as just the root pid. A pid joins the result (and
+    // need to visit; it starts as just the root. A pid joins the result (and
     // the next frontier) only if its ppid is in the current accepted set AND its
     // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
     let mut result: Vec<ProcessId> = Vec::new();
-    let mut frontier: Vec<RawPid> = vec![root.pid()];
+    let mut frontier: Vec<ProcessId> = vec![root];
     // Remaining (pid, ppid) edges not yet attached to the tree.
     let mut pending: Vec<(RawPid, RawPid)> = parents.to_vec();
     // Pids already accepted, so a duplicate edge (e.g. a snapshot that lists a
@@ -142,20 +146,20 @@ pub(crate) fn descendants_with(
         std::collections::HashMap::new();
 
     while !frontier.is_empty() {
-        let mut next: Vec<RawPid> = Vec::new();
+        let mut next: Vec<ProcessId> = Vec::new();
         // Partition: edges whose ppid is in the current frontier are candidates.
         let mut still_pending: Vec<(RawPid, RawPid)> = Vec::with_capacity(pending.len());
         for (pid, ppid) in pending.drain(..) {
-            if !frontier.contains(&ppid) {
+            let Some(&parent) = frontier.iter().find(|p| p.pid() == ppid) else {
                 still_pending.push((pid, ppid));
                 continue;
-            }
+            };
             // A process is never its own parent; guard against a degenerate
             // pid == ppid self-loop that would otherwise spin the BFS.
             if pid == ppid {
                 continue;
             }
-            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid, ppid));
+            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid, parent));
             let Some((id, key)) = read else {
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
@@ -168,7 +172,7 @@ pub(crate) fn descendants_with(
             // same process twice.
             if accepted.insert(pid) {
                 result.push(id);
-                next.push(pid);
+                next.push(id);
             }
         }
         pending = still_pending;
@@ -212,19 +216,19 @@ pub(crate) fn descendants(
         root_key,
         parents,
         ALLOW_EQUAL_ORDER,
-        |pid, ppid| resolve_or_drop(kernel, pid, ppid),
+        |pid, parent| resolve_or_drop(kernel, pid, parent),
     ))
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
-/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, ppid)` is
+/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, parent)` is
 /// injected for purity. The parent itself is never included.
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid, RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -232,7 +236,7 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some((id, key)) = resolve(pid, ppid) else {
+        let Some((id, key)) = resolve(pid, parent) else {
             log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
             continue;
         };
@@ -266,7 +270,7 @@ pub(crate) fn children_of(
         parent_key,
         parents,
         ALLOW_EQUAL_ORDER,
-        |pid, ppid| resolve_or_drop(kernel, pid, ppid),
+        |pid, parent| resolve_or_drop(kernel, pid, parent),
     ))
 }
 

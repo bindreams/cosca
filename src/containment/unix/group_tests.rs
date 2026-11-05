@@ -642,3 +642,29 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
         );
     }
 }
+
+/// A member whose pidfd cannot be opened fails the listing: a refused `pidfd_open` stays
+/// `Unsupported` (the caller reports it so), a transient one is `Other`. Mutant: "the listing error
+/// is always `Other`", "the member is excluded".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_fails_for_a_member_whose_pidfd_cannot_be_opened_and_keeps_a_refusal_unsupported() {
+    use rustix::io::Errno;
+
+    use crate::identity::stat_parse::stat_fixture;
+
+    for (errno, kind) in [
+        (Errno::PERM, std::io::ErrorKind::Unsupported),
+        (Errno::MFILE, std::io::ErrorKind::Other),
+    ] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pids(Ok(&[PID]))
+            .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 777)))
+            .on_pidfd_open(PID, Err(errno));
+        // `stat_fixture` puts the process in group 1234.
+        let err = members(&kernel, 1234).expect_err("an unopenable member lists nothing");
+        assert_eq!(err.kind(), kind, "{errno}: {err}");
+        assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");
+    }
+}

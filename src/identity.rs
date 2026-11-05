@@ -27,7 +27,7 @@ pub use state::{Existence, Liveness, Resolved};
 
 #[path = "identity/persist.rs"]
 mod persist;
-pub use persist::{Platform, ProcessIdRecord, RECORD_VERSION};
+pub use persist::{Platform, ProcessIdRecord, TokenKind, RECORD_VERSION};
 
 #[path = "identity/tree.rs"]
 mod tree;
@@ -65,13 +65,14 @@ impl Key {
         self.0
     }
 
-    /// A key restored from a record's `token`; only Linux keys have a kind.
-    fn restored(token: u64, _kind: Option<&str>) -> Key {
+    /// A key restored from a record's `token`. The kind is ignored: only Linux keys have one, and
+    /// the record's platform has been checked first.
+    fn restored(token: u64, _kind: Option<&TokenKind>) -> Key {
         Key(token)
     }
 
     /// The kind a record names for this key: none, off Linux.
-    fn wire_kind(self) -> Option<&'static str> {
+    fn wire_kind(self) -> Option<TokenKind> {
         None
     }
 
@@ -170,13 +171,16 @@ impl ProcessId {
 
     /// [`of_with`](Self::of_with), with the order key of the same read beside the id.
     ///
-    /// `expected_ppid`: the parent the caller was told the process has. Where the read carries the
-    /// process's parent (Linux: the `stat` made with the id), a process with another parent now is
-    /// [`Resolved::Gone`]: the pid has changed hands. Elsewhere it is not checked.
+    /// `parent`: the process the caller was told is this one's parent. Where the read carries the
+    /// process's parent (Linux: the `stat` made with the id), a process with another parent number
+    /// now is [`Resolved::Gone`]: the pid has changed hands. A `stat` that names the parent's number
+    /// does not yet name the parent, which may have been reaped and its number taken, so `parent` is
+    /// then proved again: a number that no longer holds it is [`Resolved::Gone`] too, and one whose
+    /// proof cannot be made is [`Resolved::Unknown`]. Elsewhere neither is checked.
     pub(crate) fn of_ordered_with(
         kernel: &dyn Kernel,
         pid: RawPid,
-        expected_ppid: Option<RawPid>,
+        parent: Option<ProcessId>,
     ) -> (Resolved<(ProcessId, OrderKey)>, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
@@ -186,9 +190,14 @@ impl ProcessId {
                 Resolved::Gone => return (Resolved::Gone, cause),
                 Resolved::Unknown => return (Resolved::Unknown, cause),
             };
-            if let Some(expected) = expected_ppid {
-                if stat_parse::parse_ppid(&stat) != Some(expected) {
+            if let Some(parent) = parent {
+                if stat_parse::parse_ppid(&stat) != Some(parent.pid()) {
                     return (Resolved::Gone, UnknownCause::default());
+                }
+                match parent.exists_with(kernel) {
+                    (Existence::Present, _) => {}
+                    (Existence::Gone, _) => return (Resolved::Gone, UnknownCause::default()),
+                    (Existence::Unknown, cause) => return (Resolved::Unknown, cause),
                 }
             }
             match stat_parse::parse_starttime_jiffies(&stat) {
@@ -198,7 +207,7 @@ impl ProcessId {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = expected_ppid;
+            let _ = parent;
             let (read, cause) = Self::of_with(kernel, pid);
             match read {
                 Resolved::Found(id) => match id.order_key_with(kernel) {

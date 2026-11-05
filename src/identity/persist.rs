@@ -112,6 +112,58 @@ impl<'de> serde::Deserialize<'de> for Platform {
     }
 }
 
+/// What a Linux record's `token` is. The two kinds are never comparable, so a record of one is
+/// refused on a host of the other.
+///
+/// [`TokenKind::Other`] exists for the reason [`Platform::Other`] does: a record from a newer
+/// `cosca` with a kind this build does not know still *parses*, and validation refuses it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TokenKind {
+    /// The inode of the process's pidfd on pidfs (Linux 6.9+).
+    Pidfs,
+    /// The `starttime` ticks `/proc` shows, where pidfds have no inode of their own.
+    Ticks,
+    /// A kind this build does not know.
+    Other(String),
+}
+
+impl TokenKind {
+    /// The wire string. These two literals ARE the persisted format — never change them.
+    pub fn as_str(&self) -> &str {
+        match self {
+            TokenKind::Pidfs => "pidfs",
+            TokenKind::Ticks => "ticks",
+            TokenKind::Other(s) => s,
+        }
+    }
+
+    /// Parse a wire string. Unknown kinds become [`TokenKind::Other`] rather than an error, so
+    /// validation — not the decoder — decides what to do with them. Public for the reason
+    /// [`Platform::from_wire`] is.
+    pub fn from_wire(s: &str) -> TokenKind {
+        match s {
+            "pidfs" => TokenKind::Pidfs,
+            "ticks" => TokenKind::Ticks,
+            other => TokenKind::Other(other.to_owned()),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for TokenKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TokenKind {
+    /// Delegates to [`TokenKind::from_wire`], which documents the leniency policy.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TokenKind, D::Error> {
+        Ok(TokenKind::from_wire(&String::deserialize(d)?))
+    }
+}
+
 /// `u64` as a decimal string — see the `token` field's doc for why.
 #[cfg(feature = "serde")]
 mod token_str {
@@ -150,7 +202,7 @@ pub struct ProcessIdRecord {
     /// represent, and a silently-rounded token is exactly the aliasing this type prevents.
     #[cfg_attr(feature = "serde", serde(with = "token_str"))]
     pub token: u64,
-    /// Linux: `/proc/sys/kernel/random/boot_id`, the boot the jiffy token is counted from.
+    /// Linux: `/proc/sys/kernel/random/boot_id`, the boot the token is counted from.
     /// `None` on Windows and macOS, whose tokens are absolute.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub boot_id: Option<String>,
@@ -163,11 +215,11 @@ pub struct ProcessIdRecord {
     /// had without this field — `(pid, boot_id, token)` — never less.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub pid_ns: Option<u64>,
-    /// Linux: what `token` is, `"pidfs"` (the pidfd's inode, on Linux 6.9+) or `"ticks"` (the
-    /// `starttime`, below it). Tokens of the two kinds are never comparable, so a record of one is
-    /// refused on a host of the other. `None` on Windows and macOS, which have one kind.
+    /// Linux: what `token` is, the pidfd's inode (Linux 6.9+) or the `starttime` (below it). Tokens
+    /// of the two kinds are never comparable, so a record of one is refused on a host of the
+    /// other. `None` on Windows and macOS, which have one kind.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub token_kind: Option<String>,
+    pub token_kind: Option<TokenKind>,
 }
 
 /// The live session a token has to belong to, as read from THIS host. Empty on platforms
@@ -176,8 +228,8 @@ pub struct ProcessIdRecord {
 pub(crate) struct Scope {
     pub(crate) boot_id: Option<String>,
     pub(crate) pid_ns: Option<u64>,
-    /// The kind of token this host's ids have: Linux `"pidfs"` or `"ticks"`.
-    pub(crate) token_kind: Option<&'static str>,
+    /// The kind of token this host's ids have: Linux `Pidfs` or `Ticks`.
+    pub(crate) token_kind: Option<TokenKind>,
 }
 
 impl Scope {
@@ -243,8 +295,8 @@ pub(crate) fn reject(record: &ProcessIdRecord, scope: &Scope, kind: RecordErrorK
             scope.boot_id,
             record.pid_ns,
             scope.pid_ns,
-            record.token_kind,
-            scope.token_kind,
+            record.token_kind.as_ref().map(TokenKind::as_str),
+            scope.token_kind.as_ref().map(TokenKind::as_str),
         ),
         source: None,
     }
@@ -287,8 +339,8 @@ pub(crate) fn validate(
             Some(_) => {}
         }
     }
-    if let Some(live) = scope.token_kind {
-        match record.token_kind.as_deref() {
+    if let Some(live) = &scope.token_kind {
+        match &record.token_kind {
             None => return Err(RecordErrorKind::MissingTokenKind),
             Some(saved) if saved != live => return Err(RecordErrorKind::ForeignTokenKind),
             Some(_) => {}
@@ -309,7 +361,7 @@ fn record_from(id: &ProcessId, scope: Result<Scope, ScopeReadError>) -> Result<P
         token: id.key.raw(),
         boot_id: scope.boot_id,
         pid_ns: scope.pid_ns,
-        token_kind: id.key.wire_kind().map(str::to_owned),
+        token_kind: id.key.wire_kind(),
     })
 }
 
@@ -323,7 +375,7 @@ fn restore(
     let (pid, token) = validate(record, here, &scope).map_err(|kind| reject(record, &scope, kind))?;
     Ok(ProcessId {
         pid,
-        key: Key::restored(token, record.token_kind.as_deref()),
+        key: Key::restored(token, record.token_kind.as_ref()),
     })
 }
 

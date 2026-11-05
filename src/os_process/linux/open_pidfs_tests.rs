@@ -98,8 +98,8 @@ fn a_thread_that_has_exited_is_none() {
     assert!(matches!(open_verified_with(&kernel, id(100)), Ok(None)));
 }
 
-/// A refusal is `Unsupported`; anything else the open fails with stays `Io`, which the group's
-/// resend treats as "no pidfd" and falls back from.
+/// A refusal is `Unsupported`; anything else the open fails with stays `Io`. The group's resend
+/// reaches neither (it is `Reached::Unknown` for both) and does not fall back to a send by number.
 #[skuld::test]
 fn a_refused_open_is_unsupported_and_a_transient_one_is_io() {
     for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {

@@ -4,7 +4,7 @@
 
 #![cfg(feature = "serde")]
 
-use super::{Platform, ProcessIdRecord, RECORD_VERSION};
+use super::{Platform, ProcessIdRecord, TokenKind, RECORD_VERSION};
 
 fn windows_record() -> ProcessIdRecord {
     ProcessIdRecord {
@@ -27,7 +27,7 @@ fn linux_record() -> ProcessIdRecord {
         token: 162_431_157,
         boot_id: Some("36c39237-f06e-4e88-a74d-ea99d42b817c".into()),
         pid_ns: Some(4_026_531_836),
-        token_kind: Some("pidfs".into()),
+        token_kind: Some(TokenKind::Pidfs),
     }
 }
 
@@ -100,6 +100,15 @@ fn an_unknown_platform_tag_decodes_rather_than_failing() {
     let json = r#"{"v":1,"platform":"freebsd","pid":7,"token":"99"}"#;
     let r: ProcessIdRecord = serde_json::from_str(json).expect("an unknown tag must still decode");
     assert_eq!(r.platform, Platform::Other("freebsd".into()));
+}
+
+#[skuld::test]
+fn an_unknown_token_kind_decodes_rather_than_failing_and_round_trips() {
+    // As the platform tag: a kind from a newer cosca must reach VALIDATION, which refuses it.
+    let json = r#"{"v":2,"platform":"linux","pid":7,"token":"99","token_kind":"tsc"}"#;
+    let r: ProcessIdRecord = serde_json::from_str(json).expect("an unknown kind must still decode");
+    assert_eq!(r.token_kind, Some(TokenKind::Other("tsc".into())));
+    assert_eq!(serde_json::to_string(&r).expect("serialize"), json);
 }
 
 #[skuld::test]

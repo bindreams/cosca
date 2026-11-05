@@ -2,7 +2,9 @@
 //! EVERY host, so the Linux-only boot-session branches are exercised on Windows and macOS
 //! CI too.
 
-use super::{reject, scope_error, validate, Platform, ProcessIdRecord, Scope, ScopeReadError, RECORD_VERSION};
+use super::{
+    reject, scope_error, validate, Platform, ProcessIdRecord, Scope, ScopeReadError, TokenKind, RECORD_VERSION,
+};
 use crate::error::{Error, RecordErrorKind};
 
 /// A well-formed Linux record: boot session `36c3…`, pid namespace 4026531836, a pidfs inode.
@@ -14,7 +16,7 @@ fn linux_record() -> ProcessIdRecord {
         token: 162_431_157,
         boot_id: Some("36c39237-f06e-4e88-a74d-ea99d42b817c".into()),
         pid_ns: Some(4_026_531_836),
-        token_kind: Some("pidfs".into()),
+        token_kind: Some(TokenKind::Pidfs),
     }
 }
 
@@ -22,7 +24,7 @@ fn linux_scope() -> Scope {
     Scope {
         boot_id: Some("36c39237-f06e-4e88-a74d-ea99d42b817c".into()),
         pid_ns: Some(4_026_531_836),
-        token_kind: Some("pidfs"),
+        token_kind: Some(TokenKind::Pidfs),
     }
 }
 
@@ -186,6 +188,18 @@ fn the_wire_strings_are_the_documented_ones() {
 }
 
 #[skuld::test]
+fn token_kinds_round_trip_through_their_wire_strings_and_an_unknown_one_is_other() {
+    for kind in [TokenKind::Pidfs, TokenKind::Ticks] {
+        assert_eq!(TokenKind::from_wire(kind.as_str()), kind);
+    }
+    // Pinned literals: these strings are the persisted format and may never drift.
+    assert_eq!(TokenKind::Pidfs.as_str(), "pidfs");
+    assert_eq!(TokenKind::Ticks.as_str(), "ticks");
+    assert_eq!(TokenKind::from_wire("tsc"), TokenKind::Other("tsc".into()));
+    assert_eq!(TokenKind::Other("tsc".into()).as_str(), "tsc");
+}
+
+#[skuld::test]
 fn platform_current_names_this_host() {
     // Expected value from `std::env::consts::OS`, an independent fact about the build
     // target — NOT a second copy of `Platform::current`'s own cfg branching, which would
@@ -286,7 +300,7 @@ fn a_scope_mismatch_names_the_values_that_diverged() {
     let live = Scope {
         boot_id: Some("11111111-2222-3333-4444-555555555555".into()),
         pid_ns: Some(4_026_539_999),
-        token_kind: Some("ticks"),
+        token_kind: Some(TokenKind::Ticks),
     };
     let e = reject(&linux_record(), &live, RecordErrorKind::ForeignBootSession);
     let rendered = e.to_string();
@@ -311,17 +325,20 @@ fn a_scope_mismatch_names_the_values_that_diverged() {
 #[skuld::test]
 fn a_record_of_the_other_kind_of_token_is_rejected() {
     // A pidfs inode is no starttime: compared with each other they would alias.
-    for (record_kind, host_kind) in [("pidfs", "ticks"), ("ticks", "pidfs")] {
+    for (record_kind, host_kind) in [
+        (TokenKind::Pidfs, TokenKind::Ticks),
+        (TokenKind::Ticks, TokenKind::Pidfs),
+    ] {
         let mut r = linux_record();
-        r.token_kind = Some(record_kind.into());
+        r.token_kind = Some(record_kind.clone());
         let scope = Scope {
-            token_kind: Some(host_kind),
+            token_kind: Some(host_kind.clone()),
             ..linux_scope()
         };
         assert_eq!(
             validate(&r, &Platform::Linux, &scope),
             Err(RecordErrorKind::ForeignTokenKind),
-            "{record_kind} record on a {host_kind} host"
+            "{record_kind:?} record on a {host_kind:?} host"
         );
     }
 }
@@ -329,9 +346,9 @@ fn a_record_of_the_other_kind_of_token_is_rejected() {
 #[skuld::test]
 fn a_record_of_the_same_kind_of_token_validates() {
     let mut r = linux_record();
-    r.token_kind = Some("ticks".into());
+    r.token_kind = Some(TokenKind::Ticks);
     let scope = Scope {
-        token_kind: Some("ticks"),
+        token_kind: Some(TokenKind::Ticks),
         ..linux_scope()
     };
     assert_eq!(validate(&r, &Platform::Linux, &scope), Ok((4242, 162_431_157)));
@@ -340,7 +357,7 @@ fn a_record_of_the_same_kind_of_token_validates() {
 #[skuld::test]
 fn an_unknown_kind_of_token_is_rejected_as_foreign() {
     let mut r = linux_record();
-    r.token_kind = Some("tsc".into());
+    r.token_kind = Some(TokenKind::Other("tsc".into()));
     assert_eq!(
         validate(&r, &Platform::Linux, &linux_scope()),
         Err(RecordErrorKind::ForeignTokenKind)
@@ -362,7 +379,7 @@ fn a_linux_record_without_a_kind_of_token_is_rejected() {
 #[skuld::test]
 fn the_kind_of_token_is_checked_after_the_pid_namespace() {
     let mut r = linux_record();
-    r.token_kind = Some("ticks".into());
+    r.token_kind = Some(TokenKind::Ticks);
     let scope = Scope {
         pid_ns: Some(1),
         ..linux_scope()
@@ -376,7 +393,7 @@ fn the_kind_of_token_is_checked_after_the_pid_namespace() {
 #[skuld::test]
 fn a_record_of_a_host_without_kinds_ignores_a_stray_kind() {
     let mut r = windows_record();
-    r.token_kind = Some("pidfs".into());
+    r.token_kind = Some(TokenKind::Pidfs);
     assert_eq!(
         validate(&r, &Platform::Windows, &Scope::none()),
         Ok((4242, 134_301_578_477_907_396))
@@ -661,7 +678,7 @@ fn a_host_whose_own_pidfd_cannot_be_opened_has_no_scope() {
 #[skuld::test]
 fn the_scope_names_the_kind_of_token_the_hosts_pidfds_give() {
     let (pidfd, _writer) = std::io::pipe().expect("a pipe");
-    for (answer, kind) in [(Some(5), "pidfs"), (None, "ticks")] {
+    for (answer, kind) in [(Some(5), TokenKind::Pidfs), (None, TokenKind::Ticks)] {
         let kernel = crate::identity::FakeKernel::new()
             .on_pidfd_open(std::process::id(), Ok(pidfd.try_clone().expect("dup").into()))
             .on_pidfs_ino(std::process::id(), Ok(answer));
@@ -682,24 +699,24 @@ fn the_scope_names_the_kind_of_token_the_hosts_pidfds_give() {
 fn a_record_names_its_ids_own_kind_and_restores_into_it() {
     use crate::identity::Key;
 
-    for (key, kind) in [(Key::Pidfs(77), "pidfs"), (Key::Ticks(77), "ticks")] {
+    for (key, kind) in [(Key::Pidfs(77), TokenKind::Pidfs), (Key::Ticks(77), TokenKind::Ticks)] {
         let id = ProcessId::from_parts_for_test(4242, key);
         let scope = Scope {
-            token_kind: Some(kind),
+            token_kind: Some(kind.clone()),
             ..linux_scope()
         };
         let record = record_from(&id, Ok(scope.clone())).expect("a record");
         assert_eq!(record.token, 77);
-        assert_eq!(record.token_kind.as_deref(), Some(kind));
+        assert_eq!(record.token_kind, Some(kind));
         assert_eq!(restore(&record, &Platform::Linux, Ok(scope)).expect("restores"), id);
     }
     let id = ProcessId::from_parts_for_test(4242, Key::Pidfs(77));
     let ticks_host = Scope {
-        token_kind: Some("ticks"),
+        token_kind: Some(TokenKind::Ticks),
         ..linux_scope()
     };
     let record = record_from(&id, Ok(ticks_host.clone())).expect("a record");
-    assert_eq!(record.token_kind.as_deref(), Some("pidfs"));
+    assert_eq!(record.token_kind, Some(TokenKind::Pidfs));
     let err = restore(&record, &Platform::Linux, Ok(ticks_host)).expect_err("another kind of host");
     assert!(
         matches!(

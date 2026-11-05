@@ -6,7 +6,9 @@
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
-//! the checked `/proc` view cannot be built, and `open_verified_with` is `Unsupported` naming `openat2`.
+//! the checked `/proc` view cannot be built, and `open_verified_with` of an id told by its
+//! `starttime` (a host before Linux 6.9) is `Unsupported` naming `openat2`; an id told by its pidfd's
+//! inode needs no `/proc` view.
 //! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support_with`]),
 //! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
@@ -24,8 +26,9 @@ const OP_NAME: &str = "process open";
 /// Open a pidfd for `id` through `kernel`, re-verifying identity. `Ok(None)` => already gone (treat
 /// as exited).
 ///
-/// Every `/proc` read goes through one checked `/proc` dirfd shown to describe `id`'s pid
-/// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
+/// A `Pidfs` id is proved by its pidfd's inode and reads no `/proc`. For a `Ticks` id every `/proc`
+/// read goes through one checked `/proc` dirfd shown to describe `id`'s pid namespace; otherwise
+/// [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
 pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,

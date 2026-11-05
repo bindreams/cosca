@@ -209,7 +209,7 @@ fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), std::process::id()), None);
+    assert_eq!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current()), None);
     let warned =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {} could not be queried", id.pid()));
     assert_eq!(warned.len(), 1, "{warned:?}");
@@ -376,9 +376,15 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
 #[skuld::test]
 fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
     const PID: u32 = 4242;
+    use crate::identity::Key;
+
     let stat = crate::identity::stat_parse::stat_fixture("S", 777);
-    let kernel = ticks_host(PID).same_view().on_read(&format!("{PID}/stat"), Ok(&stat));
+    let kernel = ticks_host(PID)
+        .same_view()
+        .on_read(&format!("{PID}/stat"), Ok(&stat))
+        .on_read("1/stat", Ok(&crate::identity::stat_parse::stat_fixture("S", 5)));
+    let parent = |pid| ProcessId::from_parts_for_test(pid, Key::for_test(5));
     // `stat_fixture` shows parent 1.
-    assert!(super::resolve_or_drop(&kernel, PID, 99).is_none());
-    assert!(super::resolve_or_drop(&kernel, PID, 1).is_some());
+    assert!(super::resolve_or_drop(&kernel, PID, parent(99)).is_none());
+    assert!(super::resolve_or_drop(&kernel, PID, parent(1)).is_some());
 }

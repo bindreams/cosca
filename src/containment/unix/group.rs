@@ -151,7 +151,10 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. Without
 /// `openat2` (Linux < 5.6, or seccomp) no view can be checked: `ErrorKind::Unsupported`. A `stat`
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
-/// (`EACCES`, or `EPERM` while the checked directory still answers).
+/// (`EACCES`, or `EPERM` while the checked directory still answers). A member whose pidfd cannot
+/// be opened fails the listing too (`ErrorKind::Unsupported` for a refused `pidfd_open`, `Other`
+/// for a transient one such as `EMFILE`): its identity is told through the pidfd, and leaving it out
+/// could clear a live group.
 #[cfg(target_os = "linux")]
 pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::parse_pgrp;
@@ -216,9 +219,16 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             // that merely would not parse, as a task exiting mid-read leaves, is excluded.
             (Resolved::Unknown, cause) => match cause.into_error(&format!("pid {pid}")) {
                 Some(why) => {
-                    return Err(std::io::Error::other(format!(
-                        "containment::unix::group::members: {why}, so process group {pgid} cannot be listed"
-                    )));
+                    // A refusal stays `Unsupported`, as the `openat2` arm above, so the caller
+                    // reports the platform's `Unsupported` and not an unassessable group.
+                    let kind = match why {
+                        crate::error::Error::Unsupported { .. } => std::io::ErrorKind::Unsupported,
+                        _ => std::io::ErrorKind::Other,
+                    };
+                    return Err(std::io::Error::new(
+                        kind,
+                        format!("containment::unix::group::members: {why}, so process group {pgid} cannot be listed"),
+                    ));
                 }
                 None => {
                     log::debug!(
@@ -470,7 +480,8 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 ///
 /// **How `open_verified_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
-///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
+///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
+///   `id.exists()` saying `Gone`) and a ptraced zombie thread.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
@@ -481,7 +492,9 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 ///   names the listed member, and a bare pid is never signalled on a guess.
 ///
 /// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
-/// inside `open_verified_with`.** This looks tempting — `pidfd_open` already succeeded, so
+/// inside `open_verified_with`.** (That is the path of a `Ticks` id, on a host before Linux 6.9. A
+/// `Pidfs` id is proved by the open pidfd's own inode and reads no `/proc`, so it has no such gap.)
+/// This looks tempting — `pidfd_open` already succeeded, so
 /// *something* is there — but it does not actually close the gap, for the same reason
 /// `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare pid:
 /// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is

@@ -150,7 +150,7 @@ fn a_held_process_needs_no_second_pidfd_open() {
 /// The root-only grace wait of a graceful shutdown looks through the handle the child holds: with
 /// `pidfd_open` refused from before the `SIGTERM`, it still sees the exit. The child is contained
 /// without a cgroup, so only its root is watched. The group's sweep after it lists the group, which
-/// needs a pidfd for each member's identity, and says so: `Unassessable` naming the refusal. The
+/// needs a pidfd for each member's identity, and says so: `Unsupported` naming the refusal. The
 /// control socket is released only afterwards, so a shutdown that sent no `SIGTERM` ends in the
 /// escalation's `SIGKILL`, not in the assertion's `SIGTERM`.
 ///
@@ -158,7 +158,6 @@ fn a_held_process_needs_no_second_pidfd_open() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
-    use std::error::Error as _;
     use std::os::unix::process::ExitStatusExt;
 
     for (code, name) in REFUSALS {
@@ -179,14 +178,14 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
         });
         drop(control);
         match result {
-            Err(e @ Error::Unassessable { .. }) => {
-                let cause = e.source().map(ToString::to_string).unwrap_or_default();
+            Err(Error::Unsupported { op, detail, .. }) => {
+                assert!(op.starts_with("listing process group"), "{name}: {op}");
                 assert!(
-                    cause.contains(&format!("pidfd_open answered {name}")),
-                    "{name}: the group sweep names the refusal: {e:?}"
+                    detail.contains(&format!("pidfd_open answered {name}")),
+                    "{name}: the group sweep names the refusal: {detail}"
                 );
             }
-            other => panic!("{name}: expected the group sweep to be Unassessable, got {other:?}"),
+            other => panic!("{name}: expected the group sweep to be Unsupported, got {other:?}"),
         }
         let status = child.wait().expect("reap the root");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
@@ -301,15 +300,13 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_before_the_escalation_
 
 /// The async `graceful_shutdown_tree` of a child contained as a process group ends the child, then
 /// cannot list the group, because a member's identity is made by opening its pidfd: with
-/// `pidfd_open` refused it surfaces `Unassessable` naming the refusal, never "no member left".
+/// `pidfd_open` refused it surfaces `Unsupported` naming the refusal, never "no member left".
 ///
 /// Mutant: the sweep treats a group it could not list as empty (`Ok`).
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 #[skuld::test]
 fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_naming_the_refusal() {
-    use std::error::Error as _;
-
     for (code, name) in REFUSALS {
         let (result, _status) = async_act_under_refusal(code, true, |runtime, child| {
             assert!(
@@ -320,14 +317,14 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_nami
             runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
         });
         match result {
-            Err(e @ Error::Unassessable { .. }) => {
-                let cause = e.source().map(ToString::to_string).unwrap_or_default();
+            Err(Error::Unsupported { op, detail, .. }) => {
+                assert!(op.starts_with("listing process group"), "{name}: {op}");
                 assert!(
-                    cause.contains(&format!("pidfd_open answered {name}")),
-                    "{name}: the refusal is the cause: {e:?}"
+                    detail.contains(&format!("pidfd_open answered {name}")),
+                    "{name}: the refusal is the cause: {detail}"
                 );
             }
-            other => panic!("{name}: expected Unassessable, got {other:?}"),
+            other => panic!("{name}: expected Unsupported, got {other:?}"),
         }
     }
 }

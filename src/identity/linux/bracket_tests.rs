@@ -49,7 +49,8 @@ fn a_pidfs_ids_order_key_is_the_start_time_its_stat_shows() {
     assert_eq!(key_of(read), OrderKey::for_test(777));
 }
 
-/// A zombie keeps its `stat`, and its key.
+/// A zombie keeps its `stat`, and its key is the start time that `stat` shows. Mutant: "a zombie's
+/// key is `Unknown` or `Gone`".
 #[skuld::test]
 fn a_zombies_order_key_is_read() {
     let (kernel, _writer) = kernel_showing(&stat_fixture("Z", 777), 100);

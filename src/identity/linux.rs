@@ -18,6 +18,10 @@ pub(crate) mod prove;
 mod bracket_tests;
 
 #[cfg(test)]
+#[path = "linux/look_tests.rs"]
+mod look_tests;
+
+#[cfg(test)]
 #[path = "linux/read_tests.rs"]
 mod read_tests;
 
@@ -36,7 +40,7 @@ use self::proc_view::ProcDir;
 use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
-use super::{Existence, Liveness, OrderKey, RawPid, Resolved, UnknownCause};
+use super::{Existence, Liveness, OrderKey, RawPid, Resolved, TokenKind, UnknownCause};
 use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
@@ -107,10 +111,6 @@ pub(super) fn signal_says_no_such_process(kernel: &dyn Kernel, pid: RawPid) -> b
     signal_probe(kernel, pid) == SignalProbe::NoSuchProcess
 }
 
-/// The wire names of the two kinds of [`Key`], in a record's `token_kind`.
-const PIDFS: &str = "pidfs";
-const TICKS: &str = "ticks";
-
 /// What makes a Linux process: `pidfs`, the inode of its pidfd, or, below Linux 6.9 where pidfds
 /// have no inode of their own, the `starttime` ticks `/proc` shows. Two ids of different kinds never
 /// compare equal.
@@ -129,23 +129,23 @@ impl Key {
     }
 
     /// A key restored from a record's `token` of the kind the record names. The record was
-    /// validated against this host's kind first, so the name is one of the two.
-    pub(super) fn restored(token: u64, kind: Option<&str>) -> Key {
+    /// validated against this host's kind first, so the kind is one of the two.
+    pub(super) fn restored(token: u64, kind: Option<&TokenKind>) -> Key {
         debug_assert!(
-            matches!(kind, Some(PIDFS | TICKS)),
+            matches!(kind, Some(TokenKind::Pidfs | TokenKind::Ticks)),
             "a validated record names a kind of token, not {kind:?}"
         );
         match kind {
-            Some(PIDFS) => Key::Pidfs(token),
+            Some(TokenKind::Pidfs) => Key::Pidfs(token),
             _ => Key::Ticks(token),
         }
     }
 
     /// The kind a record names for this key.
-    pub(super) fn wire_kind(self) -> Option<&'static str> {
+    pub(super) fn wire_kind(self) -> Option<TokenKind> {
         Some(match self {
-            Key::Pidfs(_) => PIDFS,
-            Key::Ticks(_) => TICKS,
+            Key::Pidfs(_) => TokenKind::Pidfs,
+            Key::Ticks(_) => TokenKind::Ticks,
         })
     }
 
@@ -203,7 +203,9 @@ fn look(kernel: &dyn Kernel, pid: RawPid) -> Look {
             Ok(None) => Look::Ticks,
             Err(e) => Look::Unknown(prove::cause(e)),
         },
-        Err(Errno::SRCH) => Look::Gone,
+        // `ENOENT` is the retry's: `open` retries only after `INVAL` or `ENOENT`, and `prove` takes
+        // it as `Lost` too.
+        Err(Errno::SRCH | Errno::NOENT) => Look::Gone,
         Err(Errno::INVAL) => match own_pidfs_ino(kernel) {
             Ok(Some(_)) => Look::Gone,
             Ok(None) => Look::Ticks,
@@ -534,9 +536,9 @@ fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, Errno> {
 }
 
 /// The kind of [`Key`] this host's processes have, as a record names it.
-fn own_token_kind(kernel: &dyn Kernel) -> Result<&'static str, Errno> {
+fn own_token_kind(kernel: &dyn Kernel) -> Result<TokenKind, Errno> {
     Ok(match own_pidfs_ino(kernel)? {
-        Some(_) => PIDFS,
-        None => TICKS,
+        Some(_) => TokenKind::Pidfs,
+        None => TokenKind::Ticks,
     })
 }
