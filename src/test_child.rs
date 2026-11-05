@@ -257,14 +257,15 @@ pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std
 /// The child a teardown handed back, if it did, and what lets it exit (`release`: the stdin's write
 /// end, a thread to resume). `release` drops first, so a failed assertion ends the test instead of
 /// hanging in the [`Unreaped`](crate::Unreaped)'s drop. [`tear_down_holding`] builds it from a teardown;
-/// [`new`](HandedBack::new) is for a result that came back through an error.
+/// [`expect_may_have_started_parts`] and [`expect_handed_back`] from a failure. Only this module
+/// builds one, so no row settles an `Unreaped` by hand.
 pub(crate) struct HandedBack<R> {
     release: R,
     unreaped: Option<crate::Unreaped>,
 }
 
 impl<R> HandedBack<R> {
-    pub(crate) fn new(release: R, unreaped: Option<crate::Unreaped>) -> HandedBack<R> {
+    fn new(release: R, unreaped: Option<crate::Unreaped>) -> HandedBack<R> {
         HandedBack { release, unreaped }
     }
 
@@ -301,6 +302,64 @@ pub(crate) fn tear_down_holding<R>(
 ) -> (crate::error::ChildFate, HandedBack<R>) {
     let (fate, unreaped) = child.tear_down_or_hand_back(disposition);
     (fate, HandedBack::new(release, unreaped))
+}
+
+/// The cause, fate and [`HandedBack`] child (none if the spawn handed none back) inside an error a
+/// public spawn returned, which must say the program may have started. `release` is what lets the
+/// child exit (`()`: nothing), moved into the result as for [`tear_down_holding`].
+#[track_caller]
+pub(crate) fn expect_may_have_started_parts<R>(
+    error: crate::error::Error,
+    release: R,
+) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
+    let (cause, fate, unreaped) = crate::child::spawn::failure::error_parts(error);
+    (cause, fate, HandedBack::new(release, unreaped))
+}
+
+/// [`expect_may_have_started_parts`] for an error that must hand the child back.
+#[cfg(unix)]
+#[track_caller]
+pub(crate) fn expect_handed_back<R>(
+    error: crate::error::Error,
+    release: R,
+) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
+    let (cause, fate, handed_back) = expect_may_have_started_parts(error, release);
+    assert!(
+        !handed_back.is_none(),
+        "the spawn handed no child back ({fate:?}): {cause:?}"
+    );
+    (cause, fate, handed_back)
+}
+
+/// `tear_down_held` (the sync spawn's teardown of the child it holds after the handshake) with the
+/// diagnosis `why`, its handed-back child in a [`HandedBack`] with `release`. The child has a pid.
+#[cfg(target_os = "linux")]
+pub(crate) fn tear_down_held_holding<R>(
+    child: crate::child::owned::OwnedChild,
+    front: Option<crate::elevation::front::Front>,
+    id: Option<crate::identity::ProcessId>,
+    subtree: Option<&crate::containment::cgroup::Subtree>,
+    why: &mut crate::child::spawn::Diagnosis,
+    release: R,
+    error: crate::error::Error,
+) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
+    let pid = child.pid().expect("the held child has a pid");
+    let (error, fate, unreaped) =
+        crate::child::spawn::held_teardown::tear_down_held(child, pid, front, id, subtree, why, error);
+    (error, fate, HandedBack::new(release, unreaped))
+}
+
+#[cfg(unix)]
+impl crate::child::spawn::SpawnFailure {
+    /// [`expect_may_have_started_parts`] for a failure the spawn did not turn into an error yet.
+    #[track_caller]
+    pub(crate) fn expect_may_have_started_parts<R>(
+        self,
+        release: R,
+    ) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
+        let (cause, fate, unreaped) = self.parts();
+        (cause, fate, HandedBack::new(release, unreaped))
+    }
 }
 
 fn held_blocker(
