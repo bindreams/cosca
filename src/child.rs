@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter};
 
-use crate::child::owned::teardown::TeardownKind;
 #[cfg(unix)]
 use crate::child::owned::teardown::TeardownOutcome;
+use crate::child::owned::teardown::{Disposition, TeardownKind};
 use crate::command::Command;
+use crate::containment::dispatch::TeardownCaller;
 use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -23,6 +24,7 @@ pub(crate) mod spawn;
 pub(crate) mod drop_report;
 #[path = "child/owned.rs"]
 pub(crate) mod owned;
+use owned::slot::ChildSlot;
 use owned::OwnedChild;
 
 #[path = "child/lifecycle.rs"]
@@ -47,6 +49,10 @@ pub(crate) use tree_call::{Graceful, TreeCall};
 #[cfg(test)]
 #[path = "child_tests.rs"]
 mod child_tests;
+
+#[cfg(test)]
+#[path = "child/hand_back_tests.rs"]
+mod hand_back_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/pid_reuse_tests.rs"]
@@ -122,7 +128,9 @@ pub(crate) enum ParentEnd {
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
-    proc: OwnedChild,
+    /// Empty only inside [`tear_down_or_hand_back`](Child::tear_down_or_hand_back), which consumes
+    /// the child.
+    proc: ChildSlot,
     /// Stable identity resolved immediately after spawn.
     id: ProcessId,
     pipes: BTreeMap<Fd, ParentEnd>,
@@ -152,7 +160,7 @@ impl Child {
         attachment: crate::containment::Attachment,
     ) -> Child {
         Child {
-            proc,
+            proc: ChildSlot::new(proc),
             id,
             pipes,
             kill_on_drop,
@@ -416,9 +424,13 @@ impl Child {
     /// is looked at through [`tear_down`](OwnedChild::tear_down), which waits for it only if its
     /// place says the kill reached it. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
-    /// with `why`.
+    /// with `why`, under `caller`'s name.
     #[cfg(unix)]
-    fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> TeardownOutcome {
+    fn tear_down_leaf_and_look_at_front(
+        &mut self,
+        caller: TeardownCaller,
+        why: &dyn std::fmt::Display,
+    ) -> TeardownOutcome {
         use crate::child::owned::teardown::Reach;
 
         #[cfg(target_os = "linux")]
@@ -440,7 +452,7 @@ impl Child {
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
         let torn = self.proc.tear_down(Some(self.id), TeardownKind::Look(reach), None);
-        word_front(self.id.pid(), why, torn)
+        word_front(caller, self.id.pid(), why, torn)
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -1032,35 +1044,60 @@ pub(crate) mod fault {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.kill_on_drop {
-            _ = self.tear_down();
+            _ = self.tear_down(TeardownCaller::Drop, Disposition::Leave);
         }
     }
 }
 
 impl Child {
-    /// What [`Drop`] does, now, and what it did with the child; the drop then does nothing more.
-    /// For a spawn's run-to-completion helpers, which fail after the spawn and must say what became
-    /// of the child. A child `kill_on_drop(false)` keeps is left alone, as the drop leaves it.
-    pub(crate) fn tear_down_now(&mut self) -> crate::error::ChildFate {
+    /// What [`Drop`] does, now, for a caller that owns the child and fails after its spawn: it says
+    /// what became of the child. With [`Disposition::HandBack`], a child whose teardown could not
+    /// end it is given back too.
+    ///
+    /// A `kill_on_drop(false)` child and an elevation front (sent no kill) are left, whatever
+    /// `disposition` says. The containment is torn down as `self` drops, before this returns. On
+    /// Windows a refused root kill gets the single look, as before.
+    pub(crate) fn tear_down_or_hand_back(
+        mut self,
+        disposition: Disposition,
+    ) -> (crate::error::ChildFate, Option<Unreaped>) {
+        use crate::error::ChildFate;
+
         if !self.kill_on_drop {
-            return if self.proc.is_reaped() {
-                crate::error::ChildFate::Reaped
+            let fate = if self.proc.is_reaped() {
+                ChildFate::Reaped
             } else {
-                crate::error::ChildFate::Running { id: Some(self.id) }
+                ChildFate::Running { id: Some(self.id) }
             };
+            return (fate, None);
         }
         self.kill_on_drop = false;
-        self.tear_down()
+        let disposition = if self.front.is_none() {
+            disposition
+        } else {
+            Disposition::Leave
+        };
+        let fate = self.tear_down(TeardownCaller::FailedRun, disposition);
+        let handed_back = disposition == Disposition::HandBack && matches!(fate, ChildFate::Running { .. });
+        (fate, handed_back.then(|| self.into_unreaped()))
     }
 
-    /// The kill-on-drop teardown, answering what became of the child.
-    fn tear_down(&mut self) -> crate::error::ChildFate {
+    /// The root, as an [`Unreaped`]. `self` has already torn its containment down by dropping.
+    fn into_unreaped(mut self) -> Unreaped {
+        debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
+        let root = self.proc.take().expect("a child handed back still holds its root");
+        Unreaped::new(root, Some(self.id))
+    }
+
+    /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
+    /// warn, and `disposition` words it for a child that still runs after a refused kill.
+    fn tear_down(&mut self, caller: TeardownCaller, disposition: Disposition) -> crate::error::ChildFate {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
         #[cfg(unix)]
         {
-            self.drop_unix()
+            self.drop_unix(caller, disposition)
         }
         #[cfg(not(unix))]
         {
@@ -1074,10 +1111,17 @@ impl Child {
                 };
                 left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
             }
-            let torn = self.proc.tear_down(Some(self.id), TeardownKind::Kill, None);
+            let torn = self.proc.tear_down(
+                Some(self.id),
+                TeardownKind::Kill {
+                    disposition,
+                    tree: None,
+                },
+                None,
+            );
             left.extend(torn.left);
             if !left.is_empty() {
-                log::warn!("Child::drop: {}", left.join("; "));
+                log::warn!("{}: {}", caller.label(), left.join("; "));
             }
             torn.fate
         }
@@ -1094,21 +1138,22 @@ impl Child {
     /// [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the root's pidfd
     /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)). An
     /// unreaped root stays a zombie, pinning its number, until `tear_down`.
-    fn drop_unix(&mut self) -> crate::error::ChildFate {
+    fn drop_unix(&mut self, caller: TeardownCaller, disposition: Disposition) -> crate::error::ChildFate {
         use crate::child::drop_report::DropReport;
+        use crate::child::owned::teardown::Reach;
         use crate::error::ChildFate;
 
         // A live elevation front gets no signal of its own: outside a cgroup it is left running,
         // unreaped, and named. The gate comes first, so the look at the root is right before the
         // kill it decides.
         let gate = self.kill_gate();
-        let view = crate::containment::DropView::read("Child::drop", self.id, || self.proc.state(), &self.tree_killed);
-        let mut report = DropReport::new("Child::drop", &view);
+        let view = crate::containment::DropView::read(caller, self.id, || self.proc.state(), &self.tree_killed);
+        let mut report = DropReport::new(&view);
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
-                let torn = self.tear_down_leaf_and_look_at_front(&unkillable);
+                let torn = self.tear_down_leaf_and_look_at_front(caller, &unkillable);
                 report.left.extend(torn.left);
                 report.emit(&self.reported);
                 return torn.fate;
@@ -1153,10 +1198,14 @@ impl Child {
                     Ok(()) => self.proc.reap_after_tree_kill(),
                     // Never waited for. The armed leaf still kills what it holds, retrying a kill
                     // that failed, and the front is looked at once that is done.
-                    Err(e) => self.tear_down_leaf_and_look_at_front(&e),
+                    Err(e) => self.tear_down_leaf_and_look_at_front(caller, &e),
                 }
             } else {
-                self.proc.tear_down(Some(self.id), TeardownKind::Kill, None)
+                // The tree kill above may have reached the root: if the root's own kill is refused,
+                // that kill is what ends it.
+                let tree = kill.result.is_ok().then_some(&self.attached as &dyn Reach);
+                self.proc
+                    .tear_down(Some(self.id), TeardownKind::Kill { disposition, tree }, None)
             };
             report.left.extend(torn.left);
             torn.fate
@@ -1166,24 +1215,30 @@ impl Child {
     }
 }
 
-/// What a drop says of how its look at the elevation front `pid` went (`torn.look`): a debug line
-/// for a front that was reaped, or reaped by someone else, and a leftover for the drop's one warn
-/// for any other. `why` is why the drop did not kill the front. An outcome with no look is returned
-/// as it is.
+/// What `caller` says of how its look at the elevation front `pid` went (`torn.look`): a debug line
+/// for a front that was reaped, or reaped by someone else, and a leftover for its one warn for any
+/// other. `why` is why the caller did not kill the front. An outcome with no look is returned as it
+/// is.
 #[cfg(unix)]
-fn word_front(pid: u32, why: &dyn std::fmt::Display, mut torn: TeardownOutcome) -> TeardownOutcome {
+fn word_front(
+    caller: TeardownCaller,
+    pid: u32,
+    why: &dyn std::fmt::Display,
+    mut torn: TeardownOutcome,
+) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
 
+    let label = caller.label();
     let Some(look) = torn.look.take() else {
         return torn;
     };
     torn.left = match look {
         LookOutcome::Reaped(status) => {
-            log::debug!("Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
+            log::debug!("{label}: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
             None
         }
         LookOutcome::ReapedElsewhere => {
-            log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
+            log::debug!("{label}: elevation front pid {pid} was reaped by someone else");
             None
         }
         LookOutcome::LookFailed(e) => Some(format!(

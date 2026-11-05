@@ -124,9 +124,13 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // below then says why.
     let gate = child.kill_gate();
     // The look at the root, right before the tree kill it decides.
-    let view =
-        crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
-    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
+    let view = crate::containment::DropView::read(
+        crate::containment::dispatch::TeardownCaller::FinishElevated,
+        child.id,
+        || child.proc.state(),
+        &child.tree_killed,
+    );
+    let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
@@ -259,6 +263,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             detail: format!("{write_err}; {root_note}{tree_note}"),
         },
         fate,
+        None,
     ))
 }
 
@@ -651,6 +656,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -692,6 +698,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -726,6 +733,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
                 child_fate,
+                None,
             ));
         }
     };
@@ -1373,6 +1381,7 @@ fn abandon_unadopted(
                     FrontFate::LeftUnreaped.note(error, front, Some(pid)),
                     // The id was reported, but no `ProcessId` was read from it.
                     ChildFate::Running { id: None },
+                    None,
                 );
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
@@ -1381,7 +1390,7 @@ fn abandon_unadopted(
             let tail = done.zombie_tail();
             let fate = done.warn(pid, tail);
             drop(child);
-            SpawnFailure::started(error, fate)
+            SpawnFailure::started(error, fate, None)
         }
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.
@@ -1389,6 +1398,7 @@ fn abandon_unadopted(
             SpawnFailure::started(
                 FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid)),
                 fate,
+                None,
             )
         }
     }
@@ -3216,6 +3226,7 @@ pub(crate) mod fault {
                 "forced post-fork spawn failure (test seam) for child {pid}"
             ))),
             crate::error::ChildFate::Unknown,
+            None,
         ))
     }
 
