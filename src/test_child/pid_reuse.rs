@@ -101,6 +101,19 @@ pub(crate) fn reuse(pid: u32) -> Child {
     reuser
 }
 
+/// What a reader of `id`'s pid finds there: the identity with `id`'s own start token if `same_tick`,
+/// else the next one.
+pub(crate) fn reuser_id(
+    id: crate::identity::ProcessId,
+    same_tick: bool,
+) -> crate::identity::Resolved<crate::identity::ProcessId> {
+    let raw = id.start_token_raw();
+    crate::identity::Resolved::Found(crate::identity::ProcessId::from_parts_for_test(
+        id.pid(),
+        if same_tick { raw } else { raw + 1 },
+    ))
+}
+
 /// [`sigusr1_and_wait`] without consuming the exit: sends `SIGUSR1`, then waits on a pidfd until the
 /// reuser is a zombie, and peeks with `WNOWAIT`. Returns the signal it died of.
 #[cfg(feature = "tokio")]

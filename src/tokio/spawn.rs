@@ -633,7 +633,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
     // and does not re-read the root's.
     let (resolved, cause, mut why) = match proc.target() {
-        Some(through) => resolve_identity(pid, &through),
+        Some(through) => resolve_identity(&crate::identity::HostKernel, pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
         None => {
             debug_assert!(false, "a freshly spawned tokio child holds its handle");
