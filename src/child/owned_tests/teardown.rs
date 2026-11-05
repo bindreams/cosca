@@ -2,7 +2,8 @@
 
 use std::process::ExitStatus;
 
-use crate::child::owned::teardown::{TeardownKind, TeardownOutcome};
+use super::teardown_look::FakeReach;
+use crate::child::owned::teardown::{Disposition, TeardownKind, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -35,7 +36,14 @@ fn tear_down_logged(
     crate::log_capture::install();
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
-    let torn = child.tear_down(id, TeardownKind::Kill, due);
+    let torn = child.tear_down(
+        id,
+        TeardownKind::Kill {
+            disposition: Disposition::Leave,
+            tree: None,
+        },
+        due,
+    );
     (torn, crate::log_capture::records_since_on_current_thread(mark, ""))
 }
 
@@ -181,6 +189,117 @@ fn teardown_after_a_kill_that_found_nothing_to_signal_waits_too() {
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
+}
+
+/// The `left` text of a teardown whose kill is refused and whose child still runs, under `disposition`.
+fn left_of_a_refused_kill_of_a_running_child(disposition: Disposition) -> String {
+    let fake = fake()
+        .reaps([ReapAnswer::Running])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let child = OwnedChild::new(Box::new(fake));
+    let torn = child.tear_down(
+        Some(id()),
+        TeardownKind::Kill {
+            disposition,
+            tree: None,
+        },
+        None,
+    );
+    assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{torn:?}");
+    torn.left.expect("a refused kill of a running child is warned of")
+}
+
+/// `tear_down(Kill)` over a child whose kill is refused and which is running, with `tree` saying
+/// whether a kill sent through its containment reached it. The fake answers a look "running", then
+/// the exit.
+fn refused_kill_with_a_tree_kill(tree: &FakeReach) -> (TeardownOutcome, FakeProcess) {
+    let fake = fake()
+        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+    let torn = child.tear_down(
+        Some(id()),
+        TeardownKind::Kill {
+            disposition: Disposition::HandBack,
+            tree: Some(tree),
+        },
+        None,
+    );
+    (torn, fake)
+}
+
+/// A refused kill of a child that a kill sent through its containment reached is not a child that
+/// still runs: that kill is asynchronous, so one look at the present moment races it. The exit is
+/// waited for, bounded by the kill, and nothing is left or handed back.
+///
+/// Mutants: the refused kill is followed by the one look; the wait is bounded; the reach is not asked
+/// about this child.
+#[skuld::test]
+fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
+    let reach = FakeReach::answering(Ok(true));
+    let fake = fake()
+        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let _fire = fire_on_block(&fake);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+
+    let torn = child.tear_down(
+        Some(id()),
+        TeardownKind::Kill {
+            disposition: Disposition::HandBack,
+            tree: Some(&reach),
+        },
+        None,
+    );
+
+    assert_eq!(torn.fate, ChildFate::Reaped, "{torn:?}");
+    assert_eq!(torn.left, None, "{torn:?}");
+    assert_eq!(reach.asked(), [Some(PID)]);
+    assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
+}
+
+/// A refused kill of a child that no tree kill reached is looked at once, never waited for: nothing
+/// asked it to exit. A reach that cannot say is the same.
+///
+/// Mutants: `Ok(false)` or `Err` is taken for `Ok(true)`.
+#[skuld::test]
+fn a_refused_kill_of_a_child_the_tree_kill_did_not_reach_is_looked_at_once() {
+    for answer in [Ok(false), Err(std::io::ErrorKind::Other)] {
+        let reach = FakeReach::answering(answer);
+        let (torn, fake) = refused_kill_with_a_tree_kill(&reach);
+
+        assert_eq!(torn.fate, ChildFate::Running { id: Some(id()) }, "{answer:?}: {torn:?}");
+        assert!(
+            torn.left.as_deref().is_some_and(|left| left.contains("handed back")),
+            "{answer:?}: {torn:?}"
+        );
+        assert_eq!(reach.asked(), [Some(PID)], "{answer:?}");
+        assert_eq!(fake.looks(), 1, "{answer:?}: one look");
+    }
+}
+
+/// A child to be handed back says so, and does not say it is left running.
+///
+/// Mutants: the text ignores the disposition; it drops the child or the refusal.
+#[skuld::test]
+fn a_refused_kill_of_a_child_to_be_handed_back_says_so() {
+    let refusal = std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string();
+    let left = left_of_a_refused_kill_of_a_running_child(Disposition::HandBack);
+    assert!(
+        left.contains(&PID.to_string()) && left.contains(&refusal) && left.contains("handed back to the caller"),
+        "{left}"
+    );
+    assert!(!left.contains("leaving it running"), "{left}");
+}
+
+/// A child to be left says so.
+///
+/// Mutant: the text always says the child is handed back.
+#[skuld::test]
+fn a_refused_kill_of_a_child_to_be_left_says_it_is_left_running() {
+    let left = left_of_a_refused_kill_of_a_running_child(Disposition::Leave);
+    assert!(left.contains("leaving it running"), "{left}");
+    assert!(!left.contains("handed back"), "{left}");
 }
 
 /// A kill that failed, whatever the error, is followed by one look and no wait, and a child still

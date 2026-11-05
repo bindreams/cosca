@@ -150,6 +150,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
 
     crate::log_capture::install();
     let view = |root| DropView {
+        caller: crate::containment::dispatch::TeardownCaller::Drop,
         root_pid: 1,
         root,
         tree_killed: false,

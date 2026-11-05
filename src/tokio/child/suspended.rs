@@ -80,12 +80,13 @@ impl SuspendedChild {
                 Ok(child)
             }
             Err(e) => {
-                let fate = child.tear_down_now();
+                let fate = child.tear_down_now(crate::containment::dispatch::TeardownCaller::FailedRun);
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
                         detail: format!("could not resume the frozen child: {e}"),
                     },
                     fate,
+                    None,
                     child.behind_wrapper(),
                 ))
             }

@@ -400,6 +400,42 @@ mod on_windows {
         teardown.assert_reaps_killed();
     }
 
+    /// A failed resume whose teardown cannot kill the frozen child leaves it, warned, and hands
+    /// nothing back: a child whose initial thread may never run would block an `Unreaped` for ever.
+    ///
+    /// Mutant: `resume` hands the child back.
+    #[skuld::test]
+    fn a_failed_resume_of_a_child_whose_kill_is_refused_leaves_it() {
+        crate::log_capture::install();
+        let (mut cmd, writer) = held_blocker(false);
+        let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let id = frozen.id();
+        let remote = Remote::open(id.pid());
+        let release = (writer, ResumeOnDrop(InitialThread::of(id.pid())));
+        frozen
+            .child
+            .proc
+            .script_over(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]));
+        let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+        let mark = crate::log_capture::mark();
+
+        let err = frozen.resume().expect_err("the resume was forced to fail");
+        drop(forced);
+
+        let Error::MayHaveStarted { fate, unreaped, .. } = err else {
+            panic!("expected MayHaveStarted, got {err:?}");
+        };
+        let handed_back = crate::test_child::HandedBack::new(release, unreaped.map(|unreaped| *unreaped));
+        assert_eq!(fate, ChildFate::Running { id: Some(id) });
+        assert!(handed_back.is_none(), "resume hands nothing back");
+        let warns = crate::log_capture::records_since_on_current_thread(mark, "leaving it running");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].1.starts_with("teardown after a failed run: "), "{warns:?}");
+        // The frozen thread runs and the blocker's stdin closes, so the blocker exits.
+        drop(handed_back);
+        remote.wait_for_death();
+    }
+
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.

@@ -15,20 +15,20 @@ use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
 use crate::wait::teardown_warn::Due;
 
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
-struct FakeReach {
+pub(super) struct FakeReach {
     answer: Result<bool, io::ErrorKind>,
     asked: RefCell<Vec<Option<u32>>>,
 }
 
 impl FakeReach {
-    fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
+    pub(super) fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
         Self {
             answer,
             asked: RefCell::default(),
         }
     }
 
-    fn asked(&self) -> Vec<Option<u32>> {
+    pub(super) fn asked(&self) -> Vec<Option<u32>> {
         self.asked.borrow().clone()
     }
 }
@@ -256,6 +256,7 @@ fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
 #[cfg(unix)]
 mod worded {
     use super::*;
+    use crate::containment::dispatch::TeardownCaller;
 
     const WHY: &str = "the front is not in a cgroup this drop killed";
 
@@ -263,7 +264,7 @@ mod worded {
     fn worded_by_the_drop(fake: &FakeProcess, reach: Reaches<'_>) -> (TeardownOutcome, Vec<(log::Level, String)>) {
         let (torn, _) = look_logged(fake, Some(id()), reach, None);
         let mark = crate::log_capture::mark();
-        let worded = crate::child::word_front(PID, &WHY, torn);
+        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, torn);
         (
             worded,
             crate::log_capture::records_since_on_current_thread(mark, "Child::drop: "),
@@ -381,6 +382,28 @@ mod worded {
         );
     }
 
+    /// A teardown after a failed run words its look under its own name, not a drop's.
+    ///
+    /// Mutant: the rendering hardcodes `Child::drop`.
+    #[skuld::test]
+    fn a_front_reaped_in_a_failed_runs_teardown_is_said_under_its_name() {
+        crate::log_capture::install();
+        let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+        let (torn, _) = look_logged(&fake, Some(id()), Ok(None), None);
+        let mark = crate::log_capture::mark();
+
+        crate::child::word_front(TeardownCaller::FailedRun, PID, &WHY, torn);
+
+        let records = crate::log_capture::records_since_on_current_thread(mark, "elevation front pid");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            records[0]
+                .1
+                .starts_with("teardown after a failed run: elevation front pid 4242"),
+            "{records:?}"
+        );
+    }
+
     /// A teardown that is not a front's has no look to word: the outcome is returned as it is.
     ///
     /// Mutant: the rendering rewrites `left`.
@@ -388,7 +411,7 @@ mod worded {
     fn an_outcome_with_no_look_is_returned_as_it_is() {
         let mut torn = TeardownOutcome::new(ChildFate::Reaped);
         torn.left = Some("from the policy".to_owned());
-        let worded = crate::child::word_front(PID, &WHY, torn);
+        let worded = crate::child::word_front(TeardownCaller::Drop, PID, &WHY, torn);
         assert_eq!(worded.left.as_deref(), Some("from the policy"));
     }
 }
