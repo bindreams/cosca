@@ -13,7 +13,7 @@ use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, setuid, Group};
+use crate::test_groups::{cgroup, pidfd_group_signal, setuid, Group};
 
 /// A command for a child that only a real kill ends and that the test never holds, for the macOS
 /// tests whose child is left alone: its stdin writer is leaked.
@@ -979,7 +979,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
     use crate::error::ChildFate;
     use crate::os_process::child::{ExitRecord, Foreign};
 
-    let id = crate::identity::ProcessId::from_parts(42, 1);
+    let id = crate::identity::ProcessId::from_parts_for_test(42, crate::identity::Key::for_test(1));
     for exited_front in [false, true] {
         let who = if exited_front {
             "the elevated child pid 42 (it had already exited)"
@@ -1678,6 +1678,52 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
     use crate::identity::stat_parse::stat_fixture;
+    use crate::identity::Resolved;
+    use crate::wait::exit_only::Target;
+
+    #[allow(
+        clippy::zombie_processes,
+        reason = "reaped through its pidfd; waiting by its number could reach a reused pid"
+    )]
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the child");
+    let pid = child.id();
+    let raw = Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
+    let pidfd = pidfd_open(raw, PidfdFlags::empty()).expect("pidfd_open the child");
+    // The `/proc` path: below Linux 6.9 the same-tick reuser has the child's own token.
+    let id = crate::identity::ticks_id(pid);
+
+    drop(child.stdin.take());
+    crate::test_child::pid_reuse::wait_pollin(std::os::fd::AsFd::as_fd(&pidfd));
+    let reaped = waitid(WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)), WaitIdOptions::EXITED).expect("raw reap");
+    assert!(reaped.is_some(), "the raw reap must consume an exit record");
+
+    let look_alike = stat_fixture("S", id.key().ticks());
+    let kernel = crate::identity::ticks_host(pid)
+        .same_view()
+        .on_read(&format!("{pid}/stat"), Ok(&look_alike));
+    let (unchecked, _) = super::resolve_identity_unchecked(&kernel, pid);
+    assert!(
+        matches!(unchecked, Resolved::Found(seen) if seen == id),
+        "precondition: the read by pid alone finds the child's own identity: {unchecked:?}"
+    );
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    assert!(
+        matches!(read, Resolved::Gone),
+        "a look-alike with the child's token is not the child: {read:?}"
+    );
+}
+
+/// The same read on pidfs, where the reuser's inode is its own: the read by pid alone finds the
+/// reuser's identity, and the peek through the child's pidfd, which shows it reaped, still makes the
+/// read `Gone`.
+///
+/// Mutant: `resolve_identity` skips the peek through the handle.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn resolve_identity_of_a_reaped_child_whose_pid_a_reuser_holds_is_gone(#[fixture(pidfd_group_signal)] _group: &Group) {
+    use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
+
     use crate::identity::{FakeKernel, HostKernel, ProcessId, Resolved};
     use crate::wait::exit_only::Target;
 
@@ -1693,24 +1739,27 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
     let Resolved::Found(id) = ProcessId::of(pid) else {
         panic!("the child must be readable before it is reaped")
     };
+    let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
 
     drop(child.stdin.take());
     crate::test_child::pid_reuse::wait_pollin(std::os::fd::AsFd::as_fd(&pidfd));
     let reaped = waitid(WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
 
-    let look_alike = stat_fixture("S", id.start_token_raw());
+    // The pid's new owner: a pidfd opens, with another inode.
     let kernel = FakeKernel::over(&HostKernel)
-        .same_view()
-        .on_read(&format!("{pid}/stat"), Ok(&look_alike));
+        .on_pidfd_open(
+            pid,
+            Ok(std::os::fd::OwnedFd::from(
+                std::fs::File::open("/dev/null").expect("/dev/null opens"),
+            )),
+        )
+        .on_pidfs_ino(pid, Ok(Some(ino + 1)));
     let (unchecked, _) = super::resolve_identity_unchecked(&kernel, pid);
     assert!(
-        matches!(unchecked, Resolved::Found(seen) if seen == id),
-        "precondition: the read by pid alone finds the child's own identity: {unchecked:?}"
+        matches!(unchecked, Resolved::Found(seen) if seen != id),
+        "precondition: the read by pid alone finds the reuser: {unchecked:?}"
     );
     let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
-    assert!(
-        matches!(read, Resolved::Gone),
-        "a look-alike with the child's token is not the child: {read:?}"
-    );
+    assert!(matches!(read, Resolved::Gone), "a reuser is not the child: {read:?}");
 }

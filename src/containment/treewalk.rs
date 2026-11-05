@@ -7,8 +7,8 @@
 //! teardown it takes a `(pid, ppid)` snapshot of the host, walks the ppid chain
 //! down from the root, and kills each *genuine* descendant by identity. It is
 //! best-effort and reports as [`crate::containment::Containment::TreeWalk`]: it
-//! misses reparented orphans (a child whose parent already exited, so its ppid no
-//! longer chains to the root) and broker-spawned escapes.
+//! misses reparented orphans (a child whose parent exited before the walk read the
+//! child, so its ppid no longer chains to the root) and broker-spawned escapes.
 //!
 //! # The PID-reuse / stale-ppid defense (the order-key rule)
 //!
@@ -65,8 +65,15 @@ pub(crate) enum KillOutcome {
 /// The tree-walk resolver. A pid we may not query is dropped from the walk exactly like a
 /// pid that is gone - the walk cannot kill what it cannot verify - but the two are logged
 /// apart, because "denied" is an operational signal (run elevated) and "gone" is not.
-pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid) -> Option<(ProcessId, OrderKey)> {
-    match ProcessId::of_ordered_with(kernel, pid).0 {
+///
+/// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
+/// `pid` carries its parent (Linux: the `stat` the id was made with), a candidate is dropped when
+/// its parent's number is another now, which means the pid changed hands since the snapshot or the
+/// same process was orphaned and is no longer in the tree; and when its parent's number no longer
+/// holds `parent`, which means the parent was reaped and its number taken by a process whose own
+/// children the candidate could be. Elsewhere the listing has nothing to check it against.
+pub(crate) fn resolve_or_drop(kernel: &dyn Kernel, pid: RawPid, parent: ProcessId) -> Option<(ProcessId, OrderKey)> {
+    match ProcessId::of_ordered_with(kernel, pid, Some(parent)).0 {
         Resolved::Found(read) => Some(read),
         Resolved::Gone => None,
         Resolved::Unknown => {
@@ -105,9 +112,10 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
-/// identity and order key via `resolve` and keeps it ONLY if its key orders correctly
+/// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
+/// the edge names, and keeps it ONLY if its key orders correctly
 /// against `root_key` per `allow_equal` (see module docs). `resolve` is injected
-/// so the filter is pure: live code passes `ProcessId::of_ordered_with`, tests pass a stub.
+/// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
@@ -115,17 +123,17 @@ pub(crate) fn descendants_with(
     root_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let keep = |key: OrderKey| keeps_order(key, root_key, allow_equal);
 
     // BFS over the ppid forest. `frontier` holds pids whose children we still
-    // need to visit; it starts as just the root pid. A pid joins the result (and
+    // need to visit; it starts as just the root. A pid joins the result (and
     // the next frontier) only if its ppid is in the current accepted set AND its
     // order key passes `keeps_order`. No fixed iteration cap: the loop drains a
     // strictly shrinking set of not-yet-visited edges.
     let mut result: Vec<ProcessId> = Vec::new();
-    let mut frontier: Vec<RawPid> = vec![root.pid()];
+    let mut frontier: Vec<ProcessId> = vec![root];
     // Remaining (pid, ppid) edges not yet attached to the tree.
     let mut pending: Vec<(RawPid, RawPid)> = parents.to_vec();
     // Pids already accepted, so a duplicate edge (e.g. a snapshot that lists a
@@ -138,20 +146,20 @@ pub(crate) fn descendants_with(
         std::collections::HashMap::new();
 
     while !frontier.is_empty() {
-        let mut next: Vec<RawPid> = Vec::new();
+        let mut next: Vec<ProcessId> = Vec::new();
         // Partition: edges whose ppid is in the current frontier are candidates.
         let mut still_pending: Vec<(RawPid, RawPid)> = Vec::with_capacity(pending.len());
         for (pid, ppid) in pending.drain(..) {
-            if !frontier.contains(&ppid) {
+            let Some(&parent) = frontier.iter().find(|p| p.pid() == ppid) else {
                 still_pending.push((pid, ppid));
                 continue;
-            }
+            };
             // A process is never its own parent; guard against a degenerate
             // pid == ppid self-loop that would otherwise spin the BFS.
             if pid == ppid {
                 continue;
             }
-            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid));
+            let read = *resolved.entry(pid).or_insert_with(|| resolve(pid, parent));
             let Some((id, key)) = read else {
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
@@ -164,7 +172,7 @@ pub(crate) fn descendants_with(
             // same process twice.
             if accepted.insert(pid) {
                 result.push(id);
-                next.push(pid);
+                next.push(id);
             }
         }
         pending = still_pending;
@@ -203,20 +211,24 @@ pub(crate) fn descendants(
     let Some(root_key) = anchor_key(kernel, root)? else {
         return Ok(Vec::new());
     };
-    Ok(descendants_with(root, root_key, parents, ALLOW_EQUAL_ORDER, |pid| {
-        resolve_or_drop(kernel, pid)
-    }))
+    Ok(descendants_with(
+        root,
+        root_key,
+        parents,
+        ALLOW_EQUAL_ORDER,
+        |pid, parent| resolve_or_drop(kernel, pid, parent),
+    ))
 }
 
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
-/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve` is
+/// pid and whose order key passes `keeps_order` against `parent_key`. `resolve(pid, parent)` is
 /// injected for purity. The parent itself is never included.
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_key: OrderKey,
     parents: &[(RawPid, RawPid)],
     allow_equal: bool,
-    resolve: impl Fn(RawPid) -> Option<(ProcessId, OrderKey)>,
+    resolve: impl Fn(RawPid, ProcessId) -> Option<(ProcessId, OrderKey)>,
 ) -> Vec<ProcessId> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -224,7 +236,7 @@ pub(crate) fn children_of_with(
         if ppid != parent.pid() || pid == ppid {
             continue;
         }
-        let Some((id, key)) = resolve(pid) else {
+        let Some((id, key)) = resolve(pid, parent) else {
             log::debug!("treewalk: pid {pid} unresolvable — dropped from children");
             continue;
         };
@@ -258,13 +270,58 @@ pub(crate) fn children_of(
         parent_key,
         parents,
         ALLOW_EQUAL_ORDER,
-        |pid| resolve_or_drop(kernel, pid),
+        |pid, parent| resolve_or_drop(kernel, pid, parent),
     ))
+}
+
+/// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
+/// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
+/// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
+/// so nothing is sent: `NotAttempted`, as for a pid that cannot be queried. Best-effort.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
+    use std::os::fd::AsFd as _;
+
+    use nix::errno::Errno;
+
+    match crate::os_process::linux::open::open_verified_with(kernel, id) {
+        Ok(None) => {
+            log::debug!(
+                "treewalk: skipping pid {pid} - identity changed or gone since the snapshot",
+                pid = id.pid()
+            );
+            KillOutcome::AlreadyGone
+        }
+        Ok(Some(pidfd)) => {
+            let sent = crate::containment::unix::pidfd_signal_member(pidfd.as_fd(), id.pid(), signal);
+            #[cfg(test)]
+            crate::send_log::record_by_identity(id.pid(), signal as i32);
+            match sent {
+                Ok(()) => KillOutcome::Terminated,
+                // Reaped after the proof - nothing was left to kill.
+                Err(Errno::ESRCH) => KillOutcome::AlreadyGone,
+                Err(e) => {
+                    log::warn!("treewalk: pidfd_send_signal(pid {}, {signal:?}) failed: {e}", id.pid());
+                    KillOutcome::NotAttempted
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "treewalk: pid {pid} has no pidfd that proves it - not signaled, left running: {e}",
+                pid = id.pid()
+            );
+            KillOutcome::NotAttempted
+        }
+    }
 }
 
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a
 /// recycled pid. Already-gone (`None`, or `ESRCH`) is success. Best-effort.
-#[cfg(unix)]
+///
+/// Not atomic: the check and the `kill(2)` are two syscalls, so a pid recycled between them is
+/// still hit. This is macOS's residual window (no pidfd); Linux signals through the proved pidfd.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -601,6 +658,10 @@ mod treewalk_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "treewalk_view_tests.rs"]
 mod treewalk_view_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "treewalk_pidfs_tests.rs"]
+mod treewalk_pidfs_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "treewalk_blind_tests.rs"]

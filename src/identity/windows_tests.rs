@@ -5,7 +5,7 @@ use windows::Win32::System::Threading::{
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
 use crate::identity::windows_fixture::spawn_restricted;
-use crate::identity::{Liveness, Resolved, StartToken};
+use crate::identity::{Key, Liveness, Resolved};
 
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
 /// is exited.
@@ -35,7 +35,7 @@ fn is_running_alive_for_self_dead_for_wrong_token() {
         panic!("our own token must resolve");
     };
     assert_eq!(is_running(pid, tok), Liveness::Alive, "we are obviously running");
-    let wrong = StartToken::from_raw(tok.raw().wrapping_add(1));
+    let wrong = Key::from_raw(tok.raw().wrapping_add(1));
     assert_eq!(
         is_running(pid, wrong),
         Liveness::Dead,
@@ -120,7 +120,7 @@ fn nonexistent_pid_is_gone_not_unknown() {
     // tests assert theirs by fixture.
     let ghost = 0xFFFF_FFF0u32;
     assert_eq!(start_token(ghost), Resolved::Gone);
-    assert_eq!(is_running(ghost, StartToken::from_raw(1)), Liveness::Dead);
+    assert_eq!(is_running(ghost, Key::from_raw(1)), Liveness::Dead);
 }
 
 /// `Process::kill` documents "a real failure (no rights / access-denied on a live process)
@@ -339,7 +339,7 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
     let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+    let stale = real.with_other_value();
     assert!(child.is_running(), "precondition: the pid's occupant is live");
     assert!(exited_now(stale).expect("a readable stranger on the pid proves the stale identity is gone"));
 }
@@ -357,7 +357,7 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
-    let stale = crate::identity::ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
+    let stale = real.with_other_value();
     assert!(
         child.is_running(),
         "precondition: the pid's occupant is live and unreadable"

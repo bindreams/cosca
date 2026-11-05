@@ -48,7 +48,7 @@ impl ProcessId {
             return Ok(None);
         }
         // An access-denied parent is not "no parent".
-        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid) {
+        let (parent, parent_key) = match ProcessId::of_ordered_with(kernel, ppid, None) {
             (Resolved::Found(read), _) => read,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
@@ -58,14 +58,19 @@ impl ProcessId {
                 ));
             }
         };
-        let key = match self.order_key_with(kernel) {
-            (Resolved::Found(key), _) => key,
-            (Resolved::Gone, _) => return Ok(None),
+        // `ppid` is only a number: `self`'s own read must still name it, and the parent must still
+        // hold it after that read (Linux; the other platforms check neither).
+        let key = match ProcessId::of_ordered_with(kernel, self.pid(), Some(parent)) {
+            (Resolved::Found((read, key)), _) if read == *self => key,
+            // `self` was replaced, exited, or has another parent now.
+            (Resolved::Found(_) | Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
-                return Err(crate::containment::treewalk::unqueryable(
-                    &format!("pid {}", self.pid()),
-                    cause,
-                ));
+                // The parent's proof can be what failed, not `self`'s read.
+                let subject = match cause.blamed_parent() {
+                    Some(parent) => format!("ppid {parent}"),
+                    None => format!("pid {}", self.pid()),
+                };
+                return Err(crate::containment::treewalk::unqueryable(&subject, cause));
             }
         };
         // A genuine parent predates this child; a recycled ppid names a later-started process.
@@ -132,3 +137,7 @@ impl ProcessId {
 #[cfg(test)]
 #[path = "tree_tests.rs"]
 mod tree_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tree_pidfs_tests.rs"]
+mod tree_pidfs_tests;
