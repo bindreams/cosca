@@ -18,6 +18,7 @@ use crate::test_child::Console;
 use std::os::unix::process::CommandExt as _;
 use std::process::{ChildStdin, ChildStdout};
 
+use crate::containment::cgroup::test_support::KillOnDrop;
 use crate::test_child::{fixture_command, fixture_path, is_marked_fixture_reexec};
 
 /// Marks the helper re-exec; the value is the driver's pid.
@@ -184,19 +185,11 @@ pub(crate) fn allow_any_tracer_now() -> std::io::Result<()> {
     }
 }
 
-/// Ends the helper when the driver leaves, whatever the way.
-struct Helper(std::process::Child);
-
-impl Drop for Helper {
-    fn drop(&mut self) {
-        _ = self.0.kill();
-        _ = self.0.wait();
-    }
-}
-
 /// A running foreign tracer.
 pub(crate) struct Tracer {
-    helper: Helper,
+    helper: std::process::Child,
+    /// Ends the helper when the driver leaves, whatever the way.
+    ends_helper: KillOnDrop,
     go: Option<ChildStdin>,
     lines: std::io::Lines<BufReader<ChildStdout>>,
 }
@@ -241,11 +234,13 @@ fn start_helper(pid: Option<u32>, hold_exit: bool) -> Tracer {
     if hold_exit {
         cmd.env(HOLD_EXIT_ENV, "1");
     }
-    let mut helper = Helper(crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer"));
-    let go = helper.0.stdin.take().expect("piped stdin");
-    let lines = BufReader::new(helper.0.stdout.take().expect("piped stdout")).lines();
+    let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer");
+    let ends_helper = KillOnDrop::of(&helper);
+    let go = helper.stdin.take().expect("piped stdin");
+    let lines = BufReader::new(helper.stdout.take().expect("piped stdout")).lines();
     Tracer {
         helper,
+        ends_helper,
         go: Some(go),
         lines,
     }
@@ -303,7 +298,9 @@ impl Tracer {
     /// Closes the helper's stdin and waits for it to exit cleanly.
     pub(crate) fn finish(mut self) {
         drop(self.go.take());
-        let status = self.helper.0.wait().expect("the helper exits");
+        let status = self.helper.wait().expect("the helper exits");
+        // Reaped: the guard's pidfd would refuse a kill of it.
+        _ = self.ends_helper.defuse();
         assert!(status.success(), "{status:?}");
     }
 }

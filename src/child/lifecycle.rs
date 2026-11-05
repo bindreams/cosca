@@ -50,12 +50,13 @@ pub(super) fn status_of_outcome(
 /// What became of a child after a wait, or a look at the present moment, answered `answer`
 /// (`killed`: a kill reached the child, delivered by this handle or by a containment kill that
 /// reached it). The one classification of that answer, which every teardown, `finish_elevated` and
-/// `Unreaped` asks for the fate, whether the child is left uncollected, the fate of an elevation
-/// front, and what to say.
+/// `Unreaped` asks for the fate, the fate of an elevation front, and what to say. Whether the child
+/// is left uncollected (still this process's: neither reaped by it nor shown reaped elsewhere, so a
+/// caller can hand it back) is the [`Wording`] variant, which is what the clause is built from.
 ///
-/// | answer                       | [`fate`](Self::fate)  | [`uncollected`](Self::uncollected) | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
+/// | answer                       | [`fate`](Self::fate)  | uncollected                        | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
 /// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
-/// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | nothing                                                     |
+/// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | debug "reaped it" ("after the kill" only if `killed`)       |
 /// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
 /// | `Foreign(Gone, Other)`       | `f.fate(killed)`      | no                                 | `Unaccounted`                    | debug "reaped by someone else"                              |
 /// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn "not ours to reap (launchd holds its zombie, ...)"     |
@@ -64,7 +65,8 @@ pub(super) fn status_of_outcome(
 /// | `DeadlinePassed`, not killed | `Running { id }`      | yes                                | `LeftUnreaped`                   | warn: the caller's running clause, or "its wait ended with no exit" for a wait with no deadline |
 /// | `DeadlinePassed`, `killed`   | none: a kill is followed by a wait with no deadline, and [`new`](Self::new) asserts it | | |                                                  |
 ///
-/// Every line leads with the caller's subject, a zombie launchd holds included.
+/// Every row has a clause, and every line leads with the caller's subject, a zombie launchd holds
+/// included.
 ///
 /// An unreadable record means the consuming reap took the zombie: the child was collected, only its
 /// exit is lost, so it is `Reaped` whether or not a kill reached it.
@@ -94,16 +96,6 @@ impl Settlement {
         }
     }
 
-    /// Whether the child is still this process's: neither reaped by it nor shown reaped elsewhere.
-    /// It is the child a caller can hand back. A deadline that passed, or a wait that failed, leaves
-    /// it, a zombie if there is one.
-    pub(crate) fn uncollected(&self) -> bool {
-        !matches!(
-            self.answer,
-            Ok(ChildWaitOutcome::Exited(_) | ChildWaitOutcome::Foreign(_))
-        )
-    }
-
     /// What became of an elevation front, which is sent nothing.
     #[cfg_attr(
         not(target_os = "linux"),
@@ -130,57 +122,71 @@ impl Settlement {
         }
     }
 
-    /// What to say of the child, and at what level; the caller logs it. `subject` leads the line.
-    /// `running` is the whole line for a child still running; `None` for a wait with no deadline,
-    /// which says it ended with no exit. `disposition` adds where an uncollected child goes.
-    pub(crate) fn wording(
-        &self,
-        subject: &str,
-        running: Option<&str>,
-        disposition: Disposition,
-    ) -> Option<(log::Level, String)> {
+    /// Why the child's exit record could not be read, if it could not: the child was reaped, and
+    /// only its exit is lost.
+    #[cfg(unix)]
+    pub(crate) fn unreadable_record(&self) -> Option<String> {
         match &self.answer {
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => None,
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => {
-                let after = if self.killed { " after the kill" } else { "" };
-                Some((
-                    log::Level::Warn,
-                    format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
-                ))
-            }
-            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
-                Some((log::Level::Warn, format!("{subject}: {ORPHANED}")))
-            }
-            Ok(ChildWaitOutcome::Foreign(_)) => Some((log::Level::Debug, format!("{subject}: reaped by someone else"))),
-            Err(e) => Some((
-                log::Level::Warn,
-                format!(
-                    "{subject}: the wait failed: {e}{}",
-                    disposition.handed_back_suffix(self.uncollected())
-                ),
-            )),
-            Ok(ChildWaitOutcome::DeadlinePassed) => Some((
-                log::Level::Warn,
-                running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
-            )),
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Some(unreadable(*si_code)),
+            _ => None,
         }
     }
 
-    /// [`wording`](Self::wording) for a caller with one warn to make: a line at warn is returned for
-    /// that warn, and a line below it is logged here, led by `log_lead`.
-    pub(crate) fn leftover(
-        &self,
-        subject: &str,
-        running: Option<&str>,
-        disposition: Disposition,
-        log_lead: &str,
-    ) -> Option<String> {
-        match self.wording(subject, running, disposition)? {
-            (log::Level::Warn, text) => Some(text),
-            (level, text) => {
-                log::log!(level, "{log_lead}{text}");
-                None
+    /// What to say of the child, and at what level: a clause for every answer, which the caller logs
+    /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
+    /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.
+    /// `disposition` adds where an uncollected child goes; `None` for a caller that says so itself.
+    pub(crate) fn wording(&self, subject: &str, running: Option<&str>, disposition: Option<Disposition>) -> Wording {
+        let after = if self.killed { " after the kill" } else { "" };
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(_))) => {
+                Wording::Collected(log::Level::Debug, format!("{subject}: reaped it{after}"))
             }
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Wording::Collected(
+                log::Level::Warn,
+                format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
+            ),
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
+                Wording::Collected(log::Level::Warn, format!("{subject}: {ORPHANED}"))
+            }
+            Ok(ChildWaitOutcome::Foreign(_)) => {
+                Wording::Collected(log::Level::Debug, format!("{subject}: reaped by someone else"))
+            }
+            Err(e) => Wording::Uncollected(format!(
+                "{subject}: the wait failed: {e}{}",
+                disposition.map_or("", |disposition| disposition.suffix(true))
+            )),
+            Ok(ChildWaitOutcome::DeadlinePassed) => Wording::Uncollected(
+                running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
+            ),
+        }
+    }
+}
+
+/// What a [`Settlement`] says of the child: the clause of a child the caller collected, at the level
+/// it is said at, or the warn of one it did not. A child still this process's has no level to
+/// choose: its clause is a warn, so a clause that is not cannot be built for it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wording {
+    /// Reaped by this process, or shown reaped elsewhere.
+    Collected(log::Level, String),
+    /// Still this process's: neither reaped by it nor shown reaped elsewhere; the text is a warn.
+    Uncollected(String),
+}
+
+impl Wording {
+    /// The level the clause is said at.
+    pub(crate) fn level(&self) -> log::Level {
+        match self {
+            Wording::Collected(level, _) => *level,
+            Wording::Uncollected(_) => log::Level::Warn,
+        }
+    }
+
+    /// The clause.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Wording::Collected(_, text) | Wording::Uncollected(text) => text,
         }
     }
 }

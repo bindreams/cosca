@@ -13,11 +13,11 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::super::{fault, HANDLE_PIDFD, HANDLE_PROC_DIR, TAG_INTENT};
-use super::{Abandoned, CgroupLeaf, TeardownWarn, Waiting, WarnAfter};
+use super::{Abandoned, CgroupLeaf, TeardownWarn, WarnAfter};
+use crate::child::owned::teardown::Expect;
 use crate::child::spawn::fault as spawn_fault;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{self, assert_warns_once_after_seizing, Names};
-use crate::wait::teardown_warn::Due;
 
 /// Abandons a leaf that warns past 1 s, after `intent` told it of a tracee a foreign tracer holds
 /// once killed, and asserts the one warn, naming `names`.
@@ -28,7 +28,7 @@ use crate::wait::teardown_warn::Due;
 fn assert_abandonment_warns_once<W: TeardownWarn + Send>(
     names: Names,
     intent: fn(&CgroupLeaf, u32, &OwnedFd),
-    handshake: fn(OwnedFd) -> Option<OwnedFd>,
+    handshake: fn(OwnedFd) -> Option<(OwnedFd, Expect)>,
     warn: fn() -> W,
 ) -> W {
     let mut child = foreign_tracer::blocker();
@@ -121,49 +121,10 @@ fn an_abandoned_child_named_by_its_proc_directory_is_waited_for_with_a_warn(#[fi
 /// Mutant: the abandonment tears it down with no warn.
 #[skuld::test]
 fn an_abandoned_child_the_handshake_holds_is_waited_for_with_a_warn(#[fixture(tracer_group)] _group: &Group) {
-    assert_abandonment_warns_once(Names::Unknown, |_, _, _| {}, Some, slow);
-}
-
-/// The warn of an abandonment that keeps count. Its `Due` has passed already.
-struct Recording {
-    due: Due,
-    warned: u32,
-}
-
-impl TeardownWarn for Recording {
-    fn due(&self) -> Option<Due> {
-        (self.warned == 0).then_some(self.due)
-    }
-
-    fn warn(&mut self, waiting: Waiting<'_>) {
-        self.warned += 1;
-        let Waiting::Child(pid) = waiting else {
-            panic!("an abandonment's wait for a child names a child");
-        };
-        crate::child::spawn::warn_still_waiting(pid, self.due.after);
-    }
-}
-
-/// The pidfd-only teardown warns through the caller's warn, which learns that its warn went out.
-///
-/// Mutant: the teardown warns on its own, from the threshold's length alone, so the object's count
-/// stays 0.
-#[skuld::test]
-fn the_pidfd_teardown_of_an_abandonment_warns_through_the_callers_warn(#[fixture(tracer_group)] _group: &Group) {
-    let warn = assert_abandonment_warns_once(
+    assert_abandonment_warns_once(
         Names::Unknown,
         |_, _, _| {},
-        Some,
-        || {
-            let passed = std::time::Instant::now() - std::time::Duration::from_secs(10);
-            Recording {
-                due: Due {
-                    until: passed,
-                    after: std::time::Duration::ZERO,
-                },
-                warned: 0,
-            }
-        },
+        |pidfd| Some((pidfd, Expect::Waited)),
+        slow,
     );
-    assert_eq!(warn.warned, 1, "the warn object is told of its one warn");
 }

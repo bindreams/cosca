@@ -438,4 +438,4 @@ impl fmt::Debug for OwnedChild {
 
 #[cfg(test)]
 #[path = "owned_tests.rs"]
-mod owned_tests;
+pub(crate) mod owned_tests;
