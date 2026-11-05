@@ -87,7 +87,8 @@ pub(crate) fn proc_names(
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(io::Error::other(format!(
-                "this process's /proc is an outer pid namespace's, so pid {pid}'s cgroup cannot be read"
+                "{}, so pid {pid}'s cgroup cannot be read",
+                crate::identity::DIVERGED_REASON
             )));
         }
         crate::identity::ProcView::Unassessable(why) => {
@@ -908,10 +909,10 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
     let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
-            return Err(Unreadable::View(
-                "this process's /proc is an outer pid namespace's, so no process's cgroup can be read by its pid"
-                    .into(),
-            ))
+            return Err(Unreadable::View(format!(
+                "{}, so no process's cgroup can be read by its pid",
+                crate::identity::DIVERGED_REASON
+            )))
         }
         crate::identity::ProcView::Unassessable(why) => {
             return Err(Unreadable::View(format!(
@@ -953,7 +954,10 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Ok(2) => Some(
             match hidden {
                 Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-                None => kernel.read(&proc_dir, &format!("{pid}/cgroup")).map(drop),
+                None => kernel
+                    .read(&proc_dir, &format!("{pid}/cgroup"))
+                    .and_then(crate::identity::utf8)
+                    .map(drop),
             }
             .map_err(|e| match e.raw_os_error() {
                 Some(libc::ENOENT | libc::EPERM | libc::EACCES) => Unreadable::Hidden(e),

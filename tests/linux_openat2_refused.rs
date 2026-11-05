@@ -20,16 +20,15 @@ const NO_PROCESS_CAN_HOLD: u32 = i32::MAX as u32;
 /// it, so the test's own thread keeps `openat2`.
 #[cfg(target_os = "linux")]
 fn with_openat2_refused<T: Send>(errno: i32, f: impl FnOnce() -> T + Send) -> T {
-    on_a_thread(|| {
-        common::seccomp::deny_openat2_on_this_thread(errno);
-        f()
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                common::seccomp::deny_openat2_on_this_thread(errno);
+                f()
+            })
+            .join()
+            .expect("the filtered thread")
     })
-}
-
-/// Runs `f` on a thread of its own, for a test that lands the filter itself, after it has spawned.
-#[cfg(target_os = "linux")]
-fn on_a_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| scope.spawn(f).join().expect("the filtered thread"))
 }
 
 /// A host where `openat2` is unavailable still has `/proc`, and `current()` reads `self/stat`
@@ -170,9 +169,13 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
             "enumerate::process_parents: listing the process table is not supported on linux: {}",
             refused_detail(name)
         );
-        assert!(
-            common::levels_since(mark, &warned).contains(&log::Level::Warn),
-            "{name}: the snapshot's refusal is warned of"
+        let warns = common::levels_since(mark, &warned)
+            .into_iter()
+            .filter(|level| *level == log::Level::Warn)
+            .count();
+        assert_eq!(
+            warns, 3,
+            "{name}: one warn each for parent, children(No) and children(Yes)"
         );
     }
 }
@@ -236,7 +239,7 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
             match result {
                 Err(cosca::error::Error::Unsupported { op, platform, detail }) => {
                     assert_eq!(platform, "linux", "{call} under {name}");
-                    assert!(op.contains(&pgid.to_string()), "{call} under {name}: {op}");
+                    assert_eq!(op, format!("listing process group {pgid}"), "{call} under {name}");
                     assert_eq!(
                         detail,
                         format!(
@@ -303,26 +306,32 @@ fn a_seccomp_refused_openat2_then_recovered_lets_kill_tree_retry() {
 #[skuld::test]
 fn a_seccomp_refused_openat2_leaves_an_async_treewalk_roots_kill_tree_an_error_and_the_root_alive() {
     for (errno, name) in REFUSALS {
-        let (result, status) = on_a_thread(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a current-thread runtime");
-            let _entered = runtime.enter();
-            let (mut child, control) = runtime.block_on(common::spawn_control_async_with(
-                "control-block",
-                &["R"],
-                false,
-                |cmd| {
-                    cmd.contain_with(cosca::ContainMode::TreeWalk);
-                },
-            ));
-            assert_eq!(child.containment(), cosca::Containment::TreeWalk);
-            common::seccomp::deny_openat2_on_this_thread(errno);
-            let result = child.kill_tree();
-            drop(control);
-            let status = runtime.block_on(child.wait()).expect("reap the root");
-            (result, status)
+        // A thread of its own: the filter is per-thread, and lands after the spawn.
+        let (result, status) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("a current-thread runtime");
+                    let _entered = runtime.enter();
+                    let (mut child, control) = runtime.block_on(common::spawn_control_async_with(
+                        "control-block",
+                        &["R"],
+                        false,
+                        |cmd| {
+                            cmd.contain_with(cosca::ContainMode::TreeWalk);
+                        },
+                    ));
+                    assert_eq!(child.containment(), cosca::Containment::TreeWalk);
+                    common::seccomp::deny_openat2_on_this_thread(errno);
+                    let result = child.kill_tree();
+                    drop(control);
+                    let status = runtime.block_on(child.wait()).expect("reap the root");
+                    (result, status)
+                })
+                .join()
+                .expect("the filtered thread")
         });
         assert_unsupported_naming(result, name, "kill_tree");
         assert!(

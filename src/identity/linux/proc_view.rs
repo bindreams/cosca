@@ -47,7 +47,8 @@ pub(crate) enum ProcView {
 /// Why a [`ProcView::Diverged`] `/proc` cannot answer questions about the caller's pids.
 pub(crate) const DIVERGED_REASON: &str = "this process's /proc is an outer pid namespace's";
 
-/// Why a [`ProcView::Unassessable`] `/proc` could not say which namespace it is.
+/// Why a [`ProcView::Unassessable`] `/proc` could not say which namespace it is: reading
+/// `self/status` failed, as I/O or as invalid UTF-8.
 pub(crate) const UNREADABLE_STATUS_REASON: &str = "self/status could not be read";
 
 impl ProcView {
