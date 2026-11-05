@@ -321,16 +321,30 @@ fn creator_pid(handle: HANDLE) -> Result<usize, NTSTATUS> {
 }
 
 /// The id key and the order key of `pid`, read on one `PROCESS_QUERY_LIMITED_INFORMATION` handle,
-/// so both describe the same process. `expected`: the key of the process asked about, when there
-/// is one; a pid that holds another key is [`Resolved::Gone`]. `ask_parent`: also read the creator
+/// so both describe the same process. `expected`: see
+/// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with). `ask_parent`: also read the creator
 /// pid on that handle, never a fall back to the snapshot's `th32ParentProcessID`; a refused creator
 /// query is [`ParentRead::Unreadable`] with its `NTSTATUS` in the cause ([`creator_read`]).
 pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
-    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-        Opened::Found(h) => h,
-        // No handle, so no creator: a read that asked is told it could not read it.
-        Opened::Gone => return OrderedRead::missing(Resolved::Gone, UnknownCause::default(), ask_parent),
-        Opened::Denied(_) => return OrderedRead::missing(Resolved::Unknown, UnknownCause::default(), ask_parent),
+    let (read, parent, cause) = open_and_read(pid, expected, ask_parent);
+    OrderedRead {
+        read: read.map(|(key, order)| (key, Some(order))),
+        parent,
+        cause,
+    }
+}
+
+/// The one open-then-read sequence of [`ordered_read`] and [`order_key`]: the handle of `pid`
+/// ([`open_for_query`]), the reads on it, and its close. With no handle there is no creator, so a
+/// read that asked for it is told it could not read it.
+fn open_and_read(
+    pid: RawPid,
+    expected: Option<Key>,
+    ask_parent: bool,
+) -> (Resolved<(Key, OrderKey)>, ParentRead, UnknownCause) {
+    let handle = match open_for_query(pid) {
+        Ok(handle) => handle,
+        Err(read) => return (read, ParentRead::not_read(ask_parent), UnknownCause::default()),
     };
     let (read, cause) = combine(pid, expected, creation_token_result(handle), sequence_number(handle));
     let (parent, cause) = if ask_parent {
@@ -339,7 +353,19 @@ pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool)
         (ParentRead::NotAsked, cause)
     };
     close(handle);
-    OrderedRead { read, parent, cause }
+    (read, parent, cause)
+}
+
+/// A `PROCESS_QUERY_LIMITED_INFORMATION` handle of `pid`, the weakest mask that can read the
+/// creation time. It is not universally granted to an unelevated caller, so a failure is
+/// classified rather than treated as absence: otherwise why there is no handle, [`Resolved::Gone`]
+/// or [`Resolved::Unknown`].
+fn open_for_query<T>(pid: RawPid) -> Result<HANDLE, Resolved<T>> {
+    match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Opened::Found(handle) => Ok(handle),
+        Opened::Gone => Err(Resolved::Gone),
+        Opened::Denied(_) => Err(Resolved::Unknown),
+    }
 }
 
 /// The parent number `creator`, the answer of [`creator_pid`] for `pid`, gives; a refused query is
@@ -402,7 +428,7 @@ fn combine(
 /// process holds it now. The read that proves the process is still there is the one that gives the
 /// key.
 pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let OrderedRead { read, cause, .. } = ordered_read(pid, Some(key), false);
+    let (read, _, cause) = open_and_read(pid, Some(key), false);
     (read.map(|(_, order)| order), cause)
 }
 
@@ -428,13 +454,9 @@ pub(super) fn current_token() -> Resolved<Key> {
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
-    // PROCESS_QUERY_LIMITED_INFORMATION is the weakest mask that can read the creation time,
-    // and it is not universally granted to an unelevated caller — a failure here is
-    // classified rather than treated as absence.
-    let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-        Opened::Found(h) => h,
-        Opened::Gone => return Resolved::Gone,
-        Opened::Denied(_) => return Resolved::Unknown,
+    let handle = match open_for_query(pid) {
+        Ok(handle) => handle,
+        Err(read) => return read,
     };
     let token = creation_token_result(handle);
     close(handle);

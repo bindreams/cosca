@@ -548,7 +548,7 @@ fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
 // order key =====
 
 fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
-    match id.order_key_with(&crate::identity::HostKernel).0 {
+    match id.order_key().0 {
         Resolved::Found(key) => key,
         other => panic!("the order key of {id:?} should read, got {other:?}"),
     }
@@ -560,13 +560,14 @@ fn order_key_of(id: crate::identity::ProcessId) -> crate::identity::OrderKey {
 #[skuld::test]
 fn the_order_key_is_not_the_creation_time() {
     let me = crate::identity::ProcessId::current();
-    let (read, _) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None);
+    let (read, _) =
+        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, me.pid(), None, None, None);
     let Resolved::Found((id, key)) = read else {
         panic!("our own order key must read, got {read:?}");
     };
     assert_eq!(id, me, "the id of the ordered read is the id of the by-pid read");
-    assert_ne!(key, crate::identity::OrderKey::for_test(me.key().raw()));
-    assert_eq!(key, order_key_of(me), "both reads of one process agree");
+    assert_ne!(key, Some(crate::identity::OrderKey::for_test(me.key().raw())));
+    assert_eq!(key, Some(order_key_of(me)), "both reads of one process agree");
 }
 
 /// The fact the tree walk relies on: a process's sequence number is greater than its creator's.
@@ -600,7 +601,7 @@ fn a_child_orders_after_its_creator_and_a_grandchild_after_the_child() {
 #[skuld::test]
 fn the_order_key_of_a_stale_id_is_gone() {
     let stale = crate::identity::ProcessId::current().with_other_value();
-    assert_eq!(stale.order_key_with(&crate::identity::HostKernel).0, Resolved::Gone);
+    assert_eq!(stale.order_key().0, Resolved::Gone);
 }
 
 /// Mutant: the walk drops a genuine descendant under the sequence-number order.
@@ -810,7 +811,8 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_opened_to_prove_it() {
     assert!(shell.is_running(), "precondition: the parent must be live");
     // The shell cannot be read by pid, so its id is stated; only its pid is looked up.
     let parent = crate::identity::ProcessId::from_parts_for_test(shell.pid(), Key::for_test(1));
-    let (read, cause) = crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent));
+    let (read, cause) =
+        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent), None, None);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(shell.pid()));
 }

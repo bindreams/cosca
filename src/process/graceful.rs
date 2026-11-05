@@ -45,8 +45,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// [`Error::Unassessable`] when the process table cannot be read: nothing is killed, the root
-    /// included.
+    /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
+    /// be queried: nothing is killed, the root included.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_with(&crate::identity::HostKernel)
     }
@@ -64,7 +64,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// [`Error::Unassessable`] when the process table cannot be read: nothing is signalled.
+    /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
+    /// be queried: nothing is signalled.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }

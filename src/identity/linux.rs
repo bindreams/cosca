@@ -40,7 +40,7 @@ use self::proc_view::ProcDir;
 use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::{parse_ppid, parse_starttime_jiffies};
-use super::{Existence, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
+use super::{Existence, Liveness, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
 use crate::error::Error;
 
 /// `kill(pid, 0)` — existence/permission check only, no signal delivered. The target
@@ -230,9 +230,19 @@ pub(super) fn of(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCau
 }
 
 /// [`of`], and a `stat` record that is that process's own: for a `Pidfs` key the bracketed one, and
-/// for ticks the very record the ticks were read from.
-pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
+/// for ticks the very record the ticks were read from. `expected`: see
+/// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with). A pidfd that shows another
+/// kind of key or another inode is `Gone` before the `stat` is read.
+pub(super) fn of_stat(
+    kernel: &dyn Kernel,
+    pid: RawPid,
+    expected: Option<Key>,
+) -> (Resolved<(Key, Vec<u8>)>, UnknownCause) {
     match look(kernel, pid) {
+        Look::Pidfs(ino) if expected.is_some_and(|expected| expected != Key::Pidfs(ino)) => {
+            (Resolved::Gone, UnknownCause::default())
+        }
+        Look::Ticks if matches!(expected, Some(Key::Pidfs(_))) => (Resolved::Gone, UnknownCause::default()),
         Look::Pidfs(ino) => {
             let (stat, cause) = bracketed_stat(kernel, pid, ino);
             (stat.map(|stat| (Key::Pidfs(ino), stat)), cause)
@@ -253,12 +263,11 @@ pub(super) fn of_stat(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<(Key, Vec<u
     }
 }
 
-/// The key, the order key (the `starttime`) and the parent number of `pid`, all from the `stat` that
-/// [`of_stat`] pairs with the key. A `stat` with no `starttime` is unreadable, not a start of zero;
-/// the ppid is parsed (and an unreadable one logged) only when `ask_parent`, and is then unreadable,
-/// not a parent number.
-pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -> OrderedRead {
-    let (read, cause) = of_stat(kernel, pid);
+/// The key and the parent number of `pid`, the latter from the `stat` that [`of_stat`] pairs with
+/// the key, with no order key. The ppid is parsed (and an unreadable one logged) only when
+/// `ask_parent`, and is then unreadable, not a parent number.
+pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
+    let (read, cause) = of_stat(kernel, pid, expected);
     let (key, stat) = match read {
         Resolved::Found(found) => found,
         Resolved::Gone => return OrderedRead::missing(Resolved::Gone, cause, ask_parent),
@@ -272,18 +281,14 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, ask_parent: bool) -
         log::debug!("identity: the stat of pid {pid} has no readable ppid");
         ParentRead::Unreadable
     };
-    match parse_starttime_jiffies(&stat) {
-        Some(ticks) => OrderedRead {
-            read: Resolved::Found((key, OrderKey(ticks))),
-            parent,
-            cause,
-        },
-        None => OrderedRead {
-            read: Resolved::Unknown,
-            parent,
-            cause: UnknownCause::default(),
-        },
+    // No order key: nothing on Linux orders by the start time, so a `stat` without one still gives
+    // its ppid. A `ticks` key is known only from the record just read.
+    OrderedRead {
+        read: Resolved::Found((key, None)),
+        parent,
+        cause,
     }
+    .against(expected)
 }
 
 /// Whether the process `key` names still holds `pid`.
@@ -366,12 +371,6 @@ fn start_ticks(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<u64>, Un
             (ticks_from(pid, stat), cause)
         }
     }
-}
-
-/// When `pid` started, for ordering.
-pub(super) fn order_key(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCause) {
-    let (ticks, cause) = start_ticks(kernel, pid, key);
-    (ticks.map(OrderKey), cause)
 }
 
 pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness {

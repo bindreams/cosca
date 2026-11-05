@@ -75,7 +75,8 @@ fn a_refused_sysctl_is_unknown_after_one_read() {
 fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     let (child, kid) = live_exiting_member();
     let _forced = fault::force_ppid_reads(kid.pid(), &[PpidRead::Refused]);
-    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
+    let parent = Some(ProcessId::current());
+    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), None);
@@ -122,11 +123,31 @@ fn one_parent_read_of_launchd_finds_its_parent_zero() {
 fn an_ordered_read_reads_the_parent_number_only_when_asked() {
     let (child, kid) = live_exiting_member();
     let _forced = fault::force_ppid_reads(kid.pid(), &[]);
-    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None);
+    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None, None, None);
     assert!(matches!(alone, Resolved::Found(_)), "{alone:?}");
     assert_eq!(fault::ppid_read_attempts(kid.pid()), 0);
-    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), Some(ProcessId::current()));
+    let parent = Some(ProcessId::current());
+    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert!(matches!(under, Resolved::Found(_)), "{under:?}");
     assert_eq!(fault::ppid_read_attempts(kid.pid()), 1);
+}
+
+/// A record whose key is not the `expected` one is another process's: `Gone`, with or without a
+/// parent named. The record with the expected key is found.
+///
+/// Mutant: `ordered_read` ignores `expected`.
+#[skuld::test]
+fn a_record_with_another_key_than_the_expected_one_is_gone() {
+    let (child, kid) = live_exiting_member();
+    let host = &crate::identity::HostKernel;
+    let read = |expected: Key, parent| ProcessId::of_ordered_with(host, kid.pid(), parent, Some(expected), None).0;
+    let other = kid.with_other_value().key();
+    let found = read(kid.key(), None);
+    let gone_alone = read(other, None);
+    let gone_under = read(other, Some(ProcessId::current()));
+    release_unsignalled(child);
+    assert!(matches!(found, Resolved::Found(_)), "{found:?}");
+    assert_eq!(gone_alone, Resolved::Gone);
+    assert_eq!(gone_under, Resolved::Gone);
 }

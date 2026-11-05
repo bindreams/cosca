@@ -1178,10 +1178,11 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
 }
 
 /// `ContainMode::TreeWalk` kills the whole tree by identity. Deterministic
-/// because the per-OS rule includes same-jiffy children on Linux/macOS; on
-/// Windows the strict-`>` rule still catches the grandchild (it is created after
-/// the root). Proof of death is the grandchild's control socket EOFing /
-/// ConnectionReset — never an is_alive() race or a timer.
+/// because on Linux/macOS nothing orders a child against its parent, so a child that
+/// starts in the root's own tick is a member; on Windows the strict-`>` rule still
+/// catches the grandchild (it is created after the root). Proof of death is the
+/// grandchild's control socket EOFing / ConnectionReset — never an is_alive() race
+/// or a timer.
 #[cfg(any(unix, windows))]
 #[skuld::test]
 fn treewalk_kill_tree_reaps_the_grandchild() {
