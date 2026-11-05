@@ -428,7 +428,7 @@ fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
     let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
 
-    let (read, cause) = resolve_identity_unchecked(child.pid());
+    let (read, cause) = resolve_identity_unchecked(&crate::identity::HostKernel, child.pid());
     let denied = spawn_identity_error(read, cause);
     assert!(
         matches!(denied, crate::error::Error::Unassessable { .. }),
@@ -436,7 +436,7 @@ fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
     );
 
     // Contrast: a pid no process holds.
-    let (read, cause) = resolve_identity_unchecked(0xFFFF_FFF0);
+    let (read, cause) = resolve_identity_unchecked(&crate::identity::HostKernel, 0xFFFF_FFF0);
     let absent = spawn_identity_error(read, cause);
     assert!(
         matches!(&absent, crate::error::Error::Io(e) if e.to_string().contains("reaped by another party")),
