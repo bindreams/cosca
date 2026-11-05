@@ -1,5 +1,5 @@
 //! `pidfd_open` refused by a real seccomp filter is `Unsupported` in the policy's message shape.
-//! The unit tests force the errno through a seam; these tests make the kernel answer it.
+//! The unit tests state the errno on a `FakeKernel`; these tests make the kernel answer it.
 
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -161,6 +161,11 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open() {
 
     for (code, name) in REFUSALS {
         let (child, control) = common::spawn_control("control-block", &["R"], true);
+        assert!(
+            !child.containment().can_observe_drain(),
+            "{name}: the fixture must watch the root only, got {:?}",
+            child.containment()
+        );
         let status = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -195,6 +200,46 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
                 .expect("the filtered thread");
         });
         common::kill_release_reap(&child, control);
+    }
+}
+
+/// The root-only grace wait of an async `graceful_shutdown_tree` opens the child by its identity,
+/// so a refused `pidfd_open` fails the watch: the shutdown still ends the child and reaps it, then
+/// surfaces `Unsupported` naming `process open`. The runtime is built and the child spawned on the
+/// filtered thread before the filter lands, and the shutdown runs on that thread's runtime. The
+/// async `graceful_shutdown` and `terminate` open by identity too and fail before any wait, so only
+/// the tree form reaches the grace wait with `pidfd_open` refused.
+///
+/// Mutant: the grace wait's open maps its error to "gone" (`Ok(true)`).
+#[cfg(target_os = "linux")]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_grace_wait_naming_process_open() {
+    for (code, name) in REFUSALS {
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("a current-thread runtime");
+                    let _entered = runtime.enter();
+                    let (mut child, control) =
+                        runtime.block_on(common::spawn_control_async("control-block", &["R"], true));
+                    assert!(
+                        !child.containment().can_observe_drain(),
+                        "{name}: the fixture must watch the root only, got {:?}",
+                        child.containment()
+                    );
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
+                    let result = runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)));
+                    drop(control);
+                    result
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+        assert_refused(result, "process open", name);
     }
 }
 
