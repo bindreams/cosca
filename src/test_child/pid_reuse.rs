@@ -111,6 +111,9 @@ pub(crate) fn reuse(pid: u32) -> Child {
 
 /// What a reader of `id`'s pid finds there: the identity with `id`'s own start token if `same_tick`,
 /// else the next one.
+///
+/// A same-tick reuser is a state of a host whose ids are start times in ticks. On pidfs a reuser has
+/// its own inode, so a `same_tick` row forces a state that host cannot be in.
 pub(crate) fn reuser_id(
     id: crate::identity::ProcessId,
     same_tick: bool,

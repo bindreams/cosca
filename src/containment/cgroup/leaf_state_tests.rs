@@ -159,13 +159,14 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A pidfd that cannot be polled says nothing about the child: no state, not "exited". A closed
-/// descriptor breaks the owned-fd contract of the poll, which debug builds assert.
+/// A closed descriptor breaks the owned-fd contract of the poll, which debug builds assert (release
+/// builds answer an error, which [`a_pidfd_that_polls_in_error_gives_no_state`] covers).
 ///
-/// Mutant: any ready poll reads as exit (`POLLNVAL` included).
+/// Mutant: the poll's `POLLNVAL` debug assertion is removed.
+#[cfg(debug_assertions)]
 #[skuld::test]
-#[cfg_attr(debug_assertions, should_panic(expected = "POLLNVAL"))]
-fn a_pidfd_that_cannot_be_polled_gives_no_state() {
+#[should_panic(expected = "POLLNVAL")]
+fn a_closed_pidfd_breaks_the_polls_contract() {
     use std::os::fd::{AsRawFd, BorrowedFd};
 
     let file = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -177,6 +178,24 @@ fn a_pidfd_that_cannot_be_polled_gives_no_state() {
     let child = crate::containment::ChildHandle {
         pid: std::process::id(),
         pidfd,
+    };
+    let _ = proc_state(&HostKernel, child);
+}
+
+/// A pidfd that cannot be polled says nothing about the child: no state, not "exited". Here the poll
+/// reports `POLLERR` (a pipe's write end whose reader is closed), which is an error in every
+/// profile and below the debug assertion.
+///
+/// Mutant: any ready poll reads as exit (`POLLERR` included).
+#[skuld::test]
+fn a_pidfd_that_polls_in_error_gives_no_state() {
+    use std::os::fd::AsFd as _;
+
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    let child = crate::containment::ChildHandle {
+        pid: std::process::id(),
+        pidfd: writer.as_fd(),
     };
     assert_eq!(proc_state(&HostKernel, child), None);
 }
@@ -224,7 +243,7 @@ fn a_thread_group_whose_leader_exited_has_no_state() {
 /// announces only once `/proc` shows the leader `Z` (the real condition, so the assertion cannot
 /// pass for want of waiting).
 ///
-/// Mutant: `is_alive` reads the state letter from `/proc` (`Dead`, #905).
+/// Mutant: `is_alive` reads the state letter from `/proc` (`Dead`).
 #[skuld::test]
 fn a_thread_group_whose_leader_exited_is_alive_to_its_pidfs_identity(
     #[fixture(pidfd_group_signal)] _group: &crate::test_groups::Group,

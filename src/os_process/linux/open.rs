@@ -142,8 +142,7 @@ pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error>
 ///   [`Error::NotThreadGroupLeader`]. `Unknown` from either query is `Unassessable`.
 /// - `Diverged`, or a view that could not be established, is `Unassessable` naming the view and
 ///   the `pidfd_open` errno. A raw `Io` here would surface as a bare `NotFound` on 6.16+, which
-///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
-///   `kill(2)`.
+///   reads as "gone".
 ///
 /// No pidfd to cross-check against, so the view comes from [`proc_view_with`](crate::identity::proc_view_with).
 fn verify_without_pidfd(
