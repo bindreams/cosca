@@ -360,9 +360,10 @@ fn classify_member(
 /// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
 /// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), through
 /// `open_verified_with` — the fd itself pins the identity at the kernel level, so a pid reused
-/// after `pidfd_open` cannot be hit even in principle. macOS has no pidfd equivalent, so `kill(2)` here keeps the same
-/// irreducible window as `treewalk::kill_by_identity` (re-verify, then `kill(2)`): a recycled
-/// pid in that window is a documented best-effort limitation of the group and tree sweeps.
+/// after `pidfd_open` cannot be hit even in principle, and `treewalk::kill_by_identity` signals
+/// the same way. Only macOS has the window: it has no pidfd equivalent, so `kill(2)` here and in
+/// `treewalk::kill_by_identity` (re-verify, then `kill(2)`) can reach a pid recycled in that gap,
+/// a documented best-effort limitation of the group and tree sweeps there.
 /// `Process::kill` on macOS does not have it: it signals by audit token
 /// (`os_process::macos::MacProcess::signal`).
 fn check_or_signal(
@@ -520,11 +521,12 @@ fn check_or_signal_linux_sigkill(
     id: crate::identity::ProcessId,
     root: &GroupRoot<'_>,
 ) -> Reached {
+    use std::os::fd::AsFd as _;
     match crate::os_process::linux::open::open_verified_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
-            Ok(()) => match send_member_pidfd(&pidfd, id.pid()) {
+            Ok(()) => match super::pidfd_signal_member(pidfd.as_fd(), id.pid(), Signal::SIGKILL) {
                 Ok(()) => Reached::Yes,
                 Err(nix::errno::Errno::ESRCH) => Reached::Yes, // exited between open and signal
                 Err(nix::errno::Errno::EPERM) => {
@@ -558,17 +560,6 @@ fn check_or_signal_linux_sigkill(
             Reached::Unknown
         }
     }
-}
-
-/// `SIGKILL` through a member's own pidfd, `pid` the member's.
-#[cfg(target_os = "linux")]
-fn send_member_pidfd(pidfd: &rustix::fd::OwnedFd, pid: RawPid) -> nix::Result<()> {
-    use std::os::fd::AsFd as _;
-    super::send_signal(
-        super::Target::Member(pid),
-        super::Sys::Pidfd(pidfd.as_fd(), 0),
-        Signal::SIGKILL,
-    )
 }
 
 /// "Ask forgiveness, one more time": re-confirm a `Survivor` verdict with a SECOND liveness

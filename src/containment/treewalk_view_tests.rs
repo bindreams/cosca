@@ -234,6 +234,14 @@ fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
     release(child);
 }
 
+/// [`ticks_host`] whose pidfd of `pid` is real, as on a host before Linux 6.9: a kill proves the
+/// process by the pidfd's fdinfo and its `stat`, and signals through it.
+fn ticks_host_with_a_real_pidfd(pid: u32) -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel)
+        .on_pidfd_open(pid, Ok(crate::child::front_cgroup_tests::pidfd_of(pid)))
+        .on_pidfs_ino(pid, Ok(None))
+}
+
 /// A kill re-verifies through the kernel: a pid it cannot read is not signalled and counts as
 /// not attempted; one it shows with another start time is already gone. Mutant:
 /// "`kill_by_identity` re-verifies through `HostKernel`": the member is signalled.
@@ -247,7 +255,8 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
         super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM),
         super::KillOutcome::NotAttempted
     );
-    let new_owner = ticks_host(id.pid()).on_read(&format!("{}/stat", id.pid()), Ok(&stat_of_a_new_owner(id.pid())));
+    let new_owner = ticks_host_with_a_real_pidfd(id.pid())
+        .on_read(&format!("{}/stat", id.pid()), Ok(&stat_of_a_new_owner(id.pid())));
     assert_eq!(
         super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
         super::KillOutcome::AlreadyGone
@@ -360,7 +369,7 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
             } else {
                 Err(libc::EACCES)
             };
-            let kernel = ticks_host(root.pid())
+            let kernel = ticks_host_with_a_real_pidfd(root.pid())
                 .live_without_pidfs(descendant.pid())
                 .on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
             let result = walk(&kernel, root);

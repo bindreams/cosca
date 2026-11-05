@@ -274,9 +274,54 @@ pub(crate) fn children_of(
     ))
 }
 
+/// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
+/// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
+/// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
+/// so nothing is sent: `NotAttempted`, as for a pid that cannot be queried. Best-effort.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
+    use std::os::fd::AsFd as _;
+
+    use nix::errno::Errno;
+
+    match crate::os_process::linux::open::open_verified_with(kernel, id) {
+        Ok(None) => {
+            log::debug!(
+                "treewalk: skipping pid {pid} - identity changed or gone since the snapshot",
+                pid = id.pid()
+            );
+            KillOutcome::AlreadyGone
+        }
+        Ok(Some(pidfd)) => {
+            let sent = crate::containment::unix::pidfd_signal_member(pidfd.as_fd(), id.pid(), signal);
+            #[cfg(test)]
+            crate::send_log::record_by_identity(id.pid(), signal as i32);
+            match sent {
+                Ok(()) => KillOutcome::Terminated,
+                // Reaped after the proof - nothing was left to kill.
+                Err(Errno::ESRCH) => KillOutcome::AlreadyGone,
+                Err(e) => {
+                    log::warn!("treewalk: pidfd_send_signal(pid {}, {signal:?}) failed: {e}", id.pid());
+                    KillOutcome::NotAttempted
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "treewalk: pid {pid} has no pidfd that proves it - not signaled, left running: {e}",
+                pid = id.pid()
+            );
+            KillOutcome::NotAttempted
+        }
+    }
+}
+
 /// Kill `id` only if the pid STILL resolves to that exact identity — never a
 /// recycled pid. Already-gone (`None`, or `ESRCH`) is success. Best-effort.
-#[cfg(unix)]
+///
+/// Not atomic: the check and the `kill(2)` are two syscalls, so a pid recycled between them is
+/// still hit. This is macOS's residual window (no pidfd); Linux signals through the proved pidfd.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;

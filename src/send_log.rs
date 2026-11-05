@@ -26,8 +26,7 @@ pub(crate) enum Via {
 
 pub(crate) type Entry = (u32, Sig, Via);
 
-/// A signal sent to a process by number after re-checking its identity: the pid and the signal
-/// number. Kept apart from [`Entry`] so the by-handle log of the drops keeps its shape.
+/// A signal sent to a process after checking its identity: the pid and the signal number. Kept apart from [`Entry`] so the by-handle log of the drops keeps its shape.
 pub(crate) type IdentityEntry = (u32, i32);
 
 /// One step of a send to a process group, in order: a check of the root, or a send.
@@ -93,7 +92,7 @@ pub(crate) fn record_group(step: GroupStep) {
     });
 }
 
-/// Records one identity-checked send attempt by number (`signo`), if a [`Capture`] is live.
+/// Records one identity-checked send attempt (`signo`), if a [`Capture`] is live.
 #[cfg(unix)]
 pub(crate) fn record_by_identity(pid: u32, signo: i32) {
     BY_IDENTITY.with(|log| {
@@ -141,8 +140,9 @@ impl Capture {
 }
 
 impl Capture {
-    /// The identity-checked sends by number: the tree walk on every unix, and on macOS also
-    /// the signals a held `os_process` sends.
+    /// The identity-checked sends: the tree walk on every unix (by number on macOS, through the
+    /// proved pidfd on Linux, where [`group_steps`](Self::group_steps) shows the route), and on
+    /// macOS also the signals a held `os_process` sends.
     #[cfg(unix)]
     pub(crate) fn by_identity(&self) -> Vec<IdentityEntry> {
         BY_IDENTITY.with(|log| log.borrow().clone().expect("a live capture has a log"))

@@ -3,7 +3,7 @@
 //! (its start time, from `stat`) and its identity (its pidfd's inode) are different numbers here, so
 //! a wrapper that hands the filter one for the other fails.
 //!
-//! Rows run everywhere: nothing here needs a real pidfd.
+//! Rows run on every Linux that has `pidfd_open`; none needs pidfs.
 
 use std::os::fd::OwnedFd;
 
@@ -204,4 +204,69 @@ fn on_a_ticks_host_a_child_is_kept_only_while_its_parent_shows_its_ticks() {
     assert!(super::children_of(&changed_hands, ticks_root(), &EDGES)
         .unwrap()
         .is_empty());
+}
+
+// The kill goes through the proved pidfd =====
+
+const KILLED_INO: u64 = 77;
+
+/// A `cat` that lives until its stdin closes, its pidfd, and a kernel in which that pid is `KILLED_INO`.
+/// The child is the pidfd's real target, so a signal sent through it is observable.
+fn live_child_in_a_table() -> (std::process::Child, ProcessId, FakeKernel<'static>) {
+    use std::process::{Command, Stdio};
+    let child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("cat spawns");
+    let pid = child.id();
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(pid, Ok(crate::child::front_cgroup_tests::pidfd_of(pid)))
+        .on_pidfs_ino(pid, Ok(Some(KILLED_INO)));
+    (
+        child,
+        ProcessId::from_parts_for_test(pid, Key::Pidfs(KILLED_INO)),
+        kernel,
+    )
+}
+
+/// Linux sends through the pidfd the identity was proved on, never by the pid's number, which could
+/// name another process the instant after the proof. Mutant: "send `kill(2)` by number after the
+/// proof": the send route is `Number` and no pidfd step is recorded.
+#[skuld::test]
+fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
+    use nix::sys::signal::Signal;
+    use std::os::unix::process::ExitStatusExt as _;
+    let (mut child, id, kernel) = live_child_in_a_table();
+    let sends = crate::send_log::Capture::start();
+    assert_eq!(
+        super::kill_by_identity(&kernel, id, Signal::SIGTERM),
+        super::KillOutcome::Terminated
+    );
+    assert_eq!(
+        sends.group_steps(),
+        vec![crate::send_log::GroupStep::Member(
+            crate::send_log::Route::Pidfd,
+            id.pid(),
+            libc::SIGTERM
+        )]
+    );
+    assert_eq!(
+        child.wait().expect("the child exits").signal(),
+        Some(libc::SIGTERM),
+        "the signal reached the process the pidfd names"
+    );
+}
+
+/// A process that was reaped after the proof is gone: the pidfd answers `ESRCH`. Mutant: "`ESRCH` is
+/// not attempted".
+#[skuld::test]
+fn a_kill_by_identity_of_a_process_reaped_after_the_proof_is_already_gone() {
+    let (mut child, id, kernel) = live_child_in_a_table();
+    drop(child.stdin.take());
+    child.wait().expect("the child exits at EOF");
+    assert_eq!(
+        super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM),
+        super::KillOutcome::AlreadyGone
+    );
 }
