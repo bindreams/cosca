@@ -259,7 +259,7 @@ impl Child {
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        lifecycle::wait_for_status(&self.proc)
+        lifecycle::wait_for_status(&self.proc, lifecycle::Orphaned::Warn)
     }
 
     /// Return the exit status if the child has already exited.
@@ -1241,16 +1241,12 @@ fn word_front(
         ),
     };
     torn.left = match look {
-        LookOutcome::Ended(settlement) => {
-            match settlement.wording(Some(pid), &format!("elevation front pid {pid}"), "", disposition) {
-                Some((log::Level::Warn, text)) => Some(text),
-                Some((level, text)) => {
-                    log::log!(level, "{label}: {text}");
-                    None
-                }
-                None => None,
-            }
-        }
+        LookOutcome::Ended(settlement) => settlement.leftover(
+            &format!("elevation front pid {pid}"),
+            None,
+            disposition,
+            &format!("{label}: "),
+        ),
         LookOutcome::LeftRunning => Some(match disposition {
             Disposition::Leave => format!(
                 "elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front would orphan \

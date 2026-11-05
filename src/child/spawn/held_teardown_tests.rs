@@ -132,7 +132,7 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
 /// A front its leaf's kill reached, whose reap then fails, is `Killed`, uncollected and still ours:
 /// handed back, and the error says it could not be waited on, not that it was reaped.
 ///
-/// Mutant: `ReapFailed` maps to `Reaped`.
+/// Mutant: a wait that failed after the kill reads as `Reaped`, or is not handed back.
 #[skuld::test]
 fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_says_so() {
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]));

@@ -5,11 +5,10 @@ use std::process::ExitStatus;
 
 use super::slot::ChildSlot;
 use super::teardown::Disposition;
-use super::{ChildWaitOutcome, OwnedChild};
-use crate::child::lifecycle::{wait_for_status, wait_to_exit, Settlement};
+use super::OwnedChild;
+use crate::child::lifecycle::{wait_for_status, wait_to_exit, Orphaned, Settlement};
 use crate::error::Error;
 use crate::identity::ProcessId;
-use crate::os_process::child::ExitRecord;
 use crate::os_process::child_named;
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
@@ -71,7 +70,7 @@ impl Unreaped {
     /// failed; the child is settled either way.
     pub fn wait(mut self) -> Result<ExitStatus, Error> {
         let child = self.child.take().expect("a live Unreaped holds its child");
-        wait_for_status(&child)
+        wait_for_status(&child, Orphaned::Warn)
     }
 
     /// Give the child up, unreaped. Logs nothing.
@@ -92,14 +91,14 @@ impl Drop for Unreaped {
             log::warn!("{who} was dropped without wait or leak while the thread is panicking; gave it up, unreaped");
             return;
         }
-        let answer = wait_to_exit(&child, None);
-        if let Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) = &answer {
+        let settlement = Settlement::new(wait_to_exit(&child, None), false);
+        // The drop's own line for a status, which the table words as nothing: it names the status.
+        if let Some(status) = settlement.status() {
             log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})");
             return;
         }
-        let settlement = Settlement::new(answer, false);
         let subject = format!("{who} was dropped without wait or leak");
-        if let Some((level, text)) = settlement.wording(pid, &subject, "", Disposition::Leave) {
+        if let Some((level, text)) = settlement.wording(&subject, None, Disposition::Leave) {
             log::log!(level, "{text}");
         }
     }

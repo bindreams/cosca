@@ -437,10 +437,10 @@ mod settlement {
         assert_eq!(settlement.front_fate(), front, "{settlement:?}");
     }
 
-    /// What the settlement says of the child "S" under `disposition`, with the pid 4242 and the
-    /// running clause [`RUNNING`].
+    /// What the settlement says of the child "S" under `disposition`, with the running clause
+    /// [`RUNNING`].
     fn worded(settlement: &Settlement, disposition: Disposition) -> Option<(log::Level, String)> {
-        settlement.wording(Some(PID), "S", RUNNING, disposition)
+        settlement.wording("S", Some(RUNNING), disposition)
     }
 
     /// A child that exited with a status is reaped and nothing is said, whether or not a kill reached it.
@@ -505,9 +505,10 @@ mod settlement {
         }
     }
 
-    /// A zombie launchd holds is the same, but warned of, naming the pid.
+    /// A zombie launchd holds is the same, but warned of, as a clause after the caller's subject.
     ///
-    /// Mutants: the line is `debug`; it is prefixed with the caller's subject.
+    /// Mutants: the line is `debug`; it is not led by the caller's subject, so a subject that names
+    /// a refusal loses it.
     #[skuld::test]
     fn a_zombie_launchd_holds_is_gone_or_killed_and_warned_of() {
         for (killed, fate) in [(false, ChildFate::Gone), (true, ChildFate::Killed)] {
@@ -518,14 +519,11 @@ mod settlement {
                     worded(&settlement, disposition),
                     Some((
                         log::Level::Warn,
-                        "pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)".to_owned()
+                        "S: not ours to reap (launchd holds its zombie, because its tracer died)".to_owned()
                     ))
                 );
             }
         }
-        let pidless = Settlement::new(foreign(Foreign::Orphaned), false);
-        let (_, text) = pidless.wording(None, "S", RUNNING, Disposition::Leave).expect("a warn");
-        assert!(text.starts_with(crate::os_process::PIDLESS_CHILD), "{text}");
     }
 
     /// A wait that failed after a kill reached the child: `Killed`, uncollected, and the warn says
@@ -586,6 +584,73 @@ mod settlement {
                 Some((log::Level::Warn, RUNNING.to_owned()))
             );
         }
+    }
+
+    /// A wait with no deadline that still answers a deadline passed (a contract breach that a debug
+    /// build asserts on elsewhere) is not worded as an empty line in a release build: the caller has
+    /// no running clause, so the line names the subject.
+    ///
+    /// Mutant: the wording returns the caller's clause whether or not there is one, so it is empty.
+    #[skuld::test]
+    fn a_deadline_that_passed_in_a_wait_with_no_deadline_says_the_wait_ended_with_no_exit() {
+        let settlement = Settlement::new(passed(), false);
+        for disposition in BOTH {
+            assert_eq!(
+                settlement.wording("S", None, disposition),
+                Some((log::Level::Warn, "S: its wait ended with no exit".to_owned()))
+            );
+        }
+    }
+
+    /// `ended` is every answer but a deadline that passed, and `status` the status of an exit whose
+    /// record was read.
+    ///
+    /// Mutants: `ended` reads the fate; an unreadable record has a status.
+    #[skuld::test]
+    fn ended_and_status_state_the_answer() {
+        for (settlement, ended, status) in [
+            (Settlement::new(exited(), false), true, Some(ExitStatus::default())),
+            (Settlement::new(unreadable(), false), true, None),
+            (Settlement::new(foreign(Foreign::Gone), true), true, None),
+            (Settlement::new(failed(), false), true, None),
+            (Settlement::new(passed(), false), false, None),
+        ] {
+            assert_eq!(settlement.ended(), ended, "{settlement:?}");
+            assert_eq!(settlement.status(), status, "{settlement:?}");
+        }
+    }
+
+    /// A line at warn is the leftover for the caller's one warn; one below it is logged, led as the
+    /// caller says; a silent answer is neither.
+    ///
+    /// Mutants: a debug line is returned; a warn is logged; the lead is dropped.
+    #[skuld::test]
+    fn a_leftover_is_the_warn_and_anything_below_is_logged() {
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+
+        let gone = Settlement::new(foreign(Foreign::Gone), false);
+        assert_eq!(gone.leftover("S", None, Disposition::Leave, "lead: "), None);
+        let logged = crate::log_capture::records_since_on_current_thread(mark, "S:");
+        assert_eq!(
+            logged,
+            vec![(log::Level::Debug, "lead: S: reaped by someone else".to_owned())]
+        );
+
+        let mark = crate::log_capture::mark();
+        let failed = Settlement::new(failed(), false);
+        assert_eq!(
+            failed.leftover("S", None, Disposition::Leave, "lead: ").as_deref(),
+            Some("S: the wait failed: cosca-wait-e5a1")
+        );
+        assert_eq!(
+            Settlement::new(exited(), false).leftover("S", None, Disposition::Leave, "lead: "),
+            None
+        );
+        assert_eq!(
+            crate::log_capture::records_since_on_current_thread(mark, "S:"),
+            Vec::<(log::Level, String)>::new()
+        );
     }
 
     /// A kill reached the child, and the wait that follows has no deadline: an answer that the

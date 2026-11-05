@@ -16,8 +16,6 @@ use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
-#[cfg(all(unix, test))]
-use crate::os_process::child::ExitRecord;
 use crate::stdio::{Direction, Fd, ResolvedStdio};
 
 // A child-side descriptor handed to std via `Stdio::from`.
@@ -228,27 +226,12 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             Ok(crate::signal::Sent::Delivered) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
-                let answer = wait_killed_elevated(&child);
+                let settlement = Settlement::new(wait_killed_elevated(&child), true);
                 #[cfg(test)]
-                if let Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) = &answer {
-                    fault::record_teardown_reap(pid, *status);
+                if let Some(status) = settlement.status() {
+                    fault::record_teardown_reap(pid, status);
                 }
-                let settlement = Settlement::new(answer, true);
-                let subject = if exited_front {
-                    format!("the elevated child pid {pid} (it had already exited)")
-                } else {
-                    format!("the elevated child pid {pid}")
-                };
-                // The error says it as the warn does, less where the root goes: its note says that.
-                let note = match settlement.wording(Some(pid), &subject, "", Disposition::Leave) {
-                    Some((_, text)) => text,
-                    None if exited_front => "the elevated child had already exited, and was reaped".to_string(),
-                    None => "the elevated child was terminated".to_string(),
-                };
-                let mut torn =
-                    child
-                        .proc
-                        .outcome_of(&settlement, Some(child.id()), &subject, "", Disposition::HandBack);
+                let (note, mut torn) = root_after_a_delivered_kill(pid, child.id(), exited_front, &settlement);
                 report.left.extend(torn.left.take());
                 (note, torn)
             }
@@ -262,8 +245,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
                 report.left.extend(looked.left.take());
                 let note = match &looked.look {
+                    // The wording leads with the refusal and says what the look found as a clause.
                     Some(LookOutcome::Ended(settlement)) => settlement
-                        .wording(Some(pid), &note, "", Disposition::Leave)
+                        .wording(&note, None, Disposition::Leave)
                         .map_or(note, |(_, text)| text),
                     _ => note,
                 };
@@ -319,6 +303,31 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         fate,
         unreaped,
     ))
+}
+
+/// What [`finish_elevated`] says of a root its delivered kill reached, once the wait for it ended as
+/// `settlement` states: the note for the error, and the outcome, whose `left` is the cleanup's warn.
+/// `exited_front`: the root had exited before the kill.
+#[cfg(unix)]
+fn root_after_a_delivered_kill(
+    pid: u32,
+    id: ProcessId,
+    exited_front: bool,
+    settlement: &Settlement,
+) -> (String, TeardownOutcome) {
+    let subject = if exited_front {
+        format!("the elevated child pid {pid} (it had already exited)")
+    } else {
+        format!("the elevated child pid {pid}")
+    };
+    // The error says it as the warn does, less where the root goes: its note says that.
+    let note = match settlement.wording(&subject, None, Disposition::Leave) {
+        Some((_, text)) => text,
+        None if exited_front => "the elevated child had already exited, and was reaped".to_string(),
+        None => "the elevated child was terminated".to_string(),
+    };
+    let torn = TeardownOutcome::of_settlement(settlement, Some(id), &subject, None, Disposition::HandBack);
+    (note, torn)
 }
 
 /// The fate of a child cosca did not kill (its kill was refused, or never sent), from one

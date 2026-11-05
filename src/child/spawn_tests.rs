@@ -965,6 +965,62 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     );
 }
 
+/// What `finish_elevated` says of a root its delivered kill reached, by how the wait for it ended: the
+/// error's note and the cleanup's warn, led by the root's name. A debug build asserts on the reap
+/// that produces `Unreadable`, so the answers are stated.
+///
+/// Mutants: `Unreadable` is worded as a failed wait or handed back; a root reaped elsewhere is among
+/// the leftovers; a zombie launchd holds loses the root's name or is not a leftover.
+#[cfg(unix)]
+#[skuld::test]
+fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended() {
+    use crate::child::lifecycle::Settlement;
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::error::ChildFate;
+    use crate::os_process::child::{ExitRecord, Foreign};
+
+    let id = crate::identity::ProcessId::from_parts(42, 1);
+    for exited_front in [false, true] {
+        let who = if exited_front {
+            "the elevated child pid 42 (it had already exited)"
+        } else {
+            "the elevated child pid 42"
+        };
+        let rows = [
+            (
+                Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
+                ChildFate::Reaped,
+                Some(format!(
+                    "{who}: reaped it after the kill; the child's exit record was unreadable (si_code 7)"
+                )),
+            ),
+            (
+                Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
+                ChildFate::Killed,
+                Some(format!(
+                    "{who}: not ours to reap (launchd holds its zombie, because its tracer died)"
+                )),
+            ),
+        ];
+        for (answer, fate, said) in rows {
+            let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &Settlement::new(answer, true));
+            assert_eq!(Some(&note), said.as_ref(), "{exited_front}");
+            assert_eq!(torn.left, said, "{exited_front}");
+            assert_eq!(torn.fate, fate, "{exited_front}");
+            assert!(
+                !torn.uncollected,
+                "{exited_front}: collected, or not ours: nothing to hand back"
+            );
+        }
+
+        let elsewhere = Settlement::new(Ok(ChildWaitOutcome::Foreign(Foreign::Gone)), true);
+        let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &elsewhere);
+        assert_eq!(note, format!("{who}: reaped by someone else"));
+        assert_eq!(torn.left, None, "{exited_front}: a foreign reap is not a leftover");
+        assert_eq!(torn.fate, ChildFate::Killed);
+    }
+}
+
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in
 /// the returned note and in the text the cleanup's one warn carries, logs nothing itself, and
 /// reports nothing when the teardown worked or was not tried.

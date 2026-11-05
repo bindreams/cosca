@@ -144,6 +144,24 @@ impl TeardownOutcome {
         }
     }
 
+    /// The outcome `settlement` states: its fate, and whether it left the child uncollected. A line
+    /// at warn level comes back in [`left`](Self::left), and anything below is logged here.
+    /// `subject`, `running` and `disposition` word it as [`Settlement::wording`] says.
+    pub(crate) fn of_settlement(
+        settlement: &Settlement,
+        id: Option<ProcessId>,
+        subject: &str,
+        running: Option<&str>,
+        disposition: Disposition,
+    ) -> TeardownOutcome {
+        TeardownOutcome {
+            fate: settlement.fate(id),
+            uncollected: settlement.uncollected(),
+            look: None,
+            left: settlement.leftover(subject, running, disposition, ""),
+        }
+    }
+
     /// A front's teardown, which left it `uncollected` or not and went `look`.
     fn of_front(fate: ChildFate, uncollected: bool, look: LookOutcome) -> TeardownOutcome {
         TeardownOutcome {
@@ -184,19 +202,13 @@ impl OwnedChild {
             Ok(sent) => {
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-                let answer = wait_to_exit(self, due);
+                let settlement = Settlement::new(wait_to_exit(self, due), matches!(sent, Sent::Delivered));
                 #[cfg(test)]
-                if let Ok(super::ChildWaitOutcome::Exited(crate::os_process::child::ExitRecord::Status(status))) =
-                    &answer
-                {
+                if let Some(status) = settlement.status() {
                     // An unknown pid records as 0.
-                    crate::child::spawn::fault::record_teardown_reap(self.pid().unwrap_or(0), *status);
+                    crate::child::spawn::fault::record_teardown_reap(self.pid().unwrap_or(0), status);
                 }
-                self.concluded(
-                    &Settlement::new(answer, matches!(sent, Sent::Delivered)),
-                    id,
-                    disposition,
-                )
+                self.concluded(&settlement, id, disposition)
             }
             Err(refused) => match tree.map(|tree| tree.reached(self)) {
                 // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
@@ -220,34 +232,7 @@ impl OwnedChild {
     /// The outcome of a root teardown whose wait after a kill ended as `settlement` says.
     fn concluded(&self, settlement: &Settlement, id: Option<ProcessId>, disposition: Disposition) -> TeardownOutcome {
         let subject = format!("teardown of {}", child_named(self.pid()));
-        self.outcome_of(settlement, id, &subject, "", disposition)
-    }
-
-    /// The outcome `settlement` states: its fate, and whether it left the child uncollected. A line
-    /// at warn level comes back in [`TeardownOutcome::left`], and anything below is logged here.
-    /// `subject`, `running` and `disposition` word it as [`Settlement::wording`] says.
-    pub(crate) fn outcome_of(
-        &self,
-        settlement: &Settlement,
-        id: Option<ProcessId>,
-        subject: &str,
-        running: &str,
-        disposition: Disposition,
-    ) -> TeardownOutcome {
-        let left = match settlement.wording(self.pid(), subject, running, disposition) {
-            Some((log::Level::Warn, text)) => Some(text),
-            Some((level, text)) => {
-                log::log!(level, "{text}");
-                None
-            }
-            None => None,
-        };
-        TeardownOutcome {
-            fate: settlement.fate(id),
-            uncollected: settlement.uncollected(),
-            look: None,
-            left,
-        }
+        TeardownOutcome::of_settlement(settlement, id, &subject, None, disposition)
     }
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's
@@ -266,8 +251,8 @@ impl OwnedChild {
             Disposition::Leave => format!("{subject}; leaving it running"),
             Disposition::HandBack => format!("{subject}; handed back to the caller in the error"),
         };
-        let mut torn = self.outcome_of(&settlement, id, &subject, &running, disposition);
-        if !matches!(torn.fate, ChildFate::Running { .. }) {
+        let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
+        if settlement.ended() {
             torn.look = Some(LookOutcome::Ended(settlement));
         }
         torn
@@ -290,7 +275,7 @@ impl OwnedChild {
             )
         };
         let looked = Settlement::new(self.wait(Some(crate::wait::now())), false);
-        if !matches!(looked.fate(id), ChildFate::Running { .. }) {
+        if looked.ended() {
             return ended(looked);
         }
         // The look saw it running; an unreadable reach leaves open only whether the kill reached it.

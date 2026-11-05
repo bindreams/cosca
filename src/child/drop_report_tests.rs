@@ -250,6 +250,103 @@ fn finish_elevated_logs_a_root_reaped_elsewhere_after_the_kill_at_debug() {
     );
 }
 
+/// A root whose kill was refused and which someone else had reaped when the look came: nothing is
+/// handed back, `debug` says so, and the refusal stays in the debug line and in the error.
+///
+/// Mutant: the refusal's note is replaced by the wording of the foreign reap, which has no
+/// refusal in it.
+#[skuld::test]
+fn finish_elevated_keeps_the_refusal_when_the_look_finds_the_root_reaped_elsewhere() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Gone,
+            )])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert_eq!(fate, crate::error::ChildFate::Gone);
+    assert!(handed_back.is_none());
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+    let cause = cause.to_string();
+    assert!(
+        cause.contains(&format!(
+            "could not be terminated ({}): reaped by someone else",
+            refusal()
+        )),
+        "{cause}"
+    );
+    let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped by someone else");
+    assert!(
+        debug.len() == 1 && debug[0].0 == log::Level::Debug && debug[0].1.contains(&refusal()),
+        "{debug:?}"
+    );
+}
+
+/// A root whose kill was refused and whose zombie launchd held when the look came (macOS): the one
+/// warn and the error's note both say it is not ours to reap, and both keep the refusal.
+///
+/// Mutants: the launchd line replaces the refusal in the warn; or in the error's note.
+#[skuld::test]
+fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_root() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Orphaned,
+            )])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert_eq!(fate, crate::error::ChildFate::Gone);
+    assert!(handed_back.is_none());
+    let clause = format!("could not be terminated ({}): not ours to reap (launchd", refusal());
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains(&clause), "{warns:?}");
+    let cause = cause.to_string();
+    assert!(cause.contains(&clause), "{cause}");
+}
+
+/// A root a delivered kill reached whose zombie launchd held when the wait came (macOS): the one
+/// warn says it is not ours to reap, led by the root's name, and the root is `Killed`.
+///
+/// Mutant: the launchd line is not led by the root's name.
+#[skuld::test]
+fn finish_elevated_names_the_root_when_launchd_holds_it_after_a_delivered_kill() {
+    crate::log_capture::install();
+    let (mut child, writer) = bare_blocker();
+    let pid = child.id().pid();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Orphaned,
+            )])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert!(handed_back.is_none());
+    let clause = format!("the elevated child pid {pid}: not ours to reap (launchd");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains(&clause), "{warns:?}");
+    let cause = cause.to_string();
+    assert!(cause.contains(&clause), "{cause}");
+}
+
 /// A failed spawn's cleanup whose reap fails after a delivered kill: the root is not shown
 /// collected, so it is handed back and the handle is disarmed, and the handle's drop does not retry.
 ///

@@ -522,8 +522,8 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
 /// A kill that failed on a child someone else already reaped: the look finds `ECHILD`, the child is
 /// `Gone`, and there is no warning that it is left running.
 ///
-/// Mutant: the warning is returned for every look that did not collect an exit; the fate is read
-/// from the look's raw OS error, which only Unix has.
+/// Mutant: the warning is returned for every look that did not collect an exit; the fate of a look
+/// that found the child reaped elsewhere is `Unknown`.
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent() {
     let fake = fake()
@@ -536,20 +536,25 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_and_silent(
 }
 
 /// A kill that failed on a child launchd holds the zombie of: the look finds `Orphaned`, the child is
-/// `Gone`, the launchd note comes back for the caller's one warn, and nothing is logged above `debug`.
+/// `Gone`, the launchd note comes back for the caller's one warn after the refusal it names, and
+/// nothing is logged above `debug`.
 ///
-/// Mutants: the look drops the launchd note, or logs it itself; it reads the fate from the error
-/// (`Unknown` off Unix).
+/// Mutants: the look drops the launchd note, or logs it itself; the note replaces the refusal; the
+/// look reads the child as `Unknown`.
 #[skuld::test]
 fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_returns_the_note() {
+    let refusal = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let fake = fake()
         .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let (torn, levels) = teardown(&fake);
     assert_eq!(torn.fate, ChildFate::Gone);
     assert_eq!(
-        torn.left.as_deref(),
-        Some("pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)")
+        torn.left,
+        Some(format!(
+            "child 4242 could not be terminated ({refusal}): not ours to reap (launchd holds its zombie, because its \
+             tracer died)"
+        ))
     );
     assert!(levels.iter().all(|level| *level >= log::Level::Debug), "{levels:?}");
     assert_eq!(fake.looks(), 1);

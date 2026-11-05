@@ -486,13 +486,13 @@ mod worded {
         }
     }
 
-    /// A front whose zombie launchd holds is warned of at the first look and in the wait for it, and
-    /// named by its pid.
+    /// A front whose zombie launchd holds is warned of at the first look and in the wait for it, led
+    /// by its name.
     ///
     /// Mutant: the wording is quiet about launchd, or says it at `debug`.
     #[skuld::test]
     fn a_front_launchd_holds_is_warned_of_in_the_wording() {
-        let note = "pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)";
+        let note = "elevation front pid 4242: not ours to reap (launchd holds its zombie, because its tracer died)";
         for disposition in BOTH {
             assert_left(
                 disposition,

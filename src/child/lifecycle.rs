@@ -58,11 +58,13 @@ pub(super) fn status_of_outcome(
 /// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | nothing                                                     |
 /// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
 /// | `Foreign(Gone, Other)`       | `f.fate(killed)`      | no                                 | `Unaccounted`                    | debug "reaped by someone else"                              |
-/// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn [`orphaned_note`]                                      |
+/// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn "not ours to reap (launchd holds its zombie, ...)"     |
 /// | `Err(e)`, `killed`           | `Killed`              | yes                                | `Unaccounted`                    | warn "the wait failed: e", and where the child goes         |
 /// | `Err(e)`, not `killed`       | `Unknown`             | yes                                | `Unaccounted`                    | as above                                                    |
-/// | `DeadlinePassed`, not killed | `Running { id }`      | yes                                | `LeftUnreaped`                   | warn: the caller's running clause                           |
+/// | `DeadlinePassed`, not killed | `Running { id }`      | yes                                | `LeftUnreaped`                   | warn: the caller's running clause, or "its wait ended with no exit" for a wait with no deadline |
 /// | `DeadlinePassed`, `killed`   | none: a kill is followed by a wait with no deadline, and [`new`](Self::new) asserts it | | |                                                  |
+///
+/// Every line leads with the caller's subject, a zombie launchd holds included.
 ///
 /// An unreadable record means the consuming reap took the zombie: the child was collected, only its
 /// exit is lost, so it is `Reaped` whether or not a kill reached it.
@@ -115,14 +117,26 @@ impl Settlement {
         }
     }
 
-    /// What to say of the child `pid`, and at what level; the caller logs it. `subject` leads every
-    /// line but a zombie launchd holds, which names the pid itself. `running` is the whole line
-    /// for a child still running. `disposition` adds where an uncollected child goes.
+    /// Whether the wait ended with an answer about the child: everything but a deadline that passed.
+    pub(crate) fn ended(&self) -> bool {
+        !matches!(self.answer, Ok(ChildWaitOutcome::DeadlinePassed))
+    }
+
+    /// The exit status, if the child exited and its record was read.
+    pub(crate) fn status(&self) -> Option<ExitStatus> {
+        match &self.answer {
+            Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))) => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// What to say of the child, and at what level; the caller logs it. `subject` leads the line.
+    /// `running` is the whole line for a child still running; `None` for a wait with no deadline,
+    /// which says it ended with no exit. `disposition` adds where an uncollected child goes.
     pub(crate) fn wording(
         &self,
-        pid: Option<u32>,
         subject: &str,
-        running: &str,
+        running: Option<&str>,
         disposition: Disposition,
     ) -> Option<(log::Level, String)> {
         match &self.answer {
@@ -134,7 +148,9 @@ impl Settlement {
                     format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
                 ))
             }
-            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => Some((log::Level::Warn, orphaned_note(pid))),
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
+                Some((log::Level::Warn, format!("{subject}: {ORPHANED}")))
+            }
             Ok(ChildWaitOutcome::Foreign(_)) => Some((log::Level::Debug, format!("{subject}: reaped by someone else"))),
             Err(e) => Some((
                 log::Level::Warn,
@@ -143,7 +159,28 @@ impl Settlement {
                     disposition.handed_back_suffix(self.uncollected())
                 ),
             )),
-            Ok(ChildWaitOutcome::DeadlinePassed) => Some((log::Level::Warn, running.to_owned())),
+            Ok(ChildWaitOutcome::DeadlinePassed) => Some((
+                log::Level::Warn,
+                running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
+            )),
+        }
+    }
+
+    /// [`wording`](Self::wording) for a caller with one warn to make: a line at warn is returned for
+    /// that warn, and a line below it is logged here, led by `log_lead`.
+    pub(crate) fn leftover(
+        &self,
+        subject: &str,
+        running: Option<&str>,
+        disposition: Disposition,
+        log_lead: &str,
+    ) -> Option<String> {
+        match self.wording(subject, running, disposition)? {
+            (log::Level::Warn, text) => Some(text),
+            (level, text) => {
+                log::log!(level, "{log_lead}{text}");
+                None
+            }
         }
     }
 }
@@ -182,9 +219,10 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
     answer
 }
 
-/// [`wait_to_exit`] with no threshold, as the status the public waits answer.
-pub(super) fn wait_for_status(proc: &OwnedChild) -> Result<ExitStatus, Error> {
-    status_of_outcome(proc.pid(), wait_to_exit(proc, None)?, Orphaned::Warn)?
+/// [`wait_to_exit`] with no threshold, as the status the public waits answer. Every wait with no
+/// deadline goes through it: `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`.
+pub(super) fn wait_for_status(proc: &OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
+    status_of_outcome(proc.pid(), wait_to_exit(proc, None)?, orphaned)?
         .ok_or_else(|| Error::Io(io::Error::other("an unbounded wait ended with no exit")))
 }
 
@@ -193,10 +231,13 @@ fn unreadable(si_code: i32) -> String {
     format!("the child's exit record was unreadable (si_code {si_code})")
 }
 
+/// What to say of a zombie launchd holds, after the child's name.
+const ORPHANED: &str = "not ours to reap (launchd holds its zombie, because its tracer died)";
+
 /// What to say of a child whose zombie launchd holds.
 pub(super) fn orphaned_note(pid: Option<u32>) -> String {
     format!(
-        "{}: not ours to reap (launchd holds its zombie, because its tracer died)",
+        "{}: {ORPHANED}",
         pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("pid {pid}"))
     )
 }
@@ -257,7 +298,10 @@ impl Child {
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is
     /// a deadline that passed with the root still running.
     pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
-        status_of_outcome(Some(self.id.pid()), self.proc.wait(deadline)?, orphaned)
+        match deadline {
+            Some(deadline) => status_of_outcome(Some(self.id.pid()), self.proc.wait(Some(deadline))?, orphaned),
+            None => wait_for_status(&self.proc, orphaned).map(Some),
+        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
