@@ -59,6 +59,14 @@ pub(super) fn running_from_stat(stat: &[u8], start: super::StartToken) -> super:
     }
 }
 
+/// The `stat` of a process in `state` that started at `starttime` (field 22, index 19 after the last
+/// `)`): `pid (comm) STATE ppid pgroup session tty tpgid flags minflt cminflt majflt cmajflt utime
+/// stime cutime cstime priority nice numthreads itrealvalue starttime ...`.
+#[cfg(test)]
+pub(crate) fn stat_fixture(state: &str, starttime: u64) -> Vec<u8> {
+    format!("1234 (myproc) {state} 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {starttime} 0 0").into_bytes()
+}
+
 #[cfg(test)]
 #[path = "stat_parse_tests.rs"]
 mod stat_parse_tests;
