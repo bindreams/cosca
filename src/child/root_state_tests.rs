@@ -39,8 +39,6 @@ fn state_after_own_wait_is_reaped_without_a_warn() {
 mod linux {
     use super::*;
     use crate::containment::unix::fault::record_kill_group;
-    use crate::identity::fault::alias_token;
-    use crate::identity::StartToken;
     use crate::send_log::{Capture, Via};
     use crate::signal::Sig;
     use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
@@ -56,8 +54,8 @@ mod linux {
         (cmd.spawn().expect("spawn"), writer)
     }
 
-    /// A process-group child reaped behind its back, its pid reused, and the reuser's start token
-    /// aliased to the child's (a same-tick reuse): the number still reads as the root, so only the
+    /// A process-group child reaped behind its back, its pid reused, and the number read as the
+    /// child's own identity (a same-tick reuse): the number still reads as the root, so only the
     /// child's own pidfd shows the reap. The drop sends no `killpg` by the group's number.
     ///
     /// Mutant: the drop takes no evidence from the handle (`DropView::read` ignores
@@ -69,10 +67,10 @@ mod linux {
             child.attached.signals_a_group(),
             "the test needs a group named by the root's pid, which ContainMode::Session makes"
         );
-        let token = StartToken::from_raw(child.id().start_token_raw());
+        let root = child.id();
         drop(writer);
-        let reuser = reap_behind_and_reuse(child.id().pid());
-        let _alias = alias_token(reuser.id(), token);
+        let reuser = reap_behind_and_reuse(root.pid());
+        let _read = crate::child::fault::force_root_reads(crate::identity::Resolved::Found(root));
 
         drop(child);
 
