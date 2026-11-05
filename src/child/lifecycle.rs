@@ -5,7 +5,7 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use super::owned::ChildWaitOutcome;
+use super::owned::{ChildWaitOutcome, OwnedChild};
 use super::Child;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign};
@@ -40,6 +40,17 @@ pub(super) fn status_of_outcome(
             Err(Error::Io(echild()))
         }
         ChildWaitOutcome::DeadlinePassed => Ok(None),
+    }
+}
+
+/// Block until `proc` is reaped, and return its status.
+pub(super) fn wait_to_exit(proc: &OwnedChild) -> Result<ExitStatus, Error> {
+    match status_of_outcome(proc.pid(), proc.wait(None)?, Orphaned::Warn)? {
+        Some(status) => Ok(status),
+        None => {
+            debug_assert!(false, "an unbounded wait ended with no exit");
+            Err(Error::Io(io::Error::other("an unbounded wait ended with no exit")))
+        }
     }
 }
 
@@ -108,17 +119,6 @@ impl Child {
     /// a deadline that passed with the root still running.
     pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
         status_of_outcome(Some(self.id.pid()), self.proc.wait(deadline)?, orphaned)
-    }
-
-    /// Block until the root is reaped.
-    pub(super) fn wait_root_unbounded(&self) -> Result<ExitStatus, Error> {
-        match self.wait_root(None, Orphaned::Warn)? {
-            Some(status) => Ok(status),
-            None => {
-                debug_assert!(false, "an unbounded wait ended with no exit");
-                Err(Error::Io(io::Error::other("an unbounded wait ended with no exit")))
-            }
-        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
