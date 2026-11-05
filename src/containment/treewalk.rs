@@ -8,7 +8,9 @@
 //! down from the root, and kills each *genuine* descendant by identity. It is
 //! best-effort and reports as [`crate::containment::Containment::TreeWalk`]: it
 //! misses reparented orphans (a child whose parent exited before the walk read the
-//! child, so its ppid no longer chains to the root) and broker-spawned escapes.
+//! child, so its ppid no longer chains to the root) and broker-spawned escapes. On Windows it also
+//! misses a genuine descendant whose creator exited and whose creator's pid now belongs to a later
+//! in-tree process, with its subtree (see the parent-order rule below).
 //!
 //! # The PID-reuse / stale-ppid defense (the order-key rule)
 //!
@@ -55,10 +57,12 @@
 //! Where the parent field is the *creator* and is never updated (Windows), a ppid can name a pid
 //! that a later process holds now, and that process's key can still order after the root's. So
 //! there ([`ORDER_AFTER_PARENT`]) a candidate is kept only if its key orders after its accepted
-//! parent's key, with the same `allow_equal`; the root's key is implied, since every accepted
-//! parent already ordered after it. Linux and macOS leave the rule off: their ppid is the current
-//! parent, and on macOS the rule would drop a child whose in-tree tracer started after it, or one
-//! forked after a clock step. [`children_of_with`] needs no switch: its parent is the anchor.
+//! parent's key, with the same `allow_equal`. Off elsewhere (see [`ORDER_AFTER_PARENT`]).
+//! [`children_of_with`] needs no switch: its parent is the anchor.
+//!
+//! The rule also drops a genuine descendant whose creator exited and whose creator's pid now belongs
+//! to a later in-tree process, with its subtree: from the snapshot alone it cannot be told from a
+//! stale-creator impostor.
 
 use crate::error::Error;
 use crate::identity::{Existence, Kernel, OrderKey, ProcessId, RawPid, Resolved, UnknownCause};
@@ -129,10 +133,9 @@ pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 pub(crate) const ALLOW_EQUAL_ORDER: bool = false;
 
 /// Whether a candidate must also order after its accepted parent, not only after the root. Only
-/// Windows: there the parent field is the creator and is never updated, so a ppid can name a pid
-/// that a later process holds now. Linux and macOS reparent orphans, so their ppid is the current
-/// parent; on macOS the rule would drop a child whose in-tree tracer started after it, or one
-/// forked after a clock step.
+/// Windows, where the parent field is the creator and never updated, so a ppid can name a pid a
+/// later process holds now. Off on macOS: it would drop a child whose in-tree tracer started after
+/// it, or one forked after a clock step.
 #[cfg(windows)]
 pub(crate) const ORDER_AFTER_PARENT: bool = true;
 #[cfg(not(windows))]
@@ -151,7 +154,7 @@ pub(crate) fn keeps_order(key: OrderKey, anchor: OrderKey, allow_equal: bool) ->
 /// identity and order key via `resolve(pid, parent)`, `parent` being the accepted process whose pid
 /// the edge names, and keeps it ONLY if its key orders correctly
 /// against `root_key` per `allow_equal` (see module docs). With `parent_order` it must order
-/// after the accepted parent's key instead (the root's is implied). `resolve` is injected
+/// after the accepted parent's key instead. `resolve` is injected
 /// so the filter is pure: live code passes [`resolve_or_drop`], tests pass a stub.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
@@ -200,8 +203,7 @@ pub(crate) fn descendants_with(
                 log::debug!("treewalk: pid {pid} unresolvable — dropping its subtree");
                 continue;
             };
-            // With the parent-order rule the candidate must follow the accepted parent's key: it
-            // already ordered after the root's, so the root's is implied.
+            // Under parent_order the parent's key implies the root's.
             let must_follow = if parent_order { parent_key } else { root_key };
             if !keeps_order(key, must_follow, allow_equal) {
                 log::debug!("treewalk: dropping subtree under impostor pid {pid} (recycled pid / stale ppid)");

@@ -118,9 +118,8 @@ fn impostor_prunes_its_whole_subtree() {
 
 /// The Windows stale-creator edge: 300's ppid names pid 200, but 300 was created after the root and
 /// before the process that holds 200 now (200's number changed hands, so the edge is stale). With
-/// the rule on, 300 and everything under it are dropped; off, the root's key alone vouches for
-/// them. Mutants: "compare against the root's key, not the parent's" and "the rule is ignored" both
-/// keep 300 with the rule on.
+/// the rule on, 300 and everything under it are dropped. Mutants (compare against the root's key;
+/// rule ignored) keep 300 with the rule on.
 #[skuld::test]
 fn a_candidate_that_orders_before_its_accepted_parent_is_dropped_with_its_subtree_when_the_rule_is_on() {
     let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
@@ -401,9 +400,8 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
 /// The Windows wiring of the parent-order rule, through `descendants_from_key` with real processes:
 /// `y` started before `x`, both after the root (this process). A snapshot that names `x` as `y`'s
 /// parent is a stale creator edge: `y` orders after the root but before its claimed parent, so it
-/// is dropped, and with it nothing else is lost. Named the other way round, the same processes are
-/// a genuine chain. Mutants: "`ORDER_AFTER_PARENT` is false on Windows", "the two flags of
-/// `descendants_with` are swapped in `descendants_from_key`": `y` is kept under `x`.
+/// is dropped. Named the other way round, the same processes are a genuine chain. Mutants (const
+/// false on Windows; flags swapped in `descendants_from_key`) keep `y` under `x`.
 #[cfg(windows)]
 #[skuld::test]
 fn a_real_candidate_that_started_before_its_claimed_parent_is_dropped_on_windows() {
