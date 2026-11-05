@@ -697,7 +697,7 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
     let failures = failed_front_spawns(None, |cmd| cmd.spawn().map(drop));
     assert_noted(
         &failures,
-        "the elevated program may be running; it is handed back to the caller",
+        "the elevated program may be running; handed back to the caller in the error",
     );
     for (_, pid, handed_back) in failures {
         assert_eq!(handed_back.unreaped().pid(), Some(pid));
@@ -765,7 +765,7 @@ pub(crate) fn assert_attach_failure_left_the_front(err: &Error, pid: u32, mark: 
     assert!(matches!(err, Error::Containment { .. }), "the variant is kept: {err:?}");
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-    assert!(text.contains("it is left unreaped"), "{text}");
+    assert!(text.contains("; left unreaped"), "{text}");
     assert!(
         crate::log_capture::contains_since(mark, "attach failed"),
         "the warning says the attach failed"
@@ -955,7 +955,7 @@ pub(crate) fn assert_unadopted_front_noted(err: &Error, pid: u32) {
     let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains("the elevated program may be running; left unreaped"),
         "{text}"
     );
 }

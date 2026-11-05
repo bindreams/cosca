@@ -222,7 +222,9 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
     };
     let refused = || io::Error::other(REFUSED);
     if row.found == Found::Unreadable {
-        // A child whose reap read no exit record answers every wait so, and sends a kill nothing.
+        // A child whose reap read no exit record answers every wait so, and its handle, having reaped
+        // it, sends every kill nothing: `Kill::Nothing` is the only one `tear_down` can be given for
+        // it, so the other two rows enter below `tear_down`, where the kill's answer is the input.
         let child = child_with_an_unreadable_exit();
         return match row.kill {
             // A kill sent elsewhere reached it: the reap that follows.
@@ -231,20 +233,40 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
             Kill::Refused => child.look_after_refused_kill(Some(id()), Error::Io(refused()), disposition),
         };
     }
-    let reap = match row.found {
-        Found::Exited => ReapAnswer::Reaped(exit()),
-        Found::ReapedElsewhere => ReapAnswer::Foreign(Foreign::Gone),
-        Found::Orphaned => ReapAnswer::Foreign(Foreign::Orphaned),
-        Found::WaitFailed => ReapAnswer::Err(io::ErrorKind::Other),
-        Found::Running => ReapAnswer::Running,
-        Found::Unreadable => unreachable!("answered above"),
-    };
     let signal = match row.kill {
         Kill::Delivered => Ok(Sent::Delivered),
         Kill::Nothing => Ok(Sent::Gone),
         Kill::Refused => Err(refused()),
     };
-    OwnedChild::new(Box::new(fake().reaps([reap]).signals([signal]))).tear_down(Some(id()), kill, None)
+    OwnedChild::new(Box::new(fake().reaps([reap_answer(row.found)]).signals([signal]))).tear_down(
+        Some(id()),
+        kill,
+        None,
+    )
+}
+
+/// What the wait or look of `found` answers.
+fn reap_answer(found: Found) -> ReapAnswer {
+    match found {
+        Found::Exited => ReapAnswer::Reaped(exit()),
+        Found::ReapedElsewhere => ReapAnswer::Foreign(Foreign::Gone),
+        Found::Orphaned => ReapAnswer::Foreign(Foreign::Orphaned),
+        Found::WaitFailed => ReapAnswer::Err(io::ErrorKind::Other),
+        Found::Running => ReapAnswer::Running,
+        Found::Unreadable => unreachable!("the unreadable rows build their own child"),
+    }
+}
+
+/// The outcome of the reap of a child a tree kill has just ended ([`OwnedChild::reap_after_tree_kill`]),
+/// for the row whose kill was delivered, for a caller that does `disposition`. It sends the child
+/// nothing: the kill was sent elsewhere.
+pub(crate) fn outcome_after_a_tree_kill(row: &Row, disposition: Disposition) -> TeardownOutcome {
+    assert_eq!(row.kill, Kill::Delivered, "a tree kill reached the child");
+    let child = match row.found {
+        Found::Unreadable => child_with_an_unreadable_exit(),
+        found => OwnedChild::new(Box::new(fake().reaps([reap_answer(found)]))),
+    };
+    child.reap_after_tree_kill(disposition)
 }
 
 /// What no clause says, whoever says it.
@@ -292,6 +314,27 @@ fn the_teardown_says_every_row_as_the_table_states_it() {
                 Some((row.level, wanted.to_owned())),
                 "{:?} {:?} {disposition:?}",
                 row.kill,
+                row.found
+            );
+        }
+    }
+}
+
+/// The reap of a child a tree kill ended says each delivered-kill row as the table states it, under
+/// both dispositions, a failed reap included: it is `uncollected` and handed back or left, as the
+/// row says.
+///
+/// Mutants: the tree-kill reap drops a failed wait, or says it as the other disposition.
+#[skuld::test]
+fn the_reap_after_a_tree_kill_says_every_delivered_row_as_the_table_states_it() {
+    for row in rows().into_iter().filter(|row| row.kill == Kill::Delivered) {
+        for disposition in [Disposition::Leave, Disposition::HandBack] {
+            let torn = outcome_after_a_tree_kill(&row, disposition);
+            assert_eq!(torn.uncollected, row.uncollected, "{:?} {disposition:?}", row.found);
+            assert_eq!(
+                torn.clause,
+                Some((row.level, row.clause(disposition).to_owned())),
+                "{:?} {disposition:?}",
                 row.found
             );
         }

@@ -1263,7 +1263,7 @@ fn group_leading_cat_with_pidfd() -> (std::process::Child, OwnedFd) {
 
 /// A child tokio dropped after it ran the program, whose kill is refused (as a setuid-root child
 /// refuses it), is left running and warned of, and the spawn's fate says it runs. The teardown is the
-/// caller's `Leave`: the handshake hands nothing back and starts no thread.
+/// caller's `Leave`: the handshake hands nothing back.
 ///
 /// Mutant: a refused kill reports the child reaped, or drops the warn.
 #[skuld::test]
@@ -1316,7 +1316,7 @@ fn a_dropped_front_is_left_and_noted() {
     );
     let text = err.to_string();
     assert!(text.contains("the spawned child is what sudo left"), "{text}");
-    assert!(text.contains("it is left unreaped"), "{text}");
+    assert!(text.contains("; left unreaped"), "{text}");
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }

@@ -145,6 +145,9 @@ pub(crate) struct TeardownOutcome {
     /// logs none of it: the caller logs it at its level or folds it into its own warn
     /// ([`take_warn`](Self::take_warn)).
     pub(crate) clause: Option<(log::Level, String)>,
+    /// The kind of the error the teardown's kill was refused with, if it was: for a caller whose child
+    /// can refuse it only as an elevated one does (`PermissionDenied`), to assert that it did.
+    pub(crate) refusal: Option<io::ErrorKind>,
 }
 
 impl TeardownOutcome {
@@ -156,6 +159,7 @@ impl TeardownOutcome {
             uncollected: false,
             look: None,
             clause: None,
+            refusal: None,
         }
     }
 
@@ -173,6 +177,7 @@ impl TeardownOutcome {
             uncollected: settlement.uncollected(),
             look: None,
             clause: Some(settlement.wording(subject, running, Some(disposition))),
+            refusal: None,
         }
     }
 
@@ -183,13 +188,14 @@ impl TeardownOutcome {
             uncollected,
             look: Some(look),
             clause: None,
+            refusal: None,
         }
     }
 
     /// Takes the clause for a caller with one warn: a clause at warn comes back to fold into that
     /// warn, and one below it is logged here at its level, led by the caller's `label` (the same
-    /// one that leads the caller's warn, so every line names its caller). `label` is a name, not
-    /// a lead built for the occasion: it costs nothing when the level is off.
+    /// one that leads the caller's warn, so every line names its caller). `label` is a name, so
+    /// nothing is built when the level is off.
     pub(crate) fn take_warn(&mut self, label: &str) -> Option<String> {
         match self.clause.take()? {
             (log::Level::Warn, text) => Some(text),
@@ -285,6 +291,10 @@ impl OwnedChild {
     ) -> TeardownOutcome {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
+        let refusal = match &refused {
+            Error::Io(e) => e.kind(),
+            _ => io::ErrorKind::Other,
+        };
         let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
         // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
         let running = match disposition {
@@ -292,6 +302,7 @@ impl OwnedChild {
             Disposition::HandBack => format!("{subject}{}", Disposition::HandBack.suffix(true)),
         };
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
+        torn.refusal = Some(refusal);
         if settlement.ended() {
             torn.look = Some(LookOutcome::Ended(settlement));
         }

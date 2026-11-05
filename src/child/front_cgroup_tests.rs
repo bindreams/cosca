@@ -1122,12 +1122,12 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
         );
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         let left = if handed_back {
-            "handed back to the caller"
+            "handed back to the caller in the error"
         } else {
             "left unreaped"
         };
         assert!(
-            text.contains(&format!("the elevated program may be running; it is {left}")),
+            text.contains(&format!("the elevated program may be running; {left}")),
             "{text}"
         );
         assert!(
@@ -1755,10 +1755,10 @@ pub(crate) fn assert_left_unsignalled<R>(
     let left = if handed_back.is_none() {
         "left unreaped"
     } else {
-        "handed back to the caller"
+        "handed back to the caller in the error"
     };
     assert!(
-        text.contains(&format!("the elevated program may be running; it is {left}")),
+        text.contains(&format!("the elevated program may be running; {left}")),
         "{text}"
     );
     if handed_back.is_none() {

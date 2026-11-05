@@ -814,7 +814,7 @@ async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixtur
     let (err, pid) = fail_a_contained_front_spawn(reader, move_out_of_its_leaf);
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
     assert!(
@@ -878,7 +878,7 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
     };
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
     assert!(
@@ -937,7 +937,7 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixt
     let text = err.to_string();
     assert!(text.contains("the spawned child is what sudo left"), "{text}");
     assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
+        text.contains("the elevated program may be running; left unreaped"),
         "{text}"
     );
     drop(stdin);
@@ -1125,7 +1125,7 @@ async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_nami
     assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
     assert_front_noted(
         &err,
-        "the elevated program may be running; it is left unreaped",
+        "the elevated program may be running; left unreaped",
         ChildFate::Unknown,
     );
     // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.

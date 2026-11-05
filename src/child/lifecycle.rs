@@ -65,7 +65,7 @@ pub(super) fn status_of_outcome(
 /// | `DeadlinePassed`, `killed`   | none: a kill is followed by a wait with no deadline, and [`new`](Self::new) asserts it | | |                                                  |
 ///
 /// Every row has a clause, and every line leads with the caller's subject, a zombie launchd holds
-/// included. The caller logs the clause at its level or folds it into its own warn.
+/// included.
 ///
 /// An unreadable record means the consuming reap took the zombie: the child was collected, only its
 /// exit is lost, so it is `Reaped` whether or not a kill reached it.

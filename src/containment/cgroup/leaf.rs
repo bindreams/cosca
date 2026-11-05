@@ -1031,11 +1031,31 @@ pub(crate) enum Abandoned {
     /// first send, before `exec` and outside the leaf — but that nothing here holds the pid to reap.
     MaybeUnreaped,
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
-    /// signal, and its leaf does not hold it. Says which, for the caller's one warn.
+    /// signal, and its leaf does not hold it; or its teardown left it uncollected. Says which, for
+    /// the caller's one warn.
     OutOfReach(String),
     /// The child is an elevation front, which was sent no signal of its own (see
     /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
     Front(crate::child::spawn::FrontFate),
+}
+
+#[cfg(target_os = "linux")]
+impl Abandoned {
+    /// The answer for a child that never named itself, torn down through the handshake's pidfd as
+    /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
+    /// a failed spawn's. One it left uncollected is [`OutOfReach`](Abandoned::OutOfReach), with the
+    /// clause as the one warn the caller logs.
+    fn after_pidless_teardown(torn: &mut crate::child::owned::teardown::TeardownOutcome) -> Abandoned {
+        if torn.uncollected {
+            // The clause of an uncollected child is at warn, which `take_warn` hands over.
+            let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
+            let left = torn.take_warn(label);
+            debug_assert!(left.is_some(), "the clause of an uncollected child is a warn");
+            return Abandoned::OutOfReach(left.unwrap_or_else(|| "its teardown left it uncollected".to_owned()));
+        }
+        torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
+        Abandoned::Ended
+    }
 }
 
 /// What became of the child itself when its spawn was abandoned.
@@ -1097,8 +1117,7 @@ impl CgroupLeaf {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
                 let mut torn = crate::child::spawn::held_teardown::tear_down_pidfd(None, pidfd, None, warn.due());
-                torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
-                return Abandoned::Ended;
+                return Abandoned::after_pidless_teardown(&mut torn);
             }
         }
         // Only a child that reported goes on to `exec`: one that named itself and sent no report
@@ -2021,6 +2040,10 @@ mod end_front_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf/end_child_tests.rs"]
 mod end_child_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/pidless_tests.rs"]
+mod pidless_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]

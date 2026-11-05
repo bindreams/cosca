@@ -438,6 +438,7 @@ mod worded {
                 uncollected: false,
                 look: Some(LookOutcome::Ended(Settlement::new(answer, true))),
                 clause: None,
+                refusal: None,
             };
             let worded = crate::child::word_front(PID, &WHY, disposition, torn);
             assert_eq!(

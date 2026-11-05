@@ -292,7 +292,7 @@ async fn macos_tokio_spawn_of_a_late_front_leaves_it_running_and_says_so() {
         &["elevation front", "left unreaped", ZOMBIE, LEAKS],
         &["was sent SIGKILL", SAID_REFUSED_RUNNING, SAID_NOT_SENT],
     );
-    assert!(err.to_string().contains("it is left unreaped"), "{err}");
+    assert!(err.to_string().contains("; left unreaped"), "{err}");
     crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
     drop(writer);
 }

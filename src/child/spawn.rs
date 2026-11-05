@@ -220,6 +220,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         uncollected: true,
                         look: None,
                         clause: None,
+                        refusal: None,
                     },
                 )
             }
@@ -330,8 +331,7 @@ fn root_after_a_delivered_kill(
 
 /// What [`finish_elevated`] says of a root whose kill was refused, which `refusal` states, once the
 /// one look at it found what `looked` says. A root the look collected is said as the look showed
-/// it ("it has exited, and was reaped": nothing shows it exited before the refused kill), with an
-/// unreadable exit record appended; another answer is worded as [`Settlement::wording`] words it,
+/// it, with an unreadable exit record appended; another answer is worded as [`Settlement::wording`] words it,
 /// after the refusal; a root still running is the refusal alone. The note says where the root goes:
 /// the clause does not.
 #[cfg(unix)]
@@ -2426,27 +2426,30 @@ impl FrontFate {
             return error;
         };
         let what = crate::elevation::front::describe(front, pid);
+        // Where the front goes, in the one wording of every teardown (`Disposition::suffix`).
+        use crate::child::owned::teardown::Disposition;
         let left = if handed_back {
-            "it is handed back to the caller"
+            Disposition::HandBack
         } else {
-            "it is left unreaped"
-        };
+            Disposition::Leave
+        }
+        .suffix(true);
         let fate = match self {
             FrontFate::Reaped => {
                 "it was sent no signal of its own; it had exited, or its cgroup's kill ended it, and it was reaped"
                     .to_owned()
             }
             FrontFate::LeftUnreaped => {
-                format!("it was sent nothing, so the elevated program may be running; {left}")
+                format!("it was sent nothing, so the elevated program may be running{left}")
             }
-            FrontFate::Unaccounted if handed_back => format!(
-                "it was sent nothing and could not be waited on, so the elevated program may be running; {left}"
-            ),
+            FrontFate::Unaccounted if handed_back => {
+                format!("it was sent nothing and could not be waited on, so the elevated program may be running{left}")
+            }
             FrontFate::Unaccounted => {
                 "it was sent nothing and could not be waited on, so the elevated program may be running".to_owned()
             }
             FrontFate::Unplaced => format!(
-                "it was sent nothing, and where it is cannot be read, so the elevated program may be running; {left}"
+                "it was sent nothing, and where it is cannot be read, so the elevated program may be running{left}"
             ),
         };
         error.with_note(&format!("{what}; {fate}"))
@@ -3088,9 +3091,8 @@ pub(crate) mod fault {
     }
 
     /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
-    /// returned `Ok` and before the wait: `teardown_unadopted_noting` (Windows), the sync
-    /// `finish_elevated`, `raw_spawn_teardown` (Windows), the async `wait_and_reap` and
-    /// `ProcSource::teardown_through_pidfd`, or `await_unexecuted_exit`. (`OwnedChild::tear_down` runs the hook of
+    /// returned `Ok` and before the wait, wherever a spawn's own code waits after its kill.
+    /// (`OwnedChild::tear_down` runs the hook of
     /// [`HookPoint::AfterDropKill`](crate::graceful_hooks::HookPoint) there instead.) See
     /// [`release_between_kill_and_wait`] and [`record_teardown_reaps`].
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {

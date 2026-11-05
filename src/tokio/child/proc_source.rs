@@ -211,7 +211,7 @@ impl std::os::fd::AsFd for PinnedPidfd {
 }
 
 /// Why a child is forgotten by [`ProcSource::forget_foreign`], completing "child N ...".
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const FORGET_FOREIGN: &str = "was reaped by someone else, or cannot be shown to be ours";
 
 /// Why a child its handle shows gone, not pinned, or unanswerable is forgotten, completing "child N ...".
@@ -245,6 +245,8 @@ struct TornDown {
     outcome: TeardownOutcome,
     /// What the forget leaked; `None` if the backend was already forgotten, so nothing was.
     leak: Option<&'static str>,
+    /// Why the refused kill's own look forgot the child, completing "the child ...", if it did.
+    why: Option<String>,
 }
 
 /// What forgetting tokio's handle for a child its handle does not show ours did, for the caller's
@@ -266,10 +268,11 @@ struct Forgetting {
 /// What became of a child whose teardown kill was refused (a setuid child answers `EPERM`): the
 /// exclusive states of [`ProcSource::after_refused_kill`].
 enum Refused {
-    /// Tokio's handle was forgotten for a child it does not show ours; no second teardown ran.
+    /// Tokio's handle was forgotten for a child it shows gone; no second teardown ran. (Linux: a
+    /// child it merely cannot show ours is torn down, see below.)
     Forgotten(Forgetting),
-    /// The child torn down again through its pidfd, after tokio's handle was forgotten for it, or
-    /// (if it was forgotten before) with nothing forgotten now.
+    /// The child torn down again through its pidfd, after tokio's handle was forgotten for it, here
+    /// or, with nothing forgotten now, before.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "only Linux tears a refused child down through its pidfd")
@@ -283,9 +286,9 @@ enum Refused {
 }
 
 /// What the one warning for a refused teardown kill says: the kill's error, then what became of the
-/// child. A forgotten one says why and what the forget leaked; a torn-down one what the forget
-/// leaked and the clause of its second teardown's outcome, whatever the level; a released one where
-/// it went.
+/// child. A forgotten one says why and what the forget leaked; a torn-down one, if its look forgot it,
+/// why, then what the forget leaked and the clause of its second teardown's outcome, whatever the
+/// level; a released one where it went.
 fn refused_kill_warning(pid: u32, e: &Error, after: &Refused) -> String {
     let mut text = format!("teardown kill of child {pid} failed ({e})");
     match after {
@@ -294,6 +297,9 @@ fn refused_kill_warning(pid: u32, e: &Error, after: &Refused) -> String {
             forgotten.why, forgotten.leak
         )),
         Refused::TornDown(torn_down) => {
+            if let Some(why) = &torn_down.why {
+                text.push_str(&format!("; the child {why}"));
+            }
             match torn_down.leak {
                 Some(leak) => text.push_str(&format!("; forgetting tokio's handle for it leaks {leak}")),
                 None => text.push_str("; tokio's handle for it was already forgotten"),
@@ -1100,7 +1106,7 @@ impl ProcSource {
 
     /// [`forget_foreign`](ProcSource::forget_foreign) for a spawn whose identity check found `why`:
     /// the forget's one warn carries it.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", all(unix, test)))]
     pub(crate) fn forget_foreign_noting(&mut self, why: &mut Diagnosis) -> Option<&'static str> {
         self.forget_noting(FORGET_FOREIGN, Forgotten::Unproven, why)
     }
@@ -1469,7 +1475,7 @@ impl ProcSource {
             );
         }
         self.forget_deferring("is an elevation front, sent nothing", Forgotten::Unproven, why);
-        // Nothing is handed back: tokio's `Running` waits for the async-child slice.
+        // Nothing is handed back: tokio's `Running` has no `Unreaped` yet.
         let child = OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
             Some(pid),
             self.take_forgotten_pidfd(),
@@ -1514,13 +1520,17 @@ impl ProcSource {
     /// tokio would reap it later with `waitpid(pid)` from its orphan queue, when the number may
     /// name another process. The child goes to the teardown every `OwnedChild` has, through its own
     /// pidfd, moved out of the backend: another kill, then a reap through the pidfd, or, if that kill
-    /// is refused too, one look: a child still running is left, and starts no thread. A backend
+    /// is refused too, one look: a child still running is left. A backend
     /// already forgotten (as not shown to be ours) holds the same pidfd, and is torn down the same
     /// way, with nothing more to leak. Answers what the teardown did, what the forget leaked, and
     /// what the teardown could not do, quietly: the caller's one warn carries them.
     #[cfg(target_os = "linux")]
-    fn tear_down_forgotten(mut self, pid: u32, id: Option<ProcessId>) -> TornDown {
-        let leak = self.forget_quietly(Forgotten::Unproven).map(|(_, leak)| leak);
+    fn tear_down_forgotten(mut self, pid: u32, id: Option<ProcessId>, forgot: Option<Forgetting>) -> TornDown {
+        // `forgot`: the refused kill's own look forgot the child just now, and says why and what leaked.
+        let (leak, why) = match forgot {
+            Some(forgot) => (Some(forgot.leak), Some(forgot.why)),
+            None => (self.forget_quietly(Forgotten::Unproven).map(|(_, leak)| leak), None),
+        };
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
         let torn = tear_down_pidfd(
             Some(pid),
@@ -1528,17 +1538,21 @@ impl ProcSource {
             id,
             Due::in_(super::slow_teardown_after()),
         );
-        TornDown { outcome: torn, leak }
+        TornDown {
+            outcome: torn,
+            leak,
+            why,
+        }
     }
 
     /// What a refused teardown kill (`e`; a setuid child answers `EPERM`) leaves to do, for the two
     /// teardowns that kill ([`reap_now`](ProcSource::reap_now),
     /// [`teardown_through_pidfd`](ProcSource::teardown_through_pidfd)): forget tokio's handle for a
-    /// child it shows reaped elsewhere or cannot answer for, since its drop reaps by pid; tear the
-    /// rest down again (Linux: [`tear_down_forgotten`](ProcSource::tear_down_forgotten); elsewhere:
-    /// release it to tokio's orphan queue); and warn once, with `why`, what became of it. The child
-    /// is torn down before the warn and the assertion: a panic from either must not strand a child
-    /// that is ours. Consumes the backend.
+    /// child it shows reaped elsewhere or cannot answer for, since its drop reaps by pid; tear down
+    /// again every child not shown gone (Linux: [`tear_down_forgotten`](ProcSource::tear_down_forgotten);
+    /// elsewhere: release the rest to tokio's orphan queue); and warn once, with `why`, what became
+    /// of it. The child is torn down before the warn and the assertion: a panic from either must not
+    /// strand a child that is ours. Consumes the backend.
     #[cfg_attr(not(unix), allow(unused_mut, reason = "only Unix forgets through `&mut self`"))]
     fn after_refused_kill(mut self, pid: u32, id: Option<ProcessId>, e: &Error, why: &mut Diagnosis) -> ChildFate {
         #[cfg(unix)]
@@ -1546,11 +1560,15 @@ impl ProcSource {
         #[cfg(not(unix))]
         let forgotten: Option<Forgetting> = None;
         let after = match forgotten {
+            // Linux tears down every child not shown gone through its pidfd, which pins it whatever
+            // the handle can say: one forgotten here, or before, included.
+            #[cfg(target_os = "linux")]
+            Some(forgot) if !matches!(forgot.fate, ChildFate::Gone) => {
+                Refused::TornDown(self.tear_down_forgotten(pid, id, Some(forgot)))
+            }
             Some(forgotten) => Refused::Forgotten(forgotten),
             #[cfg(target_os = "linux")]
-            // Linux tears down every child it does not forget through its pidfd, one forgotten before
-            // included.
-            None => Refused::TornDown(self.tear_down_forgotten(pid, id)),
+            None => Refused::TornDown(self.tear_down_forgotten(pid, id, None)),
             #[cfg(not(target_os = "linux"))]
             None => {
                 self.release();
@@ -1581,18 +1599,17 @@ impl ProcSource {
         pidfd.take()
     }
 
-    /// Linux teardown of a spawn whose identity check could not answer: kill the child through its
-    /// pidfd, which pins it whatever any peek said, then reap it through the same pidfd, and forget
-    /// tokio's `Child` (its drop would reap a pid that is already collected). Consumes the backend.
-    /// A refused kill is handled as in [`reap_now`](ProcSource::reap_now): the child is torn down
-    /// again through its pidfd. **Invariant:** no `wait()` future for this child is in flight.
+    /// Linux teardown of a spawn whose identity check could not answer: tokio's `Child` is
+    /// forgotten (its drop would reap a pid that is already collected), and the child is torn down
+    /// through its pidfd, which pins it whatever any peek said, as every failed spawn's held child
+    /// is ([`tear_down_pidfd`]). Consumes the backend. A refused kill is handled as in
+    /// [`reap_now`](ProcSource::reap_now). **Invariant:** no `wait()` future for this child is in
+    /// flight.
     ///
     /// `why`: what the spawn's identity check found, if that is why the child is torn down; the
-    /// teardown's one warn carries it.
+    /// teardown's one warn carries it, and the forget's leak.
     #[cfg(target_os = "linux")]
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
-        use crate::wait::exit_only::{self, Target};
-
         crate::bounded::assert_may_block("teardown_through_pidfd");
         let killed = self.teardown_kill();
         if let Err(e) = &killed {
@@ -1601,41 +1618,15 @@ impl ProcSource {
         // A fixture only the kill above would end is released here.
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        let reaped = self.wait_warning(pid, |proc| {
-            let ProcSource::Tokio { pidfd, .. } = proc else {
-                unreachable!("a freshly spawned backend is a tokio child");
-            };
-            exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd)))
-        });
-        let mut failed = None;
-        let fate = match reaped {
-            Ok(Ok(_record)) => {
-                #[cfg(test)]
-                if let crate::os_process::child::ExitRecord::Status(status) = _record {
-                    crate::child::spawn::fault::record_teardown_reap(pid, status);
-                }
-                ChildFate::Reaped
-            }
-            Ok(Err(foreign)) => {
-                log::debug!("child {pid} was reaped by someone else during its teardown");
-                foreign.fate(matches!(killed, Ok(Sent::Delivered)))
-            }
-            Err(e) => {
-                failed = Some(e);
-                ChildFate::Killed
-            }
-        };
-        // One warn: the failed reap, if there was one, and the leak of the forget.
-        match &failed {
-            Some(e) => self.forget_noting(
-                &format!("could not be reaped through its pidfd ({e})"),
-                Forgotten::Unproven,
-                why,
-            ),
-            None => self.forget_foreign_noting(why),
-        };
-        debug_assert!(failed.is_none(), "waitid on a child's own pidfd failed: {failed:?}");
-        fate
+        self.forget_deferring("is ended through its pidfd", Forgotten::Unproven, why);
+        let mut torn = tear_down_pidfd(
+            Some(pid),
+            self.take_forgotten_pidfd(),
+            id,
+            Due::in_(super::slow_teardown_after()),
+        );
+        torn.say_as_failed_spawn(why);
+        torn.fate
     }
 
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —

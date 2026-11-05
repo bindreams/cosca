@@ -241,7 +241,7 @@ fn a_running_front_with_no_subtree_is_handed_back_and_the_error_says_so() {
     handed_back.unreaped();
     let error = error.to_string();
     assert!(
-        error.contains("the elevated program may be running; it is handed back to the caller"),
+        error.contains("the elevated program may be running; handed back to the caller in the error"),
         "{error}"
     );
     handed_back.wait();
@@ -327,7 +327,7 @@ fn tear_down_leaving(
 }
 
 /// A child whose kill is refused, under a caller that leaves it, is left running and warned of, and
-/// nothing is handed back. It starts no thread: the child is the caller's to reap, and the test does.
+/// nothing is handed back. The child is the caller's to reap, and the test does.
 ///
 /// Mutants: the arm hands back what a `Leave` caller leaves; the warn says it is handed back; the child
 /// is reported reaped.
@@ -373,7 +373,7 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
     assert!(unreaped.is_none());
     let error = error.to_string();
     assert!(
-        error.contains("the elevated program may be running; it is left unreaped") && !error.contains("handed back"),
+        error.contains("the elevated program may be running; left unreaped") && !error.contains("handed back"),
         "{error}"
     );
     let warns = warns_since(mark);

@@ -74,6 +74,10 @@ pub(crate) fn tear_down_held(
 /// running, a look or a wait that failed) is left, which [`TeardownOutcome::uncollected`] says, not
 /// the fate; the caller owns the one warn, and logs the outcome's clause in it. With `due`, the wait
 /// for the killed child warns once it passes.
+///
+/// **Contract** (debug-asserted, once the child is torn down): the pidfd is the caller's own, so
+/// its kill is refused only as a setuid child refuses it, with `EPERM`, and a wait or look on it
+/// does not fail.
 pub(crate) fn tear_down_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
@@ -85,5 +89,18 @@ pub(crate) fn tear_down_pidfd(
         disposition: Disposition::Leave,
         tree: None,
     };
-    child.tear_down(id, kind, due)
+    let torn = child.tear_down(id, kind, due);
+    debug_assert!(
+        torn.refusal
+            .is_none_or(|kind| kind == std::io::ErrorKind::PermissionDenied),
+        "the kill of a child torn down through its own pidfd was refused: {:?}",
+        torn.clause
+    );
+    // Still running after a refused kill is a child left, not a failed wait.
+    debug_assert!(
+        !torn.uncollected || matches!(torn.fate, ChildFate::Running { .. }),
+        "a wait on a child's own pidfd failed: {:?}",
+        torn.clause
+    );
+    torn
 }

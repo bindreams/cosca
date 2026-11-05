@@ -95,22 +95,20 @@ In order:
      pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
      tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
      `waitpid`s by pid. The async non-front identity and attach arms
-     (`ProcSource::reap_now_noting` and `teardown_through_pidfd`) make the kill and the wait
-     the backend's, and only a refused kill goes on to `tear_down`, through `after_refused_kill`.
-     `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid;
-     `teardown_through_pidfd` reaps through the pidfd (`reap_blocking(&Target::PidFd(..))`) and
-     then forgets tokio's `Child`. Apart from these, only the cgroup leaf's `end_child` (both
-     spawns) starts a background reaping thread, until the leaf slice. `Settlement` is the one
+     (`ProcSource::reap_now_noting` and `teardown_through_pidfd`) make the first kill the
+     backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, and so does
+     `teardown_through_pidfd` after any kill, once tokio's `Child` is forgotten;
+     `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid. Apart from these,
+     only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
+     `Settlement` is the one
      classification of what a wait or look answered (the fate, whether the child is left
      uncollected, and a clause for every answer, with its level); the teardowns,
-     `finish_elevated` and `Unreaped` all ask it. A teardown logs none of the clause: the caller
-     logs it at its level or folds it into its own warn. A teardown that cannot end a child, a
+     `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child, a
      refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
      the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
      `SuspendedChild::resume` runs it too but leaves the child, since a frozen thread may never run.
-     The async Linux spawn leaves a child it could not end running, warned, until the async-child
-     slice. Windows and macOS still tear down by themselves.
+     Windows and macOS still tear down by themselves.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
