@@ -210,9 +210,16 @@ fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
 /// an error. Mutant: "transient counted as denied".
 #[skuld::test]
 fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
-    use crate::identity::{macos_fault, PpidRead};
+    use crate::identity::{macos_fault, Key, PpidRead};
     let me = std::process::id() as libc::c_int;
-    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(1)]);
+    let _forced = macos_fault::force_ppid_reads(
+        me as u32,
+        &[
+            PpidRead::Forking,
+            PpidRead::Forking,
+            PpidRead::Found(1, Key::for_test(1)),
+        ],
+    );
     let (edges, denied, _) = join_edges(&[me]).expect("edge buffer");
     assert_eq!(denied, 0);
     assert_eq!(edges, [(me as u32, 1)]);

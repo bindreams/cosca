@@ -551,7 +551,8 @@ fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
 /// One attempt at `pid`'s parent pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PpidRead {
-    Found(RawPid),
+    /// The parent pid and the start key, both from the one record the parent pid was read from.
+    Found(RawPid, Key),
     /// Both reads reported an untrusted `e_ppid == 0` ([`trusted_ppid`]): `fork()` has not
     /// finished. Transient.
     Forking,
@@ -572,12 +573,12 @@ fn read_ppid_once(pid: RawPid) -> PpidRead {
     }
     if let Some(info) = bsd_info(pid) {
         if let Some(ppid) = trusted_ppid(pid, info.pbi_ppid) {
-            return PpidRead::Found(ppid);
+            return PpidRead::Found(ppid, token_of_bsd(&info));
         }
     }
     match kinfo::kinfo(pid) {
         Resolved::Found(info) => match trusted_ppid(pid, info.e_ppid() as RawPid) {
-            Some(ppid) => PpidRead::Found(ppid),
+            Some(ppid) => PpidRead::Found(ppid, token_of_kinfo(&info)),
             None => PpidRead::Forking,
         },
         Resolved::Gone => PpidRead::Gone,
@@ -586,11 +587,11 @@ fn read_ppid_once(pid: RawPid) -> PpidRead {
 }
 
 /// Drive `read` to an answer. `Forking` is re-read after `pause(attempt)`; nothing else is.
-fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) -> Resolved<RawPid> {
+fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) -> Resolved<(RawPid, Key)> {
     let mut attempt = 0;
     loop {
         match read() {
-            PpidRead::Found(ppid) => return Resolved::Found(ppid),
+            PpidRead::Found(ppid, key) => return Resolved::Found((ppid, key)),
             PpidRead::Gone => return Resolved::Gone,
             PpidRead::Refused => return Resolved::Unknown,
             PpidRead::Forking => {
@@ -611,6 +612,12 @@ fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) 
 /// deadline; the pid exiting meanwhile ends it as `Gone`. `Gone` is only returned when the
 /// fallback itself positively confirms the pid no longer exists.
 pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
+    ppid_and_key(pid).map(|(ppid, _)| ppid)
+}
+
+/// [`ppid_of`], with the start key of the record the parent pid was read from: the parent and the
+/// identity of the process it was read for come from one read, so they describe the same process.
+pub(super) fn ppid_and_key(pid: RawPid) -> Resolved<(RawPid, Key)> {
     resolve_ppid(|| read_ppid_once(pid), fork_pause)
 }
 
