@@ -347,8 +347,9 @@ pub(crate) fn children_of_with(
 /// [`Error::Unassessable`] (or `Unsupported`) when the anchor cannot be proved.
 ///
 /// `root` needs no row in `parents`: the walk reads only the rows that name it as their parent, and
-/// a missing row of `root` says nothing about those. Toolhelp, for one, does not list an exited
-/// process whose handle is held, though its children, which Windows does not reparent, run on.
+/// a missing row of `root` says nothing about those. Toolhelp, for one, drops the row of an exited
+/// process whose handle is held (at once, or a moment after its exit), though its children, which
+/// Windows does not reparent, run on.
 pub(crate) fn walk_from(
     kernel: &dyn Kernel,
     root: ProcessId,
