@@ -130,8 +130,8 @@ fn run_with<W: Waitable>(
     }
 }
 
-/// [`run`]'s pause: sleep this thread for `d`. Nothing wakes it early, so a `Waitable` that others
-/// must reach during the pause holds no lock across it.
+/// [`run`]'s pause. Nothing wakes it early, so a `Waitable` that others must reach during the pause
+/// holds no lock across it.
 fn pause(d: Duration) {
     #[cfg(test)]
     crate::wait::block_probe::record_pause(d);

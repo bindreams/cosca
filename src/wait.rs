@@ -699,8 +699,8 @@ pub(crate) mod block_probe {
         fire_round();
     }
 
-    /// [`record`], for a thread about to sleep out a recheck pause of `d`, and run the hook
-    /// [`on_pause`] armed. A pause is not a block: it fires no round.
+    /// Record a recheck pause of `d` and run the armed [`on_pause`] hook. Unlike a block, it fires
+    /// no round.
     pub(crate) fn record_pause(d: Duration) {
         record(Some(d));
         fire(&ON_PAUSE);
@@ -783,9 +783,9 @@ pub(crate) mod block_probe {
         Armed(&ON_BLOCKING)
     }
 
-    /// Run `hook` on this thread just before its next recheck pause sleeps. The `Waitable` released
-    /// every lock it took for the look, by the `Step::Recheck` contract; the hook firing does not
-    /// prove it, and a hook that takes the lock does.
+    /// Run `hook` on this thread just before its next recheck pause sleeps. A hook that takes the
+    /// `Waitable`'s lock proves the `Step::Recheck` contract (the lock is released before the
+    /// pause); the hook firing alone does not.
     pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
         ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         Armed(&ON_PAUSE)

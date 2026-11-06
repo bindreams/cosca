@@ -680,7 +680,7 @@ mod pidfd_exit_visible {
             crate::os_process::poll::is_readable(pidfd.as_fd()).is_err(),
             "the precondition: poll fails"
         );
-        // A pause is recorded in the probe too, so a block is told by its hook.
+        // Assert via the on_blocking hook: the probe record also holds recheck pauses.
         let blocking = crate::wait::block_probe::on_blocking(|| panic!("a block after a failed poll"));
         let until = Instant::now() + Duration::from_millis(30);
         assert!(!pidfd_exit_visible_by(pidfd.as_fd(), until));
