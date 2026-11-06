@@ -2811,7 +2811,7 @@ fn an_abandoned_fronts_failed_leaf_kill_is_in_the_warn_of_its_teardown() {
         crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
     );
     assert!(!leaf_path.exists(), "the leaf is removed");
-    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "one warn: {warns:?}");
     assert!(
         warns[0].contains("cgroup.kill failed"),
@@ -3199,10 +3199,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     drop(guard);
     // No send was made, so none is noted, a refused one included.
     assert_eq!(take_member_terms(), []);
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &leaf_name)
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
@@ -3221,7 +3218,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
         ),
     }
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains(&format!("pid {pid}")), "{warns:?}");
+    assert!(warns[0].contains(&format!("pid {pid}")), "{warns:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -3311,13 +3308,10 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgrou
     crate::containment::cgroup::fault::take_member_terms();
     let mark = crate::log_capture::mark();
     let result = leaf.terminate();
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &leaf_name)
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
     result.expect("a member reaped after its pin is gone");
-    assert_eq!(warns, [], "nothing warns of a member that is gone");
+    assert_eq!(warns, Vec::<String>::new(), "nothing warns of a member that is gone");
     drop(leaf);
 }
 
@@ -3366,7 +3360,7 @@ fn cgroup_terminate_warns_once_when_the_id_cannot_be_read_and_a_member_is_unsign
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
     let mark = crate::log_capture::mark();
     let result = leaf.terminate_listed("0\n");
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(_no_id);
     drop(leaf);
     assert!(
@@ -3385,16 +3379,6 @@ fn leaf_name_of(leaf: &crate::containment::cgroup::CgroupLeaf) -> String {
         .expect("a leaf name")
         .to_string_lossy()
         .into_owned()
-}
-
-/// The texts of this thread's `warn` records since `mark` that contain `marker`.
-#[cfg(target_os = "linux")]
-fn warns_on_thread(mark: usize, marker: &str) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, marker)
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A real leaf with `n` members, each a blocker on a piped stdin it holds open, and those pipes'
@@ -3458,10 +3442,7 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
 {pid}
 "
     ));
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &leaf_name)
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
@@ -3482,7 +3463,7 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
         other => panic!("a listed pid 0 was not signalled: expected Unassessable, got {other:?}"),
     }
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("pid 0"), "{warns:?}");
+    assert!(warns[0].contains("pid 0"), "{warns:?}");
 }
 
 /// A leaf that lists only pid `0` has nothing signalled, and says so: `Unassessable`, not `Ok`.
@@ -3518,7 +3499,7 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     let result = leaf.terminate();
     drop(guard);
     let noted = take_member_terms();
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
@@ -3592,7 +3573,7 @@ fn cgroup_terminate_does_not_signal_a_member_that_exited_unreaped(#[fixture(cgro
     let mark = crate::log_capture::mark();
     let result = leaf.terminate_listed(&format!("{pid}\n"));
     let noted = take_member_terms();
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(stdin);
     member.wait().expect("reap the member");
     drop(leaf);
@@ -3618,7 +3599,7 @@ fn cgroup_terminate_counts_a_member_gone_before_its_pin_as_gone(#[fixture(cgroup
     let result = leaf.terminate_listed(&format!("{pid}\n"));
     let noted = take_member_terms();
     let gone = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} is gone"));
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(leaf);
     result.expect("a member gone before its pin is not a failure");
     assert_eq!(noted, []);
@@ -3647,7 +3628,7 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
     let noted = take_member_terms();
     let exited =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} exited before its SIGTERM"));
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
@@ -3682,7 +3663,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone_through_proc(#[
     let _no_info = crate::containment::cgroup::fault::miss_pidfd_info();
     let mark = crate::log_capture::mark();
     let result = leaf.terminate();
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     let gone =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} exited before it was placed"));
     drop(_no_info);
@@ -3755,7 +3736,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
     let result = leaf.terminate_listed(&format!("0\n{}\n{}\n", pids[0], pids[1]));
     drop(guard);
     let noted = take_member_terms();
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     for (mut member, stdin) in members.drain(..) {
         drop(stdin);
         member.wait().expect("reap the member");
@@ -3791,7 +3772,7 @@ fn cgroup_terminate_reports_a_listed_line_that_is_no_pid(#[fixture(cgroup)] _gro
     let leaf_name = leaf_name_of(&leaf);
     let mark = crate::log_capture::mark();
     let result = leaf.terminate_listed("abc\n");
-    let warns = warns_on_thread(mark, &leaf_name);
+    let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(leaf);
     let detail = match result {
         Err(crate::error::Error::Unassessable { detail, .. }) => detail,

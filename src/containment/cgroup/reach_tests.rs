@@ -9,8 +9,8 @@ use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::{alone, kill_record};
 use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
+use crate::log_capture::warns_since;
 use crate::send_log::Via;
-use crate::test_child::reaped_elsewhere::warns_since;
 use crate::test_groups::{cgroup, Group};
 
 /// A cgroup id with bits above the low 32, as kernfs gives once its 32-bit counter wraps.
@@ -710,7 +710,7 @@ fn a_probe_child_whose_pidfd_kill_fails_is_released_and_reaped_through_its_pidfd
             ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::RELEASED))
         ]
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(
         warns.iter().any(|w| w.contains(&format!("child {pid}"))),
         "a warn names the probe's child {pid}: {warns:?}"
@@ -746,7 +746,7 @@ fn a_probe_child_whose_kill_by_number_fails_is_released_and_warned() {
             ProbeStep::Reap(Via::Pid, ProbeEnd::Exit(super::RELEASED))
         ]
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(
         warns.iter().any(|w| w.contains(&format!("child {pid}"))),
         "a warn names the probe's child {pid}: {warns:?}"
@@ -995,7 +995,7 @@ fn assert_probe_answers_with_spare_descriptors(spare: usize) {
             ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
 /// A low `RLIMIT_NOFILE` does not turn the probe's verdict into an `Io` failure, nor cost the child its
@@ -1097,7 +1097,7 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
             ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::ABANDONED))
         ]
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(
         warns
             .iter()
@@ -1179,7 +1179,7 @@ fn a_release_that_cannot_be_sent_is_a_warn_naming_the_child() {
         std::os::unix::net::UnixStream::from(OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null")));
     let mark = crate::log_capture::mark();
     super::release_probe(4242, not_a_socket);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(
         warns.iter().any(|w| w.contains("child 4242")),
         "a warn names the probe's child: {warns:?}"

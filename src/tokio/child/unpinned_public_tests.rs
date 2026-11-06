@@ -9,9 +9,10 @@ use crate::test_child::Console;
 
 use crate::child::unpinned_public_tests::{
     assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned,
-    sorted, warns_since, Untrusted, BOTH,
+    sorted, Untrusted, BOTH,
 };
 use crate::error::Error;
+use crate::log_capture::warns_since;
 use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
@@ -109,7 +110,7 @@ async fn kill_of_an_orphaned_root_sends_nothing() {
     assert_peeks_exhausted();
     assert_refused(&err, "kill");
     assert_nothing_sent(&sends);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     child.kill().expect("an unreaped root is killed");
     assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
@@ -151,7 +152,7 @@ async fn terminate_of_an_orphaned_root_sends_nothing() {
     assert_peeks_exhausted();
     assert_refused(&err, "terminate");
     assert_nothing_sent(&sends);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     child.terminate().expect("an unreaped root is signalled");
     assert_eq!(sends.by_identity(), vec![(pid, libc::SIGTERM)]);
@@ -198,7 +199,7 @@ async fn kill_tree_of_an_untrusted_walked_root_sends_nothing() {
         assert_tree_refused(&err, "kill_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(looks);
 
         child.kill_tree().expect("an unreaped root is killed with its tree");
@@ -238,7 +239,7 @@ async fn kill_tree_of_a_backend_forgotten_as_launchd_held_says_launchd_holds_it(
     assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
     assert_nothing_sent(&sends);
     assert_eq!(groups.killed(), Vec::<i32>::new());
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
     crate::test_child::reaped_elsewhere::reap_behind(pid);
 }
@@ -262,7 +263,7 @@ async fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
         assert_tree_refused(&err, "kill_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(groups.killed(), Vec::<i32>::new(), "{state:?}");
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(looks);
 
         child.kill_tree().expect("an unreaped root is killed with its group");
@@ -307,7 +308,7 @@ async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGKILL, &want, state);
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
 }
@@ -351,7 +352,7 @@ async fn terminate_tree_of_an_untrusted_walked_root_sends_nothing() {
         assert_tree_refused(&err, "terminate_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(looks);
 
         child
@@ -388,7 +389,7 @@ async fn terminate_tree_of_an_untrusted_group_root_sends_no_killpg() {
         assert_tree_refused(&err, "terminate_tree", state);
         assert_nothing_sent(&sends);
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(looks);
 
         child
@@ -433,7 +434,7 @@ async fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() 
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
 }
@@ -521,7 +522,7 @@ async fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
         sends.by_identity().contains(&(pid, libc::SIGKILL)),
         "the sweep ran first"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
