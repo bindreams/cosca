@@ -28,7 +28,7 @@ fn refuse_the_kill(child: &mut Child) -> FakeProcess {
 fn a_refused_kill_hands_the_child_back_and_says_so() {
     crate::log_capture::install();
     let (mut child, stdin) = held_uncontained_blocker(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     refuse_the_kill(&mut child);
     let mark = crate::log_capture::mark();
 
@@ -57,7 +57,7 @@ fn a_refused_kill_hands_the_child_back_and_says_so() {
 fn a_refused_kill_is_left_when_the_caller_leaves_it() {
     crate::log_capture::install();
     let (mut child, stdin) = held_uncontained_blocker(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     refuse_the_kill(&mut child);
     let mark = crate::log_capture::mark();
 
@@ -82,7 +82,7 @@ fn a_refused_kill_is_left_when_the_caller_leaves_it() {
 #[skuld::test]
 fn a_child_that_opted_out_is_not_handed_back() {
     let (child, stdin) = held_uncontained_blocker(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
 
@@ -202,7 +202,7 @@ fn a_handed_back_process_group_child_has_its_group_killed_first() {
     cmd.contain_with(ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), Containment::Session);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     refuse_the_kill(&mut child);
 
     let (fate, handed_back) = tear_down_holding(child, writer, Disposition::HandBack);
@@ -280,7 +280,7 @@ fn assert_front_handed_back(
 #[skuld::test]
 fn a_running_elevation_front_is_handed_back() {
     let (child, stdin) = a_running_front();
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let mark = crate::log_capture::mark();
 
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
@@ -295,7 +295,7 @@ fn a_running_elevation_front_is_handed_back() {
 #[skuld::test]
 fn an_elevation_front_is_left_when_the_caller_leaves_it() {
     let (child, stdin) = a_running_front();
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let mark = crate::log_capture::mark();
 
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
@@ -435,7 +435,7 @@ mod in_a_cgroup {
     fn a_front_outside_its_leaf_is_handed_back_after_its_leaf_is_gone(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let leaf = cgroup_dir_of(id.pid());
         move_out_of_its_leaf(id.pid());
         let mark = crate::log_capture::mark();
@@ -454,7 +454,7 @@ mod in_a_cgroup {
     fn a_front_that_leaves_its_leaf_during_the_kill_is_handed_back(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let leaf = cgroup_dir_of(id.pid());
         let pid = id.pid();
         let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
@@ -475,7 +475,7 @@ mod in_a_cgroup {
     fn a_front_whose_place_cannot_be_read_is_handed_back(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         child.proc.script_over(|fake| fake.reaps([ReapAnswer::Running]));
         let mark = crate::log_capture::mark();
 
@@ -506,7 +506,7 @@ mod in_a_cgroup {
     fn a_front_whose_subtree_cannot_be_read_is_handed_back(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         move_out_of_its_leaf(id.pid());
         let mark = crate::log_capture::mark();
 
@@ -529,7 +529,7 @@ mod in_a_cgroup {
     fn a_refused_kill_of_a_child_the_leaf_killed_is_reaped_not_handed_back(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (mut child, stdin) = blocker_in_a_leaf();
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         refuse_the_kill(&mut child);
         let mark = crate::log_capture::mark();
 
@@ -547,7 +547,7 @@ mod in_a_cgroup {
     fn dropping_a_child_whose_kill_is_refused_but_whose_leaf_killed_it_reaps_it(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (mut child, stdin) = blocker_in_a_leaf();
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         refuse_the_kill(&mut child);
         let mark = crate::log_capture::mark();
 

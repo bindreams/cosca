@@ -222,10 +222,13 @@ pub(crate) fn spawn_raw(
         &crate::wait::exit_only::Target::Handle(owned.os_handle()),
     );
     let id = match resolved {
-        crate::identity::Resolved::Found(id) => id,
+        crate::identity::Resolved::Found(id) => Ok(id),
+        // An OS refusal says nothing against the child, and its handle names it: it is kept, with no
+        // identity. A containment that needs one fails the attach with this error.
+        crate::identity::Resolved::Unknown => Err(crate::child::spawn::spawn_identity_error(resolved, cause)),
         other => {
-            // The read failed, so no identity is known. A child the teardown could not end comes back
-            // in the failure.
+            // The child was reaped by another party, so no identity is known. A child the teardown
+            // could not end comes back in the failure.
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
                 None,
@@ -241,12 +244,13 @@ pub(crate) fn spawn_raw(
             ));
         }
     };
-    let attachment = match attach_or_fault(id, raw_handle, prepared) {
+    let id_read = id.as_ref().ok().copied();
+    let attachment = match attach_or_fault(pid, id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
-                Some(id),
+                id_read,
                 Past::Clean,
                 Disposition::HandBack,
                 None,
@@ -256,7 +260,7 @@ pub(crate) fn spawn_raw(
         }
     };
 
-    Ok(Child::from_parts(owned, id, parent_ends, kill_on_drop, attachment))
+    Ok(Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment))
 }
 
 /// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`

@@ -155,7 +155,7 @@ fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd(
         stdout: None,
         stderr: None,
         fate: super::Forgotten::Unproven,
-        pid: Some(pid),
+        pid,
         pidfd: super::PinnedPidfd(Some(pidfd)),
     };
     crate::log_capture::install();
@@ -233,8 +233,7 @@ fn exit_visible_by_refuses_inside_a_section() {
         stdout: None,
         stderr: None,
         fate: super::Forgotten::Unproven,
-        #[cfg(target_os = "linux")]
-        pid: None,
+        pid: 0,
         // Never read: the refusal comes before the backend is looked at.
         #[cfg(target_os = "linux")]
         pidfd: super::PinnedPidfd(Some(std::fs::File::open("/dev/null").expect("open /dev/null").into())),
@@ -480,11 +479,10 @@ async fn the_held_handle_reads_as_a_running_process_until_tokio_reaps_the_child(
     use crate::os_process::Exit;
 
     let (mut child, _stdin) = crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe());
-    let pid = child.pid();
 
     let held = child
         .proc()
-        .held_os_process(pid)
+        .held_os_process()
         .expect("a live child's handle can be read")
         .expect("a live child has a process to watch");
     assert!(
@@ -497,7 +495,7 @@ async fn the_held_handle_reads_as_a_running_process_until_tokio_reaps_the_child(
     child.wait().await.expect("reap the blocker");
     let reaped = child
         .proc()
-        .held_os_process(pid)
+        .held_os_process()
         .expect("a reaped child's handle can be read");
     assert!(reaped.is_none(), "a reaped child has nothing left to watch");
 }
@@ -519,7 +517,7 @@ async fn the_held_handle_look_checks_the_unique_id_after_arming_on_macos() {
 
     {
         let _other = force_uniq_read_once(ReadPurpose::Open, other_unique_id(pid));
-        let held = child.proc().held_os_process(pid).expect("a mismatch is not an error");
+        let held = child.proc().held_os_process().expect("a mismatch is not an error");
         assert!(held.is_none(), "a pid another process holds is exited, not watched");
     }
     {
@@ -527,7 +525,7 @@ async fn the_held_handle_look_checks_the_unique_id_after_arming_on_macos() {
         let Err(Error::Unassessable {
             detail,
             source: Some(source),
-        }) = child.proc().held_os_process(pid)
+        }) = child.proc().held_os_process()
         else {
             panic!("a refused read is Unassessable with its errno");
         };
@@ -538,7 +536,7 @@ async fn the_held_handle_look_checks_the_unique_id_after_arming_on_macos() {
         );
     }
     assert!(
-        child.proc().held_os_process(pid).expect("a matching read").is_some(),
+        child.proc().held_os_process().expect("a matching read").is_some(),
         "the child's own unique id is watched"
     );
 
@@ -567,7 +565,7 @@ async fn an_unproven_child_is_sent_no_sigterm_and_cannot_be_looked_at_on_macos()
 
     assert_eq!(child.proc().signal(Sig::Term).expect("no error"), Sent::Unverified);
     assert!(
-        matches!(child.proc().held_os_process(pid), Err(Error::Unassessable { .. })),
+        matches!(child.proc().held_os_process(), Err(Error::Unassessable { .. })),
         "nothing proves the number is still the child's"
     );
     // Forgotten, the child is out of tokio's reach (a kill by number is refused, a wait is `ECHILD`):

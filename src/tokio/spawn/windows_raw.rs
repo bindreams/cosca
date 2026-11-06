@@ -46,6 +46,8 @@ use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 #[derive(Debug)]
 pub(crate) struct RawAsyncChild {
     proc: Arc<OwnedHandle>,
+    /// The child's pid, as `CreateProcess` returned it: the handle pins it for the child's whole life.
+    pid: u32,
     /// The access `proc` was granted: it decides what a refused kill means.
     granted: PROCESS_ACCESS_RIGHTS,
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
@@ -56,10 +58,11 @@ pub(crate) struct RawAsyncChild {
 }
 
 impl RawAsyncChild {
-    /// The child whose process handle is `proc`, which holds `granted`.
-    pub(crate) fn new(proc: OwnedHandle, granted: PROCESS_ACCESS_RIGHTS) -> RawAsyncChild {
+    /// The child `pid` whose process handle is `proc`, which holds `granted`.
+    pub(crate) fn new(proc: OwnedHandle, pid: u32, granted: PROCESS_ACCESS_RIGHTS) -> RawAsyncChild {
         RawAsyncChild {
             proc: Arc::new(proc),
+            pid,
             granted,
             exited: None,
             #[cfg(test)]
@@ -69,6 +72,10 @@ impl RawAsyncChild {
 
     fn handle(&self) -> HANDLE {
         HANDLE(self.proc.as_raw_handle())
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
     }
 
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
@@ -322,9 +329,12 @@ pub(crate) fn spawn_raw(
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
     );
     let id = match resolved {
-        crate::identity::Resolved::Found(id) => id,
+        crate::identity::Resolved::Found(id) => Ok(id),
+        // An OS refusal says nothing against the child, and its handle names it: it is kept, with no
+        // identity. A containment that needs one fails the attach with this error.
+        crate::identity::Resolved::Unknown => Err(crate::child::spawn::spawn_identity_error(resolved, cause)),
         other => {
-            // The read failed, so no identity is known.
+            // The child was reaped by another party, so no identity is known.
             let fate = raw_spawn_teardown(proc, pid, None);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
@@ -333,17 +343,18 @@ pub(crate) fn spawn_raw(
             ));
         }
     };
-    let attachment = match attach_or_fault(id, raw_handle, prepared) {
+    let id_read = id.as_ref().ok().copied();
+    let attachment = match attach_or_fault(pid, id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = raw_spawn_teardown(proc, pid, Some(id));
+            let fate = raw_spawn_teardown(proc, pid, id_read);
             return Err(SpawnFailure::started(e, fate, None));
         }
     };
 
     Ok(Child::from_parts(
-        ProcSource::Raw(RawAsyncChild::new(proc, CREATE_PROCESS_ACCESS)),
-        id,
+        ProcSource::Raw(RawAsyncChild::new(proc, pid, CREATE_PROCESS_ACCESS)),
+        id_read,
         kill_on_drop,
         attachment,
         fd_pipes,

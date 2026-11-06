@@ -245,6 +245,10 @@ pub(crate) fn contain_without_cgroup_async(cmd: &mut crate::tokio::Command) -> &
     cmd.contain()
 }
 
+/// The `expect` message of a test that needs a spawned child's identity, which a spawn reads for every
+/// child a test makes (only a refused read leaves a child without one).
+pub(crate) const IDENTITY_READ: &str = "the spawn read the child's identity";
+
 /// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin. On Windows it has
 /// a windowless console of its own, which a `CTRL_BREAK` from this process cannot reach: a test
 /// of the graceful signals takes [`held_contained_blocker_on_console`].
@@ -261,7 +265,7 @@ pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate:
 #[cfg(windows)]
 pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::identity::ProcessId) {
     let (child, stdin) = held_contained_blocker(crate::Stdio::null());
-    let id = child.id();
+    let id = child.id().expect("the spawn read the blocker's identity");
     (child, stdin, id)
 }
 

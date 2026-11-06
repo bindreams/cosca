@@ -457,33 +457,26 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 }
 
 /// The spawn's identity check peeks through the child's pidfd. A peek that fails cannot show the
-/// child ours, but the pidfd pins it whatever the peek said: the spawn fails `Unassessable`, warns
-/// once (with the forget's leak), kills and reaps the child through the pidfd, and forgets tokio's `Child` (its drop
-/// would reap a collected pid).
+/// child ours, but the pidfd pins it whatever the peek said: the spawn keeps the child with no
+/// identity, warns once naming the error, and leaves tokio's `Child` in the backend, so the child is
+/// waited for and killed through its handle like any other.
 ///
-/// Mutants: the warn drops the error, or is a second one beside the forget's; the teardown's clause is
-/// left out of it, or logged apart at `debug` (the warn is then unlabelled and says nothing of the
-/// child's end); the identity read moves before `ProcSource::new`
-/// (tokio's `Child` is dropped by value on the error path, so `forgets()` is 0); the failed check
-/// goes to `reap_now` (`backend_drops` is 1); the teardown only forgets the child (no teardown
-/// reap is recorded, and the child is left running); the warn calls the child reaped by someone else.
+/// Mutants: the warn drops the error, or is never logged; the spawn forgets tokio's `Child`
+/// (`forgets()` is 1) or drops it (`backend_drops` is 1); the spawn still fails.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio_child() {
+async fn a_failed_identity_peek_keeps_the_tokio_child_without_an_identity() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::child::spawn::fault;
-    use crate::error::Error;
 
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
-        let (slot, armed) = (Rc::clone(&slot), Rc::clone(&armed));
+        let armed = Rc::clone(&armed);
         move || {
-            *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
             // Armed here, not before `spawn()`: the handshake's own peeks run first.
             *armed.borrow_mut() = Some(Box::new(force_peeks([Err(std::io::Error::other(
                 "forced identity-check failure 91c4",
@@ -493,69 +486,31 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
     let mark = crate::log_capture::mark();
-    // Released after the kill: a kill that sent nothing exits 0.
-    let (stdin, reaps) = crate::child::spawn::fault::teardown_blocker_stdin();
+    let (stdin, _reaps) = crate::child::spawn::fault::teardown_blocker_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("stdin");
 
-    let err = cmd.spawn().err();
+    let spawned = cmd.spawn();
 
     drop(armed);
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-        err.expect("a failed identity peek fails the spawn"),
-    );
-    assert_eq!(
-        fate,
-        crate::error::ChildFate::Reaped,
-        "the pidfd pins the child, so it is killed and reaped"
-    );
-    assert!(
-        matches!(err, Error::Unassessable { .. }),
-        "a failed peek is Unassessable, not a vanish: {err:?}"
-    );
-    // The failed check and the forget its teardown ends in are one event: one warn, which names the
-    // error and carries the leak.
+    let mut child = spawned.expect("a failed identity peek keeps the child");
+    assert_eq!(child.id(), None, "the read failed, so the child has no identity");
+    // The failed check is the event's one warn, logged when the spawn ends.
     let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 91c4)")
-            && warns[0].contains("leaks"),
-        "the failed peek is warned once, naming its own error and the leak: {warns:?}"
+        warns[0].contains("could not be checked against its handle (forced identity-check failure 91c4)"),
+        "the failed peek is warned once, naming its own error: {warns:?}"
     );
-    // The forget's note says what is known before the teardown (the child cannot be shown ours); the
-    // teardown's clause, whatever its level alone, says it was killed and reaped, in the same warn,
-    // which the failed spawn's name leads.
-    assert!(
-        warns[0].contains("cannot be shown to be ours; forgetting tokio's handle for it leaks"),
-        "the warn says why the child was forgotten: {warns:?}"
-    );
-    assert!(
-        warns[0].starts_with("teardown after a failed spawn: ") && warns[0].contains(": reaped it after the kill"),
-        "the one warn is the failed spawn's and says the child was killed and reaped: {warns:?}"
-    );
-    // The child was killed and reaped through its pidfd, not reaped by someone else.
-    assert!(
-        !warns[0].contains("reaped by someone else"),
-        "the warn does not call the child foreign: {warns:?}"
-    );
-    assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
+    assert_eq!(forgets.forgets(), 0, "tokio's Child must stay in the backend");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
-    let witness = slot.borrow_mut().take().expect("the hook ran");
-    let recorded = reaps.recorded();
+    child.kill().expect("a kept child is killed through its handle");
+    let status = child.wait().await.expect("a kept child is waited on");
     assert_eq!(
-        recorded.len(),
-        1,
-        "the teardown must have reaped the child: {recorded:?}"
-    );
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&recorded[0].1),
+        std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGKILL),
-        "the teardown must have killed the child through its pidfd"
-    );
-    assert!(
-        witness.reap().is_err(),
-        "the child is reaped already: nothing is left for the test to reap"
+        "the kill ended the child"
     );
 }
 
@@ -569,10 +524,7 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 /// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
 /// warns with the foreign-reap text; the refused kill and the forget warn separately.
 ///
-/// This is `reap_now`'s refused-kill arm (a forced attach failure). A failed identity peek's arm
-/// (`teardown_through_pidfd`) sends no kill of its own, so it has no refused-kill row: its kill is
-/// `tear_down_pidfd`'s, whose refusal the setuid row in `tokio::spawn_tests` and `OwnedChild`'s
-/// `teardown_look` rows catch.
+/// This is `reap_now`'s refused-kill arm (a forced attach failure).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_on_a_live_child_reaps_through_the_pidfd() {

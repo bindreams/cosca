@@ -318,7 +318,7 @@ fn release(stream: TcpStream) {
 pub async fn report_grandchild_async(report: ::tokio::net::TcpListener, root: &mut cosca::tokio::Child) -> ProcessId {
     use ::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    LAST_ASYNC_ROOT.with(|c| c.set(Some(root.id())));
+    LAST_ASYNC_ROOT.with(|c| c.set(root.id()));
     let root_pid = root.pid();
     let std_stream = super::accept::accept_or_die_async(&report, root).await;
     drop(report);
@@ -328,7 +328,8 @@ pub async fn report_grandchild_async(report: ::tokio::net::TcpListener, root: &m
     let mut stream = ::tokio::net::TcpStream::from_std(std_stream).expect("wrap the report stream for tokio");
     let mut line = String::new();
     // Watched without reaping, as in `accept_or_die_async`.
-    let root_process = cosca::tokio::Process::open(root.id()).expect("open the root");
+    let root_process =
+        cosca::tokio::Process::open(root.id().expect("the spawn read the root's identity")).expect("open the root");
     let n = {
         let mut reader = BufReader::new(&mut stream);
         ::tokio::select! {

@@ -216,6 +216,12 @@ impl OwnedChild {
         matches!(self.lock().state, State::E(_))
     }
 
+    /// What a peek through the child's own handle shows (the exit record once this handle has reaped
+    /// it), without reaping; see [`ReapHold::peek`], which does the same under a hold.
+    pub(crate) fn peek(&self) -> Result<PeekOutcome, Error> {
+        self.peek_locked(&self.lock())
+    }
+
     /// Whether the root is still this handle's child to act on, from the handle's own evidence; see
     /// [`ReapHold::state`].
     #[cfg(unix)]

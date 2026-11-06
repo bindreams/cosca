@@ -620,7 +620,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
         } => {
             let mut child = crate::child::Child::from_parts(
                 OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
-                id,
+                Some(id),
                 BTreeMap::new(),
                 kill_on_drop,
                 Attachment::uac_elevated(),

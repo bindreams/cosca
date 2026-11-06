@@ -18,7 +18,7 @@ fn a_seccomp_refused_openat2_makes_a_treewalk_drop_kill_the_root_and_warn_of_orp
                     let (child, stdin) = crate::test_child::held_treewalk_blocker();
                     assert_eq!(child.containment(), crate::containment::Containment::TreeWalk);
                     let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
-                    let id = child.id();
+                    let id = child.id().expect(crate::test_child::IDENTITY_READ);
                     deny_openat2_on_this_thread(errno);
                     drop(child);
                     let records = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");

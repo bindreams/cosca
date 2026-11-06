@@ -70,7 +70,7 @@ fn observer_handle(pid: u32) -> OwnedHandle {
 async fn reap_now_with_an_exit_under_way_and_a_failed_wait_is_killed() {
     crate::tokio::test_runtime::assert_current_thread();
     let (child, pid) = exited_unreaped_child();
-    let proc = ProcSource::new(child);
+    let proc = ProcSource::new(child, pid);
     let failed = super::fault::fail_handle_wait();
 
     let fate = proc.reap_now(pid, None);
@@ -89,7 +89,7 @@ async fn reap_now_with_a_delivered_kill_and_a_failed_wait_is_killed() {
     crate::tokio::test_runtime::assert_current_thread();
     let (child, pid, blocker) = blocker_child();
     let observer = observer_handle(pid);
-    let proc = ProcSource::new(child);
+    let proc = ProcSource::new(child, pid);
     let failed = super::fault::fail_handle_wait();
 
     let fate = proc.reap_now(pid, None);
@@ -123,7 +123,7 @@ async fn reap_now_of_an_exited_child_with_warnings_on_does_not_warn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, pid) = exited_unreaped_child();
-    let proc = ProcSource::new(child);
+    let proc = ProcSource::new(child, pid);
     let _warn = super::fault::warn_slow_teardowns();
 
     let fate = proc.reap_now(pid, None);
@@ -143,7 +143,7 @@ async fn reap_now_of_a_running_child_with_warnings_on_warns_once_naming_it() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, pid, _blocker) = blocker_child();
-    let proc = ProcSource::new(child);
+    let proc = ProcSource::new(child, pid);
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
 

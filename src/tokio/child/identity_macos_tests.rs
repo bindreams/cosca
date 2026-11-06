@@ -304,7 +304,7 @@ async fn macos_tokio_fdmarker_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_marker_root(),
-        Some(child.id()),
+        child.id(),
         "the marker's root is the verified identity"
     );
 }
@@ -364,7 +364,7 @@ async fn macos_tokio_treewalk_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_treewalk_root(),
-        Some(child.id()),
+        child.id(),
         "the walk's root is the verified identity"
     );
 }

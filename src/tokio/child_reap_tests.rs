@@ -7,23 +7,25 @@ use crate::test_groups::{tracer_group, Group};
 /// `child` as a backend, as the spawn builds it: Linux holds a pidfd the test opens itself (a raw
 /// tokio child has none), macOS the child's unique id.
 pub(in crate::tokio::child) fn proc_source(child: ::tokio::process::Child) -> ProcSource {
+    let pid = child.id().expect("tokio owns an un-reaped child");
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
-        let pid = child.id().expect("tokio owns an un-reaped child");
         let pidfd = pidfd_open(Pid::from_raw(pid as i32).expect("pid"), PidfdFlags::empty()).expect("pidfd_open");
-        ProcSource::new(child, pidfd)
+        ProcSource::new(child, pid, pidfd)
     }
     #[cfg(target_os = "macos")]
     {
-        let pid = child.id().expect("tokio owns an un-reaped child");
         ProcSource::new(
             child,
+            pid,
             crate::signal::read_identity(pid).expect("the identity is readable"),
         )
     }
     #[cfg(windows)]
-    ProcSource::new(child)
+    {
+        ProcSource::new(child, pid)
+    }
 }
 
 /// Blocks until `pid` has exited, without consuming its exit record.

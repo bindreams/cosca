@@ -131,17 +131,6 @@ fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] 
     }));
 }
 
-/// The teardown after a refused identity read, through the pidfd
-/// (`ProcSource::teardown_through_pidfd`).
-///
-/// Mutant: `teardown_through_pidfd` reaps with no warn.
-#[skuld::test]
-fn a_teardown_after_a_refused_identity_read_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeIdentity, || {
-        fault::set_force_identity_unknown(true);
-    }));
-}
-
 /// The teardown whose first kill was refused tears the child down again through its pidfd
 /// (`OwnedChild::tear_down`), whose own kill lands; its reap warns as well.
 ///

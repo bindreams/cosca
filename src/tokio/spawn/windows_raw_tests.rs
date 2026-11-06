@@ -175,6 +175,24 @@ async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
 
+/// The async twin of `a_raw_spawn_whose_identity_is_unreadable_keeps_its_child`.
+#[cfg(windows)]
+#[skuld::test]
+async fn an_async_raw_spawn_whose_identity_is_unreadable_keeps_its_child() {
+    crate::tokio::test_runtime::assert_current_thread();
+    use crate::child::spawn::fault;
+    let (mut c, _teardown) = raw_blocker();
+    fault::set_force_identity_unknown(true);
+    let spawned = c.spawn();
+    fault::set_force_identity_unknown(false);
+    let mut child = spawned.expect("an unreadable identity keeps the child");
+    assert_eq!(child.id(), None);
+    assert_eq!(child.try_wait().expect("try_wait"), None, "the child is still running");
+    child.kill().expect("a kept child is killed through its handle");
+    let status = child.wait().await.expect("a kept child is waited on");
+    assert!(!status.success(), "the kill ended the child: {status:?}");
+}
+
 /// The async twin of `a_raw_spawn_whose_attach_fails_tears_its_child_down`.
 #[cfg(windows)]
 #[skuld::test]
@@ -259,7 +277,8 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
 fn a_failed_start_kill_is_reported_as_its_win32_code() {
     use crate::tokio::spawn::windows_raw::RawAsyncChild;
     let event = crate::os_process::windows::cancel::new_cancel_event().expect("create an event");
-    let child = RawAsyncChild::new(event, crate::os_process::windows::CREATE_PROCESS_ACCESS);
+    // An event is no process, so it has no pid to name.
+    let child = RawAsyncChild::new(event, 0, crate::os_process::windows::CREATE_PROCESS_ACCESS);
     let err = child.start_kill().expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
@@ -300,6 +319,7 @@ fn start_kill_of_a_handle_without_terminate_to_an_exited_child_succeeds() {
     // SAFETY: `limited` is a fresh owned handle.
     let child = RawAsyncChild::new(
         unsafe { OwnedHandle::from_raw_handle(limited.0) },
+        std_child.id(),
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
     );
     child
@@ -338,6 +358,7 @@ fn start_kill_of_a_handle_without_terminate_to_a_live_child_is_denied() {
     // SAFETY: `limited` is a fresh owned handle.
     let child = RawAsyncChild::new(
         unsafe { OwnedHandle::from_raw_handle(limited.0) },
+        std_child.id(),
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
     );
     let result = child.start_kill();

@@ -41,9 +41,10 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 #[cfg(windows)]
 pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 
-/// The `expect` behind the two backend accessors: only `Drop` takes `proc`, and nothing runs on
-/// the handle after that, so both are infallible.
-const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
+/// The `expect` behind the backend accessors: only a teardown takes `proc` (it moves every resource
+/// out of the handle, so no handle method runs after that, and the teardown reads the pid from what
+/// it took), so they are infallible.
+const PROC_TAKEN: &str = "the async child's process backend is taken only by a teardown";
 
 /// Every field of a [`Child`] that owns an OS resource, **declared in the order they must be
 /// released**: the backend first, then the containment resource.
@@ -73,6 +74,13 @@ impl OsResources {
     /// the last reader.
     pub(crate) fn proc_mut(&mut self) -> &mut ProcSource {
         self.proc.as_mut().expect(PROC_TAKEN)
+    }
+
+    /// The child's pid, from the backend the resources still hold: how a teardown, which has taken
+    /// them from the handle, names the child.
+    #[cfg(unix)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.proc.as_ref().expect(PROC_TAKEN).pid()
     }
 
     /// Give up every resource, in declaration order, without waiting for anything.
@@ -205,7 +213,8 @@ impl Drop for Draining {
 #[derive(Debug)]
 pub struct Child {
     os: OsResources,
-    id: ProcessId,
+    /// Stable identity resolved immediately after spawn; `None` when the OS refused to report it.
+    id: Option<ProcessId>,
     kill_on_drop: bool,
     containment: Containment,
     /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
@@ -226,12 +235,16 @@ impl Child {
     // The only caller is the sibling `spawn` (and `OwnedStd` is module-scoped).
     pub(super) fn from_parts(
         proc: ProcSource,
-        id: ProcessId,
+        id: Option<ProcessId>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
         pipes: FdPipes,
         owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
+        debug_assert!(
+            id.is_none_or(|id| proc.pid() == id.pid()),
+            "a child's process and identity name one pid"
+        );
         Child {
             os: OsResources {
                 proc: Some(proc),
@@ -341,6 +354,7 @@ impl Child {
     ) -> crate::containment::DropView {
         crate::containment::DropView::read(
             caller,
+            self.pid(),
             self.id,
             || {
                 self.os
@@ -459,7 +473,7 @@ impl Child {
             .wait_warning(pid, |proc| proc.wait_and_reap_caused(pid, log::Level::Debug));
         match waited {
             Waited::Exited => {
-                let id = Some(self.id);
+                let id = self.id;
                 (self.proc_mut().collect_exit(id), None)
             }
             _ => (
@@ -469,18 +483,22 @@ impl Child {
         }
     }
 
-    /// The child's stable identity — valid after `wait`.
-    pub fn id(&self) -> ProcessId {
+    /// The child's stable identity — valid after `wait` — or `None` when the OS refused to report it
+    /// at spawn; see [`Child::id`](crate::Child::id).
+    pub fn id(&self) -> Option<ProcessId> {
         self.id
     }
 
     /// The pid the child had at spawn. A number only: it does not say the process still holds it
     /// (an identity is [`id`](Self::id)).
     pub fn pid(&self) -> u32 {
-        self.id.pid()
+        self.proc().pid()
     }
+
+    /// Whether the child is still running, read through the child's own handle, with or without an
+    /// [`id`](Self::id); see [`Child::is_alive`](crate::Child::is_alive).
     pub fn is_alive(&self) -> crate::identity::Liveness {
-        self.id.is_alive()
+        self.proc().liveness()
     }
     pub fn containment(&self) -> Containment {
         self.containment
@@ -1568,13 +1586,14 @@ impl Child {
                     signalled: Some(signalled),
                 };
                 let signalled = reaping.signalled.as_mut().expect("taken only once the reap is over");
+                // Read while the backend is still held: the release drops it.
+                let pid = signalled.os.pid();
                 if signalled.signals.settle == Settle::ReapAndDrain {
                     if let Err(e) = reap_killed_root_awaiting(self.id, &mut signalled.os, &mut signalled.signals).await
                     {
                         log::warn!(
-                            "async child {}: its exit cannot be watched ({e}); the teardown reaps it on this \
-                             thread, blocking",
-                            self.pid()
+                            "async child {pid}: its exit cannot be watched ({e}); the teardown reaps it on this \
+                             thread, blocking"
                         );
                         let signalled = reaping.signalled.take().expect("taken only here before the drop");
                         return self.settle(signalled);
@@ -1582,7 +1601,7 @@ impl Child {
                 }
                 let signalled = reaping.signalled.take().expect("taken only here before the drop");
                 let (os, fate, tree_failed) = self.report(*signalled);
-                os.release_after_drain_awaiting(self.pid(), tree_failed).await;
+                os.release_after_drain_awaiting(pid, tree_failed).await;
                 fate
             }
         }
@@ -1604,9 +1623,11 @@ impl Child {
     /// panics in it inside a `LocalSet` and offers no way to ask first.
     #[cfg(unix)]
     fn settle(&self, mut signalled: Box<Signalled>) -> crate::error::ChildFate {
-        let mut late = LateWarn::new(self.pid());
+        // Read while the backend is still held: the release drops it.
+        let pid = signalled.os.pid();
+        let mut late = LateWarn::new(pid);
         if signalled.signals.settle == Settle::ReapAndDrain {
-            reap_killed_root(self.id, &mut signalled.os, &mut signalled.signals, &mut late);
+            reap_killed_root(pid, self.id, &mut signalled.os, &mut signalled.signals, &mut late);
         }
         let (os, fate, tree_failed) = self.report(*signalled);
         os.release_after_drain(&mut late, tree_failed);
@@ -1622,20 +1643,27 @@ impl Child {
         // `os`, so a panic in the signals unwinds through the resources while still inside it.
         let bounded = crate::bounded::Section::enter();
         let mut os = std::mem::take(&mut self.os);
+        // The pid is read from the backend taken, which the release drops. A second call finds the
+        // resources already taken, and has nothing to do.
+        let Some(pid) = os.proc.as_ref().map(ProcSource::pid) else {
+            drop(bounded);
+            return Teardown::Done(ChildFate::Reaped);
+        };
         // Read before the `kill_on_drop` branch: a disarmed drop signals nothing, but releasing
         // tokio's `Child` still `try_wait`s the root's number, so it needs the same evidence.
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         // What an earlier forgetting recorded of a backend that no longer holds the child.
         #[cfg(unix)]
-        let forgotten = os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(self.id)));
+        let forgotten = os.proc.as_ref().and_then(|proc| proc.forgotten_fate(self.id));
         // A live elevation front gets no signal of its own: outside a cgroup it is left running,
         // and named in the drop's one warn. The gate comes first, so the look at the root is right
         // before the signals it decides.
         #[cfg(unix)]
-        let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, self.pid()));
+        let gate = self.kill_on_drop.then(|| kill_gate(self.front, &os, pid));
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
             caller,
+            pid,
             self.id,
             || {
                 os.proc
@@ -1644,7 +1672,7 @@ impl Child {
             },
             &self.tree_killed,
         );
-        let mut signals = DropSignals::new(ChildFate::Running { id: Some(self.id) });
+        let mut signals = DropSignals::new(ChildFate::Running { id: self.id });
         #[cfg(unix)]
         let mut front_left = None;
         if self.kill_on_drop {
@@ -1655,7 +1683,7 @@ impl Child {
                     let cgroup_front = matches!(gate, crate::elevation::front::Gate::CgroupOnly)
                         .then_some(self.front)
                         .flatten();
-                    signals = signal_on_drop(self.id, &view, cgroup_front, &mut os);
+                    signals = signal_on_drop(pid, self.id, &view, cgroup_front, &mut os);
                 }
             }
             #[cfg(not(unix))]
@@ -1675,7 +1703,7 @@ impl Child {
                     log::debug!(
                         "async child {} cannot be shown to be ours (reaped outside its handle, unknown, or unpinned); \
                          dropping it would reap by that number, so it was forgotten",
-                        self.pid()
+                        pid
                     );
                     // Reaped elsewhere before the kill could reach it; one it reached stays killed. A
                     // child not shown ours is not claimed reaped.
@@ -1685,7 +1713,7 @@ impl Child {
                 }
             }
         }
-        signals.name_refused_kill(self.id, &os);
+        signals.name_refused_kill(pid, self.id, &os);
         let signalled = Signalled {
             os,
             signals,
@@ -1909,7 +1937,13 @@ impl crate::containment::cgroup::TeardownWarn for LateWarn {
 /// once past [`LATE`], then collect it. A root the wait finds reaped elsewhere, or cannot show to be
 /// ours, is forgotten instead, for the drop's one report.
 #[cfg(unix)]
-fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSignals, late: &mut LateWarn) {
+fn reap_killed_root(
+    pid: u32,
+    id: Option<ProcessId>,
+    os: &mut OsResources,
+    signals: &mut DropSignals,
+    late: &mut LateWarn,
+) {
     let Some(proc) = os.proc.as_mut() else {
         return;
     };
@@ -1917,7 +1951,6 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
     if proc.is_reaped() {
         return;
     }
-    let pid = id.pid();
     let (waited, cause) = wait_warning(
         &mut *proc,
         late.due(),
@@ -1930,7 +1963,7 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
         |proc| proc.wait_and_reap_caused(pid, log::Level::Debug),
     );
     match waited {
-        Waited::Exited => signals.fate = proc.collect_exit(Some(id)),
+        Waited::Exited => signals.fate = proc.collect_exit(id),
         // The kill was delivered: dead or dying, and its exit not collected here.
         _ => signals.forgot = proc.forget_for_wait(waited, cause),
     }
@@ -1940,7 +1973,7 @@ fn reap_killed_root(id: ProcessId, os: &mut OsResources, signals: &mut DropSigna
 /// exit cannot be watched: nothing was done, and the caller reaps by other means.
 #[cfg(unix)]
 async fn reap_killed_root_awaiting(
-    id: ProcessId,
+    id: Option<ProcessId>,
     os: &mut OsResources,
     signals: &mut DropSignals,
 ) -> Result<(), Error> {
@@ -1952,7 +1985,7 @@ async fn reap_killed_root_awaiting(
     }
     let (waited, cause) = proc.wait_and_reap_awaiting().await?;
     match waited {
-        Waited::Exited => signals.fate = proc.collect_exit(Some(id)),
+        Waited::Exited => signals.fate = proc.collect_exit(id),
         _ => signals.forgot = proc.forget_for_wait(waited, cause),
     }
     Ok(())
@@ -2058,13 +2091,13 @@ impl DropSignals {
     /// the forget is over. Forgotten and not shown gone: nothing reaps the child. Forgotten as
     /// reaped elsewhere: it is gone. Released to tokio (never forgotten): tokio's orphan queue reaps
     /// it once it exits.
-    fn name_refused_kill(&mut self, id: ProcessId, os: &OsResources) {
+    fn name_refused_kill(&mut self, pid: u32, id: Option<ProcessId>, os: &OsResources) {
         use crate::child::owned::teardown::LEAVING_RUNNING;
         if !self.refused_kill {
             return;
         }
         #[cfg(unix)]
-        let tail = match os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(id))) {
+        let tail = match os.proc.as_ref().and_then(|proc| proc.forgotten_fate(id)) {
             Some(crate::error::ChildFate::Gone) => "; it is already gone",
             Some(_) => LEAVING_RUNNING,
             None => "; leaving it running",
@@ -2074,7 +2107,6 @@ impl DropSignals {
             _ = (os, id);
             LEAVING_RUNNING
         };
-        let pid = id.pid();
         self.left
             .push(format!("async child {pid} could not be terminated on drop{tail}"));
     }
@@ -2083,7 +2115,8 @@ impl DropSignals {
 /// The signals of a kill-on-drop drop: the tree, then the root. A failed tree kill is returned for
 /// the drop's one warn, with what became of the child.
 fn signal_on_drop(
-    id: ProcessId,
+    #[cfg(unix)] pid: u32,
+    id: Option<ProcessId>,
     #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(unix)] cgroup_front: Option<crate::elevation::front::Front>,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
@@ -2092,8 +2125,6 @@ fn signal_on_drop(
     use crate::error::ChildFate;
     #[allow(unused_mut, reason = "only the Unix signals collect anything")]
     let mut signals = DropSignals::new(ChildFate::Unknown);
-    #[cfg(unix)]
-    let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
     //
@@ -2171,7 +2202,7 @@ fn signal_on_drop(
                      once it exits"
                 ));
                 // Not shown to be dead: it may still be running.
-                signals.fate = ChildFate::Running { id: Some(id) };
+                signals.fate = ChildFate::Running { id };
             }
         }
         return signals;
@@ -2209,7 +2240,7 @@ fn signal_on_drop(
             return signals;
         }
         Ok(Sent::Unverified) => {
-            signals.fate = ChildFate::Running { id: Some(id) };
+            signals.fate = ChildFate::Running { id };
             return signals;
         }
         _ => {}
@@ -2223,14 +2254,14 @@ fn signal_on_drop(
                 signals.fate = if forgot.reaped_elsewhere() {
                     ChildFate::Gone
                 } else {
-                    ChildFate::Running { id: Some(id) }
+                    ChildFate::Running { id }
                 };
                 return signals;
             }
             // Forgotten earlier and unproven: only a Linux backend's kept pidfd is signalled, and it
             // refused. Not reaped, so the child may be running: tokio's `Child` was forgotten
             // (`ProcSource::forget_quietly`), so its orphan queue never gets it, and nothing reaps it.
-            if let Some(fate) = proc.forgotten_fate(Some(id)) {
+            if let Some(fate) = proc.forgotten_fate(id) {
                 debug_assert!(
                     matches!(fate, ChildFate::Running { .. }),
                     "only an unproven backend's signal fails"
@@ -2251,7 +2282,7 @@ fn signal_on_drop(
         // Worded by the drop (`DropSignals::name_refused_kill`), once the forget of tokio's `Child`
         // that may follow is over.
         signals.refused_kill = !matches!(looked, Ok(Some(_)));
-        signals.fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id));
+        signals.fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), id);
         return signals;
     }
     // Signalled: on Unix the drop reaps it next; Windows closes the handle.

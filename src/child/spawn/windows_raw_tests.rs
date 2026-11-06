@@ -626,6 +626,25 @@ fn a_raw_spawn_reads_the_identity_before_it_attaches() {
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
 
+/// A raw spawn whose identity read the OS refuses keeps the child, with no identity: its handle
+/// names it, so `wait` and `kill` work.
+///
+/// Mutant: the raw spawn still tears the child down and fails.
+#[skuld::test]
+fn a_raw_spawn_whose_identity_is_unreadable_keeps_its_child() {
+    use crate::child::spawn::fault;
+    let (mut c, _teardown) = raw_blocker();
+    fault::set_force_identity_unknown(true);
+    let spawned = c.spawn();
+    fault::set_force_identity_unknown(false);
+    let child = spawned.expect("an unreadable identity keeps the child");
+    assert_eq!(child.id(), None);
+    assert_eq!(child.try_wait().expect("try_wait"), None, "the child is still running");
+    child.kill().expect("a kept child is killed through its handle");
+    let status = child.wait().expect("a kept child is waited on");
+    assert!(!status.success(), "the kill ended the child: {status:?}");
+}
+
 /// A raw spawn whose attach fails kills and reaps its child, and answers the attach's error.
 ///
 /// Mutant: the raw teardown is skipped, leaving the child running; or it sends no kill (the child

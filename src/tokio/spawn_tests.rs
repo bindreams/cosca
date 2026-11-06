@@ -54,6 +54,78 @@ async fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+/// An identity the OS refuses to report does not end an uncontained async child: the spawn returns
+/// it with no identity, a pid, and a working `kill` and `wait`.
+///
+/// Mutants: the arm still tears the child down and fails the spawn; the kept child's pid is not the
+/// spawned one; its kill or wait is unusable.
+#[skuld::test]
+async fn an_unreadable_identity_keeps_the_async_child_without_one() {
+    fault::set_force_identity_unknown(true);
+    let (mut cmd, _teardown) = teardown_blocker();
+    let spawned = cmd.spawn();
+    fault::set_force_identity_unknown(false);
+
+    let mut child = spawned.expect("an unreadable identity keeps the child");
+    let Some(crate::identity::Resolved::Found(captured)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity");
+    };
+    assert_eq!(child.id(), None, "the read failed, so the child has no identity");
+    assert_eq!(child.pid(), captured.pid(), "the pid is the spawned child's");
+    assert_eq!(child.try_wait().expect("try_wait"), None, "the child is still running");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "is_alive looks through the handle"
+    );
+    child.kill().expect("a kept child is killed through its handle");
+    let status = child.wait().await.expect("a kept child is waited on");
+    assert!(!status.success(), "the kill ended the child: {status:?}");
+    assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
+}
+
+/// A kept async child with no identity is torn down by its drop like any other: killed and reaped.
+/// (Unix only: the Windows drop closes the handle after its kill and waits for nothing, so the
+/// child's end is not yet settled when it returns.)
+///
+/// Mutants: the drop of a child with no identity kills nothing; it panics for want of an identity.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_kept_async_child_without_an_identity_is_killed_and_reaped_on_drop() {
+    fault::set_force_identity_unknown(true);
+    // Its stdin stays open until the guard drops, so only the drop's kill can end the child.
+    let (mut cmd, _teardown) = teardown_blocker();
+    let spawned = cmd.spawn();
+    fault::set_force_identity_unknown(false);
+    let child = spawned.expect("an unreadable identity keeps the child");
+    assert_eq!(child.id(), None);
+    let captured = fault::take_captured().expect("the seam captured the child's identity");
+
+    drop(child);
+
+    fault::assert_child_reaped(captured);
+}
+
+/// A tree walk names its tree by the root's identity, so an identity the OS refuses to report fails
+/// the async spawn with the read's own error, and the child is killed and reaped.
+///
+/// Mutants: the spawn succeeds with a tree walk that has no root; the arm leaves the child running.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn an_unreadable_identity_fails_an_async_tree_walk_spawn_and_reaps_the_child() {
+    fault::set_force_identity_unknown(true);
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_unknown(false);
+
+    let (err, fate) = expect_may_have_started_with(err.expect("a tree walk without an identity must fail the spawn"));
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(fate, ChildFate::Reaped, "the teardown killed and reaped the child");
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
+}
+
 /// macOS: the identity failure of a session root kills and reaps the root through its unique id and
 /// sends its process group nothing, as macOS has no exact kill of a group. The teardown's one warn
 /// says the group's members may be left running.
@@ -312,50 +384,6 @@ fn setuid_blocker_with_ready() -> (Command, std::io::PipeWriter, impl FnOnce() +
         assert_eq!(byte, *b"+");
     };
     (cmd, writer, until_root)
-}
-
-/// A failed async spawn whose identity check cannot answer, of a child that refuses every kill (a
-/// setuid-root helper), is torn down through its pidfd, which refuses too: the child is left
-/// running, and the fate says so, not `Reaped`. One warn says it all, under the failed spawn's name:
-/// the forget, and that the teardown could not terminate it and left it running. The test, not a
-/// thread, reaps it.
-///
-/// CI only (the `setuid` group).
-///
-/// Mutants: the identity-unknown arm answers `Reaped`, or sends the child no kill through its pidfd
-/// and leaves it unreaped; the refused teardown's warn leaves out the clause, or is a second warn.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn an_identity_unknown_child_whose_kill_is_refused_stays_running_and_is_said_so(
-    #[fixture(setuid)] _group: &Group,
-) {
-    use crate::child::front_kill_tests::reap;
-
-    crate::tokio::test_runtime::assert_current_thread();
-    crate::log_capture::install();
-    let (mut cmd, writer, _root) = setuid_blocker_ready_before_identity();
-    fault::set_force_identity_unknown(true);
-    let mark = crate::log_capture::mark();
-
-    let err = cmd.spawn().err();
-
-    fault::set_force_identity_unknown(false);
-    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
-        panic!("the seam captured the child's pid");
-    };
-    let (_, fate) = expect_may_have_started_with(err.expect("the forced unknown identity fails the spawn"));
-    assert_eq!(fate, ChildFate::Running { id: None });
-    let warns = crate::log_capture::warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    let warn = &warns[0];
-    assert!(warn.starts_with("teardown after a failed spawn: "), "{warns:?}");
-    assert!(warn.contains("cannot be shown to be ours"), "{warns:?}");
-    assert!(warn.contains("could not be terminated"), "{warns:?}");
-    assert!(warn.contains("leaving it running"), "{warns:?}");
-    assert!(!warn.contains("reaped it"), "{warns:?}");
-    drop(writer);
-    let status = reap(id.pid()).expect("the child is still unreaped");
-    assert!(status.success(), "{status:?}");
 }
 
 /// Turn `runtime`'s driver, whose every turn reaps tokio's exited orphans, until the child

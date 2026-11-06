@@ -92,7 +92,7 @@ impl Target for cosca::Child {
 
     fn has_exited(&mut self) -> bool {
         #[cfg(unix)]
-        return has_exited_unreaped(self.id());
+        return has_exited_unreaped(self.id().expect("the spawn read the control target's identity"));
         #[cfg(windows)]
         self.try_wait()
             .expect("try_wait the control target before watching it")

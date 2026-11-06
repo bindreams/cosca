@@ -638,7 +638,7 @@ async fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_
     use crate::child::front_cgroup_tests::assert_front_refused_by_its_cgroup_kill;
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let pid = id.pid();
     let pidfd = pidfd_of(pid);
     let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {

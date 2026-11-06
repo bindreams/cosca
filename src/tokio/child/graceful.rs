@@ -102,7 +102,7 @@ impl Child {
     /// through the held handle. Non-reaping, so the pid stays pinned. A child with no handle left
     /// to watch has exited.
     async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(self.pid()), timeout).await
+        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(), timeout).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to

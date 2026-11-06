@@ -1,27 +1,23 @@
 //! The sync spawn's identity check on Linux: a peek through the child's pidfd that fails.
 
 use crate::child::spawn::fault::{self, SpawnPoint};
-use crate::error::Error;
 use crate::log_capture::warns_since;
 use crate::test_child::Console;
-use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::seams::force_peeks;
 
 /// A peek that fails cannot show the read named our child, but the pidfd pins the child whatever
-/// the peek said: the spawn fails `Unassessable`, warns once naming the error, and kills and reaps
-/// the child through the pidfd.
+/// the peek said: the spawn keeps the child with no identity, and warns once naming the error. The
+/// child is killed and waited for through its pidfd like any other.
 ///
-/// Mutants: the failed check is `Ok` (the spawn succeeds); the warn drops the error, or is never
-/// logged when the teardown has nothing to say; the teardown leaves the child alone (no reap is
-/// recorded, and the child is not killed).
+/// Mutants: the failed check is `Ok` (the child has an identity); the warn drops the error, or is
+/// never logged; the spawn fails, or kills the child.
 #[skuld::test]
-fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
+fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     crate::log_capture::install();
-    // Released after the kill: a kill that sent nothing exits 0.
-    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    let (stdin, _teardown) = fault::teardown_blocker_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
@@ -42,78 +38,25 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
 
     crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-        outcome.expect_err("a failed identity peek fails the spawn"),
-    );
+    let child = outcome.expect("a failed identity peek keeps the child");
     assert_eq!(
-        fate,
-        crate::error::ChildFate::Reaped,
-        "the pidfd pins the child, so it is reaped"
+        child.id(),
+        None,
+        "the read could not be checked, so the child has no identity"
     );
-    assert!(
-        matches!(err, Error::Unassessable { .. }),
-        "a failed peek is Unassessable, not a vanish: {err:?}"
-    );
-    // The teardown has nothing to warn of, so the diagnosis is logged on its own: one warn.
+    assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
+    // The failed check is the event's one warn, logged when the spawn ends.
     let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("could not be checked against its handle (forced identity-check failure 3b7e)"),
         "the failed peek is warned, naming its own error: {warns:?}"
     );
-    let recorded = teardown.recorded();
+    child.kill().expect("a kept child is killed through its pidfd");
+    let status = child.wait().expect("a kept child is waited on");
     assert_eq!(
-        recorded.len(),
-        1,
-        "the teardown must have reaped the child: {recorded:?}"
-    );
-    assert_eq!(recorded[0].0, pid.get(), "the teardown reaped another process");
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&recorded[0].1),
+        std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGKILL),
-        "the teardown must have killed the child through its pidfd"
+        "the kill ended the child"
     );
-}
-
-/// A failed identity check and the teardown it leads to are one event, so they share one `warn`.
-/// Here the teardown's kill is refused (`EPERM`, as a setuid child answers), which it warns of: that
-/// warn carries the diagnosis, and the check does not warn on its own. The child is handed back.
-///
-/// Mutants: the check warns at the call (two warns); the teardown's warn drops the diagnosis.
-#[skuld::test]
-fn a_failed_identity_peek_and_a_refused_kill_share_one_warn(#[fixture(setuid)] _group: &Group) {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    crate::log_capture::install();
-    let (mut cmd, writer, until_root) = crate::test_privilege::setuid_blocker_for_a_failing_spawn();
-    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
-    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let armed = Rc::clone(&armed);
-        move || {
-            // The kill is refused only once the helper is fully root.
-            until_root();
-            *armed.borrow_mut() = Some(Box::new(force_peeks([Err(std::io::Error::other(
-                "forced identity-check failure 6c1d",
-            ))])));
-        }
-    });
-    let mark = crate::log_capture::mark();
-
-    let outcome = cmd.spawn();
-
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
-    drop(armed);
-    let (err, _fate, handed_back) =
-        crate::test_child::expect_handed_back(outcome.expect_err("a failed identity peek fails the spawn"), writer);
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    let warns = warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 6c1d)")
-            && warns[0].contains("could not be terminated"),
-        "the one warn names the failed check and the refused kill: {warns:?}"
-    );
-    let status = handed_back.wait();
-    assert!(status.success(), "the helper exits on EOF: {status:?}");
 }

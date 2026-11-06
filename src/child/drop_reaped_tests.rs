@@ -691,7 +691,7 @@ fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
     let blocker = release_between_kill_and_wait(stdin);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -719,7 +719,7 @@ fn a_drop_whose_walk_leaves_only_the_root_warns_it_could_not_vouch_for_the_tree(
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
     let blocker = release_between_kill_and_wait(stdin);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let mark = crate::log_capture::mark();
     drop(child);
 
@@ -977,6 +977,28 @@ fn a_root_is_reaped_by_its_own_reap_or_by_its_number_reading_gone_or_different()
         (false, Resolved::Gone, true),
         (false, Resolved::Unknown, false),
     ] {
-        assert_eq!(super::root_reaped(own, id, now), reaped, "own {own}, now {now:?}");
+        assert_eq!(super::root_reaped(own, Some(id), now), reaped, "own {own}, now {now:?}");
+    }
+}
+
+/// A root with no identity has nothing its number can be compared with: the number shows it reaped
+/// only by naming no process, and the handle decides otherwise.
+///
+/// Mutants: a number that names a process reads as another process; a number that names none reads
+/// as reaped no more.
+#[skuld::test]
+fn a_root_with_no_identity_is_reaped_by_its_own_reap_or_a_number_naming_no_process() {
+    use crate::identity::{ProcessId, Resolved};
+
+    let other = ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(7));
+    for (own, now, reaped) in [
+        (true, Resolved::Found(other), true),
+        (true, Resolved::Gone, true),
+        (true, Resolved::Unknown, true),
+        (false, Resolved::Found(other), false),
+        (false, Resolved::Gone, true),
+        (false, Resolved::Unknown, false),
+    ] {
+        assert_eq!(super::root_reaped(own, None, now), reaped, "own {own}, now {now:?}");
     }
 }

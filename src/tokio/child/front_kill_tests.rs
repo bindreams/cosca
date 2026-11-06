@@ -134,7 +134,7 @@ async fn kill_of_a_live_doas_front_is_unkillable_and_sends_nothing() {
 #[skuld::test]
 async fn a_failed_password_write_leaves_a_live_front_running_and_names_it() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let (_err, fate) = crate::tokio::spawn::finish_elevated(
         child,
         Err(crate::error::Error::Elevation {
@@ -186,7 +186,7 @@ async fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
     for cmd in uncontained_cats() {
         let roots = drop_fault::record();
         let (child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let pid = id.pid();
         let (detail, fate) = failed_password_write_detail(child);
         assert_eq!(fate, ChildFate::Running { id: Some(id) }, "a live front is left");
@@ -319,7 +319,7 @@ async fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
     let (child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let pid = id.pid();
     let (err, fate) = crate::tokio::spawn::finish_elevated(
         child,
@@ -577,13 +577,13 @@ async fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
     assert_unadopted_front_noted(&err, pid);
 }
 
-/// Async twin of the sync `macos_a_front_whose_identity_is_refused_is_left_and_noted`.
+/// Async twin of the sync `macos_a_contained_front_whose_identity_is_refused_is_left_and_noted`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
+async fn macos_a_contained_front_whose_identity_is_refused_is_left_and_noted() {
     use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_spawn, refuse_the_identity};
     let (err, id, fate) = fail_a_front_spawn(
-        |_| {},
+        |cmd| _ = cmd.contain(),
         refuse_the_identity,
         |cmd| crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into),
     );

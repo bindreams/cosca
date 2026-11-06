@@ -100,26 +100,75 @@ fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
-/// An identity the OS refuses to report fails the spawn as `Unassessable`, and the child is still
-/// killed and reaped: a refusal says nothing against the child.
+/// A tree walk names its tree by the root's identity, so an identity the OS refuses to report fails
+/// the spawn with the read's own error (`Unassessable`: the refusal has no better cause), and the
+/// child is killed and reaped: a refusal says nothing against the child.
 ///
-/// Mutant: the arm leaves the child running.
-#[cfg(target_os = "linux")]
+/// Mutants: the spawn succeeds with a tree walk that has no root; the arm leaves the child running.
+#[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn identity_refusal_reaps_the_spawned_child() {
+fn an_unreadable_identity_fails_a_tree_walk_spawn_and_reaps_the_child() {
     let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
     fault::set_force_identity_unknown(true);
     let err = cmd.spawn().err();
     fault::set_force_identity_unknown(false);
 
-    let (err, fate) = expect_may_have_started_with(err.expect("a refused identity read must make spawn return Err"));
+    let (err, fate) = expect_may_have_started_with(err.expect("a tree walk without an identity must fail the spawn"));
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
         fate,
         ChildFate::Reaped,
-        "the pidfd pins the child, so the teardown reaps it"
+        "the handle pins the child, so the teardown reaps it"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
+}
+
+/// An identity the OS refuses to report does not end an uncontained child: the spawn returns it
+/// with no identity, a pid, and a working `wait` and `kill`.
+///
+/// Mutants: the arm still tears the child down and fails the spawn; the kept child's pid is not the
+/// spawned one; its kill or wait is unusable.
+#[skuld::test]
+fn an_unreadable_identity_keeps_the_child_without_one() {
+    let (mut cmd, _teardown) = teardown_blocker();
+    fault::set_force_identity_unknown(true);
+    let spawned = cmd.spawn();
+    fault::set_force_identity_unknown(false);
+
+    let child = spawned.expect("an unreadable identity keeps the child");
+    let Some(crate::identity::Resolved::Found(captured)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity");
+    };
+    assert_eq!(child.id(), None, "the read failed, so the child has no identity");
+    assert_eq!(child.pid(), captured.pid(), "the pid is the spawned child's");
+    assert_eq!(child.try_wait().expect("try_wait"), None, "the child is still running");
+    assert_eq!(
+        child.is_alive(),
+        crate::identity::Liveness::Alive,
+        "is_alive looks through the handle"
+    );
+    child.kill().expect("a kept child is killed through its handle");
+    let status = child.wait().expect("a kept child is waited on");
+    assert!(!status.success(), "the kill ended the child: {status:?}");
+    assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
+}
+
+/// A kept child with no identity is torn down by its drop like any other: killed and reaped.
+///
+/// Mutants: the drop of a child with no identity kills nothing; it panics for want of an identity.
+#[skuld::test]
+fn a_kept_child_without_an_identity_is_killed_and_reaped_on_drop() {
+    let (mut cmd, teardown) = teardown_blocker();
+    fault::set_force_identity_unknown(true);
+    let spawned = cmd.spawn();
+    fault::set_force_identity_unknown(false);
+    let child = spawned.expect("an unreadable identity keeps the child");
+    assert_eq!(child.id(), None);
+
+    drop(child);
+
     teardown.assert_killed();
 }
 
@@ -760,7 +809,8 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
             ),
         ];
         for (answer, fate, said) in rows {
-            let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &Settlement::new(answer, true));
+            let (note, torn) =
+                super::root_after_a_delivered_kill(42, Some(id), exited_front, &Settlement::new(answer, true));
             assert_eq!(Some(&note), said.as_ref(), "{exited_front}");
             assert_eq!(
                 said_of(&torn),
@@ -775,7 +825,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         }
 
         let elsewhere = Settlement::new(Ok(ChildWaitOutcome::Foreign(Foreign::Gone)), true);
-        let (note, torn) = super::root_after_a_delivered_kill(42, id, exited_front, &elsewhere);
+        let (note, torn) = super::root_after_a_delivered_kill(42, Some(id), exited_front, &elsewhere);
         assert_eq!(note, format!("{who}: reaped by someone else"));
         assert_eq!(
             said_of(&torn),
@@ -1130,17 +1180,6 @@ fn macos_identity_gone_closes_our_pipe_ends() {
     );
 }
 
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn macos_identity_unknown_closes_our_pipe_ends() {
-    macos_failed_spawn_closes_our_pipe_ends(
-        || fault::set_force_identity_unknown(true),
-        || fault::set_force_identity_unknown(false),
-        false,
-        ChildFate::Running { id: None },
-    );
-}
-
 /// As above for the attach arm (which only a seam makes a macOS spawn take): the teardown kills the
 /// child through its verified id and drops it, which closes our ends of its pipes.
 ///
@@ -1319,28 +1358,6 @@ fn macos_identity_gone_forgets_the_child_and_signals_nothing() {
     assert!(matches!(err, Error::Io(_)), "{err:?}");
     assert_eq!(fate, ChildFate::Gone, "the check found it reaped by someone else");
     assert_left_alone(mark, "was reaped by someone else", &left);
-}
-
-/// macOS: an identity that cannot be read (`Unknown`) fails the spawn as `Unassessable` and leaves
-/// the child running and unreaped, with a warning naming it.
-///
-/// Mutant: the arm tears the child down by pid.
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn macos_identity_unknown_leaves_the_child_alone() {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let mut cmd = blocker();
-    fault::set_force_identity_unknown(true);
-    let err = cmd.spawn().err();
-    fault::set_force_identity_unknown(false);
-    let left = captured_child();
-
-    let (err, fate) = expect_may_have_started_with(err.expect("a refused identity fails the spawn"));
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    // Its identity is what could not be read.
-    assert_eq!(fate, ChildFate::Running { id: None }, "left running, unreaped");
-    assert_left_alone(mark, "cannot be shown to be ours", &left);
 }
 
 /// The spawn pid is readable only inside a hook: a stale one from an earlier spawn must not answer.
