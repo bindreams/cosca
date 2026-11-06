@@ -49,9 +49,6 @@ pub(crate) trait Waitable {
     type Output;
     /// Done, or what to wait on. The [`WaitFor`] borrows `self` until the loop has waited on it.
     fn look(&mut self) -> Result<Step<'_, Self::Output>, Error>;
-    /// Called for [`Step::Recheck`], with the next step of the backoff, already cut to the time
-    /// remaining.
-    fn pause(&mut self, d: Duration);
     /// Called when the block a [`Step::Wait`] asked for fails with `e`. The default ends the loop
     /// with `e`; a `Waitable` that can still decide by looking again returns `Ok`, and `run` looks.
     fn block_failed(&mut self, e: Error) -> Result<(), Error> {
@@ -64,7 +61,8 @@ pub(crate) enum Step<'a, T> {
     Done(T),
     Wait(WaitFor<'a>),
     /// Nothing will signal the change (a tracer holds the zombie, or the OS is still finishing the
-    /// exit): look again after a [`Waitable::pause`].
+    /// exit): the driver pauses, then looks again. A `Waitable` that holds a lock gives it up before
+    /// it returns this, as it does before [`Step::Wait`].
     Recheck,
 }
 
@@ -96,6 +94,16 @@ fn backoff() -> ExponentialBackoff {
 /// every block. A failed block goes to [`Waitable::block_failed`], which ends the loop with the error
 /// unless it is survived.
 pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
+    run_with(w, deadline, pause)
+}
+
+/// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the step already cut to
+/// the time remaining, and returns once it has passed.
+fn run_with<W: Waitable>(
+    w: &mut W,
+    deadline: Option<Instant>,
+    mut pause: impl FnMut(Duration),
+) -> Result<RunOutcome<W::Output>, Error> {
     let mut steps = backoff();
     loop {
         let final_look = remaining(deadline) == Some(Duration::ZERO);
@@ -115,11 +123,23 @@ pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<R
                 let left = remaining(deadline);
                 if left != Some(Duration::ZERO) {
                     let step = steps.next().expect("a backoff without a cap never ends");
-                    w.pause(left.map_or(step, |left| step.min(left)));
+                    pause(left.map_or(step, |left| step.min(left)));
                 }
             }
         }
     }
+}
+
+/// [`run`]'s pause. Nothing wakes it early, so a `Waitable` that others must reach during the pause
+/// holds no lock across it.
+fn pause(d: Duration) {
+    #[cfg(test)]
+    crate::wait::block_probe::record_pause(d);
+    #[cfg(test)]
+    let started = Instant::now();
+    std::thread::sleep(d);
+    #[cfg(test)]
+    crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
 }
 
 /// An open process's exit, as a [`Waitable`]: `look` is [`OsProcess::exited`].
@@ -133,10 +153,6 @@ impl Waitable for ProcessExit<'_> {
             Exit::Exited => Step::Done(()),
             Exit::Running(wait_for) => Step::Wait(wait_for),
         })
-    }
-
-    fn pause(&mut self, _d: Duration) {
-        debug_assert!(false, "OsProcess::exited never asks for a recheck");
     }
 }
 
