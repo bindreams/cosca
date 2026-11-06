@@ -108,7 +108,7 @@ impl Prepared {
 
     /// [`group_is_containment`](Self::group_is_containment) for a spawn with no cgroup leaf, which
     /// needs no verdict: a tokio spawn that fails after its fork has no handle on its child to take
-    /// one through. With a leaf the leaf's abandonment decides (see `end_child`).
+    /// one through. With a leaf the leaf's abandonment decides (see `kill_group_outside_leaf`).
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn leafless_group_is_containment(&self) -> bool {
         self.cgroup_leaf.is_none() && self.group_is_containment()
@@ -133,9 +133,8 @@ impl Prepared {
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
     /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
-    /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the
-    /// pidfd its handshake left for a child the leaf cannot name, with what the handshake expects
-    /// of a teardown through it.
+    /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `child` is the pidfd its
+    /// handshake left for the leaf, with what the handshake expects of a teardown through it.
     ///
     /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
@@ -148,7 +147,7 @@ impl Prepared {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        #[cfg(target_os = "linux")] handshake: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Past)>,
+        #[cfg(target_os = "linux")] child: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Past)>,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
@@ -157,10 +156,9 @@ impl Prepared {
             let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
             #[cfg(not(feature = "tokio"))]
             let mut warn = crate::containment::cgroup::NoWarn;
-            return match leaf.abandon_before_verdict(front, handshake, &mut warn) {
-                Abandoned::Ended => AbandonedChild::Ended,
+            return match leaf.abandon_before_verdict(front, child, &mut warn) {
+                Abandoned::Ended(fate) => AbandonedChild::Ended(fate),
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
-                Abandoned::OutOfReach(why) => AbandonedChild::OutOfReach(why),
                 Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
@@ -202,18 +200,16 @@ impl Drop for Prepared {
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AbandonedChild {
-    /// Nothing of it runs, and it is reaped or will be.
-    Ended,
+    /// Nothing of it runs, and it is reaped or will be: its teardown collected it, or it was given
+    /// no child. Says what became of it.
+    Ended(crate::error::ChildFate),
     /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
-    /// It may be running where nothing can reach it: its leaf does not hold it, and it sent no
-    /// handle on itself or refused its kill, as the text says.
-    OutOfReach(String),
-    /// It never named itself, and the handshake's pidfd reached it, but its teardown left it
-    /// uncollected. Carries the teardown's clause, for the one warn, and what its warn asserts. Only
-    /// a Linux leaf produces it.
+    /// The handshake's pidfd reached it, but its teardown left it uncollected. Carries the
+    /// teardown's clause, for the one warn, and what its warn asserts. Only a Linux leaf produces
+    /// it.
     Uncollected(crate::child::owned::teardown::Left),
     /// It is an elevation front, which was sent no signal of its own, and this is what became of
     /// it.

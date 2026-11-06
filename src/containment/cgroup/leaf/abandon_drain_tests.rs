@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use super::leaf_tests::spawn_placing;
 use super::CgroupLeaf;
+use crate::child::owned::teardown::Past;
 use crate::containment::cgroup::fault;
-use crate::containment::cgroup::test_support::FakeLeaf;
+use crate::containment::cgroup::test_support::{pidfd_of, FakeLeaf};
 use crate::containment::Prepared;
 
 const DRAIN_WARN: &str = "still waiting for it to drain";
@@ -28,13 +29,14 @@ fn drain_warns_at_release(name: &str, child_argv: &[&str], front: bool) -> (Opti
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&path, &events));
     let leaf = CgroupLeaf::for_test_at(fake.leaf.clone());
     // Placed through `/dev/null`: the child reports `Placed`, so the leaf is entered.
-    let _child = spawn_placing(
+    let child = spawn_placing(
         &leaf,
         child_argv,
         false,
         std::process::Stdio::piped(),
         std::process::Stdio::null(),
     );
+    let pidfd = pidfd_of(child.id());
     let mark = crate::log_capture::mark();
     let warns_at_release = Rc::new(Cell::new(None));
     let _after_warn = fault::set_after_drain_warn({
@@ -60,7 +62,7 @@ fn drain_warns_at_release(name: &str, child_argv: &[&str], front: bool) -> (Opti
         cgroup_leaf: Some(leaf),
         teardown_warn_after: Some(Duration::ZERO),
     };
-    prepared.abandon_before_verdict(front, None);
+    prepared.abandon_before_verdict(front, Some((pidfd, Past::Clean)));
 
     fault::take_rmdir_hook();
     assert!(!fake.leaf.exists(), "the drained leaf is removed");
@@ -70,8 +72,8 @@ fn drain_warns_at_release(name: &str, child_argv: &[&str], front: bool) -> (Opti
     )
 }
 
-/// A child that named itself and entered its leaf: killed through its handle, then the leaf is
-/// killed through and drained.
+/// A child that named itself and entered its leaf: the leaf is killed through, the child is torn
+/// down through its handle, and the leaf is drained.
 ///
 /// Mutants: `abandon_before_verdict` hands `remove_killing_through` a `NoWarn`; the `Prepared` hands
 /// the leaf no threshold.

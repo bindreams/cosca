@@ -2619,36 +2619,6 @@ pub(crate) mod fault {
 
     use crate::identity::ProcessId;
 
-    thread_local! {
-        #[cfg(target_os = "linux")]
-        static FRONTS_SEEN_RUNNING: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// While the guard lives, a leaf's abandonment on this thread finds every elevation front still
-    /// running, as it finds one its leaf's kill reached but that has not exited yet: in the kernel a
-    /// task leaves its cgroup, which ends the leaf's drain, before its parent can collect it.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn see_fronts_running() -> SeeFrontsRunning {
-        FRONTS_SEEN_RUNNING.with(|f| f.set(true));
-        SeeFrontsRunning(())
-    }
-
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    #[must_use = "fronts are seen as they are again as soon as the guard is dropped"]
-    pub(crate) struct SeeFrontsRunning(());
-
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    impl Drop for SeeFrontsRunning {
-        fn drop(&mut self) {
-            FRONTS_SEEN_RUNNING.with(|f| f.set(false));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fronts_seen_running() -> bool {
-        FRONTS_SEEN_RUNNING.with(Cell::get)
-    }
-
     /// A seam's hook, run with the child's pid.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     type PidHook = Box<dyn FnOnce(u32)>;
@@ -2677,8 +2647,6 @@ pub(crate) mod fault {
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
             const { std::cell::RefCell::new(None) };
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(feature = "tokio")]
         static FAIL_TOKIO_SPAWN: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -2689,14 +2657,6 @@ pub(crate) mod fault {
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
-    /// (stdio registration, its pidfd reaper, its signal driver): the child is dropped neither
-    /// killed nor reaped, and the error returns while `Prepared` — with any cgroup leaf — drops.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn set_force_post_fork_failure(on: bool) {
-        FORCE_POST_FORK_FAIL.with(|f| f.set(on));
     }
 
     /// The pid of the child the last forced post-fork failure dropped. It is still this
@@ -2803,32 +2763,6 @@ pub(crate) mod fault {
         let pid = child.id().expect("an unreaped child has its pid");
         std::mem::forget(child);
         pid
-    }
-
-    /// Fails the NEXT tokio spawn on this thread after the handshake concluded, forgetting its child
-    /// as [`fail_tokio_spawn_after_fork`] does. That answer is the seam's own, not production's: a
-    /// test through it checks the leaf and the warnings, never the answer (use
-    /// [`fail_tokio_spawns_after_fork`] for that).
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn post_fork_failure(
-        spawned: Result<::tokio::process::Child, super::SpawnFailure>,
-        leaf: Option<&std::path::Path>,
-    ) -> Result<::tokio::process::Child, super::SpawnFailure> {
-        if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
-            return spawned;
-        }
-        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
-        let child = spawned?;
-        let pid = forget_child(child);
-        // Its pid names this spawn's failure, so a test can tell its log records from any other's.
-        // It models tokio failing after std's spawn succeeded: after `exec`.
-        Err(super::SpawnFailure::started(
-            crate::error::Error::Io(std::io::Error::other(format!(
-                "forced post-fork spawn failure (test seam) for child {pid}"
-            ))),
-            crate::error::ChildFate::Unknown,
-            None,
-        ))
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {

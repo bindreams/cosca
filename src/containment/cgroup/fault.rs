@@ -5,28 +5,15 @@ use super::dir::WalkStep;
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
-    static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static BEFORE_FRONT_PROBE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static BEFORE_HANDLE_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_TERMINATE_PIN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static CHILD_SENDS: std::cell::RefCell<Vec<ChildSend>> = const { std::cell::RefCell::new(Vec::new()) };
-    static FORCE_GROUP_KILL_GONE: Cell<bool> = const { Cell::new(false) };
     static MEMBER_TERMS: std::cell::RefCell<Vec<MemberTerm>> = const { std::cell::RefCell::new(Vec::new()) };
-    static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
-    static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
-    static FORCE_GROUP_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
-    static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static ON_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_STATE_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WAITED_PIDFD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
-    static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static REAPED_ORPHANS: std::cell::RefCell<Vec<(u32, Option<i32>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
@@ -661,15 +648,6 @@ pub(crate) fn occupy_before_unwind_armed() -> bool {
     FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.get())
 }
 
-/// Every child a leaf dropped before its verdict reaped on this thread, with the signal that
-/// killed it, since the last call — taken, so each test sees only its own.
-pub(crate) fn take_reaped_orphans() -> Vec<(u32, Option<i32>)> {
-    REAPED_ORPHANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
-}
-pub(crate) fn record_reaped_orphan(pid: u32, signal: Option<i32>) {
-    REAPED_ORPHANS.with(|r| r.borrow_mut().push((pid, signal)));
-}
-
 /// Have the NEXT report wait on this thread signal `notify` just before it blocks — the one
 /// point a test can know the wait began before the report existed.
 pub(crate) fn set_wait_polling_notifier(notify: std::sync::mpsc::Sender<()>) {
@@ -696,15 +674,6 @@ pub(crate) fn waited_pidfd() -> Option<std::os::fd::RawFd> {
     WAITED_PIDFD.with(|p| p.get())
 }
 
-/// Have the NEXT intent sent on this thread — or in a child forked from it, which inherits the
-/// flag — go without a pidfd, as when `pidfd_open` is denied in the child.
-pub(crate) fn set_force_child_pidfd_failure(on: bool) {
-    FORCE_CHILD_PIDFD_FAILURE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_child_pidfd_failure() -> bool {
-    FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
-}
-
 /// Run `hook` in the NEXT abandonment on this thread, after it has read what the child sent and
 /// before it closes the channel — the window a send must not slip through unread.
 pub(crate) fn set_after_shut_read(hook: impl FnOnce() + 'static) {
@@ -714,89 +683,6 @@ pub(crate) fn run_after_shut_read() {
     if let Some(hook) = AFTER_SHUT_READ.with(|h| h.borrow_mut().take()) {
         hook();
     }
-}
-
-/// Answer the NEXT abandoned child's kill through its handle with `EPERM` in place of the syscall,
-/// as a child that exec'd a setuid program denies an unprivileged supervisor — which a root test
-/// lane cannot reproduce for real. `end_child` never sees the flag: a send it makes by any other
-/// path is real. [`set_force_group_kill_denied`] does the same for its group kill.
-pub(crate) fn set_force_child_kill_denied(on: bool) {
-    FORCE_CHILD_KILL_DENIED.with(|f| f.set(on));
-}
-pub(crate) fn take_force_child_kill_denied() -> bool {
-    FORCE_CHILD_KILL_DENIED.with(|f| f.replace(false))
-}
-
-/// Have the NEXT background reap started on this thread report on `notify` once it has reaped.
-pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<()>) {
-    BACKGROUND_REAP_NOTIFY.with(|n| *n.borrow_mut() = Some(notify));
-}
-pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<()>> {
-    BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
-}
-
-/// Hold the NEXT placement hook run by a child forked from this thread — which inherits the flag —
-/// until a byte arrives on `gate`, so a test can order the child's hook after the parent's act.
-#[cfg(feature = "tokio")]
-pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
-    HOOK_GATE.with(|g| g.set(Some(gate)));
-}
-pub(crate) fn take_hook_gate() -> Option<std::os::fd::RawFd> {
-    HOOK_GATE.with(|g| g.take())
-}
-
-/// Have the NEXT intent sent on this thread — or in a child forked from it — go without its
-/// `/proc/self` directory, as when `/proc` is not mounted.
-pub(crate) fn set_force_child_proc_dir_failure(on: bool) {
-    FORCE_CHILD_PROC_DIR_FAILURE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_child_proc_dir_failure() -> bool {
-    FORCE_CHILD_PROC_DIR_FAILURE.with(|f| f.replace(false))
-}
-
-/// Run `hook` in the NEXT abandonment on this thread, between the check that its child is
-/// unreaped and the kill.
-pub(crate) fn set_between_check_and_kill(hook: impl FnOnce() + 'static) {
-    BETWEEN_CHECK_AND_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-}
-pub(crate) fn run_between_check_and_kill() {
-    if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
-}
-
-/// Run `hook` in the NEXT abandonment on this thread, after any group kill and right before the
-/// kill through the child's handle.
-pub(crate) fn set_before_handle_kill(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&BEFORE_HANDLE_KILL, hook)
-}
-pub(crate) fn run_before_handle_kill() {
-    crate::oneshot_hook::fire(&BEFORE_HANDLE_KILL);
-}
-
-/// Run `hook` in the NEXT abandonment on this thread, after the child has been signalled (an
-/// elevation front: after its leaf's kill reached it) and right before the wait for its exit. A
-/// test whose child blocks on a stdin it
-/// holds releases it here: a real kill has already landed, so the release changes nothing, while
-/// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
-/// at once instead of waiting out the child.
-pub(crate) fn set_before_exit_wait(hook: impl FnOnce() + 'static) -> BeforeExitWaitGuard {
-    crate::oneshot_hook::arm(&BEFORE_EXIT_WAIT, hook)
-}
-pub(crate) type BeforeExitWaitGuard = crate::oneshot_hook::Armed;
-/// Fire the [`set_before_exit_wait`] hook now, if it has not fired. A test calls this after the
-/// code under test returns, so a return before the fire point still releases its fixture.
-pub(crate) fn run_before_exit_wait() {
-    crate::oneshot_hook::fire(&BEFORE_EXIT_WAIT);
-}
-
-/// Run `hook` in the NEXT abandonment of an elevation front on this thread, after it was seen
-/// unreaped and placed, right before the probe for its exit.
-pub(crate) fn set_before_front_probe(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&BEFORE_FRONT_PROBE, hook)
-}
-pub(crate) fn run_before_front_probe() {
-    crate::oneshot_hook::fire(&BEFORE_FRONT_PROBE);
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if
@@ -883,51 +769,6 @@ pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) -> Fo
 }
 pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::RawFd> {
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())
-}
-
-/// A signal `end_child` sent an abandoned spawn's child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildSend {
-    /// Through its pidfd or `/proc` directory.
-    Handle,
-    /// To the process group it leads, by number.
-    Group,
-}
-/// Note a signal `end_child` sent on this thread.
-pub(crate) fn record_child_send(send: ChildSend) {
-    CHILD_SENDS.with(|s| s.borrow_mut().push(send));
-}
-/// The signals `end_child` sent on this thread since the last call, in order.
-pub(crate) fn take_child_sends() -> Vec<ChildSend> {
-    CHILD_SENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-/// Answer the NEXT abandoned child's group kill with `EPERM` in place of the syscall (see
-/// [`set_force_child_kill_denied`]).
-pub(crate) fn set_force_group_kill_denied(on: bool) {
-    FORCE_GROUP_KILL_DENIED.with(|f| f.set(on));
-}
-pub(crate) fn take_force_group_kill_denied() -> bool {
-    FORCE_GROUP_KILL_DENIED.with(|f| f.replace(false))
-}
-
-/// While the guard lives, answer the NEXT abandoned child's group kill with `ESRCH`, as for a group
-/// with no member left.
-pub(crate) fn force_group_kill_gone() -> GroupKillGone {
-    FORCE_GROUP_KILL_GONE.with(|f| f.set(true));
-    GroupKillGone(())
-}
-
-#[must_use = "the group kill is made again as soon as the guard is dropped"]
-pub(crate) struct GroupKillGone(());
-
-impl Drop for GroupKillGone {
-    fn drop(&mut self) {
-        FORCE_GROUP_KILL_GONE.with(|f| f.set(false));
-    }
-}
-pub(crate) fn take_force_group_kill_gone() -> bool {
-    FORCE_GROUP_KILL_GONE.with(|f| f.replace(false))
 }
 
 /// Run `hook` in the NEXT `CgroupLeaf::terminate` on this thread, once it has read `cgroup.procs`

@@ -29,11 +29,12 @@
 //! Every decision about a leaf rests on these rules. `take_placement`,
 //! `abandon_before_verdict` and `Drop` each apply them; none has a rule of its own.
 //!
-//! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying a pidfd for
-//! itself when it can open one, before it touches the leaf; then, after its `cgroup.procs` write,
-//! its *report* — `Placed` or the write's errno. It sends nothing else, and nothing after `exec`.
-//! The pidfd is the leaf's one source of truth about which process is its child: unlike a pid, it
-//! cannot come to name another process, whoever reaps the child.
+//! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying its pid,
+//! before it touches the leaf; then, after its `cgroup.procs` write, its *report* — `Placed` or
+//! the write's errno. It sends nothing else, and nothing after `exec`. The child's handle is the
+//! pidfd the spawn handshake holds for it, which the abandonment is given: unlike a pid, it
+//! cannot come to name another process, whoever reaps the child. A child that sent an intent has
+//! its pidfd in the parent, because the handshake's go-ahead comes only once the parent holds it.
 //!
 //! **One verdict.** The parent ends the exchange exactly once, by one of two acts:
 //! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit; then it
@@ -61,19 +62,16 @@
 //! itself, through its pidfd, whatever the leaf's kill returned — it may have left the leaf, or
 //! never entered it — and, when it exec'd outside the leaf, as the process group it leads. An
 //! elevation front is sent nothing: an exited one is reaped, and one its leaf's kill reached is
-//! waited for (see `end_front`).
+//! waited for (see `abandon_front`).
 //!
 //! **Ownership.** The child is this process's own, but another reaper in the process may reap it
 //! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by
 //! number. It leads its own process group (`process_group(0)`), and anything it forks after `exec`
 //! starts in that group. A process group's id cannot name another group while its leader is
 //! unreaped. cosca reaps a child only when no handle owns it — an abandoned spawn whose runtime
-//! dropped it — and, but for an elevation front, only after signalling it directly. It waits
-//! through the child's pidfd, or, for a child that sent only its `/proc` directory, by its pid once
-//! that directory shows it unreaped: a reap by another reaper after that look is not seen, and the
-//! wait may then collect another child of this process that took the number. For a front the look
-//! and that wait follow one another directly; for a child, `end_child`'s kills come between them,
-//! and a child left to the background reaper is waited for by its pid later.
+//! dropped it — and, but for an elevation front, only after signalling it directly. It does so
+//! through an [`OwnedChild`](crate::child::owned::OwnedChild) over the child's pidfd, never by
+//! its pid.
 
 #[path = "cgroup/parse.rs"]
 mod parse;

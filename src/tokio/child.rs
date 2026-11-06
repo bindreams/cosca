@@ -23,8 +23,6 @@ use std::process::ExitStatus;
 
 #[cfg(unix)]
 use crate::child::ParentEnd;
-#[cfg(target_os = "linux")]
-use crate::containment::cgroup::Waiting;
 use crate::containment::dispatch::{SweepFailure, TeardownCaller, TreeKillOutcome};
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
@@ -1892,14 +1890,11 @@ impl crate::containment::cgroup::TeardownWarn for LateWarn {
         LateWarn::due(self)
     }
 
-    fn warn(&mut self, waiting: Waiting<'_>) {
-        match waiting {
-            Waiting::Drain(leaf) => LateWarn::warn(
-                self,
-                &format!("has a cgroup leaf {} that has not drained", leaf.display()),
-            ),
-            Waiting::Child(_) => LateWarn::warn(self, "has not been reaped"),
-        }
+    fn warn(&mut self, leaf: &std::path::Path) {
+        LateWarn::warn(
+            self,
+            &format!("has a cgroup leaf {} that has not drained", leaf.display()),
+        );
     }
 }
 

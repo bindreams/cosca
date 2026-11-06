@@ -41,10 +41,10 @@ past 1 s, as the drop's does, each naming what it waits for:
   [`reap_unreported`](../src/tokio/child/proc_source.rs));
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
-  leaf's abandonment: `end_child` for a child that named itself, and the pidfd teardown of one that
-  never did (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  leaf's abandonment, which tears the child down through the pidfd the handshake left it
+  (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
-  exists and in the leaf's abandonment (`end_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  exists and in the leaf's abandonment (`abandon_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
   cleanup, and in the leaf's abandonment (`abandon_before_verdict` and `abandon_front` in
   [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
@@ -138,8 +138,7 @@ Windows, only while a handle to the process is open. Signal and wait through a h
 process:
 
 - on Linux, a `pidfd` opened while the child is provably ours, or the child's own pidfd from before
-  `exec`. A failed spawn's warn opens one by number for a child that sent only its `/proc`
-  directory, and keeps it only if that directory shows the child unreaped after the open;
+  `exec`;
 - a cgroup, since `cgroup.kill` names no PID;
 - on macOS, the audit token of a `Process` opened from a `ProcessId` and of a spawned child: the pid
   with its `p_idversion`, which `proc_signal_with_audittoken` checks in the kernel. A process that

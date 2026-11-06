@@ -306,6 +306,7 @@ impl Tracer {
 }
 
 /// What [`await_blocked_or_finished`] found.
+#[cfg(feature = "tokio")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Holder {
     /// Asleep in a `waitid` that waits.
@@ -319,6 +320,7 @@ pub(crate) enum Holder {
 /// One read of `/proc/self/task/<tid>/syscall`: `Some(Blocked)` if the thread sleeps in a `waitid`
 /// without `WNOHANG`, `Some(Finished)` if it is gone, `None` otherwise. Any other shape of the file
 /// than `running` or `<nr> ...` panics with its text.
+#[cfg(feature = "tokio")]
 fn thread_state(tid: libc::pid_t) -> Option<Holder> {
     let path = format!("/proc/self/task/{tid}/syscall");
     match std::fs::read_to_string(&path) {
@@ -349,6 +351,7 @@ fn thread_state(tid: libc::pid_t) -> Option<Holder> {
 /// says it has said it is still waiting. Each is a condition the thread reaches by itself, so the
 /// only exit is the condition; the pauses between reads are a backoff, not a bound. A thread that
 /// has finished is `Finished` whatever `warned` says.
+#[cfg(feature = "tokio")]
 fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -> bool) -> Holder {
     let mut pause = std::time::Duration::from_micros(50);
     loop {
@@ -364,6 +367,7 @@ fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -
 
 /// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
 /// `WNOHANG`, or is gone (see [`thread_state`]).
+#[cfg(feature = "tokio")]
 pub(crate) fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
     await_blocked_warned_or_finished(tid, || false)
 }
