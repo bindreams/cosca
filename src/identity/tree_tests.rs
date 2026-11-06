@@ -215,11 +215,19 @@ fn the_parent_of_an_exited_process_whose_handle_is_held_is_its_creator() {
     // The std `Child` holds the process handle until it is dropped, at the end of the row.
     child.kill().expect("terminate the child");
     child.wait().expect("the child's exit is recorded");
-    let parents = crate::containment::enumerate::process_parents(&HostKernel).expect("the process snapshot");
-    assert!(
-        !parents.iter().any(|&(pid, _)| pid == id.pid()),
-        "precondition: Toolhelp must not list the exited process whose handle is held"
-    );
+    let snapshot = || crate::containment::enumerate::process_parents(&HostKernel).expect("the process snapshot");
+    if let Some(&(_, ppid)) = snapshot().iter().find(|&&(pid, _)| pid == id.pid()) {
+        // Measured listed 0 times in 2400 trials on both Windows runner types and an x64 host; say enough to tell a
+        // stale row (gone on the next snapshot) from a listing that stays.
+        let again = snapshot().iter().any(|&(pid, _)| pid == id.pid());
+        panic!(
+            "precondition: Toolhelp must not list the exited process whose handle is held; it listed pid {} with \
+             ppid {ppid} (this process {}), and the next snapshot {} it",
+            id.pid(),
+            ProcessId::current().pid(),
+            if again { "still lists" } else { "no longer lists" }
+        );
+    }
     assert_eq!(
         id.parent().expect("the creator is readable"),
         Some(ProcessId::current())
