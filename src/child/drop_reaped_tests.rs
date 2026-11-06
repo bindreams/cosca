@@ -708,12 +708,13 @@ fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
     );
 }
 
-/// A drop whose walk leaves only the root, which the drop's own kill of the root then ends, says
-/// nothing: the root is not "left behind". Mutant: the drop reports the walk's error before the
-/// root's kill.
+/// A drop whose walk leaves only the root, which the drop's own kill of the root then ends, does not
+/// call the root "left behind", but warns once that the tree could not be vouched for: the walk saw
+/// the root running, and no later settlement is left to warn. Mutants: the drop reports the walk's
+/// error before the root's kill; the drop is silent.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_whose_walk_leaves_only_the_root_does_not_warn_when_the_drop_kills_it() {
+fn a_drop_whose_walk_leaves_only_the_root_warns_it_could_not_vouch_for_the_tree() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -723,10 +724,10 @@ fn a_drop_whose_walk_leaves_only_the_root_does_not_warn_when_the_drop_kills_it()
     drop(child);
 
     blocker.assert_killed();
-    assert_eq!(
-        crate::log_capture::warns_since_on_current_thread(mark, "Child::drop"),
-        []
-    );
+    let warns = crate::log_capture::warns_since_on_current_thread(mark, "Child::drop");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("could not be vouched for"), "{warns:?}");
+    assert!(!warns[0].1.contains("members"), "{warns:?}");
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,

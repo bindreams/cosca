@@ -362,7 +362,7 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
 /// marks the tree killed.
 #[skuld::test]
 fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
-    use super::{Attached, SettleOutcome, TreeKillOutcome, TreeKilled, Unkilled};
+    use super::{Attached, SettleOutcome, TreeKillOutcome, TreeKilled, Unkilled, UnvouchedKind};
     use crate::error::Error;
     let left = |pid| Error::MemberNotKilled {
         pid,
@@ -397,7 +397,9 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
         (
             TreeKillOutcome::Ran(Err(unkilled(&[], Some(1)))),
             true,
-            Ok(SettleOutcome::Killed),
+            Ok(SettleOutcome::Unvouched {
+                kind: UnvouchedKind::RootSeenRunning,
+            }),
             false,
         ),
         (
@@ -1115,9 +1117,9 @@ fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled(
     crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
 }
 
-/// A gone root over members an earlier kill left, which are gone now, says so twice running: the
-/// tree could not be walked, but "nothing was killed" and "killed again" are each false for a
-/// member that exited on its own. `exits_on_its_own`: the member exits at EOF before the settlement
+/// A gone root over members an earlier kill left, which are gone now, says so the first time and, the
+/// state keeping no cause, that something was left running the next: the tree could not be walked,
+/// but "nothing was killed" and "killed again" are each false for a member that exited on its own. `exits_on_its_own`: the member exits at EOF before the settlement
 /// instead of being killed by it.
 fn gone_root_answers_over_gone_members_twice(exits_on_its_own: bool) {
     use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
@@ -1157,10 +1159,14 @@ fn gone_root_answers_over_gone_members_twice(exits_on_its_own: bool) {
         drop(held.take());
         crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
     }
-    assert_eq!(texts[0], texts[1]);
+    // The state keeps no cause: the first call knows the held members are gone, the next only that
+    // something was left running.
     assert!(texts[0].contains("are gone"), "{}", texts[0]);
-    assert!(!texts[0].contains("nothing was killed"), "{}", texts[0]);
-    assert!(!texts[0].contains("killed again"), "{}", texts[0]);
+    assert!(texts[1].contains("left something running"), "{}", texts[1]);
+    for text in &texts {
+        assert!(!text.contains("nothing was killed"), "{text}");
+        assert!(!text.contains("killed again"), "{text}");
+    }
 }
 
 /// Mutant: the answer is `no_root_error`, or says the members were killed again.
@@ -1237,6 +1243,24 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
 
+    // The drop's own walk saw the root running, and its root kill ended it: no later settlement
+    // warns, so this one does.
+    let warn = attached
+        .settle_for_drop(
+            &TreeKilled::default(),
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: Vec::new(),
+                root: Some(member_left(1)),
+                resolved: Vec::new(),
+            })),
+            true,
+        )
+        .expect("a walk that left the root is warned of");
+    assert!(warn.contains("could not be vouched for"), "{warn}");
+    assert!(warn.contains("found the root running"), "{warn}");
+    assert!(!warn.contains("members"), "{warn}");
+    assert!(!warn.contains("skipped the kill"), "{warn}");
+
     let killed = TreeKilled::default();
     attached
         .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
@@ -1287,7 +1311,16 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             let answer = attached.settle(&killed, root_left(), root_ended);
 
             match answer {
-                Ok(_) => assert!(root_ended, "{label}: the root is running"),
+                Ok(outcome) => {
+                    assert!(root_ended, "{label}: the root is running");
+                    assert_eq!(
+                        outcome,
+                        super::SettleOutcome::Unvouched {
+                            kind: super::UnvouchedKind::RootSeenRunning
+                        },
+                        "{label}"
+                    );
+                }
                 Err(left) => {
                     assert!(!root_ended, "{label}: the root ended");
                     assert_eq!(pid_left(&left.first), 1, "{label}");
@@ -1302,6 +1335,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
                 !gone.first.to_string().contains("nothing was killed"),
                 "{label}: {gone}"
             );
+            assert!(!gone.first.to_string().contains("members"), "{label}: {gone}");
             assert_eq!(standing(&killed), Standing::Unvouched, "{label}");
         }
     }

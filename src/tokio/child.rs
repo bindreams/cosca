@@ -880,8 +880,10 @@ impl Child {
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
-    /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
-    /// The backstop still ran.
+    /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it,
+    /// but the walk saw the root running and what it forked meanwhile was never looked for, so the
+    /// tree is unvouched: a later `kill_tree` over the gone root is `Unassessable`, and the drop
+    /// warns. The backstop still ran.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the

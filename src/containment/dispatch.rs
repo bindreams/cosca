@@ -622,45 +622,70 @@ impl std::fmt::Display for Unsettled {
     }
 }
 
-/// How an [`Attached::settle`] that found nothing left came out: the call's own decision, which the
-/// caller reads in place of the handle's state ([`TreeKilled`]).
+/// How an [`Attached::settle`] that found nothing left came out, by the state it left ([`TreeKilled`]):
+/// the answer `Ok` does not say the tree is vouched for, this does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettleOutcome {
-    /// The kill ran, or found the killed tree already gone, and nothing is left for the caller to
-    /// report. The handle's state may still be unvouched: a root the walk left and the backstop ended
-    /// is not an error, but the walk saw it running.
+    /// The kill ran, or found the killed tree already gone, and the state left is killed: nothing is
+    /// left for the caller to report, and the tree is vouched for.
     Killed,
     /// The kill was skipped (and the sweep by identity of a macOS fd marker left nothing): it killed
-    /// nothing.
+    /// nothing, and the state left is not unvouched.
     Skipped,
-    /// As [`Skipped`](Self::Skipped), over a tree that is [`Unvouched`](TreeState::Unvouched) after
-    /// the settlement (a skip can move a [`Left`](TreeState::Left) tree to it). `kind` says what it
-    /// was before.
+    /// The state left is [`Unvouched`](TreeState::Unvouched), whatever the call did: a skipped kill
+    /// over a tree a skip moved there from [`Left`](TreeState::Left), or a walk that left only the
+    /// root, whose own end then made the answer `Ok`. `kind` says what was found.
     Unvouched { kind: UnvouchedKind },
 }
 
-/// What a skipped kill found of a tree it cannot vouch for ([`SettleOutcome::Unvouched`]), as far as
+/// What a settlement found of a tree it cannot vouch for ([`SettleOutcome::Unvouched`]), as far as
 /// the settlement knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnvouchedKind {
     /// The tree held members an earlier kill left, which are gone now.
     HeldMembersGone,
+    /// This settlement's walk saw the root running and left it; the root's own kill then ended it, so
+    /// the call is `Ok`. What it forked meanwhile was never looked for.
+    RootSeenRunning,
     /// An earlier kill left something running (the root, members the handle holds no identity for, or
     /// members since gone), and the settlement no longer knows which.
     Earlier,
 }
 
 impl UnvouchedKind {
-    /// The drop's warn for a skipped kill over a tree it cannot vouch for.
+    /// The drop's warn for a settlement over a tree it cannot vouch for.
     fn drop_text(self) -> &'static str {
         match self {
             UnvouchedKind::HeldMembersGone => {
                 "the drop skipped the kill, and the members an earlier kill left are gone now, but no later walk \
                  has checked what they forked, so the tree could not be vouched for"
             }
+            UnvouchedKind::RootSeenRunning => {
+                "the walk found the root running and the root was killed after it, but what the root forked \
+                 meanwhile was never looked for, so the tree could not be vouched for"
+            }
             UnvouchedKind::Earlier => {
                 "the drop skipped the kill, and an earlier kill left something running that no later walk has \
                  checked for what it forked, so the tree could not be vouched for"
+            }
+        }
+    }
+
+    /// What a gone root answers over a tree of this kind: the tree could not be walked, but not
+    /// nothing was killed.
+    fn gone_root_text(self) -> &'static str {
+        match self {
+            UnvouchedKind::HeldMembersGone => {
+                "the members an earlier kill left are gone; the tree could not be walked from its gone root, so \
+                 what they forked is unknown"
+            }
+            UnvouchedKind::RootSeenRunning => {
+                "the root an earlier walk found running is gone; the tree could not be walked from it, so what it \
+                 forked is unknown"
+            }
+            UnvouchedKind::Earlier => {
+                "an earlier kill left something running, and no walk since has checked what it forked; the tree \
+                 could not be walked from its gone root"
             }
         }
     }
@@ -682,7 +707,7 @@ pub(crate) enum TreeKillOutcome {
     /// A `TreeWalk` walk found its root gone, or holding its pid no longer: there is no tree to walk
     /// from, so this kill killed nothing. It is [`Error::Unassessable`]: [`no_root_error`](Self::no_root_error)
     /// over a tree never settled, [`no_root_after_kills_error`](Self::no_root_after_kills_error) over
-    /// one whose left members are gone.
+    /// an unvouched one, worded by what the settlement knows of it ([`UnvouchedKind`]).
     NoRoot,
     /// The root's number is untrusted, so the kill skipped what names the tree by it. The tree is
     /// not killed.
@@ -714,14 +739,11 @@ impl TreeKillOutcome {
         }
     }
 
-    /// What a [`NoRoot`](Self::NoRoot) is as an error over members an earlier kill left, which are
-    /// gone now (killed, or exited on their own): the tree could not be walked, but not nothing was
-    /// killed.
-    pub(crate) fn no_root_after_kills_error() -> Error {
+    /// What a [`NoRoot`](Self::NoRoot) is as an error over a tree an earlier kill left unvouched
+    /// (`kind` says what it found): the tree could not be walked, but not nothing was killed.
+    pub(crate) fn no_root_after_kills_error(kind: UnvouchedKind) -> Error {
         Error::Unassessable {
-            detail: "the members an earlier kill left are gone; the tree could not be walked from its gone root, so \
-                     what they forked is unknown"
-                .to_owned(),
+            detail: kind.gone_root_text().to_owned(),
             source: None,
         }
     }
@@ -1024,9 +1046,16 @@ impl Attached {
                 left_now = crate::containment::treewalk::Left::of(left);
             }
         }
+        // What this call knows of the tree it cannot vouch for: held members that are gone, or only
+        // that an earlier kill left something running.
+        let kind_before = if held_before {
+            UnvouchedKind::HeldMembersGone
+        } else {
+            UnvouchedKind::Earlier
+        };
         if gone_root && result.is_ok() && !was_killed {
-            // The members an earlier walk left are gone, but nothing walked the tree for what they forked.
-            result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error()));
+            // What an earlier walk left is gone or unknown, but nothing walked the tree for what it forked.
+            result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error(kind_before)));
         }
         // A member the walk saw running un-vouches the tree, whatever ended it afterwards: it may have
         // forked first. Only the answer follows the root's end.
@@ -1038,21 +1067,21 @@ impl Attached {
                 left.unsettled(root_ended)
             }
         };
-        let unvouched = if held_before {
-            UnvouchedKind::HeldMembersGone
-        } else {
-            UnvouchedKind::Earlier
-        };
+        // An `Ok` answer over something running left only the root, and its end settled the answer.
+        let root_only = running && unsettled.is_ok();
         *state = next(&state, ran, left_now, running);
-        // A gone root answers `Ok` only over a killed tree.
-        unsettled.map(|()| {
-            if ran || gone_root {
-                SettleOutcome::Killed
-            } else if matches!(*state, TreeState::Unvouched) {
-                SettleOutcome::Unvouched { kind: unvouched }
-            } else {
-                SettleOutcome::Skipped
-            }
+        // The answer follows the state left: `Killed` only over a vouched tree. A gone root answers
+        // `Ok` only over a killed tree.
+        unsettled.map(|()| match *state {
+            TreeState::Unvouched => SettleOutcome::Unvouched {
+                kind: if root_only {
+                    UnvouchedKind::RootSeenRunning
+                } else {
+                    kind_before
+                },
+            },
+            _ if ran || gone_root => SettleOutcome::Killed,
+            _ => SettleOutcome::Skipped,
         })
     }
 

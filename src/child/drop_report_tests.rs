@@ -147,14 +147,16 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
 }
 
 /// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
-/// kill of the root ends it, so the tree is settled. The error says nothing of a tree that could not
-/// be killed, the cleanup warns of none, and the handle is disarmed. A walk that left a descendant is
-/// still reported, in the error and the warn. Not on macOS, where `TreeWalk` mode is an fd marker.
+/// kill of the root ends it, so the error says nothing of a tree that could not be killed and the
+/// cleanup warns of none, but the walk saw the root running, so the tree is not vouched for and the
+/// handle stays armed: its drop warns, once. A walk that left a descendant is reported, in the error
+/// and the warn. Not on macOS, where `TreeWalk` mode is an fd marker.
 ///
-/// Mutant: the cleanup reports the walk's error before the root's kill.
+/// Mutants: the cleanup reports the walk's error before the root's kill; the tree is settled (the
+/// handle disarmed) by a root the walk saw running.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the_root() {
+fn finish_elevated_leaves_a_walk_that_left_only_the_root_unvouched_and_the_handle_armed() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
@@ -166,12 +168,11 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
         let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
-        // A settled tree disarms the handle; an unsettled one is looked at again when it drops, and
-        // that look is the armed drop's first act, whatever it then logs.
-        assert_eq!(
+        // A settled tree disarms the handle; an unsettled or unvouched one is looked at again when it
+        // drops, and that look is the armed drop's first act, whatever it then logs.
+        assert!(
             drop_looks.seen(),
-            reported,
-            "{left:?}: the handle is armed iff the tree was left"
+            "{left:?}: the tree is not vouched for, so the handle is armed"
         );
         let cause = cause.to_string();
         assert_eq!(
@@ -186,15 +187,21 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
             .filter(|warn| warn.starts_with("finish_elevated:"))
             .collect();
         assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
+        // The armed drop's one warn of the root-only walk.
+        let unvouched = warns_since(mark)
+            .into_iter()
+            .filter(|warn| warn.contains("could not be vouched for"))
+            .count();
+        assert_eq!(unvouched, usize::from(!reported), "{left:?}");
     }
 }
 
 /// A teardown whose walk left only the root, and whose root someone else had reaped when the
-/// teardown's kill of it came, warns of nothing (the root is not running, whoever ended it) but does
-/// not vouch for the tree: the walk saw the root running.
+/// teardown's kill of it came, does not vouch for the tree: the walk saw the root running. The
+/// teardown's own warn says so, and the tree is not marked killed.
 ///
 /// Mutants: the root counts as ended only when this handle's own kill ended it (`Reaped`, `Killed`);
-/// the tree is marked killed.
+/// the tree is marked killed; the teardown is silent.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
@@ -216,7 +223,10 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     child.kill_on_drop = false;
 
     assert_eq!(torn.fate, crate::error::ChildFate::Gone);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
+    assert!(!warns[0].contains("members"), "{warns:?}");
     assert!(!child.tree_killed.is_set(), "the walk saw the root running");
     drop(writer);
 }
