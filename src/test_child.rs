@@ -1916,3 +1916,20 @@ pub(crate) fn exited_through_open(
         },
     }
 }
+
+/// The first Toolhelp snapshot that no longer lists `pid`, an exited process whose handle is held. CI has seen
+/// Toolhelp still list such a process in the first snapshot after its exit was signalled, under a full test
+/// run's load; a row that stays would hang here, and fail at the test's bound.
+#[cfg(windows)]
+pub(crate) fn parents_once_unlisted(
+    pid: crate::identity::RawPid,
+) -> Vec<(crate::identity::RawPid, crate::identity::RawPid)> {
+    loop {
+        let parents =
+            crate::containment::enumerate::process_parents(&crate::identity::HostKernel).expect("the process snapshot");
+        if !parents.iter().any(|&(listed, _)| listed == pid) {
+            return parents;
+        }
+        std::thread::yield_now();
+    }
+}
