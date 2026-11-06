@@ -985,14 +985,8 @@ impl ProcSource {
             else {
                 unreachable!("`is_running` read a running child by its unique id");
             };
-            crate::identity::has_exited(*pid, *unique, crate::identity::ReadPurpose::Running).map_err(|errno| {
-                std::io::Error::new(
-                    std::io::Error::from_raw_os_error(errno).kind(),
-                    format!(
-                        "pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be running"
-                    ),
-                )
-            })
+            crate::identity::has_exited(*pid, *unique, crate::identity::ReadPurpose::Running)
+                .map_err(|errno| crate::identity::has_exited_error(*pid, errno))
         }
     }
 

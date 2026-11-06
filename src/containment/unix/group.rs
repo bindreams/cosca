@@ -478,6 +478,8 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 /// open just confirmed, even if the pid number is reused by something else in between — no gap
 /// remains, unlike `check_or_signal`'s plain-`kill(2)` path.
 ///
+/// The open's answers map to a [`Reached`] as follows:
+///
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
 ///   `id.exists()` saying `Gone`) and a ptraced zombie thread.

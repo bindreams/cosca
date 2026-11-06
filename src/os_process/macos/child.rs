@@ -107,15 +107,8 @@ impl OsChild for MacChild {
     /// XNU withholds `NOTE_EXIT` from a parent that does not trace the child while `p_oppid` is
     /// set, so a zombie its tracer holds is seen as one (`SZOMB`) on the verified unique id.
     fn exited_unannounced(&self) -> Result<bool, Error> {
-        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running).map_err(|errno| {
-            Error::Io(std::io::Error::new(
-                std::io::Error::from_raw_os_error(errno).kind(),
-                format!(
-                    "pid {}: its identity could not be read (errno {errno}); it cannot be shown to be running",
-                    self.pid
-                ),
-            ))
-        })
+        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running)
+            .map_err(|errno| Error::Io(crate::identity::has_exited_error(self.pid, errno)))
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the

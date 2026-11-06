@@ -616,7 +616,9 @@ async fn graceful_shutdown_of_an_unproven_child_sends_nothing_and_is_echild_on_m
 }
 
 /// A zombie a foreign tracer holds has exited, so the child reads `Dead` from its pidfd's edge,
-/// though the parent's peek finds no record to show for it.
+/// though the parent's peek finds no record to show for it. The `SIGKILL` makes the exit: left to
+/// exit by itself, the tracee stops at a signal-delivery stop (`SIGPIPE` on its closed stdout) and
+/// waits for the tracer, so it never exits.
 ///
 /// Mutant: liveness answered from the peek, which reads the held zombie as `Running`.
 #[cfg(target_os = "linux")]

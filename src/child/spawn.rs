@@ -2205,9 +2205,10 @@ pub(crate) fn spawn_identity_error(
 /// - **Linux:** the key is read from the held pidfd, with no second `pidfd_open` of the pid: on
 ///   pidfs (6.9+) its inode, else (no inode of its own) the `/proc` `starttime` by pid. Then a peek
 ///   through the pidfd. `Running` and `Exit` keep the read (a reap is irreversible, so the pid
-///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, warned. On pidfs
-///   the pidfd, not the pid, named the read, so the peek does not check it: it shows whether
-///   another party reaped the child.
+///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, and the child is
+///   kept without an identity ([`kept_without_identity`]): the check is logged at debug, and warned
+///   only if a failing attach's teardown folds it into its warn. On pidfs the pidfd, not the pid,
+///   named the read, so the peek does not check it: it shows whether another party reaped the child.
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
@@ -2216,7 +2217,8 @@ pub(crate) fn spawn_identity_error(
 /// On macOS the `through` id is the one the child reported before `exec`.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
-/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`. The
+/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`, unless the child is kept
+/// (see the `Diagnosis` keep rule). The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
     kernel: &dyn crate::identity::Kernel,
@@ -2279,18 +2281,22 @@ pub(crate) fn resolve_identity(
 }
 
 /// What the identity check found when it could not show the spawned child to be ours, owed to the
-/// failed spawn's one `warn`.
+/// failed spawn's one `warn`, and the notes the failed spawn's teardown adds.
 ///
 /// The spawn's failure arm hands it to the teardown it runs. A step of that teardown that warns
 /// [`fold`](Diagnosis::fold)s it into its text, so the check and the teardown are one record. When
 /// no step warns, the diagnosis is logged on its own when it is dropped.
+///
+/// The keep rule: a child kept without an identity ([`kept_without_identity`]) owes no failure for
+/// the check that left it so, so that text is held apart. It leads a fold, and is logged at `debug`
+/// if nothing folds it. A note added after the keep is the failure's own, and still warns.
 #[derive(Debug, Default)]
 pub(crate) struct Diagnosis {
     owed: Option<String>,
+    /// The text of the check that left the child kept, taken out of `owed` by the keep.
+    kept_check: Option<String>,
     /// The error of the failed check, until [`kept_without_identity`] builds the spawn's error from it.
     failed_check: Option<std::io::Error>,
-    /// Logged at `debug` and not `warn` when nothing folds it: the child is kept, so no failure is owed.
-    kept: bool,
 }
 
 impl Diagnosis {
@@ -2299,8 +2305,8 @@ impl Diagnosis {
     fn of(text: String) -> Diagnosis {
         Diagnosis {
             owed: Some(text),
+            kept_check: None,
             failed_check: None,
-            kept: false,
         }
     }
 
@@ -2309,8 +2315,8 @@ impl Diagnosis {
     fn of_failed_check(text: String, error: std::io::Error) -> Diagnosis {
         Diagnosis {
             owed: Some(text),
+            kept_check: None,
             failed_check: Some(error),
-            kept: false,
         }
     }
 
@@ -2323,32 +2329,36 @@ impl Diagnosis {
         }
     }
 
-    /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn.
+    /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn. The
+    /// kept check counts: a teardown only runs for a failed spawn, which it is then part of.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn is_owed(&self) -> bool {
-        self.owed.is_some()
+        self.owed.is_some() || self.kept_check.is_some()
     }
 
-    /// `text`, led by the diagnosis if it is still owed, which it then no longer is.
+    /// `text`, led by the kept check and the diagnosis if either is still owed, which they then no
+    /// longer are.
     pub(crate) fn fold(&mut self, text: impl std::fmt::Display) -> String {
-        match self.owed.take() {
-            Some(diagnosis) => format!("{diagnosis}; {text}"),
-            None => text.to_string(),
-        }
+        let mut parts: Vec<String> = [self.kept_check.take(), self.owed.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        parts.push(text.to_string());
+        parts.join("; ")
     }
 }
 
 impl Drop for Diagnosis {
     fn drop(&mut self) {
         // Not while unwinding: a logger that panics there would abort.
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(check) = self.kept_check.take() {
+            log::debug!("{check}");
+        }
         if let Some(diagnosis) = self.owed.take() {
-            if !std::thread::panicking() {
-                if self.kept {
-                    log::debug!("{diagnosis}");
-                } else {
-                    log::warn!("{diagnosis}");
-                }
-            }
+            log::warn!("{diagnosis}");
         }
     }
 }
@@ -2367,7 +2377,7 @@ pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCau
         None => spawn_identity_error(crate::identity::Resolved::Unknown, cause),
     };
     log::debug!("child {pid}: {error}; the child is kept without an identity");
-    why.kept = true;
+    why.kept_check = why.owed.take();
     error
 }
 

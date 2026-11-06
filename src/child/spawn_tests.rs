@@ -162,7 +162,7 @@ fn an_unreadable_identity_keeps_the_child_without_one() {
 ///
 /// Mutant: the attach fails early for want of an identity, whatever the mechanism.
 #[cfg(target_os = "linux")]
-fn assert_contained_root_is_kept_without_an_identity(mode: crate::ContainMode, expected: &[crate::Containment]) {
+fn assert_contained_root_is_kept_without_an_identity(mode: crate::ContainMode, expected: crate::Containment) {
     let (mut cmd, _teardown) = teardown_blocker();
     cmd.contain_with(mode);
     fault::set_force_identity_unknown(true);
@@ -171,10 +171,10 @@ fn assert_contained_root_is_kept_without_an_identity(mode: crate::ContainMode, e
 
     let child = spawned.expect("an unreadable identity keeps a root whose containment needs none");
     assert_eq!(child.id(), None, "the read failed, so the child has no identity");
-    assert!(
-        expected.contains(&child.containment()),
-        "{mode:?} attached as {:?}, not one of {expected:?}",
-        child.containment()
+    assert_eq!(
+        child.containment(),
+        expected,
+        "{mode:?} attached as the wrong mechanism"
     );
     child
         .kill_tree()
@@ -185,23 +185,51 @@ fn assert_contained_root_is_kept_without_an_identity(mode: crate::ContainMode, e
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_unreadable_identity_keeps_a_session_root() {
-    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Session, &[crate::Containment::Session]);
+    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Session, crate::Containment::Session);
 }
 
-/// `Strongest` is a cgroup leaf or, without one, a process group: both attach by pid or handle.
+/// `Strongest` with no cgroup leaf made (forced, so whatever the host gives) is the process group.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn an_unreadable_identity_keeps_a_strongest_root_in_a_group() {
-    assert_contained_root_is_kept_without_an_identity(
-        crate::ContainMode::Strongest,
-        &[crate::Containment::CgroupV2, crate::Containment::ProcessGroup],
-    );
+fn an_unreadable_identity_keeps_a_strongest_root_in_a_process_group() {
+    let (mode, _forced) = super::identity_group_tests::Container::Leafless.arm();
+    assert_contained_root_is_kept_without_an_identity(mode, crate::Containment::ProcessGroup);
 }
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_unreadable_identity_keeps_a_cgroup_root(#[fixture(cgroup)] _group: &Group) {
-    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Strongest, &[crate::Containment::CgroupV2]);
+    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Strongest, crate::Containment::CgroupV2);
+}
+
+/// macOS: a session or process-group root keeps its child when the identity is unreadable, as on
+/// Linux, with no fd marker: a marker names its holders by the root's identity, so a marked root
+/// is refused instead. CI-only.
+///
+/// Mutant: the attach fails early for want of an identity, whatever the mechanism.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_an_unreadable_identity_keeps_a_session_or_process_group_root() {
+    for (mode, expected) in [
+        (crate::ContainMode::Session, crate::Containment::Session),
+        (crate::ContainMode::Strongest, crate::Containment::ProcessGroup),
+    ] {
+        let (mut cmd, _teardown) = teardown_blocker();
+        cmd.contain_with(mode).suppress_fd_marker();
+        fault::set_force_identity_unknown(true);
+        let spawned = cmd.spawn();
+        fault::set_force_identity_unknown(false);
+
+        let child = spawned.expect("an unreadable identity keeps a root whose containment needs none");
+        assert_eq!(child.id(), None, "the read failed, so the child has no identity");
+        assert_eq!(
+            child.containment(),
+            expected,
+            "{mode:?} attached as the wrong mechanism"
+        );
+        child.kill().expect("a kept child is killed through its handle");
+        child.wait().expect("the kept child is waited on");
+    }
 }
 
 /// A kept child with no identity is torn down by its drop like any other: killed and reaped.
@@ -1596,6 +1624,39 @@ fn an_unfolded_diagnosis_is_logged_on_drop_but_not_while_unwinding() {
         mark,
         "diagnosis 9b7a, dropped unwinding"
     ));
+}
+
+/// A keep leaves the failed check at debug, but a note owed after the keep (a refused group kill, a
+/// forgotten tokio handle) is the failure's own and warns, as it would on a diagnosis never kept.
+/// No existing spawn seam reaches such a note from a kept child (only a tokio elevation front's
+/// failed attach adds one), so the row drives the diagnosis directly.
+///
+/// Mutant: the keep demotes everything owed to debug, later notes too.
+#[cfg(unix)]
+#[skuld::test]
+fn a_note_owed_after_a_keep_is_warned_and_the_kept_check_is_not() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut why = super::Diagnosis::of_failed_check(
+        "check 6d1f, kept".to_owned(),
+        std::io::Error::other("forced check failure"),
+    );
+    let _ = super::kept_without_identity(1, Default::default(), &mut why);
+    why.add("later note 2b9c");
+
+    drop(why);
+
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("later note 2b9c") && !warns[0].contains("check 6d1f"),
+        "the later note is warned alone: {warns:?}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "check 6d1f, kept"),
+        [log::Level::Debug],
+        "the kept check is logged once, at debug"
+    );
 }
 
 /// `resolve_identity` of a child reaped behind its back, whose pid a same-tick reuser (the child's
