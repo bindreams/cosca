@@ -508,7 +508,7 @@ fn standing_of(state: &super::TreeState) -> Standing {
     match state {
         super::TreeState::Never => Standing::Never,
         super::TreeState::Killed => Standing::Killed,
-        super::TreeState::Unvouched => Standing::Unvouched,
+        super::TreeState::Unvouched(_) => Standing::Unvouched,
         super::TreeState::Left(held) => {
             assert!(!held.is_empty(), "a tree left holds a member");
             Standing::Left(
@@ -532,7 +532,7 @@ fn standing_of(state: &super::TreeState) -> Standing {
 /// members.
 #[skuld::test]
 fn next_is_the_one_transition_of_state_and_facts() {
-    use super::TreeState;
+    use super::{TreeState, UnvouchedKind};
     use crate::containment::treewalk::Left;
     let unread = |pid| Left::Unread {
         pid,
@@ -543,7 +543,7 @@ fn next_is_the_one_transition_of_state_and_facts() {
         0 => TreeState::Never,
         1 => TreeState::Killed,
         2 => TreeState::Left(vec![unread(7)]),
-        _ => TreeState::Unvouched,
+        _ => TreeState::Unvouched(UnvouchedKind::Earlier),
     };
     // (label, walked, left_now, running, next from [Never, Killed, Left(7), Unvouched])
     type Row = (&'static str, bool, Vec<Left>, bool, [Standing; 4]);
@@ -565,9 +565,19 @@ fn next_is_the_one_transition_of_state_and_facts() {
     ];
     for (label, walked, left_now, running, wants) in facts {
         for (at, want) in wants.into_iter().enumerate() {
-            let got = super::next(&prev_at(at), walked, left_now.clone(), running);
+            let got = super::next(
+                &prev_at(at),
+                walked,
+                left_now.clone(),
+                running,
+                UnvouchedKind::RootSeenRunning,
+            );
 
             assert_eq!(standing_of(&got), want, "{} x {label}", prev_names[at]);
+            // The kind the settlement names is the one the state keeps.
+            if let TreeState::Unvouched(kind) = got {
+                assert_eq!(kind, UnvouchedKind::RootSeenRunning, "{} x {label}", prev_names[at]);
+            }
         }
     }
 }
@@ -810,7 +820,7 @@ fn settle_answers_each_outcome_over_an_unvouched_tree() {
                 (Err(gone()), Standing::Unvouched),
                 (
                     Ok(Unvouched {
-                        kind: UnvouchedKind::Earlier,
+                        kind: UnvouchedKind::HeldMembersGone,
                     }),
                     Standing::Unvouched,
                 ),
@@ -1117,11 +1127,11 @@ fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled(
     crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
 }
 
-/// A gone root over members an earlier kill left, which are gone now, says so the first time and, the
-/// state keeping no cause, that something was left running the next: the tree could not be walked,
-/// but "nothing was killed" and "killed again" are each false for a member that exited on its own. `exits_on_its_own`: the member exits at EOF before the settlement
-/// instead of being killed by it.
-fn gone_root_answers_over_gone_members_twice(exits_on_its_own: bool) {
+/// A gone root over members an earlier kill left, which are gone now, says so each time, in the same
+/// words: the tree could not be walked, but "nothing was killed" and "killed again" are each false for
+/// a member that exited on its own. `exits_on_its_own`: the member exits at EOF before the
+/// settlement instead of being killed by it.
+fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
     use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
@@ -1159,26 +1169,25 @@ fn gone_root_answers_over_gone_members_twice(exits_on_its_own: bool) {
         drop(held.take());
         crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
     }
-    // The state keeps no cause: the first call knows the held members are gone, the next only that
-    // something was left running.
-    assert!(texts[0].contains("are gone"), "{}", texts[0]);
-    assert!(texts[1].contains("left something running"), "{}", texts[1]);
+    assert_eq!(texts[0], texts[1]);
     for text in &texts {
+        assert!(text.contains("are gone"), "{text}");
         assert!(!text.contains("nothing was killed"), "{text}");
         assert!(!text.contains("killed again"), "{text}");
     }
 }
 
-/// Mutant: the answer is `no_root_error`, or says the members were killed again.
+/// Mutant: the answer is `no_root_error`, or says the members were killed again, or changes with the
+/// second call.
 #[skuld::test]
 fn a_gone_root_over_members_killed_by_the_settlement_says_they_are_gone_each_time() {
-    gone_root_answers_over_gone_members_twice(false);
+    gone_root_answers_over_gone_members_each_time(false);
 }
 
 /// Mutant: the answer says the members were killed.
 #[skuld::test]
 fn a_gone_root_over_a_member_that_exited_on_its_own_says_it_is_gone_each_time() {
-    gone_root_answers_over_gone_members_twice(true);
+    gone_root_answers_over_gone_members_each_time(true);
 }
 
 /// A drop that skips the kill over a tree it cannot vouch for warns of it, in words true of what
@@ -1213,35 +1222,41 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     assert!(warn.contains("are gone"), "{warn}");
     assert!(!warn.contains("no longer tracked"), "{warn}");
 
-    // A cause that is no longer known.
-    let (unvouched, after) = unvouched_tree();
+    // Something left running that no settlement has seen end: the root, whose end the call did not see.
+    let root_left = || {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: Vec::new(),
+            root: Some(member_left(1)),
+            resolved: Vec::new(),
+        }))
+    };
+    let earlier = TreeKilled::default();
+    attached
+        .settle(&earlier, root_left(), false)
+        .expect_err("the root is running");
     let warn = attached
-        .settle_for_drop(&unvouched, skipped(), true)
+        .settle_for_drop(&earlier, skipped(), true)
         .expect("an unvouched tree is warned of");
-    after();
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("skipped the kill"), "{warn}");
     assert!(warn.contains("left something running"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
 
-    // A walk that left only the root.
+    // A walk that left only the root, then a `kill_tree` that answered `Ok`: the drop says what that
+    // call found, every time, not that it skipped a kill over something an earlier kill left.
     let root_only = TreeKilled::default();
-    attached
-        .settle(
-            &root_only,
-            TreeKillOutcome::Ran(Err(Unkilled {
-                members: Vec::new(),
-                root: Some(member_left(1)),
-                resolved: Vec::new(),
-            })),
-            true,
-        )
-        .expect("the root ended");
-    let warn = attached
-        .settle_for_drop(&root_only, skipped(), true)
-        .expect("an unvouched tree is warned of");
-    assert!(warn.contains("could not be vouched for"), "{warn}");
-    assert!(!warn.contains("members"), "{warn}");
+    attached.settle(&root_only, root_left(), true).expect("the root ended");
+    for _ in 0..2 {
+        let warn = attached
+            .settle_for_drop(&root_only, skipped(), true)
+            .expect("an unvouched tree is warned of");
+        assert!(warn.contains("could not be vouched for"), "{warn}");
+        assert!(warn.contains("found the root running"), "{warn}");
+        assert!(warn.contains("the root had ended by then"), "{warn}");
+        assert!(!warn.contains("members"), "{warn}");
+        assert!(!warn.contains("skipped the kill"), "{warn}");
+        assert!(!warn.contains("earlier kill"), "{warn}");
+    }
 
     // The drop's own walk saw the root running, and its root kill ended it: no later settlement
     // warns, so this one does.
@@ -1258,6 +1273,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .expect("a walk that left the root is warned of");
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("found the root running"), "{warn}");
+    assert!(warn.contains("the root had ended by then"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
     assert!(!warn.contains("skipped the kill"), "{warn}");
 
@@ -1328,15 +1344,26 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             }
             assert_eq!(standing(&killed), Standing::Unvouched, "{label}");
 
-            let gone = attached
-                .settle(&killed, TreeKillOutcome::NoRoot, true)
-                .expect_err("a gone root walked nothing");
-            assert!(
-                !gone.first.to_string().contains("nothing was killed"),
-                "{label}: {gone}"
-            );
-            assert!(!gone.first.to_string().contains("members"), "{label}: {gone}");
-            assert_eq!(standing(&killed), Standing::Unvouched, "{label}");
+            // The kind the state stores is the latest one named: a root seen running and ended names
+            // `RootSeenRunning`; one still running leaves only that something was.
+            let want = if root_ended {
+                "found running"
+            } else {
+                "left something running"
+            };
+            let mut texts = Vec::new();
+            for _ in 0..2 {
+                let gone = attached
+                    .settle(&killed, TreeKillOutcome::NoRoot, true)
+                    .expect_err("a gone root walked nothing");
+                let text = gone.first.to_string();
+                assert!(!text.contains("nothing was killed"), "{label}: {gone}");
+                assert!(!text.contains("members"), "{label}: {gone}");
+                assert!(text.contains(want), "{label}: {gone}");
+                assert_eq!(standing(&killed), Standing::Unvouched, "{label}");
+                texts.push(text);
+            }
+            assert_eq!(texts[0], texts[1], "{label}");
         }
     }
 }

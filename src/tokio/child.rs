@@ -875,15 +875,21 @@ impl Child {
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and logs that descendants may be orphaned.)
+    /// kills the root and logs that descendants may be orphaned.) A root that is gone (this handle
+    /// reaped it) or no longer holds its pid is `Unassessable` too: no walk ran and nothing was
+    /// killed, and a retry cannot work, since the root will not come back.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
-    /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it,
-    /// but the walk saw the root running and what it forked meanwhile was never looked for, so the
-    /// tree is unvouched: a later `kill_tree` over the gone root is `Unassessable`, and the drop
-    /// warns. The backstop still ran.
+    /// kill was refused. The handle keeps the members the walk left: a later `kill_tree`, or the
+    /// drop, kills those whose identity was read again, and reports the others again. That holds
+    /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
+    /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
+    /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
+    /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
+    /// and what it forked meanwhile was never looked for, so the tree is unvouched in the same way:
+    /// a later `kill_tree` over the gone root is `Unassessable`, and the drop warns.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the

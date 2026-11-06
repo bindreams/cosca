@@ -147,19 +147,19 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
 }
 
 /// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
-/// kill of the root ends it, so the error says nothing of a tree that could not be killed and the
-/// cleanup warns of none, but the walk saw the root running, so the tree is not vouched for and the
-/// handle stays armed: its drop warns, once. A walk that left a descendant is reported, in the error
-/// and the warn. Not on macOS, where `TreeWalk` mode is an fd marker.
+/// kill of the root ends it, but the walk saw the root running, so the tree is not vouched for. The
+/// cleanup says so once, in the error and the warn, and disarms the handle, so its drop does not say
+/// it again. A walk that left a descendant is a failed kill: reported, and the handle stays armed to
+/// try again. Not on macOS, where `TreeWalk` mode is an fd marker.
 ///
-/// Mutants: the cleanup reports the walk's error before the root's kill; the tree is settled (the
-/// handle disarmed) by a root the walk saw running.
+/// Mutants: the cleanup reports the walk's error before the root's kill; the handle stays armed over
+/// an unvouched tree (its drop warns again).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_leaves_a_walk_that_left_only_the_root_unvouched_and_the_handle_armed() {
+fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
-    for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+    for (left, failed) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
         let (child, writer) = crate::test_child::held_treewalk_blocker_leaving(left);
         let mark = crate::log_capture::mark();
         let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
@@ -168,32 +168,67 @@ fn finish_elevated_leaves_a_walk_that_left_only_the_root_unvouched_and_the_handl
         let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
-        // A settled tree disarms the handle; an unsettled or unvouched one is looked at again when it
-        // drops, and that look is the armed drop's first act, whatever it then logs.
-        assert!(
-            drop_looks.seen(),
-            "{left:?}: the tree is not vouched for, so the handle is armed"
-        );
+        // A failed kill leaves the handle armed to try again: the look at the tree when it drops is the
+        // armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+        assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
         let cause = cause.to_string();
         assert_eq!(
             cause.contains("its contained tree could not be killed"),
-            reported,
+            failed,
             "{left:?}: {cause}"
         );
-        // The handle left armed by an unsettled tree warns again when it drops; the cleanup's own
-        // warn is the one counted.
-        let warns: Vec<_> = warns_since(mark)
-            .into_iter()
+        assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
+        let warns = warns_since(mark);
+        let finish_elevated: Vec<_> = warns
+            .iter()
             .filter(|warn| warn.starts_with("finish_elevated:"))
             .collect();
-        assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
-        // The armed drop's one warn of the root-only walk.
-        let unvouched = warns_since(mark)
-            .into_iter()
+        assert_eq!(finish_elevated.len(), 1, "{left:?}: {warns:?}");
+        // The cleanup's one warn, and no drop's after it.
+        let unvouched = warns
+            .iter()
             .filter(|warn| warn.contains("could not be vouched for"))
             .count();
-        assert_eq!(unvouched, usize::from(!reported), "{left:?}");
+        assert_eq!(unvouched, usize::from(!failed), "{left:?}: {warns:?}");
     }
+}
+
+/// A failed spawn's cleanup that hands the root back (its exit was not collected) over a walk that
+/// left only the root: an unvouched tree is not a failed kill, so the cleanup does not retry it, says
+/// once that the tree could not be vouched for, and the handle is disarmed.
+///
+/// Mutants: the cleanup retries over an unvouched tree and reports "the retry failed too"; the warn
+/// is not said, or said again by the drop.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let cause = cause.to_string();
+    assert!(cause.contains("could not be vouched for"), "{cause}");
+    assert!(!cause.contains("retry"), "{cause}");
+    assert!(!drop_looks.seen(), "the handle is disarmed");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let unvouched = warns
+        .iter()
+        .filter(|warn| warn.contains("could not be vouched for"))
+        .count();
+    assert_eq!(unvouched, 1, "{warns:?}");
+    assert!(warns.iter().all(|warn| !warn.contains("retry")), "{warns:?}");
+    handed_back.wait();
 }
 
 /// A teardown whose walk left only the root, and whose root someone else had reaped when the

@@ -510,14 +510,14 @@ impl Child {
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
-    /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it,
-    /// but the walk saw the root running and what it forked meanwhile was never looked for, so the
-    /// tree is unvouched: a later `kill_tree` over the gone root is `Unassessable`, and the drop
-    /// warns. The backstop still ran. The handle keeps the members the walk left: a later `kill_tree`, or the
+    /// kill was refused. The handle keeps the members the walk left: a later `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
     /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
     /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
-    /// gone and the tree could not be walked: the tree cannot be vouched for again.
+    /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
+    /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
+    /// and what it forked meanwhile was never looked for, so the tree is unvouched in the same way:
+    /// a later `kill_tree` over the gone root is `Unassessable`, and the drop warns.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -549,8 +549,9 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying what was skipped even when
     /// every holder was reached; a holder that could not be reached is that holder's error. Any other
     /// mechanism has nothing left to send, and the call returns `Unassessable` saying that nothing
-    /// was sent and what was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
-    /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
+    /// was sent and what was skipped. The handle backstop reads the root's state again: a root
+    /// orphaned during the sweep is an exited zombie, so the backstop is skipped and the sweep's
+    /// answer stands.
     ///
     /// **On Linux 6.9+, a process group whose root is reaped, or whose root's handle cannot say,** is
     /// still named exactly by the root's pidfd, whoever reaped it: while the group has a member it is

@@ -125,7 +125,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// tree kill does not run for it, so the cleanup retries that kill once first, and the warn and the
 /// error say how the retry went (a skipped kill is not a retry that worked). The handle is also
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
-/// alone (a reaped or unpinned root). Only a failed tree kill with a root not handed back leaves
+/// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
+/// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
+/// says so, and the handle is disarmed. Only a failed tree kill with a root not handed back leaves
 /// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
 /// second time.
 #[cfg(unix)]
@@ -253,6 +255,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         .as_ref()
         .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)))
         || (skipped.is_some() && view.leaves_root_alone());
+    // An unvouched tree is not a failed kill: there is nothing to retry, and the cleanup says so once.
+    let unvouched = matches!(tree, Some(Ok(SettleOutcome::Unvouched { .. })));
     let subject = child.attached.teardown_subject();
     let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
     report.tree = tree_warn;
@@ -261,7 +265,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     }
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
     // here. The one warn and the error's note say how the retry went.
-    if hands_back && !tree_settled {
+    if hands_back && !tree_settled && !unvouched {
         let retry = kill_tree();
         match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
@@ -291,7 +295,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     } else {
         root_note
     };
-    if hands_back || tree_settled {
+    if hands_back || tree_settled || unvouched {
         child.kill_on_drop = false;
     }
     // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
@@ -404,20 +408,29 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// `Attached::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
-/// tree was killed. `Some(Ok(Skipped | Unvouched))`: a kill that killed nothing; its skip note says so (the
-/// caller's). None of these is reported here.
+/// tree was killed. `Some(Ok(Skipped))`: a kill that killed nothing; its skip note says so (the
+/// caller's). None of these is reported here. `Some(Ok(Unvouched { kind }))`: reported as `kind` says.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(
     tree: Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
     subject: &dyn std::fmt::Display,
 ) -> (String, Option<String>) {
-    let Some(Err(e)) = tree else {
-        return (String::new(), None);
-    };
-    (
-        format!("; its contained tree could not be killed ({subject}: {e})"),
-        Some(tree_teardown_warn(subject, &e)),
-    )
+    use crate::containment::dispatch::SettleOutcome;
+
+    match tree {
+        Some(Err(e)) => (
+            format!("; its contained tree could not be killed ({subject}: {e})"),
+            Some(tree_teardown_warn(subject, &e)),
+        ),
+        Some(Ok(SettleOutcome::Unvouched { kind })) => {
+            let text = kind.unvouched_text();
+            (
+                format!("; {text} ({subject})"),
+                Some(tree_teardown_warn(subject, &text)),
+            )
+        }
+        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Skipped)) => (String::new(), None),
+    }
 }
 
 /// The text of the cleanup's `warn` about the tree's teardown: `said`, about `subject`, under

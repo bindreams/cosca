@@ -989,6 +989,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         .as_ref()
         .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)) && drain_failure.is_none())
         || (skipped.is_some() && view.leaves_root_alone());
+    // An unvouched tree is not a failed kill: the drop has nothing to retry, and the cleanup's one
+    // report says so.
+    let unvouched = matches!(tree, Some(Ok(SettleOutcome::Unvouched { .. })));
     let subject = child.teardown_subject();
     let (mut tree_note, tree_warn) = crate::child::spawn::report_tree_teardown(tree, &subject);
     // A drain is watched only after a kill that left nothing, which `settle` answers `Killed`.
@@ -1014,7 +1017,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     report.tree = tree_warn;
     report.drain = drain_warn;
     let warned = report.emit(&[]);
-    child.end_cleanup(tree_settled && root_settled, warned);
+    child.end_cleanup((tree_settled || unvouched) && root_settled, warned);
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,

@@ -208,18 +208,18 @@ mod linux {
     }
 
     /// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
-    /// kill of the root ends it, so the error says nothing of a tree that could not be killed and the
-    /// cleanup warns of none, but the walk saw the root running, so the tree is not vouched for and the
-    /// handle stays armed: its drop warns, once. A walk that left a descendant is reported, in the
-    /// error and the warn.
+    /// kill of the root ends it, but the walk saw the root running, so the tree is not vouched for. The
+    /// cleanup says so once, in the error and the warn, and disarms the handle, so its drop does not
+    /// say it again. A walk that left a descendant is a failed kill: reported, and the handle stays
+    /// armed to try again.
     ///
-    /// Mutants: the cleanup reports the walk's error before the root's kill; the tree is settled (the
-    /// handle disarmed) by a root the walk saw running.
+    /// Mutants: the cleanup reports the walk's error before the root's kill; the handle stays armed
+    /// over an unvouched tree (its drop warns again).
     #[skuld::test]
-    async fn finish_elevated_leaves_a_walk_that_left_only_the_root_unvouched_and_the_handle_armed() {
+    async fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
         use crate::containment::treewalk::fault::LeftBehind;
         crate::log_capture::install();
-        for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+        for (left, failed) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
             let (child, _writer) = crate::test_child::held_treewalk_blocker_leaving_async(left);
             let mark = crate::log_capture::mark();
             let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
@@ -230,31 +230,25 @@ mod linux {
             let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
 
             assert!(fate.not_running(), "{left:?}: {fate:?}");
-            // A settled tree disarms the handle; an unsettled or unvouched one is looked at again when
-            // it drops, and that look is the armed drop's first act, whatever it then logs.
-            assert!(
-                drop_looks.seen(),
-                "{left:?}: the tree is not vouched for, so the handle is armed"
-            );
+            // A failed kill leaves the handle armed to try again: the look at the tree when it drops
+            // is the armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+            assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
             let cause = cause.to_string();
             assert_eq!(
                 cause.contains("its contained tree could not be killed"),
-                reported,
+                failed,
                 "{left:?}: {cause}"
             );
-            // The handle left armed by an unsettled tree warns again when it drops; the cleanup's own
-            // warn is the one counted.
-            let warns: Vec<_> = warns_since(mark)
-                .into_iter()
-                .filter(|warn| warn.starts_with("finish_elevated:"))
-                .collect();
-            assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
-            // The armed drop's one warn of the root-only walk.
-            let unvouched = warns_since(mark)
-                .into_iter()
+            assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
+            let warns = warns_since(mark);
+            let cleanup = warns.iter().filter(|warn| warn.starts_with("finish_elevated:")).count();
+            assert_eq!(cleanup, 1, "{left:?}: {warns:?}");
+            // The cleanup's one warn, and no drop's after it.
+            let unvouched = warns
+                .iter()
                 .filter(|warn| warn.contains("could not be vouched for"))
                 .count();
-            assert_eq!(unvouched, usize::from(!reported), "{left:?}");
+            assert_eq!(unvouched, usize::from(!failed), "{left:?}: {warns:?}");
         }
     }
 
