@@ -1273,7 +1273,7 @@ fn a_sweep_warns_once_of_a_member_that_refuses_the_kill(#[fixture(setuid)] _grou
 
     child.kill_tree().expect_err("the root refuses the kill");
 
-    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was sent no SIGKILL");
+    let warned = crate::log_capture::warns_since(mark, "was sent no SIGKILL");
     assert_eq!(warned.len(), 1, "{warned:?}");
     drop(stdin);
     assert!(child.wait().expect("the helper exits on EOF").success());

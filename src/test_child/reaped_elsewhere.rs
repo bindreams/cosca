@@ -161,15 +161,6 @@ pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
 #[cfg(feature = "tokio")]
 pub(crate) const MAY_STILL_RUN: &str = "may still be running";
 
-/// The text of every `warn` since `mark` on this thread.
-pub(crate) fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
-}
-
 /// A root `sh` that leaves a marker holder outside its process group, then sleeps. The holder is a
 /// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
 /// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It
