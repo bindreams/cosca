@@ -32,6 +32,7 @@
 //! SIGKILL that bystander.
 
 use crate::test_child::{await_member_ready, member_command};
+use crate::test_groups::{setuid, Group};
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -1252,7 +1253,7 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
 ///
 /// Mutants: the sweep does not warn of it; it warns once for each channel that finds the member.
 #[skuld::test]
-fn a_sweep_warns_once_of_a_member_that_refuses_the_kill(#[fixture(setuid)] _group: &crate::test_groups::Group) {
+fn a_sweep_warns_once_of_a_member_that_refuses_the_kill(#[fixture(setuid)] _group: &Group) {
     use std::io::Read as _;
     crate::log_capture::install();
     let mut cmd = crate::test_privilege::setuid_blocker_command();
