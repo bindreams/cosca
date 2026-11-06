@@ -2366,8 +2366,8 @@ impl Drop for Diagnosis {
 /// The `Unknown` arm of an identity read, for every spawn: the child is kept with no identity, and
 /// a containment that needs one fails the attach with the returned error. The error is the failed
 /// check's own when the read was `Found` and the check through the handle failed (its error is the
-/// source), and the read's `cause` otherwise. The keep is logged at `debug`. The diagnosis then
-/// warns only if a failed attach's teardown folds it in; a kept child owes no warn.
+/// source), and the read's `cause` otherwise. The keep is logged at `debug`. The failed check then
+/// warns only if a failed attach's teardown folds it in; a note added after the keep warns as usual.
 pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCause, why: &mut Diagnosis) -> Error {
     let error = match why.failed_check.take() {
         Some(source) => Error::Unassessable {
