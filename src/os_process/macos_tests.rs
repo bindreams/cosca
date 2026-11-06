@@ -5,7 +5,7 @@ use super::{ExitWatch, MacProcess};
 use crate::error::Error;
 use crate::identity::{uniq_info, ProcessId, ReadPurpose, UniqRead};
 use crate::os_process::drive::exited_held;
-use crate::os_process::{kill, open, terminate, terminate_by_id, Exit, OsProcess};
+use crate::os_process::{kill, open, terminate, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
 
@@ -73,7 +73,6 @@ fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let sends = crate::send_log::Capture::start();
     let other = id.with_other_value();
     assert!(open(other).unwrap().is_none(), "a wrong start token opens nothing");
-    terminate_by_id(other).unwrap();
     assert_eq!(sends.by_identity(), vec![], "nothing may be sent to a stranger");
     // Still running: the right identity opens and sees no exit.
     let p = open(id).unwrap().expect("the blocker is alive");
@@ -293,8 +292,7 @@ fn a_pid_zero_identity_never_reaches_kill() {
         open(bogus).expect("a pid-0 identity resolves to a stranger").is_none(),
         "a pid-0 identity opens nothing"
     );
-    crate::os_process::terminate_by_id(bogus).expect("same for the graceful signal");
-    // If either call had reached `kill(2)`, this process would have died with it.
+    // If the call had reached `kill(2)`, this process would have died with it.
     assert_eq!(
         crate::identity::ProcessId::current().is_alive(),
         crate::identity::Liveness::Alive,

@@ -9,7 +9,7 @@ use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`crate::tokio::drive::exited_by_id`]) or whole-tree
+/// performs — root-only ([`Child::exited_through_handle`]) or whole-tree
 /// ([`crate::tokio::wait::wait_tree_drained_dispatch`]). Outside test builds the seam module
 /// does not exist at all, so this compiles to a constant `None`. Duplicated (not shared) with
 /// the sync `crate::child::graceful` twin — see this module's own fault-seam doc comment for
@@ -92,8 +92,21 @@ impl Child {
         if mechanism.addresses_a_bare_pid() && !self.proc().pins_pid() {
             return Err(self.unpinned_pid_refusal("terminate"));
         }
-        let id = self.id();
-        crate::graceful::signal(mechanism, id, |_| crate::os_process::terminate_by_id(id))
+        crate::graceful::signal(mechanism, self.pid(), |sig| self.proc().signal(sig).map(drop))
+    }
+
+    /// Whether the child has exited by the time `timeout` is over (`None`: until it does), looked at
+    /// through the held handle. Non-reaping, so the pid stays pinned. A child with no handle left
+    /// to watch has exited.
+    async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
+        crate::tokio::drive::exited_opening(
+            || match self.os.proc.as_ref() {
+                Some(proc) => proc.held_os_process(self.pid()),
+                None => Ok(None),
+            },
+            timeout,
+        )
+        .await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -152,7 +165,7 @@ impl Child {
         // kill and reap still run (grace unobservable => escalate now); the watch error surfaces
         // only after they succeed (a kill/reap error wins — deliberate subsumption, mirroring
         // kill_tree's both-fail disposition).
-        let watch = crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await;
+        let watch = self.exited_through_handle(Some(grace)).await;
         if !matches!(watch, Ok(true)) {
             if let Err(e) = &watch {
                 log::debug!(
@@ -414,7 +427,7 @@ impl Child {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match crate::tokio::drive::exited_by_id(self.id(), Some(Duration::ZERO)).await {
+                Ok(_) => match self.exited_through_handle(Some(Duration::ZERO)).await {
                     Ok(exited) => (false, exited, None),
                     Err(e) => (false, false, Some(e)),
                 },
@@ -422,7 +435,7 @@ impl Child {
             }
         } else {
             // NON-reaping grace-wait on the root only.
-            match crate::tokio::drive::exited_by_id(self.id(), Some(grace)).await {
+            match self.exited_through_handle(Some(grace)).await {
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
             }

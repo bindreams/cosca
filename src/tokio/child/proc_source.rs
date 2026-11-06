@@ -18,6 +18,7 @@ use crate::containment::dispatch::TeardownCaller;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
+use crate::os_process::OsProcess;
 #[cfg(unix)]
 use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
@@ -648,6 +649,79 @@ impl ProcSource {
             ProcSource::Tokio { pidfd, .. } | ProcSource::Foreign { pidfd, .. } => {
                 crate::tokio::wait::pidfd_exited_within(std::os::fd::AsFd::as_fd(pidfd), grace).await
             }
+        }
+    }
+
+    /// The held handle read as an [`OsProcess`], to watch the child's exit through without reaping it
+    /// or looking its pid up. `pid` is the child's. `None`: nothing is left to watch, because the
+    /// child is reaped, by tokio or by someone else, and has exited.
+    ///
+    /// - **Linux:** a duplicate of the pidfd, which names the child whatever the forget knew.
+    /// - **macOS:** an exit watch armed on the pid, checked against the unique id read at spawn. A
+    ///   child forgotten as not shown to be ours has nothing here to name it: `Unassessable`.
+    /// - **Windows:** a duplicate of the process handle.
+    ///
+    /// A duplicate can fail (`EMFILE`, `ENFILE`, a handle-table limit): `Io`, which a watch reports as
+    /// a watch failure.
+    pub(crate) fn held_os_process(&self, pid: u32) -> Result<Option<Box<dyn OsProcess>>, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let pidfd = match self {
+                ProcSource::Foreign { fate, .. } if fate.gone() => return Ok(None),
+                ProcSource::Tokio { pidfd, .. } | ProcSource::Foreign { pidfd, .. } => pidfd,
+            };
+            let held = std::os::fd::AsFd::as_fd(pidfd)
+                .try_clone_to_owned()
+                .map_err(Error::Io)?;
+            Ok(Some(Box::new(crate::os_process::linux::LinuxProcess::new(
+                Some(pid),
+                held,
+            ))))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = pid;
+            match self {
+                ProcSource::Foreign { fate, .. } if fate.gone() => Ok(None),
+                ProcSource::Foreign { .. } => Err(Error::Unassessable {
+                    detail: "the child cannot be shown to be ours, and its exit cannot be watched".to_owned(),
+                    source: None,
+                }),
+                ProcSource::Tokio { child, .. } if child.id().is_none() => Ok(None),
+                ProcSource::Tokio {
+                    child,
+                    identity: Some(unique),
+                    ..
+                } => {
+                    let pid = child.id().expect("checked above");
+                    crate::os_process::macos::child::MacChild::new(pid, *unique)
+                        .map(|watched| Some(Box::new(watched) as Box<dyn OsProcess>))
+                }
+                ProcSource::Tokio { identity: None, .. } => {
+                    debug_assert!(false, "a spawn that left a child with no unique id fails");
+                    Err(Error::Unassessable {
+                        detail: "the child has no unique id, and its exit cannot be watched".to_owned(),
+                        source: None,
+                    })
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::BorrowedHandle;
+
+            let Some(raw) = self.raw_handle() else {
+                return Ok(None);
+            };
+            // SAFETY: the backend owns the process handle live while `raw_handle` is `Some`, and the
+            // borrow ends with the duplicate below.
+            let held = unsafe { BorrowedHandle::borrow_raw(raw) }
+                .try_clone_to_owned()
+                .map_err(Error::Io)?;
+            // Both backends' handles come from `CreateProcess`, which grants every right.
+            Ok(Some(Box::new(crate::os_process::windows::WindowsProcess::for_child(
+                held, pid,
+            ))))
         }
     }
 

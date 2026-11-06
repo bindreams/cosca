@@ -75,8 +75,7 @@ In order:
    `Attached::wait_drained`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
-   - The async `Child` (the PR that moves it onto the stack): `terminate_by_id`, which its
-     graceful path sends through; `GroupRoot::new` with no `ReapHold`; its tests' hooks,
+   - The async `Child` (the PR that moves it onto the stack): `GroupRoot::new` with no `ReapHold`; its tests' hooks,
      `exit_only::seams` and `signal::seams`, which `Process::kill`'s tests share.
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
      identity, `kill_and_reap_*` and `unique_report` still take by handle or number;

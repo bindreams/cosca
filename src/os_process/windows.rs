@@ -172,7 +172,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
 }
 
 /// Windows has no per-process graceful-termination signal.
-pub(super) fn terminate_unsupported() -> Error {
+pub(crate) fn terminate_unsupported() -> Error {
     Error::Unsupported {
         op: "graceful terminate (SIGTERM-equivalent)".into(),
         platform: "windows",

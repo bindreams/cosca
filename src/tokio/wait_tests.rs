@@ -1,5 +1,5 @@
-//! Unit tests for the reactor-native waits in `tokio::wait`, and for the by-id async wait
-//! (`tokio::drive::exited_by_id`) on real processes. In the library because they are
+//! Unit tests for the reactor-native waits in `tokio::wait`, and for the async exit watch
+//! (`tokio::drive::exited_opening`) on real processes opened by number. In the library because they are
 //! `pub(crate)`. Death-proof discipline: a generous grace on an already-dead child is a
 //! failure bound (the exit event precedes the call); `Duration::ZERO` on a live child makes
 //! the timeout branch deterministic.
@@ -13,7 +13,12 @@ use crate::test_child::Console;
 #[cfg(unix)]
 use super::armed_deadline_seam::Armed;
 use crate::identity::ProcessId;
-use crate::tokio::drive::exited_by_id;
+
+/// The exit watch these tests drive: [`exited_opening`](crate::tokio::drive::exited_opening) over the
+/// process `id` names. Nothing outside the tests watches by number.
+async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, crate::error::Error> {
+    crate::tokio::drive::exited_opening(|| crate::os_process::open(id), timeout).await
+}
 
 // A long-lived std child (leak-proof: killed + reaped by each test) that only a kill or a closed
 // stdin ends; see `test_child::BLOCKER_ARGV`. Each test calls `wait()` (which closes the piped
