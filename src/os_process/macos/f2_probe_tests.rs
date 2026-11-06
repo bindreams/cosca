@@ -1,7 +1,9 @@
 //! F2 measurement (throwaway, never merged): does `MacChild::exited`, the never-drained exit kqueue,
 //! wake for (a) a child reaped by someone else, (b) a child whose tracer died after the child's exit,
 //! (c) a child whose tracer died while the child was still exiting (the one route the code names for
-//! launchd to hold a zombie of a child this process forked)?
+//! launchd to hold a zombie of a child this process forked), and (d) the same as (c) when the tracer
+//! attaches only after a wait on the child is already blocked, for a `MacChild` (d) and for a
+//! `MacProcess` opened by identity (d')?
 //!
 //! Each test arms a `MacChild` while the child runs, parks a waiter thread in
 //! `drive::exited_until` (the kqueue wait `await_reapable` is compared against), drives the case
@@ -18,8 +20,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::MacChild;
-use crate::identity::{uniq_info, ReadPurpose, UniqRead};
-use crate::os_process::drive::exited_until;
+use crate::error::Error;
+use crate::identity::{uniq_info, ProcessId, ReadPurpose, UniqRead};
+use crate::os_process::drive::{exited_held, exited_until};
 use crate::os_process::{Exit, OsProcess};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_child::wait_until_zombie;
@@ -66,7 +69,12 @@ fn banner(label: &str, tl: &mut String) {
 
 /// One zero-timeout look at the exit kqueue.
 fn look(mac: &MacChild) -> &'static str {
-    match mac.exited() {
+    look_os(mac)
+}
+
+/// [`look`] through the [`OsProcess`] trait.
+fn look_os(process: &dyn OsProcess) -> &'static str {
+    match process.exited() {
         Ok(Exit::Exited) => "Exited",
         Ok(Exit::Running(_)) => "Running",
         Err(_) => "Err",
@@ -292,15 +300,10 @@ fn lingering_pair() -> (TcpStream, TcpStream) {
     (held, peer)
 }
 
-/// (c) The tracee is still EXITING (its exit is stuck closing a lingering socket, so it is not yet a
-/// zombie) when its tracer dies. The code (`wait::macos::tracer_watch`) says XNU then gives it to
-/// launchd with `p_oppid` still the test, and withholds its `NOTE_EXIT` from the test. Measured:
-/// the state `ps` shows before and after, who holds it, whether the exit kqueue wakes.
-#[skuld::test]
-fn f2_probe_tracee_exiting_when_tracer_dies(#[fixture(tracer_group)] _group: &Group) {
-    let mut tl = String::from("F2 TIMELINE:");
-    banner("F2(c)", &mut tl);
-    let me = std::process::id();
+/// A child whose exit is stuck closing a lingering socket (see [`lingering_pair`]): `(child, stdin,
+/// peer)`. The child exits when `stdin` is dropped, then hangs, not yet a zombie, until `peer` is
+/// dropped.
+fn spawn_lingering_exit() -> (std::process::Child, std::process::ChildStdin, TcpStream) {
     let (held, peer) = lingering_pair();
     let mut cmd = crate::test_child::held_std_killable_blocker();
     let fd = held.as_raw_fd();
@@ -315,9 +318,22 @@ fn f2_probe_tracee_exiting_when_tracer_dies(#[fixture(tracer_group)] _group: &Gr
         });
     }
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee");
-    // The tracee is now the only holder of `held`, so its exit is the last close.
+    // The child is now the only holder of `held`, so its exit is the last close.
     drop(held);
     let stdin = child.stdin.take().expect("piped stdin");
+    (child, stdin, peer)
+}
+
+/// (c) The tracee is still EXITING (its exit is stuck closing a lingering socket, so it is not yet a
+/// zombie) when its tracer dies. The code (`wait::macos::tracer_watch`) says XNU then gives it to
+/// launchd with `p_oppid` still the test, and withholds its `NOTE_EXIT` from the test. Measured:
+/// the state `ps` shows before and after, who holds it, whether the exit kqueue wakes.
+#[skuld::test]
+fn f2_probe_tracee_exiting_when_tracer_dies(#[fixture(tracer_group)] _group: &Group) {
+    let mut tl = String::from("F2 TIMELINE:");
+    banner("F2(c)", &mut tl);
+    let me = std::process::id();
+    let (child, stdin, peer) = spawn_lingering_exit();
     let pid = child.id();
     let mac = MacChild::new(pid, unique_of(pid)).expect("arm the child");
     let mut helper = tracer::start(Mode::Hold).attach_unheld(pid);
@@ -379,4 +395,173 @@ fn f2_probe_tracee_exiting_when_tracer_dies(#[fixture(tracer_group)] _group: &Gr
     std::mem::forget(helper);
     drop(child);
     panic!("{tl}");
+}
+
+/// How (d) and (d') block on the process: the real wait, bounded by [`WAKE_BOUND`] as the failure
+/// report. `OwnedChild::exited_by` is `exited_until` over its `OsProcess`, so (d) calls that.
+type WaitFn = fn(&dyn OsProcess) -> Result<bool, Error>;
+
+/// Drives case (d) on `process`, a look at the child `pid`: `stdin` ends the child, whose exit then
+/// hangs until `peer` is dropped. A waiter blocks in `wait`; only once its first look has run
+/// (`block_probe::on_blocking` fires just before its blocking `poll`) does a tracer attach; then the
+/// child begins to exit, and the tracer is killed while it is mid-exit. Ends in `panic!` with the
+/// timeline.
+fn late_attach_case(
+    label: &'static str,
+    mut tl: String,
+    process: &dyn OsProcess,
+    wait: WaitFn,
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    peer: TcpStream,
+) -> ! {
+    let me = std::process::id();
+    let pid = child.id();
+    let pending = tracer::start(Mode::Hold);
+    note!(tl, "{label}: test pid = {me}, tracee pid = {pid}, no tracer yet");
+    note!(
+        tl,
+        "{label}: look before the wait = {}, ps = {:?}",
+        look_os(process),
+        ps_state(pid)
+    );
+
+    let t0 = Instant::now();
+    let mut peer = Some(peer);
+    let mut helper_slot = None;
+    std::thread::scope(|s| {
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        s.spawn(move || {
+            // Fires on this thread, after the wait's first look and just before its blocking `poll`.
+            // If the wait returns without blocking, the hook never runs and the channel closes.
+            let _armed = crate::wait::block_probe::on_blocking(move || _ = blocked_tx.send(()));
+            let result = wait(process).map_err(|e| e.to_string());
+            _ = tx.send(Woke {
+                result,
+                at: Instant::now(),
+            });
+        });
+        match blocked_rx.recv() {
+            Ok(()) => note!(
+                tl,
+                "{label}: the wait is about to block at {} ms, look = {}, ps = {:?}",
+                ms(t0, Instant::now()),
+                look_os(process),
+                ps_state(pid)
+            ),
+            Err(_) => note!(
+                tl,
+                "{label}: the wait returned without blocking, at {} ms",
+                ms(t0, Instant::now())
+            ),
+        }
+
+        let mut helper = pending.attach_unheld(pid);
+        assert_eq!(helper.recv(), Report::Attached);
+        let tracer_pid = helper.helper_pid();
+        note!(
+            tl,
+            "{label}: tracer helper pid = {tracer_pid} attached at {} ms, look = {}, ps = {:?}",
+            ms(t0, Instant::now()),
+            look_os(process),
+            ps_state(pid)
+        );
+        helper_slot = Some(helper);
+
+        drop(stdin);
+        // Until the tracee reads as exiting (E) or already a zombie (Z): the exit has begun.
+        let began = watch(&mut tl, &format!("{label} exit"), t0, pid, |sample| {
+            let stat = sample.split_whitespace().next().unwrap_or("");
+            (stat.contains('E') || stat.contains('Z')).then(|| format!("stat {stat:?}: the exit has begun"))
+        });
+        note!(
+            tl,
+            "{label}: exit begun = {}, look = {}, ps = {:?}",
+            began.is_some(),
+            look_os(process),
+            ps_state(pid)
+        );
+
+        // SAFETY: the helper is this test's own unreaped child.
+        let sent = unsafe { libc::kill(tracer_pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(sent, 0, "{}", std::io::Error::last_os_error());
+        note!(tl, "{label}: tracer killed at {} ms", ms(t0, Instant::now()));
+
+        // Until ps names a holder other than the dead tracer, or the bound passes.
+        watch(&mut tl, &format!("{label} holder"), t0, pid, |sample| {
+            holder_verdict(sample, me, tracer_pid)
+        });
+        note!(tl, "{label}: look after the tracer's death = {}", look_os(process));
+
+        // Let the exit finish: the peer goes away with unread data, which resets the connection.
+        drop(peer.take());
+        note!(tl, "{label}: peer closed at {} ms", ms(t0, Instant::now()));
+        // Until no process has the pid (launchd reaped it), or the zombie reads as the test's.
+        watch(&mut tl, &format!("{label} end"), t0, pid, |sample| {
+            if sample.is_empty() {
+                return Some("no process has the pid (reaped by someone)".to_string());
+            }
+            let stat = sample.split_whitespace().next().unwrap_or("");
+            (stat.contains('Z') && ppid_of(sample) == Some(me.to_string().as_str()))
+                .then(|| "a zombie the test holds".to_string())
+        });
+        let woke = rx.recv().expect("the waiter reports");
+        report(label, &mut tl, t0, &woke);
+    });
+    note!(
+        tl,
+        "{label}: final look = {}, ps = {:?}",
+        look_os(process),
+        ps_state(pid)
+    );
+    drop(peer);
+    // The killed helper fails `Session`'s clean-exit check, so its teardown is skipped.
+    std::mem::forget(helper_slot);
+    drop(child);
+    panic!("{tl}");
+}
+
+/// (d) A tracer attaches to the child only after a wait on its `MacChild` has blocked, then dies
+/// while the child is mid-exit. The deputy deduces a hang (XNU withholds the `NOTE_EXIT`, and the
+/// exit kqueue is not armed for the attach); this measures it.
+#[skuld::test]
+fn f2_probe_attach_after_wait_started(#[fixture(tracer_group)] _group: &Group) {
+    let mut tl = String::from("F2 TIMELINE:");
+    banner("F2(d)", &mut tl);
+    let (child, stdin, peer) = spawn_lingering_exit();
+    let pid = child.id();
+    let mac = MacChild::new(pid, unique_of(pid)).expect("arm the child");
+    late_attach_case(
+        "F2(d)",
+        tl,
+        &mac,
+        |p| exited_until(p, Some(Instant::now() + WAKE_BOUND)),
+        child,
+        stdin,
+        peer,
+    )
+}
+
+/// (d') The same against a `MacProcess` opened by identity (`os_process::open`), waited on through
+/// `drive::exited_held`. The test is still the child's parent, so this is not a non-parent look.
+#[skuld::test]
+fn f2_probe_attach_after_wait_started_held(#[fixture(tracer_group)] _group: &Group) {
+    let mut tl = String::from("F2 TIMELINE:");
+    banner("F2(d')", &mut tl);
+    let (child, stdin, peer) = spawn_lingering_exit();
+    let pid = child.id();
+    let id = ProcessId::of(pid).found().expect("identity of the live child");
+    let process = crate::os_process::open(id)
+        .expect("open the child by identity")
+        .expect("the child is alive");
+    late_attach_case(
+        "F2(d')",
+        tl,
+        &*process,
+        |p| exited_held(p, Some(WAKE_BOUND)),
+        child,
+        stdin,
+        peer,
+    )
 }
