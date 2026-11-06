@@ -253,7 +253,6 @@ fn held_names_another_pid(kernel: &dyn Kernel, pid: RawPid, held: std::os::fd::B
     )
 }
 
-/// The key `look` shows for `pid`.
 fn key_of(kernel: &dyn Kernel, pid: RawPid, look: Look) -> (Resolved<Key>, UnknownCause) {
     match look {
         Look::Pidfs(ino) => (Resolved::Found(Key::Pidfs(ino)), UnknownCause::default()),

@@ -97,12 +97,9 @@ pub(crate) enum KillOutcome {
     Terminated,
     /// The pid holds no process, or holds a different one - nothing to kill.
     AlreadyGone,
-    /// A live-or-unassessable process we did not signal, with why: [`Error::Unassessable`] when its
-    /// identity could not be read at kill time, [`Error::Unsupported`] when the OS refuses the pidfd
-    /// it is read through, [`Error::Io`] with the OS error when the OS refused the signal. On Linux
-    /// any other error the proof of the pidfd finished with is wrapped as `Unassessable`, so an `Io`
-    /// here is always the OS's answer to the signal. The only outcome that can leave a process running. It warns of nothing: the caller
-    /// that reports the outcome ([`hard_kill`]) or cannot ([`warn_if_not_attempted`]) says it.
+    /// A live-or-unassessable process we did not signal, with why. The only outcome that can leave a
+    /// process running. Warns of nothing: the caller that reports it ([`hard_kill`]) or cannot
+    /// ([`warn_if_not_attempted`]) says it.
     NotAttempted(Error),
 }
 

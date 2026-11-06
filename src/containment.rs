@@ -83,7 +83,9 @@ pub enum Containment {
     /// `pkexec` wrapper never reports this variant, since that wrapper closes every descriptor
     /// >= 3 before exec; an already-elevated caller's spawn has no such wrapper and can.
     FdMarker,
-    /// Identity-aware descendant enumeration at teardown. Misses reparented orphans.
+    /// Identity-aware descendant enumeration at teardown. Misses reparented orphans. It names the
+    /// tree by the root's identity, so a spawn whose root's identity the OS refuses to report
+    /// (see [`Child::id`](crate::Child::id)) fails with that error rather than returning one.
     TreeWalk,
     /// A nested member of an ancestor's containment group/job: this child joined the
     /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
@@ -241,7 +243,8 @@ pub enum ContainMode {
     /// than to no containment.
     Strongest,
     /// Identity-aware process-tree walk at teardown — selectable directly (e.g.
-    /// for a child known to `setsid` out of a process group).
+    /// for a child known to `setsid` out of a process group). The spawn fails if the OS refuses to
+    /// report the root's identity.
     TreeWalk,
     /// Unix session containment via `setsid`: the child becomes a session leader
     /// and process-group leader, detached from any controlling terminal.

@@ -47,8 +47,8 @@ pub(crate) struct HeldTeardown<'a> {
 /// child, the child's fate, and the child itself if `how.disposition` hands back one that still runs.
 ///
 /// A child that is not a front is killed and reaped. A front is sent nothing and looked at: reaped
-/// if it has exited, waited for if `how.subtree`, where its leaf's kill went, shows that kill
-/// reached it, and otherwise running. `why` leads the teardown's one warn, if it has one.
+/// if it has exited, waited for (warning once past 1 s) if `how.subtree`, where its leaf's kill went,
+/// shows that kill reached it, and otherwise running. `why` leads the teardown's one warn, if it has one.
 #[cfg(target_os = "linux")]
 pub(crate) fn tear_down_held(
     child: OwnedChild,

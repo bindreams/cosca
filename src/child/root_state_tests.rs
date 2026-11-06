@@ -62,7 +62,7 @@ mod linux {
             child.attached.signals_a_group(),
             "the test needs a group named by the root's pid, which ContainMode::Session makes"
         );
-        let root = child.id();
+        let root = child.id().expect(crate::test_child::IDENTITY_READ);
         drop(writer);
         let reuser = reap_behind_and_reuse(root.pid());
         let _read = crate::child::fault::force_root_reads(crate::identity::Resolved::Found(root));
@@ -251,6 +251,7 @@ mod linux {
             .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
         let view = crate::containment::DropView::read(
             crate::containment::dispatch::TeardownCaller::Drop,
+            child.pid(),
             child.id,
             || child.proc.state(),
             &child.tree_killed,
