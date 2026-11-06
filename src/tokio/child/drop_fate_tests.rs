@@ -188,9 +188,11 @@ async fn the_drop_of_an_unproven_backend_whose_root_its_pidfd_shows_gone_says_go
 }
 
 /// Linux: a kill refused through the kept pidfd of a backend forgotten unproven leaves the child
-/// possibly running, and the drop's one warn names the refused kill.
+/// possibly running, and the drop's one warn names the refused kill and says it is left running and
+/// unreaped: tokio's `Child` was forgotten, so nothing reaps it.
 ///
-/// Mutant: the backend counts as reaped, so the refused kill is not named.
+/// Mutants: the backend counts as reaped, so the refused kill is not named; the warn says only that
+/// the child is left running.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_refused_kill_of_an_unproven_backend_at_drop_is_named() {
@@ -204,11 +206,125 @@ async fn a_refused_kill_of_an_unproven_backend_at_drop_is_named() {
     drop(refused);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
-    assert_eq!(
-        crate::log_capture::records_since(mark, "could not be terminated on drop").len(),
-        1,
-        "the refused kill is named once"
+    let warns = crate::log_capture::records_since(mark, "could not be terminated on drop");
+    assert_eq!(warns.len(), 1, "the refused kill is named once: {warns:?}");
+    let wording = format!(
+        "async child {} could not be terminated on drop{}",
+        id.pid(),
+        crate::child::owned::teardown::LEAVING_RUNNING
     );
+    assert!(warns[0].contains(&wording), "the warn says {wording:?}: {warns:?}");
+}
+
+/// Linux: a refused kill of a child whose handle cannot be asked at the drop's own look (it could
+/// not say ours at the read, showed ours at the forget's look, and cannot say at the gate of the
+/// `try_wait`) leaves the child to the forget that follows, so its warn says it is left running and
+/// unreaped.
+///
+/// Mutant: the warn says only "leaving it running", which tokio's orphan queue would make true of a
+/// child it holds.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_refused_kill_whose_look_at_drop_fails_is_left_running_and_unreaped() {
+    use crate::os_process::child::PeekOutcome;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = live(true);
+    let id = child.id();
+    let refused = super::fault::force_kill_failure();
+    let fail = || Err(std::io::Error::other("forced peek failure 6c4e"));
+    let looks = force_peeks([fail(), Ok(PeekOutcome::Running), fail(), fail()]);
+    let mark = crate::log_capture::mark();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
+    let left = crate::wait::exit_only::seams::forced_peeks_left();
+    drop(looks);
+    drop(refused);
+    collect(id, writer);
+    assert_eq!(
+        fate,
+        ChildFate::Unknown,
+        "a look that failed shows nothing of the child"
+    );
+    assert_eq!(
+        left, 0,
+        "the read, the forget's look, the gate and the forget's second look"
+    );
+    let warns = crate::log_capture::records_since(mark, "could not be terminated on drop");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let wording = format!(
+        "async child {} could not be terminated on drop{}",
+        id.pid(),
+        crate::child::owned::teardown::LEAVING_RUNNING
+    );
+    assert!(warns[0].contains(&wording), "the warn says {wording:?}: {warns:?}");
+}
+
+/// Linux: a refused kill of a child every look shows running and ours is not followed by a forget:
+/// the drop releases tokio's `Child`, whose orphan queue reaps it once it exits. The warn says only
+/// that it is left running, not that it is unreaped.
+///
+/// Mutant: the warn says "and unreaped" whatever became of tokio's `Child`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_refused_kill_of_a_child_released_to_tokio_is_left_running_and_not_unreaped() {
+    use crate::os_process::child::PeekOutcome;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = live(true);
+    let id = child.id();
+    let refused = super::fault::force_kill_failure();
+    let looks = force_peeks((0..4).map(|_| Ok(PeekOutcome::Running)));
+    let mark = crate::log_capture::mark();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
+    drop(looks);
+    drop(refused);
+    // Tokio's orphan queue collects the child once its stdin closes.
+    drop(writer);
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    let warns = crate::log_capture::records_since(mark, "could not be terminated on drop");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let wording = format!(
+        "async child {} could not be terminated on drop; leaving it running",
+        id.pid()
+    );
+    assert!(warns[0].ends_with(&wording), "the warn ends {wording:?}: {warns:?}");
+}
+
+/// Linux: a refused kill of a child the drop's own look shows reaped by someone else is gone: the
+/// warn does not call it running.
+///
+/// Mutant: the warn says "leaving it running" of a child the gate showed reaped elsewhere.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_refused_kill_of_a_child_shown_reaped_elsewhere_at_drop_says_it_is_gone() {
+    use crate::os_process::child::{Foreign, PeekOutcome};
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = live(true);
+    let id = child.id();
+    let refused = super::fault::force_kill_failure();
+    // The read and the forget's look show it ours; the gate shows it reaped elsewhere.
+    let looks = force_peeks([
+        Ok(PeekOutcome::Running),
+        Ok(PeekOutcome::Running),
+        Ok(PeekOutcome::Foreign(Foreign::Gone)),
+    ]);
+    let mark = crate::log_capture::mark();
+    let fate = child.tear_down_now(TeardownCaller::Drop);
+    let left = crate::wait::exit_only::seams::forced_peeks_left();
+    drop(looks);
+    drop(refused);
+    // The gate forgot tokio's `Child`, so the real child is ours to collect.
+    collect(id, writer);
+    assert_eq!(fate, ChildFate::Gone);
+    assert_eq!(left, 0, "the read, the forget's look and the gate");
+    let warns = crate::log_capture::records_since(mark, "could not be terminated on drop");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    let wording = format!(
+        "async child {} could not be terminated on drop; it is already gone",
+        id.pid()
+    );
+    assert!(warns[0].ends_with(&wording), "the warn ends {wording:?}: {warns:?}");
 }
 
 /// Linux: a backend forgotten unproven is asked of its kept pidfd whether the child runs, so a

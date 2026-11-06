@@ -171,7 +171,7 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
         // A failed kill leaves the handle armed to try again: the look at the tree when it drops is the
-        // armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+        // armed drop's first act, whatever it then logs. No tree kill is made early over an unvouched tree.
         assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
         let cause = cause.to_string();
         assert_eq!(
@@ -196,14 +196,14 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
 }
 
 /// A failed spawn's cleanup that hands the root back (its exit was not collected) over a walk that
-/// left only the root: an unvouched tree is not a failed kill, so the cleanup does not retry it, says
-/// once that the tree could not be vouched for, and the handle is disarmed.
+/// left only the root: an unvouched tree is not a failed kill, so the cleanup makes no early tree
+/// kill over it, says once that the tree could not be vouched for, and the handle is disarmed.
 ///
-/// Mutants: the cleanup retries over an unvouched tree and reports "the retry failed too"; the warn
-/// is not said, or said again by the drop.
+/// Mutants: the cleanup makes the drop's tree kill early over an unvouched tree and reports it
+/// made early or failed too; the warn is not said, or said again by the drop.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back() {
+fn finish_elevated_makes_no_early_tree_kill_over_an_unvouched_tree_when_it_hands_the_root_back() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -220,7 +220,10 @@ fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back(
 
     let cause = cause.to_string();
     assert!(cause.contains("could not be vouched for"), "{cause}");
-    assert!(!cause.contains("retry"), "{cause}");
+    assert!(
+        !cause.contains("made early") && !cause.contains("failed too"),
+        "{cause}"
+    );
     assert!(!drop_looks.seen(), "the handle is disarmed");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
     let warns = warns_since(mark);
@@ -229,21 +232,26 @@ fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back(
         .filter(|warn| warn.contains("could not be vouched for"))
         .count();
     assert_eq!(unvouched, 1, "{warns:?}");
-    assert!(warns.iter().all(|warn| !warn.contains("retry")), "{warns:?}");
+    assert!(
+        warns
+            .iter()
+            .all(|warn| !warn.contains("made early") && !warn.contains("failed too")),
+        "{warns:?}"
+    );
     handed_back.wait();
 }
 
 /// A failed spawn's cleanup whose first tree kill left the root running (its own kill of the root was
-/// refused) and whose root was reaped by someone else before the retry: the retry finds no root to
-/// walk, and the one report says what the first walk found, that it saw the root running, not that
-/// "something" was left. The handle is disarmed (the root is handed back).
+/// refused) and whose root was reaped by someone else before the drop's tree kill, made early: that
+/// kill finds no root to walk, and the one report says what the first walk found, that it saw the
+/// root running, not that "something" was left. The handle is disarmed (the root is handed back).
 ///
 /// Mutants: the kind of the unvouched tree is not the latest fact (the root seen running), so the
-/// retry's text names an earlier kill's leftovers instead; the handle stays armed, so its drop says
-/// it again.
+/// early tree kill's text names an earlier kill's leftovers instead; the handle stays armed, so its
+/// drop says it again.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_finds_it_gone() {
+fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree_kill_finds_it_gone() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -253,7 +261,7 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
         f.signals([refused()])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
-    // The first walk killed the root: someone else reaps it before the retry, which finds no root.
+    // The first walk killed the root: someone else reaps it before the early tree kill, which finds no root.
     let pid = child.id().pid();
     let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         crate::test_child::wait_until_zombie(pid);
@@ -273,8 +281,8 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
     );
     let found = "the root an earlier walk found running is gone";
     assert!(
-        cause.contains("the retry failed too") && cause.contains(found),
-        "the retry's answer: {cause}"
+        cause.contains("the drop's tree kill, made early, failed too") && cause.contains(found),
+        "the early tree kill's answer: {cause}"
     );
     assert!(!cause.contains("left something running"), "{cause}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
@@ -290,16 +298,16 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
 }
 
 /// A failed spawn's cleanup whose first tree kill left a member that refuses the kill, whose root
-/// kill ended the root without collecting its exit (so it is handed back and the kill is retried), and
-/// whose retry finds the member gone but its walk leaves the root, whose own end the cleanup saw: the
-/// retry ends unvouched, not failed. The cleanup's one report says what the first attempt left and
-/// that the retry could not vouch for the tree. Needs the `setuid` group: the member is a setuid-root
-/// helper.
+/// kill ended the root without collecting its exit (so it is handed back and the drop's tree kill is
+/// made early), and whose early tree kill finds the member gone but its walk leaves the root, whose
+/// own end the cleanup saw: the early tree kill ends unvouched, not failed. The cleanup's one report
+/// says what the first attempt left and that the early tree kill could not vouch for the tree. Needs
+/// the `setuid` group: the member is a setuid-root helper.
 ///
-/// Mutant: a retry that ends unvouched is dropped from the report (as a skipped one is).
+/// Mutant: an early tree kill that ends unvouched is dropped from the report (as a skipped one is).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_the_first_kill(
+fn finish_elevated_reports_an_early_tree_kill_that_ends_unvouched_after_a_member_refused_the_first_kill(
     #[fixture(setuid)] _group: &Group,
 ) {
     use crate::containment::treewalk::fault::{force_incomplete_once, LeftBehind};
@@ -320,7 +328,7 @@ fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_th
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
     // The first walk killed the root and was refused by the member. Let the member exit, and wait until
-    // nothing names it, and make the retry's walk leave the root, before the retry.
+    // nothing names it, and make the early tree kill's walk leave the root, before that kill.
     let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         drop(writer);
         while std::path::Path::new(&format!("/proc/{member}")).exists() {
@@ -338,10 +346,10 @@ fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_th
         "the first failure: {cause}"
     );
     assert!(
-        cause.contains("; on the retry, ") && cause.contains("could not be vouched for"),
-        "the retry's answer: {cause}"
+        cause.contains("; on the drop's tree kill, made early, ") && cause.contains("could not be vouched for"),
+        "the early tree kill's answer: {cause}"
     );
-    assert!(!cause.contains("the retry failed too"), "{cause}");
+    assert!(!cause.contains("failed too"), "{cause}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
     let warns = warns_since(mark);
     let tree: Vec<_> = warns
@@ -350,7 +358,7 @@ fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_th
         .collect();
     assert_eq!(tree.len(), 1, "{warns:?}");
     assert!(
-        tree[0].contains("; on the retry, ") && tree[0].contains("could not be vouched for"),
+        tree[0].contains("; on the drop's tree kill, made early, ") && tree[0].contains("could not be vouched for"),
         "{warns:?}"
     );
     handed_back.wait();
@@ -658,7 +666,7 @@ fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() 
 
 /// A child in a stand-in cgroup leaf whose first `cgroup.kill` write fails (a write to a directory),
 /// with the write end of its stdin, the leaf's path and its `cgroup.kill`. The leaf's own `Drop` is
-/// disarmed, so only the handle's drop may retry the kill. The directory is returned to outlive them.
+/// disarmed, so only the handle's drop may make the tree kill again. The directory is returned to outlive them.
 #[cfg(target_os = "linux")]
 fn child_in_a_leaf_whose_kill_fails() -> (
     crate::Child,
@@ -721,7 +729,7 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
         drop_records
             .iter()
             .any(|(level, text)| *level == log::Level::Debug && text.contains("contained-tree teardown")),
-        "the drop retried the kill and said so at debug: {drop_records:?}"
+        "the drop made its tree kill and said so at debug: {drop_records:?}"
     );
 }
 
@@ -732,13 +740,13 @@ fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
 /// Mutant: the cleanup disarms the handle whatever became of the tree.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
+fn a_failed_tree_kill_is_followed_by_the_drops_own_tree_kill() {
     use crate::child::spawn::fault;
 
     crate::log_capture::install();
     let (child, writer, leaf_path, kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
-    // The failure ends once the root is killed: the retry finds a file it can write. The root is
-    // released there too: a kill that sent nothing exits 0.
+    // The failure ends once the root is killed: the drop's tree kill finds a file it can write. The
+    // root is released there too: a kill that sent nothing exits 0.
     let reaps = fault::record_teardown_reaps();
     let healed = kill_file.clone();
     let _hook = fault::set_between_kill_and_wait(move || {
@@ -753,30 +761,30 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
     assert_eq!(
         std::fs::read(&kill_file).expect("read cgroup.kill"),
         crate::containment::cgroup::KILL_PAYLOAD,
-        "the handle's drop must retry the tree kill ({err:?})"
+        "the handle's drop must make its tree kill ({err:?})"
     );
     assert_eq!(
         crate::log_capture::levels_since(mark, &crate::child::spawn::teardown_warn_marker(&leaf_path)),
         [log::Level::Warn],
-        "the failed kill is reported once, and the retry adds nothing"
+        "the failed kill is reported once, and the drop's tree kill adds nothing"
     );
     reaps.assert_killed();
 }
 
 /// A tree kill that fails in a cleanup whose root kill is refused: the root is handed back and the
-/// handle disarmed, so no drop retries the tree kill. The cleanup retries it before it hands the
-/// root back.
+/// handle disarmed, so no drop makes the tree kill. The cleanup makes the drop's tree kill, early,
+/// before it hands the root back.
 ///
-/// Mutant: the cleanup hands the root back without retrying a failed tree kill.
+/// Mutant: the cleanup hands the root back without making the drop's tree kill after a failed one.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_failed_tree_kill_is_retried_before_the_root_is_handed_back() {
+fn the_drops_tree_kill_is_made_early_when_a_failed_one_precedes_a_handed_back_root() {
     use crate::child::spawn::fault;
 
     crate::log_capture::install();
     let (mut child, writer, _leaf_path, kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
     child.proc.script_over(|f| f.signals([refused()]));
-    // The failure ends once the root's kill is refused: the retry finds a file it can write.
+    // The failure ends once the root's kill is refused: the early tree kill finds a file it can write.
     let healed = kill_file.clone();
     let _hook = fault::set_between_kill_and_wait(move || {
         std::fs::remove_dir(&healed).expect("remove the directory");
@@ -790,18 +798,19 @@ fn a_failed_tree_kill_is_retried_before_the_root_is_handed_back() {
     assert_eq!(
         std::fs::read(&kill_file).expect("read cgroup.kill"),
         crate::containment::cgroup::KILL_PAYLOAD,
-        "the cleanup must retry the tree kill"
+        "the cleanup must make the drop's tree kill"
     );
     handed_back.wait();
 }
 
-/// A retry that killed the tree is not reported as a failed teardown: the one warn says the kill took
-/// a retry and names the first failure, and the error no longer says the tree was not killed.
+/// The drop's tree kill, made early, that killed the tree is not reported as a failed teardown: the
+/// one warn says the early kill was needed and names the first failure, and the error does not say
+/// the tree was not killed.
 ///
 /// Mutant: the warn keeps the first failure's text, or the error keeps its note.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_tree_kill_that_worked_on_the_retry_is_reported_as_a_retry_not_a_failure() {
+fn a_tree_kill_that_worked_when_made_early_is_reported_as_such_not_as_a_failure() {
     use crate::child::spawn::fault;
 
     crate::log_capture::install();
@@ -824,8 +833,8 @@ fn a_tree_kill_that_worked_on_the_retry_is_reported_as_a_retry_not_a_failure() {
         .find(|warn| warn.contains(&leaf_path.display().to_string()))
         .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
     assert!(
-        warn.contains("took a retry") && warn.contains(&first),
-        "the warn says the kill took a retry, after: {first}: {warn}"
+        warn.contains("needed the drop's tree kill, made early") && warn.contains(&first),
+        "the warn says the early tree kill was needed, after: {first}: {warn}"
     );
     assert!(
         !warn.contains(crate::child::spawn::TREE_TEARDOWN_WARN),
@@ -838,16 +847,18 @@ fn a_tree_kill_that_worked_on_the_retry_is_reported_as_a_retry_not_a_failure() {
     handed_back.wait();
 }
 
-/// A retry that fails again puts its error in the one warn and in the error, after the first's.
+/// The drop's tree kill, made early, that fails too puts its error in the one warn and in the error,
+/// after the first's.
 ///
-/// Mutant: the retry's error is dropped.
+/// Mutant: the early kill's error is dropped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_tree_kill_that_failed_on_the_retry_too_names_both_failures() {
+fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
     crate::log_capture::install();
     let (mut child, writer, leaf_path, _kill_file, _dir) = child_in_a_leaf_whose_kill_fails();
     child.proc.script_over(|f| f.signals([refused()]));
-    // The first write fails with `EIO`, the retry's with `EISDIR` (`cgroup.kill` is a directory).
+    // The first write fails with `EIO`, the early tree kill's with `EISDIR` (`cgroup.kill` is a
+    // directory).
     let _first = crate::containment::cgroup::fault::fail_next_kill_write();
     let mark = crate::log_capture::mark();
 
@@ -855,7 +866,7 @@ fn a_tree_kill_that_failed_on_the_retry_too_names_both_failures() {
     let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     let first = std::io::Error::from_raw_os_error(libc::EIO).to_string();
-    let retry = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    let early = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
     let warns = warns_since(mark);
     let warn = warns
         .iter()
@@ -863,19 +874,20 @@ fn a_tree_kill_that_failed_on_the_retry_too_names_both_failures() {
         .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
     for text in [warn.as_str(), cause.to_string().as_str()] {
         assert!(
-            text.contains(&first) && text.contains(&format!("the retry failed too ({retry})")),
-            "both failures, first then the retry's: {text}"
+            text.contains(&first) && text.contains(&format!("the drop's tree kill, made early, failed too ({early})")),
+            "both failures, first then the early kill's: {text}"
         );
     }
     handed_back.wait();
 }
 
 /// A tree kill skipped because the root's state is unknown, and a root whose kill is refused and
-/// which is handed back: the retry skips again and kills nothing, so the error still says the tree
-/// was not killed. The tree is a ppid walk from the root's number, which an unknown root skips on
-/// every kernel; a process group does not skip on Linux 6.9+, where the root's pidfd names it.
+/// which is handed back: the early tree kill skips again and kills nothing, so the error still says
+/// the tree was not killed. The tree is a ppid walk from the root's number, which an unknown root
+/// skips on every kernel; a process group does not skip on Linux 6.9+, where the root's pidfd names
+/// it.
 ///
-/// Mutant: the retry's `Ok` clears the note whether or not it killed the tree.
+/// Mutant: the early kill's `Ok` clears the note whether or not it killed the tree.
 #[skuld::test]
 fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
     crate::log_capture::install();

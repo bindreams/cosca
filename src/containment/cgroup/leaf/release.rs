@@ -13,7 +13,7 @@ impl CgroupLeaf {
     /// the levels of `Drop`: `debug`, or `warn` only if a kill attempt failed. A drain that could
     /// not be read is reported as that, at the same level.
     ///
-    /// Never calls [`abandon`](Self::abandon_before_verdict), `disarm` or `wait_drained_then_warn`:
+    /// Never calls [`abandon_before_verdict`](Self::abandon_before_verdict), `disarm` or `wait_drained_then_warn`:
     /// the first two would clear the kill record this reads, and the last is the wait.
     pub(crate) fn release_without_waiting(mut self) {
         debug_assert!(self.report.is_none(), "a released leaf has taken its placement verdict");
@@ -22,21 +22,18 @@ impl CgroupLeaf {
         self.abandoned = true;
 
         let armed = self.armed.load(Ordering::Relaxed);
-        let killed = self.killed.load(Ordering::Relaxed);
+        let killed = self.kill_landed();
         let first = match self.rmdir_leaf() {
             Ok(()) => return,
             Err(e) if removed_after_drain(&e) => return,
             Err(e) => e,
         };
         if !self.child_entered() {
-            warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
-            );
+            self.report_left_unkilled(false, &first, None);
             return;
         }
         if armed || killed {
-            if let Err(e) = self.hard_kill() {
+            if let Err(e) = self.kill_unless_written() {
                 warn_leaf_left_behind(
                     &self.leaf_path,
                     format_args!("rmdir failed ({first}) on release; cgroup.kill failed ({e})"),
@@ -52,12 +49,12 @@ impl CgroupLeaf {
             Ok(_) => None,
             Err(e) => Some(e),
         };
-        // A failed read says nothing about the drain: it is reported as what it is.
-        let cause = match &unread {
-            Some(e) => format!("its drain could not be read ({e})"),
-            None => "the tree it killed has not drained".to_owned(),
-        };
         if armed || killed {
+            // A failed read says nothing about the drain: it is reported as what it is.
+            let cause = match &unread {
+                Some(e) => format!("its drain could not be read ({e})"),
+                None => "the tree it killed has not drained".to_owned(),
+            };
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!(
@@ -65,21 +62,8 @@ impl CgroupLeaf {
                      wait_tree().await before dropping to have the leaf removed"
                 ),
             );
-        } else if self.kill_attempt_failed.load(Ordering::Relaxed) {
-            warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!(
-                    "rmdir failed ({first}); its cgroup.kill failed, so the tree that opted out of \
-                     Drop's own teardown is still running{}",
-                    unread.as_ref().map_or(String::new(), |_| format!("; {cause}"))
-                ),
-            );
         } else {
-            log::debug!(
-                "cgroup leaf {} is left behind for a tree that opted out of teardown ({first}){}",
-                self.leaf_path.display(),
-                unread.as_ref().map_or(String::new(), |_| format!("; {cause}"))
-            );
+            self.report_left_unkilled(true, &first, unread.as_ref());
         }
     }
 }
