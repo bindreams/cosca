@@ -130,7 +130,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
-    use crate::containment::dispatch::HardKillForDropOutcome;
+    use crate::containment::dispatch::TreeKillOutcome;
 
     let Err(write_err) = written else {
         return Ok(child);
@@ -158,7 +158,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         skipped = kill.skip_note(&view);
         kill
     });
-    let tree_failure = match tree.as_ref().map(HardKillForDropOutcome::result) {
+    let tree_failure = match tree.as_ref().map(TreeKillOutcome::result) {
         Some(Err(left)) => Some(left.first().to_string()),
         _ => None,
     };
@@ -177,8 +177,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     } else {
         let root = match gate {
             // Not asked again after the kill: a killed front can read as neither exited nor in its
-            // cgroup, between leaving the cgroup's member list and becoming a zombie.
-            crate::elevation::front::Gate::CgroupOnly if child.tree_killed.is_set() => {
+            // cgroup, between leaving the cgroup's member list and becoming a zombie. The kill's own
+            // outcome says it landed; the handle's mark is set by `settle`, below.
+            crate::elevation::front::Gate::CgroupOnly if tree.as_ref().is_some_and(TreeKillOutcome::completed) => {
                 child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
             }
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
@@ -257,7 +258,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
     let subject = child.attached.teardown_subject();
-    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
+    let (mut tree_note, tree_warn) = report_tree_teardown(tree, None, &subject);
     report.tree = tree_warn;
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
@@ -287,7 +288,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 tree_note.push_str(&too);
                 match report.tree.as_mut() {
                     Some(warn) => warn.push_str(&too),
-                    None => report.tree = report_tree_teardown(Some(Err(again)), &subject).1,
+                    None => report.tree = report_tree_teardown(Some(Err(again)), None, &subject).1,
                 }
             }
         }
@@ -411,18 +412,31 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// `Attached::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok)`: it worked.
-/// Neither is reported.
+/// Neither is reported. `drain`: the failure of the wait for the killed tree to drain, which the
+/// async cleanup makes after a kill that landed. It is reported beside the kill's outcome, not as it.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(
     tree: Option<Result<(), crate::containment::dispatch::Unsettled>>,
+    drain: Option<&Error>,
     subject: &dyn std::fmt::Display,
 ) -> (String, Option<String>) {
-    let Some(Err(e)) = tree else {
+    let (mut notes, mut warns) = (Vec::new(), Vec::new());
+    if let Some(Err(e)) = tree {
+        notes.push(format!("its contained tree could not be killed ({subject}: {e})"));
+        warns.push(e.to_string());
+    }
+    if let Some(e) = drain {
+        notes.push(format!(
+            "its contained tree was killed, but its drain could not be watched ({subject}: {e})"
+        ));
+        warns.push(format!("the kill succeeded, but its drain could not be watched ({e})"));
+    }
+    if notes.is_empty() {
         return (String::new(), None);
-    };
+    }
     (
-        format!("; its contained tree could not be killed ({subject}: {e})"),
-        Some(format!("{TREE_TEARDOWN_WARN} ({subject}): {e}")),
+        format!("; {}", notes.join("; ")),
+        Some(format!("{TREE_TEARDOWN_WARN} ({subject}): {}", warns.join("; "))),
     )
 }
 
@@ -1172,7 +1186,7 @@ impl LateTree {
         let mut succeeded_after = false;
         for sweep in self.sweeps.drain(..) {
             match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {
-                (Err(left), None) => failed = Some(left.said()),
+                (Err(left), None) => failed = Some(left.to_string()),
                 (Err(_), Some(_)) => succeeded_after = false,
                 (Ok(()), failed) => succeeded_after = failed.is_some(),
             }

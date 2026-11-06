@@ -202,11 +202,11 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 }
 
 /// [`unqueryable`] for the ordered read of `pid` that left `Unknown` with `cause`: the subject is
-/// `label pid`, or the parent whose proof failed when `cause` blames it, in which case the error
-/// also names `pid`, the read that was left unanswered.
+/// `label pid`, or the parent whose proof failed when `cause` blames it. A caller that shows the
+/// error apart from `pid` names `pid` itself (`Walk::complete_members`).
 pub(crate) fn unqueryable_read(label: &str, pid: RawPid, cause: UnknownCause) -> Error {
     match cause.blamed_parent() {
-        Some(parent) => unqueryable(&format!("ppid {parent}"), cause).with_note(&format!("reading {label} {pid}")),
+        Some(parent) => unqueryable(&format!("ppid {parent}"), cause),
         None => unqueryable(&format!("{label} {pid}"), cause),
     }
 }

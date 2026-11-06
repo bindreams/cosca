@@ -285,7 +285,12 @@ fn a_child_whose_parent_cannot_be_proved_is_reported_by_an_error_naming_both() {
                 walked.unassessed
             );
         };
-        assert!(names_both(detail), "{depth:?}: {detail}");
+        // The entry is the cause, which names the parent; the candidate is named once, by the entry's
+        // pid, and by each caller that shows the cause: not by the cause itself.
+        assert!(
+            detail.contains(&format!("ppid {ROOT} identity could not be read")) && !detail.contains("reading"),
+            "{depth:?}: {detail}"
+        );
         let err = walked.complete_members().expect_err("the list would be short");
         let Error::Unassessable { detail, .. } = &err else {
             panic!("{depth:?}: expected Unassessable, got {err:?}");

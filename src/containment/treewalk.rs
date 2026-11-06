@@ -129,23 +129,36 @@ pub(crate) struct Walk {
 
 impl Walk {
     /// The members, for a query that must not take a short list for the tree: `Err` when the walk
-    /// could not assess a candidate, the first one's error, with the others' pids in its note. It logs
-    /// nothing; the caller decides.
+    /// could not assess a candidate, the first one's error, with each other's pid and cause in its
+    /// note. It logs nothing; the caller decides.
     pub(crate) fn complete_members(self) -> Result<Vec<ProcessId>, Error> {
         let Walk { members, unassessed } = self;
         let mut unassessed = unassessed.into_iter();
-        let Some((_, first)) = unassessed.next() else {
+        let Some((pid, first)) = unassessed.next() else {
             return Ok(members);
         };
-        let others: Vec<String> = unassessed.map(|(pid, _)| format!("pid {pid}")).collect();
+        // The error names the candidate when its own read failed, and the parent when that one's
+        // proof did: the note says which candidate was dropped either way.
+        let first = first.with_note(&format!("reading pid {pid}"));
+        let others: Vec<String> = unassessed
+            .map(|(pid, why)| format!("pid {pid} ({})", cause_text(&why)))
+            .collect();
         Err(if others.is_empty() {
             first
         } else {
             first.with_note(&format!(
                 "the walk could not assess these either: {}",
-                others.join(", ")
+                others.join("; ")
             ))
         })
+    }
+}
+
+/// What an unassessed candidate's error says, without the variant's wrapping.
+fn cause_text(why: &Error) -> String {
+    match why {
+        Error::Unassessable { detail, .. } => detail.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -155,11 +168,7 @@ impl Walk {
 #[cfg(unix)]
 pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Error)]) {
     for (pid, why) in unassessed {
-        let why = match why {
-            Error::Unassessable { detail, .. } => detail.clone(),
-            other => other.to_string(),
-        };
-        log::warn!("treewalk: pid {pid} dropped from the walk ({why})");
+        log::warn!("treewalk: pid {pid} dropped from the walk ({})", cause_text(why));
     }
 }
 

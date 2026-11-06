@@ -438,15 +438,17 @@ impl DropView {
 
 /// Whether a `Child` handle has already killed its tree completely (`kill_tree`, the sweep of
 /// `graceful_shutdown_tree`, a failed elevated spawn's cleanup). A later drop that skips a
-/// number-named kill then has nothing left behind to warn about.
+/// number-named kill then has nothing left behind to warn about. Only [`Attached::settle`] sets it,
+/// and only a later call reads it (`DropView`): a caller that has just run a kill reads the kill's
+/// own [`TreeKillOutcome`].
 #[derive(Debug, Default)]
 pub(crate) struct TreeKilled(std::sync::atomic::AtomicBool);
 
 impl TreeKilled {
     /// Record a complete kill: `Ok`, and for a `TreeWalk` no unresolved member. A kill that failed,
     /// left members behind, or was skipped must not be marked, so a later drop still warns about
-    /// them. A `Child`'s kill marks through [`Attached::settle`] alone.
-    pub(crate) fn mark(&self) {
+    /// them. A `Child`'s kill marks through [`Attached::settle`] alone, so this is private to it.
+    fn mark(&self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -500,21 +502,23 @@ pub(crate) struct Unkilled {
 
 impl Unkilled {
     /// The first member left: a member before the root. A kill that completed is not an `Unkilled`,
-    /// so there is one.
-    pub(crate) fn first(&self) -> &Error {
-        self.members
-            .first()
-            .or(self.root.as_ref())
+    /// so there is one. Written once for the borrowed and the owned case.
+    fn first_of<T>(members: impl IntoIterator<Item = T>, root: Option<T>) -> T {
+        members
+            .into_iter()
+            .next()
+            .or(root)
             .expect("an incomplete kill left a member")
+    }
+
+    /// The first member left.
+    pub(crate) fn first(&self) -> &Error {
+        Self::first_of(&self.members, self.root.as_ref())
     }
 
     /// What `kill_tree` returns: the first member left.
     pub(crate) fn into_error(self) -> Error {
-        self.members
-            .into_iter()
-            .next()
-            .or(self.root)
-            .expect("an incomplete kill left a member")
+        Self::first_of(self.members, self.root)
     }
 
     /// What is still left once the root's own handle has had its say: `Ok` when nothing is, else the
@@ -551,15 +555,6 @@ pub(crate) struct Unsettled {
 }
 
 impl Unsettled {
-    /// All of it in one text: the first member, then each other.
-    pub(crate) fn said(&self) -> String {
-        std::iter::once(&self.first)
-            .chain(&self.others)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
     /// The error a caller returns: the first member left. The caller's one report is that error, and a
     /// `warn`, led by `caller`, for each of the others.
     pub(crate) fn report(self, caller: &str) -> Error {
@@ -570,15 +565,18 @@ impl Unsettled {
     }
 }
 
+/// All of it in one text: the first member, then each other.
 impl std::fmt::Display for Unsettled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.said())
+        write!(f, "{}", self.first)?;
+        self.others.iter().try_for_each(|other| write!(f, "; {other}"))
     }
 }
 
-/// What a tree kill that may skip did ([`Attached::hard_kill_for_drop`]).
+/// What a tree kill did ([`Attached::hard_kill_for_drop`], [`Attached::hard_kill`]): the one value
+/// [`Attached::settle`] turns into what is left and into the handle's mark.
 #[derive(Debug)]
-pub(crate) enum HardKillForDropOutcome {
+pub(crate) enum TreeKillOutcome {
     /// The kill ran, or there was nothing to kill (a Linux process group with no member left); `Err`
     /// is what it left.
     Ran(Result<(), Unkilled>),
@@ -596,20 +594,35 @@ pub(crate) enum HardKillForDropOutcome {
     },
 }
 
-impl HardKillForDropOutcome {
+/// A kill that ran: what [`Attached::hard_kill`] and the paths that send by hand return.
+impl From<Result<(), Unkilled>> for TreeKillOutcome {
+    fn from(result: Result<(), Unkilled>) -> TreeKillOutcome {
+        TreeKillOutcome::Ran(result)
+    }
+}
+
+impl TreeKillOutcome {
     /// What the kill that ran, or the sweep by identity of a skipped one, left.
     pub(crate) fn result(&self) -> &Result<(), Unkilled> {
         match self {
-            HardKillForDropOutcome::Ran(result) | HardKillForDropOutcome::Skipped { holders: result, .. } => result,
+            TreeKillOutcome::Ran(result) | TreeKillOutcome::Skipped { holders: result, .. } => result,
         }
+    }
+
+    /// Whether the kill ran and left nothing, the root included: the tree is killed. This is the
+    /// kill's own answer, which a caller reads instead of the handle's mark ([`TreeKilled`]), which
+    /// only [`Attached::settle`] sets.
+    #[cfg(unix)]
+    pub(crate) fn completed(&self) -> bool {
+        matches!(self, TreeKillOutcome::Ran(Ok(())))
     }
 
     /// What the kill skipped, as an action, when it was skipped.
     #[cfg(unix)]
     pub(crate) fn skipped(&self) -> Option<&str> {
         match self {
-            HardKillForDropOutcome::Skipped { action, .. } => Some(action),
-            HardKillForDropOutcome::Ran(_) => None,
+            TreeKillOutcome::Skipped { action, .. } => Some(action),
+            TreeKillOutcome::Ran(_) => None,
         }
     }
 
@@ -802,16 +815,15 @@ impl Attached {
         }
     }
 
-    /// [`hard_kill`](Self::hard_kill) for a caller with no root to kill after it, settled by
-    /// [`settle`](Self::settle) with the root not ended: the first member left, if any.
+    /// [`hard_kill`](Self::hard_kill) for a caller with no root to kill after it, settled and reported
+    /// as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not ended.
     #[cfg(unix)]
     pub(crate) fn hard_kill_settled(
         &self,
         killed: &TreeKilled,
         root: &crate::containment::GroupRoot<'_>,
     ) -> Result<(), Error> {
-        self.settle(killed, HardKillForDropOutcome::Ran(self.hard_kill(root)), false)
-            .map_err(|left| left.first)
+        self.settle_for_kill_tree(killed, self.hard_kill(root), false)
     }
 
     /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk` refusal to walk: the
@@ -837,12 +849,12 @@ impl Attached {
     pub(crate) fn settle(
         &self,
         killed: &TreeKilled,
-        outcome: HardKillForDropOutcome,
+        outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<(), Unsettled> {
-        let (ran, result) = match outcome {
-            HardKillForDropOutcome::Ran(result) => (true, result),
-            HardKillForDropOutcome::Skipped { holders, .. } => (false, holders),
+        let (ran, result) = match outcome.into() {
+            TreeKillOutcome::Ran(result) => (true, result),
+            TreeKillOutcome::Skipped { holders, .. } => (false, holders),
         };
         if let Err(left) = result {
             debug_assert!(
@@ -865,7 +877,7 @@ impl Attached {
         walk: Result<(), Unkilled>,
         root_ended: bool,
     ) -> Result<(), Error> {
-        self.settle(killed, HardKillForDropOutcome::Ran(walk), root_ended)
+        self.settle(killed, walk, root_ended)
             .map_err(|left| left.report("kill_tree"))
     }
 
@@ -874,9 +886,10 @@ impl Attached {
     pub(crate) fn settle_for_drop(
         &self,
         killed: &TreeKilled,
-        outcome: HardKillForDropOutcome,
+        outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Option<String> {
+        let outcome = outcome.into();
         let refused = self.hard_kill_refused_to_walk(outcome.result());
         self.settle(killed, outcome, root_ended).err().map(|left| {
             let mut said = format!("contained-tree teardown did not fully succeed: {left}");
@@ -1030,18 +1043,18 @@ impl Attached {
     /// (`RootState::Unknown`): nothing then shows the number still names the root.
     ///
     /// Logs nothing above `debug`: what a skip left undone is returned in
-    /// [`HardKillForDropOutcome::Skipped`], for the caller's one report, and a skipped kill never
+    /// [`TreeKillOutcome::Skipped`], for the caller's one report, and a skipped kill never
     /// marks the tree killed ([`settle`](Self::settle)).
     #[cfg(unix)]
     pub(crate) fn hard_kill_for_drop(
         &self,
         view: &DropView,
         root: &crate::containment::GroupRoot<'_>,
-    ) -> HardKillForDropOutcome {
+    ) -> TreeKillOutcome {
         let action = match self.drop_reach(view, root) {
-            DropReach::Kill => return HardKillForDropOutcome::Ran(self.hard_kill(root)),
+            DropReach::Kill => return self.hard_kill(root).into(),
             #[cfg(target_os = "linux")]
-            DropReach::GroupGone => return HardKillForDropOutcome::Ran(Ok(())),
+            DropReach::GroupGone => return TreeKillOutcome::Ran(Ok(())),
             DropReach::Skip(action) => action,
         };
         let why = view.why_number_untrusted();
@@ -1062,7 +1075,7 @@ impl Attached {
                 .map_err(Unkilled::from),
             _ => Ok(()),
         };
-        HardKillForDropOutcome::Skipped { action, holders }
+        TreeKillOutcome::Skipped { action, holders }
     }
 
     /// What a drop, or a failed spawn's cleanup, does to the tree after its look at the root
@@ -1113,10 +1126,10 @@ impl Attached {
     /// A tree path's signal while the root's number cannot be trusted (`root` is `Unpinned` or
     /// `Unknown`): what a drop does. Nothing that names the tree by the root's number runs (the
     /// `killpg`, the walk from the root's pid, the root's kill by pid). A macOS fd marker still
-    /// signals its holders, which are named by identity; `Ok` there says every holder was reached,
-    /// and for `Kill` the tree is marked killed. Any other number-named mechanism has no channel
-    /// left: `Unassessable`, with what was skipped. `None` for a mechanism that names the tree
-    /// some other way, which signals as usual.
+    /// signals its holders, which are named by identity; `Ok` there says every holder was reached.
+    /// Any other number-named mechanism has no channel left: `Unassessable`, with what was skipped.
+    /// `None` for a mechanism that names the tree some other way, which signals as usual. The caller
+    /// settles a `Kill`'s answer ([`TreeCall`](crate::child::TreeCall)).
     #[cfg(target_os = "macos")]
     pub(crate) fn signal_tree_untrusted(
         &self,
@@ -1125,7 +1138,6 @@ impl Attached {
         root_pid: u32,
         op: &str,
         earlier: Option<&str>,
-        killed: &TreeKilled,
     ) -> Option<Result<(), Error>> {
         let skipped = self.named_by_root_number(root_pid, signal.verb())?;
         let why = crate::signal::why_untrusted(root);
@@ -1141,42 +1153,27 @@ impl Attached {
         };
         let except = m.root().filter(|_| matches!(root, crate::signal::RootState::Unpinned));
         log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
-        let result = match signal {
+        Some(match signal {
             TreeSignal::Kill => m.hard_kill_holders_only(except),
             TreeSignal::Term => m.terminate_holders_only(except),
-        };
-        if result.is_ok() && matches!(signal, TreeSignal::Kill) {
-            killed.mark();
-        }
-        Some(result)
+        })
     }
 
     /// Send `signal` to the tree through what names it by identity alone, for a root that is
     /// reaped: a macOS fd marker's holders, named by the pipe they hold, which no reuse of a pid
-    /// redirects. `None` for a mechanism with no such channel. For `Kill`, an `Ok` marks the tree
-    /// killed only if `mark` is set.
+    /// redirects. `None` for a mechanism with no such channel. The caller settles a `Kill`'s answer.
     #[cfg(unix)]
     #[cfg_attr(
         not(target_os = "macos"),
         allow(unused_variables, reason = "only a macOS fd marker names its tree by identity")
     )]
-    pub(crate) fn signal_holders_only(
-        &self,
-        signal: TreeSignal,
-        mark: Option<&TreeKilled>,
-    ) -> Option<Result<(), Error>> {
+    pub(crate) fn signal_holders_only(&self, signal: TreeSignal) -> Option<Result<(), Error>> {
         match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => {
-                let result = match signal {
-                    TreeSignal::Kill => m.hard_kill_holders_only(None),
-                    TreeSignal::Term => m.terminate_holders_only(None),
-                };
-                if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
-                    killed.mark();
-                }
-                Some(result)
-            }
+            Attached::FdMarker(m) => Some(match signal {
+                TreeSignal::Kill => m.hard_kill_holders_only(None),
+                TreeSignal::Term => m.terminate_holders_only(None),
+            }),
             _ => None,
         }
     }
@@ -1192,26 +1189,21 @@ impl Attached {
     }
 
     /// Send `signal` to a macOS fd marker's group and holders, with no walk from the root's pid: for
-    /// a root this process reaped, whose pid names no process. `None` for any other mechanism. For
-    /// `Kill`, an `Ok` marks the tree killed only if `mark` is set.
+    /// a root this process reaped, whose pid names no process. `None` for any other mechanism. The
+    /// caller settles a `Kill`'s answer.
     #[cfg(target_os = "macos")]
     pub(crate) fn signal_group_and_holders(
         &self,
         signal: TreeSignal,
-        mark: Option<&TreeKilled>,
         root: &crate::containment::GroupRoot<'_>,
     ) -> Option<Result<(), Error>> {
         let Attached::FdMarker(m) = self else {
             return None;
         };
-        let result = match signal {
+        Some(match signal {
             TreeSignal::Kill => m.hard_kill_group_and_holders(root),
             TreeSignal::Term => m.terminate_group_and_holders(root),
-        };
-        if let (Ok(()), TreeSignal::Kill, Some(killed)) = (&result, signal, mark) {
-            killed.mark();
-        }
-        Some(result)
+        })
     }
 
     /// Whether [`signal_tree_untrusted`](Self::signal_tree_untrusted) has a channel left to signal

@@ -873,7 +873,7 @@ fn leave_unverified_front(
 /// have started. The waits for the root and for the tree's drain each warn once past 1 s.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
-    use crate::containment::dispatch::{HardKillForDropOutcome, Unkilled};
+    use crate::containment::dispatch::TreeKillOutcome;
 
     let Err(write_err) = written else {
         return Ok(child);
@@ -888,23 +888,20 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let tree: Option<HardKillForDropOutcome> = (child.containment().can_teardown() && !front_closed).then(|| {
+    // The drain watch's failure after a kill that landed: its own fact, beside the kill's outcome.
+    let mut drain_failure = None;
+    let tree: Option<TreeKillOutcome> = (child.containment().can_teardown() && !front_closed).then(|| {
         let kill = child.kill_tree_members_unless_reaped(&view);
         skipped = kill.skip_note(&view);
-        if kill.result().is_err() {
-            return kill;
-        }
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
         // naming a `wait_tree` the caller never gets.
-        match child.block_until_members_drained() {
-            Ok(()) => kill,
-            Err(e) => HardKillForDropOutcome::Ran(Err(Unkilled::from(Error::Containment {
-                detail: format!("the kill succeeded, but its drain could not be watched ({e})"),
-            }))),
+        if kill.completed() {
+            drain_failure = child.block_until_members_drained().err();
         }
+        kill
     });
-    let tree_failure = match tree.as_ref().map(HardKillForDropOutcome::result) {
+    let tree_failure = match tree.as_ref().map(TreeKillOutcome::result) {
         Some(Err(left)) => Some(left.first().to_string()),
         _ => None,
     };
@@ -927,7 +924,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let root = match gate {
             // Not asked again after the kill: a killed front can read as neither exited nor in its
             // cgroup, between leaving the cgroup's member list and becoming a zombie.
-            crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
+            // The kill's own outcome says it landed; the handle's mark is set by `settle`, below.
+            crate::elevation::front::Gate::CgroupOnly if tree.as_ref().is_some_and(TreeKillOutcome::completed) => {
                 child.cgroup_kill_reached().map(|()| Sent::Delivered)
             }
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
@@ -991,7 +989,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree.is_none() || child.tree_killed() || (skipped.is_some() && view.leaves_root_alone());
-    let (mut tree_note, tree_warn) = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
+    let (mut tree_note, tree_warn) =
+        crate::child::spawn::report_tree_teardown(tree, drain_failure.as_ref(), &child.teardown_subject());
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }

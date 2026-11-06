@@ -1113,9 +1113,7 @@ impl Child {
         #[cfg(not(unix))]
         {
             let mut left = Vec::new();
-            let tree = crate::containment::dispatch::HardKillForDropOutcome::Ran(
-                self.attached.hard_kill(&crate::containment::GroupRoot::none()),
-            );
+            let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
             let torn = self.proc.tear_down(
                 Some(self.id),
                 Kill {

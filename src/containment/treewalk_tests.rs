@@ -149,6 +149,27 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
     assert_eq!(pids(got), [400]);
 }
 
+/// `complete_members` is the first unassessed candidate's error, naming that candidate, and each
+/// other's pid and cause. Mutants: "the others' causes are dropped"; "the first is not named".
+#[skuld::test]
+fn complete_members_names_every_unassessed_candidate_with_its_cause() {
+    let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
+    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
+        Err(Error::Unassessable {
+            detail: format!("cause of {pid}"),
+            source: None,
+        })
+    });
+    let first = got.unassessed[0].0;
+    let error = got.complete_members().expect_err("three candidates were not assessed");
+    let said = error.to_string();
+    assert!(said.contains(&format!("cause of {first}")), "{said}");
+    assert!(said.contains(&format!("reading pid {first}")), "{said}");
+    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
+        assert!(said.contains(&format!("pid {other} (cause of {other})")), "{said}");
+    }
+}
+
 /// A snapshot that lists the unreadable pid twice reads it once and counts it once.
 #[skuld::test]
 fn a_duplicate_edge_to_an_unreadable_candidate_is_one_unassessed_entry() {

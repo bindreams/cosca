@@ -859,7 +859,7 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
         ("cosca-report-not-tried", None, false),
     ] {
         let mark = crate::log_capture::mark();
-        let (note, warn) = super::report_tree_teardown(tree, &name);
+        let (note, warn) = super::report_tree_teardown(tree, None, &name);
         assert_eq!(
             warn.as_deref()
                 .is_some_and(|text| text.contains(super::TREE_TEARDOWN_WARN) && text.contains(name)),
@@ -882,6 +882,45 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
             "{name}: it logs nothing itself"
         );
     }
+}
+
+/// A drain watch that failed after a kill that landed is reported on its own: the kill's failure,
+/// if there was one, stays in the report beside it.
+///
+/// Mutant: the drain's failure replaces the kill's, or is not reported when the kill worked.
+#[cfg(unix)]
+#[skuld::test]
+fn report_tree_teardown_reports_a_failed_drain_beside_the_kill() {
+    let name = "cosca-report-drain";
+    let drain = Error::Containment {
+        detail: "forced drain failure".into(),
+    };
+    let (note, warn) = super::report_tree_teardown(Some(Ok(())), Some(&drain), &name);
+    let warn = warn.expect("a drain that could not be watched is reported");
+    assert!(
+        warn.contains(super::TREE_TEARDOWN_WARN) && warn.contains("forced drain failure"),
+        "{warn}"
+    );
+    assert!(
+        note.contains("its drain could not be watched") && note.contains(name),
+        "{note}"
+    );
+    assert!(!note.contains("could not be killed"), "the kill worked: {note}");
+
+    let failed = Some(Err(crate::containment::dispatch::Unsettled {
+        first: Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR)),
+        others: Vec::new(),
+    }));
+    let (note, warn) = super::report_tree_teardown(failed, Some(&drain), &name);
+    let warn = warn.expect("both are reported");
+    assert!(
+        warn.contains("forced drain failure") && warn.contains("Is a directory"),
+        "{warn}"
+    );
+    assert!(
+        note.contains("could not be killed") && note.contains("its drain could not be watched"),
+        "{note}"
+    );
 }
 
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.

@@ -86,3 +86,50 @@ async fn a_failed_elevation_writes_drain_warns_once_past_1s() {
     assert_eq!(levels, [log::Level::Warn], "exactly one warn, at warn");
     assert!(removed, "the drained leaf is removed");
 }
+
+/// A drain watch that fails after a kill that landed does not make the kill a failure: the error
+/// says the tree was killed and the watch could not be followed, and the one warn says the same.
+///
+/// Mutant: the cleanup makes the watch's failure the kill's outcome (the tree "could not be killed").
+#[skuld::test]
+async fn a_drain_watch_that_fails_after_a_landed_kill_is_reported_beside_it() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+
+    let (detail, warns) = std::thread::scope(|s| {
+        s.spawn(move || {
+            let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
+            let (fake, leaf) = linux::fake_leaf("cosca-failed-write-unwatchable-drain", true);
+            let child = linux::contained_by(child, leaf);
+            // The kill lands; then the file the drain watch reads is garbage.
+            let _corrupted = leaf_fault::set_after_kill_write({
+                let events = fake.events.clone();
+                move || std::fs::write(&events, "garbage\n").expect("corrupt cgroup.events")
+            });
+            let mark = crate::log_capture::mark();
+            let (err, _fate) =
+                crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+                    .expect_err("a failed write fails the spawn")
+                    .expect_may_have_started_with();
+            teardown.assert_killed();
+            (
+                err.to_string(),
+                crate::log_capture::records_since_on_current_thread(
+                    mark,
+                    "tree teardown after a failed password write",
+                ),
+            )
+        })
+        .join()
+        .expect("the cleanup")
+    });
+
+    assert!(detail.contains("its drain could not be watched"), "{detail}");
+    assert!(!detail.contains("could not be killed"), "the kill landed: {detail}");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("its drain could not be watched"), "{warns:?}");
+}
