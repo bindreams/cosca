@@ -208,6 +208,31 @@ pub enum Error {
         #[source]
         source: Option<std::io::Error>,
     },
+    /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
+    /// it left behind, was not. `source` says why: the member's identity could not be read, at the
+    /// walk or when the kill came ([`Error::Unassessable`]), or the OS refused the kill
+    /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
+    /// for [`Process::kill`](crate::Process::kill)). It names the first member left; the call warns of
+    /// the others. The root is named only when it is the sole member left.
+    ///
+    /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
+    /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
+    /// the tree. A `TreeWalk` handle's retry kills the members it left again by identity, and a member
+    /// whose identity was never read is reported again. `Process::kill_tree` walks again.
+    ///
+    /// **macOS.** There [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) is the fd marker's
+    /// sweep, which reports a member it could not reach as [`Error::Containment`] or
+    /// [`Error::Unassessable`] without a `source`. This variant comes from the ppid walk alone:
+    /// `Process::kill_tree`, and a `TreeWalk` handle on Linux and Windows.
+    #[error("pid {pid} was not killed: {source}{}", .note.as_deref().map(|note| format!("; {note}")).unwrap_or_default())]
+    MemberNotKilled {
+        pid: u32,
+        #[source]
+        source: Box<Error>,
+        /// What the spawn's cleanup adds of the child's fate, when it is the one that returns the
+        /// error. It leaves `source` as it is, which keeps the refusal's OS error.
+        note: Option<String>,
+    },
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
     /// Not "gone": the thread is running. `source` is the OS error that refused it; compare
@@ -323,6 +348,17 @@ pub enum ChildFate {
     Gone,
     /// cosca cannot say what became of the child.
     Unknown,
+}
+
+impl ChildFate {
+    /// Whether the child is not running: killed, reaped, or already gone. The one meaning of "the
+    /// root is dead" that settles a tree kill's report, as [`SweepFailure::killed_root`] has it for a
+    /// kill through the handle.
+    ///
+    /// [`SweepFailure::killed_root`]: crate::containment::dispatch::SweepFailure::killed_root
+    pub(crate) fn not_running(&self) -> bool {
+        matches!(self, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone)
+    }
 }
 
 impl std::fmt::Display for ChildFate {
@@ -448,8 +484,9 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code. An
+    /// [`Error::MemberNotKilled`] takes the note in its own `note`, so its `source` (and the OS error
+    /// that is part of its contract) is untouched.
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
         match self {
@@ -474,6 +511,17 @@ impl Error {
             Error::Unassessable { detail, source } => Error::Unassessable {
                 detail: append(detail),
                 source,
+            },
+            // The note goes beside `source`, not into it: a refused kill's OS error is the contract of
+            // this variant, and wrapping it would hide it (an `io::Error` with a payload has no OS code).
+            Error::MemberNotKilled {
+                pid,
+                source,
+                note: earlier,
+            } => Error::MemberNotKilled {
+                pid,
+                source,
+                note: Some(earlier.map_or_else(|| note.to_owned(), append)),
             },
             Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
                 pid,

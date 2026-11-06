@@ -1,7 +1,7 @@
 //! The tree paths' one look at the root, and what each sends by the root's number after it. Shared
 //! by the sync and async `kill_tree`, `terminate_tree` and `graceful_shutdown_tree`.
 
-use crate::containment::dispatch::TreeSignal;
+use crate::containment::dispatch::{TreeKillOutcome, TreeSignal, Unkilled};
 use crate::containment::{Attached, GroupRoot, TreeKilled};
 use crate::error::Error;
 use crate::identity::RawPid;
@@ -142,7 +142,7 @@ fn own_reaped_free(attached: &Attached) -> RootNumber {
 
 /// One tree call: the tree of `attached`, whose root is `pid`, sent `signal` by the operation
 /// `op`, which already sent `earlier` (so an error never claims the operation sent nothing).
-/// `killed` is marked by a `Kill` that reached the whole tree.
+/// A `Kill` that reached the whole tree is settled into `killed` ([`TreeCall::answered`]).
 pub(crate) struct TreeCall<'a> {
     pub(crate) attached: &'a Attached,
     pub(crate) pid: RawPid,
@@ -197,11 +197,13 @@ impl TreeCall<'_> {
     /// handle's own reap ([`RootNumber::NoWalk`]). What names the tree by identity still runs: a
     /// macOS fd marker's holders, named by the pipe they hold.
     ///
+    /// Each answer a `Kill` gives of a tree that was reached is [`answered`](Self::answered).
+    ///
     /// - `Untrusted` (macOS): `Attached::signal_tree_untrusted`.
-    /// - `NoWalk` (macOS): the group and the holders. A `Kill` that is `Ok` marks the tree killed.
+    /// - `NoWalk` (macOS): the group and the holders.
     /// - `Empty`: the holders are signalled, and the call is their sweep's answer (`Ok` with no
-    ///   holders channel). A `Kill` that is `Ok` marks the tree killed.
-    /// - `GroupGone` (Linux): nothing is sent, the call is `Ok`, and a `Kill` marks the tree killed.
+    ///   holders channel).
+    /// - `GroupGone` (Linux): nothing is sent, and the call is `Ok`.
     /// - `MayNameAnother`: [`number_skipped`](Self::number_skipped), after `signal_root` when the
     ///   handle still names the root exactly.
     ///
@@ -223,17 +225,9 @@ impl TreeCall<'_> {
             RootNumber::Untrusted(root) => self.untrusted(&root),
             #[cfg(target_os = "macos")]
             RootNumber::NoWalk => Some(self.no_walk(group)),
-            RootNumber::Empty => Some(self.empty_group().unwrap_or_else(|| {
-                if let TreeSignal::Kill = self.signal {
-                    self.killed.mark();
-                }
-                Ok(())
-            })),
+            RootNumber::Empty => Some(self.answered(self.empty_group().unwrap_or(Ok(())))),
             #[cfg(target_os = "linux")]
-            RootNumber::GroupGone => {
-                self.group_gone();
-                Some(Ok(()))
-            }
+            RootNumber::GroupGone => Some(self.group_gone()),
             RootNumber::MayNameAnother { why, exact_root } => {
                 let root = exact_root.then(signal_root);
                 Some(Err(self.number_skipped(&why, root)))
@@ -270,19 +264,16 @@ impl TreeCall<'_> {
             },
             // The group has no member left: nothing to signal, wait for or sweep but the root.
             #[cfg(target_os = "linux")]
-            RootNumber::GroupGone => {
-                self.group_gone();
-                Graceful::Sent {
-                    result: Ok(()),
-                    earlier: None,
-                }
-            }
+            RootNumber::GroupGone => Graceful::Sent {
+                result: self.group_gone(),
+                earlier: None,
+            },
             // The group is empty: nothing goes out by its number, only to the marker holders, if any.
             RootNumber::Empty => {
                 let holders = self.empty_group();
                 Graceful::Sent {
                     earlier: holders.is_some().then_some("the SIGTERM to any marker holders"),
-                    result: holders.unwrap_or(Ok(())),
+                    result: self.answered(holders.unwrap_or(Ok(()))),
                 }
             }
             // The pid may name another process. A macOS fd marker shuts its holders down by the pipe
@@ -305,11 +296,27 @@ impl TreeCall<'_> {
         }
     }
 
+    /// This call's answer: a `Kill`'s is settled into the handle's state (it reaches no root of its
+    /// own to end, so `root_ended` is false), through [`Attached::settle`](crate::containment::Attached::settle),
+    /// the only writer of it. A `SIGTERM`'s is the answer as it is.
+    fn answered(&self, result: Result<(), Error>) -> Result<(), Error> {
+        match self.signal {
+            TreeSignal::Kill => self.attached.settle_for_kill_tree(
+                self.op,
+                self.killed,
+                TreeKillOutcome::Ran(result.map_err(Unkilled::from)),
+                false,
+            ),
+            TreeSignal::Term => result,
+        }
+    }
+
     /// The signal for [`RootNumber::Untrusted`] (macOS).
     #[cfg(target_os = "macos")]
     fn untrusted(&self, root: &RootState) -> Option<Result<(), Error>> {
         self.attached
-            .signal_tree_untrusted(self.signal, root, self.pid, self.op, self.earlier, self.killed)
+            .signal_tree_untrusted(self.signal, root, self.pid, self.op, self.earlier)
+            .map(|result| self.answered(result))
     }
 
     /// The signal for [`RootNumber::NoWalk`]: the group and a macOS fd marker's holders, and no
@@ -322,29 +329,30 @@ impl TreeCall<'_> {
             self.op,
             self.pid
         );
-        self.attached
-            .signal_group_and_holders(self.signal, Some(self.killed), group)
-            .unwrap_or_else(|| {
-                debug_assert!(false, "only an fd marker with a group gets here");
-                Ok(())
-            })
+        self.answered(
+            self.attached
+                .signal_group_and_holders(self.signal, group)
+                .unwrap_or_else(|| {
+                    debug_assert!(false, "only an fd marker with a group gets here");
+                    Ok(())
+                }),
+        )
     }
 
-    /// [`RootNumber::GroupGone`]: nothing is sent, and a `Kill` marks the tree killed.
+    /// [`RootNumber::GroupGone`]: nothing is sent, and the answer is `Ok`.
     #[cfg(target_os = "linux")]
-    fn group_gone(&self) {
+    fn group_gone(&self) -> Result<(), Error> {
         log::debug!(
             "{}({}): the root is reaped, and its pidfd shows its process group has no member left, so nothing is sent",
             self.op,
             self.pid
         );
-        if let TreeSignal::Kill = self.signal {
-            self.killed.mark();
-        }
+        self.answered(Ok(()))
     }
 
     /// The signal for [`RootNumber::Empty`]: nothing by the root's number, and a macOS fd marker's
-    /// holders by the pipe they hold. `None` for a mechanism with no such channel.
+    /// holders by the pipe they hold. `None` for a mechanism with no such channel. The caller
+    /// [`answered`](Self::answered)s it.
     fn empty_group(&self) -> Option<Result<(), Error>> {
         log::debug!(
             "{}({}): this handle reaped the root, so its group is empty or it had none, a walk from its pid \
@@ -352,7 +360,7 @@ impl TreeCall<'_> {
             self.op,
             self.pid
         );
-        self.attached.signal_holders_only(self.signal, Some(self.killed))
+        self.attached.signal_holders_only(self.signal)
     }
 
     /// The answer for [`RootNumber::MayNameAnother`], `why` its reason: nothing is sent by the
@@ -360,7 +368,7 @@ impl TreeCall<'_> {
     /// skipped and what was sent, `root` included: the signal to the root through its handle, if
     /// one was sent. The holders' sweep's error, the root signal's error, or `Unassessable`.
     pub(crate) fn number_skipped(&self, why: &str, root: Option<Result<Sent, Error>>) -> Error {
-        let holders = self.attached.signal_holders_only(self.signal, None);
+        let holders = self.attached.signal_holders_only(self.signal);
         let (sent_root, failed_root) = match self.signal {
             TreeSignal::Kill => (
                 "killed the root through its pidfd, which names it exactly, and sent nothing else",
@@ -407,7 +415,7 @@ impl TreeCall<'_> {
     /// `signal` to the marker holders of a macOS fd marker, which names its tree by identity.
     #[cfg(target_os = "macos")]
     pub(crate) fn holders_only(&self, signal: TreeSignal) -> Result<(), Error> {
-        self.attached.signal_holders_only(signal, None).unwrap_or_else(|| {
+        self.attached.signal_holders_only(signal).unwrap_or_else(|| {
             debug_assert!(false, "only a mechanism that names its tree by identity gets here");
             Ok(())
         })

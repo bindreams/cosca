@@ -8,8 +8,8 @@ use ::tokio::io::AsyncBufReadExt as _;
 use crate::test_child::Console;
 
 use crate::child::unpinned_public_tests::{
-    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned, sorted, warns_since,
-    Untrusted, BOTH,
+    assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned,
+    sorted, warns_since, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
@@ -276,7 +276,8 @@ async fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
 }
 
 /// Mutants: the sweep is skipped; it signals the `Unpinned` root; it spares the `Unknown` root; it
-/// fires `killpg` or walks from the root's pid.
+/// fires `killpg` or walks from the root's pid; the answer is `Ok`, though the kill skipped the rest
+/// of the tree.
 #[skuld::test]
 async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -291,9 +292,10 @@ async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let mark = crate::log_capture::mark();
         let _looks = state.peek();
 
-        child
+        let err = child
             .kill_tree()
-            .expect("every holder was reached, so the tree is down");
+            .expect_err("every holder was reached, but the kill skipped the rest of the tree");
+        assert_holders_only(&err, "kill_tree", state);
 
         assert_peeks_exhausted();
         assert_eq!(groups.killed(), Vec::<i32>::new(), "{state:?}");

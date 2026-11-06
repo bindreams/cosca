@@ -1350,6 +1350,7 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
     child
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
+        .into_result()
         .expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
@@ -1373,6 +1374,7 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
     killed
         .attached
         .hard_kill(&crate::containment::GroupRoot::none())
+        .into_result()
         .expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
