@@ -768,13 +768,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid, &through);
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
-        // An OS refusal says nothing against the child, and its handle names it: it is kept, with no
-        // identity. A containment that needs one fails the attach with this error.
-        crate::identity::Resolved::Unknown => {
-            let error = spawn_identity_error(resolved, cause);
-            log::debug!("child {pid}: {error}; the child is kept without an identity");
-            Err(error)
-        }
+        // Kept with no identity; see `Child::id`.
+        crate::identity::Resolved::Unknown => Err(kept_without_identity(pid, cause, &mut why)),
         // A vanish is not a refusal: the child was reaped by another party.
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
@@ -801,13 +796,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
                 let identity = crate::containment::RootIdentity::Gone;
-                // The child was reaped by another party, so no identity is known.
                 let child_fate = leave_unverified_child(child, identity, None, &mut why);
                 (front.map(|_| FrontFate::of_unverified(identity)), child_fate)
             };
             let error = spawn_identity_error(other, cause);
-            // The child was reaped by another party, so no identity is known. A child the teardown
-            // could not end comes back in the error.
+            // A child the teardown could not end comes back in the error.
             #[cfg(target_os = "linux")]
             let (error, child_fate, unreaped) = held_teardown::tear_down_held(
                 owned,
@@ -939,8 +932,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     Ok(child)
 }
 
-/// macOS: an attach given a verified identity reads nothing, so it cannot fail. Only a test seam
-/// makes it. (An attach with no identity fails when the containment needs one.)
+/// macOS: an attach given a verified identity reads nothing, so it cannot fail.
 #[cfg(target_os = "macos")]
 pub(crate) fn assert_attach_cannot_fail(error: &Error) {
     #[cfg(test)]
@@ -2270,9 +2262,12 @@ pub(crate) fn resolve_identity(
             Err(e) => (
                 Resolved::Unknown,
                 cause,
-                Diagnosis::of(format!(
-                    "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
-                )),
+                Diagnosis::of_failed_check(
+                    format!(
+                        "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
+                    ),
+                    e,
+                ),
             ),
         }
     }
@@ -2290,33 +2285,53 @@ pub(crate) fn resolve_identity(
 /// [`fold`](Diagnosis::fold)s it into its text, so the check and the teardown are one record. When
 /// no step warns, the diagnosis is logged on its own when it is dropped.
 #[derive(Debug, Default)]
-pub(crate) struct Diagnosis(Option<String>);
+pub(crate) struct Diagnosis {
+    owed: Option<String>,
+    /// The error of the failed check, until [`kept_without_identity`] builds the spawn's error from it.
+    failed_check: Option<std::io::Error>,
+    /// Logged at `debug` and not `warn` when nothing folds it: the child is kept, so no failure is owed.
+    kept: bool,
+}
 
 impl Diagnosis {
     /// A diagnosis to carry.
     #[cfg(unix)]
     fn of(text: String) -> Diagnosis {
-        Diagnosis(Some(text))
+        Diagnosis {
+            owed: Some(text),
+            failed_check: None,
+            kept: false,
+        }
+    }
+
+    /// A diagnosis of a check that failed with `error`.
+    #[cfg(unix)]
+    fn of_failed_check(text: String, error: std::io::Error) -> Diagnosis {
+        Diagnosis {
+            owed: Some(text),
+            failed_check: Some(error),
+            kept: false,
+        }
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
     #[cfg(unix)]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
-        match &mut self.0 {
+        match &mut self.owed {
             Some(owed) => owed.push_str(&format!("; {text}")),
-            None => self.0 = Some(text.to_string()),
+            None => self.owed = Some(text.to_string()),
         }
     }
 
     /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn is_owed(&self) -> bool {
-        self.0.is_some()
+        self.owed.is_some()
     }
 
     /// `text`, led by the diagnosis if it is still owed, which it then no longer is.
     pub(crate) fn fold(&mut self, text: impl std::fmt::Display) -> String {
-        match self.0.take() {
+        match self.owed.take() {
             Some(diagnosis) => format!("{diagnosis}; {text}"),
             None => text.to_string(),
         }
@@ -2326,12 +2341,34 @@ impl Diagnosis {
 impl Drop for Diagnosis {
     fn drop(&mut self) {
         // Not while unwinding: a logger that panics there would abort.
-        if let Some(diagnosis) = self.0.take() {
+        if let Some(diagnosis) = self.owed.take() {
             if !std::thread::panicking() {
-                log::warn!("{diagnosis}");
+                if self.kept {
+                    log::debug!("{diagnosis}");
+                } else {
+                    log::warn!("{diagnosis}");
+                }
             }
         }
     }
+}
+
+/// The `Unknown` arm of an identity read, for every spawn: the child is kept with no identity, and
+/// a containment that needs one fails the attach with the returned error. The error is the failed
+/// check's own when the read was `Found` and the check through the handle failed (its error is the
+/// source), and the read's `cause` otherwise. The keep is logged at `debug`. The diagnosis then
+/// warns only if a failed attach's teardown folds it in; a kept child owes no warn.
+pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCause, why: &mut Diagnosis) -> Error {
+    let error = match why.failed_check.take() {
+        Some(source) => Error::Unassessable {
+            detail: "the spawned child's identity could not be checked against its handle".into(),
+            source: Some(source),
+        },
+        None => spawn_identity_error(crate::identity::Resolved::Unknown, cause),
+    };
+    log::debug!("child {pid}: {error}; the child is kept without an identity");
+    why.kept = true;
+    error
 }
 
 /// The unchecked half of [`resolve_identity`]: the read, which nothing has yet shown to name our

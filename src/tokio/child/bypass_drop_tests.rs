@@ -458,10 +458,10 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 
 /// The spawn's identity check peeks through the child's pidfd. A peek that fails cannot show the
 /// child ours, but the pidfd pins it whatever the peek said: the spawn keeps the child with no
-/// identity, warns once naming the error, and leaves tokio's `Child` in the backend, so the child is
-/// waited for and killed through its handle like any other.
+/// identity, warns of nothing (the failed check is logged at debug), and leaves tokio's `Child` in
+/// the backend, so the child is waited for and killed through its handle like any other.
 ///
-/// Mutants: the warn drops the error, or is never logged; the spawn forgets tokio's `Child`
+/// Mutants: the failed check warns, drops the error, or is never logged; the spawn forgets tokio's `Child`
 /// (`forgets()` is 1) or drops it (`backend_drops` is 1); the spawn still fails.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -496,12 +496,15 @@ async fn a_failed_identity_peek_keeps_the_tokio_child_without_an_identity() {
     drop(armed);
     let mut child = spawned.expect("a failed identity peek keeps the child");
     assert_eq!(child.id(), None, "the read failed, so the child has no identity");
-    // The failed check is the event's one warn, logged when the spawn ends.
-    let warns = crate::log_capture::warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 91c4)"),
-        "the failed peek is warned once, naming its own error: {warns:?}"
+    assert_eq!(
+        crate::log_capture::warns_since(mark, ""),
+        Vec::<String>::new(),
+        "a kept child warns of nothing"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "forced identity-check failure 91c4"),
+        [log::Level::Debug],
+        "the failed check is logged once, at debug, naming its own error"
     );
     assert_eq!(forgets.forgets(), 0, "tokio's Child must stay in the backend");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");

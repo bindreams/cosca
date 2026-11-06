@@ -156,6 +156,54 @@ fn an_unreadable_identity_keeps_the_child_without_one() {
     assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
 }
 
+/// A containment that attaches by pid or handle does not need the identity: a contained root whose
+/// identity the OS refuses to report is kept, in the mechanism the request chose, and its tree is
+/// killed through that mechanism.
+///
+/// Mutant: the attach fails early for want of an identity, whatever the mechanism.
+#[cfg(target_os = "linux")]
+fn assert_contained_root_is_kept_without_an_identity(mode: crate::ContainMode, expected: &[crate::Containment]) {
+    let (mut cmd, _teardown) = teardown_blocker();
+    cmd.contain_with(mode);
+    fault::set_force_identity_unknown(true);
+    let spawned = cmd.spawn();
+    fault::set_force_identity_unknown(false);
+
+    let child = spawned.expect("an unreadable identity keeps a root whose containment needs none");
+    assert_eq!(child.id(), None, "the read failed, so the child has no identity");
+    assert!(
+        expected.contains(&child.containment()),
+        "{mode:?} attached as {:?}, not one of {expected:?}",
+        child.containment()
+    );
+    child
+        .kill_tree()
+        .expect("the mechanism kills the tree by pid or handle");
+    child.wait().expect("the kept child is waited on");
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unreadable_identity_keeps_a_session_root() {
+    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Session, &[crate::Containment::Session]);
+}
+
+/// `Strongest` is a cgroup leaf or, without one, a process group: both attach by pid or handle.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unreadable_identity_keeps_a_strongest_root_in_a_group() {
+    assert_contained_root_is_kept_without_an_identity(
+        crate::ContainMode::Strongest,
+        &[crate::Containment::CgroupV2, crate::Containment::ProcessGroup],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unreadable_identity_keeps_a_cgroup_root(#[fixture(cgroup)] _group: &Group) {
+    assert_contained_root_is_kept_without_an_identity(crate::ContainMode::Strongest, &[crate::Containment::CgroupV2]);
+}
+
 /// A kept child with no identity is torn down by its drop like any other: killed and reaped.
 ///
 /// Mutants: the drop of a child with no identity kills nothing; it panics for want of an identity.

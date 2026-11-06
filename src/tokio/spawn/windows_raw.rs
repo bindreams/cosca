@@ -323,18 +323,16 @@ pub(crate) fn spawn_raw(
         frozen: cmd.flags_request().suspended,
     };
     let raw_handle = proc.as_raw_handle();
-    let (resolved, cause, _) = resolve_identity(
+    let (resolved, cause, mut why) = resolve_identity(
         &crate::identity::HostKernel,
         pid,
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
     );
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
-        // An OS refusal says nothing against the child, and its handle names it: it is kept, with no
-        // identity. A containment that needs one fails the attach with this error.
-        crate::identity::Resolved::Unknown => Err(crate::child::spawn::spawn_identity_error(resolved, cause)),
+        // Kept with no identity; see `Child::id`.
+        crate::identity::Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
         other => {
-            // The child was reaped by another party, so no identity is known.
             let fate = raw_spawn_teardown(proc, pid, None);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),

@@ -6,11 +6,12 @@ use crate::test_child::Console;
 use crate::wait::exit_only::seams::force_peeks;
 
 /// A peek that fails cannot show the read named our child, but the pidfd pins the child whatever
-/// the peek said: the spawn keeps the child with no identity, and warns once naming the error. The
-/// child is killed and waited for through its pidfd like any other.
+/// the peek said: the spawn keeps the child with no identity. The failed check is logged at debug
+/// and warns of nothing: a kept child owes no failure. The child is killed and waited for through
+/// its pidfd like any other.
 ///
-/// Mutants: the failed check is `Ok` (the child has an identity); the warn drops the error, or is
-/// never logged; the spawn fails, or kills the child.
+/// Mutants: the failed check is `Ok` (the child has an identity); the failed check warns though the
+/// child is kept, or is never logged; the spawn fails, or kills the child.
 #[skuld::test]
 fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
     use std::cell::{Cell, RefCell};
@@ -45,12 +46,20 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
         "the read could not be checked, so the child has no identity"
     );
     assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
-    // The failed check is the event's one warn, logged when the spawn ends.
-    let warns = warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 3b7e)"),
-        "the failed peek is warned, naming its own error: {warns:?}"
+    assert_eq!(
+        warns_since(mark, ""),
+        Vec::<String>::new(),
+        "a kept child warns of nothing"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "forced identity-check failure 3b7e"),
+        [log::Level::Debug],
+        "the failed check is logged once, at debug, naming its own error"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "kept without an identity"),
+        [log::Level::Debug],
+        "the keep is logged once, at debug"
     );
     child.kill().expect("a kept child is killed through its pidfd");
     let status = child.wait().expect("a kept child is waited on");
@@ -69,7 +78,8 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
 ///
 /// Mutants: the failure arm tears down with a fresh diagnosis, which leaves the failed check to be
 /// logged apart from the teardown's warn (two warns); the check warns at the call as well as at the
-/// teardown (two warns); the child is not reaped.
+/// teardown (two warns); the child is not reaped; the error is built from the read's cause, which
+/// the successful read left empty, and not from the failed peek.
 #[skuld::test]
 fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() {
     use std::cell::{Cell, RefCell};
@@ -114,8 +124,12 @@ fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() 
         outcome.expect_err("a tree walk without an identity fails the spawn"),
     );
     assert!(
-        matches!(err, crate::error::Error::Unassessable { .. }),
-        "a failed peek is Unassessable, not a vanish: {err:?}"
+        matches!(
+            &err,
+            crate::error::Error::Unassessable { source: Some(source), .. }
+                if source.to_string().contains("forced identity-check failure 8e2f")
+        ),
+        "a failed peek is Unassessable with the peek's own error as source, not a vanish: {err:?}"
     );
     assert_eq!(
         fate,

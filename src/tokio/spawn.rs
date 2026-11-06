@@ -658,13 +658,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
     let id = match resolved {
         Resolved::Found(id) => Ok(id),
-        // An OS refusal says nothing against the child, and its handle names it: it is kept, with no
-        // identity. A containment that needs one fails the attach with this error.
-        Resolved::Unknown => {
-            let error = crate::child::spawn::spawn_identity_error(resolved, cause);
-            log::debug!("child {pid}: {error}; the child is kept without an identity");
-            Err(error)
-        }
+        // Kept with no identity; see `Child::id`.
+        Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
         // Tear the child down so a vanished-identity error never leaks a live (Windows: still
         // CREATE_SUSPENDED) process.
         other => {
@@ -694,7 +689,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                     None,
                 ));
-                // The child was reaped by another party, so no identity is known.
                 #[cfg(not(target_os = "macos"))]
                 {
                     let (error, child_fate) = proc.leave_front_noting(
