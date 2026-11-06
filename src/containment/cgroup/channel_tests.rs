@@ -149,8 +149,8 @@ fn report_channel_is_close_on_exec() {
     }
 }
 
-/// Everything the child sent before the parent abandoned the exchange is still read, pidfd
-/// included: the shut cuts off only what comes after.
+/// Everything the child sent before the parent abandoned the exchange is still read: the shut cuts
+/// off only what comes after.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
@@ -170,7 +170,6 @@ fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
     }
     let received = channel.shut();
     assert_eq!(received.pid, Some(std::process::id()));
-    assert!(received.pidfd.is_some(), "the intent carries a pidfd");
     assert_eq!(received.placement(), PlacementReport::Placed);
     // SAFETY: the child's end is still open in `slot`; the parent's end is shut for reading.
     assert_eq!(

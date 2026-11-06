@@ -2,13 +2,12 @@
 //! can be placed. Unprivileged: the ids are forced, and the probe reads a child of this process.
 
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
-use crate::containment::cgroup::test_support::alone;
+use crate::containment::cgroup::test_support::{alone, kill_record};
 use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
 use crate::send_log::Via;
 use crate::test_child::reaped_elsewhere::warns_since;
@@ -28,7 +27,7 @@ fn subtree(leaf_id: u64, killed: bool) -> Subtree {
         None,
         crate::containment::cgroup::Swept::default(),
         super::PlacedAtRemoval::default(),
-        Arc::new(AtomicBool::new(killed)),
+        kill_record(killed),
     )
 }
 
@@ -59,7 +58,7 @@ fn subtree_of(fd: OwnedFd, swept: crate::containment::cgroup::Swept) -> Subtree 
         Some("/stand-in-leaf".to_owned()),
         swept,
         super::PlacedAtRemoval::default(),
-        Arc::new(AtomicBool::new(true)),
+        kill_record(true),
     )
 }
 
@@ -288,7 +287,7 @@ fn cgroup_a_task_in_a_cgroup_the_sweep_removed_is_in_the_subtree(#[fixture(cgrou
         Some("/stand-in-leaf".to_owned()),
         leaf.swept(),
         super::PlacedAtRemoval::default(),
-        Arc::new(AtomicBool::new(true)),
+        kill_record(true),
     );
     assert!(holds_hidden(&subtree, sub).expect("no /proc read"));
 }

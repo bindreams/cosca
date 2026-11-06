@@ -275,24 +275,16 @@ impl Drop for ShutOnDrop<'_> {
     }
 }
 
-/// Where a child spawned for a cgroup leaf leaves the handshake's pidfd, or a copy of it, when its
-/// spawn fails after its fork: for the leaf's abandonment, which uses it for a child the leaf cannot
-/// name (see [`Handshake::leaving_front`]). It goes with the [`Past`] of a teardown through it,
-/// which the handshake knows and the leaf does not.
+/// Where a child spawned for a cgroup leaf leaves the handshake's pidfd when its spawn fails after
+/// its fork: for the leaf's abandonment, which is the child's one owner from then on (see
+/// [`Handshake::leaving_front`]). It goes with the [`Past`] of a teardown through it, which the
+/// handshake knows and the leaf does not.
 pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<(OwnedFd, Past)>>>;
 
-/// Who answers for a child whose spawn failed after its fork, when that child is an elevation
-/// front (see [`Handshake::leaving_front`]).
+/// Who answers for a child whose spawn failed after its fork (see [`Handshake::leaving_front`]).
 enum LeftFront {
     /// Not a front: torn down as any child.
     NotAFront,
-    /// Not a front, spawned for a cgroup leaf: torn down as any child, after a copy of its pidfd
-    /// is left for the leaf's abandonment.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only tokio's spawn leaves a child to a leaf")
-    )]
-    LeafHeld(LeftPidfd),
     /// Not a front, and the process group the root leads is its containment (no cgroup leaf can have
     /// taken it): the group is killed through the pidfd before the root is torn down
     /// ([`killing_group`](Handshake::killing_group)).
@@ -310,11 +302,11 @@ enum LeftFront {
         allow(dead_code, reason = "only tokio's spawn names a front")
     )]
     Here(crate::elevation::front::Front),
-    /// A front spawned for a cgroup leaf, left to the leaf's abandonment: the handshake signals
-    /// and waits on nothing, and leaves its pidfd here.
+    /// A child spawned for a cgroup leaf, front or not, left to the leaf's abandonment: the
+    /// handshake signals and waits on nothing, and leaves its pidfd here.
     #[cfg_attr(
         not(feature = "tokio"),
-        allow(dead_code, reason = "only tokio's spawn names a front")
+        allow(dead_code, reason = "only tokio's spawn leaves a child to a leaf")
     )]
     ToLeaf(LeftPidfd),
 }
@@ -326,12 +318,10 @@ impl Handshake {
     /// `spawn()` leaves the child unreaped (tokio's) names one: std reaps the child of a spawn it
     /// fails.
     ///
-    /// A front spawned for a cgroup leaf (`leaf` names where its pidfd goes) is left to the leaf,
-    /// whose abandonment kills through it and then answers for the front: the handshake neither
-    /// signals nor waits on it, nor notes its fate. Its pidfd goes to `leaf`, for a child the leaf
-    /// cannot name: one whose intent carried no handle, or that never sent one. Any other child
-    /// spawned for a leaf leaves a copy there, through which the leaf kills the group of a root it
-    /// did not take and could not name.
+    /// A child spawned for a cgroup leaf (`leaf` names where its pidfd goes), front or not, is left
+    /// to the leaf, whose abandonment is its one owner from then on: it kills the child through the
+    /// leaf and through its pidfd, or looks at a front, and answers for it. The handshake neither
+    /// signals nor waits on it, nor notes its fate.
     #[cfg(feature = "tokio")]
     pub(crate) fn leaving_front(
         mut self,
@@ -339,9 +329,8 @@ impl Handshake {
         leaf: Option<LeftPidfd>,
     ) -> Handshake {
         self.front = match (front, leaf) {
-            (Some(_), Some(leaf)) => LeftFront::ToLeaf(leaf),
+            (_, Some(leaf)) => LeftFront::ToLeaf(leaf),
             (Some(front), None) => LeftFront::Here(front),
-            (None, Some(leaf)) => LeftFront::LeafHeld(leaf),
             (None, None) => LeftFront::NotAFront,
         };
         self
@@ -863,7 +852,7 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
 /// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
 /// tokio dropped it after it ran the program, so it is sent nothing. A child std already
-/// collected never ran the program (its exec failed): it is not a front. A front spawned for a
+/// collected never ran the program (its exec failed): it is not a front. A child spawned for a
 /// cgroup leaf is the leaf's to answer for: its pidfd is left for the leaf, unused here, and the
 /// failure's fate is a placeholder (`Unknown`) that the leaf's abandonment replaces.
 ///
@@ -922,16 +911,6 @@ fn conclude<T: Spawned>(
                 }
                 let child_fate = end_through_pidfd(None, pidfd, past, warn_after, &mut why).fate;
                 (error, child_fate)
-            }
-            LeftFront::LeafHeld(leaf) => {
-                // The leaf's copy names a child this teardown, through the original, is about to
-                // wait for: if that wait fails, so may the leaf's later one on the same child.
-                // `past` is the original's, not the copy's.
-                match pidfd.try_clone() {
-                    Ok(copy) => leaf.set(Some((copy, Past::WaitMayFail))),
-                    Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
-                }
-                (error, teardown(pidfd).fate)
             }
             LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).fate),
         }
@@ -1083,9 +1062,7 @@ pub(crate) fn await_unexecuted_exit(
         None => crate::wait::teardown_warn::wait_warning(
             pidfd.as_fd(),
             crate::wait::teardown_warn::Due::in_(warn_after),
-            |pidfd, until| {
-                crate::wait::teardown_warn::exit_visible_by(crate::wait::teardown_warn::ExitWatch::PidFd(*pidfd), until)
-            },
+            |pidfd, until| crate::wait::pidfd_exit_visible_by(*pidfd, until),
             |after| super::warn_still_waiting(pid, after),
             |pidfd| {
                 let seen = wait_visible_exit(&Target::PidFd(pidfd))?;

@@ -1,6 +1,9 @@
 //! A failed spawn's teardown of the child it holds after the spawn: on Linux, through its pidfd when
 //! the identity read or the attach that follows fails (sync and async) and of the child the
 //! handshake itself abandons; on Windows, the std and raw spawns' child over its process handle.
+//! The teardown over a handle with what its caller expects of it ([`tear_down_expecting`]) and the
+//! look at a front (`look_at_failed_spawn_front`) are also what a cgroup leaf's abandonment
+//! builds on.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
@@ -8,9 +11,9 @@ use std::os::fd::OwnedFd;
 use super::Diagnosis;
 #[cfg(target_os = "linux")]
 use super::FrontFate;
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past};
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::Reach;
-use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, TeardownOutcome};
+use crate::child::owned::teardown::{Reach, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
 use crate::containment::cgroup::Subtree;
@@ -68,10 +71,9 @@ pub(crate) fn tear_down_held(
         return (error, fate, unreaped);
     }
     let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
-    let look = child.look_at_front(id, reach, due);
-    let front_fate = FrontFate::of_look(&look.look);
-    let torn = crate::child::word_front(pid, &"its spawn failed", disposition, look);
-    let (fate, unreaped) = say_failed_spawn(child, id, torn, Past::WaitMayFail, disposition, why);
+    let (front_fate, torn) = look_at_failed_spawn_front(&child, id, reach, disposition, due);
+    let torn = HandleTeardown::new(torn, Expect::of(&child, Past::WaitMayFail));
+    let (fate, unreaped) = say_failed_spawn(child, id, torn, disposition, why);
     let error = if unreaped.is_some() {
         front_fate.note_handed_back(error, front, pid)
     } else {
@@ -97,8 +99,39 @@ pub(crate) fn tear_down_failed_spawn(
         disposition,
         tree: None,
     };
-    let torn = child.tear_down(id, kill, due);
-    say_failed_spawn(child, id, torn, past, disposition, why)
+    let torn = tear_down_expecting(&child, id, kill, past, due);
+    say_failed_spawn(child, id, torn, disposition, why)
+}
+
+/// Tears `child` down as `kill` says, over its handle, expecting `past` of it (see [`Past`]); the
+/// handle's own allowance is its constructor's. The one place a teardown over a handle is paired
+/// with what its caller expects of it.
+pub(crate) fn tear_down_expecting(
+    child: &OwnedChild,
+    id: Option<ProcessId>,
+    kill: Kill<'_>,
+    past: Past,
+    due: Option<Due>,
+) -> HandleTeardown {
+    HandleTeardown::new(child.tear_down(id, kill, due), Expect::of(child, past))
+}
+
+/// Looks at the elevation front `child`, sent nothing, after its spawn failed: the front's fate,
+/// and the look worded as the failed spawn's teardown of it (see [`OwnedChild::look_at_front`] for
+/// `reach`, `id` and `due`). `disposition`: what the caller does with a front it finds running.
+/// The caller says the outcome.
+#[cfg(target_os = "linux")]
+pub(crate) fn look_at_failed_spawn_front(
+    child: &OwnedChild,
+    id: Option<ProcessId>,
+    reach: Result<Option<&dyn Reach>, std::io::Error>,
+    disposition: Disposition,
+    due: Option<Due>,
+) -> (FrontFate, TeardownOutcome) {
+    let look = child.look_at_front(id, reach, due);
+    let front_fate = FrontFate::of_look(&look.look);
+    let torn = crate::child::word_front(child.pid(), &"its spawn failed", disposition, look);
+    (front_fate, torn)
 }
 
 /// Says `torn` as the failed spawn's one warn; hands `child` back per `disposition` if it is
@@ -106,12 +139,11 @@ pub(crate) fn tear_down_failed_spawn(
 fn say_failed_spawn(
     child: OwnedChild,
     id: Option<ProcessId>,
-    torn: TeardownOutcome,
-    past: Past,
+    torn: HandleTeardown,
     disposition: Disposition,
     why: &mut Diagnosis,
 ) -> (ChildFate, Option<Unreaped>) {
-    let remains = HandleTeardown::new(torn, Expect::of(&child, past)).say_as_failed_spawn(why);
+    let remains = torn.say_as_failed_spawn(why);
     let unreaped = disposition.hands_back(&remains).then(|| Unreaped::new(child, id));
     (remains.fate, unreaped)
 }
@@ -135,5 +167,5 @@ pub(crate) fn tear_down_pidfd(
         disposition: Disposition::Leave,
         tree: None,
     };
-    HandleTeardown::new(child.tear_down(id, kill, due), Expect::of(&child, past))
+    tear_down_expecting(&child, id, kill, past, due)
 }
