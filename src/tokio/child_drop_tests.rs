@@ -545,7 +545,7 @@ async fn an_async_drop_removes_an_already_drained_leaf() {
 /// `kill_on_drop(false)` on a spawn that has not committed, with a `kill_tree()` behind it, as
 /// tokio's `finish_elevated` leaves a handle: the handle no longer signals on drop, but the leaf
 /// is still armed and this handle killed it. The tree has not drained, and the drop returns with
-/// the kill fired again, a warning, and the root untouched.
+/// a warning, no second kill, and the root untouched.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
@@ -578,12 +578,8 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     fake.clear_kill();
     let (steps, levels) = linux::dropped(child, name);
 
-    assert_eq!(steps, ["rmdir populated 1", "kill"]);
-    assert_eq!(
-        fake.kill_written(),
-        crate::containment::cgroup::KILL_PAYLOAD,
-        "the release must write cgroup.kill again, not only record the step"
-    );
+    assert_eq!(steps, ["rmdir populated 1"]);
+    assert_eq!(fake.kill_written(), b"", "the landed kill is not written again");
     assert!(fake.leaf.exists());
     assert_eq!(levels, [log::Level::Warn]);
     assert_eq!(

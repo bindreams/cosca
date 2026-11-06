@@ -1104,74 +1104,12 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
         !fake.leaf.exists(),
         "a disarmed Drop must still remove a leaf its caller already killed, once it drains, got {steps:?}"
     );
-    assert_eq!(
-        fake.kill_written(),
-        crate::containment::cgroup::KILL_PAYLOAD,
-        "the drop must write cgroup.kill again, not only record the step, got {steps:?}"
-    );
-    // The first kill happened before `record_leaf_steps()`, so it leaves no step here — but
-    // `Drop` re-fires `cgroup.kill` before waiting (see the next test), which does show up.
+    assert_eq!(fake.kill_written(), b"", "the landed kill is not written again");
+    // The kill happened before `record_leaf_steps()`, so it leaves no step here.
     assert_eq!(
         steps,
-        vec!["rmdir populated 1", "kill", "rmdir populated 0"],
-        "a disarmed leaf's kill must be re-fired and then retried only once it drains, got {steps:?}"
-    );
-}
-
-/// #194 follow-up: a disarmed `Drop` re-fires `cgroup.kill` right before waiting on the drain, so
-/// an occupant that migrated into the leaf after the caller's own kill — or one that escaped it by
-/// forking while the kill was in flight, on a kernel before 6.14 (`cgroup: fix race between fork
-/// and cgroup.kill`) — cannot make `Drop` wait on a drain nothing is driving. A stale `killed` flag
-/// must not by itself excuse `Drop` from killing again.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
-    use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
-
-    let fake = FakeLeaf::new("cosca-disarmed-repopulated-leaf", true);
-    let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
-    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
-    let events = fake.events.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
-
-    let leaf = entered_leaf_at(fake.leaf.clone());
-    leaf.disarm();
-    leaf.hard_kill().expect("kill the tree");
-    // The first kill's tree fully drains, then an occupant migrates in (or a fork escapes a kill
-    // in flight, pre-6.14): the leaf reads populated again, though `killed` is still set from the
-    // first, successful write.
-    FakeLeaf::set_populated(&fake.events, false);
-    FakeLeaf::set_populated(&fake.events, true);
-    fake.clear_kill();
-
-    fault::record_leaf_steps();
-    drop(leaf);
-    let steps = fault::take_leaf_steps();
-    drop(actor);
-    fault::take_rmdir_hook();
-
-    assert!(
-        !fake.leaf.exists(),
-        "Drop must still remove the leaf once its re-fired kill drains, got {steps:?}"
-    );
-    assert_eq!(
-        fake.kill_written(),
-        crate::containment::cgroup::KILL_PAYLOAD,
-        "the drop must write cgroup.kill again, not only record the step, got {steps:?}"
-    );
-    let killed_at = steps
-        .iter()
-        .position(|s| s == "kill")
-        .unwrap_or_else(|| panic!("a re-populated leaf must be killed again before Drop waits, got {steps:?}"));
-    let after_kill = &steps[killed_at + 1..];
-    assert!(
-        !after_kill.is_empty(),
-        "the drop must retry the rmdir after re-firing the kill, got {steps:?}"
-    );
-    assert!(
-        after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
-        "every rmdir after the re-fired kill must wait for the drain, got {steps:?}"
+        vec!["rmdir populated 1", "rmdir populated 0"],
+        "a disarmed leaf's landed kill is not written again, and the rmdir retries only once it drains, got {steps:?}"
     );
 }
 
@@ -1208,6 +1146,40 @@ fn death_watch_an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
     assert!(fake.leaf.exists(), "the leaf is left behind");
     let warns = crate::log_capture::records_since(mark, "cgroup.kill failed");
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
+}
+
+/// An armed `Drop` after a `cgroup.kill` that landed (`kill_tree()`) waits for that kill's drain and
+/// does not write it again: one write per teardown. The cleared fake file shows a second write.
+///
+/// Mutant: the armed `Drop` writes `cgroup.kill` again after a landed write.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_armed_drop_after_a_landed_kill_waits_for_its_drain_and_does_not_write_it_again() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-armed-drop-landed-kill", true);
+    let (leaf_dir, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf_dir, &events));
+    let events = fake.events.clone();
+    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.hard_kill().expect("kill the tree");
+    fake.clear_kill();
+    fault::record_leaf_steps();
+    drop(leaf);
+    let steps = fault::take_leaf_steps();
+    drop(actor);
+    fault::take_rmdir_hook();
+
+    assert_eq!(fake.kill_written(), b"", "the landed kill is not written again");
+    assert_eq!(
+        steps,
+        ["rmdir populated 1", "rmdir populated 0"],
+        "the drop waits for the drain of the kill that landed, then removes the leaf"
+    );
+    assert!(!fake.leaf.exists());
 }
 
 /// #194 follow-up: in `Drop`'s never-killed branch, a first `rmdir` that fails is not always the

@@ -98,11 +98,13 @@ fn a_leaf_that_drains_by_the_time_of_the_read_is_swept_and_removed() {
     assert_eq!(levels, Vec::<log::Level>::new());
 }
 
-/// Killed by this handle and disarmed after (`Child::detach`): the release fires the kill again,
-/// and warns when the leaf has not drained. The armed twin, which `finish_elevated` leaves, is
-/// `an_armed_undrained_leaf_is_killed_left_behind_and_warned_about`.
+/// Killed by this handle and disarmed after (`Child::detach`): the release does not write the kill
+/// again, and warns when the leaf has not drained. The armed twin is
+/// `an_armed_leaf_this_handle_killed_is_not_killed_again_and_warned_about`.
+///
+/// Mutant: the release writes `cgroup.kill` again after a landed write.
 #[skuld::test]
-fn a_disarmed_leaf_this_handle_killed_is_killed_again_and_warned_about() {
+fn a_disarmed_leaf_this_handle_killed_is_not_killed_again_and_warned_about() {
     let name = "cosca-release-disarmed-killed";
     let (fake, leaf) = entered(name, true);
     leaf.hard_kill().expect("kill the tree");
@@ -110,12 +112,25 @@ fn a_disarmed_leaf_this_handle_killed_is_killed_again_and_warned_about() {
     fake.clear_kill();
     let (steps, levels) = release(leaf, name);
 
-    assert_eq!(steps, ["rmdir populated 1", "kill"]);
-    assert_eq!(
-        fake.kill_written(),
-        crate::containment::cgroup::KILL_PAYLOAD,
-        "the release must write cgroup.kill again, not only record the step"
-    );
+    assert_eq!(steps, ["rmdir populated 1"]);
+    assert_eq!(fake.kill_written(), b"", "the landed kill is not written again");
+    assert!(fake.leaf.exists());
+    assert_eq!(levels, [log::Level::Warn]);
+}
+
+/// Armed twin of the previous test: the handle killed the tree (`kill_tree()`) and was dropped armed.
+///
+/// Mutant: the release writes `cgroup.kill` again after a landed write.
+#[skuld::test]
+fn an_armed_leaf_this_handle_killed_is_not_killed_again_and_warned_about() {
+    let name = "cosca-release-armed-killed";
+    let (fake, leaf) = entered(name, true);
+    leaf.hard_kill().expect("kill the tree");
+    fake.clear_kill();
+    let (steps, levels) = release(leaf, name);
+
+    assert_eq!(steps, ["rmdir populated 1"]);
+    assert_eq!(fake.kill_written(), b"", "the landed kill is not written again");
     assert!(fake.leaf.exists());
     assert_eq!(levels, [log::Level::Warn]);
 }

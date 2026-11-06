@@ -36,11 +36,11 @@ impl CgroupLeaf {
             return;
         }
         if armed || killed {
-            // A write already made and failed is final.
-            let written = match self.kill.failure() {
-                Some(why) => Err(why),
-                None => self.hard_kill().map_err(|e| e.to_string()),
-            };
+            // One write per teardown: a write already made, landed or failed, is its answer.
+            let written = self
+                .kill
+                .answer()
+                .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()));
             if let Err(e) = written {
                 warn_leaf_left_behind(
                     &self.leaf_path,

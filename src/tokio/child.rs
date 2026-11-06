@@ -97,7 +97,7 @@ impl OsResources {
     /// drop does once it has reaped the root or found it gone. The backend goes first, through
     /// [`ProcSource::release`]; it holds no unreaped child by now, so tokio's drop queues nothing.
     /// The containment resource then drops in place, as the sync `Drop` drops it: a cgroup leaf
-    /// is killed again if it is still populated, drained, swept and removed. The drain shares the
+    /// is killed unless a write was made, drained, swept and removed. The drain shares the
     /// drop's one `late` warn. `tree_failed`: the drop's own tree kill failed, which is final: the
     /// leaf is given up without waiting.
     #[cfg(unix)]
@@ -1266,8 +1266,7 @@ impl Child {
 
 impl Child {
     /// Leave the child (and its contained tree) running after this handle drops. The drop then
-    /// never signals the tree or the root, except that a leaf this handle already killed through
-    /// [`kill_tree`](Self::kill_tree) has its `cgroup.kill` written once more by the release.
+    /// never signals the tree or the root.
     ///
     /// Dropping never waits: a leaf this handle killed and that has not drained is left behind
     /// with a warning, and one nothing killed is left at `debug`, since the caller asked for that.
@@ -1484,9 +1483,9 @@ impl Child {
 ///   some runtime runs.
 /// - **The containment resource.** A `Cgroup` leaf is removed if it has drained. A leaf that has
 ///   not drained is **left behind**, and a warning names it, if this handle killed it (a disarmed
-///   handle's [`kill_tree`](Child::kill_tree) is released like an armed one, with its `cgroup.kill`
-///   written once more) or was armed to. Call [`wait_tree`](Child::wait_tree) first to have the
-///   leaf removed. Other mechanisms drop in place.
+///   handle's [`kill_tree`](Child::kill_tree) is released like an armed one) or was armed to. Call
+///   [`wait_tree`](Child::wait_tree) first to have the leaf removed. Other mechanisms drop in
+///   place.
 ///
 /// A leaf whose `cgroup.kill` fails has nothing to bound its drain: it is given up the same way,
 /// though the drop still reaps a root its kill reached. The failed write is not made again.

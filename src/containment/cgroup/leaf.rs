@@ -931,10 +931,15 @@ impl CgroupLeaf {
         if std::mem::replace(&mut self.abandoned, true) {
             return;
         }
-        // Remove the leaf. If still occupied (e.g. hard_kill not yet called), fire cgroup.kill,
-        // wait for the leaf to drain, then retry — but only if the child entered it: a final
-        // report other than `Placed` proves nothing of the child's is there. A leaf that outlives
-        // the removal is reported.
+        // Remove the leaf. If still occupied, fire cgroup.kill (unless a write was made, whose
+        // answer stands: one write per teardown), wait for the leaf to drain, then retry — but only
+        // if the child entered it: a final report other than `Placed` proves nothing of the
+        // child's is there. A leaf that outlives the removal is reported.
+        //
+        // The kill is not written again after one landed. An occupant that migrated in after it
+        // came from a party that already controls the subtree (see `LeafDir::rmdir`), and the
+        // fork race of kernels before 6.14 (`cgroup: fix race between fork and cgroup.kill`) is
+        // the documented assumption of `Command::kill_on_drop`.
         let Err(first) = self.rmdir_leaf() else {
             return;
         };
@@ -942,8 +947,8 @@ impl CgroupLeaf {
         //
         // | entered | armed | killed | Drop                                                                        |
         // |---------|-------|--------|-----------------------------------------------------------------------------|
-        // | true    | true  | –      | rmdir; if it fails, cgroup.kill, drain, sweep, rmdir                        |
-        // | true    | false | true   | rmdir; if it fails, re-fire cgroup.kill, wait for the drain, sweep, rmdir   |
+        // | true    | true  | –      | rmdir; if it fails, cgroup.kill unless written, drain, sweep, rmdir         |
+        // | true    | false | true   | rmdir; if it fails, wait for the drain, sweep, rmdir                        |
         // | true    | false | false  | rmdir; if `populated 0` already, sweep, rmdir; else one rmdir, left running |
         // | false   | –     | –      | one rmdir: the child never entered the leaf                                 |
         if !self.child_entered() {
@@ -967,14 +972,8 @@ impl CgroupLeaf {
                 return;
             }
             if self.kill.landed() {
-                // A stale `killed` flag must not make this wait forever: re-fire the kill before
-                // waiting on its drain. An occupant that migrated in after the first kill was
-                // never targeted, and on a kernel before 6.14 a process that forked while that
-                // kill was in flight could escape it (`cgroup: fix race between fork and
-                // cgroup.kill`, Linux 6.14) — either way, `drain_and_remove(None, ..)` re-runs
-                // `hard_kill()` first, exactly as the armed path's own kill-then-wait does.
                 self.drain_and_remove(
-                    None,
+                    self.kill.answer(),
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
                     warn,
                 );
@@ -1015,9 +1014,9 @@ impl CgroupLeaf {
             return;
         }
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
-        // that is already gone left nothing behind. A write already made and failed is final.
+        // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(self.kill.failure().map(Err), "after its handle's teardown", warn);
+            self.drain_and_remove(self.kill.answer(), "after its handle's teardown", warn);
         }
     }
 }
