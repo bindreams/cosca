@@ -50,8 +50,9 @@ fn spawned_child_has_live_identity() {
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
-    // id() is stable across two calls.
-    assert_eq!(child.pid(), child.pid());
+    // id() is stable across two calls, and pid() is its number.
+    assert_eq!(child.id(), child.id());
+    assert_eq!(child.pid(), child.id().pid());
     let _ = child.wait();
 }
 
