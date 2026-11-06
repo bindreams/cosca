@@ -169,12 +169,20 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
 }
 
 /// A root whose pid cannot be queried is an error naming the pid and the view, with nothing
-/// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped".
+/// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped". The
+/// `/proc` path: only a `starttime` id is proved through the view; a `pidfs` id is proved by its
+/// pidfd, in `treewalk_pidfs_tests`.
 #[skuld::test]
 fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
     for (_, walk) in walks() {
-        let (child, id) = live_member();
-        let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel).same_view(), 1);
+        let (child, host_id) = live_member();
+        let id = ticks_id(host_id.pid());
+        let kernel = View::Unreadable.fail(
+            FakeKernel::over(&HostKernel)
+                .live_without_pidfs(id.pid(), pidfd_of(id.pid()))
+                .same_view(),
+            1,
+        );
         let result = walk(&kernel, id);
         assert_unassessable_naming(
             result,
