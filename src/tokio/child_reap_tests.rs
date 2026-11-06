@@ -505,7 +505,7 @@ async fn forget_if_foreign_leaves_a_child_nothing_has_reaped() {
 #[skuld::test]
 async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
     let mut child = spawn_cosca_child_that_exits();
-    reap_behind_the_owner(child.id().pid());
+    reap_behind_the_owner(child.pid());
 
     let (fate, _) = child.wait_and_reap_blocking();
 
@@ -525,7 +525,7 @@ async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
 #[skuld::test]
 async fn kill_of_a_foreign_reaped_child_forgets_it() {
     let mut child = spawn_cosca_child_that_exits();
-    reap_behind_the_owner(child.id().pid());
+    reap_behind_the_owner(child.pid());
 
     child.kill().expect("a kill of a foreign-reaped child answers Ok");
 
@@ -900,7 +900,7 @@ async fn kill_ends_a_child_stopped_for_its_tracer(#[fixture(tracer_group)] _grou
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
-    let pid = child.id().pid() as libc::pid_t;
+    let pid = child.pid() as libc::pid_t;
     crate::test_support::own_tracer::seize_and_stop(pid);
 
     child.kill().expect("kill");

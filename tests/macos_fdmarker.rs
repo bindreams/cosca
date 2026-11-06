@@ -106,7 +106,7 @@ fn a_contained_macos_root_reports_the_fd_marker_mechanism() {
 #[skuld::test]
 fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the reparented setsid orphan");
 }
@@ -115,7 +115,7 @@ fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan() {
 #[skuld::test]
 fn terminate_tree_reaches_the_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     child.terminate_tree().expect("terminate_tree");
     grand.assert_dead("the reparented setsid orphan under SIGTERM");
     child.kill_tree().expect("kill_tree cleanup");
@@ -127,7 +127,7 @@ fn terminate_tree_reaches_the_reparented_orphan() {
 #[skuld::test]
 fn treewalk_mode_reaches_the_orphan_through_the_marker_alone() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::TreeWalk);
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the orphan, with no process-group channel available");
 }
@@ -149,7 +149,7 @@ fn detach_leaves_a_marked_tree_running() {
 #[skuld::test]
 fn dropping_a_marked_child_kills_the_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     drop(child);
     grand.assert_dead("the reparented orphan, on Child::drop");
 }
@@ -204,7 +204,7 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
 #[skuld::test]
 async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_spawn() {
     let (mut child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest).await;
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the reparented setsid orphan (tokio spawn path)");
 }
@@ -271,7 +271,7 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     }
     let (_root, mut grand) = (root.expect("root tag"), grand.expect("grandchild tag"));
 
-    assert_escaped(child.id().pid(), grand.pid);
+    assert_escaped(child.pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the orphan, reachable only via a marker that must have survived a real, wide caller fd mapping");
 }

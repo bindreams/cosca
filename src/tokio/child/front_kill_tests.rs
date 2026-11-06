@@ -40,7 +40,7 @@ pub(super) async fn assert_ends_unsignalled(child: &mut Child, stdin: ChildStdin
 #[skuld::test]
 async fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_unkillable_front(child.kill(), pid);
     assert_ends_unsignalled(&mut child, stdin).await;
 }
@@ -50,7 +50,7 @@ async fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
 async fn kill_of_an_exited_front_is_ok() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let refused = crate::signal::seams::refuse_kills();
     child.kill().expect("an exited front is killed like any child");
     drop(refused);
@@ -62,7 +62,7 @@ async fn kill_of_an_exited_front_is_ok() {
 async fn kill_of_an_exited_front_returns_any_other_failure() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let failing = crate::signal::seams::fail_kills_with(libc::EINVAL);
     match child.kill() {
         Err(crate::error::Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{io}"),
@@ -79,7 +79,7 @@ async fn kill_tree_of_an_exited_front_is_ok() {
     cmd.contain_with(ContainMode::Session);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let refused = crate::signal::seams::refuse_kills();
     child
         .kill_tree()
@@ -94,7 +94,7 @@ async fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     use crate::child::front_kill_tests::reap;
     crate::log_capture::install();
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();
@@ -123,7 +123,7 @@ async fn kill_reads_the_front_its_spawn_found_not_its_report() {
 #[skuld::test]
 async fn kill_of_a_live_doas_front_is_unkillable_and_sends_nothing() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Doas));
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_refused_by(child.kill(), &format!("pid {pid} is what doas left"));
     assert_ends_unsignalled(&mut child, stdin).await;
 }
@@ -161,7 +161,7 @@ fn uncontained_cats() -> [Command; 2] {
 async fn kill_of_a_live_front_without_a_group_sends_nothing() {
     for cmd in uncontained_cats() {
         let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-        let pid = child.id().pid();
+        let pid = child.pid();
         assert_unkillable_front(child.kill(), pid);
         assert_ends_unsignalled(&mut child, stdin).await;
     }
@@ -235,7 +235,7 @@ async fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exit
     let mut cmd = cat();
     cmd.kill_on_drop(false);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     assert!(reap(pid).is_some(), "the test reaps the front itself");
@@ -253,7 +253,7 @@ async fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_noth
     cmd.contain_with(ContainMode::Session);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     assert_ne!(child.containment(), Containment::CgroupV2);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_unkillable_front(child.kill_tree(), pid);
     assert_ends_unsignalled(&mut child, stdin).await;
 }
@@ -274,7 +274,7 @@ async fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
         .await
         .expect("read `ready`");
     assert_eq!(&ready, b"ready\n");
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_unkillable_front(child.graceful_shutdown(Duration::ZERO).await, pid);
     assert_ends_unsignalled(&mut child, stdin).await;
 }
@@ -290,7 +290,7 @@ async fn drop_of_a_live_front_signals_nothing_and_warns() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
     let (child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -352,7 +352,7 @@ async fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     cmd.kill_on_drop(false);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let _refused = crate::signal::seams::refuse_kills();
     let gates = crate::elevation::front::seams::count_kill_gates();
     let (err, fate) = crate::tokio::spawn::finish_elevated(
@@ -376,7 +376,7 @@ async fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
 #[skuld::test]
 async fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_refused_by(child.terminate(), &format!("pid {pid} is osascript"));
     assert_ends_unsignalled(&mut child, stdin).await;
 }
@@ -384,7 +384,7 @@ async fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
 #[skuld::test]
 async fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_refused_by(
         child.graceful_shutdown(Duration::ZERO).await,
         &format!("pid {pid} is osascript"),

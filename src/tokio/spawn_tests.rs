@@ -1088,7 +1088,7 @@ async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let err = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
@@ -1124,7 +1124,7 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     });
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
@@ -1211,7 +1211,7 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
         child.signals_a_group(),
         "the test needs a group named by the root's pid, which ContainMode::Session makes"
     );
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
     let mut status = 0;

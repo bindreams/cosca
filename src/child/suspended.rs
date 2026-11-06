@@ -80,6 +80,11 @@ impl SuspendedChild {
         self.child.id()
     }
 
+    /// The pid the child had at spawn; see [`Child::pid`].
+    pub fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+
     /// Let the child run, returning the ordinary [`Child`].
     ///
     /// # Errors

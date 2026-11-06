@@ -16,10 +16,10 @@ use crate::{Child, Unreaped};
 const ABSENT_PID: u32 = 0x7fff_fffe;
 
 /// An uncontained `Child` over `fake`, which the test keeps to script and read it. It does not
-/// kill on drop.
+/// kill on drop. The fake answers [`ABSENT_PID`] to the child's pid, as its identity names it.
 pub(crate) fn child_over(fake: &FakeProcess) -> Child {
     Child::from_parts(
-        OwnedChild::new(Box::new(fake.clone())),
+        OwnedChild::new(Box::new(fake.clone().with_pid(ABSENT_PID))),
         ProcessId::from_parts_for_test(ABSENT_PID, Key::for_test(1)),
         BTreeMap::new(),
         false,

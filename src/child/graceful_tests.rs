@@ -543,7 +543,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     // here and not when the grace runs out.
     #[cfg(windows)]
     let check = {
-        let pid = child.id().pid();
+        let pid = child.pid();
         term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
             crate::test_child::ctrl_break::assert_break_sent_to(pid)
         })
