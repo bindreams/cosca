@@ -137,7 +137,7 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
-    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
     tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,

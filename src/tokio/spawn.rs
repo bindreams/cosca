@@ -921,7 +921,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let root = match gate {
             // Not asked again after the kill: a killed front can read as neither exited nor in its
             // cgroup, between leaving the cgroup's member list and becoming a zombie.
-            // The kill's own outcome says it landed; the handle's mark is set by `settle`, below.
+            // The kill's own outcome says it landed; the handle's state is settled by `settle`, below.
             crate::elevation::front::Gate::CgroupOnly if tree.as_ref().is_some_and(TreeKillOutcome::completed) => {
                 child.cgroup_kill_reached().map(|()| Sent::Delivered)
             }

@@ -666,9 +666,10 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
     });
 }
 
-/// A member whose kill by identity succeeds is gone after any outcome: the tree it was left in is
-/// settled by a gone root or a walk that ran and left nothing, and not by a walk not made or skipped.
-/// Mutants: as the table above; a held member is not killed by an outcome that did not run.
+/// A member whose kill by identity succeeds is gone after any outcome: a walk ran and left it, and
+/// everything it left is now gone, so the tree is killed whatever the outcome, and the answer is
+/// still the outcome's own. Mutants: as the table above; a held member is not killed by an outcome
+/// that did not run; the state falls back to never settled, so a later gone root is `Unassessable`.
 #[skuld::test]
 fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
     use super::SettleOutcome::{Killed, Skipped};
@@ -679,8 +680,8 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
                 (Ok(Killed), Standing::Killed),
                 (Err(vec!["pid 8".to_owned()]), Standing::Left(vec![8])),
                 (Ok(Killed), Standing::Killed),
-                (Err(gone()), Standing::Never),
-                (Ok(Skipped), Standing::Never),
+                (Err(gone()), Standing::Killed),
+                (Ok(Skipped), Standing::Killed),
             ]
         },
         || {
@@ -714,6 +715,55 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_refuses_the_kill(
         });
         (killed, id.pid(), after)
     });
+}
+
+/// A handle that is not a `TreeWalk` holds no members, so a kill that runs and leaves a member after
+/// it settled the tree killed moves the tree back to never settled: the drop that follows must warn
+/// of the member the call just reported. Mutant: the tree stays killed.
+#[skuld::test]
+fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_walk_unsettles_it() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::None;
+    let killed = TreeKilled::default();
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a complete kill");
+    assert_eq!(standing(&killed), Standing::Killed);
+
+    let left = attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(8)],
+                root: None,
+                resolved: Vec::new(),
+            })),
+            true,
+        )
+        .expect_err("a member was left");
+
+    assert_eq!(pid_left(&left.first), 8);
+    assert_eq!(standing(&killed), Standing::Never);
+
+    // The same for a skipped kill whose sweep of the holders left a member.
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a complete kill");
+    attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Skipped {
+                action: "walk".into(),
+                holders: Err(Unkilled {
+                    members: vec![member_left(9)],
+                    root: None,
+                    resolved: Vec::new(),
+                }),
+            },
+            true,
+        )
+        .expect_err("a member was left");
+    assert_eq!(standing(&killed), Standing::Never);
 }
 
 // What a `TreeWalk` handle remembers of the members a kill left =====

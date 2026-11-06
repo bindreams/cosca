@@ -296,9 +296,9 @@ impl TreeCall<'_> {
         }
     }
 
-    /// This call's answer: a `Kill`'s is settled into the handle's mark (it reaches no root of its
+    /// This call's answer: a `Kill`'s is settled into the handle's state (it reaches no root of its
     /// own to end, so `root_ended` is false), through [`Attached::settle`](crate::containment::Attached::settle),
-    /// the only writer of the mark. A `SIGTERM`'s is the answer as it is.
+    /// the only writer of it. A `SIGTERM`'s is the answer as it is.
     fn answered(&self, result: Result<(), Error>) -> Result<(), Error> {
         match self.signal {
             TreeSignal::Kill => self.attached.settle_for_kill_tree(

@@ -603,7 +603,7 @@ fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
 
 /// A member of a `TreeWalk` tree that a walk left, as the handle holds it for the next kill
 /// ([`with_earlier`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Left {
     /// The walk read its identity and its kill was refused: a later kill kills it by identity again.
     Resolved(ProcessId),

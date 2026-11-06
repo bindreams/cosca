@@ -210,7 +210,7 @@ pub struct Child {
     id: ProcessId,
     kill_on_drop: bool,
     containment: Containment,
-    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
     tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
