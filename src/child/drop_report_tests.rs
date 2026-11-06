@@ -231,6 +231,62 @@ fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back(
     handed_back.wait();
 }
 
+/// A failed spawn's cleanup whose first tree kill left the root running (its own kill of the root was
+/// refused) and whose root was reaped by someone else before the retry: the retry finds no root to
+/// walk, and the one report says what the first walk found, that it saw the root running, not that
+/// "something" was left. The handle is disarmed (the root is handed back).
+///
+/// Mutants: the kind of the unvouched tree is not the latest fact (the root seen running), so the
+/// retry's text names an earlier kill's leftovers instead; the handle stays armed, so its drop says
+/// it again.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_finds_it_gone() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+    // The first walk killed the root: someone else reaps it before the retry, which finds no root.
+    let pid = child.id().pid();
+    let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        crate::test_child::wait_until_zombie(pid);
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own zombie child.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let cause = cause.to_string();
+    assert!(
+        cause.contains("its contained tree could not be killed"),
+        "the first failure: {cause}"
+    );
+    let found = "the root an earlier walk found running is gone";
+    assert!(
+        cause.contains("the retry failed too") && cause.contains(found),
+        "the retry's answer: {cause}"
+    );
+    assert!(!cause.contains("left something running"), "{cause}");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let tree: Vec<_> = warns
+        .iter()
+        .filter(|warn| warn.starts_with("finish_elevated:"))
+        .collect();
+    assert_eq!(tree.len(), 1, "{warns:?}");
+    assert!(tree[0].contains(found), "{warns:?}");
+    // The root was reaped above, so there is nothing for the handed-back child to wait for.
+    drop(handed_back);
+}
+
 /// A teardown whose walk left only the root, and whose root someone else had reaped when the
 /// teardown's kill of it came, does not vouch for the tree: the walk saw the root running. The
 /// teardown's own warn says so, and the tree is not marked killed.

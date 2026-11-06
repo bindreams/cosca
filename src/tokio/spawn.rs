@@ -982,16 +982,19 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         }
     };
     let tree = tree.map(|walk| child.settle_tree(walk, fate.not_running()));
-    // The tree is settled when it was killed completely and its drain was watched, was not for the
-    // cleanup to kill, or was deliberately left alone because the root is reaped or unpinned. A drain
-    // that could not be watched leaves the handle armed: its drop waits for it again.
-    let tree_settled = tree
-        .as_ref()
-        .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)) && drain_failure.is_none())
+    // The tree is settled when no kill of it is left to try and its drain was watched, or it was
+    // deliberately left alone because the root is reaped or unpinned. A drain that could not be watched
+    // leaves the handle armed: its drop waits for it again. (A drain is watched only after a kill that
+    // `settle` answers `Killed`, so a failed watch is never over an unvouched tree.)
+    let tree_settled = (!crate::child::spawn::tree_needs_another_kill(&tree) && drain_failure.is_none())
         || (skipped.is_some() && view.leaves_root_alone());
-    // An unvouched tree is not a failed kill: the drop has nothing to retry, and the cleanup's one
-    // report says so.
     let unvouched = matches!(tree, Some(Ok(SettleOutcome::Unvouched { .. })));
+    // An unvouched tree disarms the handle on the strength of the root's end: nothing is left for the
+    // drop to kill.
+    debug_assert!(
+        !(unvouched && root_settled) || fate.not_running(),
+        "an unvouched tree leaves the handle disarmed only over a root that ended: {fate:?}"
+    );
     let subject = child.teardown_subject();
     let (mut tree_note, tree_warn) = crate::child::spawn::report_tree_teardown(tree, &subject);
     // A drain is watched only after a kill that left nothing, which `settle` answers `Killed`.
@@ -1017,7 +1020,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     report.tree = tree_warn;
     report.drain = drain_warn;
     let warned = report.emit(&[]);
-    child.end_cleanup((tree_settled || unvouched) && root_settled, warned);
+    child.end_cleanup(tree_settled && root_settled, warned);
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,

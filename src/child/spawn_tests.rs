@@ -1242,6 +1242,39 @@ fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
     assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
 }
 
+/// Both `finish_elevated`s ask the one predicate whether a tree kill is left to try: none was made,
+/// the tree was killed, or it cannot be vouched for, and there is not; a kill that left members, or
+/// was skipped and killed nothing, and there is.
+///
+/// Mutants: an unvouched tree is retried; a skipped kill counts as settled.
+#[cfg(unix)]
+#[skuld::test]
+fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the_tree() {
+    use crate::containment::dispatch::{SettleOutcome, Unsettled, UnvouchedKind};
+    let unsettled = || Unsettled {
+        first: Error::Containment {
+            detail: "refused".into(),
+        },
+        others: Vec::new(),
+    };
+    let table = [
+        ("none made", None, false),
+        ("killed", Some(Ok(SettleOutcome::Killed)), false),
+        (
+            "unvouched",
+            Some(Ok(SettleOutcome::Unvouched {
+                kind: UnvouchedKind::RootSeenRunning,
+            })),
+            false,
+        ),
+        ("skipped", Some(Ok(SettleOutcome::Skipped)), true),
+        ("left members", Some(Err(unsettled())), true),
+    ];
+    for (label, tree, want) in table {
+        assert_eq!(super::tree_needs_another_kill(&tree), want, "{label}");
+    }
+}
+
 /// The `detail` of the error `finish_elevated` returns for `child` after a failed password write.
 #[cfg(unix)]
 fn finish_elevated_detail(child: crate::Child) -> String {

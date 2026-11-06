@@ -127,7 +127,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
 /// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
 /// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
-/// says so, and the handle is disarmed. Only a failed tree kill with a root not handed back leaves
+/// says so, and the handle is disarmed. A retry that itself ends unvouched is reported the same way,
+/// after the first failure. Only a failed tree kill with a root not handed back leaves
 /// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
 /// second time.
 #[cfg(unix)]
@@ -249,14 +250,16 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let fate = torn.fate;
     // After the root's kill, which settles a walk that left only the root.
     let tree = tree.map(|kill| child.attached.settle(&child.tree_killed, kill, fate.not_running()));
-    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
-    // deliberately left alone because the root is reaped or unpinned.
-    let tree_settled = tree
-        .as_ref()
-        .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)))
-        || (skipped.is_some() && view.leaves_root_alone());
-    // An unvouched tree is not a failed kill: there is nothing to retry, and the cleanup says so once.
+    // The tree is settled when no kill of it is left to try, or it was deliberately left alone because
+    // the root is reaped or unpinned.
+    let tree_settled = !tree_needs_another_kill(&tree) || (skipped.is_some() && view.leaves_root_alone());
     let unvouched = matches!(tree, Some(Ok(SettleOutcome::Unvouched { .. })));
+    // An unvouched tree disarms the handle on the strength of the root's end (or of its being the
+    // caller's): nothing is left for the drop to kill.
+    debug_assert!(
+        !unvouched || hands_back || fate.not_running(),
+        "an unvouched tree leaves the handle disarmed only over a root that ended or went to the caller: {fate:?}"
+    );
     let subject = child.attached.teardown_subject();
     let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
     report.tree = tree_warn;
@@ -265,11 +268,12 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     }
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
     // here. The one warn and the error's note say how the retry went.
-    if hands_back && !tree_settled && !unvouched {
+    if hands_back && !tree_settled {
         let retry = kill_tree();
-        match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
+        // What the retry adds to the first attempt's report, and the outcome that report is built from.
+        let more = match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
-            Ok(SettleOutcome::Skipped | SettleOutcome::Unvouched { .. }) => {}
+            Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {
@@ -278,14 +282,19 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                          failed: {first}"
                     )
                 });
+                None
             }
-            Err(again) => {
-                let too = format!("; the retry failed too ({again})");
-                tree_note.push_str(&too);
-                match report.tree.as_mut() {
-                    Some(warn) => warn.push_str(&too),
-                    None => report.tree = report_tree_teardown(Some(Err(again)), &subject).1,
-                }
+            // The retry is the cleanup's last word on the tree: unvouched, it is reported as such.
+            Ok(outcome @ SettleOutcome::Unvouched { kind }) => {
+                Some((format!("; on the retry, {}", kind.unvouched_text()), Ok(outcome)))
+            }
+            Err(again) => Some((format!("; the retry failed too ({again})"), Err(again))),
+        };
+        if let Some((added, again)) = more {
+            tree_note.push_str(&added);
+            match report.tree.as_mut() {
+                Some(warn) => warn.push_str(&added),
+                None => report.tree = report_tree_teardown(Some(again), &subject).1,
             }
         }
     }
@@ -295,7 +304,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     } else {
         root_note
     };
-    if hands_back || tree_settled || unvouched {
+    if hands_back || tree_settled {
         child.kill_on_drop = false;
     }
     // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
@@ -431,6 +440,22 @@ pub(crate) fn report_tree_teardown(
         }
         None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Skipped)) => (String::new(), None),
     }
+}
+
+/// Whether a failed spawn's cleanup, after the tree kill it tried (`None`: none was), has another to
+/// try, for both `finish_elevated` variants. Not when the tree was killed, and not when it cannot be
+/// vouched for: that is no failed kill, a kill of it again could not change it, and the cleanup says so
+/// once. A kill that left members, or was skipped and killed nothing, has another to try.
+#[cfg(unix)]
+pub(crate) fn tree_needs_another_kill(
+    tree: &Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
+) -> bool {
+    use crate::containment::dispatch::SettleOutcome;
+
+    !matches!(
+        tree,
+        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Unvouched { .. }))
+    )
 }
 
 /// The text of the cleanup's `warn` about the tree's teardown: `said`, about `subject`, under

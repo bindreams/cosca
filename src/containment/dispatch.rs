@@ -461,8 +461,10 @@ pub(crate) struct TreeKilled {
 ///   `Unvouched`. A held member is held because its kill was refused: it ran on and may have forked,
 ///   and killing it again by identity does not reach its children.
 ///
-/// A settlement that leaves the state `Unvouched` keeps the [`UnvouchedKind`] it has, unless its own
-/// facts name a different one: then the latest.
+/// The kind of an `Unvouched` state is the latest fact: a walk that saw the root running names
+/// [`RootSeenRunning`](UnvouchedKind::RootSeenRunning), whether or not the root had ended; held members
+/// that all dropped out, [`HeldMembersGone`](UnvouchedKind::HeldMembersGone); something else left with
+/// no identity, [`Earlier`](UnvouchedKind::Earlier). A settlement with no new fact keeps the stored kind.
 #[derive(Debug, Default)]
 enum TreeState {
     /// Nothing has settled the tree: no kill left anything running, and no walk left nothing.
@@ -484,24 +486,37 @@ enum TreeState {
 /// The state after a settlement, by the rule on [`TreeState`]. The facts: `walked`, the outcome was a
 /// walk that ran; `left_now`, the members it left with identities; `running`, the outcome left
 /// something running (the root included, whatever then ended it), not merely an error for a walk it
-/// did not make (a gone root's or an unmade walk's error is not a member seen running). `kind`: what
-/// the settlement found of a tree it leaves unvouched; the state keeps it.
+/// did not make (a gone root's or an unmade walk's error is not a member seen running);
+/// `root_seen_running`, the walk left the root (whatever then ended it), which is `running`.
 fn next(
     prev: &TreeState,
     walked: bool,
     left_now: Vec<crate::containment::treewalk::Left>,
     running: bool,
-    kind: UnvouchedKind,
+    root_seen_running: bool,
 ) -> TreeState {
+    debug_assert!(
+        !root_seen_running || running,
+        "a root seen running is something left running"
+    );
     if !left_now.is_empty() {
         return TreeState::Left(left_now);
     }
+    // The kind the facts name, for a state they leave unvouched.
+    let named = if root_seen_running {
+        UnvouchedKind::RootSeenRunning
+    } else if matches!(prev, TreeState::Left(_)) {
+        UnvouchedKind::HeldMembersGone
+    } else {
+        UnvouchedKind::Earlier
+    };
     match prev {
         _ if walked && !running => TreeState::Killed,
         TreeState::Never if !running => TreeState::Never,
         TreeState::Killed if !running => TreeState::Killed,
+        TreeState::Unvouched(kept) if !running => TreeState::Unvouched(*kept),
         TreeState::Never | TreeState::Killed | TreeState::Left(_) | TreeState::Unvouched(_) => {
-            TreeState::Unvouched(kind)
+            TreeState::Unvouched(named)
         }
     }
 }
@@ -657,8 +672,8 @@ pub(crate) enum SettleOutcome {
 pub(crate) enum UnvouchedKind {
     /// The tree held members an earlier kill left, which are gone now.
     HeldMembersGone,
-    /// This settlement's walk saw the root running and left it; the root's own kill then ended it, so
-    /// the call is `Ok`. What it forked meanwhile was never looked for.
+    /// A walk saw the root running and left it. If the root's own kill then ended it, the call was
+    /// `Ok`. What the root forked meanwhile was never looked for.
     RootSeenRunning,
     /// An earlier kill left something running (the root, members the handle holds no identity for, or
     /// members since gone), and the settlement no longer knows which.
@@ -1058,7 +1073,6 @@ impl Attached {
             TreeState::Left(held) => held.clone(),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
         };
-        let held_before = !held.is_empty();
         let gone_root = matches!(outcome, TreeKillOutcome::NoRoot);
         let ran = matches!(outcome, TreeKillOutcome::Ran(_));
         // What a walk not made or a gone root leaves is its error, not a member seen running.
@@ -1073,20 +1087,18 @@ impl Attached {
                 left_now = crate::containment::treewalk::Left::of(left);
             }
         }
-        // What this call knows of the tree it cannot vouch for: held members that are gone, or only
-        // that an earlier kill left something running.
-        let kind_before = match &*state {
-            _ if held_before => UnvouchedKind::HeldMembersGone,
-            TreeState::Unvouched(kind) => *kind,
-            TreeState::Never | TreeState::Killed | TreeState::Left(_) => UnvouchedKind::Earlier,
-        };
-        if gone_root && result.is_ok() && !was_killed {
-            // What an earlier walk left is gone or unknown, but nothing walked the tree for what it forked.
-            result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error(kind_before)));
-        }
         // A member the walk saw running un-vouches the tree, whatever ended it afterwards: it may have
         // forked first. Only the answer follows the root's end.
         let running = result.is_err() && !looked_for_no_member;
+        let root_seen_running = matches!(&result, Err(left) if left.root.is_some());
+        let after = next(&state, ran, left_now, running, root_seen_running);
+        if gone_root && result.is_ok() && !was_killed {
+            // What an earlier walk left is gone or unknown, but nothing walked the tree for what it forked.
+            let TreeState::Unvouched(kind) = after else {
+                unreachable!("a gone root over held or unvouched members leaves the tree unvouched");
+            };
+            result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error(kind)));
+        }
         let unsettled = match result {
             Ok(()) => Ok(()),
             Err(left) => {
@@ -1094,25 +1106,18 @@ impl Attached {
                 left.unsettled(root_ended)
             }
         };
-        // An `Ok` answer over something running left only the root, and its end settled the answer.
-        let root_only = running && unsettled.is_ok();
-        // The kind the state keeps: the one it has, unless this settlement names another (the latest).
-        let kind = if root_only {
-            UnvouchedKind::RootSeenRunning
-        } else {
-            kind_before
-        };
-        *state = next(&state, ran, left_now, running, kind);
         // The answer follows the state left: `Killed` only over a vouched tree. A gone root answers
         // `Ok` only over a killed tree.
-        unsettled.map(|()| match *state {
-            TreeState::Unvouched(kind) => SettleOutcome::Unvouched { kind },
+        let answer = unsettled.map(|()| match &after {
+            TreeState::Unvouched(kind) => SettleOutcome::Unvouched { kind: *kind },
             _ if ran || gone_root => {
-                debug_assert!(matches!(*state, TreeState::Killed), "`Killed` answers a killed tree");
+                debug_assert!(matches!(after, TreeState::Killed), "`Killed` answers a killed tree");
                 SettleOutcome::Killed
             }
             _ => SettleOutcome::Skipped,
-        })
+        });
+        *state = after;
+        answer
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
