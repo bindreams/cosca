@@ -412,14 +412,10 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
         drop(child);
     }
     let stdin = stdin.take().expect("released only before a failure");
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert_eq!(warns.len(), 1, "one warn for the one event: {warns:?}");
     assert!(
-        warns[0].1.contains("contained-tree teardown did not fully succeed")
-            && warns[0].1.contains("elevation front pid"),
+        warns[0].contains("contained-tree teardown did not fully succeed") && warns[0].contains("elevation front pid"),
         "the failed kill and the front are in it: {warns:?}"
     );
     assert_eq!(teardowns.count(), 0, "the drop must not kill or reap the front");

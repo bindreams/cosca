@@ -4,7 +4,8 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::super::root_state_tests::{failed_peek, session_blocker, warns_since};
+    use super::super::root_state_tests::{failed_peek, session_blocker};
+    use crate::log_capture::warns_since;
     use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
@@ -34,7 +35,7 @@ mod linux {
         drop(child);
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("reaped by someone else") && warns[0].contains("leaks"),
@@ -64,7 +65,7 @@ mod linux {
 
         assert_peeks_exhausted();
         assert_eq!(forgets.forgets(), 0);
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("elevation front pid") && !warns[0].contains("leaks"),
@@ -89,7 +90,7 @@ mod linux {
         drop(child);
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("reaped by someone else") && warns[0].contains("leaks"),
@@ -120,7 +121,7 @@ mod linux {
             Vec::<i32>::new(),
             "no killpg by a reaped root's number"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("does not kill its process group") && warns[0].contains("leaks"),
@@ -143,7 +144,7 @@ mod linux {
         drop(child);
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].starts_with("Child::drop:")
@@ -171,7 +172,7 @@ mod linux {
         drop(child);
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("RootState::Unknown")
@@ -197,7 +198,7 @@ mod linux {
             .expect_err("the spawn fails");
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
         assert!(
             warns[0].starts_with("finish_elevated:")
@@ -240,7 +241,7 @@ mod linux {
                 "{left:?}: {cause}"
             );
             assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
-            let warns = warns_since(mark);
+            let warns = warns_since(mark, "");
             let cleanup = warns.iter().filter(|warn| warn.starts_with("finish_elevated:")).count();
             assert_eq!(cleanup, 1, "{left:?}: {warns:?}");
             // The cleanup's one warn, and no drop's after it.
@@ -296,7 +297,7 @@ mod linux {
         let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
 
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
         assert!(
             warns[0].contains("waitid"),
@@ -330,7 +331,7 @@ mod linux {
             panicked.is_err(),
             "a failed wait on the child's own pidfd is asserted in debug"
         );
-        assert_eq!(warns_since(mark), Vec::<String>::new());
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new());
         assert!(
             crate::log_capture::contains_since(mark, "waitid on child"),
             "the failure is still logged, at the level given"
@@ -360,7 +361,7 @@ mod linux {
             1,
             "the handle's drop retries the refused root kill ({err:?})"
         );
-        assert_eq!(warns_since(mark), Vec::<String>::new());
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new());
         teardown.assert_killed();
     }
 
@@ -416,7 +417,7 @@ mod linux {
             Vec::<i32>::new(),
             "no killpg by an unconfirmed root's number"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
         assert!(
             warns[0].starts_with("finish_elevated:") && warns[0].contains("RootState::Unknown"),
@@ -443,7 +444,7 @@ mod linux {
 
         proc.reap_now(pid, None);
 
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("waitid") && warns[0].contains("leaks"),
@@ -454,7 +455,7 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::super::root_state_tests::warns_since;
+    use crate::log_capture::warns_since;
     use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::test_child::Console;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
@@ -482,7 +483,7 @@ mod macos {
         proc.reap_now(pid, None);
 
         assert_peeks_exhausted();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("launchd") && warns[0].contains("leaks"),

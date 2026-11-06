@@ -266,12 +266,9 @@ async fn tokio_forget_foreign_warns_naming_the_leak() {
     assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
     proc.forget_foreign();
 
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &format!("child {pid}"))
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, &format!("child {pid}"));
     assert_eq!(warns.len(), 1, "exactly one warning: {warns:?}");
-    assert!(warns[0].1.contains("leak"), "the warning must name the leak: {warns:?}");
+    assert!(warns[0].contains("leak"), "the warning must name the leak: {warns:?}");
     assert!(proc.is_reaped(), "a forgotten child has nothing left to reap");
 }
 
