@@ -32,7 +32,7 @@ fn stale_root() -> ProcessId {
 #[track_caller]
 fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
     match result {
-        Err(Error::MemberNotKilled { pid: named, source }) => {
+        Err(Error::MemberNotKilled { pid: named, source, .. }) => {
             assert_eq!(named, pid, "the first member left behind");
             assert!(matches!(*source, Error::Unassessable { .. }), "{source:?}");
             let said = source.to_string();
@@ -534,8 +534,8 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let cause = format!("pid {} identity could not be read", descendant.pid());
     let left = super::hard_kill(&kernel, root).expect_err("a descendant was left");
-    assert!(!left.only_root, "a descendant was left, not only the root");
-    assert_not_killed(Err(left.error), descendant.pid(), &[&cause]);
+    assert!(!left.members.is_empty(), "a descendant was left, not only the root");
+    assert_not_killed(Err(left.into_error()), descendant.pid(), &[&cause]);
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
@@ -556,9 +556,8 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
 fn a_descendant_that_cannot_be_read_is_reported_once() {
     crate::log_capture::install();
     let warns_naming = |mark, descendant: ProcessId| -> Vec<String> {
-        crate::log_capture::records_since_on_current_thread(mark, "treewalk:")
+        crate::log_capture::warns_since_on_current_thread(mark, &format!("pid {}", descendant.pid()))
             .into_iter()
-            .filter(|(level, said)| *level == log::Level::Warn && said.contains(&format!("pid {}", descendant.pid())))
             .map(|(_, said)| said)
             .collect()
     };
@@ -597,11 +596,12 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
     release_with_a_signalled_root("terminate", child, libc::SIGTERM);
 }
 
-/// Every member left behind but the first is warned of once, with its pid and why; the first is the
-/// error's. The made-up second member is `fault`'s, as no real second descendant refuses a kill
-/// without setuid. Mutant: "`hard_kill` drops every member after the first".
+/// Every member left behind is in what `hard_kill` returns, the one that could not be read first, and
+/// `hard_kill` warns of none: its caller reports, once. The made-up second member is `fault`'s, as no
+/// real second descendant refuses a kill without setuid. Mutants: "`hard_kill` drops every member after
+/// the first"; "`hard_kill` warns of the members after the first".
 #[skuld::test]
-fn every_member_left_behind_but_the_first_is_warned_of_once() {
+fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     use super::fault::{self, LeftBehind};
     crate::log_capture::install();
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
@@ -609,20 +609,18 @@ fn every_member_left_behind_but_the_first_is_warned_of_once() {
     let mark = crate::log_capture::mark();
     fault::force_incomplete_once(LeftBehind::Descendant);
     let left = super::hard_kill(&kernel, root).expect_err("two members were left");
-    let warned: Vec<String> = crate::log_capture::records_since_on_current_thread(mark, "treewalk:")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, said)| said)
+    let warned = crate::log_capture::warns_since_on_current_thread(mark, "treewalk:");
+    let pids: Vec<u32> = left
+        .members
+        .iter()
+        .map(|error| match error {
+            Error::MemberNotKilled { pid, .. } => *pid,
+            other => panic!("expected MemberNotKilled, got {other:?}"),
+        })
         .collect();
-    assert!(
-        matches!(left.error, Error::MemberNotKilled { pid, .. } if pid == descendant.pid()),
-        "{left:?}"
-    );
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(
-        warned[0].contains(&format!("pid {second} was not killed")),
-        "{warned:?}"
-    );
+    assert_eq!(pids, [descendant.pid(), second], "{left:?}");
+    assert!(left.root.is_none(), "{left:?}");
+    assert_eq!(warned, [], "the caller reports");
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
 }
 

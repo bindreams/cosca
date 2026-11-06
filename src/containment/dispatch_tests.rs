@@ -288,7 +288,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
 #[skuld::test]
 fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
     use super::super::treewalk::fault::{self, LeftBehind};
-    for left in [LeftBehind::Root, LeftBehind::Descendant] {
+    for left in [LeftBehind::Root, LeftBehind::Descendant, LeftBehind::RootAndDescendant] {
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(["cat"]);
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
@@ -301,7 +301,7 @@ fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
         let result = child.kill_tree();
         match left {
             LeftBehind::Root => result.expect("only the root was left, and the backstop killed it"),
-            LeftBehind::Descendant => {
+            LeftBehind::Descendant | LeftBehind::RootAndDescendant => {
                 let err = result.expect_err("a descendant was left");
                 assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
             }
@@ -319,7 +319,7 @@ fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
 #[skuld::test]
 async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
     use super::super::treewalk::fault::{self, LeftBehind};
-    for left in [LeftBehind::Root, LeftBehind::Descendant] {
+    for left in [LeftBehind::Root, LeftBehind::Descendant, LeftBehind::RootAndDescendant] {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(["cat"]);
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
@@ -332,7 +332,7 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
         let result = child.kill_tree();
         match left {
             LeftBehind::Root => result.expect("only the root was left, and the backstop killed it"),
-            LeftBehind::Descendant => {
+            LeftBehind::Descendant | LeftBehind::RootAndDescendant => {
                 let err = result.expect_err("a descendant was left");
                 assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
             }

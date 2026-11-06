@@ -552,9 +552,9 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
     assert!(child.is_running(), "precondition: the subject must be live");
     match super::hard_kill(&crate::identity::HostKernel, id) {
         Err(super::Unkilled {
-            error: crate::error::Error::MemberNotKilled { pid, source },
-            only_root: true,
-        }) => {
+            members,
+            root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
+        }) if members.is_empty() => {
             assert_eq!(pid, child.pid());
             assert!(
                 matches!(*source, crate::error::Error::Unassessable { source: Some(_), .. }),
@@ -578,8 +578,8 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
     let left = super::hard_kill(&crate::identity::HostKernel, child.id()).expect_err("the kill is refused");
-    assert!(left.only_root, "the root is the only member the walk left");
-    let err = left.error;
+    assert!(left.members.is_empty(), "the root is the only member the walk left");
+    let err = left.root.expect("the root was left");
     // The message reads once: the pid, then the OS's own words.
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     assert_eq!(
@@ -587,7 +587,7 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
         format!("pid {} was not killed: {os}", child.id().pid())
     );
     match err {
-        crate::error::Error::MemberNotKilled { pid, source } => {
+        crate::error::Error::MemberNotKilled { pid, source, .. } => {
             assert_eq!(pid, child.id().pid());
             assert!(
                 matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),

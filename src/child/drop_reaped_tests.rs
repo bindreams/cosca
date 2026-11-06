@@ -609,6 +609,57 @@ fn a_drop_whose_walk_leaves_only_the_root_does_not_warn_when_the_drop_kills_it()
     );
 }
 
+/// A walk that left a descendant and the root, then the root's kill by the handle: the report names
+/// the descendant alone, for `kill_tree` and for the drop. The root is dead, so a line about it would
+/// be stale.
+///
+/// Mutant: the walk warns of every member it left, the root included, before the root's kill.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
+    let root = child.id().pid();
+    let mark = crate::log_capture::mark();
+
+    let err = child.kill_tree().expect_err("a descendant was left");
+
+    assert!(
+        matches!(err, crate::error::Error::MemberNotKilled { pid, .. } if pid == root.wrapping_add(1)),
+        "{err:?}"
+    );
+    let stale = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {root} was not killed"));
+    assert_eq!(stale, [], "the root was killed by the handle");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
+}
+
+/// [`kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone`] for the
+/// drop: one report, of the descendant.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
+    let blocker = release_between_kill_and_wait(stdin);
+    let root = child.id().pid();
+    let mark = crate::log_capture::mark();
+
+    drop(child);
+
+    blocker.assert_killed();
+    let warns = crate::log_capture::warns_since_on_current_thread(mark, "");
+    assert_eq!(warns.len(), 1, "one report of the event: {warns:?}");
+    let text = &warns[0].1;
+    assert!(
+        text.contains(&format!("pid {} was not killed", root.wrapping_add(1))),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("pid {root} was not killed")), "{text}");
+}
+
 /// Exactly one record of the drop's skip since `mark`, at `debug`.
 #[track_caller]
 fn assert_skipped_at_debug(mark: usize) {

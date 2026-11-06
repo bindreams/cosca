@@ -224,11 +224,14 @@ pub enum Error {
     /// sweep, which reports a member it could not reach as [`Error::Containment`] or
     /// [`Error::Unassessable`] without a `source`. This variant comes from the ppid walk alone:
     /// `Process::kill_tree`, and a `TreeWalk` handle on Linux and Windows.
-    #[error("pid {pid} was not killed: {source}")]
+    #[error("pid {pid} was not killed: {source}{}", .note.as_deref().map(|note| format!("; {note}")).unwrap_or_default())]
     MemberNotKilled {
         pid: u32,
         #[source]
         source: Box<Error>,
+        /// What the spawn's cleanup adds of the child's fate, when it is the one that returns the
+        /// error. It leaves `source` as it is, which keeps the refusal's OS error.
+        note: Option<String>,
     },
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
@@ -479,9 +482,8 @@ impl Error {
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
     /// original error as the [`source`](std::error::Error::source), which keeps the OS code. An
-    /// [`Error::MemberNotKilled`] whose source is an OS error is returned as it is, without the
-    /// note: its [`raw_os_error`](std::io::Error::raw_os_error) is part of its contract.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
+    /// [`Error::MemberNotKilled`] takes the note in its own `note`, so its `source` (and the OS error
+    /// that is part of its contract) is untouched.
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
         match self {
@@ -507,14 +509,16 @@ impl Error {
                 detail: append(detail),
                 source,
             },
-            // A refused kill's OS error is the contract of this variant, and a note would hide it
-            // behind a wrapper (an `io::Error` with a payload has no OS code).
-            Error::MemberNotKilled { pid, source } if matches!(&*source, Error::Io(e) if e.raw_os_error().is_some()) => {
-                Error::MemberNotKilled { pid, source }
-            }
-            Error::MemberNotKilled { pid, source } => Error::MemberNotKilled {
+            // The note goes beside `source`, not into it: a refused kill's OS error is the contract of
+            // this variant, and wrapping it would hide it (an `io::Error` with a payload has no OS code).
+            Error::MemberNotKilled {
                 pid,
-                source: Box::new(source.with_note(note)),
+                source,
+                note: earlier,
+            } => Error::MemberNotKilled {
+                pid,
+                source,
+                note: Some(earlier.map_or_else(|| note.to_owned(), append)),
             },
             Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
                 pid,

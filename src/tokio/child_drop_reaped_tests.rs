@@ -507,6 +507,50 @@ async fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
     assert_eq!(drop_records.len(), 1, "one report of the event: {drop_records:?}");
 }
 
+/// A walk that left a descendant and the root, then the root's kill by the handle: the report names
+/// the descendant alone, for `kill_tree` and for the drop. The root is dead, so a line about it would
+/// be stale. Mutant: the walk warns of every member it left, the root included, before the root's kill.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn kill_tree_and_drop_after_a_walk_that_left_a_descendant_and_the_root_name_the_descendant_alone() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, stdin) = crate::test_child::held_treewalk_blocker_leaving_async(LeftBehind::RootAndDescendant);
+    let root = child.id().pid();
+    let descendant = root.wrapping_add(1);
+    let mark = crate::log_capture::mark();
+
+    let err = child.kill_tree().expect_err("a descendant was left");
+
+    assert!(
+        matches!(err, crate::error::Error::MemberNotKilled { pid, .. } if pid == descendant),
+        "{err:?}"
+    );
+    let stale = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {root} was not killed"));
+    assert_eq!(stale, [], "the root was killed by the handle");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
+
+    // The drop of that child: armed by the unsettled tree, it reports the descendant once.
+    let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving_async(LeftBehind::RootAndDescendant);
+    let teardown = release_between_kill_and_wait(stdin);
+    let root = child.id().pid();
+    let sends = Capture::start();
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    assert_the_drop_killed(&teardown, &sends, root);
+    let warns = crate::log_capture::warns_since_on_current_thread(mark, "");
+    assert_eq!(warns.len(), 1, "one report of the event: {warns:?}");
+    let text = &warns[0].1;
+    assert!(
+        text.contains(&format!("pid {} was not killed", root.wrapping_add(1))),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("pid {root} was not killed")), "{text}");
+}
+
 /// A drop whose walk leaves only the root, which the drop's own kill of the root then ends, says
 /// nothing. Mutant: the drop reports the walk's error before the root's kill.
 #[cfg(not(target_os = "macos"))]

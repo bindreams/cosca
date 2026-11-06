@@ -60,7 +60,7 @@ pub(crate) struct DropReport<'a> {
     /// The elevation front the event left running instead of signalling, and why.
     pub(crate) front: Option<&'a Error>,
     /// What the drop did not do because the root's number is untrusted
-    /// ([`DropKill::skipped`](crate::containment::dispatch::DropKill)).
+    /// ([`HardKillForDropOutcome::left_undone`](crate::containment::dispatch::HardKillForDropOutcome::left_undone)).
     pub(crate) skipped: Option<String>,
     /// What forgetting tokio's `Child` leaked, if the event forgot it.
     pub(crate) forgot: Option<Forgot>,

@@ -242,6 +242,32 @@ mod linux {
         }
     }
 
+    /// A tree kill skipped because the root's state is unknown has not killed the tree: the cleanup's
+    /// settle does not mark it, so the failed spawn's handle stays armed.
+    ///
+    /// Mutant: a skipped kill marks the tree killed.
+    #[skuld::test]
+    async fn a_skipped_tree_kill_does_not_mark_the_tree_killed() {
+        use crate::containment::dispatch::{RootView, TeardownCaller};
+        crate::log_capture::install();
+        let (child, _writer) = crate::test_child::held_treewalk_blocker_async();
+        let view = crate::containment::DropView {
+            caller: TeardownCaller::FinishElevated,
+            root_pid: child.id().pid(),
+            root: RootView::Unknown(std::io::Error::other("forced")),
+            tree_killed: false,
+        };
+
+        let kill = child.kill_tree_members_unless_reaped(&view);
+
+        assert!(
+            kill.skipped().is_some(),
+            "the walk from the root's number is skipped: {kill:?}"
+        );
+        child.settle_tree(kill, true).expect("a skip leaves nothing to report");
+        assert!(!child.tree_killed(), "a skipped kill does not mark the tree killed");
+    }
+
     /// The wait's failure is named in the one warn: the cause of a foreign wait result is carried, not
     /// only logged at `debug`.
     ///

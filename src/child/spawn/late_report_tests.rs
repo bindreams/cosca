@@ -535,6 +535,26 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
     );
 }
 
+/// A walk that left only the root is settled by the root's kill, which follows it: the warn says
+/// nothing of the tree.
+///
+/// Mutant: the walk's result is judged before the root's kill.
+#[skuld::test]
+fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() {
+    let (pid, fate, _, mark) = late_tree_walk(|| {
+        crate::containment::treewalk::fault::force_incomplete_once(
+            crate::containment::treewalk::fault::LeftBehind::Root,
+        );
+    });
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(
+        pid,
+        mark,
+        &[SAID_REAPED],
+        &["tree was not", "fully killed", "was not killed"],
+    );
+}
+
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with
 /// what it starts after that. The first kill of its tree finds no group yet; the hook between that
 /// kill and the root's lets the child run on, `setsid`, `exec` and fork its grandchild, and waits

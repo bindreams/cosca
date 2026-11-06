@@ -263,27 +263,50 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
     }
 }
 
-/// The error for that child names the parent whose proof failed, and the warn of the walk's caller
-/// ([`super::warn_unassessed`]) names the child's pid once. Mutant: "the error blames the child's
-/// pid".
+/// The error for that child names the parent whose proof failed and the child it dropped. The walk
+/// and `children`' list of a walk (`ProcessId::children` is a query) log nothing; the warn of a
+/// caller with no error to return ([`super::warn_unassessed`]) says it once. Mutants: "the error
+/// names the parent alone"; "the walk or `children` warns".
 #[skuld::test]
-fn the_report_of_a_child_whose_parent_cannot_be_proved_names_the_parent() {
+fn a_child_whose_parent_cannot_be_proved_is_reported_by_an_error_naming_both() {
     crate::log_capture::install();
-    let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
-    let walked = super::walk_from(&kernel, root(), &EDGES, Recursive::Yes)
+    let kernel = || table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let names_both = |detail: &str| {
+        detail.contains(&format!("ppid {ROOT} identity could not be read")) && detail.contains(&format!("pid {CHILD}"))
+    };
+    let mark = crate::log_capture::mark();
+    for depth in [Recursive::No, Recursive::Yes] {
+        let walked = super::walk_from(&kernel(), root(), &EDGES, depth)
+            .expect("the root reads")
+            .expect("the root is live");
+        let [(_, Error::Unassessable { detail, .. })] = &walked.unassessed[..] else {
+            panic!(
+                "{depth:?}: expected one Unassessable entry, got {:?}",
+                walked.unassessed
+            );
+        };
+        assert!(names_both(detail), "{depth:?}: {detail}");
+        let err = walked.complete_members().expect_err("the list would be short");
+        let Error::Unassessable { detail, .. } = &err else {
+            panic!("{depth:?}: expected Unassessable, got {err:?}");
+        };
+        assert!(names_both(detail), "{depth:?}: {detail}");
+    }
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "a query logs nothing"
+    );
+
+    let walked = super::walk_from(&kernel(), root(), &EDGES, Recursive::Yes)
         .expect("the root reads")
         .expect("the root is live");
     let mark = crate::log_capture::mark();
     super::warn_unassessed(&walked.unassessed);
-    let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "");
     assert_eq!(warned.len(), 1, "{warned:?}");
-    let (level, message) = &warned[0];
-    assert_eq!(*level, log::Level::Warn);
-    assert!(
-        message.contains(&format!("ppid {ROOT} identity could not be read")),
-        "{message}"
-    );
-    assert_eq!(message.matches(&format!("pid {CHILD}")).count(), 1, "{message}");
+    assert_eq!(warned[0].0, log::Level::Warn);
+    assert!(names_both(&warned[0].1), "{warned:?}");
 }
 
 /// On a host whose pidfds have no inode the proof is the ticks compare: the root's `stat` shows the

@@ -202,13 +202,13 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 }
 
 /// [`unqueryable`] for the ordered read of `pid` that left `Unknown` with `cause`: the subject is
-/// `label pid`, or the parent whose proof failed when `cause` blames it.
+/// `label pid`, or the parent whose proof failed when `cause` blames it, in which case the error
+/// also names `pid`, the read that was left unanswered.
 pub(crate) fn unqueryable_read(label: &str, pid: RawPid, cause: UnknownCause) -> Error {
-    let subject = match cause.blamed_parent() {
-        Some(parent) => format!("ppid {parent}"),
-        None => format!("{label} {pid}"),
-    };
-    unqueryable(&subject, cause)
+    match cause.blamed_parent() {
+        Some(parent) => unqueryable(&format!("ppid {parent}"), cause).with_note(&format!("reading {label} {pid}")),
+        None => unqueryable(&format!("{label} {pid}"), cause),
+    }
 }
 
 /// What [`OrderedRead::judged`] makes of a read before the parent is proved again.

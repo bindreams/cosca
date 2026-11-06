@@ -25,7 +25,7 @@ use std::process::ExitStatus;
 use crate::child::ParentEnd;
 #[cfg(target_os = "linux")]
 use crate::containment::cgroup::Waiting;
-use crate::containment::dispatch::{SweepFailure, TeardownCaller};
+use crate::containment::dispatch::{HardKillForDropOutcome, SweepFailure, TeardownCaller};
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -279,10 +279,10 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn settle_tree(
         &self,
-        walk: Result<(), crate::containment::dispatch::Unkilled>,
+        kill: crate::containment::dispatch::HardKillForDropOutcome,
         root_ended: bool,
-    ) -> Result<(), Error> {
-        self.os.attached.settle(&self.tree_killed, walk, root_ended)
+    ) -> Result<(), crate::containment::dispatch::Unsettled> {
+        self.os.attached.settle(&self.tree_killed, kill, root_ended)
     }
 
     /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
@@ -323,21 +323,19 @@ impl Child {
     /// [`kill_tree`](Self::kill_tree) adds, for a failed spawn, which kills and reaps the root
     /// separately. The root may already be reaped: when it is (this handle's own reap, the number
     /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
-    /// names the tree by the root's number runs, and why and what was skipped is returned as
-    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`). On Linux
-    /// 6.9+ the root's pidfd decides a process group instead
-    /// ([`Attached::hard_kill_marking_unless_reaped`](crate::containment::Attached::hard_kill_marking_unless_reaped)).
+    /// names the tree by the root's number runs, and the outcome says so. The same when the handle
+    /// could not say (`RootState::Unknown`). On Linux 6.9+ the root's pidfd decides a process group
+    /// instead ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)).
+    /// The caller settles the outcome ([`settle_tree`](Self::settle_tree)).
     #[cfg(unix)]
     pub(super) fn kill_tree_members_unless_reaped(
         &self,
         view: &crate::containment::DropView,
-    ) -> Result<Option<String>, crate::containment::dispatch::Unkilled> {
+    ) -> crate::containment::dispatch::HardKillForDropOutcome {
         let check = || self.group_number_holds();
-        self.os.attached.hard_kill_marking_unless_reaped(
-            view,
-            &self.tree_killed,
-            &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
-        )
+        self.os
+            .attached
+            .hard_kill_for_drop(view, &crate::containment::GroupRoot::new(self.root_pidfd(), &check))
     }
 
     /// What this child's own handle and the root's number say about the root, for a cleanup that
@@ -838,11 +836,10 @@ impl Child {
                 let check = || self.group_number_holds();
                 self.os
                     .attached
-                    .hard_kill_marking(
+                    .hard_kill_settled(
                         &self.tree_killed,
                         &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
                     )
-                    .map_err(crate::containment::dispatch::Unkilled::into_error)
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 cgroup_kill_reached(self.front, &self.os, self.id.pid())?;
                 return Ok(Sent::Delivered);
@@ -964,7 +961,7 @@ impl Child {
                 root_ended: root_ended_by_handle.get(),
             });
         }
-        let group_result = self.os.attached.hard_kill_marking(&self.tree_killed, &group);
+        let group_result = self.os.attached.hard_kill(&group);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
         if self.os.attached.hard_kill_refused_to_walk(&group_result) {
@@ -975,14 +972,18 @@ impl Child {
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            return match group_result {
+            return match self
+                .os
+                .attached
+                .settle_for_kill_tree(&self.tree_killed, group_result, false)
+            {
                 Ok(()) if in_cgroup => cgroup_kill_reached(self.front, &self.os, self.id.pid()),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
                     self.front,
                     self.id.pid(),
-                    left.into_error(),
+                    left,
                 )),
-                other => other.map_err(crate::containment::dispatch::Unkilled::into_error),
+                other => other,
             }
             .map_err(SweepFailure::from);
         }
@@ -1728,7 +1729,7 @@ impl Child {
         // Reported after the root's kill: a walk that left only the root is settled by it.
         let tree = os.attached.settle_for_drop(
             &self.tree_killed,
-            std::mem::replace(&mut signals.tree, Ok(())),
+            std::mem::replace(&mut signals.tree, HardKillForDropOutcome::Ran(Ok(()))),
             signals.fate.ended_by_the_kill(),
         );
         #[cfg(unix)]
@@ -1984,7 +1985,7 @@ fn cgroup_kill_reached(front: Option<crate::elevation::front::Front>, os: &OsRes
 struct DropSignals {
     /// What became of the child.
     fate: crate::error::ChildFate,
-    /// What the tree kill skipped ([`DropKill::skipped`](crate::containment::dispatch::DropKill)).
+    /// What the tree kill skipped ([`HardKillForDropOutcome::left_undone`]).
     #[cfg(unix)]
     skipped: Option<String>,
     /// What forgetting tokio's `Child` leaked, if the failed root kill forgot it.
@@ -1992,7 +1993,7 @@ struct DropSignals {
     forgot: Option<crate::child::drop_report::Forgot>,
     /// The contained tree's teardown, worded for the report only once the root's kill is known
     /// ([`Attached::settle_for_drop`](crate::containment::Attached::settle_for_drop)).
-    tree: Result<(), crate::containment::dispatch::Unkilled>,
+    tree: HardKillForDropOutcome,
     /// What the root kill could not do.
     left: Vec<String>,
     /// What the armed drop waits for once it has signalled.
@@ -2024,7 +2025,7 @@ impl DropSignals {
             skipped: None,
             #[cfg(unix)]
             forgot: None,
-            tree: Ok(()),
+            tree: HardKillForDropOutcome::Ran(Ok(())),
             left: Vec::new(),
         }
     }
@@ -2070,13 +2071,13 @@ fn signal_on_drop(
             view,
             &crate::containment::GroupRoot::new(proc.and_then(ProcSource::pidfd), &check),
         );
-        signals.skipped = kill.skipped;
-        kill.result
+        signals.skipped = kill.left_undone(view);
+        kill
     };
     #[cfg(not(unix))]
     let tree = {
         _ = tree_killed;
-        os.attached.hard_kill(&crate::containment::GroupRoot::none())
+        HardKillForDropOutcome::Ran(os.attached.hard_kill(&crate::containment::GroupRoot::none()))
     };
     // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on, once
     // the root is killed ([`Child::report`]).
@@ -2098,9 +2099,9 @@ fn signal_on_drop(
     // have its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
     if let Some(front) = cgroup_front {
-        let reached = match &signals.tree {
+        let reached = match signals.tree.result() {
             Ok(()) => cgroup_kill_reached(Some(front), os, pid).map_err(|e| e.to_string()),
-            Err(left) => Err(left.error.to_string()),
+            Err(left) => Err(left.first().to_string()),
         };
         match reached {
             // Ended by the cgroup kill: reaped through its handle like any killed root.

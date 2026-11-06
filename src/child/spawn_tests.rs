@@ -847,7 +847,12 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
     crate::log_capture::install();
-    let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
+    let failed = || {
+        Some(Err(crate::containment::dispatch::Unsettled {
+            first: Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR)),
+            others: Vec::new(),
+        }))
+    };
     for (name, tree, reported) in [
         ("cosca-report-failed", failed(), true),
         ("cosca-report-worked", Some(Ok(())), false),
@@ -1195,7 +1200,7 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 /// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
 /// group number may name another group by now, and the error says the tree kill was skipped.
 ///
-/// Mutant: `finish_elevated` runs `hard_kill_marking` before it learns the root was reaped.
+/// Mutant: `finish_elevated` runs `hard_kill` before it learns the root was reaped.
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {

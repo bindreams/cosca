@@ -685,6 +685,56 @@ fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
     handed_back.wait();
 }
 
+/// A tree kill skipped because the root's state is unknown has not killed the tree: a failed spawn's
+/// cleanup leaves the handle armed, so its drop tries again. A killed root does not change that.
+///
+/// Mutant: a skipped kill marks the tree killed, which disarms the handle.
+#[skuld::test]
+fn finish_elevated_leaves_the_handle_armed_after_a_skipped_tree_kill() {
+    crate::log_capture::install();
+    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+    let mark = crate::log_capture::mark();
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert!(
+        cause.to_string().contains("its contained tree was not killed"),
+        "nothing killed the tree: {cause}"
+    );
+    // An armed handle's drop looks at the tree again, at `debug` at least; a disarmed one says nothing.
+    let drops = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
+    assert!(!drops.is_empty(), "the handle was disarmed by a kill that did not run");
+}
+
+/// A drop that skipped the tree kill (the root's state is unknown) has not killed the tree, so it
+/// does not mark it.
+///
+/// Mutant: `settle` marks the tree killed for a kill that was skipped.
+#[skuld::test]
+fn a_teardown_that_skipped_the_tree_kill_does_not_mark_the_tree_killed() {
+    crate::log_capture::install();
+    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+
+    let torn = child.tear_down(
+        crate::containment::dispatch::TeardownCaller::FailedRun,
+        crate::child::owned::teardown::Disposition::Leave,
+    );
+
+    assert!(torn.fate.ended_by_the_kill(), "{:?}", torn.fate);
+    assert!(
+        !child.tree_killed.is_set(),
+        "a skipped kill does not mark the tree killed"
+    );
+    drop(writer);
+}
+
 /// A handle that could not say, when the root's number shows it reaped: the doubt is not dropped
 /// silently. The `debug` record names the caller and the handle's error.
 ///

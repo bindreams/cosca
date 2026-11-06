@@ -873,6 +873,8 @@ fn leave_unverified_front(
 /// have started. The waits for the root and for the tree's drain each warn once past 1 s.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
+    use crate::containment::dispatch::{HardKillForDropOutcome, Unkilled};
+
     let Err(write_err) = written else {
         return Ok(child);
     };
@@ -886,19 +888,24 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let tree: Option<Result<(), crate::containment::dispatch::Unkilled>> =
-        (child.containment().can_teardown() && !front_closed).then(|| {
-            skipped = child.kill_tree_members_unless_reaped(&view)?;
-            // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
-            // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
-            // naming a `wait_tree` the caller never gets.
-            child.block_until_members_drained().map_err(|e| Error::Containment {
+    let tree: Option<HardKillForDropOutcome> = (child.containment().can_teardown() && !front_closed).then(|| {
+        let kill = child.kill_tree_members_unless_reaped(&view);
+        skipped = kill.skip_note(&view);
+        if kill.result().is_err() {
+            return kill;
+        }
+        // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
+        // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
+        // naming a `wait_tree` the caller never gets.
+        match child.block_until_members_drained() {
+            Ok(()) => kill,
+            Err(e) => HardKillForDropOutcome::Ran(Err(Unkilled::from(Error::Containment {
                 detail: format!("the kill succeeded, but its drain could not be watched ({e})"),
-            })?;
-            Ok(())
-        });
-    let tree_failure = match &tree {
-        Some(Err(left)) => Some(left.error.to_string()),
+            }))),
+        }
+    });
+    let tree_failure = match tree.as_ref().map(HardKillForDropOutcome::result) {
+        Some(Err(left)) => Some(left.first().to_string()),
         _ => None,
     };
     // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was

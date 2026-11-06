@@ -270,12 +270,15 @@ mod linux {
             view.root
         );
 
-        let skipped = child
+        let kill = child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &killed, &crate::containment::GroupRoot::trusted_for_test())
+            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
+        assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
+        child
+            .attached
+            .settle(&killed, kill, true)
             .expect("a skip is not an error");
 
-        assert!(skipped.is_some(), "the number-named kill must be skipped");
         assert!(!killed.is_set(), "a skipped kill must not mark the tree killed");
         assert_eq!(recorder.killed(), Vec::<i32>::new());
     }

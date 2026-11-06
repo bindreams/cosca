@@ -406,8 +406,7 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_marking(&self.tree_killed, &crate::containment::GroupRoot::none())
-                    .map_err(crate::containment::dispatch::Unkilled::into_error)
+                    .hard_kill_settled(&self.tree_killed, &crate::containment::GroupRoot::none())
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -642,7 +641,7 @@ impl Child {
                 root_ended: root_ended_by_handle.get(),
             });
         }
-        let group_result = self.attached.hard_kill_marking(&self.tree_killed, &group);
+        let group_result = self.attached.hard_kill(&group);
         #[cfg(unix)]
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
@@ -655,14 +654,17 @@ impl Child {
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            return match group_result {
+            return match self
+                .attached
+                .settle_for_kill_tree(&self.tree_killed, group_result, false)
+            {
                 Ok(()) if in_cgroup => self.cgroup_kill_reached(),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
                     self.front,
                     self.id.pid(),
-                    left.into_error(),
+                    left,
                 )),
-                other => other.map_err(crate::containment::dispatch::Unkilled::into_error),
+                other => other,
             }
             .map_err(SweepFailure::from);
         }
@@ -1111,7 +1113,9 @@ impl Child {
         #[cfg(not(unix))]
         {
             let mut left = Vec::new();
-            let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
+            let tree = crate::containment::dispatch::HardKillForDropOutcome::Ran(
+                self.attached.hard_kill(&crate::containment::GroupRoot::none()),
+            );
             let torn = self.proc.tear_down(
                 Some(self.id),
                 Kill {
@@ -1172,13 +1176,12 @@ impl Child {
         let held = self.proc.hold(self.id.pid());
         let kill = self.attached.hard_kill_for_drop(&view, &held.group());
         drop(held);
-        report.skipped = kill.skipped;
+        report.skipped = kill.left_undone(&view);
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
         // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
         // reported, never asserted on. Reported after the root's kill below: a walk that left only
         // the root is settled by it.
-        let result = kill.result;
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
         // (`cosca::tokio::Child`'s `Drop`) does the same on Unix.
@@ -1194,9 +1197,9 @@ impl Child {
             })
         } else {
             if cgroup_only {
-                let not_reached = match &result {
+                let not_reached = match kill.result() {
                     Ok(()) => self.cgroup_kill_reached().err().map(|e| e.to_string()),
-                    Err(left) => Some(left.error.to_string()),
+                    Err(left) => Some(left.first().to_string()),
                 };
                 match not_reached {
                     // The cgroup kill ended it: reap it, sending nothing.
@@ -1208,7 +1211,7 @@ impl Child {
             } else {
                 // The tree kill above may have reached the root: if the root's own kill is refused,
                 // that kill is what ends it.
-                let reach = result.is_ok().then_some(&self.attached as &dyn Reach);
+                let reach = kill.result().is_ok().then_some(&self.attached as &dyn Reach);
                 self.proc.tear_down(
                     Some(self.id),
                     Kill {
@@ -1222,7 +1225,7 @@ impl Child {
         let remains = report.fold_clause(torn);
         report.tree = self
             .attached
-            .settle_for_drop(&self.tree_killed, result, remains.fate.ended_by_the_kill());
+            .settle_for_drop(&self.tree_killed, kill, remains.fate.ended_by_the_kill());
         report.emit(&self.reported);
         remains
     }

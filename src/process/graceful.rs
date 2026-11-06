@@ -56,8 +56,11 @@ impl Process {
 
     /// [`kill_tree`](Self::kill_tree), reading through `kernel`.
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        // No handle backstop: the root is left as any member is, and the first member left is the
+        // error. This call's one report of the others.
         crate::containment::treewalk::hard_kill(kernel, self.id)
-            .map_err(crate::containment::dispatch::Unkilled::into_error)
+            .or_else(|left| left.unsettled(false))
+            .map_err(|left| left.report("Process::kill_tree"))
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
