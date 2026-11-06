@@ -98,8 +98,10 @@ pub(crate) enum KillOutcome {
     /// The pid holds no process, or holds a different one - nothing to kill.
     AlreadyGone,
     /// A live-or-unassessable process we did not signal, with why: [`Error::Unassessable`] when its
-    /// identity could not be read at kill time, [`Error::Io`] with the OS error when the OS refused
-    /// the signal. The only outcome that can leave a process running. It warns of nothing: the caller
+    /// identity could not be read at kill time, [`Error::Unsupported`] when the OS refuses the pidfd
+    /// it is read through, [`Error::Io`] with the OS error when the OS refused the signal. On Linux
+    /// any other error the proof of the pidfd finished with is wrapped as `Unassessable`, so an `Io`
+    /// here is always the OS's answer to the signal. The only outcome that can leave a process running. It warns of nothing: the caller
     /// that reports the outcome ([`hard_kill`]) or cannot ([`warn_if_not_attempted`]) says it.
     NotAttempted(Error),
 }
@@ -365,7 +367,7 @@ pub(crate) fn walk_from(
 
 /// A kill that sent nothing because the process's identity could not be read at kill time. The
 /// message reads after the pid, which the error of a walk that left it behind names.
-#[cfg(any(unix, windows))]
+#[cfg(any(all(unix, not(target_os = "linux")), windows))]
 fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
     KillOutcome::NotAttempted(Error::Unassessable { detail, source })
 }
@@ -379,12 +381,15 @@ fn refused(os: std::io::Error) -> KillOutcome {
 /// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
 /// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
 /// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
-/// so nothing is sent: `NotAttempted`, as for a pid that cannot be queried. Best-effort.
+/// so nothing is sent: `NotAttempted`, with the error the walk gives the same pid
+/// ([`unqueryable`](crate::identity::unqueryable)). Best-effort.
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use std::os::fd::AsFd as _;
 
     use nix::errno::Errno;
+
+    use crate::os_process::linux::open::OpenFailure;
 
     match crate::os_process::linux::open::open_verified_with(kernel, id) {
         Ok(None) => {
@@ -405,11 +410,24 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
                 Err(e) => refused(e.into()),
             }
         }
-        Err(Error::Unassessable { detail, source }) => identity_unread(detail, source),
-        Err(e) => identity_unread(
-            format!("its pidfd could not be proved to name it ({e})"),
-            Some(e.into_io()),
-        ),
+        Err(OpenFailure::Call(call)) => {
+            KillOutcome::NotAttempted(crate::identity::call_error(&format!("pid {}", id.pid()), call))
+        }
+        Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(match error {
+            error @ (Error::Unassessable { .. } | Error::Unsupported { .. }) => error,
+            other => unproved(id.pid(), other),
+        }),
+    }
+}
+
+/// `error`, which the open of `pid`'s pidfd finished with and which is no refusal of a signal (a
+/// live thread that leads no group, a `poll` that reported `POLLERR`), as [`Error::Unassessable`]
+/// with `error` as its source.
+#[cfg(target_os = "linux")]
+fn unproved(pid: RawPid, error: Error) -> Error {
+    Error::Unassessable {
+        detail: format!("pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {error}"),
+        source: Some(std::io::Error::other(error)),
     }
 }
 

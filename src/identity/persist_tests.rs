@@ -672,6 +672,36 @@ fn a_host_whose_own_pidfd_cannot_be_opened_has_no_scope() {
     );
 }
 
+/// A host whose own pidfd's inode cannot be read has no scope either, and the error names that read,
+/// not `pidfd_open`, with its errno.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_host_whose_own_pidfs_ino_cannot_be_read_has_no_scope() {
+    let (pidfd, _writer) = std::io::pipe().expect("a pipe");
+    let kernel = crate::identity::FakeKernel::new()
+        .on_pidfd_open(std::process::id(), Ok(pidfd.into()))
+        .on_pidfs_ino(std::process::id(), Err(rustix::io::Errno::BADF));
+    let err = crate::identity::backend::session_scope_at(
+        &kernel,
+        std::path::Path::new("/proc/sys/kernel/random/boot_id"),
+        std::path::Path::new("/proc/self/ns/pid"),
+    )
+    .map_err(scope_error)
+    .expect_err("a failed inode read must fail the scope");
+    let Error::IdentityRecord { kind, detail, source } = &err else {
+        panic!("expected Error::IdentityRecord, got {err:?}");
+    };
+    assert_eq!(*kind, RecordErrorKind::ScopeUnreadable);
+    assert!(
+        detail.contains("pidfs_ino") && !detail.contains("pidfd_open"),
+        "{detail}"
+    );
+    assert_eq!(
+        source.as_ref().expect("cause preserved").raw_os_error(),
+        Some(libc::EBADF)
+    );
+}
+
 /// The kind a pidfd shows is the kind of the scope: pidfs says `pidfs`, a pidfd with no inode
 /// says `ticks`.
 #[cfg(target_os = "linux")]
