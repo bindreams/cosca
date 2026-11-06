@@ -15,7 +15,7 @@ use crate::test_child::{
     live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
 };
 use crate::test_groups::{pidfd_group_signal, Group};
-use crate::Recursive;
+use crate::{Process, Recursive};
 
 use super::treewalk_pidfs_tests::{children_of, descendants};
 
@@ -73,13 +73,25 @@ fn id_walks() -> [(&'static str, Walk); 2] {
     ]
 }
 
+/// An open handle on the live process `id` names, whichever kind of key it is: [`open_live`] reads
+/// through the host, which on 6.9+ shows a `starttime` id as another process's.
+fn open_handle(id: ProcessId) -> Process {
+    if id.pidfs_ino().is_some() {
+        return open_live(id);
+    }
+    let kernel = FakeKernel::over(&HostKernel).live_without_pidfs(id.pid(), pidfd_of(id.pid()));
+    Process::open_with(&kernel, id)
+        .expect("open the live process")
+        .expect("the live process is not gone")
+}
+
 /// Every walk, `Process`'s included, over an open handle on the live `id`.
 fn walks() -> [(&'static str, Walk); 4] {
     [
         ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
         ("terminate", |k, id| super::terminate(k, id)),
-        ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
-        ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
+        ("kill_tree", |k, id| open_handle(id).kill_tree_with(k)),
+        ("terminate_tree", |k, id| open_handle(id).terminate_tree_with(k)),
     ]
 }
 
@@ -169,12 +181,15 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
 }
 
 /// A root whose pid cannot be queried is an error naming the pid and the view, with nothing
-/// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped".
+/// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped". The
+/// `/proc` path: only a `starttime` id is proved through the view; a `pidfs` id is proved by its
+/// pidfd, in `treewalk_pidfs_tests`.
 #[skuld::test]
 fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
     for (_, walk) in walks() {
-        let (child, id) = live_member();
-        let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel).same_view(), 1);
+        let (child, host_id) = live_member();
+        let id = ticks_id(host_id.pid());
+        let kernel = View::Unreadable.fail(ticks_host(id.pid()).same_view(), 1);
         let result = walk(&kernel, id);
         assert_unassessable_naming(
             result,
