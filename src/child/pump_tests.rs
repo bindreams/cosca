@@ -1,4 +1,3 @@
-#[cfg(target_os = "linux")]
 use crate::test_child::Console;
 use crate::test_groups::{unprivileged, Group};
 use crate::Stdio;
