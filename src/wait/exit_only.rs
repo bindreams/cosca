@@ -21,7 +21,7 @@ use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
 
 #[cfg(target_os = "linux")]
 #[path = "exit_only/linux.rs"]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 #[path = "exit_only/macos.rs"]
 mod macos;

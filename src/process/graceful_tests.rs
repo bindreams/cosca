@@ -44,8 +44,8 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
 }
 
 // A watch failure must not strand the foreign process between the soft signal and the
-// escalation: the kill still runs, then the watch error surfaces. With the old
-// `exited_by_id(..)?` shape the SIGTERM-ignoring child would survive the op.
+// escalation: the kill still runs, then the watch error surfaces. A wait that returned the error
+// first would leave the SIGTERM-ignoring child alive.
 #[skuld::test]
 fn foreign_graceful_lone_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_blocker();

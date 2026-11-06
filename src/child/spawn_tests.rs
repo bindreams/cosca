@@ -1060,17 +1060,18 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
     let mark = crate::log_capture::mark();
-    let _unsure =
-        crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other("forced peek failure 7a2e")));
+    let unsure = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure 7a2e"))]));
 
     let (err, _fate) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
         .expect_may_have_started_with();
 
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    unsure.assert_peeks_exhausted();
     teardown.assert_killed();
     assert!(reaped(pid), "the root was killed through its handle, got {err:?}");
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
