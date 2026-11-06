@@ -125,11 +125,16 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// tree kill does not run for it, so the cleanup retries that kill once first, and the warn and the
 /// error say how the retry went (a skipped kill is not a retry that worked). The handle is also
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
-/// alone (a reaped or unpinned root). Only a failed tree kill with a root not handed back leaves
+/// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
+/// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
+/// says so, and the handle is disarmed. A retry that itself ends unvouched is reported the same way,
+/// after the first failure. Only a failed tree kill with a root not handed back leaves
 /// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
 /// second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
+    use crate::containment::dispatch::{SettleOutcome, TreeKillOutcome};
+
     let Err(write_err) = written else {
         return Ok(child);
     };
@@ -149,24 +154,14 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.id.pid());
-        child
-            .attached
-            .hard_kill_marking_unless_reaped(&view, &child.tree_killed, &held.group())
+        child.attached.hard_kill_for_drop(&view, &held.group())
     };
-    let tree = (child.containment().can_teardown() && !front_closed).then(|| kill_tree().map(|s| skipped = s));
-    let tree_failure = match &tree {
-        Some(Err(e)) => Some(e.to_string()),
-        _ => None,
-    };
-    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
-    // deliberately left alone because the root is reaped or unpinned.
-    let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
-    let subject = child.attached.teardown_subject();
-    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
-    report.tree = tree_warn;
-    if let Some(note) = skipped {
-        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
-    }
+    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
+        let kill = kill_tree();
+        skipped = kill.skip_note(&view);
+        kill
+    });
+    let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let pid = child.id().pid();
     let (root_note, torn) = if view.unpinned_root() {
@@ -182,8 +177,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     } else {
         let root = match gate {
             // Not asked again after the kill: a killed front can read as neither exited nor in its
-            // cgroup, between leaving the cgroup's member list and becoming a zombie.
-            crate::elevation::front::Gate::CgroupOnly if child.tree_killed.is_set() => {
+            // cgroup, between leaving the cgroup's member list and becoming a zombie. The kill's own
+            // outcome says it landed; the handle's state is settled by `settle`, below.
+            crate::elevation::front::Gate::CgroupOnly if tree.as_ref().is_some_and(TreeKillOutcome::completed) => {
                 child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
             }
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
@@ -252,11 +248,33 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
+    // After the root's kill, which settles a walk that left only the root.
+    let tree = tree.map(|kill| child.attached.settle(&child.tree_killed, kill, fate.not_running()));
+    // The tree is settled when no kill of it is left to try, or it was deliberately left alone because
+    // the root is reaped or unpinned.
+    let tree_settled = !tree_needs_another_kill(&tree) || (skipped.is_some() && view.leaves_root_alone());
+    let unvouched = matches!(tree, Some(Ok(SettleOutcome::Unvouched { .. })));
+    // An unvouched tree disarms the handle on the strength of the root's end (or of its being the
+    // caller's): nothing is left for the drop to kill.
+    debug_assert!(
+        !unvouched || hands_back || fate.not_running(),
+        "an unvouched tree leaves the handle disarmed only over a root that ended or went to the caller: {fate:?}"
+    );
+    let subject = child.attached.teardown_subject();
+    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
+    report.tree = tree_warn;
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
+    }
     // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
     // here. The one warn and the error's note say how the retry went.
     if hands_back && !tree_settled {
-        match kill_tree() {
-            Ok(None) => {
+        let retry = kill_tree();
+        // What the retry adds to the first attempt's report, and the outcome that report is built from.
+        let more = match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
+            // A skip kills nothing: the notes of the first attempt stand.
+            Ok(SettleOutcome::Skipped) => None,
+            Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {
                     format!(
@@ -264,16 +282,19 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                          failed: {first}"
                     )
                 });
+                None
             }
-            // A skip kills nothing: the notes of the first attempt stand.
-            Ok(Some(_)) => {}
-            Err(again) => {
-                let too = format!("; the retry failed too ({again})");
-                tree_note.push_str(&too);
-                match report.tree.as_mut() {
-                    Some(warn) => warn.push_str(&too),
-                    None => report.tree = report_tree_teardown(Some(Err(again)), &subject).1,
-                }
+            // The retry is the cleanup's last word on the tree: unvouched, it is reported as such.
+            Ok(outcome @ SettleOutcome::Unvouched { kind }) => {
+                Some((format!("; on the retry, {}", kind.unvouched_text()), Ok(outcome)))
+            }
+            Err(again) => Some((format!("; the retry failed too ({again})"), Err(again))),
+        };
+        if let Some((added, again)) = more {
+            tree_note.push_str(&added);
+            match report.tree.as_mut() {
+                Some(warn) => warn.push_str(&added),
+                None => report.tree = report_tree_teardown(Some(again), &subject).1,
             }
         }
     }
@@ -395,20 +416,53 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// are one event). `subject` names the tree, because the teardown error itself may not (see
 /// `Attached::teardown_subject`).
 ///
-/// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok)`: it worked.
-/// Neither is reported.
+/// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
+/// tree was killed. `Some(Ok(Skipped))`: a kill that killed nothing; its skip note says so (the
+/// caller's). None of these is reported here. `Some(Ok(Unvouched { kind }))`: reported as `kind` says.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(
-    tree: Option<Result<(), Error>>,
+    tree: Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
     subject: &dyn std::fmt::Display,
 ) -> (String, Option<String>) {
-    let Some(Err(e)) = tree else {
-        return (String::new(), None);
-    };
-    (
-        format!("; its contained tree could not be killed ({subject}: {e})"),
-        Some(format!("{TREE_TEARDOWN_WARN} ({subject}): {e}")),
+    use crate::containment::dispatch::SettleOutcome;
+
+    match tree {
+        Some(Err(e)) => (
+            format!("; its contained tree could not be killed ({subject}: {e})"),
+            Some(tree_teardown_warn(subject, &e)),
+        ),
+        Some(Ok(SettleOutcome::Unvouched { kind })) => {
+            let text = kind.unvouched_text();
+            (
+                format!("; {text} ({subject})"),
+                Some(tree_teardown_warn(subject, &text)),
+            )
+        }
+        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Skipped)) => (String::new(), None),
+    }
+}
+
+/// Whether a failed spawn's cleanup, after the tree kill it tried (`None`: none was), has another to
+/// try, for both `finish_elevated` variants. Not when the tree was killed, and not when it cannot be
+/// vouched for: that is no failed kill, a kill of it again could not change it, and the cleanup says so
+/// once. A kill that left members, or was skipped and killed nothing, has another to try.
+#[cfg(unix)]
+pub(crate) fn tree_needs_another_kill(
+    tree: &Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
+) -> bool {
+    use crate::containment::dispatch::SettleOutcome;
+
+    !matches!(
+        tree,
+        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Unvouched { .. }))
     )
+}
+
+/// The text of the cleanup's `warn` about the tree's teardown: `said`, about `subject`, under
+/// [`TREE_TEARDOWN_WARN`].
+#[cfg(unix)]
+pub(crate) fn tree_teardown_warn(subject: &dyn std::fmt::Display, said: &dyn std::fmt::Display) -> String {
+    format!("{TREE_TEARDOWN_WARN} ({subject}): {said}")
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`
@@ -1007,7 +1061,9 @@ pub(crate) fn kill_and_reap_unreported(
         tree.kill(Sweep::RootKilled { zombie })
     });
     let mut owed = std::mem::take(&mut tree.notes);
-    owed.extend(tree.failure_note());
+    // The root is ended when its kill was sent, or it was already gone; not when it could not be
+    // verified or the kill was refused.
+    owed.extend(tree.failure_note(matches!(kill, KillOutcome::Delivered | KillOutcome::NotSent)));
     notes.splice(0..0, owed);
     Unreported {
         fate,
@@ -1049,12 +1105,9 @@ struct LateTree {
     unique: u64,
     /// The root's identity, when the attach read it.
     id: Option<ProcessId>,
-    /// The first sweep's failure. No later sweep is shown to reach what it missed, so none clears it:
-    /// the root's kill reparents its descendants out of a walk from its pid, a member that refused the
-    /// kill can leave the group, and a holder can close its marker.
-    failed: Option<String>,
-    /// Whether a sweep succeeded after `failed`, and none failed since.
-    succeeded_after: bool,
+    /// What each sweep left, in the order they ran. Judged together once the root's kill is known
+    /// ([`failure_note`](Self::failure_note)).
+    sweeps: Vec<Result<(), crate::containment::dispatch::Unkilled>>,
     /// What the sweeps could not do.
     notes: Vec<String>,
 }
@@ -1071,8 +1124,7 @@ impl LateTree {
             pid,
             unique,
             id: None,
-            failed: None,
-            succeeded_after: false,
+            sweeps: Vec::new(),
             notes: Vec::new(),
         };
         if prepared.mode.is_none() || !prepared.is_root {
@@ -1127,12 +1179,11 @@ impl LateTree {
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
                     crate::child::tree_call::group_number_holds(pid, state)
                 };
-                let result = match attached.hard_kill_report(&crate::containment::GroupRoot::new(None, &check)) {
-                    (Err(e), _) => Err(e.to_string()),
-                    (Ok(()), false) => Err("a member could not be killed".to_owned()),
-                    (Ok(()), true) => Ok(()),
-                };
-                self.fold(result);
+                self.sweeps.push(
+                    attached
+                        .hard_kill(&crate::containment::GroupRoot::new(None, &check))
+                        .into_result(),
+                );
             }
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
@@ -1143,26 +1194,30 @@ impl LateTree {
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
             (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
-            (Reach::Holders(m), _) => {
-                let result = m.hard_kill_holders_only(None).map_err(|e| e.to_string());
-                self.fold(result);
+            (Reach::Holders(m), _) => self.sweeps.push(
+                m.hard_kill_holders_only(None)
+                    .map_err(crate::containment::dispatch::Unkilled::from),
+            ),
+        }
+    }
+
+    /// The `warn`'s note for the sweeps that failed, once the root's kill is known: `root_ended` says
+    /// whether it ended the root, which settles a walk that left only the root
+    /// ([`Unkilled::unsettled`](crate::containment::dispatch::Unkilled::unsettled), as
+    /// [`Attached::settle`](crate::containment::Attached::settle) does). The first failure stands: a
+    /// later sweep is not shown to reach what it missed.
+    fn failure_note(&mut self, root_ended: bool) -> Option<String> {
+        let mut failed = None;
+        let mut succeeded_after = false;
+        for sweep in self.sweeps.drain(..) {
+            match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {
+                (Err(left), None) => failed = Some(left.to_string()),
+                (Err(_), Some(_)) => succeeded_after = false,
+                (Ok(()), failed) => succeeded_after = failed.is_some(),
             }
         }
-    }
-
-    /// Folds a sweep's result into [`failed`](Self::failed).
-    fn fold(&mut self, result: Result<(), String>) {
-        match (result, &self.failed) {
-            (Err(e), None) => self.failed = Some(e),
-            (Err(_), Some(_)) => self.succeeded_after = false,
-            (Ok(()), failed) => self.succeeded_after = failed.is_some(),
-        }
-    }
-
-    /// The `warn`'s note for a sweep that failed.
-    fn failure_note(&mut self) -> Option<String> {
-        let failed = self.failed.take()?;
-        Some(if self.succeeded_after {
+        let failed = failed?;
+        Some(if succeeded_after {
             format!(
                 "its tree may not be fully killed: a kill of it failed ({failed}), and the later one that succeeded \
                  cannot be shown to reach what that one missed"

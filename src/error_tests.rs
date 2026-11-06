@@ -261,6 +261,43 @@ fn with_note_keeps_each_variant_and_appends() {
     assert_eq!(source_code(&e), Some(libc::EACCES));
 }
 
+/// A member left behind by a refused kill takes a note and keeps its OS error as the error's source:
+/// the code is the variant's contract, and the note goes in the variant's own `note`. One that could
+/// not be read takes it the same way, and a second note follows the first.
+///
+/// Mutants: `with_note` wraps the refusal's `io::Error`, which then has no OS code; it drops the note
+/// of a refusal.
+#[cfg(unix)]
+#[skuld::test]
+fn with_note_keeps_the_os_error_of_a_refused_kill_a_member_not_killed() {
+    let refused = Error::MemberNotKilled {
+        pid: 7,
+        source: Box::new(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM))),
+        note: None,
+    }
+    .with_note("front left");
+    let Error::MemberNotKilled { pid: 7, source, .. } = &refused else {
+        panic!("expected MemberNotKilled, got {refused:?}");
+    };
+    assert!(
+        matches!(&**source, Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().ends_with("(os error 1); front left"), "{refused}");
+
+    let unread = Error::MemberNotKilled {
+        pid: 7,
+        source: Box::new(Error::Unassessable {
+            detail: "d".into(),
+            source: None,
+        }),
+        note: None,
+    }
+    .with_note("front left")
+    .with_note("and more");
+    assert!(unread.to_string().ends_with("d; front left; and more"), "{unread}");
+}
+
 /// The elevated-program note belongs to a wrapper-elevated spawn only, and only to a fate that says
 /// the backend is not running.
 ///

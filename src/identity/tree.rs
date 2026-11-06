@@ -89,10 +89,7 @@ impl ProcessId {
             return Ok(Vec::new());
         };
         // A candidate the walk could not read may be a child: the list would be short, not empty.
-        match walk.unassessed.into_iter().next() {
-            Some((_, why)) => Err(why),
-            None => Ok(walk.members),
-        }
+        walk.complete_members()
     }
 }
 

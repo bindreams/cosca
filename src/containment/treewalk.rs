@@ -65,16 +65,17 @@
 //! process that cannot be the child is not a member the walk failed to assess. A candidate whose own
 //! read fails (no record, on Windows no sequence number, or a parent number that cannot be read) goes to the proof of the accepted parent
 //! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
-//! a warning naming `ppid N`; and only a held parent lets its own failure stand, dropped with a
-//! warning naming the candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or
-//! sequence-number query).
+//! an error naming `ppid N`; and only a held parent lets its own failure stand, an error naming the
+//! candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or sequence-number query).
 //!
 //! # A walk that could not assess a member
 //!
 //! Both of those drops are a candidate the walk could not assess, unlike a `Gone` one, which is
 //! not a member and is dropped silently. The walk returns them in [`Walk::unassessed`] beside its
-//! members, so no caller takes a short list for the whole tree: [`hard_kill`] reports `Ok(false)`,
-//! the fd marker's sweep reports itself incomplete, and `ProcessId::children` is an error.
+//! members, so no caller takes a short list for the whole tree: [`hard_kill`] returns each as a
+//! member left behind, the fd marker's sweep reports itself incomplete, and `ProcessId::children`
+//! is an error ([`Walk::complete_members`]). The walk logs nothing: its caller reports, once. A
+//! caller with no error to return for them says each ([`warn_unassessed`]).
 //!
 //! A process the walk cannot read is never taken for one that is not the root's. On Windows that
 //! includes a process it cannot open (one the caller may not query), whose creator pid is never
@@ -82,6 +83,7 @@
 //! cannot tell it from a genuine child, so every walk from that root is incomplete for as long as it
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
@@ -89,15 +91,26 @@ use crate::Recursive;
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
 /// to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum KillOutcome {
     /// The signal reached the verified identity.
     Terminated,
     /// The pid holds no process, or holds a different one - nothing to kill.
     AlreadyGone,
-    /// A live-or-unassessable process we did not signal. The only outcome that can leave a
-    /// process running.
-    NotAttempted,
+    /// A live-or-unassessable process we did not signal, with why: [`Error::Unassessable`] when its
+    /// identity could not be read at kill time, [`Error::Io`] with the OS error when the OS refused
+    /// the signal. The only outcome that can leave a process running. It warns of nothing: the caller
+    /// that reports the outcome ([`hard_kill`]) or cannot ([`warn_if_not_attempted`]) says it.
+    NotAttempted(Error),
+}
+
+/// Warn of a best-effort kill of `id` with `signal` that sent nothing to a process that may be
+/// running, for a caller that returns no error for it ([`terminate`], the fd marker's sweep).
+#[cfg(unix)]
+pub(crate) fn warn_if_not_attempted(id: ProcessId, signal: Signal, outcome: &KillOutcome) {
+    if let KillOutcome::NotAttempted(why) = outcome {
+        log::warn!("treewalk: pid {} was sent no {signal}: {why}", id.pid());
+    }
 }
 
 /// What a walk found: the genuine members, and the candidates it could not assess.
@@ -114,8 +127,50 @@ pub(crate) struct Walk {
     pub(crate) unassessed: Vec<(RawPid, Error)>,
 }
 
-/// The tree-walk resolver. Denied is warned and returned as `Err` (counted in [`Walk::unassessed`]);
-/// gone is `Ok(None)`.
+impl Walk {
+    /// The members, for a query that must not take a short list for the tree: `Err` when the walk
+    /// could not assess a candidate, the first one's error, with each other's pid and cause in its
+    /// note. It logs nothing; the caller decides.
+    pub(crate) fn complete_members(self) -> Result<Vec<ProcessId>, Error> {
+        let Walk { members, unassessed } = self;
+        let mut unassessed = unassessed.into_iter();
+        let Some((_, first)) = unassessed.next() else {
+            return Ok(members);
+        };
+        let others: Vec<String> = unassessed
+            .map(|(pid, why)| format!("pid {pid} ({})", cause_text(&why)))
+            .collect();
+        Err(if others.is_empty() {
+            first
+        } else {
+            first.with_note(&format!(
+                "the walk could not assess these either: {}",
+                others.join("; ")
+            ))
+        })
+    }
+}
+
+/// What an unassessed candidate's error says, without the variant's wrapping.
+fn cause_text(why: &Error) -> String {
+    match why {
+        Error::Unassessable { detail, .. } => detail.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Warn of each candidate in `unassessed` the walk could not read, for a caller with no error to
+/// return for them (`terminate`, the fd marker's sweep). The others report theirs in the error
+/// ([`hard_kill`], `ProcessId::children`), so a member is reported once.
+#[cfg(unix)]
+pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Error)]) {
+    for (pid, why) in unassessed {
+        log::warn!("treewalk: pid {pid} dropped from the walk ({})", cause_text(why));
+    }
+}
+
+/// The tree-walk resolver. Denied is returned as `Err` (counted in [`Walk::unassessed`], which the
+/// walk's caller reports); gone is `Ok(None)`.
 ///
 /// `parent` is the process the walk accepted as the parent the snapshot gave `pid`. Where the read of
 /// `pid` carries its parent, a candidate
@@ -131,23 +186,11 @@ pub(crate) fn resolve_or_drop(
     parent: ProcessId,
     bound: Option<OrderKey>,
 ) -> Resolution {
-    let read = ProcessId::of_ordered_with(kernel, pid, Some(parent), None, bound);
-    let parent_blamed = read.1.blamed_parent().is_some();
-    let resolution = resolution_of("pid", pid, read);
-    if let Err(error) = &resolution {
-        let why = match error {
-            Error::Unassessable { detail, .. } => detail.clone(),
-            other => other.to_string(),
-        };
-        // The reason names the pid when it is the subject, else the blamed parent; then the pid is named here.
-        let dropped = if parent_blamed {
-            format!("pid {pid} dropped")
-        } else {
-            "dropped".to_owned()
-        };
-        log::warn!("treewalk: {why} - {dropped} from the walk");
-    }
-    resolution
+    resolution_of(
+        "pid",
+        pid,
+        ProcessId::of_ordered_with(kernel, pid, Some(parent), None, bound),
+    )
 }
 
 #[cfg(unix)]
@@ -212,7 +255,7 @@ pub(crate) fn descendants_with(
                         None
                     }
                     Ok(read) => read,
-                    // Already warned where the read was made.
+                    // Reported by the walk's caller, from the list.
                     Err(why) => {
                         walk.unassessed.push((pid, why));
                         None
@@ -320,6 +363,19 @@ pub(crate) fn walk_from(
     }))
 }
 
+/// A kill that sent nothing because the process's identity could not be read at kill time. The
+/// message reads after the pid, which the error of a walk that left it behind names.
+#[cfg(any(unix, windows))]
+fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
+    KillOutcome::NotAttempted(Error::Unassessable { detail, source })
+}
+
+/// A kill the OS refused: the error carries the OS error, as `Process::kill` does.
+#[cfg(any(unix, windows))]
+fn refused(os: std::io::Error) -> KillOutcome {
+    KillOutcome::NotAttempted(Error::Io(os))
+}
+
 /// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
 /// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
 /// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
@@ -346,19 +402,14 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
                 Ok(()) => KillOutcome::Terminated,
                 // Reaped after the proof - nothing was left to kill.
                 Err(Errno::ESRCH) => KillOutcome::AlreadyGone,
-                Err(e) => {
-                    log::warn!("treewalk: pidfd_send_signal(pid {}, {signal:?}) failed: {e}", id.pid());
-                    KillOutcome::NotAttempted
-                }
+                Err(e) => refused(e.into()),
             }
         }
-        Err(e) => {
-            log::warn!(
-                "treewalk: pid {pid} has no pidfd that proves it - not signaled, left running: {e}",
-                pid = id.pid()
-            );
-            KillOutcome::NotAttempted
-        }
+        Err(Error::Unassessable { detail, source }) => identity_unread(detail, source),
+        Err(e) => identity_unread(
+            format!("its pidfd could not be proved to name it ({e})"),
+            Some(e.into_io()),
+        ),
     }
 }
 
@@ -385,21 +436,13 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
             return KillOutcome::AlreadyGone;
         }
         Resolved::Unknown => {
-            log::warn!(
-                "treewalk: pid {pid} could not be queried (access denied?) - not signaled, left running",
-                pid = id.pid()
-            );
-            return KillOutcome::NotAttempted;
+            return identity_unread("it could not be queried (access denied?)".to_owned(), None);
         }
     }
     // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
     // the CALLER-S ENTIRE PROCESS GROUP. Use the same total guard the `sig 0` probe uses.
     let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
-        log::warn!(
-            "treewalk: pid {} is not a single-process signal target - not signaled",
-            id.pid()
-        );
-        return KillOutcome::NotAttempted;
+        return identity_unread("it is not a single-process signal target".to_owned(), None);
     };
     let sent = kill(Pid::from_raw(target), signal);
     #[cfg(test)]
@@ -408,10 +451,7 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
         Ok(()) => KillOutcome::Terminated,
         // Exited between the re-verify and the signal - nothing was left to kill.
         Err(nix::errno::Errno::ESRCH) => KillOutcome::AlreadyGone,
-        Err(e) => {
-            log::warn!("treewalk: kill(pid {}, {signal:?}) failed: {e}", id.pid());
-            KillOutcome::NotAttempted
-        }
+        Err(e) => refused(e.into()),
     }
 }
 
@@ -433,11 +473,10 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
         Opened::Found(h) => h,
         Opened::Gone => return KillOutcome::AlreadyGone,
         Opened::Denied(e) => {
-            log::warn!(
-                "treewalk: pid {} could not be queried (access denied?) - not opened to terminate ({e}), left running",
-                id.pid()
+            return identity_unread(
+                format!("it could not be queried (access denied?) - not opened to terminate ({e})"),
+                Some(crate::error::win32_io_error(e)),
             );
-            return KillOutcome::NotAttempted;
         }
     };
     let outcome = match crate::identity::windows_handle_identity(handle, id) {
@@ -447,10 +486,7 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
             match windows_terminate_held(handle, rights) {
                 Termination::Terminated => KillOutcome::Terminated,
                 Termination::Exited => KillOutcome::AlreadyGone,
-                Termination::Failed(e) => {
-                    log::warn!("treewalk: TerminateProcess(pid {}) failed: {e}", id.pid());
-                    KillOutcome::NotAttempted
-                }
+                Termination::Failed(e) => refused(crate::error::win32_io_error(e)),
             }
         }
         HandleIdentity::Different => {
@@ -460,13 +496,10 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
             );
             KillOutcome::AlreadyGone
         }
-        HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "treewalk: pid {} opened but its identity could not be read ({e}) - not terminated",
-                id.pid()
-            );
-            KillOutcome::NotAttempted
-        }
+        HandleIdentity::Unreadable(e) => identity_unread(
+            format!("it opened but its identity could not be read ({e}) - not terminated"),
+            Some(crate::error::win32_io_error(e)),
+        ),
     };
     windows_close(handle);
     outcome
@@ -474,63 +507,226 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute
 /// genuine descendants, kill the root FIRST then each descendant. SIGKILL on
-/// Unix; `TerminateProcess` on Windows. Best-effort; already-gone is success.
+/// Unix; `TerminateProcess` on Windows. Best-effort; a member that is already gone is success.
 ///
 /// # Errors
 ///
-/// [`Error::Unassessable`] when the process snapshot cannot be taken, or `root` cannot be proved
-/// to hold its pid after it (a root that exists but cannot be queried).
-/// Nothing is killed, the root included: killing the root first would reparent its descendants
-/// out of the ppid walk, so a retry could no longer find them. A root that no longer holds its pid
-/// is `Ok`, with nothing killed.
+/// [`TreeKillOutcome::Unwalked`], an [`Error::Unassessable`], when the process snapshot cannot be
+/// taken, or `root` cannot be proved to hold its pid after it (a root that exists but cannot be
+/// queried). Nothing is killed, the root included: killing the root first would reparent its
+/// descendants out of the ppid walk, so a retry could no longer find them. A root that no longer
+/// holds its pid is [`TreeKillOutcome::NoRoot`], with nothing killed.
 ///
-/// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
-/// kill, or a candidate's identity could not be read (so it and its subtree were not walked), so
-/// members may be left running.
-pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
+/// [`Error::MemberNotKilled`] when the walk ran but left a member behind: a candidate whose identity
+/// could not be read (so it and its subtree were not walked), or an identity it resolved whose kill
+/// was refused. Everything else was killed. The [`Unkilled`] holds every member left, the root
+/// apart: the candidates the walk could not read, in the order it found them, then the descendants
+/// whose kill sent nothing, in the order they were tried. It reports none of them: the caller does,
+/// once, after the root's death by its handle has had its say ([`Attached::settle`]).
+///
+/// [`Attached::settle`]: crate::containment::Attached::settle
+pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
     #[cfg(not(test))]
     let skip_root = false;
-    let parents = crate::containment::enumerate::process_parents(kernel)?;
-    let Some(Walk {
+    let Walk {
         members: descendants,
         unassessed,
-    }) = walk_from(kernel, root, &parents, Recursive::Yes)?
-    else {
-        return Ok(true);
+    } = match crate::containment::enumerate::process_parents(kernel)
+        .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
+    {
+        Ok(Some(walk)) => walk,
+        Ok(None) => return TreeKillOutcome::NoRoot,
+        Err(error) => return TreeKillOutcome::Unwalked(error),
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
-    let mut complete = true;
-    #[cfg(test)]
-    if fault::take_force_incomplete() {
-        complete = false;
+    // A candidate that could not be read is not killed, and nor is anything under it: left behind.
+    let mut left: Vec<Error> = unassessed.into_iter().map(|(pid, why)| not_killed(pid, why)).collect();
+    let mut root_left: Option<Error> = None;
+    // Forced-incomplete seam: fabricates a refused member.
+    #[cfg(all(test, unix))]
+    if let Some(forced) = fault::take_force_incomplete() {
+        let forced_error = |pid| {
+            not_killed(
+                pid,
+                Error::Containment {
+                    detail: "the walk was forced incomplete".into(),
+                },
+            )
+        };
+        if forced.leaves_root() {
+            root_left = Some(forced_error(root.pid()));
+        }
+        if forced.leaves_descendant() {
+            left.push(forced_error(root.pid().wrapping_add(1)));
+        }
     }
-    // A candidate that could not be read is not killed, and nor is anything under it: not complete.
-    complete &= unassessed.is_empty();
-    #[cfg(unix)]
+    let mut resolved = Vec::new();
+    #[cfg(any(unix, windows))]
     {
         if !skip_root {
-            complete &= kill_by_identity(kernel, root, Signal::SIGKILL) != KillOutcome::NotAttempted;
+            root_left = left_behind(root, kill_one(kernel, root)).or(root_left);
         }
         for id in descendants {
-            complete &= kill_by_identity(kernel, id, Signal::SIGKILL) != KillOutcome::NotAttempted;
-        }
-    }
-    #[cfg(windows)]
-    {
-        if !skip_root {
-            complete &= kill_by_identity(root) != KillOutcome::NotAttempted;
-        }
-        for id in descendants {
-            complete &= kill_by_identity(id) != KillOutcome::NotAttempted;
+            if let Some(error) = left_behind(id, kill_one(kernel, id)) {
+                left.push(error);
+                resolved.push(id);
+            }
         }
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (kernel, root, descendants, skip_root);
-    Ok(complete)
+    if left.is_empty() && root_left.is_none() {
+        return TreeKillOutcome::Ran(Ok(()));
+    }
+    TreeKillOutcome::Ran(Err(Unkilled {
+        members: left,
+        root: root_left,
+        resolved,
+    }))
+}
+
+/// `id`'s SIGKILL by identity (`TerminateProcess` on Windows).
+#[cfg(any(unix, windows))]
+fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
+    #[cfg(unix)]
+    return kill_by_identity(kernel, id, Signal::SIGKILL);
+    #[cfg(windows)]
+    {
+        let _ = kernel;
+        kill_by_identity(id)
+    }
+}
+
+/// A member of a `TreeWalk` tree that a walk left, as the handle holds it for the next kill
+/// ([`with_earlier`]).
+#[derive(Debug, Clone)]
+pub(crate) enum Left {
+    /// The walk read its identity and its kill was refused: a later kill kills it by identity again.
+    Resolved(ProcessId),
+    /// The walk never read its identity, so nothing can act on it: a later kill reports it again,
+    /// with `said`, why it could not be read.
+    Unread { pid: RawPid, said: String },
+}
+
+impl Left {
+    /// Every member `left` names, in order. A walk that was not made, or found no root, adds its
+    /// error as the last member, an [`Error::Unassessable`] or [`Error::Unsupported`] with no root
+    /// beside it; that names no process, so none is held. Every other member is a
+    /// [`Error::MemberNotKilled`].
+    pub(crate) fn of(left: &Unkilled) -> Vec<Left> {
+        let last = left.members.len().saturating_sub(1);
+        left.members
+            .iter()
+            .enumerate()
+            .filter_map(|(at, member)| {
+                let Error::MemberNotKilled { pid, source, .. } = member else {
+                    debug_assert!(
+                        at == last
+                            && left.root.is_none()
+                            && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
+                        "only the error of a walk not made is not a `MemberNotKilled`, and it is last: {left:?}"
+                    );
+                    return None;
+                };
+                Some(match left.resolved.iter().find(|id| id.pid() == *pid) {
+                    Some(id) => Left::Resolved(*id),
+                    None => Left::Unread {
+                        pid: *pid,
+                        said: match &**source {
+                            Error::Unassessable { detail, .. } => detail.clone(),
+                            other => other.to_string(),
+                        },
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn pid(&self) -> RawPid {
+        match self {
+            Left::Resolved(id) => id.pid(),
+            Left::Unread { pid, .. } => *pid,
+        }
+    }
+}
+
+/// `walked`, the answer of a kill that walked a tree, with `earlier`, the members the kills before it
+/// left. The root's death reparents a descendant out of any later walk, so such a walk cannot find
+/// them: each one read is killed again by its identity, so one that is gone stops failing the call
+/// and one that still refuses is `MemberNotKilled` again; one never read is `MemberNotKilled` again
+/// as it was. A member the walk names itself is not repeated. The earlier members come first, as the
+/// first failure stands.
+pub(crate) fn with_earlier(
+    kernel: &dyn Kernel,
+    earlier: Vec<Left>,
+    walked: Result<(), Unkilled>,
+) -> Result<(), Unkilled> {
+    let mut walked = match walked {
+        Ok(()) => Unkilled {
+            members: Vec::new(),
+            root: None,
+            resolved: Vec::new(),
+        },
+        Err(left) => left,
+    };
+    let named: Vec<RawPid> = walked
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            Error::MemberNotKilled { pid, .. } => Some(*pid),
+            _ => None,
+        })
+        .collect();
+    let mut members = Vec::new();
+    for left in earlier.into_iter().filter(|left| !named.contains(&left.pid())) {
+        match left {
+            Left::Resolved(id) => {
+                #[cfg(any(unix, windows))]
+                if let Some(error) = left_behind(id, kill_one(kernel, id)) {
+                    members.push(error);
+                    walked.resolved.push(id);
+                }
+                #[cfg(not(any(unix, windows)))]
+                let _ = (kernel, id);
+            }
+            Left::Unread { pid, said } => members.push(not_killed(
+                pid,
+                Error::Unassessable {
+                    detail: said,
+                    source: None,
+                },
+            )),
+        }
+    }
+    if members.is_empty() && walked.members.is_empty() && walked.root.is_none() {
+        return Ok(());
+    }
+    members.append(&mut walked.members);
+    walked.members = members;
+    Err(walked)
+}
+
+/// The error for the member `pid` a walk left behind, `source` why.
+fn not_killed(pid: RawPid, source: Error) -> Error {
+    Error::MemberNotKilled {
+        pid,
+        source: Box::new(source),
+        note: None,
+    }
+}
+
+/// `id`'s kill's `outcome` as the error of a member left behind, when it sent nothing to a process
+/// that may be running.
+#[cfg(any(unix, windows))]
+fn left_behind(id: ProcessId, outcome: KillOutcome) -> Option<Error> {
+    match outcome {
+        KillOutcome::NotAttempted(source) => Some(not_killed(id.pid(), source)),
+        KillOutcome::Terminated | KillOutcome::AlreadyGone => None,
+    }
 }
 
 /// Test-only: force the NEXT `hard_kill` on THIS thread to skip the root's identity kill
@@ -542,7 +738,8 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
         static WALKS: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
-        static FORCE_INCOMPLETE: Cell<bool> = const { Cell::new(false) };
+        #[cfg(unix)]
+        static FORCE_INCOMPLETE: Cell<Option<LeftBehind>> = const { Cell::new(None) };
         #[cfg(windows)]
         static BEFORE_TERMINATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
@@ -561,15 +758,39 @@ pub(crate) mod fault {
         }
     }
 
-    /// Make the NEXT `hard_kill` on THIS thread report an incomplete walk, as an unreadable
-    /// process table or a refused kill would. Take semantics.
+    /// Which member a forced-incomplete walk leaves behind.
     #[cfg(unix)]
-    pub(crate) fn force_incomplete_once() {
-        FORCE_INCOMPLETE.with(|f| f.set(true));
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LeftBehind {
+        /// The root only.
+        Root,
+        /// A non-root member.
+        Descendant,
+        /// The root and a non-root member.
+        RootAndDescendant,
     }
 
-    pub(super) fn take_force_incomplete() -> bool {
-        FORCE_INCOMPLETE.with(|f| f.replace(false))
+    #[cfg(unix)]
+    impl LeftBehind {
+        pub(super) fn leaves_root(self) -> bool {
+            matches!(self, LeftBehind::Root | LeftBehind::RootAndDescendant)
+        }
+
+        pub(super) fn leaves_descendant(self) -> bool {
+            matches!(self, LeftBehind::Descendant | LeftBehind::RootAndDescendant)
+        }
+    }
+
+    /// Make the next `hard_kill` on this thread leave `left` behind, as a refused kill would. Consumed
+    /// by that call.
+    #[cfg(unix)]
+    pub(crate) fn force_incomplete_once(left: LeftBehind) {
+        FORCE_INCOMPLETE.with(|f| f.set(Some(left)));
+    }
+
+    #[cfg(unix)]
+    pub(super) fn take_force_incomplete() -> Option<LeftBehind> {
+        FORCE_INCOMPLETE.with(|f| f.take())
     }
 
     /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill`,
@@ -642,8 +863,8 @@ pub(crate) mod fault {
 /// cooperative shutdown that still re-verifies identity before each signal, so it
 /// reaches the whole genuine tree that the walk could assess, and errors as `hard_kill` does
 /// (`# Errors`). Unlike `hard_kill` it does not report a candidate the walk could not assess
-/// ([`Walk::unassessed`]): that candidate and its subtree are warned of and not signalled, and
-/// the result is still `Ok`.
+/// ([`Walk::unassessed`]), nor a member whose signal was not sent: they are warned of and not
+/// signalled, and the result is still `Ok`.
 ///
 /// Windows: send `CTRL_BREAK_EVENT` to the root's process group (the root was
 /// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
@@ -667,11 +888,10 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
-        // Best effort by contract: a candidate that could not be read was warned and is not signalled.
-        let descendants = walk.members;
-        let _ = kill_by_identity(kernel, root, Signal::SIGTERM);
-        for id in descendants {
-            let _ = kill_by_identity(kernel, id, Signal::SIGTERM);
+        // Best effort by contract: a candidate that could not be read is warned of and not signalled.
+        warn_unassessed(&walk.unassessed);
+        for id in std::iter::once(root).chain(walk.members) {
+            warn_if_not_attempted(id, Signal::SIGTERM, &kill_by_identity(kernel, id, Signal::SIGTERM));
         }
         Ok(())
     }
