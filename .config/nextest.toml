@@ -95,6 +95,9 @@ inherits = "ci"
 [profile.ci-cgroup]
 inherits = "ci"
 
+[profile.ci-cgroup-setuid]
+inherits = "ci"
+
 [profile.ci-elevation]
 inherits = "ci"
 
