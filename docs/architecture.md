@@ -90,8 +90,9 @@ In order:
      and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
      (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of every child it is
      left (`CgroupLeaf::abandon_before_verdict`: the group a child that exec'd outside the leaf
-     leads, through `OwnedChild::hold`, then the leaf, then `tear_down` with the leaf's kill as
-     its `Kill` tree, or `look_at_front` for a front). The sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
+     leads, through `OwnedChild::hold`, then the leaf killed through and removed, then
+     `tear_down` with the leaf's kill as its `Kill` tree, or `look_at_front` for a front). The
+     sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
      ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`), in
      the async raw spawn too; a refused kill comes back in the sync spawn's failure as an
      `Unreaped`, and the async raw spawn leaves the child, warned. Both spawns build their

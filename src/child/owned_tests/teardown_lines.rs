@@ -31,6 +31,14 @@ pub(crate) const LEFT: &str = if cfg!(unix) {
     "; nothing waits for it"
 };
 
+/// What a caller that leaves a child still running after its refused kill says of it: no one
+/// reaps it afterwards, where a zombie exists to be left.
+pub(crate) const LEAVING_RUNNING: &str = if cfg!(unix) {
+    "; leaving it running and unreaped"
+} else {
+    "; leaving it running"
+};
+
 /// Where a child goes that a caller hands back.
 pub(crate) const HANDED_BACK: &str = "; handed back to the caller in the error";
 
@@ -201,14 +209,14 @@ pub(crate) fn rows() -> Vec<Row> {
             format!("{after_a_refusal}: {orphaned}"),
         ),
         by_disposition(Kill::Refused, Found::WaitFailed, format!("{after_a_refusal}: {failed}")),
-        // Still running: a caller that leaves it says it keeps running, and one that hands it back
-        // says so.
+        // Still running: a caller that leaves it says it keeps running and nothing reaps it, and one
+        // that hands it back says so.
         Row {
             kill: Kill::Refused,
             found: Found::Running,
             level: Warn,
             uncollected: true,
-            leave: format!("{after_a_refusal}; leaving it running"),
+            leave: format!("{after_a_refusal}{LEAVING_RUNNING}"),
             hand_back: format!("{after_a_refusal}{HANDED_BACK}"),
         },
     ]
@@ -280,7 +288,7 @@ const NEVER_SAID: [&str; 3] = ["not waited on", "torn down through", "left uncol
 
 /// What a clause says of where the child goes, or what is done to it: it says at most one.
 fn fates() -> [&'static str; 3] {
-    [HANDED_BACK, LEFT, "; leaving it running"]
+    [HANDED_BACK, LEFT, LEAVING_RUNNING]
 }
 
 /// The clause says one thing of the child's fate, in the one wording, and no wording of an earlier

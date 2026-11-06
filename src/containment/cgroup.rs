@@ -62,7 +62,7 @@
 //! itself, through its pidfd, whatever the leaf's kill returned — it may have left the leaf, or
 //! never entered it — and, when it exec'd outside the leaf, as the process group it leads. An
 //! elevation front is sent nothing: an exited one is reaped, and one its leaf's kill reached is
-//! waited for (see `abandon_front`).
+//! waited for (see `abandon_before_verdict`).
 //!
 //! **Ownership.** The child is this process's own, but another reaper in the process may reap it
 //! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by

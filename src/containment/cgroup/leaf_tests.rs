@@ -2523,7 +2523,7 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let abandoned = leaf.abandon_before_verdict(
         false,
-        Some((pidfd_of(pid), Past::Clean)),
+        (pidfd_of(pid), Past::Clean),
         &mut crate::containment::cgroup::NoWarn,
     );
 
@@ -2587,7 +2587,7 @@ fn a_pidless_intent_with_a_pidfd_is_killed_and_reaped_through_it() {
 
     let abandoned = leaf.abandon_before_verdict(
         false,
-        Some((pidfd.try_clone().expect("duplicate the pidfd"), Past::Clean)),
+        (pidfd.try_clone().expect("duplicate the pidfd"), Past::Clean),
         &mut crate::containment::cgroup::NoWarn,
     );
     assert_eq!(
@@ -2658,9 +2658,9 @@ fn an_abandoned_intent_given_no_pidfd_is_never_signalled() {
             .expect("send a forged intent");
     }
 
-    assert_eq!(
-        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
-        crate::containment::cgroup::Abandoned::Ended(ChildFate::Unknown)
+    assert!(
+        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        "the intent named a pid"
     );
 
     let mut echo = [0u8; 1];
@@ -2690,9 +2690,9 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
-    assert_eq!(
-        leaf.abandon_before_verdict(false, None, &mut crate::containment::cgroup::NoWarn),
-        crate::containment::cgroup::Abandoned::MaybeUnreaped
+    assert!(
+        !leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        "nothing named a pid"
     );
     assert!(!leaf_path.exists(), "the empty leaf is removed");
 }
@@ -2732,11 +2732,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     let pidfd = pidfd_of(child.id());
     drop(child);
 
-    let abandoned = leaf.abandon_before_verdict(
-        false,
-        Some((pidfd, Past::Clean)),
-        &mut crate::containment::cgroup::NoWarn,
-    );
+    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
     assert_eq!(
         abandoned,
         crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)

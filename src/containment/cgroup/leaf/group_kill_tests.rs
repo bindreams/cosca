@@ -119,8 +119,8 @@ fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeR
     out
 }
 
-/// The one `warn` for a group kill that was not sent because the kernel refused the flag and the
-/// child was reaped: it names the group.
+/// The one `warn` of an event whose group kill was not sent because the kernel refused the flag and
+/// the child was reaped: it names the group.
 fn assert_one_warn_for_the_unsent_group_kill(mark: usize, pid: u32) {
     let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
@@ -142,7 +142,7 @@ fn a_group_kill_goes_through_the_childs_handle(#[fixture(pidfd_group_signal)] _g
     let owned = owned_over(leader.pid());
     let capture = crate::send_log::Capture::start();
 
-    kill_group_outside_leaf(&owned, leader.pid());
+    assert_eq!(kill_group_outside_leaf(&owned, leader.pid()), None);
 
     assert_eq!(
         member_output(to_member, from_member),
@@ -164,7 +164,7 @@ fn a_group_kill_by_number_follows_its_own_check() {
     let capture = crate::send_log::Capture::start();
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
 
-    kill_group_outside_leaf(&owned, leader.pid());
+    assert_eq!(kill_group_outside_leaf(&owned, leader.pid()), None);
 
     drop(refused);
     assert_eq!(member_output(to_member, from_member), "", "the member was killed");
@@ -192,7 +192,7 @@ fn a_group_kill_finding_no_group_is_logged_at_debug(#[fixture(pidfd_group_signal
     crate::test_child::reaped_elsewhere::reap_behind(pid);
 
     let mark = crate::log_capture::mark();
-    kill_group_outside_leaf(&owned, pid);
+    assert_eq!(kill_group_outside_leaf(&owned, pid), None);
 
     let records = crate::log_capture::records_since_on_current_thread(mark, "process group");
     assert_eq!(records.len(), 1, "{records:?}");
@@ -214,7 +214,7 @@ fn a_reaped_childs_group_is_killed_through_its_handle(#[fixture(pidfd_group_sign
     crate::test_child::reaped_elsewhere::reap_behind(pid);
     let capture = crate::send_log::Capture::start();
 
-    kill_group_outside_leaf(&owned, pid);
+    assert_eq!(kill_group_outside_leaf(&owned, pid), None);
 
     assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
     assert_eq!(member_output(to_member, from_member), "", "the member was killed");
@@ -222,9 +222,11 @@ fn a_reaped_childs_group_is_killed_through_its_handle(#[fixture(pidfd_group_sign
 
 /// Where the kernel refuses `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9), a child reaped before the
 /// kill gets nothing sent to its group's number: the check before it finds the child reaped. Its
-/// member lives on, which is one `warn` naming the group.
+/// member lives on, which is the refusal returned naming the group, for the event's one warn: the
+/// kill logs none of its own.
 ///
-/// Mutants: "a group kill by number for a reaped child"; "the unsent group kill is a `debug`".
+/// Mutants: "a group kill by number for a reaped child"; "the unsent group kill is not returned";
+/// "the group kill warns on its own".
 #[skuld::test]
 fn a_reaped_childs_group_gets_no_kill_by_number() {
     use crate::send_log::{GroupStep, Route};
@@ -238,10 +240,18 @@ fn a_reaped_childs_group_gets_no_kill_by_number() {
     let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let mark = crate::log_capture::mark();
 
-    kill_group_outside_leaf(&owned, pid);
+    let not_sent = kill_group_outside_leaf(&owned, pid);
 
     drop(refused);
-    assert_one_warn_for_the_unsent_group_kill(mark, pid);
+    assert!(
+        not_sent.is_some_and(|text| text.contains(&format!("process group {pid}"))),
+        "it names the group"
+    );
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect::<Vec<_>>();
+    assert!(warns.is_empty(), "the group kill logs no warn of its own: {warns:?}");
     let steps = capture.group_steps();
     assert!(
         !steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _))),
@@ -256,10 +266,25 @@ fn a_reaped_childs_group_gets_no_kill_by_number() {
 fn abandon_group_leader_reporting(report: Option<i32>) -> (Abandoned, String) {
     let (leader, _input, to_member, from_member) = leader_held_with_member();
     let pid = leader.defuse();
+    let (_dir, mut leaf) = leaf_told(pid, report);
+    let pidfd = pidfd_of(pid);
+    // By the number: the kernel's own refusal of the flag is not needed, and the check is the
+    // child being unreaped, which only a group kill before the child's teardown finds.
+    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+
+    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut NoWarn);
+
+    drop(refused);
+    (abandoned, member_output(to_member, from_member))
+}
+
+/// A plain-directory leaf, and its directory, that was sent the intent of the forked child `pid`
+/// and then `report`, if any.
+fn leaf_told(pid: u32, report: Option<i32>) -> (tempfile::TempDir, CgroupLeaf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-group-leader");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = CgroupLeaf::for_test_at(leaf_path);
+    let leaf = CgroupLeaf::for_test_at(leaf_path);
     let slot = leaf.placement_slot();
     // SAFETY: the leaf's channel is open.
     unsafe {
@@ -268,15 +293,31 @@ fn abandon_group_leader_reporting(report: Option<i32>) -> (Abandoned, String) {
             slot.send_report(report).expect("send the report");
         }
     }
-    let pidfd = pidfd_of(pid);
-    // By the number: the kernel's own refusal of the flag is not needed, and the check is the
-    // child being unreaped, which only a group kill before the child's teardown finds.
-    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    (dir, leaf)
+}
 
-    let abandoned = leaf.abandon_before_verdict(false, Some((pidfd, Past::Clean)), &mut NoWarn);
+/// A child that exec'd outside its leaf, whose group kill is refused and whose teardown ends it
+/// cleanly, is one event with one `warn`, the group kill's: the abandonment answers `Ended`, and the
+/// member the kill missed lives on.
+///
+/// Mutants: the group kill logs a warn of its own beside the child's; the refusal is dropped.
+#[skuld::test]
+fn a_refused_group_kill_of_an_ended_child_is_the_events_one_warn() {
+    crate::log_capture::install();
+    let (leader, to_member, from_member) = leader_with_member_exiting();
+    let pid = leader.defuse();
+    let (_dir, mut leaf) = leaf_told(pid, Some(libc::EBADF));
+    let pidfd = pidfd_of(pid);
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
+    let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let mark = crate::log_capture::mark();
+
+    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut NoWarn);
 
     drop(refused);
-    (abandoned, member_output(to_member, from_member))
+    assert!(matches!(abandoned, Abandoned::Ended(_)), "{abandoned:?}");
+    assert_one_warn_for_the_unsent_group_kill(mark, pid);
+    assert_eq!(member_output(to_member, from_member), "survived");
 }
 
 /// A child that exec'd outside its leaf has its group killed before it is torn down: the group goes

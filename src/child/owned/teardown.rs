@@ -76,6 +76,14 @@ const LEFT: &str = if cfg!(unix) {
     "; nothing waits for it"
 };
 
+/// What a caller that leaves a child running after its kill was refused says of it. Nothing reaps it
+/// afterwards, so on Unix it is a zombie once it exits; Windows has none.
+const LEAVING_RUNNING: &str = if cfg!(unix) {
+    "; leaving it running and unreaped"
+} else {
+    "; leaving it running"
+};
+
 /// How [`OwnedChild::tear_down`] kills the child, then settles it as the module doc says.
 pub(crate) struct Kill<'a> {
     pub(crate) disposition: Disposition,
@@ -458,6 +466,10 @@ pub(crate) struct Left {
 )]
 impl Left {
     /// Logs `line` through [`warn_teardown`]: the teardown left the child uncollected.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the tokio spawn logs the warn of an abandoned child")
+    )]
     pub(crate) fn warn(&self, line: &str) {
         warn_teardown(Some(line), &self.remains, self.expect);
     }
@@ -574,9 +586,9 @@ impl OwnedChild {
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
         let refused_kind = refusal_kind(&refused);
         let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
-        // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
+        // Still running: the caller that leaves it says so, and that nothing reaps it.
         let running = match disposition {
-            Disposition::Leave => format!("{subject}; leaving it running"),
+            Disposition::Leave => format!("{subject}{LEAVING_RUNNING}"),
             Disposition::HandBack => format!("{subject}{}", Disposition::HandBack.suffix(true)),
         };
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);

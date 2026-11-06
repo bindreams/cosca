@@ -687,12 +687,13 @@ async fn cgroup_a_post_fork_tokio_failure_ends_its_child_in_or_out_of_its_leaf(#
 
 /// A post-fork tokio failure of a child that refuses every kill of this process (a setuid-root
 /// helper) and is outside its leaf — its placement write fails — leaves it running, and says so:
-/// one warn for its group, which refused too, and one for the child, which the teardown could not
-/// terminate and left running. Nothing reaps it behind the caller's back: the test does.
+/// one warn, for the child, which the teardown could not terminate and left running, and for its
+/// group, which refused too. Nothing reaps it behind the caller's back: the test does.
 ///
 /// CI only (the `cgroup` and `setuid` groups).
 ///
-/// Mutants: a refused kill reports the child reaped; the child's refusal is not warned of.
+/// Mutants: a refused kill reports the child reaped; the child's refusal is not warned of; the
+/// group's refusal is warned of beside the child's.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_of_a_child_that_refuses_its_kill_leaves_it_running(
@@ -720,16 +721,12 @@ async fn cgroup_a_post_fork_tokio_failure_of_a_child_that_refuses_its_kill_leave
 
     assert_eq!(fate, ChildFate::Running { id: None });
     let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
-    assert_eq!(warns.len(), 2, "{warns:?}");
+    assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns.iter().any(|warn| warn.contains(&format!("process group {pid}"))),
-        "the refused group kill is warned of: {warns:?}"
-    );
-    assert!(
-        warns
-            .iter()
-            .any(|warn| warn.contains("could not be terminated") && warn.contains("leaving it running")),
-        "the refused kill of the child is warned of: {warns:?}"
+        warns[0].contains(&format!("process group {pid}"))
+            && warns[0].contains("could not be terminated")
+            && warns[0].contains("leaving it running"),
+        "the refused group kill and the refused kill of the child are one warn: {warns:?}"
     );
     // The helper exits once its stdin closes; the test, not a thread, reaps it.
     drop(writer);

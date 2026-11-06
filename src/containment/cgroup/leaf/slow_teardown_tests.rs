@@ -41,7 +41,7 @@ fn assert_abandonment_warns_once<W: TeardownWarn + Send>(warn: fn() -> W) -> W {
                 .expect("send the intent");
         }
         let mut warn = warn();
-        let abandoned = leaf.abandon_before_verdict(false, Some((pidfd, Past::Clean)), &mut warn);
+        let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut warn);
         let signals: Vec<_> = reaps
             .recorded()
             .into_iter()

@@ -44,9 +44,10 @@ past 1 s, as the drop's does, each naming what it waits for:
   leaf's abandonment, which tears the child down through the pidfd the handshake left it
   (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
-  exists and in the leaf's abandonment (`abandon_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  exists and in the leaf's abandonment (`abandon_before_verdict` in
+  [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
-  cleanup, and in the leaf's abandonment (`abandon_before_verdict` and `abandon_front` in
+  cleanup, and in the leaf's abandonment (`abandon_before_verdict` in
   [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
 
 Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and

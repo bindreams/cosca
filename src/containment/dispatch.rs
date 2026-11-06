@@ -156,9 +156,15 @@ impl Prepared {
             let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
             #[cfg(not(feature = "tokio"))]
             let mut warn = crate::containment::cgroup::NoWarn;
+            let Some(child) = child else {
+                return if leaf.abandon_without_child(&mut warn) {
+                    AbandonedChild::Ended(crate::error::ChildFate::Unknown)
+                } else {
+                    AbandonedChild::MaybeUnreaped
+                };
+            };
             return match leaf.abandon_before_verdict(front, child, &mut warn) {
                 Abandoned::Ended(fate) => AbandonedChild::Ended(fate),
-                Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
