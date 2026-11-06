@@ -249,7 +249,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang(#[fixtu
     // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
     // is the `Drop` under test and not a reference count going down.
     let mut payload =
-        common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
+        common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(child.pid()));
 
     // sudo and doas leave this process tracking a front: sudo itself, which outlives the root
     // program it launched (a kill would orphan it), or, with direct exec, the root program, whose

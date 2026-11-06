@@ -19,7 +19,7 @@ fn zombie_group_root() -> crate::tokio::Child {
     cmd.suppress_fd_marker();
     let child = crate::tokio::spawn::spawn(&mut cmd).expect("spawn");
     drop(writer);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     child
 }
 
@@ -27,7 +27,7 @@ fn zombie_group_root() -> crate::tokio::Child {
 async fn tokio_kill_tree_checks_the_root_again_before_a_send_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let mut child = zombie_group_root();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let (steps, result) = reaped_after_the_look(pid, || child.kill_tree());
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
@@ -37,7 +37,7 @@ async fn tokio_kill_tree_checks_the_root_again_before_a_send_by_number() {
 async fn tokio_terminate_tree_checks_the_root_again_before_a_send_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let child = zombie_group_root();
-    let (steps, result) = reaped_after_the_look(child.id().pid(), || child.terminate_tree());
+    let (steps, result) = reaped_after_the_look(child.pid(), || child.terminate_tree());
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }
@@ -47,7 +47,7 @@ async fn tokio_terminate_tree_checks_the_root_again_before_a_send_by_number() {
 async fn tokio_graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let mut child = zombie_group_root();
-    let pid = child.id().pid();
+    let pid = child.pid();
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterRootLook, move || {
@@ -63,7 +63,7 @@ async fn tokio_graceful_shutdown_tree_checks_the_root_again_before_a_send_by_num
 async fn tokio_drop_checks_the_root_again_before_a_send_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let child = zombie_group_root();
-    let (steps, ()) = reaped_after_the_look(child.id().pid(), || drop(child));
+    let (steps, ()) = reaped_after_the_look(child.pid(), || drop(child));
     assert_nothing_by_number(&steps);
 }
 
@@ -71,7 +71,7 @@ async fn tokio_drop_checks_the_root_again_before_a_send_by_number() {
 async fn tokio_finish_elevated_checks_the_root_again_before_a_send_by_number() {
     crate::tokio::test_runtime::assert_current_thread();
     let child = zombie_group_root();
-    let (steps, failed) = reaped_after_the_look(child.id().pid(), || {
+    let (steps, failed) = reaped_after_the_look(child.pid(), || {
         crate::tokio::spawn::finish_elevated(
             child,
             Err(crate::error::Error::Io(std::io::Error::other("no password"))),

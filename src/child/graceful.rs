@@ -136,7 +136,7 @@ impl Child {
         if let Err(e) = &watch {
             log::debug!(
                 "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {e}",
-                id = self.id.pid()
+                id = self.pid()
             );
         }
         #[cfg(test)]
@@ -153,7 +153,7 @@ impl Child {
             // An exit is permanent, so a refused signal to an exited front changes nothing.
             crate::elevation::front::Gate::Exited => match self.kill_root() {
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                    log::debug!("the kill of exited front pid {} was refused ({e})", self.pid());
                 }
                 other => other.map(drop).map_err(Error::Io)?,
             },
@@ -168,7 +168,7 @@ impl Child {
                         &self.tree_killed,
                         &crate::containment::GroupRoot::none(),
                     )
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }
         }
@@ -300,7 +300,7 @@ impl Child {
         // This handle's reaps are held off from the look until the `SIGTERM` is sent; the paths that
         // send nothing by the root's number wait the grace without it.
         #[cfg(unix)]
-        let held = self.proc.hold(self.id.pid());
+        let held = self.proc.hold(self.pid());
         #[cfg(unix)]
         let group = held.group();
         #[cfg(not(unix))]
@@ -361,7 +361,7 @@ impl Child {
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
                 log::debug!(
                     "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {e}",
-                    id = self.id.pid()
+                    id = self.pid()
                 );
                 Err(e)
             }
@@ -411,7 +411,7 @@ impl Child {
         if let Some(e) = &watch_err {
             log::debug!(
                 "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
-                id = self.id.pid()
+                id = self.pid()
             );
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
@@ -440,7 +440,7 @@ impl Child {
                     if let Err(e) = self.wait() {
                         log::debug!(
                             "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
-                            id = self.id.pid()
+                            id = self.pid()
                         );
                     }
                 }
@@ -451,10 +451,10 @@ impl Child {
         fault::run_hook(fault::HookPoint::BeforeReap);
         #[cfg(target_os = "macos")]
         if self.root_is_unpinned() {
-            return Err(crate::signal::unpinned_status(self.id.pid(), "graceful_shutdown_tree"));
+            return Err(crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"));
         }
         #[cfg(unix)]
-        let status = super::tree_call::status_unless_reaped_elsewhere(self.wait(), self.id.pid())?;
+        let status = super::tree_call::status_unless_reaped_elsewhere(self.wait(), self.pid())?;
         #[cfg(not(unix))]
         let status = self.wait()?;
         if let Some(e) = watch_err {
@@ -468,7 +468,7 @@ impl Child {
         if let Err(e) = &term {
             log::debug!(
                 "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {e}",
-                id = self.id.pid()
+                id = self.pid()
             );
         }
         Ok(status)

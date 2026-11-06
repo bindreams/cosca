@@ -58,6 +58,11 @@ impl SuspendedChild {
         self.child.id()
     }
 
+    /// The pid the child had at spawn; see [`Child::pid`].
+    pub fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+
     /// Let the child run, returning the ordinary async [`Child`].
     ///
     /// A plain `fn`, not `async`: the deferred half of a spawn. It blocks the calling thread only as
