@@ -10,7 +10,73 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::kernel::{Kernel, PIDFD_THREAD};
-use crate::identity::{RawPid, UnknownCause};
+use crate::identity::RawPid;
+
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    PidfdOpen,
+    PidfsIno,
+    Poll,
+}
+
+/// A call that failed, and the errno it answered.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FailedCall {
+    call: Call,
+    errno: Errno,
+}
+
+impl FailedCall {
+    /// A `pidfd_open` that answered `errno`.
+    pub(crate) const fn pidfd_open(errno: Errno) -> FailedCall {
+        FailedCall {
+            call: Call::PidfdOpen,
+            errno,
+        }
+    }
+
+    /// A read of a pidfd's inode that answered `errno`.
+    pub(crate) const fn pidfs_ino(errno: Errno) -> FailedCall {
+        FailedCall {
+            call: Call::PidfsIno,
+            errno,
+        }
+    }
+
+    /// A `poll` of a pidfd that answered `errno`.
+    pub(crate) const fn poll(errno: Errno) -> FailedCall {
+        FailedCall {
+            call: Call::Poll,
+            errno,
+        }
+    }
+
+    /// The call's name, as an error says what failed.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self.call {
+            Call::PidfdOpen => "pidfd_open",
+            Call::PidfsIno => "pidfs_ino",
+            Call::Poll => "poll",
+        }
+    }
+
+    pub(crate) const fn errno(&self) -> Errno {
+        self.errno
+    }
+
+    /// The name of the errno if this call is a refusal: a `pidfd_open` answered as documented on
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported). No other call is refused; its
+    /// failure, with any errno, is its own.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        match (self.call, self.errno) {
+            (Call::PidfdOpen, Errno::NOSYS) => Some("ENOSYS"),
+            (Call::PidfdOpen, Errno::PERM) => Some("EPERM"),
+            (Call::PidfdOpen, Errno::ACCESS) => Some("EACCES"),
+            (Call::PidfdOpen, Errno::NODEV) => Some("ENODEV"),
+            _ => None,
+        }
+    }
+}
 
 /// What opening `pid` found about the process a `Pidfs` id names.
 #[derive(Debug)]
@@ -21,8 +87,8 @@ pub(crate) enum Proof {
     /// `pid` holds no process, or another one: the id's process is gone.
     Lost,
     /// Nothing was proven: the open or the inode read failed in a way that says nothing about `pid`.
-    /// A refusal of `pidfd_open` is in the cause, and is `Unsupported`, not a reason to look in `/proc`.
-    Unknown(UnknownCause),
+    /// A refusal of `pidfd_open` is `Unsupported`, not a reason to look in `/proc`.
+    Unknown(FailedCall),
 }
 
 /// `pid` as a `pidfd_open` target: `None` for a number no process can hold.
@@ -51,11 +117,6 @@ pub(super) fn open(kernel: &dyn Kernel, target: Pid) -> Result<Opened, Errno> {
     }
 }
 
-/// The cause of an `Unknown` that a failed pidfd call (`errno`) left.
-pub(super) fn cause(errno: Errno) -> UnknownCause {
-    UnknownCause::of_errno(errno)
-}
-
 /// Opens `pid` and proves that its pidfd has inode `ino`.
 pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
     let Some(target) = target(pid) else {
@@ -66,7 +127,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
         // `ESRCH`: nobody holds the number. `EINVAL`/`ENOENT` from the retry: no process of a kernel
         // that has pidfs holds it as a task, so the id's process does not.
         Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Proof::Lost,
-        Err(e) => return Proof::Unknown(cause(e)),
+        Err(e) => return Proof::Unknown(FailedCall::pidfd_open(e)),
     };
     match kernel.pidfs_ino(opened.fd.as_fd()) {
         Ok(Some(found)) if found == ino => Proof::Holds {
@@ -74,7 +135,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
             thread: opened.thread,
         },
         Ok(_) => Proof::Lost,
-        Err(e) => Proof::Unknown(cause(e)),
+        Err(e) => Proof::Unknown(FailedCall::pidfs_ino(e)),
     }
 }
 
