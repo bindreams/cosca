@@ -93,6 +93,35 @@ fn a_refused_pidfd_open_is_unknown_and_unsupported() {
     }
 }
 
+/// Only a failed `pidfd_open` is a refusal: the same errnos from the inode read or a `poll` are the
+/// call's own failure, `Unassessable` with the raw errno. Mutant: "the refusal rule ignores the call".
+#[skuld::test]
+fn only_a_failed_pidfd_open_is_a_refusal() {
+    use std::error::Error as _;
+
+    use crate::identity::{FailedCall, UnknownCause};
+
+    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+        let (fd, _writer) = unreadable();
+        let kernel = FakeKernel::new()
+            .on_pidfd_open(PID, Ok(fd))
+            .on_pidfs_ino(PID, Err(errno));
+        let (existence, cause) = id(100).exists_with(&kernel);
+        assert_eq!(existence, Existence::Unknown, "pidfs_ino {errno}");
+        let causes = [
+            ("pidfs_ino", cause),
+            ("poll", UnknownCause::of_call(FailedCall::poll(errno))),
+        ];
+        for (call, cause) in causes {
+            let err = cause.into_error("pid 4242").expect("the call is the cause");
+            assert!(matches!(err, Error::Unassessable { .. }), "{call} {errno}: {err:?}");
+            let source = err.source().expect("the errno is the source");
+            let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
+            assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()), "{call} {errno}");
+        }
+    }
+}
+
 /// A thread that leads no group opens only with `PIDFD_THREAD`: `EINVAL` before 6.16, `ENOENT` from
 /// 6.16. Mutant: "the retry is skipped", or "the retry is for every errno".
 #[skuld::test]

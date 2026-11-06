@@ -717,19 +717,24 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
     use rustix::io::Errno;
     const PID: u32 = 4242;
     let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
-    let (reader, _writer) = std::io::pipe().expect("a pipe");
+    // The writers keep each pidfd stand-in from polling readable.
+    let mut writers = Vec::new();
+    let mut from_pidfs_ino = |errno| {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        writers.push(writer);
+        FakeKernel::new()
+            .on_pidfd_open(PID, Ok(reader.into()))
+            .on_pidfs_ino(PID, Err(errno))
+    };
     let kernels = [
         ("EPERM", FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM))),
         ("ENOSYS", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NOSYS))),
         ("EACCES", FakeKernel::new().on_pidfd_open(PID, Err(Errno::ACCESS))),
         ("ENODEV", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NODEV))),
         ("EMFILE", FakeKernel::new().on_pidfd_open(PID, Err(Errno::MFILE))),
-        (
-            "EBADF from pidfs_ino",
-            FakeKernel::new()
-                .on_pidfd_open(PID, Ok(reader.into()))
-                .on_pidfs_ino(PID, Err(Errno::BADF)),
-        ),
+        ("EBADF from pidfs_ino", from_pidfs_ino(Errno::BADF)),
+        ("EPERM from pidfs_ino", from_pidfs_ino(Errno::PERM)),
+        ("ENOSYS from pidfs_ino", from_pidfs_ino(Errno::NOSYS)),
     ];
     for (row, kernel) in kernels {
         let (_, cause) = ProcessId::of_with(&kernel, PID);
@@ -742,23 +747,30 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
     }
 }
 
-/// A failed inode read says it is the inode read that failed, not `pidfd_open`, and keeps its errno.
+/// A failed inode read says it is the inode read that failed, not `pidfd_open`, and keeps its errno,
+/// a refusing one too: only `pidfd_open` is refused.
 #[skuld::test]
 fn a_failed_inode_read_is_named_by_the_kill() {
     use rustix::io::Errno;
     const PID: u32 = 4242;
-    let (reader, _writer) = std::io::pipe().expect("a pipe");
-    let kernel = FakeKernel::new()
-        .on_pidfd_open(PID, Ok(reader.into()))
-        .on_pidfs_ino(PID, Err(Errno::BADF));
-    let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
-    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
-    let super::KillOutcome::NotAttempted(Error::Unassessable { detail, source }) = outcome else {
-        panic!("expected NotAttempted(Unassessable), got {outcome:?}");
-    };
-    assert!(
-        detail.contains("pidfs_ino") && !detail.contains("pidfd_open"),
-        "{detail}"
-    );
-    assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+    for errno in [Errno::BADF, Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+        let (reader, _writer) = std::io::pipe().expect("a pipe");
+        let kernel = FakeKernel::new()
+            .on_pidfd_open(PID, Ok(reader.into()))
+            .on_pidfs_ino(PID, Err(errno));
+        let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
+        let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+        let super::KillOutcome::NotAttempted(Error::Unassessable { detail, source }) = outcome else {
+            panic!("{errno}: expected NotAttempted(Unassessable), got {outcome:?}");
+        };
+        assert!(
+            detail.contains("pidfs_ino") && !detail.contains("pidfd_open"),
+            "{errno}: {detail}"
+        );
+        assert_eq!(
+            source.and_then(|e| e.raw_os_error()),
+            Some(errno.raw_os_error()),
+            "{errno}"
+        );
+    }
 }

@@ -408,9 +408,10 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
                 Err(e) => refused(e.into()),
             }
         }
-        Err(OpenFailure::Call(cause)) => {
-            KillOutcome::NotAttempted(crate::identity::unqueryable(&format!("pid {}", id.pid()), cause))
-        }
+        Err(OpenFailure::Call(call)) => KillOutcome::NotAttempted(crate::identity::unqueryable(
+            &format!("pid {}", id.pid()),
+            crate::identity::UnknownCause::of_call(call),
+        )),
         Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(error),
     }
 }

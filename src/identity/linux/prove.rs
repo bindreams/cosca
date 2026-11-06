@@ -10,13 +10,15 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::kernel::{Kernel, PIDFD_THREAD};
-use crate::identity::{RawPid, UnknownCause};
+use crate::identity::RawPid;
 
 /// A call that failed, and the errno it answered. The name is what an error says failed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FailedCall {
     name: &'static str,
     errno: Errno,
+    /// Whether the call is `pidfd_open`, the only one whose refusal means no pidfd is possible here.
+    is_pidfd_open: bool,
 }
 
 impl FailedCall {
@@ -25,6 +27,7 @@ impl FailedCall {
         FailedCall {
             name: "pidfd_open",
             errno,
+            is_pidfd_open: true,
         }
     }
 
@@ -33,12 +36,17 @@ impl FailedCall {
         FailedCall {
             name: "pidfs_ino",
             errno,
+            is_pidfd_open: false,
         }
     }
 
     /// A `poll` of a pidfd that answered `errno`.
     pub(crate) const fn poll(errno: Errno) -> FailedCall {
-        FailedCall { name: "poll", errno }
+        FailedCall {
+            name: "poll",
+            errno,
+            is_pidfd_open: false,
+        }
     }
 
     pub(crate) const fn name(&self) -> &'static str {
@@ -47,6 +55,17 @@ impl FailedCall {
 
     pub(crate) const fn errno(&self) -> Errno {
         self.errno
+    }
+
+    /// The name of the errno if this call is a refusal: a `pidfd_open` answered as documented on
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported). No other call is refused; its
+    /// failure, with any errno, is its own.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        if self.is_pidfd_open {
+            crate::os_process::linux::open::refusal_name(self.errno)
+        } else {
+            None
+        }
     }
 }
 
@@ -59,8 +78,8 @@ pub(crate) enum Proof {
     /// `pid` holds no process, or another one: the id's process is gone.
     Lost,
     /// Nothing was proven: the open or the inode read failed in a way that says nothing about `pid`.
-    /// A refusal of `pidfd_open` is in the cause, and is `Unsupported`, not a reason to look in `/proc`.
-    Unknown(UnknownCause),
+    /// A refusal of `pidfd_open` is `Unsupported`, not a reason to look in `/proc`.
+    Unknown(FailedCall),
 }
 
 /// `pid` as a `pidfd_open` target: `None` for a number no process can hold.
@@ -89,11 +108,6 @@ pub(super) fn open(kernel: &dyn Kernel, target: Pid) -> Result<Opened, Errno> {
     }
 }
 
-/// The cause of an `Unknown` that a failed pidfd call left.
-pub(super) fn cause(call: FailedCall) -> UnknownCause {
-    UnknownCause::of_call(call)
-}
-
 /// Opens `pid` and proves that its pidfd has inode `ino`.
 pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
     let Some(target) = target(pid) else {
@@ -104,7 +118,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
         // `ESRCH`: nobody holds the number. `EINVAL`/`ENOENT` from the retry: no process of a kernel
         // that has pidfs holds it as a task, so the id's process does not.
         Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Proof::Lost,
-        Err(e) => return Proof::Unknown(cause(FailedCall::pidfd_open(e))),
+        Err(e) => return Proof::Unknown(FailedCall::pidfd_open(e)),
     };
     match kernel.pidfs_ino(opened.fd.as_fd()) {
         Ok(Some(found)) if found == ino => Proof::Holds {
@@ -112,7 +126,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
             thread: opened.thread,
         },
         Ok(_) => Proof::Lost,
-        Err(e) => Proof::Unknown(cause(FailedCall::pidfs_ino(e))),
+        Err(e) => Proof::Unknown(FailedCall::pidfs_ino(e)),
     }
 }
 

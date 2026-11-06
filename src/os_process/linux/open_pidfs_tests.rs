@@ -128,6 +128,29 @@ fn a_pidfd_whose_inode_cannot_be_read_is_io() {
     );
 }
 
+/// An inode read the OS refuses is the read's failure, `Io` naming it with the raw errno, not a
+/// refusal of `pidfd_open`. Mutant: "the refusal rule ignores the call".
+#[skuld::test]
+fn a_refused_inode_read_is_io_not_unsupported() {
+    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+        let (fd, _writer) = unreadable();
+        let kernel = FakeKernel::new()
+            .on_pidfd_open(PID, Ok(fd))
+            .on_pidfs_ino(PID, Err(errno));
+        let result = open_verified_error_with(&kernel, id(100));
+        let Err(Error::Io(e)) = &result else {
+            panic!("{errno}: {result:?}");
+        };
+        let raw = e
+            .get_ref()
+            .and_then(|context| context.source())
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error);
+        assert!(e.to_string().starts_with("pidfs_ino: "), "{errno}: {e}");
+        assert_eq!(raw, Some(errno.raw_os_error()), "{errno}");
+    }
+}
+
 /// A live child opens on its inode; once reaped the id opens to nothing.
 #[skuld::test]
 fn a_real_child_opens_by_its_inode_and_is_none_once_reaped(#[fixture(pidfd_group_signal)] _group: &Group) {

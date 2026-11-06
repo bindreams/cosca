@@ -206,9 +206,9 @@ fn look(kernel: &dyn Kernel, pid: RawPid) -> Look {
         Err(Errno::INVAL) => match own_pidfs_ino(kernel) {
             Ok(Some(_)) => Look::Gone,
             Ok(None) => Look::Ticks,
-            Err(failed) => Look::Unknown(prove::cause(failed)),
+            Err(failed) => Look::Unknown(UnknownCause::of_call(failed)),
         },
-        Err(e) => Look::Unknown(prove::cause(prove::FailedCall::pidfd_open(e))),
+        Err(e) => Look::Unknown(UnknownCause::of_call(prove::FailedCall::pidfd_open(e))),
     }
 }
 
@@ -217,7 +217,7 @@ fn look_at(kernel: &dyn Kernel, fd: std::os::fd::BorrowedFd<'_>) -> Look {
     match kernel.pidfs_ino(fd) {
         Ok(Some(ino)) => Look::Pidfs(ino),
         Ok(None) => Look::Ticks,
-        Err(e) => Look::Unknown(prove::cause(prove::FailedCall::pidfs_ino(e))),
+        Err(e) => Look::Unknown(UnknownCause::of_call(prove::FailedCall::pidfs_ino(e))),
     }
 }
 
@@ -341,7 +341,7 @@ pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, 
         Key::Pidfs(ino) => match prove::prove(kernel, pid, ino) {
             Proof::Holds { .. } => (Existence::Present, UnknownCause::default()),
             Proof::Lost => (Existence::Gone, UnknownCause::default()),
-            Proof::Unknown(cause) => (Existence::Unknown, cause),
+            Proof::Unknown(call) => (Existence::Unknown, UnknownCause::of_call(call)),
         },
     }
 }
@@ -394,7 +394,7 @@ fn bracketed_stat(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> (Resolved<Vec<u
     match prove::prove(kernel, pid, ino) {
         Proof::Holds { .. } => (Resolved::Found(stat), UnknownCause::default()),
         Proof::Lost => (Resolved::Gone, UnknownCause::default()),
-        Proof::Unknown(cause) => (Resolved::Unknown, cause),
+        Proof::Unknown(call) => (Resolved::Unknown, UnknownCause::of_call(call)),
     }
 }
 
@@ -425,11 +425,8 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness
                 }
             },
             Proof::Lost => Liveness::Dead,
-            Proof::Unknown(cause) => {
-                log::debug!(
-                    "the pidfd of pid {pid} could not be opened or proved: {:?}",
-                    cause.call()
-                );
+            Proof::Unknown(call) => {
+                log::debug!("the pidfd of pid {pid} could not be opened or proved: {call:?}");
                 Liveness::Unknown
             }
         },
@@ -494,10 +491,8 @@ pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error
 /// [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`] naming the call
 /// and carrying the errno.
 pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
-    match crate::os_process::linux::open::refusal_name(call.errno()) {
-        Some(name) => {
-            crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), call.name(), name)
-        }
+    match call.refusal() {
+        Some(name) => crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), name),
         None => Error::Unassessable {
             detail: format!(
                 "{subject} identity could not be read: {}: {}",
