@@ -14,7 +14,8 @@ use windows::Win32::System::Threading::{
 
 use super::proc::create_process;
 use crate::child::lifecycle::Wording;
-use crate::child::owned::teardown::{Disposition, Kill};
+use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
+use crate::child::owned::teardown::{Disposition, Expect, Kill};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::Diagnosis;
@@ -125,65 +126,98 @@ fn owned(fake: FakeProcess) -> (OwnedChild, FakeProcess) {
 
 // A failed spawn's teardown =====
 
-/// A failed spawn's teardown of `child`, leaving a child it cannot end, with the wait for a killed
-/// one warning past `warn_after`; its fate.
-fn left_after_a_failed_spawn(child: OwnedChild, id: Option<ProcessId>, warn_after: Option<Duration>) -> ChildFate {
-    let (fate, unreaped) = tear_down_failed_spawn(
+/// Both ways a caller disposes of a child its failed spawn's teardown could not collect.
+const DISPOSITIONS: [Disposition; 2] = [Disposition::Leave, Disposition::HandBack];
+
+/// A failed spawn's teardown of `child`, as a caller that `expect`s that of its handle and disposes of
+/// an uncollected child as `disposition` says, with the wait for a killed child warning past
+/// `warn_after`; its fate, and the child if it was handed back.
+fn after_a_failed_spawn(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    expect: Expect,
+    disposition: Disposition,
+    warn_after: Option<Duration>,
+) -> (ChildFate, Option<crate::Unreaped>) {
+    tear_down_failed_spawn(
         child,
         id,
-        Disposition::Leave,
+        expect,
+        disposition,
         Due::in_(warn_after),
         &mut Diagnosis::default(),
-    );
-    assert!(unreaped.is_none(), "a teardown that leaves its child hands none back");
-    fate
+    )
 }
 
 /// A failed spawn's teardown with warnings on, whose child has already exited by the time it looks,
-/// does not warn. The handle lacks `PROCESS_TERMINATE`, so only its signalled state shows the exit.
+/// does not warn, under either disposition. The handle lacks `PROCESS_TERMINATE`, so only its signalled
+/// state shows the exit.
 ///
 /// Mutant: the look at the child's exit finds it late whatever its handle says.
 #[skuld::test]
 fn a_failed_spawn_teardown_of_an_exited_child_with_warnings_on_does_not_warn() {
-    let owner = Suspended::spawn();
-    let id = owner.id();
-    let (child, _fake) = owned(real(owner.without_terminate_right(), owner.pid));
-    owner.end_with_code_zero()();
-    owner.wait_for_exit();
+    for disposition in DISPOSITIONS {
+        let owner = Suspended::spawn();
+        let id = owner.id();
+        let (child, _fake) = owned(real(owner.without_terminate_right(), owner.pid));
+        owner.end_with_code_zero()();
+        owner.wait_for_exit();
 
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let fate = left_after_a_failed_spawn(child, Some(id), Some(Duration::from_secs(1)));
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        let (fate, unreaped) = after_a_failed_spawn(
+            child,
+            Some(id),
+            Expect::Waited,
+            disposition,
+            Some(Duration::from_secs(1)),
+        );
 
-    assert_eq!(fate, ChildFate::Reaped);
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
-    assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(fate, ChildFate::Reaped, "{disposition:?}");
+        assert!(
+            unreaped.is_none(),
+            "a collected child is handed back by none: {disposition:?}"
+        );
+        let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+        assert!(warns.is_empty(), "{disposition:?}: {warns:?}");
+    }
 }
 
 /// A failed spawn's teardown with warnings on whose child is still running when it looks (the kill is
 /// forced to be refused as an exit under way, so nothing ends it until the wait blocks) warns once,
-/// naming the pid, and goes on to the wait. The child is really unsignalled: nothing overrides the
-/// look.
+/// naming the pid, and goes on to the wait, under either disposition. The child is really
+/// unsignalled: nothing overrides the look.
 ///
 /// Mutants: the look finds the child exited whatever its handle says; the warn drops the pid.
 #[skuld::test]
 fn a_failed_spawn_teardown_of_a_running_child_with_warnings_on_warns_once_naming_it() {
-    let owner = Suspended::spawn();
-    let (child, _fake) = owned(real(owner.duplicate(), owner.pid));
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    // Ends the process once the wait blocks, which is after the look.
-    let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    let fate = left_after_a_failed_spawn(child, None, Some(Duration::ZERO));
+    for disposition in DISPOSITIONS {
+        let owner = Suspended::spawn();
+        let (child, _fake) = owned(real(owner.duplicate(), owner.pid));
+        let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        // Ends the process once the wait blocks, which is after the look.
+        let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
+        let (fate, unreaped) = after_a_failed_spawn(child, None, Expect::Waited, disposition, Some(Duration::ZERO));
 
-    assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the warn");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
-    assert_eq!(warns.len(), 1, "one warn: {warns:?}");
-    assert!(
-        warns[0].1.contains(&format!("child {} ", owner.pid)),
-        "the warn names the child: {warns:?}"
-    );
+        refusal.assert_reached();
+        assert_eq!(
+            fate,
+            ChildFate::Reaped,
+            "the wait goes on past the warn: {disposition:?}"
+        );
+        assert!(
+            unreaped.is_none(),
+            "a collected child is handed back by none: {disposition:?}"
+        );
+        let warns = crate::log_capture::records_since_on_current_thread(mark, "still waiting");
+        assert_eq!(warns.len(), 1, "one warn: {disposition:?}: {warns:?}");
+        assert!(
+            warns[0].1.contains(&format!("child {} ", owner.pid)),
+            "the warn names the child: {warns:?}"
+        );
+    }
 }
 
 /// A failed spawn's teardown whose `TerminateProcess` is denied on a live child (the handle lacks
@@ -203,7 +237,8 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait(
     // hanging.
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    let fate = left_after_a_failed_spawn(child, Some(id), None);
+    let (fate, unreaped) = after_a_failed_spawn(child, Some(id), Expect::Waited, Disposition::Leave, None);
+    assert!(unreaped.is_none(), "a teardown that leaves its child hands none back");
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert_eq!(fake.looks(), 1, "one look, and no wait");
     assert_eq!(
@@ -226,64 +261,137 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait(
 }
 
 /// A failed spawn's teardown whose kill fails on a child that has exited collects it from the look
-/// and warns of nothing.
+/// and warns of nothing, under either disposition: the child is collected, so none is handed back.
 ///
 /// Mutant: the failed-kill arm answers `Running` without looking, and warns.
 #[skuld::test]
 fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_silently() {
+    for disposition in DISPOSITIONS {
+        let owner = Suspended::spawn();
+        let id = owner.id();
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        let fake = FakeProcess::new([])
+            .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+                std::process::ExitStatus::default(),
+            ))])
+            .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+        let (child, fake) = owned(fake);
+        let (fate, unreaped) = after_a_failed_spawn(child, Some(id), Expect::Waited, disposition, None);
+        assert_eq!(fate, ChildFate::Reaped, "{disposition:?}");
+        assert!(
+            unreaped.is_none(),
+            "a collected child is handed back by none: {disposition:?}"
+        );
+        assert_eq!(fake.looks(), 1);
+        let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
+            .into_iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .collect::<Vec<_>>();
+        assert_eq!(warned, [], "nothing is left running: {disposition:?}");
+    }
+}
+
+/// The kill is delivered to a live process and the wait after it fails (a caller that expects
+/// anything of its handle, as when a look on it failed): the fate is `Killed`, and the kill is what
+/// ended it (exit code 1). The child is uncollected: handed back under `HandBack`, warned of as left
+/// under `Leave`.
+///
+/// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so the
+/// process never exits and the owner's wait hangs; the teardown waits a second time; `HandBack` drops
+/// the child, or says it is left.
+#[skuld::test]
+fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
+    for disposition in DISPOSITIONS {
+        let owner = Suspended::spawn();
+        let (child, fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        let (fate, unreaped) = after_a_failed_spawn(child, None, Expect::Anything, disposition, None);
+        assert_eq!(fate, ChildFate::Killed, "{disposition:?}");
+        assert_eq!(
+            unreaped.is_some(),
+            disposition == Disposition::HandBack,
+            "an uncollected child is handed back by HandBack alone: {disposition:?}"
+        );
+        assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
+        assert_eq!(
+            owner.wait_for_exit().code(),
+            Some(1),
+            "the teardown's kill must have ended it"
+        );
+        // Said as every teardown says a failed wait, under the failed spawn's name.
+        let warns = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string());
+        let where_it_went = match disposition {
+            Disposition::Leave => LEFT,
+            Disposition::HandBack => HANDED_BACK,
+        };
+        assert_eq!(
+            warns,
+            [(
+                log::Level::Warn,
+                format!(
+                    "teardown after a failed spawn: teardown of child {}: the wait failed: {}{where_it_went}",
+                    owner.pid,
+                    crate::child::owned::owned_tests::teardown_lines::wait_error(),
+                )
+            )],
+            "{disposition:?}"
+        );
+    }
+}
+
+/// A caller that expects a wait on its handle to succeed is told when it did not: a failed wait after
+/// a delivered kill is a breach of the contract, asserted where the warn is logged, after it.
+///
+/// A fake answers the failed wait: a handle from `CreateProcess` fails none.
+///
+/// Mutant: `warn_teardown` asserts nothing.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "a wait on a child's own handle failed")]
+fn a_failed_wait_on_a_handle_the_spawn_expected_to_wait_on_breaks_the_contract() {
     let owner = Suspended::spawn();
-    let id = owner.id();
+    let (child, _fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
     crate::log_capture::install();
-    let mark = crate::log_capture::mark();
+    after_a_failed_spawn(child, None, Expect::Waited, Disposition::Leave, None);
+}
+
+/// A kill of a handle the spawn owns is refused only for want of permission: any other refusal
+/// breaks the contract.
+///
+/// A fake answers the refusal: no real handle is refused for another reason.
+///
+/// Mutant: `warn_teardown` does not read the refusal's kind.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "refused for a reason other than permission")]
+fn a_kill_refused_for_another_reason_than_permission_breaks_the_contract() {
+    crate::log_capture::install();
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Reaped(ExitRecord::Status(
             std::process::ExitStatus::default(),
         ))])
-        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-    let (child, fake) = owned(fake);
-    let fate = left_after_a_failed_spawn(child, Some(id), None);
-    assert_eq!(fate, ChildFate::Reaped);
-    assert_eq!(fake.looks(), 1);
-    let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect::<Vec<_>>();
-    assert_eq!(warned, [], "nothing is left running");
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::Other))]);
+    let (child, _fake) = owned(fake);
+    after_a_failed_spawn(child, None, Expect::Waited, Disposition::Leave, None);
 }
 
-/// The kill is delivered to a live process: the fate is `Killed`, and the kill is what ended it (exit
-/// code 1).
+/// A caller that knows a look on its handle failed expects nothing of the teardown: the same refusal
+/// is no breach.
 ///
-/// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so the
-/// process never exits and the owner's wait hangs; the teardown waits a second time.
+/// Mutant: `Expect::Anything` asserts like `Expect::Waited`.
 #[skuld::test]
-fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
-    let owner = Suspended::spawn();
-    let (child, fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
+fn a_kill_refused_for_another_reason_than_permission_is_no_breach_when_anything_is_expected() {
     crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let fate = left_after_a_failed_spawn(child, None, None);
-    assert_eq!(fate, ChildFate::Killed);
-    assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
-    assert_eq!(
-        owner.wait_for_exit().code(),
-        Some(1),
-        "the teardown's kill must have ended it"
-    );
-    // Said as every teardown says a failed wait, under the failed spawn's name.
-    let warns = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string());
-    assert_eq!(
-        warns,
-        [(
-            log::Level::Warn,
-            format!(
-                "teardown after a failed spawn: teardown of child {}: the wait failed: {}{}",
-                owner.pid,
-                crate::child::owned::owned_tests::teardown_lines::wait_error(),
-                crate::child::owned::owned_tests::teardown_lines::LEFT
-            )
-        )]
-    );
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+            std::process::ExitStatus::default(),
+        ))])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::Other))]);
+    let (child, _fake) = owned(fake);
+    let (fate, _) = after_a_failed_spawn(child, None, Expect::Anything, Disposition::Leave, None);
+    assert_eq!(fate, ChildFate::Reaped);
 }
 
 /// A failed spawn that hands its child back, whose `TerminateProcess` is denied on a live child (the
@@ -303,8 +411,7 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_hands_the_child_back() {
         owner.pid,
     )));
 
-    let (fate, unreaped) =
-        tear_down_failed_spawn(child, Some(id), Disposition::HandBack, None, &mut Diagnosis::default());
+    let (fate, unreaped) = after_a_failed_spawn(child, Some(id), Expect::Waited, Disposition::HandBack, None);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     let unreaped = unreaped.expect("a refused kill under HandBack hands the child back");
@@ -441,7 +548,7 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     let owner = Suspended::spawn();
     let (handle, _fake) = handle_over(&owner, |fake| fake);
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
         Kill {
@@ -466,7 +573,7 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
 fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
     let owner = Suspended::spawn();
     let (handle, fake) = handle_over(&owner, |fake| fake.reaps([ReapAnswer::Err(KIND)]));
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
         Kill {

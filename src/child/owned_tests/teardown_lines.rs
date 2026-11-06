@@ -225,7 +225,8 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
         disposition,
         tree: None,
     };
-    let refused = || io::Error::other(REFUSED);
+    // A kill is refused for want of permission: the only refusal a teardown over its own handle expects.
+    let refused = || io::Error::new(io::ErrorKind::PermissionDenied, REFUSED);
     if row.found == Found::Unreadable {
         // A child whose reap read no exit record answers every wait so, and its handle, having reaped
         // it, sends every kill nothing: `Kill::Nothing` is the only one `tear_down` can be given for
@@ -393,7 +394,8 @@ fn callers() -> Vec<(&'static str, Say)> {
     }
     #[cfg(any(target_os = "linux", windows))]
     callers.push((TeardownCaller::FailedSpawn.label(), |torn| {
-        torn.say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
+        use crate::child::owned::teardown::{Expect, HandleTeardown};
+        HandleTeardown::new(torn, Expect::Anything).say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
     }));
     callers
 }

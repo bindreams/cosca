@@ -414,7 +414,7 @@ impl Drop for Limited {
 #[skuld::test]
 fn a_refusal_on_a_handle_holding_terminate_is_the_exit() {
     let child = spawn_blocked_child();
-    super::fault::refuse_next_terminate_as_exiting();
+    let _refusal = super::fault::refuse_next_terminate_as_exiting();
     let outcome = super::terminate_held(handle_of(&child));
     end(child);
     assert!(
@@ -463,7 +463,7 @@ fn a_refusal_on_a_handle_without_terminate_is_failed_while_the_process_runs() {
 fn an_exiting_refusal_on_a_handle_without_terminate_is_failed_while_unsignalled() {
     let child = spawn_blocked_child();
     let limited = Limited::of(&child, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
-    super::fault::refuse_next_terminate_as_exiting();
+    let _refusal = super::fault::refuse_next_terminate_as_exiting();
     let outcome = super::terminate_held(limited.0);
     drop(limited);
     end(child);
@@ -534,7 +534,7 @@ fn a_refusal_on_a_handle_without_terminate_or_synchronize_is_the_exit_once_the_c
 /// Mutant: a failed read of the granted access is treated as holding the right.
 #[skuld::test]
 fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
-    super::fault::refuse_next_terminate_as_exiting();
+    let _refusal = super::fault::refuse_next_terminate_as_exiting();
     let outcome = super::terminate_held(windows::Win32::Foundation::HANDLE::default());
     let super::Termination::Failed(e) = outcome else {
         panic!("a handle that cannot be read is not shown to be of an exiting process");

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Expect, Left, PidfdTeardown};
+use crate::child::owned::teardown::{Expect, HandleTeardown, Left};
 #[cfg(target_os = "linux")]
 use crate::child::spawn::held_teardown::tear_down_pidfd;
 #[cfg(target_os = "linux")]
@@ -1059,7 +1059,7 @@ impl Abandoned {
     /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
     /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
     /// clause as the one warn the caller logs, and the teardown's verdict.
-    fn after_pidless_teardown(torn: PidfdTeardown) -> Abandoned {
+    fn after_pidless_teardown(torn: HandleTeardown) -> Abandoned {
         match torn.uncollected() {
             Ok(left) => Abandoned::Uncollected(left),
             Err(collected) => {

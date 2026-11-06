@@ -244,9 +244,30 @@ pub(crate) mod fault {
     }
 
     /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
-    /// calling `TerminateProcess`; the process stays alive.
-    pub(crate) fn refuse_next_terminate_as_exiting() {
+    /// calling `TerminateProcess`; the process stays alive. The guard clears the refusal on drop,
+    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread.
+    pub(crate) fn refuse_next_terminate_as_exiting() -> ExitingRefusal {
         EXITING.with(|e| e.set(true));
+        ExitingRefusal(())
+    }
+
+    #[must_use = "the refusal is cleared as soon as the guard is dropped"]
+    pub(crate) struct ExitingRefusal(());
+
+    impl ExitingRefusal {
+        /// A kill reached `TerminateProcess` and was refused: the refusal is used up.
+        pub(crate) fn assert_reached(&self) {
+            assert!(
+                !EXITING.with(|e| e.get()),
+                "no kill reached TerminateProcess to be refused"
+            );
+        }
+    }
+
+    impl Drop for ExitingRefusal {
+        fn drop(&mut self) {
+            EXITING.with(|e| e.set(false));
+        }
     }
 
     pub(super) fn take_exiting_refusal() -> bool {

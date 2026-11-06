@@ -158,7 +158,7 @@ fn signal_failure_carries_the_win32_code() {
 fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     let (child, _stdin, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let result = kill(&*p);
     // The seam sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");

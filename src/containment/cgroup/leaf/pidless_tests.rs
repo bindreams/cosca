@@ -4,7 +4,7 @@
 
 use super::Abandoned;
 use crate::child::owned::owned_tests::teardown_lines::{outcome, rows};
-use crate::child::owned::teardown::{Disposition, Expect, Left, PidfdTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Left};
 use crate::error::ChildFate;
 
 /// `Ended` promises the child is reaped or will be, so a teardown that left it uncollected (a kill
@@ -28,7 +28,7 @@ fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() 
         } else {
             Expect::Waited
         };
-        let torn = PidfdTeardown::new(outcome, expect);
+        let torn = HandleTeardown::new(outcome, expect);
         let remains = torn.outcome.remains();
         let answer = Abandoned::after_pidless_teardown(torn);
         if row.uncollected {

@@ -6,7 +6,7 @@ use std::process::ExitStatus;
 
 #[cfg(unix)]
 use crate::child::drop_report::Forgot;
-use crate::child::owned::teardown::PidfdTeardown;
+use crate::child::owned::teardown::HandleTeardown;
 #[cfg(target_os = "linux")]
 use crate::child::owned::teardown::{Disposition, Expect};
 #[cfg(target_os = "linux")]
@@ -235,14 +235,14 @@ fn foreign_why(state: &RootState) -> String {
 }
 
 /// What the second teardown of a child whose first kill was refused did, as its
-/// [`PidfdTeardown`]'s outcome says, plus what forgetting tokio's handle for it leaked, for the
+/// [`HandleTeardown`]'s outcome says, plus what forgetting tokio's handle for it leaked, for the
 /// caller's one warn. Only Linux tears a refused kill's child down again through its pidfd.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only Linux tears a child down again through its pidfd")
 )]
 struct TornDown {
-    torn: PidfdTeardown,
+    torn: HandleTeardown,
     /// What the forget leaked; `None` if the backend was forgotten before, so nothing more leaked
     /// (and its warn says so).
     leak: Option<&'static str>,

@@ -4,7 +4,7 @@
 //! `fault::set_late_exit` find the one check of the exit late; the wait after it is real and ends at
 //! once. The raw rows (`OwnedChild::tear_down`) refuse the kill as an exit under way and use a zero
 //! threshold, so the child is really running at the first look, and close its stdin once the wait
-//! blocks. The unoverridden look is tested against real handles in `windows_teardown_tests` and
+//! blocks; they check that the kill reached `TerminateProcess` to be refused. The unoverridden look is tested against real handles in `windows_teardown_tests` and
 //! `proc_tests`.
 //!
 //! In the std row the process ends only by `TerminateProcess`, or by its stdin closing. The teardown's
@@ -82,13 +82,15 @@ fn raw_teardown_with_an_exit_under_way(force: fn(bool)) -> (ChildFate, Vec<Strin
     cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout");
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     force(true);
     let spawned = cmd.spawn();
     force(false);
     let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         spawned.expect_err("the forced failure fails the spawn"),
     );
+    // The refusal stands in for the kill's `TerminateProcess`, so the teardown did send its kill.
+    refusal.assert_reached();
     (fate, warns_since(mark))
 }
 

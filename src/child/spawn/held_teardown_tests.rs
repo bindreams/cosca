@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
-use crate::child::owned::teardown::{Disposition, Expect, PidfdTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
@@ -422,28 +422,28 @@ fn a_front_with_no_pid_is_named_as_such() {
 
 /// The teardown of the table's row `kill` and `found`, as a caller that leaves the child expects
 /// `expect` of it, and the clause its row says.
-fn teardown_of(kill: teardown_lines::Kill, found: teardown_lines::Found, expect: Expect) -> (PidfdTeardown, String) {
+fn teardown_of(kill: teardown_lines::Kill, found: teardown_lines::Found, expect: Expect) -> (HandleTeardown, String) {
     let row = teardown_lines::rows()
         .into_iter()
         .find(|row| row.kill == kill && row.found == found)
         .expect("the table has the row");
-    let torn = PidfdTeardown::new(teardown_lines::outcome(&row, Disposition::Leave), expect);
+    let torn = HandleTeardown::new(teardown_lines::outcome(&row, Disposition::Leave), expect);
     (torn, row.leave)
 }
 
 /// The teardown whose kill was delivered and whose wait then failed: uncollected, and `Killed`, as a
 /// failed wait on a pidfd leaves it.
-fn after_a_failed_wait(expect: Expect) -> PidfdTeardown {
+fn after_a_failed_wait(expect: Expect) -> HandleTeardown {
     teardown_of(Kill::Delivered, Found::WaitFailed, expect).0
 }
 
 /// A failed wait on a pidfd no look failed on is a breach of the contract, asserted where the warn is
 /// logged, whoever the caller is.
 ///
-/// Mutant: `warn_pidfd_teardown` asserts nothing.
+/// Mutant: `warn_teardown` asserts nothing.
 #[cfg(debug_assertions)]
 #[skuld::test]
-#[should_panic(expected = "a wait on a child's own pidfd failed")]
+#[should_panic(expected = "a wait on a child's own handle failed")]
 fn a_failed_wait_on_a_pidfd_nothing_looked_at_breaks_the_contract() {
     crate::log_capture::install();
     after_a_failed_wait(Expect::Waited).say_as_failed_spawn(&mut Diagnosis::default());
