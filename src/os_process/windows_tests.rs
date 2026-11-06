@@ -138,16 +138,52 @@ fn the_wait_is_on_the_opened_process_handle() {
 fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
-    let p = super::WindowsProcess {
-        pid: std::process::id(),
-        handle: super::cancel::new_cancel_event().expect("create an event handle"),
-        has_synchronize: true,
-    };
+    let p = super::WindowsProcess::for_child(
+        super::cancel::new_cancel_event().expect("create an event handle"),
+        std::process::id(),
+    );
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// A UAC handle whose access cannot be read is taken to hold `SYNCHRONIZE` and no more, so a
+/// refused kill of its live child is a refusal of permission: an error, never an exit.
+///
+/// Mutant: the unreadable access is taken for every right (`PROCESS_ALL_ACCESS`), so a refused kill
+/// breaks the contract instead of reporting it.
+#[skuld::test]
+fn a_uac_handle_whose_access_cannot_be_read_is_refused_for_permission() {
+    use crate::os_process::child::{KillRefusal, OsChild as _};
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
+    let granted = super::access_of_uac_read(Err::<u32, _>("unreadable"));
+    assert_eq!(granted, PROCESS_SYNCHRONIZE);
+    let event = super::cancel::new_cancel_event().expect("create an event handle");
+    let p = super::WindowsProcess::for_uac(event, std::process::id(), granted);
+    assert_eq!(p.kill_refusal(), KillRefusal::Permission);
+}
+
+/// A UAC handle that was read as not granted `SYNCHRONIZE` cannot be waited on, which its owner's
+/// waits and looks depend on: a breach of the contract.
+///
+/// Mutant: the read access is passed on whatever it holds.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "holds SYNCHRONIZE")]
+fn a_uac_handle_read_without_synchronize_breaks_the_contract() {
+    use windows::Win32::System::Threading::PROCESS_TERMINATE;
+    super::access_of_uac_read(Ok::<_, &str>(PROCESS_TERMINATE.0));
+}
+
+/// A UAC handle read as holding `SYNCHRONIZE` keeps the access it was read as.
+#[skuld::test]
+fn a_uac_handle_keeps_the_access_it_was_read_as() {
+    use windows::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    let read = PROCESS_SYNCHRONIZE.0 | PROCESS_TERMINATE.0;
+    assert_eq!(super::access_of_uac_read(Ok::<_, &str>(read)).0, read);
 }
 
 /// A kill of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the
@@ -158,7 +194,7 @@ fn signal_failure_carries_the_win32_code() {
 fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     let (child, _stdin, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let result = kill(&*p);
     // The seam sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");

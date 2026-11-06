@@ -3,7 +3,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 
-use super::child::{OsChild, OsHandle, PeekOutcome, TryReapOutcome};
+use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::signal::{send_pidfd, Sent, Sig};
@@ -45,6 +45,11 @@ impl OsProcess for LinuxProcess {
 impl OsChild for LinuxProcess {
     fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// `pidfd_send_signal` is refused only with `EPERM`.
+    fn kill_refusal(&self) -> KillRefusal {
+        KillRefusal::Permission
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {

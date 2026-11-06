@@ -43,7 +43,7 @@ fn kill_never_waits() {
     let fake = FakeProcess::over(os);
     let child = OwnedChild::new(Box::new(fake.clone()));
     drop(stdin);
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     assert_eq!(
         child.signal(Sig::Kill).expect("a refusal under way is no error"),
         Sent::Gone

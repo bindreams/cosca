@@ -364,6 +364,29 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
 
+/// A refusal is classified by what the OS refused with: an I/O error is its own kind, any other
+/// error is another reason.
+///
+/// Mutant: every error that is not `Io` is another reason.
+#[skuld::test]
+fn a_refusal_is_classified_by_what_it_is() {
+    use crate::error::Error;
+    let denied = || Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let contained = || Error::Containment {
+        detail: "refused".into(),
+    };
+    let kinds = [
+        (denied(), std::io::ErrorKind::PermissionDenied),
+        (contained(), std::io::ErrorKind::Other),
+    ];
+    for (refused, kind) in kinds {
+        let described = refused.to_string();
+        let child = OwnedChild::new(Box::new(fake().reaps([ReapAnswer::Reaped(exit())])));
+        let torn = child.look_after_refused_kill(Some(id()), refused, Disposition::Leave);
+        assert_eq!(torn.remains().refused, Some(kind), "{described}");
+    }
+}
+
 /// A refused kill of a child that no tree kill reached is looked at once, never waited for: nothing
 /// asked it to exit. A reach that cannot say is the same.
 ///
