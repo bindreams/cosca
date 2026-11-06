@@ -12,6 +12,44 @@ use rustix::process::{Pid, PidfdFlags};
 use super::kernel::{Kernel, PIDFD_THREAD};
 use crate::identity::{RawPid, UnknownCause};
 
+/// A call that failed, and the errno it answered. The name is what an error says failed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FailedCall {
+    name: &'static str,
+    errno: Errno,
+}
+
+impl FailedCall {
+    /// A `pidfd_open` that answered `errno`.
+    pub(crate) const fn pidfd_open(errno: Errno) -> FailedCall {
+        FailedCall {
+            name: "pidfd_open",
+            errno,
+        }
+    }
+
+    /// A read of a pidfd's inode that answered `errno`.
+    pub(crate) const fn pidfs_ino(errno: Errno) -> FailedCall {
+        FailedCall {
+            name: "pidfs_ino",
+            errno,
+        }
+    }
+
+    /// A `poll` of a pidfd that answered `errno`.
+    pub(crate) const fn poll(errno: Errno) -> FailedCall {
+        FailedCall { name: "poll", errno }
+    }
+
+    pub(crate) const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) const fn errno(&self) -> Errno {
+        self.errno
+    }
+}
+
 /// What opening `pid` found about the process a `Pidfs` id names.
 #[derive(Debug)]
 pub(crate) enum Proof {
@@ -51,9 +89,9 @@ pub(super) fn open(kernel: &dyn Kernel, target: Pid) -> Result<Opened, Errno> {
     }
 }
 
-/// The cause of an `Unknown` that a failed pidfd call (`errno`) left.
-pub(super) fn cause(errno: Errno) -> UnknownCause {
-    UnknownCause::of_errno(errno)
+/// The cause of an `Unknown` that a failed pidfd call left.
+pub(super) fn cause(call: FailedCall) -> UnknownCause {
+    UnknownCause::of_call(call)
 }
 
 /// Opens `pid` and proves that its pidfd has inode `ino`.
@@ -66,7 +104,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
         // `ESRCH`: nobody holds the number. `EINVAL`/`ENOENT` from the retry: no process of a kernel
         // that has pidfs holds it as a task, so the id's process does not.
         Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Proof::Lost,
-        Err(e) => return Proof::Unknown(cause(e)),
+        Err(e) => return Proof::Unknown(cause(FailedCall::pidfd_open(e))),
     };
     match kernel.pidfs_ino(opened.fd.as_fd()) {
         Ok(Some(found)) if found == ino => Proof::Holds {
@@ -74,7 +112,7 @@ pub(crate) fn prove(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> Proof {
             thread: opened.thread,
         },
         Ok(_) => Proof::Lost,
-        Err(e) => Proof::Unknown(cause(e)),
+        Err(e) => Proof::Unknown(cause(FailedCall::pidfs_ino(e))),
     }
 }
 

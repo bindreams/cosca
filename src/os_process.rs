@@ -97,7 +97,7 @@ pub(crate) fn open_with(
 ) -> Result<Option<Box<dyn OsProcess>>, Error> {
     #[cfg(target_os = "linux")]
     {
-        Ok(linux::open::open_verified_with(kernel, id)?
+        Ok(linux::open::open_verified_error_with(kernel, id)?
             .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>))
     }
     #[cfg(windows)]

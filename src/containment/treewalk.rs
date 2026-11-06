@@ -365,7 +365,7 @@ pub(crate) fn walk_from(
 
 /// A kill that sent nothing because the process's identity could not be read at kill time. The
 /// message reads after the pid, which the error of a walk that left it behind names.
-#[cfg(any(unix, windows))]
+#[cfg(any(all(unix, not(target_os = "linux")), windows))]
 fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
     KillOutcome::NotAttempted(Error::Unassessable { detail, source })
 }
@@ -379,12 +379,15 @@ fn refused(os: std::io::Error) -> KillOutcome {
 /// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
 /// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
 /// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
-/// so nothing is sent: `NotAttempted`, as for a pid that cannot be queried. Best-effort.
+/// so nothing is sent: `NotAttempted`, with the error the walk gives the same pid
+/// ([`unqueryable`](crate::identity::unqueryable)). Best-effort.
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
     use std::os::fd::AsFd as _;
 
     use nix::errno::Errno;
+
+    use crate::os_process::linux::open::OpenFailure;
 
     match crate::os_process::linux::open::open_verified_with(kernel, id) {
         Ok(None) => {
@@ -405,11 +408,10 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
                 Err(e) => refused(e.into()),
             }
         }
-        Err(Error::Unassessable { detail, source }) => identity_unread(detail, source),
-        Err(e) => identity_unread(
-            format!("its pidfd could not be proved to name it ({e})"),
-            Some(e.into_os_io()),
-        ),
+        Err(OpenFailure::Call(cause)) => {
+            KillOutcome::NotAttempted(crate::identity::unqueryable(&format!("pid {}", id.pid()), cause))
+        }
+        Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(error),
     }
 }
 

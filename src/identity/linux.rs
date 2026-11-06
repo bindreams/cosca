@@ -206,9 +206,9 @@ fn look(kernel: &dyn Kernel, pid: RawPid) -> Look {
         Err(Errno::INVAL) => match own_pidfs_ino(kernel) {
             Ok(Some(_)) => Look::Gone,
             Ok(None) => Look::Ticks,
-            Err(e) => Look::Unknown(prove::cause(e)),
+            Err(failed) => Look::Unknown(prove::cause(failed)),
         },
-        Err(e) => Look::Unknown(prove::cause(e)),
+        Err(e) => Look::Unknown(prove::cause(prove::FailedCall::pidfd_open(e))),
     }
 }
 
@@ -217,7 +217,7 @@ fn look_at(kernel: &dyn Kernel, fd: std::os::fd::BorrowedFd<'_>) -> Look {
     match kernel.pidfs_ino(fd) {
         Ok(Some(ino)) => Look::Pidfs(ino),
         Ok(None) => Look::Ticks,
-        Err(e) => Look::Unknown(prove::cause(e)),
+        Err(e) => Look::Unknown(prove::cause(prove::FailedCall::pidfs_ino(e))),
     }
 }
 
@@ -428,7 +428,7 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness
             Proof::Unknown(cause) => {
                 log::debug!(
                     "the pidfd of pid {pid} could not be opened or proved: {:?}",
-                    cause.errno()
+                    cause.call()
                 );
                 Liveness::Unknown
             }
@@ -478,7 +478,7 @@ pub(super) fn current_key(kernel: &dyn Kernel) -> Result<Key, Error> {
                 ))),
             }
         }
-        Err(e) => Err(crate::os_process::linux::open::open_error(e)),
+        Err(failed) => Err(crate::os_process::linux::open::open_error(failed)),
     }
 }
 
@@ -490,15 +490,21 @@ pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error
         .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source))
 }
 
-/// The error for a by-pid identity read of `subject` that a failed pidfd call (`errno`) made
-/// `Unknown`: [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`]
-/// carrying the errno.
-pub(crate) fn errno_error(subject: &str, errno: Errno) -> Error {
-    match crate::os_process::linux::open::refusal_name(errno) {
-        Some(name) => crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), name),
+/// The error for a by-pid identity read of `subject` that a failed pidfd call made `Unknown`:
+/// [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`] naming the call
+/// and carrying the errno.
+pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
+    match crate::os_process::linux::open::refusal_name(call.errno()) {
+        Some(name) => {
+            crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), call.name(), name)
+        }
         None => Error::Unassessable {
-            detail: format!("{subject} identity could not be read: {errno}"),
-            source: Some(std::io::Error::from(errno)),
+            detail: format!(
+                "{subject} identity could not be read: {}: {}",
+                call.name(),
+                call.errno()
+            ),
+            source: Some(std::io::Error::from(call.errno())),
         },
     }
 }
@@ -593,9 +599,9 @@ pub(super) fn session_scope_at(
             source,
         })?
         .ino();
-    let token_kind = own_token_kind(kernel).map_err(|errno| ScopeReadError {
-        path: "pidfd_open of this process".to_owned(),
-        source: std::io::Error::from(errno),
+    let token_kind = own_token_kind(kernel).map_err(|failed| ScopeReadError {
+        path: format!("{} of this process", failed.name()),
+        source: std::io::Error::from(failed.errno()),
     })?;
     Ok(Scope {
         boot_id: Some(boot_id.to_owned()),
@@ -605,13 +611,15 @@ pub(super) fn session_scope_at(
 }
 
 /// The inode of this process's own pidfd: `Some` on pidfs, `None` where pidfds have none.
-fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, Errno> {
-    let pidfd = kernel.pidfd_open(rustix::process::getpid(), PidfdFlags::empty())?;
-    kernel.pidfs_ino(pidfd.as_fd())
+fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, prove::FailedCall> {
+    let pidfd = kernel
+        .pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
+        .map_err(prove::FailedCall::pidfd_open)?;
+    kernel.pidfs_ino(pidfd.as_fd()).map_err(prove::FailedCall::pidfs_ino)
 }
 
 /// The kind of [`Key`] this host's processes have, as a record names it.
-fn own_token_kind(kernel: &dyn Kernel) -> Result<TokenKind, Errno> {
+fn own_token_kind(kernel: &dyn Kernel) -> Result<TokenKind, prove::FailedCall> {
     Ok(match own_pidfs_ino(kernel)? {
         Some(_) => TokenKind::Pidfs,
         None => TokenKind::Ticks,

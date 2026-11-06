@@ -70,8 +70,8 @@ impl Process {
                 // A pidfd call that failed is the open's own failure: a refusal is `Unsupported`
                 // naming the open, as for `open`.
                 #[cfg(target_os = "linux")]
-                if let Some(errno) = cause.errno() {
-                    return Err(crate::os_process::linux::open::open_error(errno));
+                if let Some(call) = cause.call() {
+                    return Err(crate::os_process::linux::open::open_error(call));
                 }
                 Err(crate::identity::unqueryable(&format!("pid {pid}"), cause))
             }

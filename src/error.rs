@@ -155,8 +155,8 @@ pub enum Error {
     ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
     ///   either way no pidfd is possible.
     ///
-    /// Any other failure is transient and surfaces as [`Error::Io`], prefixed `pidfd_open:`
-    /// (`EMFILE`, `ENFILE`, `ENOMEM`).
+    /// Any other failure is transient and surfaces as [`Error::Io`], prefixed with the failed call,
+    /// `pidfd_open:` (`EMFILE`, `ENFILE`, `ENOMEM`) or `pidfs_ino:` for the read of the pidfd's inode.
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this
@@ -210,7 +210,8 @@ pub enum Error {
     },
     /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
     /// it left behind, was not. `source` says why: the member's identity could not be read, at the
-    /// walk or when the kill came ([`Error::Unassessable`]), or the OS refused the kill
+    /// walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when the OS
+    /// refuses the pidfd the identity is read through), or the OS refused the kill
     /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
     /// for [`Process::kill`](crate::Process::kill)). It names the first member left; the call warns of
     /// the others. The root is named only when it is the sole member left.
@@ -470,29 +471,6 @@ impl Error {
         match self {
             Error::Io(e) => e,
             other => std::io::Error::other(other),
-        }
-    }
-
-    /// [`into_io`](Self::into_io) for a caller that hands the result on as a `source`, whose
-    /// [`raw_os_error`](std::io::Error::raw_os_error) is the contract: the `io::Error` that carries
-    /// the OS code, without the context [`io_context`] added to an [`Error::Io`] (whose message the
-    /// caller has already printed) and without [`Error::NotThreadGroupLeader`]'s wrapping.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn into_os_io(self) -> std::io::Error {
-        match self {
-            Error::Io(mut e) => {
-                // Each layer holds its `io::Error` as `source`: `io_context` nests.
-                while e.get_ref().is_some_and(|inner| inner.is::<IoContext>()) {
-                    let inner = e.into_inner().expect("a custom error, checked above");
-                    e = inner
-                        .downcast::<IoContext>()
-                        .expect("an `IoContext`, checked above")
-                        .source;
-                }
-                e
-            }
-            Error::NotThreadGroupLeader { source, .. } => source,
-            other => other.into_io(),
         }
     }
 

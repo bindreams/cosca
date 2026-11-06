@@ -385,11 +385,12 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     let super::KillOutcome::NotAttempted(why) = outcome else {
         panic!("expected NotAttempted, got {outcome:?}");
     };
-    // An identity that could not be read is `Unassessable`, with the refusal as its source.
+    // An identity that could not be read is `Unassessable`, with the refusal as its source, and
+    // the failed call is named.
     let Error::Unassessable { detail, source } = &why else {
         panic!("expected Unassessable, got {why:?}");
     };
-    assert!(detail.contains("pidfd"), "{detail}");
+    assert!(detail.contains("pidfd_open"), "{detail}");
     assert_eq!(
         source.as_ref().and_then(std::io::Error::raw_os_error),
         Some(libc::EMFILE),
@@ -652,7 +653,7 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
     assert_not_killed(
         Err(again.into_error()),
         descendant.pid(),
-        &["its pidfd could not be proved to name it"],
+        &["identity could not be read: pidfd_open"],
     );
     assert_eq!(sends.by_identity(), [], "nothing was sent to it");
 
@@ -706,4 +707,58 @@ fn a_candidate_whose_stat_shows_another_parent_is_dropped() {
     assert!(super::resolve_or_drop(&kernel, PID, parent(1), None)
         .expect("a read")
         .is_some());
+}
+
+/// The kill of a `pidfs` id whose pidfd call failed says what the walk says of the same pid: the
+/// error built from the same cause, a refusal included (`Unsupported`, with no `Unassessable` around
+/// it). Mutant: "the kill wraps what the open failed with in its own `Unassessable`".
+#[skuld::test]
+fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
+    use rustix::io::Errno;
+    const PID: u32 = 4242;
+    let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
+    let (reader, _writer) = std::io::pipe().expect("a pipe");
+    let kernels = [
+        ("EPERM", FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM))),
+        ("ENOSYS", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NOSYS))),
+        ("EACCES", FakeKernel::new().on_pidfd_open(PID, Err(Errno::ACCESS))),
+        ("ENODEV", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NODEV))),
+        ("EMFILE", FakeKernel::new().on_pidfd_open(PID, Err(Errno::MFILE))),
+        (
+            "EBADF from pidfs_ino",
+            FakeKernel::new()
+                .on_pidfd_open(PID, Ok(reader.into()))
+                .on_pidfs_ino(PID, Err(Errno::BADF)),
+        ),
+    ];
+    for (row, kernel) in kernels {
+        let (_, cause) = ProcessId::of_with(&kernel, PID);
+        let walk = crate::identity::unqueryable(&format!("pid {PID}"), cause);
+        let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+        let super::KillOutcome::NotAttempted(kill) = outcome else {
+            panic!("{row}: expected NotAttempted, got {outcome:?}");
+        };
+        assert_eq!(format!("{kill:?}"), format!("{walk:?}"), "{row}");
+    }
+}
+
+/// A failed inode read says it is the inode read that failed, not `pidfd_open`, and keeps its errno.
+#[skuld::test]
+fn a_failed_inode_read_is_named_by_the_kill() {
+    use rustix::io::Errno;
+    const PID: u32 = 4242;
+    let (reader, _writer) = std::io::pipe().expect("a pipe");
+    let kernel = FakeKernel::new()
+        .on_pidfd_open(PID, Ok(reader.into()))
+        .on_pidfs_ino(PID, Err(Errno::BADF));
+    let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
+    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    let super::KillOutcome::NotAttempted(Error::Unassessable { detail, source }) = outcome else {
+        panic!("expected NotAttempted(Unassessable), got {outcome:?}");
+    };
+    assert!(
+        detail.contains("pidfs_ino") && !detail.contains("pidfd_open"),
+        "{detail}"
+    );
+    assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EBADF));
 }

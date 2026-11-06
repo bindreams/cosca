@@ -10,7 +10,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use rustix::io::Errno;
 use rustix::process::PidfdFlags;
 
-use super::open_verified_with;
+use super::open_verified_error_with;
 use crate::error::Error;
 use crate::identity::{FakeKernel, HostKernel, Kernel as _, Key, ProcessId};
 use crate::test_groups::{pidfd_group_signal, Group};
@@ -46,7 +46,7 @@ fn a_pid_that_opens_to_the_ids_inode_opens_with_no_proc_read() {
     let kernel = FakeKernel::new()
         .on_pidfd_open(PID, Ok(fd))
         .on_pidfs_ino(PID, Ok(Some(100)));
-    assert!(matches!(open_verified_with(&kernel, id(100)), Ok(Some(_))));
+    assert!(matches!(open_verified_error_with(&kernel, id(100)), Ok(Some(_))));
 }
 
 #[skuld::test]
@@ -55,16 +55,19 @@ fn a_pid_that_opens_to_another_inode_is_none() {
     let kernel = FakeKernel::new()
         .on_pidfd_open(PID, Ok(fd))
         .on_pidfs_ino(PID, Ok(Some(101)));
-    assert!(matches!(open_verified_with(&kernel, id(100)), Ok(None)));
+    assert!(matches!(open_verified_error_with(&kernel, id(100)), Ok(None)));
 }
 
 #[skuld::test]
 fn a_pid_with_no_process_and_one_no_pidfd_opens_for_are_none() {
-    assert!(matches!(open_verified_with(&refusing(Errno::SRCH), id(100)), Ok(None)));
+    assert!(matches!(
+        open_verified_error_with(&refusing(Errno::SRCH), id(100)),
+        Ok(None)
+    ));
     let kernel = FakeKernel::new()
         .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(Errno::INVAL))
         .on_pidfd_open_flags(PID, THREAD, Err(Errno::INVAL));
-    assert!(matches!(open_verified_with(&kernel, id(100)), Ok(None)));
+    assert!(matches!(open_verified_error_with(&kernel, id(100)), Ok(None)));
 }
 
 /// A thread that leads no group is no process to signal: `NotThreadGroupLeader` carrying the errno
@@ -77,7 +80,7 @@ fn a_live_thread_that_leads_no_group_is_not_a_thread_group_leader() {
             .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(first))
             .on_pidfd_open_flags(PID, THREAD, Ok(fd))
             .on_pidfs_ino(PID, Ok(Some(100)));
-        match open_verified_with(&kernel, id(100)) {
+        match open_verified_error_with(&kernel, id(100)) {
             Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
                 assert_eq!(pid, PID);
                 assert_eq!(source.raw_os_error(), Some(first.raw_os_error()), "{first}");
@@ -95,7 +98,7 @@ fn a_thread_that_has_exited_is_none() {
         .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(Errno::INVAL))
         .on_pidfd_open_flags(PID, THREAD, Ok(readable()))
         .on_pidfs_ino(PID, Ok(Some(100)));
-    assert!(matches!(open_verified_with(&kernel, id(100)), Ok(None)));
+    assert!(matches!(open_verified_error_with(&kernel, id(100)), Ok(None)));
 }
 
 /// A refusal is `Unsupported`; anything else the open fails with stays `Io`. The group's resend
@@ -103,11 +106,11 @@ fn a_thread_that_has_exited_is_none() {
 #[skuld::test]
 fn a_refused_open_is_unsupported_and_a_transient_one_is_io() {
     for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
-        let result = open_verified_with(&refusing(errno), id(100));
+        let result = open_verified_error_with(&refusing(errno), id(100));
         assert!(matches!(result, Err(Error::Unsupported { .. })), "{errno}: {result:?}");
     }
     for errno in [Errno::MFILE, Errno::NFILE, Errno::NOMEM] {
-        let result = open_verified_with(&refusing(errno), id(100));
+        let result = open_verified_error_with(&refusing(errno), id(100));
         assert!(matches!(result, Err(Error::Io(_))), "{errno}: {result:?}");
     }
 }
@@ -118,8 +121,11 @@ fn a_pidfd_whose_inode_cannot_be_read_is_io() {
     let kernel = FakeKernel::new()
         .on_pidfd_open(PID, Ok(fd))
         .on_pidfs_ino(PID, Err(Errno::BADF));
-    let result = open_verified_with(&kernel, id(100));
-    assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+    let result = open_verified_error_with(&kernel, id(100));
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.to_string().starts_with("pidfs_ino: ")),
+        "{result:?}"
+    );
 }
 
 /// A live child opens on its inode; once reaped the id opens to nothing.
@@ -140,11 +146,11 @@ fn a_real_child_opens_by_its_inode_and_is_none_once_reaped(#[fixture(pidfd_group
         .expect("the host has pidfs");
     let id = ProcessId::from_parts_for_test(pid, Key::Pidfs(ino));
 
-    let held = open_verified_with(&HostKernel, id).expect("a live process opens");
+    let held = open_verified_error_with(&HostKernel, id).expect("a live process opens");
     assert!(held.is_some(), "a live child opens");
     drop(held);
 
     child.kill().expect("kill the child");
     child.wait().expect("reap the child");
-    assert!(matches!(open_verified_with(&HostKernel, id), Ok(None)));
+    assert!(matches!(open_verified_error_with(&HostKernel, id), Ok(None)));
 }

@@ -184,27 +184,6 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
-/// The `io::Error` an error hands on as a `source` is the one that carries the OS code, whether the
-/// error had context added to it (`Io`) or holds the code as its own `source`.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn into_os_io_reads_the_os_code_through_context() {
-    let os = || std::io::Error::from_raw_os_error(libc::EMFILE);
-    let io = Error::Io(crate::error::io_context("pidfd_open", os())).into_os_io();
-    assert_eq!(io.raw_os_error(), Some(libc::EMFILE), "{io:?}");
-    let nested = Error::Io(crate::error::io_context(
-        "outer",
-        crate::error::io_context("inner", os()),
-    ));
-    assert_eq!(nested.into_os_io().raw_os_error(), Some(libc::EMFILE));
-    let not_a_leader = Error::NotThreadGroupLeader {
-        pid: 7,
-        detail: String::new(),
-        source: os(),
-    };
-    assert_eq!(not_a_leader.into_os_io().raw_os_error(), Some(libc::EMFILE));
-}
-
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
 /// An I/O error keeps its kind, and its OS code as the note's `source`.
 #[cfg(unix)]

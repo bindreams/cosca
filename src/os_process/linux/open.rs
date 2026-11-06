@@ -2,7 +2,10 @@
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
 //! A signal through the pidfd is identity-bound (no pid-reuse race). A refused `pidfd_open` is
 //! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
-//! classification is documented once, on [`Error::Unsupported`].
+//! classification is documented once, on [`Error::Unsupported`]. [`open_verified_with`] keeps a
+//! failed pidfd call apart from the errors it has finished ([`OpenFailure`]), so each consumer builds
+//! its error from the call and its errno: [`open_verified_error_with`] for
+//! [`Process::open`](crate::Process::open), the tree walk's by-identity kill for the walk's own.
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
@@ -17,11 +20,49 @@ use std::os::fd::AsFd as _;
 use rustix::process::{Pid, PidfdFlags};
 
 use crate::error::Error;
-use crate::identity::{Existence, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, ViewUnreadable};
+use crate::identity::{
+    Existence, FailedCall, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, UnknownCause, ViewUnreadable,
+};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
 const OP_NAME: &str = "process open";
+
+/// Why [`open_verified_with`] opened nothing and found nothing gone.
+#[derive(Debug)]
+pub(crate) enum OpenFailure {
+    /// A pidfd call failed for a reason that says nothing about the target. The cause holds the
+    /// call and its errno, for a consumer to build its own error from: a refusal is
+    /// [`Error::Unsupported`] and anything else a failure carrying the raw errno.
+    Call(UnknownCause),
+    /// An error already in its final form.
+    Finished(Error),
+}
+
+impl OpenFailure {
+    /// The failure of the pidfd call `call`.
+    fn call(call: FailedCall) -> OpenFailure {
+        OpenFailure::Call(UnknownCause::of_call(call))
+    }
+
+    /// The error [`Process::open`](crate::Process::open) documents: a failed call is
+    /// [`open_error`], the rest as they are.
+    pub(crate) fn into_open_error(self) -> Error {
+        match self {
+            OpenFailure::Call(cause) => open_error(cause.call().expect("a failed open's cause is a failed call")),
+            OpenFailure::Finished(error) => error,
+        }
+    }
+}
+
+/// [`open_verified_with`] with its failure as the error [`Process::open`](crate::Process::open)
+/// documents.
+pub(crate) fn open_verified_error_with(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    open_verified_with(kernel, id).map_err(OpenFailure::into_open_error)
+}
 
 /// Open a pidfd for `id` through `kernel`, re-verifying identity. `Ok(None)` => already gone (treat
 /// as exited).
@@ -29,7 +70,10 @@ const OP_NAME: &str = "process open";
 /// A `Pidfs` id is proved by its pidfd's inode and reads no `/proc`. For a `Ticks` id every `/proc`
 /// read goes through one checked `/proc` dirfd shown to describe `id`'s pid namespace; otherwise
 /// [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
-pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+pub(crate) fn open_verified_with(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+) -> Result<Option<rustix::fd::OwnedFd>, OpenFailure> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
@@ -40,14 +84,16 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
     }
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
     match kernel.pidfd_open(raw, PidfdFlags::empty()) {
-        Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd),
+        Ok(pidfd) => verify_pidfd_target(kernel, id, pidfd).map_err(OpenFailure::Finished),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
         // ENOENT (>= 6.16) means either a reaped process-group leader whose pid lives on as a PGID
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
-        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(kernel, id, e),
-        Err(e) => Err(open_error(e)),
+        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => {
+            verify_without_pidfd(kernel, id, e).map_err(OpenFailure::Finished)
+        }
+        Err(e) => Err(OpenFailure::call(FailedCall::pidfd_open(e))),
     }
 }
 
@@ -57,7 +103,7 @@ pub(crate) fn open_verified_with(kernel: &dyn Kernel, id: ProcessId) -> Result<O
 /// [`Error::NotThreadGroupLeader`], and one that has exited (a ptraced zombie thread kept until its
 /// tracer waits; its pidfd polls readable) is gone. A process reaped after the open still has its
 /// inode, so the pidfd is returned and polls readable.
-fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<rustix::fd::OwnedFd>, OpenFailure> {
     match crate::identity::prove(kernel, id.pid(), ino) {
         Proof::Holds { fd, thread: None } => Ok(Some(fd)),
         Proof::Holds {
@@ -65,26 +111,31 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
             thread: Some(errno),
         } => match crate::os_process::poll::is_readable(fd.as_fd()) {
             Ok(true) => Ok(None),
-            Ok(false) => Err(Error::NotThreadGroupLeader {
+            Ok(false) => Err(OpenFailure::Finished(Error::NotThreadGroupLeader {
                 pid: id.pid(),
                 detail: OPEN_CONSEQUENCE.into(),
                 source: std::io::Error::from(errno),
+            })),
+            // A `poll` that failed with an errno is a failed call; `POLLERR` and `POLLNVAL` have none.
+            Err(e) => Err(match e.raw_os_error() {
+                Some(raw) => OpenFailure::call(FailedCall::poll(rustix::io::Errno::from_raw_os_error(raw))),
+                None => OpenFailure::Finished(Error::Io(crate::error::io_context("poll", e))),
             }),
-            Err(e) => Err(Error::Io(crate::error::io_context("poll", e))),
         },
         Proof::Lost => Ok(None),
-        Proof::Unknown(cause) => Err(open_error(
-            cause.errno().expect("a proof is unknown only for a failed pidfd call"),
-        )),
+        Proof::Unknown(cause) => Err(OpenFailure::Call(cause)),
     }
 }
 
-/// The error for a `pidfd_open` that failed with `errno` for a reason that says nothing about the
-/// target: a refusal is [`Error::Unsupported`], anything else [`Error::Io`].
-pub(crate) fn open_error(errno: rustix::io::Errno) -> Error {
-    match refusal_name(errno) {
-        Some(name) => pidfd_open_unsupported(OP_NAME, name),
-        None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
+/// The error for a pidfd call that failed for a reason that says nothing about the target: a
+/// refusal is [`Error::Unsupported`], anything else [`Error::Io`] prefixed with the call's name.
+pub(crate) fn open_error(call: FailedCall) -> Error {
+    match refusal_name(call.errno()) {
+        Some(name) => pidfd_open_unsupported(OP_NAME, call.name(), name),
+        None => Error::Io(crate::error::io_context(
+            call.name(),
+            std::io::Error::from(call.errno()),
+        )),
     }
 }
 
@@ -100,20 +151,18 @@ pub(crate) fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
+pub(crate) fn pidfd_open_unsupported(op: &str, call: &str, errno_name: &str) -> Error {
     Error::Unsupported {
         op: op.into(),
         platform: "linux",
-        detail: format!(
-            "cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: pidfd_open answered {errno_name}"
-        ),
+        detail: format!("cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: {call} answered {errno_name}"),
     }
 }
 
 /// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.
 pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
     match refusal_name(errno) {
-        Some(name) => pidfd_open_unsupported("spawn", name),
+        Some(name) => pidfd_open_unsupported("spawn", "pidfd_open", name),
         None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
     }
 }

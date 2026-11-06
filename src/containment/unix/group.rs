@@ -522,7 +522,7 @@ fn check_or_signal_linux_sigkill(
     root: &GroupRoot<'_>,
 ) -> Reached {
     use std::os::fd::AsFd as _;
-    match crate::os_process::linux::open::open_verified_with(kernel, id) {
+    match crate::os_process::linux::open::open_verified_error_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,

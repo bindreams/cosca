@@ -672,7 +672,7 @@ pub(crate) use backend::pid_stat;
 pub(crate) use backend::kernel::{HostKernel, Kernel};
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::prove::{prove, Proof};
+pub(crate) use backend::prove::{prove, FailedCall, Proof};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
@@ -713,7 +713,7 @@ pub(crate) struct UnknownCause {
     view: Option<ViewUnreadable>,
     /// The failed `pidfd_open`, `fstatfs` or `fstat` that left the read `Unknown`.
     #[cfg(target_os = "linux")]
-    errno: Option<rustix::io::Errno>,
+    call: Option<FailedCall>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -756,8 +756,8 @@ impl UnknownCause {
 
     /// The failed pidfd call, when one is why.
     #[cfg(target_os = "linux")]
-    pub(crate) fn errno(&self) -> Option<rustix::io::Errno> {
-        self.errno
+    pub(crate) fn call(&self) -> Option<FailedCall> {
+        self.call
     }
 
     /// The cause of a read through `/proc` that `view`, when it is `Some`, left `Unknown`.
@@ -765,17 +765,17 @@ impl UnknownCause {
     pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
         UnknownCause {
             view,
-            errno: None,
+            call: None,
             parent: None,
         }
     }
 
-    /// The cause of a read that a failed pidfd call (`errno`) left `Unknown`.
+    /// The cause of a read that a failed pidfd call left `Unknown`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn of_errno(errno: rustix::io::Errno) -> UnknownCause {
+    pub(crate) fn of_call(call: FailedCall) -> UnknownCause {
         UnknownCause {
             view: None,
-            errno: Some(errno),
+            call: Some(call),
             parent: None,
         }
     }
@@ -789,9 +789,9 @@ impl UnknownCause {
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
-            match (self.view, self.errno) {
+            match (self.view, self.call) {
                 (Some(why), _) => Some(backend::view_error(subject, why)),
-                (None, Some(errno)) => Some(backend::errno_error(subject, errno)),
+                (None, Some(call)) => Some(backend::call_error(subject, call)),
                 (None, None) => None,
             }
         }
