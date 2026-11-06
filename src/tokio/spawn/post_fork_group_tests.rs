@@ -149,8 +149,8 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
         fate,
         steps,
         member,
-        pid,
         group_warns,
+        ..
     } = failed;
     assert_eq!(fate, root.fate(), "{root:?}");
     assert_eq!(
@@ -173,12 +173,30 @@ fn below_6_9_sends_nothing_to_the_group(root: Root, container: Container) {
         1,
         "one warn says the members may be left running: {group_warns:?}"
     );
-    // A root its leaf did not take is answered for by the leaf's abandonment, in its own words.
-    let note = match container {
-        Container::LeafNotTaken => format!("could not kill an abandoned spawn's child's process group {pid}"),
-        Container::Session | Container::Leafless => left_running_note(),
-    };
-    assert!(group_warns[0].contains(&note), "{group_warns:?}");
+    assert!(group_warns[0].contains(&left_running_note()), "{group_warns:?}");
+}
+
+/// Below 6.9 the leaf's abandonment kills the group of a root its leaf did not take by the group's
+/// number, right after a check that the root is unreaped, which holds because the group goes first,
+/// before the root is torn down; the member dies. Mutants: "the root is torn down before the group is
+/// killed" (the check finds it reaped, the member lives on and one `warn` says so); "no check
+/// before the number".
+fn below_6_9_kills_the_group_of_a_root_its_leaf_did_not_take_by_its_number() {
+    let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let (mode, placement) = Container::LeafNotTaken.arm();
+    let failed = failed_spawn(Root::Running, mode, placement);
+    drop(old_kernel);
+    assert_eq!(failed.fate, ChildFate::Reaped);
+    assert_eq!(
+        failed.steps,
+        [
+            GroupStep::Group(Route::Pidfd, libc::SIGKILL),
+            GroupStep::Check,
+            GroupStep::Group(Route::Number, libc::SIGKILL)
+        ]
+    );
+    failed.member.assert_killed();
+    assert_eq!(failed.group_warns, Vec::<String>::new(), "the group was killed");
 }
 
 #[skuld::test]
@@ -297,45 +315,10 @@ async fn cgroup_a_tokio_spawn_failing_after_its_fork_kills_the_group_of_a_root_i
 }
 
 #[skuld::test]
-async fn cgroup_a_tokio_spawn_failing_after_its_fork_below_6_9_sends_nothing_to_the_group_of_a_root_its_leaf_did_not_take(
+async fn cgroup_a_tokio_spawn_failing_after_its_fork_below_6_9_kills_the_group_of_a_root_its_leaf_did_not_take_by_its_number(
     #[fixture(cgroup)] _cgroup: &Group,
 ) {
-    below_6_9_sends_nothing_to_the_group(Root::Running, Container::LeafNotTaken);
-}
-
-/// Makes the next intent go with no handle on its child: both its `pidfd_open` and its `/proc/self`
-/// open fail. Only the forked child takes the flags; the guard clears this thread's.
-struct NoHandle;
-
-impl NoHandle {
-    fn arm() -> NoHandle {
-        crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
-        crate::containment::cgroup::fault::set_force_child_proc_dir_failure(true);
-        NoHandle
-    }
-}
-
-impl Drop for NoHandle {
-    fn drop(&mut self) {
-        crate::containment::cgroup::fault::take_force_child_pidfd_failure();
-        crate::containment::cgroup::fault::take_force_child_proc_dir_failure();
-    }
-}
-
-/// A root its leaf did not take, whose intent carried no handle on it, still has its group killed
-/// by the leaf's abandonment, through the handshake's pidfd. Mutant: the leaf gets no pidfd for a
-/// child that is not a front, so it cannot name the child and kills nothing.
-#[skuld::test]
-async fn cgroup_a_tokio_spawn_failing_after_its_fork_kills_the_group_of_a_root_its_leaf_did_not_take_and_cannot_name(
-    #[fixture(cgroup)] _cgroup: &Group,
-    #[fixture(pidfd_group_signal)] _group: &Group,
-) {
-    let no_handle = NoHandle::arm();
-    let (mode, placement) = Container::LeafNotTaken.arm();
-    let failed = failed_spawn(Root::Running, mode, (placement, no_handle));
-    assert_eq!(failed.fate, ChildFate::Reaped);
-    failed.member.assert_killed();
-    assert_eq!(failed.group_warns, Vec::<String>::new(), "the group was killed");
+    below_6_9_kills_the_group_of_a_root_its_leaf_did_not_take_by_its_number();
 }
 
 /// A `sudo`/`doas`-style front is sent nothing: a kill of its group would orphan the elevated

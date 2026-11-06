@@ -1525,12 +1525,12 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }
 
-/// A front spawned for a cgroup leaf and dropped by tokio after its fork is the leaf's to answer
-/// for: the handshake stashes its pidfd for the leaf, signals and waits on nothing, and returns the
-/// error as it came, with no note of the front's fate. Mutants: "the arm tears the child down",
-/// "the arm notes the front", "the arm drops the pidfd".
+/// A child spawned for a cgroup leaf, a front or not, and dropped by tokio after its fork is the
+/// leaf's to answer for: the handshake stashes its pidfd for the leaf, signals and waits on nothing,
+/// and returns the error as it came, with no note of the child's fate. Mutants: "the arm tears the
+/// child down", "the arm notes the front", "the arm drops the pidfd".
 #[skuld::test]
-fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
+fn a_child_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
     use std::os::fd::AsRawFd as _;
 
     let (mut cat, pidfd) = cat_with_pidfd();
@@ -1562,34 +1562,6 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
     // reaped before this wait.
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
-}
-
-/// A child the leaf holds without a front is torn down by the handshake through the original pidfd,
-/// and the leaf gets a copy: the handshake's wait may have failed, so the copy's teardown may leave
-/// the child uncollected without a refused kill, whatever the peek of the original said.
-///
-/// Mutant: the copy carries the original's past (`Clean` after a successful peek).
-#[skuld::test]
-fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_may_fail_its_wait() {
-    let (mut cat, pidfd) = cat_with_pidfd();
-    let left: super::LeftPidfd = Rc::new(Cell::new(None));
-    let (_, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        super::LeftFront::LeafHeld(Rc::clone(&left)),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    assert_eq!(
-        fate,
-        ChildFate::Reaped,
-        "the handshake ended the child through the original"
-    );
-    let (_copy, past) = left.take().expect("the leaf holds a copy");
-    assert_eq!(past, crate::child::owned::teardown::Past::WaitMayFail);
-    drop(cat.stdin.take());
 }
 
 /// Only a child told to go can run the program, so every arm of `conclude` but one answers that it

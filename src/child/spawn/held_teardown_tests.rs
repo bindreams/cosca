@@ -3,8 +3,6 @@
 //! read from a cgroup.
 
 use std::io;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
@@ -51,7 +49,7 @@ fn killed_subtree() -> Subtree {
         None,
         Swept::default(),
         PlacedAtRemoval::default(),
-        Arc::new(AtomicBool::new(true)),
+        crate::containment::cgroup::test_support::kill_record(true),
     )
 }
 

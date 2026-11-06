@@ -10,21 +10,9 @@ use super::*;
 #[cfg(target_os = "linux")]
 pub(super) const REPORT_PLACED: i32 = -1;
 
-/// A message's length: its tag, its value, and — in an intent — the kind of handle it carries.
+/// A message's length: its tag and its value.
 #[cfg(target_os = "linux")]
-const MESSAGE_LEN: usize = 16;
-
-/// An intent's handle on its sender: none.
-#[cfg(target_os = "linux")]
-const HANDLE_NONE: u64 = 0;
-/// An intent's handle on its sender: a pidfd.
-#[cfg(target_os = "linux")]
-pub(super) const HANDLE_PIDFD: u64 = 1;
-/// An intent's handle on its sender: its `/proc/<pid>` directory, open — for when `pidfd_open` is
-/// denied. It names that process, not its number: once the process is reaped, nothing opens
-/// through it, whatever process the number names by then.
-#[cfg(target_os = "linux")]
-pub(super) const HANDLE_PROC_DIR: u64 = 2;
+const MESSAGE_LEN: usize = 8;
 
 /// The tag of a child's intent message; its value is the child's pid.
 #[cfg(target_os = "linux")]
@@ -37,9 +25,10 @@ const TAG_REPORT: i32 = 2;
 const PROCEED: u8 = b'P';
 
 /// The channel of the placement exchange (see the module's contract): a `SOCK_SEQPACKET` socket
-/// pair. The child sends two messages of two native-endian `i32`s — its *intent* (with its pid,
-/// and its pidfd as `SCM_RIGHTS` when it can open one), then its *report* (the write's errno or
-/// [`REPORT_PLACED`]). The parent may send one byte back: *proceed*.
+/// pair. The child sends two messages of two native-endian `i32`s — its *intent* (with its pid),
+/// then its *report* (the write's errno or [`REPORT_PLACED`]). The parent may send one byte back:
+/// *proceed*. The child names itself to the parent's teardown by pid alone: the spawn handshake's
+/// pidfd, which the parent holds before the child sends anything, is the handle.
 ///
 /// `pre_exec` runs after `fork`, where async-signal-safety forbids allocating, formatting or
 /// locking, and nothing the child computes survives its `exec`. A `sendmsg(2)` from a buffer on
@@ -96,10 +85,6 @@ pub(crate) struct Received {
     pub(crate) report: Option<PlacementReport>,
     /// Its pid, once its intent is sent: it reached cosca's hook and may enter the leaf.
     pub(crate) pid: Option<u32>,
-    /// The pidfd its intent carried, when it could open one.
-    pub(crate) pidfd: Option<OwnedFd>,
-    /// Its `/proc/<pid>` directory, open, when it had no pidfd to send.
-    pub(crate) proc_dir: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -195,22 +180,13 @@ impl ReportChannel {
     /// Read every message queued, without blocking, into what was received. `true` once the
     /// channel can deliver no more: shut for reading, or every copy of the child's end closed.
     fn drain(&mut self) -> bool {
-        use std::mem::MaybeUninit;
-
-        use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+        use rustix::net::{recv, RecvFlags};
 
         loop {
             let mut message = [0u8; MESSAGE_LEN];
-            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-            let mut control = RecvAncillaryBuffer::new(&mut space);
-            let received = recvmsg(
-                &self.read,
-                &mut [std::io::IoSliceMut::new(&mut message)],
-                &mut control,
-                RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
-            );
-            let bytes = match received {
-                Ok(received) => received.bytes,
+            let bytes = match recv(&self.read, &mut message, RecvFlags::DONTWAIT) {
+                // Read, and the message's full length: whole or not at all on a `SEQPACKET` socket.
+                Ok((bytes, _)) => bytes,
                 // `ENOMEM` is the kernel's transient shortage, not an answer.
                 Err(rustix::io::Errno::INTR | rustix::io::Errno::NOMEM) => continue,
                 Err(rustix::io::Errno::AGAIN) => return false,
@@ -219,27 +195,11 @@ impl ReportChannel {
             if bytes == 0 {
                 return true;
             }
-            debug_assert_eq!(bytes, message.len(), "a message is two i32s and a u64");
+            debug_assert_eq!(bytes, message.len(), "a message is two i32s");
             let tag = i32::from_ne_bytes(message[..4].try_into().expect("four bytes"));
-            let value = i32::from_ne_bytes(message[4..8].try_into().expect("four bytes"));
-            let handle = u64::from_ne_bytes(message[8..].try_into().expect("eight bytes"));
-            let mut pidfd = None;
-            for ancillary in control.drain() {
-                if let RecvAncillaryMessage::ScmRights(fds) = ancillary {
-                    for fd in fds {
-                        pidfd.get_or_insert(fd);
-                    }
-                }
-            }
+            let value = i32::from_ne_bytes(message[4..].try_into().expect("four bytes"));
             match tag {
-                TAG_INTENT => {
-                    self.received.pid = u32::try_from(value).ok();
-                    match handle {
-                        HANDLE_PIDFD => self.received.pidfd = pidfd,
-                        HANDLE_PROC_DIR => self.received.proc_dir = pidfd,
-                        _ => {}
-                    }
-                }
+                TAG_INTENT => self.received.pid = u32::try_from(value).ok(),
                 TAG_REPORT => {
                     self.received.report.get_or_insert(match value {
                         REPORT_PLACED => PlacementReport::Placed,
@@ -322,57 +282,21 @@ pub(crate) struct ReportSlot {
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// Send the intent: this process's pid, and a handle on this process — a pidfd, or, when
-    /// `pidfd_open` is denied, its `/proc/self` directory.
+    /// Send the intent: this process's pid.
     ///
     /// # Safety
     /// As [`ReportSlot::send`].
     pub(super) unsafe fn send_intent(self) -> io::Result<Delivery> {
         // A raw syscall, so async-signal-safe.
         let pid = rustix::process::getpid();
-        #[cfg(test)]
-        let (pidfd_denied, proc_denied) = (
-            fault::take_force_child_pidfd_failure(),
-            fault::take_force_child_proc_dir_failure(),
-        );
-        #[cfg(not(test))]
-        let (pidfd_denied, proc_denied) = (false, false);
-        let pidfd = if pidfd_denied {
-            -1
-        } else {
-            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-                .map_or(-1, std::os::fd::IntoRawFd::into_raw_fd)
-        };
-        let (handle, kind) = if pidfd >= 0 {
-            (pidfd, HANDLE_PIDFD)
-        } else {
-            // Safety: a NUL-terminated path; the result is checked.
-            let dir = if proc_denied {
-                -1
-            } else {
-                unsafe {
-                    libc::open(
-                        c"/proc/self".as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    )
-                }
-            };
-            (dir, if dir >= 0 { HANDLE_PROC_DIR } else { HANDLE_NONE })
-        };
-        // Safety: the caller's guarantee; `handle` is this process's own or -1.
-        let sent = unsafe { self.send(TAG_INTENT, pid.as_raw_nonzero().get(), kind, handle) };
-        if handle >= 0 {
-            // Safety: the descriptor opened above, closed once.
-            unsafe { libc::close(handle) };
-        }
-        sent
+        // Safety: the caller's guarantee.
+        unsafe { self.send(TAG_INTENT, pid.as_raw_nonzero().get()) }
     }
 
     /// Close this child's inherited copy of the parent's end, before anything else in the hook.
     ///
     /// Until `exec` the child holds that copy, so the parent's own close would not end the
-    /// socket, and a decided parent's close would never reach the child as `EPIPE`. It also
-    /// frees a descriptor for the `pidfd_open` that follows, in a table that may be full.
+    /// socket, and a decided parent's close would never reach the child as `EPIPE`.
     ///
     /// # Safety
     /// Only in a forked child, where `parent_fd` is its own inherited copy — never in the parent,
@@ -388,11 +312,11 @@ impl ReportSlot {
     /// As [`ReportSlot::send`].
     pub(super) unsafe fn send_report(self, value: i32) -> io::Result<Delivery> {
         // Safety: the caller's guarantee.
-        unsafe { self.send(TAG_REPORT, value, 0, -1) }
+        unsafe { self.send(TAG_REPORT, value) }
     }
 
-    /// Send one message, with `pidfd` attached as `SCM_RIGHTS` unless it is -1. Async-signal-safe:
-    /// one `sendmsg(2)` from buffers on the stack, then at most one `recv(2)`.
+    /// Send one message. Async-signal-safe: one `send(2)` from a buffer on the stack, then at most
+    /// one `recv(2)`.
     ///
     /// `EPIPE` (or `ECONNRESET`) means the parent has ended the exchange (see the module's
     /// contract): *proceed* queued means it decided, and this child carries on; none means it
@@ -401,46 +325,13 @@ impl ReportSlot {
     /// # Safety
     /// The child's end must still be open at this number, which holds from the leaf's creation
     /// until the parent has taken the verdict.
-    pub(super) unsafe fn send(self, tag: i32, value: i32, handle: u64, pidfd: RawFd) -> io::Result<Delivery> {
-        #[repr(C, align(8))]
-        struct Control([u8; 64]);
-
+    pub(super) unsafe fn send(self, tag: i32, value: i32) -> io::Result<Delivery> {
         let mut message = [0u8; MESSAGE_LEN];
         message[..4].copy_from_slice(&tag.to_ne_bytes());
-        message[4..8].copy_from_slice(&value.to_ne_bytes());
-        message[8..].copy_from_slice(&handle.to_ne_bytes());
-        let mut iov = libc::iovec {
-            iov_base: message.as_mut_ptr().cast(),
-            iov_len: message.len(),
-        };
-        let mut control = Control([0; 64]);
-        // Safety: plain data; zeroed is a valid empty header.
-        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-        header.msg_iov = &mut iov;
-        header.msg_iovlen = 1;
-        if pidfd >= 0 {
-            let fd_len = std::mem::size_of::<RawFd>() as libc::c_uint;
-            header.msg_control = control.0.as_mut_ptr().cast();
-            // Safety: arithmetic on a length.
-            let space = unsafe { libc::CMSG_SPACE(fd_len) } as usize;
-            debug_assert!(
-                space <= control.0.len(),
-                "one descriptor's control message fits `control`, needs {space}"
-            );
-            header.msg_controllen = space as _;
-            // Safety: `control` is aligned and large enough for one descriptor's header and data.
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(&header);
-                debug_assert!(!cmsg.is_null(), "`msg_controllen` leaves room for one header");
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), pidfd);
-            }
-        }
+        message[4..].copy_from_slice(&value.to_ne_bytes());
         loop {
-            // Safety: every pointer in `header` is to this frame; the caller guarantees the fd.
-            let sent = unsafe { libc::sendmsg(self.fd, &header, libc::MSG_NOSIGNAL) };
+            // Safety: `message` is a buffer on this frame; the caller guarantees the fd.
+            let sent = unsafe { libc::send(self.fd, message.as_ptr().cast(), message.len(), libc::MSG_NOSIGNAL) };
             if sent == message.len() as isize {
                 return Ok(Delivery::Queued);
             }
