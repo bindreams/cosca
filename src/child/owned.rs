@@ -13,8 +13,9 @@
 //!
 //! `N` (nobody is waiting), `W { token }` (one thread, the *holder*, runs the wait loop) and
 //! `E(record)` (the exit record is cached, the child is reaped). Only the holder looks with
-//! `try_reap` and waits on what the look returned, with the lock released; every other waiter blocks
-//! on the [`Condvar`] and re-dispatches on each wake. While `W` is held, only the holder reaps.
+//! `try_reap` and waits on what the look returned, or pauses for a recheck, with the lock released
+//! for both; every other waiter blocks on the [`Condvar`] and re-dispatches on each wake. While `W`
+//! is held, only the holder reaps.
 //!
 //! - Every lock is taken poison-tolerantly (`lock().unwrap_or_else(PoisonError::into_inner)`),
 //!   `Condvar` results included. `Debug` alone uses `try_lock`.

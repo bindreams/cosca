@@ -618,10 +618,6 @@ impl crate::os_process::drive::Waitable for PidfdExit<'_> {
         }
     }
 
-    fn pause(&mut self, d: Duration) {
-        std::thread::sleep(d);
-    }
-
     fn block_failed(&mut self, e: crate::error::Error) -> Result<(), crate::error::Error> {
         self.note_poll_failed(&e);
         Ok(())
