@@ -52,15 +52,13 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
                 let held = std::rc::Rc::clone(&held);
                 move || drop(held.take())
             };
-            let (_after_leaf_kill, _before_exit_wait, _between_kill_and_wait);
+            let (_after_leaf_kill, _between_kill_and_wait);
             let blocker = if front {
                 _after_leaf_kill = Some(leaf_fault::set_after_kill_write(release()));
-                _before_exit_wait = Some(leaf_fault::set_before_exit_wait(release()));
                 _between_kill_and_wait = Some(fault::set_between_kill_and_wait(release()));
                 None
             } else {
                 _after_leaf_kill = None;
-                _before_exit_wait = None;
                 _between_kill_and_wait = None;
                 Some(fault::release_between_kill_and_wait(held.take()))
             };
@@ -185,9 +183,10 @@ fn a_spawn_failing_after_its_fork_warns_once_past_1s(#[fixture(tracer_group)] _g
 }
 
 /// As above, for an elevation front in a cgroup leaf: the handshake leaves the front to its leaf,
-/// whose abandonment kills through the leaf and waits for the front's exit (`end_front`).
+/// whose abandonment kills through the leaf and waits for the front's exit
+/// (`OwnedChild::look_at_front`).
 ///
-/// Mutants: `end_front` waits with no warn; the abandonment hands it no threshold.
+/// Mutants: the look's wait has no warn; the abandonment hands it no threshold.
 #[skuld::test]
 fn a_front_whose_spawn_failed_after_its_fork_warns_once_past_1s(
     #[fixture(tracer_group)] _tracer: &Group,

@@ -81,15 +81,18 @@ In order:
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
      identity, `kill_and_reap_*` and `unique_report` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
-     through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`) and the cgroup
-     leaf's abandonment (`leaf.rs`); the `exit_only::seams` their tests use. `OwnedChild::tear_down`
+     through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`); the
+     `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, and `Child::drop` uses it. On Linux it also ends every
      sync spawn failure (the handshake's `conclude`, and the identity and attach arms,
      `held_teardown.rs`) and, in the async spawn, the failures of a child the handshake holds by
      pidfd (`conclude`'s `(Err, Opened)` and unexecuted arms), an elevation front at the identity
      and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
-     (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of a child it cannot
-     name. The sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
+     (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of every child it is
+     left (`CgroupLeaf::abandon_before_verdict`: the group a child that exec'd outside the leaf
+     leads, through `OwnedChild::hold`, then the leaf killed through, then `tear_down` with the
+     leaf's kill as its `Kill` tree, or `look_at_front` for a front, then the leaf removed). The
+     sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
      ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`), in
      the async raw spawn too; a refused kill comes back in the sync spawn's failure as an
      `Unreaped`, and the async raw spawn leaves the child, warned. Both spawns build their
@@ -109,13 +112,10 @@ In order:
      (`OsChild::kill_refusal`: a pidfd is refused for permission alone, a `CreateProcess` handle
      never, a UAC handle by the access it was granted), and the two make the `Expect` that
      `warn_teardown`, which logs the teardown's warn, asserts (the Windows spawns' teardown,
-     `held_teardown::tear_down_failed_spawn`, is told the same, and logs through it too); a front
-     left to the leaf (`ToLeaf`) hands the leaf its original pidfd with the `Past`, and a child the
-     leaf holds (`LeafHeld`) hands it a copy, with `Past::WaitMayFail` since the handshake tears down
-     through the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to
-     where it is logged.
-     Apart from these,
-     only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
+     `held_teardown::tear_down_failed_spawn`, is told the same, and logs through it too); a child
+     spawned for a leaf (`ToLeaf`), front or not, hands the leaf its pidfd with the `Past`, and the
+     leaf is its one owner; the leaf's abandonment carries the `Expect` with the clause (`Left`) to
+     where it is logged. No spawn starts a background reaping thread.
      `Settlement` is the one
      classification of what a wait or look answered (the fate, and a clause for every answer: a
      child left uncollected has only a warn, so no clause of one can be built at another level);
