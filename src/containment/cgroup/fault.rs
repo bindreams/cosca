@@ -178,9 +178,9 @@ pub(crate) fn pump_starts_fail() -> bool {
     FAIL_PUMP_STARTS.with(Cell::get)
 }
 
-/// The next `cgroup.kill` write on this thread fails with `EIO` and kills nothing; the writes after
-/// it succeed. A teardown whose one write fails, with a second write that would work: a test of
-/// "a failed write is final" sees that second write as a recorded kill.
+/// The next `cgroup.kill` write on this thread fails with `EIO` and writes nothing; every write
+/// after it goes through. A test that a failed write is final sees a later write as a `kill` in
+/// the file.
 pub(crate) fn fail_next_kill_write() -> FailNextKillWrite {
     FAIL_NEXT_KILL_WRITE.with(|f| f.set(true));
     FailNextKillWrite(())

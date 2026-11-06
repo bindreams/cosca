@@ -525,9 +525,10 @@ impl Command {
     /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
     /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
     /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
-    /// and so does the drop, which waits for that child's whole life. Neither raises an event
-    /// cosca could re-kill on: `populated` does not change, and a fork writes no file. cosca does
-    /// not probe for the fix.
+    /// and so does the drop, which waits for that child's whole life and warns once past 1 s.
+    /// The same holds for a process that migrated into the leaf after a landed kill. Neither raises
+    /// an event cosca could re-kill on: `populated` does not change, and a fork writes no file.
+    /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown.
     ///
     /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
     /// [`Child`](crate::Child) does so as sync Rust normally does. The async

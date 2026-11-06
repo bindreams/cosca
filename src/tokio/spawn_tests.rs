@@ -907,8 +907,7 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
 /// on `cgroup.kill`'s raw bytes.
 ///
 /// The `detach` below disarms the leaf, but this handle has killed it, so `child`'s `Drop`
-/// releases it like an armed one and re-fires `hard_kill` on the dropping thread. That write has
-/// finished by the time `finish_elevated` returns.
+/// releases it like an armed one, with no second write.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
@@ -940,8 +939,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
         ),
         "got {err:?}"
     );
-    // The failure path's own kill comes first; the `Drop` that follows re-fires it after its
-    // `rmdir`.
+    // The failure path's own kill comes first.
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     assert_eq!(
         steps.first().map(String::as_str),

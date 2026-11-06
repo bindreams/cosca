@@ -121,16 +121,16 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// `finish_elevated`.
 ///
 /// A root the cleanup did not show collected ([`TeardownOutcome::uncollected`]) is handed back in
-/// the error (an `Unreaped`) and the handle is disarmed. The drop, whose tree kill a failed one
-/// leaves to be made, does not run for it, so the cleanup makes that kill itself, early, and the
-/// warn and the error say how it went (a skipped kill is not one that worked). The handle is also
-/// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
-/// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
-/// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
-/// says so, and the handle is disarmed. A retry that itself ends unvouched is reported the same way,
-/// after the first failure. Only a failed tree kill with a root not handed back leaves
-/// the handle armed, so its drop makes its own tree kill; that drop does not warn of the event a
-/// second time.
+/// the error (an `Unreaped`) and the handle is disarmed, so its drop, which would make a tree kill
+/// the cleanup's failed one left undone, does not run. After a failed tree kill the cleanup makes
+/// that drop's tree kill itself, early, and the warn and the error say how it went (a skipped kill
+/// is not one that worked). The handle is also disarmed once the tree is settled: killed, not for
+/// the cleanup to kill, or deliberately left alone (a reaped or unpinned root). A tree that could
+/// not be vouched for (a walk saw the root running, and its end came after) is no failed kill: no
+/// tree kill is made early for it, the cleanup's one report says so, and the handle is disarmed. An
+/// early tree kill that itself ends unvouched is reported the same way, after the first failure.
+/// Only a failed tree kill with a root not handed back leaves the handle armed; its drop then makes
+/// its tree kill and does not warn of the event a second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     use crate::containment::dispatch::{SettleOutcome, TreeKillOutcome};
@@ -269,26 +269,32 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A handed-back root takes the drop, which makes the tree kill, with it: that kill is made here,
     // early. The one warn and the error's note say how it went.
     if hands_back && !tree_settled {
-        let retry = kill_tree();
-        // What the retry adds to the first attempt's report, and the outcome that report is built from.
-        let more = match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
+        let early = kill_tree();
+        // What the early tree kill adds to the first attempt's report, and the outcome that report is
+        // built from.
+        let more = match child.attached.settle(&child.tree_killed, early, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {
                     format!(
-                        "tree teardown after a failed password write took a retry ({subject}): the first attempt \
-                         failed: {first}"
+                        "tree teardown after a failed password write needed the drop's tree kill, made early \
+                         ({subject}): the cleanup's kill failed: {first}"
                     )
                 });
                 None
             }
-            // The retry is the cleanup's last word on the tree: unvouched, it is reported as such.
-            Ok(outcome @ SettleOutcome::Unvouched { kind }) => {
-                Some((format!("; on the retry, {}", kind.unvouched_text()), Ok(outcome)))
-            }
-            Err(again) => Some((format!("; the retry failed too ({again})"), Err(again))),
+            // The early tree kill is the cleanup's last word on the tree: unvouched, it is reported
+            // as such.
+            Ok(outcome @ SettleOutcome::Unvouched { kind }) => Some((
+                format!("; on the drop's tree kill, made early, {}", kind.unvouched_text()),
+                Ok(outcome),
+            )),
+            Err(again) => Some((
+                format!("; the drop's tree kill, made early, failed too ({again})"),
+                Err(again),
+            )),
         };
         if let Some((added, again)) = more {
             tree_note.push_str(&added);
@@ -307,7 +313,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     if hands_back || tree_settled {
         child.kill_on_drop = false;
     }
-    // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
+    // The drop, armed or not, need not warn of what the cleanup warned of again.
     child.reported = warned;
     let unreaped = hands_back.then(|| child.into_unreaped());
     Err(SpawnFailure::started(
