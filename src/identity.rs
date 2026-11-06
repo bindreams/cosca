@@ -855,6 +855,19 @@ impl ProcessId {
         }
     }
 
+    /// [`of_with`](Self::of_with) for the child `pid` that the caller holds the pidfd `held` of: the
+    /// key is read from `held` and the pid is not opened again. Before Linux 6.9, where `held` has
+    /// no inode of its own, it is the `/proc` read by `pid`. The caller checks through `held` that
+    /// `pid` still names the child.
+    pub(crate) fn of_held_with(
+        kernel: &dyn Kernel,
+        pid: RawPid,
+        held: std::os::fd::BorrowedFd<'_>,
+    ) -> (Resolved<ProcessId>, UnknownCause) {
+        let (read, cause) = backend::of_held(kernel, pid, held);
+        (read.map(|key| ProcessId { pid, key }), cause)
+    }
+
     /// [`of_with`](Self::of_with), and the process's own `stat` record (its `ppid`, `pgrp`, ...),
     /// read so that it belongs to the identity returned: a `stat` of a later holder of the pid is
     /// never paired with this id.
