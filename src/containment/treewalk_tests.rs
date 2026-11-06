@@ -626,7 +626,7 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
         child.id(),
     )
     .expect("the owned handle always yields an identity");
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let outcome = super::kill_by_identity(id);
     // The seam sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");

@@ -5,13 +5,13 @@ use super::{refused_kill_answer, refused_kill_warning, Forgetting, Refused};
 use crate::child::owned::owned_tests::teardown_lines;
 use crate::child::owned::owned_tests::teardown_lines::PID;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, Expect, Kill, PidfdTeardown, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, TeardownOutcome};
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
-use crate::os_process::child::ExitRecord;
+use crate::os_process::child::{ExitRecord, KillRefusal};
 #[cfg(target_os = "linux")]
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 #[cfg(target_os = "linux")]
@@ -39,7 +39,13 @@ fn second_teardown(kill: Result<Sent, std::io::Error>, reap: ReapAnswer, id: Opt
 #[cfg(target_os = "linux")]
 fn torn_down(outcome: TeardownOutcome) -> Refused {
     Refused::TornDown(TornDown {
-        torn: PidfdTeardown::new(outcome, Expect::Waited),
+        torn: HandleTeardown::new(
+            outcome,
+            Expect {
+                refusal: KillRefusal::Permission,
+                past: Past::Clean,
+            },
+        ),
         leak: Some("a pidfd"),
         why: None,
     })

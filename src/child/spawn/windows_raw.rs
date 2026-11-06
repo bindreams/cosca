@@ -86,19 +86,17 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-use crate::child::lifecycle::Settlement;
-use crate::child::owned::teardown::{Disposition, TeardownOutcome};
+use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
+use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
     Diagnosis, ParentStd, PipeOwnership, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
-use crate::error::{win32_io_error, ChildFate, Error};
-use crate::os_process::child_named;
+use crate::error::{win32_io_error, Error};
 use crate::os_process::windows::WindowsProcess;
-use crate::signal::Sig;
 use crate::stdio::{Fd, ResolvedStdio};
 
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
@@ -216,39 +214,49 @@ pub(crate) fn spawn_raw(
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
     };
-    let raw_handle = proc.as_raw_handle();
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
+    let raw_handle = owned.os_handle().as_raw_handle();
     let (resolved, cause, _) = resolve_identity(
         &crate::identity::HostKernel,
         pid,
-        &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
+        &crate::wait::exit_only::Target::Handle(owned.os_handle()),
     );
     let id = match resolved {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            // The read failed, so no identity is known.
-            let fate = raw_spawn_teardown(proc, pid, None, None);
+            // The read failed, so no identity is known. A child the teardown could not end comes back
+            // in the failure.
+            let (fate, unreaped) = tear_down_failed_spawn(
+                owned,
+                None,
+                Past::Clean,
+                Disposition::HandBack,
+                None,
+                &mut Diagnosis::default(),
+            );
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
-                None,
+                unreaped,
             ));
         }
     };
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = raw_spawn_teardown(proc, pid, Some(id), None);
-            return Err(SpawnFailure::started(e, fate, None));
+            let (fate, unreaped) = tear_down_failed_spawn(
+                owned,
+                Some(id),
+                Past::Clean,
+                Disposition::HandBack,
+                None,
+                &mut Diagnosis::default(),
+            );
+            return Err(SpawnFailure::started(e, fate, unreaped));
         }
     };
 
-    Ok(Child::from_parts(
-        OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
-        id,
-        parent_ends,
-        kill_on_drop,
-        attachment,
-    ))
+    Ok(Child::from_parts(owned, id, parent_ends, kill_on_drop, attachment))
 }
 
 /// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`
@@ -484,62 +492,6 @@ pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
         ))
     })?;
     Ok(to_wide_nul(image.as_os_str()))
-}
-
-/// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn
-/// never leaks a running/zombie process (mirrors the std path's teardown). `pub(crate)`: the async
-/// raw backend shares the identical error-teardown.
-///
-/// `warn_after`: with it, the wait for the killed child warns once it passes that long, and goes on
-/// ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
-pub(crate) fn raw_spawn_teardown(
-    proc: OwnedHandle,
-    pid: u32,
-    id: Option<crate::identity::ProcessId>,
-    warn_after: Option<std::time::Duration>,
-) -> ChildFate {
-    teardown_spawned(
-        &OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
-        pid,
-        id,
-        warn_after,
-    )
-}
-
-/// [`raw_spawn_teardown`] of the spawned `child`: one kill, which never waits, and then the one
-/// wait.
-fn teardown_spawned(
-    child: &OwnedChild,
-    pid: u32,
-    id: Option<crate::identity::ProcessId>,
-    warn_after: Option<std::time::Duration>,
-) -> ChildFate {
-    // A failed kill asked nothing to exit, so the wait would park forever: log and leak instead.
-    if let Err(refused) = child.signal(Sig::Kill) {
-        let looked = child.look_after_refused_kill(id, refused, Disposition::Leave);
-        return looked.say_as_failed_spawn(&mut Diagnosis::default()).fate;
-    }
-    // A fixture only that kill would end is released here.
-    #[cfg(test)]
-    crate::child::spawn::fault::run_between_kill_and_wait();
-    let waited = crate::wait::teardown_warn::wait_warning(
-        child,
-        crate::wait::teardown_warn::Due::in_(warn_after),
-        |child, until| crate::wait::teardown_warn::handle_signaled_by(HANDLE(child.os_handle().as_raw_handle()), until),
-        |after| crate::child::spawn::warn_still_waiting(Some(pid), after),
-        |child| child.wait(None),
-    );
-    // The kill was delivered, or the child's exit was already under way: either way it is dead or
-    // dying.
-    let settlement = Settlement::new(waited, true);
-    #[cfg(test)]
-    if let Some(status) = settlement.status() {
-        crate::child::spawn::fault::record_teardown_reap(pid, status);
-    }
-    let subject = format!("teardown of {}", child_named(Some(pid)));
-    TeardownOutcome::of_settlement(&settlement, id, &subject, None, Disposition::Leave)
-        .say_as_failed_spawn(&mut Diagnosis::default())
-        .fate
 }
 
 /// The `STARTUPINFOEXW` for a raw spawn, with what it points at.

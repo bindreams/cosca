@@ -219,7 +219,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
-use windows::Win32::System::Threading::GetProcessId;
+use windows::Win32::System::Threading::{GetProcessId, PROCESS_ACCESS_RIGHTS};
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
@@ -292,12 +292,13 @@ fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
     Ok(s.encode_wide().chain(std::iter::once(0)).collect())
 }
 
-/// The outcome of a runas launch. `Launched` carries the owned handle, pid, stable
-/// identity, and the report — the async path builds its own `Child` from these.
+/// The outcome of a runas launch. `Launched` carries the owned handle, the access it was granted,
+/// pid, stable identity, and the report — the async path builds its own `Child` from these.
 pub(crate) enum RunasOutcome {
     AlreadyElevated,
     Launched {
         proc: OwnedHandle,
+        granted: PROCESS_ACCESS_RIGHTS,
         pid: u32,
         id: ProcessId,
         report: ElevationReport,
@@ -562,6 +563,8 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
 
     // Identity from the OWNED handle — no second OpenProcess.
     let handle = HANDLE(proc.as_raw_handle());
+    // The one read of what the handle was granted: the kill below and the child it becomes take it.
+    let granted = crate::os_process::windows::uac_access(handle);
     // SAFETY: `handle` is our live, owned process handle.
     let pid = match unsafe { GetProcessId(handle) } {
         0 => Err(windows::core::Error::from_thread()),
@@ -574,7 +577,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let Some((pid, id)) = tracked else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle));
+        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle, granted));
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
@@ -590,7 +593,13 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         stripped_env: Vec::new(),
         stdio: ElevatedStdio::OwnConsole,
     };
-    Ok(RunasOutcome::Launched { proc, pid, id, report })
+    Ok(RunasOutcome::Launched {
+        proc,
+        granted,
+        pid,
+        id,
+        report,
+    })
 }
 
 pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, SpawnFailure> {
@@ -602,9 +611,15 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
             )));
             Ok(child)
         }
-        RunasOutcome::Launched { proc, pid, id, report } => {
+        RunasOutcome::Launched {
+            proc,
+            granted,
+            pid,
+            id,
+            report,
+        } => {
             let mut child = crate::child::Child::from_parts(
-                OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
+                OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

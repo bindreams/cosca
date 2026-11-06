@@ -5,23 +5,22 @@
 //! whose hook takes an argument and answers with a value uses [`arm_with`]/[`fire_with`].
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::thread::LocalKey;
 
-/// One armed hook, tagged with the generation that armed it.
-type Slot<A, R> = Option<(u64, Box<dyn FnOnce(A) -> R>)>;
+/// One armed hook and the flag its guard reads: the flag also names the guard.
+type Slot<A, R> = Option<(Rc<Cell<bool>>, Box<dyn FnOnce(A) -> R>)>;
 
 /// The slot behind one seam, whose hook is given an `A` and answers an `R`. `const`-constructible,
 /// for `thread_local!`.
 pub(crate) struct OneShotHook<A = (), R = ()> {
     slot: RefCell<Slot<A, R>>,
-    generation: Cell<u64>,
 }
 
 impl<A, R> OneShotHook<A, R> {
     pub(crate) const fn new() -> Self {
         Self {
             slot: RefCell::new(None),
-            generation: Cell::new(0),
         }
     }
 }
@@ -38,14 +37,12 @@ pub(crate) fn arm_with<A: 'static, R: 'static>(
     key: &'static LocalKey<OneShotHook<A, R>>,
     hook: impl FnOnce(A) -> R + 'static,
 ) -> Armed<A, R> {
-    let generation = key.with(|h| {
-        let generation = h.generation.get() + 1;
-        h.generation.set(generation);
-        let previous = h.slot.borrow_mut().replace((generation, Box::new(hook)));
+    let fired = Rc::new(Cell::new(false));
+    key.with(|h| {
+        let previous = h.slot.borrow_mut().replace((Rc::clone(&fired), Box::new(hook)));
         debug_assert!(previous.is_none(), "a one-shot hook is already armed");
-        generation
     });
-    Armed { key, generation }
+    Armed { key, fired }
 }
 
 /// Run and disarm `key`'s hook. Does nothing when it has already fired or was never armed.
@@ -56,14 +53,29 @@ pub(crate) fn fire(key: &'static LocalKey<OneShotHook>) {
 /// [`fire`] for a hook given `arg`: its answer, or `None` when there was no hook to run.
 pub(crate) fn fire_with<A: 'static, R: 'static>(key: &'static LocalKey<OneShotHook<A, R>>, arg: A) -> Option<R> {
     let taken = key.with(|h| h.slot.borrow_mut().take());
-    taken.map(|(_, hook)| hook(arg))
+    taken.map(|(fired, hook)| {
+        fired.set(true);
+        hook(arg)
+    })
 }
 
 /// Clears the hook it armed, and only that one: a hook armed after this guard's fired stays.
 #[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
 pub(crate) struct Armed<A: 'static = (), R: 'static = ()> {
     key: &'static LocalKey<OneShotHook<A, R>>,
-    generation: u64,
+    /// Set by the fire of this guard's hook, and by nothing else.
+    fired: Rc<Cell<bool>>,
+}
+
+impl<A: 'static, R: 'static> Armed<A, R> {
+    /// Panics unless the hook this guard armed has fired.
+    #[track_caller]
+    pub(crate) fn assert_fired(&self) {
+        assert!(
+            self.fired.get(),
+            "the armed one-shot hook never fired: its fire point was not reached"
+        );
+    }
 }
 
 impl<A: 'static, R: 'static> Drop for Armed<A, R> {
@@ -71,7 +83,7 @@ impl<A: 'static, R: 'static> Drop for Armed<A, R> {
         let mine = self.key.with(|h| {
             let mut slot = h.slot.borrow_mut();
             match &*slot {
-                Some((generation, _)) if *generation == self.generation => slot.take(),
+                Some((fired, _)) if Rc::ptr_eq(fired, &self.fired) => slot.take(),
                 _ => None,
             }
         });
