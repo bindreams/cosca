@@ -2513,7 +2513,7 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
     let slot = leaf.placement_slot();
     // Blocked on a piped stdin the test holds: only a real kill ends it, and a skipped one hangs
-    // the test, which the runner's bound fails.
+    // the test.
     let mut cmd = std::process::Command::new("/bin/cat");
     cmd.stdin(std::process::Stdio::piped()).process_group(0);
     // SAFETY: the closure runs between fork and exec; /dev/null stands in for cgroup.procs.
@@ -2914,9 +2914,9 @@ fn abandoning_a_named_child_with_no_handle_is_a_breach() {
 /// forked after `exec` is in that group, outside the leaf, so only the group kill can end the
 /// descendant, which holds the child's stdout: reading it to EOF proves both dead. The descendant
 /// is a `cat` blocked on a stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
-/// real signal. The shell is parked in its own `wait`, so with the kill of its group skipped the
-/// abandonment's wait for it would never return, which the runner's bound fails. A byte written
-/// after the abandonment returns is not echoed if the group kill reached the `cat`.
+/// real signal. The shell is ended by its own pidfd kill either way, so only the group kill ends
+/// the `cat`: a byte written after the abandonment returns is not echoed if the group kill reached
+/// it.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
@@ -2933,7 +2933,6 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
         std::process::Stdio::piped(),
         std::process::Stdio::piped(),
     );
-    // Moved into the hook below; see this function's doc.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();

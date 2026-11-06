@@ -796,7 +796,7 @@ fn the_drops_tree_kill_is_made_early_when_a_failed_one_precedes_a_handed_back_ro
 }
 
 /// The drop's tree kill, made early, that killed the tree is not reported as a failed teardown: the
-/// one warn says the early kill was needed and names the first failure, and the error no longer says
+/// one warn says the early kill was needed and names the first failure, and the error does not say
 /// the tree was not killed.
 ///
 /// Mutant: the warn keeps the first failure's text, or the error keeps its note.

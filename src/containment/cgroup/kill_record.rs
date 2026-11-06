@@ -44,7 +44,7 @@ impl KillRecord {
         matches!(*self.written(), Written::Landed)
     }
 
-    /// What the writes answered, `None` if none was made: a teardown that finds one makes no other.
+    /// What the writes answered, `None` if none was made.
     pub(crate) fn answer(&self) -> Option<KillAnswer> {
         match &*self.written() {
             Written::Never => None,

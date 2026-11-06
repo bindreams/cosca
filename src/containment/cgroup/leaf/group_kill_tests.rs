@@ -321,7 +321,7 @@ fn a_refused_group_kill_of_an_ended_child_is_the_events_one_warn() {
 }
 
 /// A child that exec'd outside its leaf has its group killed before it is torn down: the group goes
-/// by its number (here, as before Linux 6.9) and needs the child unreaped, which its teardown ends.
+/// by its number (here, as on kernels refusing the pidfd group flag) and needs the child unreaped, which its teardown ends.
 /// A child that entered its leaf, or reported nothing, never exec'd outside it, and its group is
 /// left.
 ///

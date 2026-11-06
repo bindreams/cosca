@@ -274,7 +274,7 @@ async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped
     assert!(warns[0].1.contains("could not be terminated"), "{warns:?}");
     assert!(warns[0].1.contains("leaving it running"), "{warns:?}");
     assert!(!warns[0].1.contains("torn down"), "{warns:?}");
-    // The helper exits once its stdin closes; the test, not a thread, reaps it.
+    // The helper exits once its stdin closes; the test reaps it.
     drop(writer);
     let status = reap(id.pid()).expect("the child is still unreaped");
     assert!(status.success(), "{status:?}");
@@ -635,7 +635,7 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
 
 /// A post-fork tokio failure ends its child whether or not it entered its leaf: cosca kills and
 /// reaps it through the pidfd the handshake left the leaf, and warns about nothing. Its stdin is
-/// held, so a kill that sent nothing hangs the wait, which the runner's bound fails.
+/// held, so a kill that sent nothing hangs the wait.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_ends_its_child_in_or_out_of_its_leaf(#[fixture(cgroup)] _group: &Group) {
@@ -728,7 +728,7 @@ async fn cgroup_a_post_fork_tokio_failure_of_a_child_that_refuses_its_kill_leave
             && warns[0].contains("leaving it running"),
         "the refused group kill and the refused kill of the child are one warn: {warns:?}"
     );
-    // The helper exits once its stdin closes; the test, not a thread, reaps it.
+    // The helper exits once its stdin closes; the test reaps it.
     drop(writer);
     let status = reap(pid).expect("the child is still unreaped");
     assert!(status.success(), "{status:?}");

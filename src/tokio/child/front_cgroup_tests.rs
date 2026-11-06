@@ -788,7 +788,7 @@ async fn cgroup_a_contained_front_tokio_drops_is_killed_through_its_leaf_and_rea
 
 /// A contained front moved out of its leaf before the abandonment is outside the leaf's kill: it is
 /// sent nothing, not waited for, and left unreaped, and the error says so. A wait on it would hang
-/// for as long as the test holds the front's stdin, which the runner's bound fails.
+/// for as long as the test holds the front's stdin.
 #[skuld::test]
 async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_kill_tests::reap;
