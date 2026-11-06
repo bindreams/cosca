@@ -6,7 +6,7 @@ use crate::child::owned::teardown::Past;
 use crate::containment::cgroup::test_support::{
     block_on, childs_copy, entered_leaf_at, fork_running, handle_of, pidfd_of,
 };
-use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport};
+use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport, WithoutChild};
 #[cfg(target_os = "linux")]
 use crate::error::ChildFate;
 #[cfg(target_os = "linux")]
@@ -2823,8 +2823,9 @@ fn an_abandoned_intent_given_no_pidfd_is_never_signalled() {
             .expect("send a forged intent");
     }
 
-    assert!(
+    assert_eq!(
         leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        WithoutChild::Named,
         "the intent named a pid"
     );
 
@@ -2855,11 +2856,58 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
-    assert!(
-        !leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+    assert_eq!(
+        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        WithoutChild::Unnamed,
         "nothing named a pid"
     );
     assert!(!leaf_path.exists(), "the empty leaf is removed");
+}
+
+/// The leaf answers for a spawn once: a second abandonment is a breach of the contract, which
+/// debug builds assert.
+///
+/// Mutant: a repeated call answers as the first did, or silently.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[skuld::test]
+#[should_panic(expected = "the leaf answers for a child once")]
+fn an_abandonment_without_a_child_repeated_is_a_breach() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-twice");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
+}
+
+/// A child that named itself always has its pidfd in the parent (the handshake's go-ahead comes
+/// only once the parent holds it), so a `Prepared` asked to answer for a named child with no
+/// handle is a breach of that contract, which debug builds assert.
+///
+/// Mutant: the answer is `Ended`, or given silently.
+#[cfg(all(target_os = "linux", feature = "tokio", debug_assertions))]
+#[skuld::test]
+#[should_panic(expected = "named itself")]
+fn abandoning_a_named_child_with_no_handle_is_a_breach() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-named-no-handle");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    // SAFETY: the leaf's channel is open.
+    unsafe {
+        leaf.placement_slot()
+            .send(crate::containment::cgroup::TAG_INTENT, std::process::id() as i32)
+            .expect("send an intent");
+    }
+    let mut prepared = crate::containment::Prepared {
+        mode: Some(crate::containment::ContainMode::Strongest),
+        is_root: true,
+        cgroup_leaf: Some(leaf),
+        teardown_warn_after: None,
+    };
+
+    prepared.abandon_before_verdict(false, None);
 }
 
 /// An abandoned child whose placement failed is killed as the process group it leads: what it

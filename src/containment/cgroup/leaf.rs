@@ -931,7 +931,10 @@ impl CgroupLeaf {
         // uses the watch itself.
         self.watch.stop_pump();
         self.procs_fd = None;
-        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
+        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange. A
+        // spawn that gave the leaf its child ended it already, so this is a spawn with none: a
+        // child that named itself is one `std` collected, and the answer has nothing for `Drop`
+        // to act on.
         if self.report.is_some() {
             self.abandon_without_child(warn);
         }
@@ -1045,6 +1048,21 @@ pub(crate) enum Abandoned {
     Front(crate::child::spawn::FrontFate),
 }
 
+/// What [`CgroupLeaf::abandon_without_child`] found of a child it was given no handle for.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithoutChild {
+    /// The child never named itself: it may not have been forked, and one that was exits at its
+    /// first send, with nothing here to reap it.
+    Unnamed,
+    /// The child named a pid. A child that named itself always has its pidfd in the parent (the
+    /// handshake's go-ahead comes only once the parent holds it), so a spawn with no handle for it
+    /// is one where `std` collected the child: only a sync spawn answers so.
+    Named,
+    /// The exchange was already ended: a breach of the call-once contract.
+    AlreadyAbandoned,
+}
+
 #[cfg(target_os = "linux")]
 impl Abandoned {
     /// The answer for a child torn down through its pidfd as `torn` says. A child the teardown
@@ -1144,17 +1162,22 @@ impl CgroupLeaf {
     /// End the exchange of a spawn that has no child to give the leaf (see
     /// [`abandon_before_verdict`](Self::abandon_before_verdict)): kill through the leaf if the
     /// child entered it, and remove the leaf. Nothing is sent to the child, which nothing here
-    /// holds. Answers whether the child sent its intent, naming a process that may have been
-    /// forked and, if `std` did not collect it, left unreaped.
+    /// holds. Answers whether the child named itself ([`WithoutChild`]).
     ///
-    /// Idempotent: the channel is taken once, and `Drop` does nothing after it.
-    pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) -> bool {
+    /// Called once per leaf: the channel is taken once, and a repeat is a breach, which debug
+    /// builds assert. `Drop` does nothing after it.
+    pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) -> WithoutChild {
         let Some(received) = self.shut_exchange() else {
-            return true;
+            debug_assert!(false, "the leaf answers for a child once");
+            return WithoutChild::AlreadyAbandoned;
         };
         let killed = self.kill_entered();
         self.remove_abandoned(killed, warn);
-        received.pid.is_some()
+        if received.pid.is_some() {
+            WithoutChild::Named
+        } else {
+            WithoutChild::Unnamed
+        }
     }
 
     /// Takes and shuts the report channel, and records whether the child entered the leaf: what an
