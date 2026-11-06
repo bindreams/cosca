@@ -277,6 +277,17 @@ jobs:
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
 
+      # PROBE (not for merge): the F2 timelines. Each probe test ends in `panic!`, so nextest prints
+      # its timeline. Runs first with the TRACER group on, so (b) is not skipped. Its failure skips
+      # the later steps, which is intended.
+      - name: Run the F2 probe (darwin)
+        if: matrix.os == 'darwin'
+        timeout-minutes: 15
+        env:
+          COSCA_TEST_TRACER: "1"
+          COSCA_TEST_TRACER_CONSENT: "1"
+        run: ${{ matrix.nextest }} tracer cargo nextest run --locked --no-tests=fail --no-fail-fast --target ${{ matrix.target }} -E 'test(f2_probe)'
+
       # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
       # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
       # plus the suite's runtime, so a hang costs one step. On Unix the runner signals only the

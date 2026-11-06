@@ -3,9 +3,11 @@
 //!
 //! Each test arms a `MacChild` while the child runs, parks a waiter thread in
 //! `drive::exited_until` (the kqueue wait `await_reapable` is compared against), drives the case
-//! on the test thread, and prints a timeline with `eprintln!`. Nothing is asserted on the result:
-//! the waiter's own deadline is the failure bound surfaced to a human.
+//! on the test thread, and records a timeline. Each test ends with `panic!("{timeline}")` so the
+//! CI log shows it (nextest's ci profile hides a passing test's output). Nothing else is asserted
+//! on the result: the waiter's own deadline is the failure bound surfaced to a human.
 
+use std::fmt::Write as _;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -42,9 +44,18 @@ fn run(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn banner(label: &str) {
-    eprintln!("{label}: sw_vers = {:?}", run("sw_vers", &[]));
-    eprintln!("{label}: uname -m = {:?}", run("uname", &["-m"]));
+/// Appends one line to the timeline (and echoes it to stderr).
+macro_rules! note {
+    ($tl:expr, $($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        eprintln!("{line}");
+        write!($tl, "\n{line}").unwrap();
+    }};
+}
+
+fn banner(label: &str, tl: &mut String) {
+    note!(tl, "{label}: sw_vers = {:?}", run("sw_vers", &[]));
+    note!(tl, "{label}: uname -m = {:?}", run("uname", &["-m"]));
 }
 
 /// One zero-timeout look at the exit kqueue.
@@ -79,24 +90,25 @@ fn park_waiter<'s>(scope: &'s std::thread::Scope<'s, '_>, mac: &'s MacChild) -> 
     rx
 }
 
-fn report(label: &str, t0: Instant, woke: &Woke) {
+fn report(label: &str, tl: &mut String, t0: Instant, woke: &Woke) {
     match &woke.result {
-        Ok(true) => eprintln!("{label}: woke after {} ms (exited_until = true)", ms(t0, woke.at)),
-        Ok(false) => eprintln!("{label}: no wake within {} s", WAKE_BOUND.as_secs()),
-        Err(e) => eprintln!("{label}: wait failed after {} ms: {e}", ms(t0, woke.at)),
+        Ok(true) => note!(tl, "{label}: woke after {} ms (exited_until = true)", ms(t0, woke.at)),
+        Ok(false) => note!(tl, "{label}: no wake within {} s", WAKE_BOUND.as_secs()),
+        Err(e) => note!(tl, "{label}: wait failed after {} ms: {e}", ms(t0, woke.at)),
     }
 }
 
 /// (a) The child exits and someone else (the test, by `waitpid`) reaps it.
 #[skuld::test]
 fn f2_probe_reaped_elsewhere() {
-    banner("F2(a)");
+    let mut tl = String::from("F2 TIMELINE:");
+    banner("F2(a)", &mut tl);
     let mut cmd = crate::test_child::held_std_killable_blocker();
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let pid = child.id();
     let mac = MacChild::new(pid, unique_of(pid)).expect("arm the child");
-    eprintln!("F2(a): look while running = {}", look(&mac));
+    note!(tl, "F2(a): look while running = {}", look(&mac));
 
     let t0 = Instant::now();
     std::thread::scope(|s| {
@@ -104,32 +116,35 @@ fn f2_probe_reaped_elsewhere() {
         drop(stdin);
         wait_until_zombie(pid);
         let t_zombie = Instant::now();
-        eprintln!("F2(a): zombie at {} ms, look = {}", ms(t0, t_zombie), look(&mac));
+        note!(tl, "F2(a): zombie at {} ms, look = {}", ms(t0, t_zombie), look(&mac));
         reap_behind(pid);
         let t_reaped = Instant::now();
-        eprintln!(
+        note!(
+            tl,
             "F2(a): reaped by waitpid at {} ms, look = {}",
             ms(t0, t_reaped),
             look(&mac)
         );
         let woke = rx.recv().expect("the waiter reports");
-        report("F2(a)", t0, &woke);
+        report("F2(a)", &mut tl, t0, &woke);
     });
-    eprintln!("F2(a): final look = {}", look(&mac));
+    note!(tl, "F2(a): final look = {}", look(&mac));
     drop(child);
+    panic!("{tl}");
 }
 
 /// (b) A tracer holds the child's zombie, then dies; XNU gives the zombie to launchd.
 #[skuld::test]
 fn f2_probe_launchd_held_zombie(#[fixture(tracer_group)] _group: &Group) {
-    banner("F2(b)");
+    let mut tl = String::from("F2 TIMELINE:");
+    banner("F2(b)", &mut tl);
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let pid = tracee.id().pid();
     let mac = MacChild::new(pid, unique_of(pid)).expect("arm the child");
     let mut helper = tracer::start(Mode::Hold).attach(&mut tracee);
     assert_eq!(helper.recv(), Report::Attached);
-    eprintln!("F2(b): look while traced and running = {}", look(&mac));
+    note!(tl, "F2(b): look while traced and running = {}", look(&mac));
 
     let t0 = Instant::now();
     std::thread::scope(|s| {
@@ -137,7 +152,8 @@ fn f2_probe_launchd_held_zombie(#[fixture(tracer_group)] _group: &Group) {
         drop(stdin);
         assert_eq!(helper.recv(), Report::Exited);
         let t_exit = Instant::now();
-        eprintln!(
+        note!(
+            tl,
             "F2(b): zombie on the tracer's list at {} ms, look = {}, ppid = {:?}",
             ms(t0, t_exit),
             look(&mac),
@@ -148,7 +164,7 @@ fn f2_probe_launchd_held_zombie(#[fixture(tracer_group)] _group: &Group) {
         let sent = unsafe { libc::kill(helper.helper_pid() as libc::pid_t, libc::SIGKILL) };
         assert_eq!(sent, 0, "{}", std::io::Error::last_os_error());
         let t_killed = Instant::now();
-        eprintln!("F2(b): tracer killed at {} ms", ms(t0, t_killed));
+        note!(tl, "F2(b): tracer killed at {} ms", ms(t0, t_killed));
 
         // Until the zombie reads as launchd's (ppid 1), or the bound passes.
         let launchd_at = loop {
@@ -157,7 +173,8 @@ fn f2_probe_launchd_held_zombie(#[fixture(tracer_group)] _group: &Group) {
                 break Some(Instant::now());
             }
             if t_killed.elapsed() > WAKE_BOUND {
-                eprintln!(
+                note!(
+                    tl,
                     "F2(b): the zombie never read ppid 1 within {} s (last ppid {ppid:?})",
                     WAKE_BOUND.as_secs()
                 );
@@ -166,17 +183,19 @@ fn f2_probe_launchd_held_zombie(#[fixture(tracer_group)] _group: &Group) {
             std::thread::yield_now();
         };
         if let Some(t) = launchd_at {
-            eprintln!(
+            note!(
+                tl,
                 "F2(b): launchd holds the zombie at {} ms, look = {}",
                 ms(t0, t),
                 look(&mac)
             );
         }
         let woke = rx.recv().expect("the waiter reports");
-        report("F2(b)", t0, &woke);
+        report("F2(b)", &mut tl, t0, &woke);
     });
-    eprintln!("F2(b): final look = {}", look(&mac));
+    note!(tl, "F2(b): final look = {}", look(&mac));
     // The killed helper fails `Session`'s clean-exit check, so its teardown is skipped.
     std::mem::forget(helper);
     drop(tracee);
+    panic!("{tl}");
 }
