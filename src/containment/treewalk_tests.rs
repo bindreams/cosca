@@ -636,7 +636,7 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
 fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_the_errno(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
-    let (child, stdin) = root_over_setuid_blockers(1);
+    let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
 
     let left = super::hard_kill(&crate::identity::HostKernel, child.id())
         .into_result()
@@ -699,7 +699,7 @@ fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     crate::log_capture::install();
-    let (child, stdin) = root_over_setuid_blockers(2);
+    let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(2, |_| {});
     let process = crate::Process::open_pid(child.id().pid())
         .expect("open")
         .expect("running");
@@ -729,7 +729,7 @@ fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once
 #[skuld::test]
 fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _group: &crate::test_groups::Group) {
     crate::log_capture::install();
-    let (child, stdin) = root_over_setuid_blockers(1);
+    let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
     let mark = crate::log_capture::mark();
 
     super::terminate(&crate::identity::HostKernel, child.id()).expect("best effort");
@@ -741,12 +741,6 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     assert!(warned[0].1.contains(&os.to_string()), "{warned:?}");
     drop(stdin);
     child.wait().expect("reap the root");
-}
-
-/// [`crate::test_privilege::root_over_setuid_blockers`], uncontained.
-#[cfg(unix)]
-fn root_over_setuid_blockers(count: usize) -> (crate::Child, std::io::PipeWriter) {
-    crate::test_privilege::root_over_setuid_blockers(count, |_| {})
 }
 
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale

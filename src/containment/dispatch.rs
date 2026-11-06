@@ -461,10 +461,15 @@ pub(crate) struct TreeKilled {
 ///   `Unvouched`. A held member is held because its kill was refused: it ran on and may have forked,
 ///   and killing it again by identity does not reach its children.
 ///
-/// The kind of an `Unvouched` state is the latest fact: a walk that saw the root running names
-/// [`RootSeenRunning`](UnvouchedKind::RootSeenRunning), whether or not the root had ended; held members
-/// that all dropped out, [`HeldMembersGone`](UnvouchedKind::HeldMembersGone); something else left with
-/// no identity, [`Earlier`](UnvouchedKind::Earlier), from any previous state. A settlement with no new fact keeps the stored kind.
+/// The kind of an `Unvouched` state is the latest fact:
+///
+/// - a walk that saw the root running names [`RootSeenRunning`](UnvouchedKind::RootSeenRunning),
+///   whether or not the root had ended;
+/// - held members that all dropped out name [`HeldMembersGone`](UnvouchedKind::HeldMembersGone);
+/// - something else left running with no identity names [`Earlier`](UnvouchedKind::Earlier), from
+///   any previous state.
+///
+/// A settlement with no new fact keeps the stored kind.
 #[derive(Debug, Default)]
 enum TreeState {
     /// Nothing has settled the tree: no kill left anything running, and no walk left nothing.
@@ -677,8 +682,9 @@ pub(crate) enum UnvouchedKind {
     /// A walk saw the root running and left it. If the root's own kill then ended it, the call was
     /// `Ok`. What the root forked meanwhile was never looked for.
     RootSeenRunning,
-    /// An earlier kill left something running (the root, members the handle holds no identity for, or
-    /// members since gone), and the settlement no longer knows which.
+    /// A kill, this settlement's own or an earlier one, left something running that it could not name
+    /// (the root, members the handle holds no identity for, or members since gone), and the settlement
+    /// no longer knows which.
     Earlier,
 }
 
@@ -693,7 +699,7 @@ impl UnvouchedKind {
                 "the walk found the root running, and what the root forked meanwhile was never looked for"
             }
             UnvouchedKind::Earlier => {
-                "an earlier kill left something running that no later walk has checked for what it forked"
+                "a kill left something running that it could not name, and no later walk has checked what it forked"
             }
         }
     }
@@ -727,8 +733,8 @@ impl UnvouchedKind {
                  forked is unknown"
             }
             UnvouchedKind::Earlier => {
-                "an earlier kill left something running, and no walk since has checked what it forked; the tree \
-                 could not be walked from its gone root"
+                "a kill left something running that it could not name, and no walk since has checked what it \
+                 forked; the tree could not be walked from its gone root"
             }
         }
     }

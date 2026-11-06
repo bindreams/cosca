@@ -578,7 +578,7 @@ fn next_is_the_one_transition_of_state_and_facts() {
             [Standing::Never, killed(), held(), held(), root(), earlier()]),
         ("no walk, something running with no identity", false, vec![], true, false,
             [earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
-        ("walk, member 8 left",true, vec![unread(8)], true, false,
+        ("walk, member 8 left", true, vec![unread(8)], true, false,
             [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
         ("walk, member 8 left and the root seen running", true, vec![unread(8)], true, true,
             [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
@@ -1266,7 +1266,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .expect("an unvouched tree is warned of");
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("skipped the kill"), "{warn}");
-    assert!(warn.contains("left something running"), "{warn}");
+    assert!(warn.contains("left something running that it could not name"), "{warn}");
+    assert!(!warn.contains("earlier kill"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
 
     // A walk that saw the root running and left it, whose end the call did not see: the root was seen
