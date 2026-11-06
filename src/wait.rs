@@ -656,7 +656,7 @@ fn win32_wait_clamp() -> u32 {
 
 /// Test-only, thread-local record of the timeout each timed block or recheck pause was armed with on
 /// this thread (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or a
-/// [`crate::os_process::drive`] pause.
+/// [`crate::os_process::drive`] pause, or a `Condvar` block of an `OwnedChild`.
 /// A test proves a deadline wait armed nothing longer than the time remaining, and blocked at all,
 /// from the log.
 #[cfg(test)]
@@ -670,13 +670,15 @@ pub(crate) mod block_probe {
     #[cfg(target_os = "macos")]
     type RoundHook = Box<dyn FnMut(u32)>;
 
-    /// A one-shot hook slot: [`on_blocking`]'s or [`on_pause`]'s.
-    type Slot = RefCell<Option<Box<dyn FnOnce()>>>;
+    /// A one-shot hook slot ([`on_blocking`]'s, [`on_pause`]'s or [`on_condvar_block`]'s). The hook
+    /// gets the timeout the block or pause was armed with (`None`: none).
+    type Slot = RefCell<Option<Box<dyn FnOnce(Option<Duration>)>>>;
 
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
         static ON_BLOCKING: Slot = const { RefCell::new(None) };
         static ON_PAUSE: Slot = const { RefCell::new(None) };
+        static ON_CONDVAR_BLOCK: Slot = const { RefCell::new(None) };
         #[cfg(target_os = "macos")]
         static ROUND: Cell<u32> = const { Cell::new(0) };
         #[cfg(target_os = "macos")]
@@ -694,7 +696,7 @@ pub(crate) mod block_probe {
     /// `WaitForSingleObject`), and run the hook [`on_blocking`] armed.
     pub(crate) fn record_blocking(armed: Option<Duration>) {
         record(armed);
-        fire(&ON_BLOCKING);
+        fire(&ON_BLOCKING, armed);
         #[cfg(target_os = "macos")]
         fire_round();
     }
@@ -703,13 +705,21 @@ pub(crate) mod block_probe {
     /// no round.
     pub(crate) fn record_pause(d: Duration) {
         record(Some(d));
-        fire(&ON_PAUSE);
+        fire(&ON_PAUSE, Some(d));
     }
 
-    /// Run the hook armed in `slot`, taken out first, so the hook may arm the slot again.
-    fn fire(slot: &'static std::thread::LocalKey<Slot>) {
+    /// Record a `Condvar` block `armed` for (`None`: no timeout) and run the armed
+    /// [`on_condvar_block`] hook, under the lock. Unlike a block on a descriptor, it fires no round.
+    pub(crate) fn record_condvar_block(armed: Option<Duration>) {
+        record(armed);
+        fire(&ON_CONDVAR_BLOCK, armed);
+    }
+
+    /// Run the hook armed in `slot` with `armed`, taken out first, so the hook may arm the slot
+    /// again.
+    fn fire(slot: &'static std::thread::LocalKey<Slot>, armed: Option<Duration>) {
         if let Some(hook) = slot.with(|h| h.borrow_mut().take()) {
-            hook();
+            hook(armed);
         }
     }
 
@@ -766,7 +776,7 @@ pub(crate) mod block_probe {
         })
     }
 
-    /// Disarms an unfired [`on_blocking`] or [`on_pause`] hook on drop.
+    /// Disarms an unfired [`on_blocking`], [`on_pause`] or [`on_condvar_block`] hook on drop.
     #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
     pub(crate) struct Armed(&'static std::thread::LocalKey<Slot>);
 
@@ -779,7 +789,7 @@ pub(crate) mod block_probe {
     /// Run `hook` on this thread just before its next blocking `poll` or `WaitForSingleObject`: the
     /// thread has released every lock it took for the wait it is about to make.
     pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
-        ON_BLOCKING.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        ON_BLOCKING.with(|h| *h.borrow_mut() = Some(Box::new(move |_| hook())));
         Armed(&ON_BLOCKING)
     }
 
@@ -787,8 +797,23 @@ pub(crate) mod block_probe {
     /// `Waitable`'s lock proves the `Step::Recheck` contract (the lock is released before the
     /// pause); the hook firing alone does not.
     pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
-        ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(move |_| hook())));
         Armed(&ON_PAUSE)
+    }
+
+    /// Run `hook`, under the lock, just before this thread's next `Condvar::wait` or `wait_timeout`.
+    /// A test's hook sends on a channel it then `recv()`s, so it knows the waiter is inside the
+    /// `Condvar` before it releases anything: the wait releases the lock atomically, so the release
+    /// cannot overtake it.
+    pub(crate) fn on_condvar_block(hook: impl FnOnce() + 'static) -> Armed {
+        on_condvar_block_with(move |_| hook())
+    }
+
+    /// [`on_condvar_block`], with the time the block is about to be armed for: `None` is a block
+    /// with no timeout.
+    pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<Duration>) + 'static) -> Armed {
+        ON_CONDVAR_BLOCK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Armed(&ON_CONDVAR_BLOCK)
     }
 
     /// Every timeout armed on this thread since the last call, in order.
