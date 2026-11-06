@@ -476,7 +476,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
     let _dying = crate::identity::kinfo::fault::force_parents(tracer_pid, || started_by_us_traced_by(LAUNCHD));
     let (owned, mac) = watch(pid, unique);
     // The first pause is the wait's own backoff: the child's parent read answers launchd after it.
-    let _pause = crate::child::owned::seams::on_condvar_block({
+    let _pause = crate::wait::block_probe::on_pause({
         let holder = Rc::clone(&holder);
         move || holder.set(LAUNCHD)
     });
