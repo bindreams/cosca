@@ -550,8 +550,8 @@ fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
 // A recheck =====
 
 /// A look that asks for a recheck (a zombie a tracer holds, or an exit XNU is still finishing)
-/// is repeated after a backoff of 1, 2, 4 ... ms, on the handle's `Condvar`, until it shows the
-/// record: the looks are the pauses plus one, and none polls.
+/// is repeated after a backoff of 1, 2, 4 ... ms until it shows the record: the looks are the
+/// pauses plus one, and none polls.
 ///
 /// Mutant: a recheck that loops with no pause (a spin), or that blocks on the look's wait.
 #[skuld::test]
@@ -569,6 +569,26 @@ fn a_recheck_backs_off_until_the_zombie_shows() {
     let ms = |n| Some(Duration::from_millis(n));
     assert_eq!(pauses, [ms(1), ms(2), ms(4)]);
     assert_eq!(fake.looks(), pauses.len() + 1);
+}
+
+/// A holder paused for a recheck holds no lock: the handle answers a peek, on the holder's own
+/// thread, from inside the pause.
+///
+/// Mutant: the pause under the lock, so the peek locks a handle its own thread holds.
+#[skuld::test]
+fn a_holders_recheck_pause_leaves_the_handle_unlocked() {
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Recheck, ReapAnswer::Reaped(exit())])
+        .peeks([Ok(PeekOutcome::Running)]);
+    let child = owned_over(&fake);
+    let (peeked_tx, peeked_rx) = std::sync::mpsc::channel();
+    let _hook = crate::wait::block_probe::on_pause({
+        let child = Arc::clone(&child);
+        move || _ = peeked_tx.send(child.peek())
+    });
+    status(child.wait(None));
+    let peeked = peeked_rx.try_recv().expect("the holder paused once");
+    assert!(matches!(peeked, Ok(PeekOutcome::Running)), "{peeked:?}");
 }
 
 /// A holder blocked on its wait holds no lock: `Debug` shows `W`, not `locked`, and `signal`

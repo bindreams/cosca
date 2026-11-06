@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{absolute, exited_held, run, ProcessExit, RunOutcome, Step, Waitable};
+use super::{absolute, exited_held, run, run_with, ProcessExit, RunOutcome, Step, Waitable};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -101,14 +101,13 @@ enum Move {
     WaitFails,
 }
 
-/// A [`Waitable`] that plays `moves` and records the pauses it is asked for. A pause runs `on_pause`
-/// (a test moves the frozen clock in it), then returns at once.
+/// A [`Waitable`] that plays `moves`. A row drives it with [`run_with`] and its own pause, which
+/// records what it is asked for (and moves the frozen clock, where the row needs it) and returns at
+/// once.
 struct Scripted {
     moves: std::collections::VecDeque<Move>,
     source: FakeProcess,
     looks: usize,
-    pauses: Vec<Duration>,
-    on_pause: Box<dyn FnMut(Duration)>,
     on_look: Box<dyn FnMut(usize)>,
     /// Whether [`Waitable::block_failed`] lets the loop go on.
     survive_block_errors: bool,
@@ -127,8 +126,6 @@ impl Scripted {
             moves,
             source,
             looks: 0,
-            pauses: Vec::new(),
-            on_pause: Box::new(|_| {}),
             on_look: Box::new(|_| {}),
             survive_block_errors: false,
             block_errors: 0,
@@ -170,11 +167,6 @@ impl Waitable for Scripted {
             Err(e)
         }
     }
-
-    fn pause(&mut self, d: Duration) {
-        self.pauses.push(d);
-        (self.on_pause)(d);
-    }
 }
 
 fn ms(n: u64) -> Duration {
@@ -195,8 +187,12 @@ fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
 fn run_pauses_the_backoff_steps_on_recheck() {
     block_probe::take();
     let mut w = Scripted::new([Move::Recheck; 8].into_iter().chain([Move::Done]));
-    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
-    assert_eq!(whole_ms(&w.pauses), [1, 2, 4, 8, 16, 32, 50, 50]);
+    let mut pauses = Vec::new();
+    assert!(matches!(
+        run_with(&mut w, None, |d| pauses.push(d)).unwrap(),
+        RunOutcome::Done(())
+    ));
+    assert_eq!(whole_ms(&pauses), [1, 2, 4, 8, 16, 32, 50, 50]);
     assert_eq!(w.looks, 9, "one look per pause, and one more");
     assert!(block_probe::take().is_empty(), "a Recheck blocks on nothing");
 }
@@ -206,8 +202,12 @@ fn run_pauses_the_backoff_steps_on_recheck() {
 fn run_restarts_the_backoff_after_a_wait() {
     block_probe::take();
     let mut w = Scripted::new([Move::Recheck, Move::Recheck, Move::Wait, Move::Recheck, Move::Done]);
-    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
-    assert_eq!(whole_ms(&w.pauses), [1, 2, 1]);
+    let mut pauses = Vec::new();
+    assert!(matches!(
+        run_with(&mut w, None, |d| pauses.push(d)).unwrap(),
+        RunOutcome::Done(())
+    ));
+    assert_eq!(whole_ms(&pauses), [1, 2, 1]);
     assert_eq!(block_probe::take().len(), 1, "the one Wait blocked once");
 }
 
@@ -219,10 +219,14 @@ fn run_restarts_the_backoff_after_a_wait() {
 fn run_clamps_a_pause_to_the_time_remaining() {
     let (_clock, _start) = test_clock::FrozenClockGuard::install();
     let mut w = Scripted::new([Move::Recheck; 4]);
-    w.on_pause = Box::new(test_clock::advance);
-    let outcome = run(&mut w, absolute(Some(ms(4)))).unwrap();
+    let mut pauses = Vec::new();
+    let outcome = run_with(&mut w, absolute(Some(ms(4))), |d| {
+        pauses.push(d);
+        test_clock::advance(d);
+    })
+    .unwrap();
     assert!(matches!(outcome, RunOutcome::DeadlinePassed), "{outcome:?}");
-    assert_eq!(whole_ms(&w.pauses), [1, 2, 1]);
+    assert_eq!(whole_ms(&pauses), [1, 2, 1]);
     assert_eq!(w.looks, 4, "the last look is made at the deadline");
 }
 
@@ -232,9 +236,10 @@ fn run_never_pauses_after_the_deadline() {
     let (_clock, _start) = test_clock::FrozenClockGuard::install();
     // The deadline is already past.
     let mut w = Scripted::new([Move::Recheck]);
-    let outcome = run(&mut w, absolute(Some(Duration::ZERO))).unwrap();
+    let mut pauses = Vec::new();
+    let outcome = run_with(&mut w, absolute(Some(Duration::ZERO)), |d| pauses.push(d)).unwrap();
     assert!(matches!(outcome, RunOutcome::DeadlinePassed), "{outcome:?}");
-    assert!(w.pauses.is_empty());
+    assert!(pauses.is_empty());
     assert_eq!(w.looks, 1);
     // The deadline passes during a look that asks for a recheck: no pause, one final look, whose
     // answer is the outcome.
@@ -244,9 +249,9 @@ fn run_never_pauses_after_the_deadline() {
             test_clock::advance(ms(5));
         }
     });
-    let outcome = run(&mut w, absolute(Some(ms(5)))).unwrap();
+    let outcome = run_with(&mut w, absolute(Some(ms(5))), |d| pauses.push(d)).unwrap();
     assert!(matches!(outcome, RunOutcome::Done(())), "{outcome:?}");
-    assert!(w.pauses.is_empty());
+    assert!(pauses.is_empty());
     assert_eq!(w.looks, 2);
 }
 
@@ -270,18 +275,9 @@ fn run_returns_a_block_error_the_waitable_does_not_survive() {
 fn run_looks_again_after_a_block_error_the_waitable_survives() {
     let mut w = Scripted::new([Move::WaitFails, Move::Recheck, Move::Done]);
     w.survive_block_errors = true;
-    assert!(matches!(run(&mut w, None).unwrap(), RunOutcome::Done(())));
+    assert!(matches!(run_with(&mut w, None, |_| {}).unwrap(), RunOutcome::Done(())));
     assert_eq!(w.block_errors, 1);
     assert_eq!(w.looks, 3);
-}
-
-/// `exited()` never answers a recheck, so a [`ProcessExit`] has nothing to pause for: asking it to is
-/// a contract violation, not a sleep.
-#[cfg(debug_assertions)]
-#[skuld::test]
-#[should_panic(expected = "never asks for a recheck")]
-fn a_process_exit_is_never_paused() {
-    ProcessExit(&fake([])).pause(ms(1));
 }
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends
