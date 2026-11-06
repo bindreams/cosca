@@ -503,11 +503,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     shell.kill().expect("terminate the root");
     shell.wait().expect("the root's exit is recorded");
 
-    let parents = crate::containment::enumerate::process_parents(&HostKernel).expect("the process snapshot");
-    assert!(
-        !parents.iter().any(|&(pid, _)| pid == root.pid()),
-        "precondition: Toolhelp must not list the exited root whose handle is held"
-    );
+    let parents = crate::test_child::parents_once_unlisted(root.pid());
     assert!(
         parents.iter().any(|&(pid, ppid)| pid == ping && ppid == root.pid()),
         "precondition: the running child must still name the exited root as its creator"
