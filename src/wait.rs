@@ -670,8 +670,7 @@ pub(crate) mod block_probe {
     #[cfg(target_os = "macos")]
     type RoundHook = Box<dyn FnMut(u32)>;
 
-    /// A one-shot hook slot ([`on_blocking`]'s, [`on_pause`]'s or [`on_condvar_block`]'s). The hook
-    /// gets the timeout the block or pause was armed with (`None`: none).
+    /// A one-shot hook slot ([`on_blocking`]'s, [`on_pause`]'s or [`on_condvar_block`]'s).
     type Slot = RefCell<Option<Box<dyn FnOnce(Option<Duration>)>>>;
 
     thread_local! {
@@ -708,8 +707,8 @@ pub(crate) mod block_probe {
         fire(&ON_PAUSE, Some(d));
     }
 
-    /// Record a `Condvar` block `armed` for (`None`: no timeout) and run the armed
-    /// [`on_condvar_block`] hook, under the lock. Unlike a block on a descriptor, it fires no round.
+    /// Record a `Condvar` block `armed` for (`None`: no timeout) and run the [`on_condvar_block`]
+    /// hook. Fires no macOS round.
     pub(crate) fn record_condvar_block(armed: Option<Duration>) {
         record(armed);
         fire(&ON_CONDVAR_BLOCK, armed);
@@ -802,16 +801,13 @@ pub(crate) mod block_probe {
     }
 
     /// Run `hook`, under the `OwnedChild`'s lock, just before this thread's next block on that
-    /// handle's `Condvar` (no other `Condvar` fires it).
-    /// A test's hook sends on a channel it then `recv()`s, so it knows the waiter is inside the
-    /// `Condvar` before it releases anything: the wait releases the lock atomically, so the release
-    /// cannot overtake it.
+    /// handle's `Condvar`. The wait releases the lock atomically, so a hook that signals the test
+    /// proves the waiter is inside the `Condvar` before anything else can take the lock.
     pub(crate) fn on_condvar_block(hook: impl FnOnce() + 'static) -> Armed {
         on_condvar_block_with(move |_| hook())
     }
 
-    /// [`on_condvar_block`], with the time the block is about to be armed for: `None` is a block
-    /// with no timeout.
+    /// [`on_condvar_block`], with the armed timeout (`None`: no timeout).
     pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<Duration>) + 'static) -> Armed {
         ON_CONDVAR_BLOCK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         Armed(&ON_CONDVAR_BLOCK)
