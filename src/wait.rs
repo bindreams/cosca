@@ -694,9 +694,7 @@ pub(crate) mod block_probe {
     /// `WaitForSingleObject`), and run the hook [`on_blocking`] armed.
     pub(crate) fn record_blocking(armed: Option<Duration>) {
         record(armed);
-        if let Some(hook) = ON_BLOCKING.with(|h| h.borrow_mut().take()) {
-            hook();
-        }
+        fire(&ON_BLOCKING);
         #[cfg(target_os = "macos")]
         fire_round();
     }
@@ -705,7 +703,12 @@ pub(crate) mod block_probe {
     /// [`on_pause`] armed. A pause is not a block: it fires no round.
     pub(crate) fn record_pause(d: Duration) {
         record(Some(d));
-        if let Some(hook) = ON_PAUSE.with(|h| h.borrow_mut().take()) {
+        fire(&ON_PAUSE);
+    }
+
+    /// Run the hook armed in `slot`, taken out first, so the hook may arm the slot again.
+    fn fire(slot: &'static std::thread::LocalKey<Slot>) {
+        if let Some(hook) = slot.with(|h| h.borrow_mut().take()) {
             hook();
         }
     }
@@ -780,8 +783,9 @@ pub(crate) mod block_probe {
         Armed(&ON_BLOCKING)
     }
 
-    /// Run `hook` on this thread just before its next recheck pause sleeps: the thread has
-    /// released every lock it took for the look.
+    /// Run `hook` on this thread just before its next recheck pause sleeps. The `Waitable` released
+    /// every lock it took for the look, by the `Step::Recheck` contract; the hook firing does not
+    /// prove it, and a hook that takes the lock does.
     pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
         ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         Armed(&ON_PAUSE)
