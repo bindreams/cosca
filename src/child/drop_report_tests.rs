@@ -2,19 +2,11 @@
 //! however many steps (the unsettled root, the refused kill, the failed reap) each had to say. Each
 //! test forces the looks it counts on and asserts they were all made.
 
+use crate::log_capture::warns_since;
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{setuid, Group};
 use crate::ContainMode;
-
-/// Every record at `warn` or above that this thread logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
-}
 
 /// One scripted refusal of a kill: the `EPERM` the kernel answers a signal to another user's process.
 fn refused() -> crate::os_process::fake::SignalAnswer {
@@ -70,7 +62,7 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
 
     fake.assert_peeks_exhausted();
     assert_eq!(fake.signal_calls(), [crate::signal::Sig::Kill], "the drop's kill");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with("Child::drop:")
@@ -138,7 +130,7 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
         crate::child::spawn::fault::take_force_reap_failure().is_none(),
         "the cleanup consumed the forced failure"
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
         warns[0].starts_with("finish_elevated:")
@@ -180,7 +172,7 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
             "{left:?}: {cause}"
         );
         assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         let finish_elevated: Vec<_> = warns
             .iter()
             .filter(|warn| warn.starts_with("finish_elevated:"))
@@ -226,7 +218,7 @@ fn finish_elevated_makes_no_early_tree_kill_over_an_unvouched_tree_when_it_hands
     );
     assert!(!drop_looks.seen(), "the handle is disarmed");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     let unvouched = warns
         .iter()
         .filter(|warn| warn.contains("could not be vouched for"))
@@ -286,7 +278,7 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree
     );
     assert!(!cause.contains("left something running"), "{cause}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     let tree: Vec<_> = warns
         .iter()
         .filter(|warn| warn.starts_with("finish_elevated:"))
@@ -351,7 +343,7 @@ fn finish_elevated_reports_an_early_tree_kill_that_ends_unvouched_after_a_member
     );
     assert!(!cause.contains("failed too"), "{cause}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     let tree: Vec<_> = warns
         .iter()
         .filter(|warn| warn.starts_with("finish_elevated:"))
@@ -391,7 +383,7 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     child.kill_on_drop = false;
 
     assert_eq!(torn.fate, crate::error::ChildFate::Gone);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
     assert!(!warns[0].contains("members"), "{warns:?}");
@@ -419,7 +411,7 @@ fn finish_elevated_hands_back_a_root_whose_kill_was_refused() {
     assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
     assert_eq!(fake.signal_calls().len(), 1, "the cleanup's kill alone");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&refusal()), "{warns:?}");
     let status = handed_back.wait();
@@ -468,7 +460,7 @@ fn finish_elevated_names_the_failure_of_the_look_after_a_refused_kill() {
     let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     let failed_look = std::io::Error::from(std::io::ErrorKind::Other).to_string();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains(&format!("the wait failed: {failed_look}")),
@@ -525,7 +517,7 @@ fn finish_elevated_logs_a_root_reaped_elsewhere_after_the_kill_at_debug() {
     let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
 
     assert!(handed_back.is_none());
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped by someone else");
     assert!(
         debug.len() == 1 && debug[0].0 == log::Level::Debug,
@@ -555,7 +547,7 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_the_root_reaped_elsewhe
 
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(handed_back.is_none());
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     let cause = cause.to_string();
     assert!(
         cause.contains(&format!(
@@ -593,7 +585,7 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_roo
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(handed_back.is_none());
     let clause = format!("could not be terminated ({}): not ours to reap (launchd", refusal());
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&clause), "{warns:?}");
     let cause = cause.to_string();
@@ -623,7 +615,7 @@ fn finish_elevated_names_the_root_when_launchd_holds_it_after_a_delivered_kill()
     assert_eq!(fate, crate::error::ChildFate::Killed);
     assert!(handed_back.is_none());
     let clause = format!("the elevated child pid {pid}: not ours to reap (launchd");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&clause), "{warns:?}");
     let cause = cause.to_string();
@@ -652,7 +644,7 @@ fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() 
     assert_eq!(fate, crate::error::ChildFate::Killed);
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
     assert_eq!(fake.signal_calls().len(), 1, "the cleanup's kill alone");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("the elevated child pid")
@@ -827,7 +819,7 @@ fn a_tree_kill_that_worked_when_made_early_is_reported_as_such_not_as_a_failure(
     let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
 
     let first = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     let warn = warns
         .iter()
         .find(|warn| warn.contains(&leaf_path.display().to_string()))
@@ -867,7 +859,7 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
 
     let first = std::io::Error::from_raw_os_error(libc::EIO).to_string();
     let early = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     let warn = warns
         .iter()
         .find(|warn| warn.contains(&leaf_path.display().to_string()))

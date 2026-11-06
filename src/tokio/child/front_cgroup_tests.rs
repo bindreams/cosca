@@ -165,14 +165,10 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
         drop(child);
     }
     let stdin = stdin.take().expect("released only before a failure");
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert_eq!(warns.len(), 1, "one warn for the one event: {warns:?}");
     assert!(
-        warns[0].1.contains("contained-tree teardown did not fully succeed")
-            && warns[0].1.contains("elevation front pid"),
+        warns[0].contains("contained-tree teardown did not fully succeed") && warns[0].contains("elevation front pid"),
         "the failed kill and the front are in it: {warns:?}"
     );
     assert_eq!(roots.kills(), 0, "the drop must not kill the front");
@@ -258,20 +254,15 @@ async fn assert_tokio_drop_kills_the_leaf(fault: impl FnOnce() -> Box<dyn std::a
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     // One warn for the event: a failed tree kill shares it with the front's note.
-    let warns: Vec<_> =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"))
-            .into_iter()
-            .filter(|(level, _)| *level <= log::Level::Warn)
-            .collect();
+    let warns = crate::log_capture::warns_since(mark, &format!("elevation front pid {pid}"));
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.starts_with("Child::drop:"), "{warns:?}");
+    assert!(warns[0].starts_with("Child::drop:"), "{warns:?}");
     assert!(
         warns[0]
-            .1
             .contains("the front is killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it exits"),
         "{warns:?}"
     );
-    assert!(!warns[0].1.contains("left running"), "{warns:?}");
+    assert!(!warns[0].contains("left running"), "{warns:?}");
     // The write is made before the drop returns; the processes' ends follow it.
     assert!(steps.iter().any(|s| s == "kill"), "the leaf was killed: {steps:?}");
     release.assert_killed();
