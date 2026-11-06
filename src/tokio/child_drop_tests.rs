@@ -566,7 +566,7 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     // The root stays alive: only the tree is killed.
     let view = child.read_root_view(crate::containment::dispatch::TeardownCaller::Drop);
     let killed = child.kill_tree_members_unless_reaped(&view);
-    assert!(killed.result().is_ok(), "kill the tree: {killed:?}");
+    assert!(killed.completed(), "kill the tree: {killed:?}");
     assert_eq!(
         fake.kill_written(),
         crate::containment::cgroup::KILL_PAYLOAD,

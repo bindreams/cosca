@@ -7,7 +7,7 @@ use crate::child::owned::teardown::{Disposition, Kill, Remains};
 #[cfg(unix)]
 use crate::child::owned::teardown::{FrontLook, TeardownOutcome};
 use crate::command::Command;
-use crate::containment::dispatch::{SweepFailure, TeardownCaller};
+use crate::containment::dispatch::{SweepFailure, TeardownCaller, TreeKillOutcome};
 use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -503,13 +503,17 @@ impl Child {
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and logs that descendants may be orphaned.)
+    /// kills the root and logs that descendants may be orphaned.) A root that is gone (this handle
+    /// reaped it) or no longer holds its pid is `Unassessable` too: no walk ran and nothing was
+    /// killed, and a retry cannot work, since the root will not come back.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
     /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
-    /// The backstop still ran.
+    /// The backstop still ran. The handle keeps the members the walk left: a later `kill_tree`, or the
+    /// drop, kills those whose identity was read again, and reports the others again, so the tree is
+    /// not taken for killed while a member is not shown killed.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -537,10 +541,11 @@ impl Child {
     /// zombie, see [`kill`](Child::kill)) or `Unknown`, nothing that names the tree by the root's
     /// number runs: no `killpg`, no walk from its pid, no kill of the root by pid, and no handle
     /// backstop. An fd marker still kills its marker holders, which are named by identity (an
-    /// `Unpinned` root is an exited zombie and is left alone), and the call is `Ok` only if every
-    /// holder was reached. Any other mechanism has nothing left to send, and the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying that nothing was sent and what
-    /// was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
+    /// `Unpinned` root is an exited zombie and is left alone), and the call is
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying what was skipped even when
+    /// every holder was reached; a holder that could not be reached is that holder's error. Any other
+    /// mechanism has nothing left to send, and the call returns `Unassessable` saying that nothing
+    /// was sent and what was skipped. The handle backstop reads the root's state again: a root orphaned during the sweep
     /// is an exited zombie, so the backstop is skipped and the sweep's answer stands.
     ///
     /// **On Linux 6.9+, a process group whose root is reaped, or whose root's handle cannot say,** is
@@ -647,7 +652,9 @@ impl Child {
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
-        let group_result = group_result.unless_refused()?;
+        if let TreeKillOutcome::Unwalked(error) = group_result {
+            return Err(error.into());
+        }
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
@@ -1129,7 +1136,6 @@ impl Child {
                 None,
             );
             let (warn, remains) = torn.take_warn(caller.label());
-            // Reported after the root's kill: a walk that left only the root is settled by it.
             left.extend(
                 self.attached
                     .settle_for_drop(&self.tree_killed, tree, remains.fate.not_running()),
@@ -1184,8 +1190,7 @@ impl Child {
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
         // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
-        // reported, never asserted on. Reported after the root's kill below: a walk that left only
-        // the root is settled by it.
+        // reported, never asserted on.
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
         // (`cosca::tokio::Child`'s `Drop`) does the same on Unix.

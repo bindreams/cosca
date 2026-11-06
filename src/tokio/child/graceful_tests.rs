@@ -865,10 +865,13 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let before = ::tokio::time::Instant::now();
-    child
+    // The sweep found no root to walk from, so it killed nothing: its error is the call's, and it
+    // supersedes the held refusal.
+    let err = child
         .graceful_shutdown_tree(GRACE)
         .await
-        .expect("a swept tree supersedes the held refusal");
+        .expect_err("a sweep that found no root killed nothing");
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
     assert_eq!(
         ::tokio::time::Instant::now() - before,
         Duration::ZERO,

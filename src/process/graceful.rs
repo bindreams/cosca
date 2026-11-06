@@ -46,7 +46,8 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is killed, the root included.
+    /// be queried: nothing is killed, the root included. Also when the root is gone, or no longer
+    /// holds its pid: no walk ran, and nothing was killed.
     ///
     /// [`Error::MemberNotKilled`] when the walk killed what it could and left a member running,
     /// naming the first and why: its identity could not be read, or its kill was refused.

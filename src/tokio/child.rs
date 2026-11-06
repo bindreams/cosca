@@ -973,7 +973,9 @@ impl Child {
         let group_result = self.os.attached.hard_kill(&group);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
-        let group_result = group_result.unless_refused()?;
+        if let TreeKillOutcome::Unwalked(error) = group_result {
+            return Err(error.into());
+        }
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
@@ -1736,7 +1738,6 @@ impl Child {
                 signals.fate = ChildFate::Reaped;
             }
         }
-        // Reported after the root's kill: a walk that left only the root is settled by it.
         let tree = signals.tree.take().and_then(|kill| {
             os.attached
                 .settle_for_drop(&self.tree_killed, kill, signals.fate.not_running())

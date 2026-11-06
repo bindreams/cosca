@@ -435,7 +435,7 @@ impl Child {
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
         // a LIVE root (waiting unswept would hang), but once the root is dead (its exit was observed,
-        // or the sweep's backstop killed it), the reap runs first so no zombie is stranded.
+        // or the sweep's backstop killed it), the reap runs first.
         if !drained {
             // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
             // not merely that it would have no-op'd: forcing this call to fail and then

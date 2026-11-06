@@ -1225,10 +1225,12 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     let skipped = |marker| {
         let kill = crate::containment::Attached::FdMarker(marker)
             .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
-        kill.result().as_ref().expect("the holders-only sweep");
-        kill.skipped()
+        let skipped = kill
+            .skipped()
             .expect("the reaped root's kill by its number is skipped")
-            .to_owned()
+            .to_owned();
+        kill.into_result().expect("the holders-only sweep");
+        skipped
     };
 
     let root = crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1));

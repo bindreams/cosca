@@ -577,7 +577,7 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
                 }),
                 note: None,
             }),
-            refused_to_walk: false,
+            resolved: Vec::new(),
         })],
         notes: Vec::new(),
     };

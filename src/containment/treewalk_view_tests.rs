@@ -20,13 +20,6 @@ use crate::Recursive;
 
 use super::treewalk_pidfs_tests::{children_of, descendants};
 
-/// An identity for this process's pid that this process no longer holds: its children are the
-/// children of the pid's new owner.
-fn stale_root() -> ProcessId {
-    let me = ProcessId::current();
-    me.with_other_value()
-}
-
 /// `result` is the error of a walk that left `pid` unkilled because its identity could not be read
 /// ([`Error::Unassessable`]), and its message says each of `causes`.
 #[track_caller]
@@ -178,14 +171,25 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 // The anchor guards the walk =====
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own, and are never signalled. Mutant: "walk without an anchor". A stale identity cannot be
-/// opened, so only the identity-level walks run.
+/// its own, and are never signalled. The signal-only walks are `Ok`; the kills killed nothing, and
+/// are `Unassessable` (`Process::kill_tree` included, which has no handle to settle it). Mutants:
+/// "walk without an anchor"; "a kill that found no root is `Ok`".
 #[skuld::test]
-fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
-    for (name, walk) in id_walks() {
-        let (child, _) = live_member();
-        let result = walk(&HostKernel, stale_root());
-        assert!(result.is_ok(), "{name}: {result:?}");
+fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unassessable() {
+    for (name, walk) in walks() {
+        let (child, id) = live_member();
+        // The `/proc` path: the root's `stat` shows another start time, as its pid's new owner's.
+        let id = ticks_id(id.pid());
+        let pid = id.pid();
+        let kernel = FakeKernel::over(&HostKernel)
+            .live_without_pidfs(pid, pidfd_of(pid))
+            .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
+        let result = walk(&kernel, id);
+        if name.contains("kill") {
+            assert_unassessable_naming(result, &["no walk ran"]);
+        } else {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
         release(child);
     }
 }
@@ -630,6 +634,43 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     assert!(left.root.is_none(), "{left:?}");
     assert_eq!(warned, [], "the caller reports");
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+}
+
+/// The members an earlier kill left, against a later walk that finds none of them
+/// ([`with_earlier`](super::with_earlier)): one whose identity was read is killed by it again, and
+/// is `MemberNotKilled` again while the kernel still cannot reach it; one never read is
+/// `MemberNotKilled` again with its first cause, and the kernel is not asked about it.
+///
+/// Mutants: a member left is forgotten; a read member is not killed again; a member never read is
+/// acted on by its pid.
+#[skuld::test]
+fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again() {
+    use super::{with_earlier, Left};
+    let sends = crate::send_log::Capture::start();
+    let (child, _, descendant, kernel) = root_with_an_unreadable_descendant();
+
+    let again = with_earlier(&kernel, vec![Left::Resolved(descendant)], Ok(()))
+        .expect_err("the kernel still cannot reach the descendant");
+    assert_eq!(again.members.len(), 1, "{again:?}");
+    assert_not_killed(
+        Err(again.into_error()),
+        descendant.pid(),
+        &["its pidfd could not be proved to name it"],
+    );
+    assert_eq!(sends.by_identity(), [], "nothing was sent to it");
+
+    let unread = Left::Unread {
+        pid: descendant.pid(),
+        said: "its identity could not be read".into(),
+    };
+    let again = with_earlier(&kernel, vec![unread], Ok(())).expect_err("never read, so never shown killed");
+    assert_not_killed(
+        Err(again.into_error()),
+        descendant.pid(),
+        &["its identity could not be read"],
+    );
+    assert_eq!(sends.by_identity(), [], "nothing is sent by a bare pid");
+    release(child);
 }
 
 /// `children` of a root with a descendant the walk cannot read is an error naming that pid and why,

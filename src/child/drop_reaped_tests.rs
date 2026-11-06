@@ -538,6 +538,52 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
+/// The handle remembers a member a walk left: its backstop killed the root, which stays a zombie
+/// until it is reaped, so a second walk from it finds no member. The member's identity was never
+/// read, so the second `kill_tree` reports it again instead of settling the tree as killed.
+///
+/// Mutant: a walk that finds less settles the tree as killed.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_mark_the_tree() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
+    let first = child.kill_tree().expect_err("the walk left a member");
+    let second = child
+        .kill_tree()
+        .expect_err("the member the first walk left is not shown killed");
+    let pid_of = |error: &crate::error::Error| match error {
+        crate::error::Error::MemberNotKilled { pid, .. } => *pid,
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    };
+    assert_eq!(pid_of(&second), pid_of(&first), "{first:?}, {second:?}");
+    assert!(!child.tree_killed.is_set(), "a member was left");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
+}
+
+/// The drop is the second reader of what a walk left. After a `kill_tree` that left a member, the
+/// root is still an unreaped zombie, so the drop kills as usual, and its walk finds nothing: the
+/// drop still warns of the member, once.
+///
+/// Mutant: the drop's walk settles the tree as killed and warns nothing.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
+    child.kill_tree().expect_err("the walk left a member");
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = crate::log_capture::records_since_on_current_thread(mark, "was not killed");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+    drop(stdin);
+}
+
 /// A walk that left only the root is settled by the backstop's kill of it, so the tree is marked
 /// killed and the drop has nothing to say. Mutant: the tree is not marked killed.
 #[cfg(not(target_os = "macos"))]
@@ -558,21 +604,22 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_warn()
 }
 
 /// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
-/// nothing and does not mark the tree killed: the drop still says it skips the walk, as it would
-/// without the call.
+/// nothing: it is `Unassessable`, and does not mark the tree killed, so the drop still says it skips
+/// the walk, as it would without the call.
 ///
-/// Mutant: a walk that found no root counts as a kill that ran.
+/// Mutants: a walk that found no root counts as a kill that ran; it answers `Ok`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_tree_on_a_tree_walk_whose_root_is_reaped_does_not_mark_the_tree_killed() {
+fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_mark_the_tree_killed() {
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker();
     drop(stdin);
     child.wait().expect("reap the root");
 
-    child
+    let err = child
         .kill_tree()
-        .expect("a root that is gone leaves no tree to walk, and no member behind");
+        .expect_err("a root that is gone leaves no tree to walk: nothing was killed");
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
 
     assert!(!child.tree_killed.is_set(), "a walk that found no root killed nothing");
     let mark = crate::log_capture::mark();

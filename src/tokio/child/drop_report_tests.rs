@@ -220,6 +220,7 @@ mod linux {
         for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
             let (child, _writer) = crate::test_child::held_treewalk_blocker_leaving_async(left);
             let mark = crate::log_capture::mark();
+            let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
 
             let failure =
                 crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
@@ -227,12 +228,12 @@ mod linux {
             let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
 
             assert!(fate.not_running(), "{left:?}: {fate:?}");
-            // A settled tree disarms the handle; an unsettled one is looked at again when it drops.
-            let drops = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
+            // A settled tree disarms the handle; an unsettled one is looked at again when it drops, and
+            // that look is the armed drop's first act, whatever it then logs.
             assert_eq!(
-                !drops.is_empty(),
+                drop_looks.seen(),
                 reported,
-                "{left:?}: the handle is armed iff reported: {drops:?}"
+                "{left:?}: the handle is armed iff the tree was left"
             );
             let cause = cause.to_string();
             assert_eq!(

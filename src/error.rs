@@ -217,7 +217,8 @@ pub enum Error {
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
-    /// the tree. A retry walks again.
+    /// the tree. A `TreeWalk` handle's retry kills the members it left again by identity, and a member
+    /// whose identity was never read is reported again. `Process::kill_tree` walks again.
     ///
     /// **macOS.** There [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) is the fd marker's
     /// sweep, which reports a member it could not reach as [`Error::Containment`] or

@@ -245,7 +245,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
-    // The tree is reported after the root's kill: a walk that left only the root is settled by it.
+    // After the root's kill, which settles a walk that left only the root.
     let tree = tree.map(|kill| child.attached.settle(&child.tree_killed, kill, fate.not_running()));
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
@@ -1068,7 +1068,7 @@ struct LateTree {
     /// The root's identity, when the attach read it.
     id: Option<ProcessId>,
     /// What each sweep left, in the order they ran. Judged together once the root's kill is known
-    /// ([`failure_note`](Self::failure_note)), as a walk that left only the root is settled by it.
+    /// ([`failure_note`](Self::failure_note)).
     sweeps: Vec<Result<(), crate::containment::dispatch::Unkilled>>,
     /// What the sweeps could not do.
     notes: Vec<String>,
@@ -1170,7 +1170,6 @@ impl LateTree {
     /// later sweep is not shown to reach what it missed.
     fn failure_note(&mut self, root_ended: bool) -> Option<String> {
         let mut failed = None;
-        // Whether a sweep succeeded after `failed`, and none failed since.
         let mut succeeded_after = false;
         for sweep in self.sweeps.drain(..) {
             match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {

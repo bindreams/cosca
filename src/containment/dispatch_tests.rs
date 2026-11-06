@@ -368,7 +368,7 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     let unkilled = |members: &[u32], root: Option<u32>| Unkilled {
         members: members.iter().map(|pid| left(*pid)).collect(),
         root: root.map(left),
-        refused_to_walk: false,
+        resolved: Vec::new(),
     };
     let skipped = |holders| TreeKillOutcome::Skipped {
         action: "walk".into(),
@@ -380,7 +380,6 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     type Answer = Result<SettleOutcome, (u32, Vec<u32>)>;
     let table: Vec<(TreeKillOutcome, bool, Answer, bool)> = vec![
         (TreeKillOutcome::Ran(Ok(())), false, Ok(SettleOutcome::Killed), true),
-        (TreeKillOutcome::NoRoot, false, Ok(SettleOutcome::Skipped), false),
         (skipped(Ok(())), true, Ok(SettleOutcome::Skipped), false),
         (skipped(Err(unkilled(&[7], None))), true, Err((7, vec![])), false),
         (
@@ -430,6 +429,180 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     }
 }
 
+/// A walk that was not made, or found no root, killed nothing: `settle` answers it with an error
+/// (`Unassessable`; the snapshot's error as it was) and marks nothing, for a reader of any kind.
+///
+/// Mutants: either is answered `Ok`; either marks the tree killed.
+#[skuld::test]
+fn settle_answers_a_walk_that_was_not_made_with_an_error_and_marks_nothing() {
+    use super::{Attached, TreeKillOutcome, TreeKilled};
+    use crate::error::Error;
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    for outcome in [
+        TreeKillOutcome::NoRoot,
+        TreeKillOutcome::Unwalked(Error::Unassessable {
+            detail: "the snapshot could not be taken".into(),
+            source: None,
+        }),
+    ] {
+        let label = format!("{outcome:?}");
+        let killed = TreeKilled::default();
+
+        let left = attached
+            .settle(&killed, outcome, true)
+            .expect_err("nothing was killed, whatever became of the root");
+
+        assert!(matches!(left.first, Error::Unassessable { .. }), "{label}: {left}");
+        assert!(left.others.is_empty(), "{label}: {left}");
+        assert!(!killed.is_set(), "{label}");
+    }
+}
+
+/// A root that is gone leaves nothing to walk once this handle has killed the tree: a later kill or
+/// drop that finds no root is settled, not an error. Mutant: it is `Unassessable` whatever the mark
+/// says (the drop after a `kill_tree` and a `wait` then warns, on Windows).
+#[skuld::test]
+fn settle_answers_a_gone_root_as_killed_once_the_handle_killed_the_tree() {
+    use super::{Attached, SettleOutcome, TreeKillOutcome, TreeKilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), false)
+        .expect("the tree is killed");
+
+    let later = attached
+        .settle(&killed, TreeKillOutcome::NoRoot, false)
+        .expect("the tree was killed already");
+
+    assert_eq!(later, SettleOutcome::Killed);
+}
+
+// What a `TreeWalk` handle remembers of the members a kill left =====
+
+/// A `MemberNotKilled` for `pid`, as a walk reports a member it left.
+fn member_left(pid: u32) -> crate::error::Error {
+    crate::error::Error::MemberNotKilled {
+        pid,
+        source: Box::new(crate::error::Error::Unassessable {
+            detail: "its identity could not be read".into(),
+            source: None,
+        }),
+        note: None,
+    }
+}
+
+/// The pid a `MemberNotKilled` names.
+fn pid_left(error: &crate::error::Error) -> u32 {
+    match error {
+        crate::error::Error::MemberNotKilled { pid, .. } => *pid,
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    }
+}
+
+/// A member whose identity was never read stays left: a later kill whose walk finds nothing does not
+/// settle the tree as killed, but answers with the same member and marks nothing. Once a later kill
+/// names it itself, it is not repeated.
+///
+/// Mutants: a later walk that finds less settles the tree as killed; the member is forgotten after
+/// one report; the member is reported twice when the walk names it again.
+#[skuld::test]
+fn a_member_whose_identity_was_never_read_is_reported_again_until_a_kill_shows_it_killed() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    let left = |pids: &[u32]| {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: pids.iter().copied().map(member_left).collect(),
+            root: None,
+            resolved: Vec::new(),
+        }))
+    };
+
+    let first = attached
+        .settle(&killed, left(&[7]), true)
+        .expect_err("a member was left");
+    assert_eq!(pid_left(&first.first), 7);
+
+    let later = attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect_err("a walk that finds nothing does not show the member killed");
+    assert_eq!((pid_left(&later.first), later.others.len()), (7, 0));
+    assert!(!killed.is_set());
+
+    let named_again = attached
+        .settle(&killed, left(&[7, 8]), true)
+        .expect_err("two members are left");
+    assert_eq!(pid_left(&named_again.first), 7);
+    assert_eq!(named_again.others.iter().map(pid_left).collect::<Vec<_>>(), [8]);
+}
+
+/// A member whose identity was read and whose kill was refused is killed by identity again by the
+/// next kill that runs, and the tree is then settled and marked. Mutants: the retry does not kill it;
+/// it kills it and still answers with the earlier error.
+#[skuld::test]
+fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    let id = blocker.id();
+
+    let first = attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(id.pid())],
+                root: None,
+                resolved: vec![id],
+            })),
+            true,
+        )
+        .expect_err("the member was left");
+    assert_eq!(pid_left(&first.first), id.pid());
+    assert!(!killed.is_set());
+
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("the retry killed the member by its identity");
+
+    assert!(killed.is_set());
+    // Released after the kill: a retry that sent nothing lets the member exit on EOF, so the
+    // assertion fails instead of the wait hanging.
+    drop(stdin);
+    crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
+}
+
+/// A member whose identity was read and that has exited since stops failing the call: nothing is
+/// signalled, and the tree is settled. Mutant: the earlier error is returned whatever became of the
+/// member.
+#[skuld::test]
+fn a_member_that_exited_since_it_was_left_stops_failing_the_call() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    let id = blocker.id();
+    attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(id.pid())],
+                root: None,
+                resolved: vec![id],
+            })),
+            true,
+        )
+        .expect_err("the member was left");
+    drop(stdin);
+    blocker.wait().expect("the member exits on its own and is reaped");
+
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a member that is gone is not left");
+
+    assert!(killed.is_set());
+}
+
 // A tree call's report names the call =====
 
 /// The members a call's walk left besides the first are warned of under the name of the call that
@@ -454,7 +627,7 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![member(1), member(2)],
             root: None,
-            refused_to_walk: false,
+            resolved: Vec::new(),
         })),
         Ok(()),
         false,
