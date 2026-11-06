@@ -155,9 +155,9 @@ pub enum Error {
     ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
     ///   either way no pidfd is possible.
     ///
-    /// Only `pidfd_open` is refused. Any other failure is transient and surfaces as [`Error::Io`],
-    /// prefixed with the failed call: `pidfd_open:` (`EMFILE`, `ENFILE`, `ENOMEM`), or `pidfs_ino:`
-    /// or `poll:` for the read of the pidfd's inode or the poll of the pidfd, whatever their errno.
+    /// Only `pidfd_open` is refused. Any other failure surfaces as [`Error::Io`], prefixed with the
+    /// failed call: `pidfd_open:` (`EMFILE`, `ENFILE`, `ENOMEM`), or `pidfs_ino:` or `poll:` for the
+    /// read of the pidfd's inode or the poll of the pidfd, whatever their errno.
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this

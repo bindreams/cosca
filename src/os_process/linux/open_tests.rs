@@ -562,7 +562,7 @@ fn refused_with(errno: Errno) -> Error {
 
 /// Every refusal is `Unsupported` in the policy's message shape.
 ///
-/// Mutants: `EACCES` (or any other) missing from `refusal_name`; the detail carries a guessed
+/// Mutants: `EACCES` (or any other) missing from `FailedCall::refusal`; the detail carries a guessed
 /// cause; a different `Errno` name.
 #[skuld::test]
 fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {

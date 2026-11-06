@@ -126,25 +126,19 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
 /// refused `pidfd_open` is [`Error::Unsupported`], anything else [`Error::Io`] prefixed with the
 /// call's name.
 pub(crate) fn open_error(call: FailedCall) -> Error {
+    io_or_unsupported(OP_NAME, call)
+}
+
+/// `call` as [`Error::Unsupported`] naming `op` when [`FailedCall::refusal`] says it was refused,
+/// else [`Error::Io`] prefixed with the call's name. The classification is documented on
+/// [`Error::Unsupported`].
+fn io_or_unsupported(op: &str, call: FailedCall) -> Error {
     match call.refusal() {
-        Some(name) => pidfd_open_unsupported(OP_NAME, name),
+        Some(name) => pidfd_open_unsupported(op, name),
         None => Error::Io(crate::error::io_context(
             call.name(),
             std::io::Error::from(call.errno()),
         )),
-    }
-}
-
-/// The name of `errno` if `pidfd_open` answering it is a refusal: no pidfd is possible here.
-/// The classification is documented on [`Error::Unsupported`]; [`FailedCall::refusal`] applies it
-/// to a failed call.
-pub(crate) fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
-    match errno {
-        rustix::io::Errno::NOSYS => Some("ENOSYS"),
-        rustix::io::Errno::PERM => Some("EPERM"),
-        rustix::io::Errno::ACCESS => Some("EACCES"),
-        rustix::io::Errno::NODEV => Some("ENODEV"),
-        _ => None,
     }
 }
 
@@ -160,10 +154,7 @@ pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
 
 /// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.
 pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
-    match refusal_name(errno) {
-        Some(name) => pidfd_open_unsupported("spawn", name),
-        None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
-    }
+    io_or_unsupported("spawn", FailedCall::pidfd_open(errno))
 }
 
 /// The pre-fork probe: `pidfd_open` through `kernel` on this process's own pid, closed at once. Spawning forks

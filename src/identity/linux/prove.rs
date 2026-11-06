@@ -12,45 +12,53 @@ use rustix::process::{Pid, PidfdFlags};
 use super::kernel::{Kernel, PIDFD_THREAD};
 use crate::identity::RawPid;
 
-/// A call that failed, and the errno it answered. The name is what an error says failed.
+/// Which call failed.
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    PidfdOpen,
+    PidfsIno,
+    Poll,
+}
+
+/// A call that failed, and the errno it answered.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FailedCall {
-    name: &'static str,
+    call: Call,
     errno: Errno,
-    /// Whether the call is `pidfd_open`, the only one whose refusal means no pidfd is possible here.
-    is_pidfd_open: bool,
 }
 
 impl FailedCall {
     /// A `pidfd_open` that answered `errno`.
     pub(crate) const fn pidfd_open(errno: Errno) -> FailedCall {
         FailedCall {
-            name: "pidfd_open",
+            call: Call::PidfdOpen,
             errno,
-            is_pidfd_open: true,
         }
     }
 
     /// A read of a pidfd's inode that answered `errno`.
     pub(crate) const fn pidfs_ino(errno: Errno) -> FailedCall {
         FailedCall {
-            name: "pidfs_ino",
+            call: Call::PidfsIno,
             errno,
-            is_pidfd_open: false,
         }
     }
 
     /// A `poll` of a pidfd that answered `errno`.
     pub(crate) const fn poll(errno: Errno) -> FailedCall {
         FailedCall {
-            name: "poll",
+            call: Call::Poll,
             errno,
-            is_pidfd_open: false,
         }
     }
 
+    /// The call's name, as an error says what failed.
     pub(crate) const fn name(&self) -> &'static str {
-        self.name
+        match self.call {
+            Call::PidfdOpen => "pidfd_open",
+            Call::PidfsIno => "pidfs_ino",
+            Call::Poll => "poll",
+        }
     }
 
     pub(crate) const fn errno(&self) -> Errno {
@@ -61,10 +69,12 @@ impl FailedCall {
     /// [`Error::Unsupported`](crate::error::Error::Unsupported). No other call is refused; its
     /// failure, with any errno, is its own.
     pub(crate) fn refusal(&self) -> Option<&'static str> {
-        if self.is_pidfd_open {
-            crate::os_process::linux::open::refusal_name(self.errno)
-        } else {
-            None
+        match (self.call, self.errno) {
+            (Call::PidfdOpen, Errno::NOSYS) => Some("ENOSYS"),
+            (Call::PidfdOpen, Errno::PERM) => Some("EPERM"),
+            (Call::PidfdOpen, Errno::ACCESS) => Some("EACCES"),
+            (Call::PidfdOpen, Errno::NODEV) => Some("ENODEV"),
+            _ => None,
         }
     }
 }

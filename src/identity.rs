@@ -672,6 +672,9 @@ pub(crate) use backend::pid_stat;
 pub(crate) use backend::kernel::{HostKernel, Kernel};
 
 #[cfg(target_os = "linux")]
+pub(crate) use backend::call_error;
+
+#[cfg(target_os = "linux")]
 pub(crate) use backend::prove::{prove, FailedCall, Proof};
 
 #[cfg(all(target_os = "linux", test))]
@@ -711,7 +714,7 @@ pub(crate) use backend::proc_view::{
 pub(crate) struct UnknownCause {
     #[cfg(target_os = "linux")]
     view: Option<ViewUnreadable>,
-    /// The failed `pidfd_open`, `fstatfs` or `fstat` that left the read `Unknown`.
+    /// The failed `pidfd_open`, `pidfs_ino` or `poll` that left the read `Unknown`.
     #[cfg(target_os = "linux")]
     call: Option<FailedCall>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
