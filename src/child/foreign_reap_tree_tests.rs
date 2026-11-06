@@ -353,7 +353,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
     let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
-    let other = child.id().with_other_value();
+    let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
     // pid. This guard clears the second force too, should it go unconsumed.
     let _reads = force_next_root_read(Resolved::Found(other));
@@ -410,7 +410,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
-    let other = child.id().with_other_value();
+    let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 
     child.kill_tree().expect("every holder was reached");
@@ -672,7 +672,7 @@ fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_t
     let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
-    let other = child.id().with_other_value();
+    let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 
     let result = child.kill_tree();

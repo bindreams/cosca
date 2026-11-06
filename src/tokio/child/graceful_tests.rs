@@ -86,7 +86,7 @@ async fn cleanup(child: &mut crate::tokio::Child) {
 async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, stdin) = kill_only_blocker().await;
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
@@ -128,7 +128,7 @@ async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
 async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, stdin) = kill_only_blocker().await;
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
@@ -333,7 +333,7 @@ async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
 async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, stdin) = kill_only_blocker().await;
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::Containment);
@@ -378,7 +378,7 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, stdin) = kill_only_blocker().await;
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::UnassessablePerMember);
@@ -483,7 +483,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     #[cfg(windows)]
     let _sock = {
         use std::io::Read;
-        let mut sock = crate::test_child::accept_or_die(&listener, child.id());
+        let mut sock = crate::test_child::accept_or_die(&listener, child.id().expect(crate::test_child::IDENTITY_READ));
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("registration tag");
         sock
@@ -591,7 +591,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
         .read_exact(&mut readiness)
         .await
         .expect("readiness byte");
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     // The root is still blocked on `read _ <&4`: release it, then wait for its exit WITHOUT
     // reaping.
     exit_gate.write_all(b"x\n").await.expect("release the root's exit 0");
@@ -658,7 +658,7 @@ async fn async_graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_
         .read_exact(&mut readiness)
         .await
         .expect("readiness byte");
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Present,

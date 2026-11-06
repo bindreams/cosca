@@ -20,7 +20,7 @@ const ABSENT_PID: u32 = 0x7fff_fffe;
 pub(crate) fn child_over(fake: &FakeProcess) -> Child {
     Child::from_parts(
         OwnedChild::new(Box::new(fake.clone().with_pid(ABSENT_PID))),
-        ProcessId::from_parts_for_test(ABSENT_PID, Key::for_test(1)),
+        Some(ProcessId::from_parts_for_test(ABSENT_PID, Key::for_test(1))),
         BTreeMap::new(),
         false,
         Attachment {

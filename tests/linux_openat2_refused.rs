@@ -203,7 +203,7 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snaps
 fn a_seccomp_refused_openat2_makes_process_kill_tree_and_terminate_tree_unsupported_naming_openat2() {
     for (errno, name) in REFUSALS {
         let (child, control) = common::spawn_blocker();
-        let process = cosca::Process::open(child.id())
+        let process = cosca::Process::open(child.id().expect("the spawn read the child's identity"))
             .expect("open")
             .expect("the child is running");
         let results = with_openat2_refused(errno, || {

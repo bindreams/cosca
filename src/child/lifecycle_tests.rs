@@ -255,7 +255,7 @@ fn drop_kills_and_reaps_the_child() {
     cmd.stdin(stdin).expect("set stdin");
     let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
     let child = cmd.spawn().expect("spawn");
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     assert_eq!(
         id.is_alive(),
         crate::identity::Liveness::Alive,

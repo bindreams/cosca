@@ -596,9 +596,12 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let left = super::hard_kill(&crate::identity::HostKernel, child.id())
-        .into_result()
-        .expect_err("the kill is refused");
+    let left = super::hard_kill(
+        &crate::identity::HostKernel,
+        child.id().expect(crate::test_child::IDENTITY_READ),
+    )
+    .into_result()
+    .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
     let err = left.root.expect("the root was left");
     // The message reads once: the pid, then the OS's own words.
@@ -631,9 +634,12 @@ fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_
 ) {
     let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
 
-    let left = super::hard_kill(&crate::identity::HostKernel, child.id())
-        .into_result()
-        .expect_err("the helper refuses the kill");
+    let left = super::hard_kill(
+        &crate::identity::HostKernel,
+        child.id().expect(crate::test_child::IDENTITY_READ),
+    )
+    .into_result()
+    .expect_err("the helper refuses the kill");
 
     assert!(left.root.is_none(), "the root was killed: {:?}", left.root);
     assert_eq!(left.members.len(), 1, "{:?}", left.members);
@@ -721,7 +727,11 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
     let mark = crate::log_capture::mark();
 
-    super::terminate(&crate::identity::HostKernel, child.id()).expect("best effort");
+    super::terminate(
+        &crate::identity::HostKernel,
+        child.id().expect(crate::test_child::IDENTITY_READ),
+    )
+    .expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     let warned = crate::log_capture::warns_since(mark, "was sent no SIGTERM");

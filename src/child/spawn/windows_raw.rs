@@ -216,16 +216,17 @@ pub(crate) fn spawn_raw(
     };
     let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
     let raw_handle = owned.os_handle().as_raw_handle();
-    let (resolved, cause, _) = resolve_identity(
+    let (resolved, cause, mut why) = resolve_identity(
         &crate::identity::HostKernel,
         pid,
         &crate::wait::exit_only::Target::Handle(owned.os_handle()),
     );
     let id = match resolved {
-        crate::identity::Resolved::Found(id) => id,
+        crate::identity::Resolved::Found(id) => Ok(id),
+        // Kept with no identity; see `Child::id`.
+        crate::identity::Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
         other => {
-            // The read failed, so no identity is known. A child the teardown could not end comes back
-            // in the failure.
+            // A child the teardown could not end comes back in the failure.
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
                 None,
@@ -241,12 +242,13 @@ pub(crate) fn spawn_raw(
             ));
         }
     };
+    let id_read = id.as_ref().ok().copied();
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
-                Some(id),
+                id_read,
                 Past::Clean,
                 Disposition::HandBack,
                 None,
@@ -256,7 +258,7 @@ pub(crate) fn spawn_raw(
         }
     };
 
-    Ok(Child::from_parts(owned, id, parent_ends, kill_on_drop, attachment))
+    Ok(Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment))
 }
 
 /// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`
