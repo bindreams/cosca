@@ -72,7 +72,7 @@ async fn async_kill_tree_tears_down_tree() {
     })
     .await;
     let (root, grand) = (
-        common::Member::new(root, child.id().pid()),
+        common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     child.kill_tree().expect("kill_tree");
@@ -146,7 +146,7 @@ async fn async_contain_with_treewalk_tears_down_tree() {
     };
     assert_eq!(child.containment(), expected);
     let (root, grand) = (
-        common::Member::new(root, child.id().pid()),
+        common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     child.kill_tree().expect("treewalk kill_tree");
@@ -257,7 +257,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     })
     .await;
     let (root, grand) = (
-        common::Member::new(root, child.id().pid()),
+        common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     {

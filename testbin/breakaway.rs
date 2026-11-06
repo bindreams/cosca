@@ -135,7 +135,7 @@ impl crate::accept::Target for ChildHandle {
     fn pid(&self) -> u32 {
         match self {
             ChildHandle::Raw(c) => c.id(),
-            ChildHandle::Cosca(c) => c.id().pid(),
+            ChildHandle::Cosca(c) => c.pid(),
         }
     }
 
@@ -208,7 +208,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
             }
             match cmd.spawn() {
                 Ok(c) => {
-                    let pid = c.id().pid();
+                    let pid = c.pid();
                     ("Ok".to_string(), Some(ChildHandle::Cosca(c)), Some(pid))
                 }
                 Err(e) => (cosca_outcome(&e), None, None),

@@ -607,13 +607,10 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     let err = left.root.expect("the root was left");
     // The message reads once: the pid, then the OS's own words.
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
-    assert_eq!(
-        err.to_string(),
-        format!("pid {} was not killed: {os}", child.id().pid())
-    );
+    assert_eq!(err.to_string(), format!("pid {} was not killed: {os}", child.pid()));
     match err {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
-            assert_eq!(pid, child.id().pid());
+            assert_eq!(pid, child.pid());
             assert!(
                 matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
                 "{source:?}"
@@ -646,7 +643,7 @@ fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_
     assert_eq!(left.members.len(), 1, "{:?}", left.members);
     match &left.members[0] {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
-            assert_ne!(*pid, child.id().pid(), "the helper, not the root");
+            assert_ne!(*pid, child.pid(), "the helper, not the root");
             assert!(
                 matches!(**source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
                 "{source:?}"
@@ -669,15 +666,13 @@ fn process_kill_tree_of_a_root_that_refuses_the_signal_names_the_root(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let process = crate::Process::open_pid(child.id().pid())
-        .expect("open")
-        .expect("running");
+    let process = crate::Process::open_pid(child.pid()).expect("open").expect("running");
 
     let err = process.kill_tree().expect_err("the root refuses the kill");
 
     match err {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
-            assert_eq!(pid, child.id().pid());
+            assert_eq!(pid, child.pid());
             assert!(
                 matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
                 "{source:?}"
@@ -700,9 +695,7 @@ fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once
 ) {
     crate::log_capture::install();
     let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(2, |_| {});
-    let process = crate::Process::open_pid(child.id().pid())
-        .expect("open")
-        .expect("running");
+    let process = crate::Process::open_pid(child.pid()).expect("open").expect("running");
     let mark = crate::log_capture::mark();
 
     let err = process.kill_tree().expect_err("two members refuse the kill");

@@ -98,7 +98,7 @@ async fn kill_of_an_orphaned_root_sends_nothing() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let _looks = orphaned();
@@ -123,7 +123,7 @@ async fn kill_of_an_unknown_root_is_sent_through_its_handle() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let _looks = Untrusted::Unknown.peek();
 
@@ -140,7 +140,7 @@ async fn terminate_of_an_orphaned_root_sends_nothing() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let _looks = orphaned();
@@ -165,7 +165,7 @@ async fn terminate_of_an_unknown_root_is_sent_through_its_handle() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let _looks = Untrusted::Unknown.peek();
 
@@ -185,7 +185,7 @@ async fn kill_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
@@ -223,7 +223,7 @@ async fn kill_tree_of_a_backend_forgotten_as_launchd_held_says_launchd_holds_it(
     crate::log_capture::install();
     let groups = crate::containment::unix::fault::record_kill_group();
     let (mut child, writer) = group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let looks = orphaned();
     child
         .proc_mut()
@@ -252,7 +252,7 @@ async fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_kill_group();
         let (mut child, writer) = group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let looks = state.peek();
@@ -288,7 +288,7 @@ async fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (mut child, writer, descendant) = session_tree().await;
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let _looks = state.peek();
@@ -338,7 +338,7 @@ async fn terminate_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
         let (child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
@@ -376,7 +376,7 @@ async fn terminate_tree_of_an_untrusted_group_root_sends_no_killpg() {
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
         let (child, writer) = group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let looks = state.peek();
@@ -415,7 +415,7 @@ async fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() 
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (child, writer, descendant) = session_tree().await;
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let _looks = state.peek();
@@ -465,7 +465,7 @@ async fn terminate_tree_decides_on_one_look_at_the_root() {
     crate::tokio::test_runtime::assert_current_thread();
     let groups = crate::containment::unix::fault::record_term_group();
     let (child, writer) = group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
 
     child.terminate_tree().expect("a running root's group is signalled");
@@ -481,7 +481,7 @@ async fn kill_tree_decides_on_one_look_at_the_root() {
     crate::tokio::test_runtime::assert_current_thread();
     let groups = crate::containment::unix::fault::record_kill_group();
     let (mut child, writer) = group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _looks = force_peeks([
         Ok(PeekOutcome::Running),
         Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
@@ -507,7 +507,7 @@ async fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
@@ -535,7 +535,7 @@ async fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let _looks = force_peeks([Ok(PeekOutcome::Running), Err(std::io::Error::other("unreadable"))]);
 
@@ -555,7 +555,7 @@ async fn kill_tree_reads_the_root_once_for_its_backstop() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let _looks = force_peeks([
         Ok(PeekOutcome::Running),

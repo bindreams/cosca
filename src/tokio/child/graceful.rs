@@ -157,7 +157,7 @@ impl Child {
             if let Err(e) = &watch {
                 log::debug!(
                     "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {e}",
-                    id = self.id().pid()
+                    id = self.pid()
                 );
             }
             #[cfg(test)]
@@ -375,7 +375,7 @@ impl Child {
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
                 log::debug!(
                     "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {e}",
-                    id = self.id().pid()
+                    id = self.pid()
                 );
                 Err(e)
             }
@@ -430,7 +430,7 @@ impl Child {
         if let Some(e) = &watch_err {
             log::debug!(
                 "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
-                id = self.id().pid()
+                id = self.pid()
             );
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
@@ -459,7 +459,7 @@ impl Child {
                     if let Err(e) = self.wait().await {
                         log::debug!(
                             "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
-                            id = self.id().pid()
+                            id = self.pid()
                         );
                     }
                 }
@@ -470,17 +470,14 @@ impl Child {
         fault::run_hook(fault::HookPoint::BeforeReap);
         #[cfg(target_os = "macos")]
         if self.root_is_unpinned() {
-            return Err(crate::signal::unpinned_status(
-                self.id().pid(),
-                "graceful_shutdown_tree",
-            ));
+            return Err(crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"));
         }
         #[cfg(unix)]
         if self.os.proc.as_ref().is_some_and(|proc| proc.forgot_unproven()) {
-            return Err(crate::child::tree_call::status_of_an_unproven_root(self.id().pid()));
+            return Err(crate::child::tree_call::status_of_an_unproven_root(self.pid()));
         }
         #[cfg(unix)]
-        let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.id().pid())?;
+        let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.pid())?;
         #[cfg(not(unix))]
         let status = self.wait().await?;
         if let Some(e) = watch_err {
@@ -494,7 +491,7 @@ impl Child {
         if let Err(e) = &term {
             log::debug!(
                 "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {e}",
-                id = self.id().pid()
+                id = self.pid()
             );
         }
         Ok(status)

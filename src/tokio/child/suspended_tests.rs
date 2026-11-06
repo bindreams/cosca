@@ -127,7 +127,7 @@ mod on_windows {
     /// Drop `child` (built by [`drop_leg_blocker`]`(true)`), then release its stdin: the drop's kill
     /// came first, so the child dies with the kill's exit code, or the test fails by assertion.
     fn drop_and_expect_it_killed(child: Child, writer: Option<std::io::PipeWriter>, what: &str) {
-        let remote = Remote::open(child.id().pid());
+        let remote = Remote::open(child.pid());
         drop(child);
         drop(writer);
         remote.wait_for_death();
@@ -215,7 +215,7 @@ mod on_windows {
     async fn frozen_child_has_executed_no_instruction_before_resume() {
         for raw in BACKENDS {
             let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            let thread = InitialThread::of(frozen.id().pid());
+            let thread = InitialThread::of(frozen.pid());
             assert_eq!(thread.suspend_count(), 1, "raw={raw}: frozen until resumed");
 
             let child = frozen.resume().expect("resume");
@@ -231,7 +231,7 @@ mod on_windows {
     async fn resume_succeeds_when_another_party_started_a_running_thread_in_the_frozen_child() {
         for raw in BACKENDS {
             let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.id().pid());
+            let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.pid());
 
             let child = frozen
                 .resume()
@@ -491,8 +491,8 @@ mod on_windows {
     /// `Child`'s bounded one: it signals and returns, so the proof is the process object, opened
     /// while the frozen child pins the pid.
     fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: std::io::PipeWriter, what: &str) {
-        let remote = Remote::open(frozen.id().pid());
-        let thread = InitialThread::of(frozen.id().pid());
+        let remote = Remote::open(frozen.pid());
+        let thread = InitialThread::of(frozen.pid());
         drop(frozen);
         release_and_expect_it_killed(&thread, writer, &remote, what);
     }
@@ -549,8 +549,8 @@ mod on_windows {
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
         let frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let remote = Remote::open(frozen.id().pid());
-        let thread = InitialThread::of(frozen.id().pid());
+        let remote = Remote::open(frozen.pid());
+        let thread = InitialThread::of(frozen.pid());
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
         let err = frozen.resume().expect_err("the resume was forced to fail");
@@ -571,7 +571,7 @@ mod on_windows {
         let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
         // Opened while `frozen` holds the process, so the pid cannot name anything else.
         // SAFETY: plain Win32 calls; the handle is closed below.
-        let victim: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, frozen.id().pid()) }
+        let victim: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, frozen.pid()) }
             .expect("open the frozen child");
         // SAFETY: `victim` is live.
         unsafe {
@@ -599,8 +599,8 @@ mod on_windows {
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
         let frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let remote = Remote::open(frozen.id().pid());
-        let thread = InitialThread::of(frozen.id().pid());
+        let remote = Remote::open(frozen.pid());
+        let thread = InitialThread::of(frozen.pid());
         thread.suspend_once();
 
         let err = frozen.resume().expect_err("the child is still frozen after one resume");

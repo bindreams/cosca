@@ -50,8 +50,9 @@ fn spawned_child_has_live_identity() {
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
-    // id() is stable across two calls.
-    assert_eq!(child.id().pid(), child.id().pid());
+    // id() is stable across two calls, and pid() is its number.
+    assert_eq!(child.id(), child.id());
+    assert_eq!(child.pid(), child.id().pid());
     let _ = child.wait();
 }
 
@@ -1193,7 +1194,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
         gc_stream,
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
-    let root = common::Member::new(root_stream, child.id().pid());
+    let root = common::Member::new(root_stream, child.pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1224,7 +1225,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
         gc_stream,
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
-    let mut root = common::Member::new(root_stream, child.id().pid());
+    let mut root = common::Member::new(root_stream, child.pid());
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
     } else {
@@ -1888,7 +1889,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
 
     // The worker is `sh`'s own fork, made after `sh` exec'd, so the root's placement — whichever
     // way it went — is settled. The root is alive in `wait`, so its cgroup is readable.
-    let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let root_cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.pid())).expect("root cgroup");
     let root_cgroup = unified_cgroup(&root_cgroup).to_string();
     let leaf_prefix = format!("{own}/cosca-{}-", std::process::id());
     // A leaf is `cosca-<pid>-<seq>-<random>`.
@@ -1962,7 +1963,7 @@ fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor(#[fix
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
 
     // The root is alive (it holds its control socket), so its cgroup is readable.
-    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id().pid())).expect("root cgroup");
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", child.pid())).expect("root cgroup");
     let procs = format!("{}/cgroup.procs", unified_cgroup(&cgroup));
     let held: Vec<String> = std::fs::read_dir("/proc/self/fd")
         .expect("list this process's fds")

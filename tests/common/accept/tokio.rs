@@ -24,7 +24,7 @@ pub async fn accept_or_die_async_also(
     child: &mut cosca::tokio::Child,
     also: Option<ProcessId>,
 ) -> TcpStream {
-    let target_pid = child.id().pid();
+    let target_pid = child.pid();
     // As in the sync path: a target that has already exited is dead, decided before any wait so
     // that no reactor-readiness ordering between the accept arm and the exit arm can matter.
     #[cfg(unix)]

@@ -151,7 +151,7 @@ pub(crate) fn reap_behind_status(pid: u32) -> std::process::ExitStatus {
 /// A [`session_sleep`] child, killed and reaped behind its back, and its group's id.
 pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
     let child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     (child, pid)
@@ -230,7 +230,7 @@ pub(crate) fn escaped_holder_tree(mode: crate::ContainMode, ignore_term: bool) -
         .read_line(&mut line)
         .expect("read the holder's pid");
     let pid: u32 = line.trim().parse().expect("the holder's pid");
-    assert_left_the_group(pid, child.id().pid());
+    assert_left_the_group(pid, child.pid());
     let holder = EscapedHolder {
         pid,
         _stdin: child.stdin().expect("stdin pipe"),
