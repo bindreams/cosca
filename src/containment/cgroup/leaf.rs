@@ -508,8 +508,8 @@ impl CgroupLeaf {
     }
 
     /// Whether a `cgroup.kill` write on this leaf landed, by any handle's teardown. A failed write
-    /// after it does not undo it: the landed kill still bounds the leaf's drain. Every reader of
-    /// the leaf's record asks here.
+    /// after it does not undo it: the landed kill still bounds the leaf's drain. Every reader that
+    /// asks whether a kill landed asks here.
     pub(crate) fn kill_landed(&self) -> bool {
         self.kill.landed()
     }

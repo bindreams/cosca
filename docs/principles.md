@@ -101,11 +101,12 @@ leaves undrained stays behind, logged as principle 7 says.
 A leaf whose `cgroup.kill` fails, and on which no earlier kill landed, is given up the same way,
 though the drop still reaps a root its kill reached. A teardown writes `cgroup.kill` once, and a
 failed write is final for it. The one place that writes again within a call is `finish_elevated`,
-after its own failed write: it makes the drop's tree kill itself, early, because it hands the root
-back and disarms the handle, so the drop that would have made that kill never runs. Everywhere
-else a second write is a different teardown's (a `kill_tree()`, then the drop).
-Its still-running root is left to tokio's drop of its `Child`: an in-drop `try_wait`
-([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
+when its first tree kill did not settle the tree (it failed or was skipped): it makes the drop's
+tree kill itself, early, because it hands the root back and disarms the handle, so the drop that
+would have made that kill never runs. Everywhere else a second write is a different teardown's (a
+`kill_tree()`, then the drop). A leaf the async drop gives up leaves its still-running root to
+tokio's drop of its `Child`: an in-drop `try_wait` ([tokio reap.rs], [tokio pidfd_reaper.rs]),
+then tokio's orphan queue. Both are tokio's state, not
 cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4). The orphan
 queue is best-effort: it drains only while some tokio runtime parks ([tokio runtime/process.rs]),
 and until then the root stays a zombie.
