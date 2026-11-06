@@ -183,7 +183,7 @@ fn a_resumed_child_runs() {
 
         let mut sock = accept_or_die(&listener, &mut child);
         let (tag, pid) = common::read_tag_and_pid(&mut sock);
-        assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
+        assert_eq!((tag, pid), (b'C', child.pid()), "{backend}");
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
         // Released after the kill: a kill that sent nothing exits 0.
@@ -204,7 +204,7 @@ async fn an_async_resumed_child_runs() {
 
         let mut sock = accept_or_die_async(&listener, &mut child).await;
         let (tag, pid) = common::read_tag_and_pid(&mut sock);
-        assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}");
+        assert_eq!((tag, pid), (b'C', child.pid()), "{backend}");
         common::assert_echoes(&mut sock, "the resumed child");
         child.kill().expect("kill");
         drop(sock);
@@ -331,7 +331,7 @@ fn resumed_then_detached_child_is_alive(backend: &str, shape: &str) {
         .expect("resume");
     let mut sock = accept_or_die(&listener, &mut child);
     let (tag, pid) = common::read_tag_and_pid(&mut sock);
-    assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}/{shape}");
+    assert_eq!((tag, pid), (b'C', child.pid()), "{backend}/{shape}");
     // While the `Child` pins the pid: the handle that ends the child once the test is done.
     let cleanup = Watch::open_terminable(pid);
 
@@ -373,7 +373,7 @@ async fn async_resumed_then_detached_child_is_alive(backend: &str, shape: &str) 
         .expect("resume");
     let mut sock = accept_or_die_async(&listener, &mut child).await;
     let (tag, pid) = common::read_tag_and_pid(&mut sock);
-    assert_eq!((tag, pid), (b'C', child.id().pid()), "{backend}/{shape}");
+    assert_eq!((tag, pid), (b'C', child.pid()), "{backend}/{shape}");
     // While the `Child` pins the pid: the handle that ends the child once the test is done.
     let cleanup = Watch::open_terminable(pid);
 

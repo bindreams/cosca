@@ -87,7 +87,7 @@ pub trait Target {
 
 impl Target for cosca::Child {
     fn pid(&self) -> u32 {
-        self.id().pid()
+        self.pid()
     }
 
     fn has_exited(&mut self) -> bool {

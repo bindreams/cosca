@@ -115,7 +115,7 @@ fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_p
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
     let child = session(&["true"]).spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.wait().expect("reap the root");
 
     let mark = crate::log_capture::mark();
@@ -187,7 +187,7 @@ fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_war
     let teardowns = record_root_teardowns();
     let (child, stdin) = session_blocker();
     let blocker = release_at_drop_kill(stdin);
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -206,7 +206,7 @@ fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let (child, stdin) = session_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     drop(stdin);
     crate::test_child::assert_zombie_sigkilled("the root", pid);
@@ -269,7 +269,7 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pi
     cmd.args(["true"]);
     cmd.contain_with(ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.wait().expect("reap the root");
 
     let mark = crate::log_capture::mark();
@@ -306,7 +306,7 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
     let blocker = release_at_drop_kill(child.stdin().expect("stdin pipe"));
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -321,7 +321,7 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
 /// A blocker root, killed and then waited for, so that only `wait()` sets the own-reap flag.
 fn waited_on_blocker_root() -> (u32, crate::Child) {
     let (child, stdin) = session_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
@@ -363,7 +363,7 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
     let teardowns = record_root_teardowns();
     let (child, stdin) = session_blocker();
     let blocker = release_at_drop_kill(stdin);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
 
     let mark = crate::log_capture::mark();
@@ -388,7 +388,7 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
     let (child, stdin) = session_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     drop(stdin);
     crate::test_child::assert_zombie_sigkilled("the root", pid);
@@ -418,7 +418,7 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["true"]).spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill_tree().expect("kill_tree");
     child.wait().expect("reap the root");
     recorder.assert_killed_only(pid as i32);
@@ -443,7 +443,7 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let (child, stdin) = session_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::AfterTerminate, stdin);
     let status = child
         .graceful_shutdown_tree(std::time::Duration::from_secs(60))
@@ -472,7 +472,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
     let recorder = record_kill_group();
     let (child, stdin) = session_blocker();
     let blocker = release_between_kill_and_wait(stdin);
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let (err, fate) = super::spawn::finish_elevated(
@@ -746,7 +746,7 @@ fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descenda
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
-    let root = child.id().pid();
+    let root = child.pid();
     let mark = crate::log_capture::mark();
 
     let err = child.kill_tree().expect_err("a descendant was left");
@@ -770,7 +770,7 @@ fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
     let blocker = release_between_kill_and_wait(stdin);
-    let root = child.id().pid();
+    let root = child.pid();
     let mark = crate::log_capture::mark();
 
     drop(child);
@@ -845,7 +845,7 @@ fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[fixtur
     stdout.read_exact(&mut started).expect("read `started`");
     let stdin = child.stdin().expect("stdin pipe");
     let mut stderr = child.stderr().expect("stderr pipe");
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     // Released as the kill returns; see [`KillRelease`].
     let release = crate::child::front_cgroup_tests::release_after_cgroup_kill(stdin);
 
@@ -914,7 +914,7 @@ fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
     assert_eq!(child.containment(), Containment::FdMarker);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     // Released after the kill: a `kill` that sent nothing fails the assertion, not the reap.
     drop(stdin);

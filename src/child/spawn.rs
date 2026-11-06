@@ -155,7 +155,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
-        let held = child.proc.hold(child.id.pid());
+        let held = child.proc.hold(child.pid());
         child.attached.hard_kill_for_drop(&view, &held.group())
     };
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
@@ -165,7 +165,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     });
     let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let (root_note, torn) = if view.unpinned_root() {
         // Nothing was signalled.
         let fate = crate::os_process::child::Foreign::Gone.fate(false);
@@ -187,7 +187,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
             crate::elevation::front::Gate::CgroupOnly => Err(crate::elevation::front::cgroup_not_killed_of(
                 child.front,
-                child.id().pid(),
+                child.pid(),
                 tree_failure.as_deref(),
             )),
             crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),

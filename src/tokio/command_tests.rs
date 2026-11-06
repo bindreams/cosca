@@ -132,7 +132,7 @@ async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWri
     let root = Pidfd::of(child);
     #[cfg(not(target_os = "linux"))]
     let released = crate::child::spawn::fault::release_between_kill_and_wait(writer);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = crate::send_log::Capture::start();
     let mut teardown = std::pin::pin!(super::after_the_spawn(
         crate::error::Error::Io(std::io::Error::other("pump")),

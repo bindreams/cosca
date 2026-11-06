@@ -92,7 +92,7 @@ pub fn spawn_frozen_report(addr: &str, backend: &str) -> ! {
     let mut cmd = blocker_command(backend, "127.0.0.1:9");
     cmd.contain();
     let frozen = cmd.spawn_suspended().expect("spawn the frozen grandchild");
-    let child_pid = frozen.id().pid();
+    let child_pid = frozen.pid();
     writeln!(
         sock,
         "frozen pid={child_pid} containment={:?} job={} kill_on_close={}",
@@ -115,7 +115,7 @@ pub fn spawn_frozen_report_async(addr: &str, backend: &str) -> ! {
         cmd.contain();
         cmd.spawn_suspended().expect("spawn the async frozen grandchild")
     });
-    let child_pid = frozen.id().pid();
+    let child_pid = frozen.pid();
     writeln!(
         sock,
         "frozen pid={child_pid} containment={:?} job={} kill_on_close={}",

@@ -228,7 +228,7 @@ pub(crate) fn assert_sent_by_identity(sends: &Capture, signo: i32, want: &[u32],
 fn kill_of_an_orphaned_root_sends_nothing() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let fake = orphan(&mut child);
@@ -255,7 +255,7 @@ fn kill_of_an_orphaned_root_sends_nothing() {
 fn kill_of_an_unknown_root_is_sent_through_its_handle() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let fake = Untrusted::Unknown.script(&mut child);
 
@@ -271,7 +271,7 @@ fn kill_of_an_unknown_root_is_sent_through_its_handle() {
 fn terminate_of_an_orphaned_root_sends_nothing() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let fake = orphan(&mut child);
@@ -295,7 +295,7 @@ fn terminate_of_an_orphaned_root_sends_nothing() {
 fn terminate_of_an_unknown_root_is_sent_through_its_handle() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let fake = Untrusted::Unknown.script(&mut child);
 
@@ -316,7 +316,7 @@ fn kill_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
@@ -351,7 +351,7 @@ fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_kill_group();
         let (mut child, writer) = group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = state.script(&mut child);
@@ -388,7 +388,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (mut child, writer, descendant) = session_tree();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = state.script(&mut child);
@@ -436,7 +436,7 @@ fn terminate_tree_of_an_untrusted_walked_root_sends_nothing() {
     crate::log_capture::install();
     for state in BOTH {
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let walks = crate::containment::treewalk::fault::record_walks();
         let mark = crate::log_capture::mark();
@@ -472,7 +472,7 @@ fn terminate_tree_of_an_untrusted_group_root_sends_no_killpg() {
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
         let (mut child, writer) = group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = state.script(&mut child);
@@ -509,7 +509,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (mut child, writer, descendant) = session_tree();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = state.script(&mut child);
@@ -563,7 +563,7 @@ fn terminate_tree_terminates_a_trusted_session_root() {
 fn terminate_tree_decides_on_one_look_at_the_root() {
     let groups = crate::containment::unix::fault::record_term_group();
     let (mut child, writer) = group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let fake = child
         .proc
         .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
@@ -584,7 +584,7 @@ fn terminate_tree_decides_on_one_look_at_the_root() {
 fn kill_tree_decides_on_one_look_at_the_root() {
     let groups = crate::containment::unix::fault::record_kill_group();
     let (mut child, writer) = group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let fake = child.proc.script_over(|f| {
         f.peeks([
             Ok(PeekOutcome::Running),
@@ -612,7 +612,7 @@ fn kill_tree_decides_on_one_look_at_the_root() {
 fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let fake = child
@@ -641,7 +641,7 @@ fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
 fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let fake = child
         .proc
