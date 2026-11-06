@@ -111,10 +111,9 @@ fn failed_spawn_as(
         Ok(child) => panic!("the spawn must fail after its fork: {:?}", child.id()),
         Err(e) => crate::child::spawn::failure::expect_may_have_started_with(e),
     };
-    let group_warns = crate::log_capture::records_since_on_current_thread(mark, "left running")
+    let group_warns = crate::log_capture::warns_since(mark, "left running")
         .into_iter()
-        .filter(|(level, text)| *level <= log::Level::Warn && text.contains("process group"))
-        .map(|(_, text)| text)
+        .filter(|text| text.contains("process group"))
         .collect();
     Failed {
         fate,
@@ -395,22 +394,15 @@ async fn a_tokio_exec_failure_whose_group_kill_is_refused_warns_that_the_reaped_
     );
     drop(refused);
     assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "the process group of")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "the process group of");
     assert_eq!(warns.len(), 1, "{warns:?}");
     let named = crate::child::spawn::named(None);
     assert!(
-        warns[0]
-            .1
-            .contains(&format!("could not kill the process group of {named}")),
+        warns[0].contains(&format!("could not kill the process group of {named}")),
         "{warns:?}"
     );
     assert!(
-        warns[0]
-            .1
-            .contains("already reaped, so it may never have run the program"),
+        warns[0].contains("already reaped, so it may never have run the program"),
         "{warns:?}"
     );
 }
@@ -435,16 +427,11 @@ async fn a_tokio_exec_failure_below_6_9_warns_that_the_reaped_child_may_never_ha
     drop(old_kernel);
     assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
     assert_eq!(capture.group_steps(), [GroupStep::Group(Route::Pidfd, libc::SIGKILL)]);
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "the process group of")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "the process group of");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains(&left_running_note()), "{warns:?}");
+    assert!(warns[0].contains(&left_running_note()), "{warns:?}");
     assert!(
-        warns[0]
-            .1
-            .contains("already reaped, so it may never have run the program"),
+        warns[0].contains("already reaped, so it may never have run the program"),
         "{warns:?}"
     );
 }

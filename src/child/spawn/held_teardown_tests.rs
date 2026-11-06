@@ -12,6 +12,7 @@ use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
+use crate::log_capture::warns_since;
 use crate::os_process::child::{Foreign, KillRefusal};
 use crate::os_process::fake::{failed_signal, FakeProcess, ReapAnswer};
 use crate::test_child::{held_uncontained_blocker, tear_down_held_holding};
@@ -30,15 +31,6 @@ fn held_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild,
     child.kill_on_drop = false;
     let owned = child.proc.take().expect("the child holds its root");
     (owned, stdin)
-}
-
-/// Every record at `warn` or above that this thread logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A subtree of a leaf with id 7, killed through, which places a task by its pidfd's cgroup id.
@@ -183,7 +175,7 @@ fn a_child_that_is_not_a_front_is_killed_and_reaped_and_nothing_is_handed_back()
         failed().to_string(),
         "a child that is not a front adds no note"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     assert_eq!(
         crate::child::front_kill_tests::reap(pid),
         None,
@@ -265,7 +257,7 @@ fn the_diagnosis_leads_the_one_warn_of_the_teardown() {
         let (_, _, handed_back) = tear_down_held_holding(owned, front, None, None, &mut why, stdin, failed());
         drop(why);
 
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{front:?}: {warns:?}");
         assert!(
             warns[0].starts_with("teardown after a failed spawn: diagnosis 7c2e; "),
@@ -340,7 +332,7 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
 
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(unreaped.is_none(), "a caller that leaves it is handed nothing back");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("leaving it running") && !warns[0].contains("handed back"),
@@ -369,7 +361,7 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
         error.contains("the elevated program may be running; left unreaped") && !error.contains("handed back"),
         "{error}"
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("is left running and unreaped") && !warns[0].contains("handed back"),
@@ -400,7 +392,7 @@ fn a_front_with_no_pid_is_named_as_such() {
     assert!(unreaped.is_none());
     let error = error.to_string();
     assert!(error.contains("the spawned child is what sudo left"), "{error}");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with("teardown after a failed spawn: the elevation front (pid unknown)"),
@@ -465,7 +457,7 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     after_a_failed_wait(Past::WaitMayFail).say_as_failed_spawn(&mut Diagnosis::default());
-    assert_eq!(warns_since(mark).len(), 1);
+    assert_eq!(warns_since(mark, "").len(), 1);
 }
 
 /// The test's cleanup of a blocker that a teardown may leave running: it exits on its stdin's
@@ -563,7 +555,7 @@ fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
     drop(why);
 
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         [format!(
             "teardown after a failed spawn: the identity check failed; {clause}"
         )]

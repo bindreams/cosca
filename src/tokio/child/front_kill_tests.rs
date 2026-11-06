@@ -419,18 +419,15 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     // one warn, which carries the leak. (Mutant: the forget warns on its own.) The front is only
     // looked at, and is left running: the warn does not say it was torn down. (Mutant:
     // `leave_front_noting`'s forget note claims a teardown.)
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), failures.len(), "{warns:?}");
     assert!(
         warns
             .iter()
-            .all(|(_, text)| text.contains("leaks") && text.contains("is left running and unreaped")),
+            .all(|text| text.contains("leaks") && text.contains("is left running and unreaped")),
         "{warns:?}"
     );
-    assert!(warns.iter().all(|(_, text)| !text.contains("torn down")), "{warns:?}");
+    assert!(warns.iter().all(|text| !text.contains("torn down")), "{warns:?}");
     for (_, pid, handed_back) in &failures {
         assert!(
             handed_back.is_none(),
@@ -540,7 +537,7 @@ async fn a_front_reaped_elsewhere_before_its_identity_read_is_gone() {
         .expect_err("a front reaped before its identity read fails the spawn")
         .expect_may_have_started_with();
     assert_eq!(fate, ChildFate::Gone, "{err}");
-    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("leaks"), "the warn carries the forget: {warns:?}");
 }

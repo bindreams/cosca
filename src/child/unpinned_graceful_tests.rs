@@ -9,9 +9,10 @@ use std::time::Duration;
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
     assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused,
-    group_blocker, orphan, session_tree, walked_blocker, warns_since, Untrusted, BOTH,
+    group_blocker, orphan, session_tree, walked_blocker, Untrusted, BOTH,
 };
 use crate::error::Error;
+use crate::log_capture::warns_since;
 use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::send_log::{Capture, Via};
@@ -46,7 +47,7 @@ fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
     fake.assert_peeks_exhausted();
     assert_refused(&err, "terminate");
     assert_nothing_sent(&sends);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     child
         .graceful_shutdown(Duration::ZERO)
@@ -90,7 +91,7 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
         vec![(pid, Sig::Term, Via::Identity)],
         "the escalation must send nothing to a root we do not pin: the terminate's SIGTERM is the only send"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(hook);
 
     let status = child
@@ -129,7 +130,7 @@ fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
         vec![(pid, Sig::Term, Via::Identity)],
         "only the terminate's SIGTERM went by pid"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
@@ -151,7 +152,7 @@ fn wait_timeout_still_warns_of_an_orphaned_root() {
         .expect_err("a zombie launchd holds is not reaped");
 
     assert_eq!(fake.looks(), 1, "the wait looked once");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("not ours to reap"), "{warns:?}");
     drop(writer);
@@ -188,7 +189,7 @@ fn graceful_shutdown_tree_of_an_untrusted_root_with_no_identity_channel_ends_up_
             assert_tree_refused(&err, "graceful_shutdown_tree", state);
             assert_nothing_sent(&sends);
             assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}, group: {group}");
-            assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}, group: {group}");
+            assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}, group: {group}");
             drop(hook);
 
             child
@@ -250,7 +251,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         };
         assert_eq!(signalled, want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
 }
@@ -321,7 +322,7 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
         "{:?}",
         sends.by_identity()
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
@@ -359,7 +360,7 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
@@ -389,6 +390,6 @@ fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_reap() {
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }

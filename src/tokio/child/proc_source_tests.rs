@@ -176,11 +176,7 @@ fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd(
     assert_eq!(already_reaped.raw_os_error(), Some(libc::ECHILD));
     // Reaped through the pidfd: the guard's pidfd would refuse a kill of it.
     _ = guard.defuse();
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(
         warns,
         vec![format!(
