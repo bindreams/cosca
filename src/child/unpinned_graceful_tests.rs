@@ -67,7 +67,7 @@ fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
 fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::term_ignoring_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let fake = child.proc.script_over(|f| f);
@@ -109,7 +109,7 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::term_ignoring_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     // The terminate's read and the escalation's read are peeks; the grace wait's own look is a reap.
@@ -215,7 +215,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         let _holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (mut child, writer, descendant) = session_tree();
         let sends = Capture::start();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let mark = crate::log_capture::mark();
         let after_terminate: Arc<Mutex<Option<Vec<u32>>>> = Arc::default();
         let hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
@@ -335,7 +335,7 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
 fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_sweep() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     // SAFETY: `pid` is this test's own child.
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
     crate::test_child::wait_until_zombie(pid);
@@ -372,7 +372,7 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
 fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_reap() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let fake = child.proc.script_over(|f| f);
     let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, orphan_next_peek(&fake));

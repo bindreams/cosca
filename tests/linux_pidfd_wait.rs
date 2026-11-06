@@ -54,7 +54,7 @@ fn open_pid_of_a_live_non_leader_tid_is_an_error() {
     let tid = read_tid(&mut reader);
     assert_ne!(
         tid,
-        child.id().pid(),
+        child.pid(),
         "the reported tid must be the WORKER thread's, not the process leader's"
     );
 
@@ -85,7 +85,7 @@ fn open_pid_of_a_live_non_leader_tid_is_an_error() {
 #[skuld::test]
 fn open_of_a_ptraced_zombie_thread_is_none() {
     let (mut child, writer, listener) = spawn_tid_reporter("traced-worker");
-    let leader = child.id().pid() as libc::pid_t;
+    let leader = child.pid() as libc::pid_t;
     let mut tracer = Tracer {
         leader,
         worker: None,
@@ -237,7 +237,7 @@ fn resume(pid: libc::pid_t) {
 #[skuld::test]
 fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_connecting() {
     let (mut child, _writer, listener) = spawn_tid_reporter("--not-a-real-mode");
-    let pid = child.id().pid();
+    let pid = child.pid();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_reader(&listener, &mut child)));
     let message = common::panic_message(result.expect_err("the accept must panic, not return or hang"));
     assert!(

@@ -31,7 +31,7 @@ struct Root {
 
 impl Root {
     fn of(child: &Child) -> Root {
-        let pid = child.id().pid();
+        let pid = child.pid();
         #[cfg(target_os = "linux")]
         {
             let pid = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");
@@ -196,7 +196,7 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
 
     crate::log_capture::install();
     let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     let root = Root::of(&child);
     let mut tracer = foreign_tracer::spawn_helper(pid);
     let needle = format!("async child {pid}");
@@ -395,7 +395,7 @@ async fn tokio_armed_drop_warns_once_when_the_drain_is_slow() {
     let name = "cosca-armed-drop-slow-drain";
     let child = reaped_blocker().await;
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let needle = format!("async child {}", child.id().pid());
+    let needle = format!("async child {}", child.pid());
     let mark = crate::log_capture::mark();
     let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
@@ -563,7 +563,7 @@ fn a_teardown_dropped_during_the_drain_warns_once() {
     });
     let (fate, warned_at_release, release, killed) = rt.block_on(async {
         let (child, killed) = released_blocker();
-        let needle = format!("async child {}", child.id().pid());
+        let needle = format!("async child {}", child.pid());
         let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
         let teardown = child.tear_down_awaiting();
@@ -614,7 +614,7 @@ fn a_teardown_whose_drain_watch_fails_warns_once() {
     let _watch_fails = super::fault::fail_drain_watch();
     let (fate, warned_at_release, release, killed) = rt.block_on(async {
         let (child, killed) = released_blocker();
-        let needle = format!("async child {}", child.id().pid());
+        let needle = format!("async child {}", child.pid());
         let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
         let mut child = linux::contained_by(child, leaf);
         (child.tear_down_awaiting().await, warned_at_release, release, killed)
@@ -702,7 +702,7 @@ async fn tokio_armed_drop_whose_drain_pump_cannot_start_warns_once() {
     let name = "cosca-armed-drop-pump-refused";
     let child = reaped_blocker().await;
     let (fake, leaf) = linux::fake_leaf(name, true);
-    let needle = format!("async child {}", child.id().pid());
+    let needle = format!("async child {}", child.pid());
     let mark = crate::log_capture::mark();
     let (warned_at_release, release) = release_from_the_blocking_wait(&fake, name, needle, mark);
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
@@ -734,7 +734,7 @@ async fn macos_tokio_armed_drop_warns_once_when_the_reap_is_slow() {
 
     crate::log_capture::install();
     let (child, _stdin) = blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let root = Root::of(&child);
     let mark = crate::log_capture::mark();
     let forced: Rc<RefCell<Option<Forced>>> = Rc::default();

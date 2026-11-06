@@ -37,7 +37,7 @@ enum Teardown {
 async fn reap_root(child: &mut crate::tokio::Child, release: std::io::PipeWriter, reap: Reap) {
     match reap {
         Reap::Own => {
-            kill_own_child(child.id().pid());
+            kill_own_child(child.pid());
             drop(release);
             let status = child.wait().await.expect("this handle reaps the root");
             crate::test_child::assert_killed("the root", status);
