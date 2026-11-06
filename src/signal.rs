@@ -4,7 +4,7 @@
 #[cfg(unix)]
 use std::io;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::error::io_context;
 
 /// A signal cosca sends to an owned process.
@@ -49,7 +49,7 @@ pub(crate) enum Sent {
         not(any(target_os = "macos", all(unix, feature = "tokio"))),
         allow(
             dead_code,
-            reason = "only macOS's by-pid send and tokio's forgotten backend cannot verify a process"
+            reason = "only macOS's audit-token send and tokio's forgotten backend cannot verify a process"
         )
     )]
     Unverified,
@@ -231,59 +231,35 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     }
 }
 
-/// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: no id
-/// is held, so nothing is sent). Nothing is
-/// sent to a pid that is gone or reused. A refused re-read is an error carrying the errno, so an
-/// `EPERM` stays `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it
-/// has no handle to send through.
+/// Send `sig` to the child at `pid` through an audit token, only while the pid still has the unique
+/// id `identity` (`None`: no id is held, so nothing is sent). The kernel checks the pid with its
+/// `p_idversion` and signals while it holds a reference, so a reused pid is never signalled; only
+/// the documented 2^32 version wrap is left, and the id read right before each send follows an
+/// `exec`. A refused send is the bare errno, so an `EPERM` stays raw; a refused id read keeps its
+/// errno's kind, so an `EPERM` stays `PermissionDenied`.
+///
+/// A child that has exited and is not reaped is [`Sent::Delivered`], as on Linux: it is ours, and
+/// its zombie holds the pid.
 #[cfg(target_os = "macos")]
-pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io::Result<Sent> {
-    use crate::identity::{uniq_info, ReadPurpose, UniqRead};
-    let unreadable = |errno: i32| {
-        io_context(
-            format!("pid {pid}: its identity could not be read; {sig:?} not sent"),
-            io::Error::from_raw_os_error(errno),
-        )
-    };
-    let Some(expected) = identity else {
+pub(crate) fn via_audit_token(pid: u32, identity: Option<u64>, sig: Sig) -> io::Result<Sent> {
+    use crate::os_process::macos::{read_version, signal_by_token, SignalByTokenOutcome};
+
+    let Some(unique) = identity else {
         log::debug!("child {pid} holds no unique id; {sig:?} not sent");
         return Ok(Sent::Unverified);
     };
-    match uniq_info(pid, ReadPurpose::Kill) {
-        UniqRead::Found(now) if now.unique_id == expected => {}
-        UniqRead::Found(_) | UniqRead::Gone => {
-            log::debug!("child {pid} is gone or its pid names another process; {sig:?} not sent");
-            return Ok(Sent::Gone);
-        }
-        UniqRead::Refused(errno) => return Err(unreadable(errno)),
-    }
-    // `kill(0, sig)` signals the caller's whole process group.
-    let Some(target) = crate::identity::probe::signal_target(pid) else {
-        debug_assert!(false, "a child's pid {pid} is not a single-process signal target");
-        return Err(io::Error::other(format!(
-            "pid {pid} is not a single-process signal target; {sig:?} not sent"
-        )));
+    let Some(mut idversion) = read_version(pid, unique, sig)? else {
+        log::debug!("child {pid} is gone or its pid names another process; {sig:?} not sent");
+        return Ok(Sent::Gone);
     };
+    let sent = signal_by_token(pid, unique, &mut idversion, sig);
+    // Every return of `signal_by_token` follows a send attempt, whatever it answered.
     #[cfg(test)]
-    let seam = seams::kills_refused();
-    #[cfg(not(test))]
-    let seam: Option<i32> = None;
-    let sent = match seam {
-        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-        // SAFETY: `target` is a positive pid, so the signal goes to one process.
-        None if unsafe { libc::kill(target, sig.as_libc()) } == 0 => Ok(()),
-        None => Err(io::Error::last_os_error()),
-    };
-    #[cfg(test)]
-    crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
-    match sent {
-        Ok(()) => Ok(Sent::Delivered),
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
-            log::debug!("kill({pid}, {sig:?}): the child is already gone");
-            Ok(Sent::Gone)
-        }
-        Err(e) => Err(io_context("kill", e)),
-    }
+    crate::send_log::record(pid, sig, crate::send_log::Via::Identity);
+    Ok(match sent? {
+        SignalByTokenOutcome::Delivered | SignalByTokenOutcome::ExitedUnreaped => Sent::Delivered,
+        SignalByTokenOutcome::Gone => Sent::Gone,
+    })
 }
 
 /// Test seam: while the guard lives, every kill sent on this thread is refused with `EPERM` and
@@ -317,7 +293,7 @@ pub(crate) mod seams {
         }
     }
 
-    pub(super) fn kills_refused() -> Option<i32> {
+    pub(crate) fn kills_refused() -> Option<i32> {
         REFUSED.with(Cell::get)
     }
 }

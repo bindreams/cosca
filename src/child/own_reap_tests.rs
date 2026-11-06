@@ -44,7 +44,7 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
     let (tx, rx) = channel();
     let _blocked = {
         let tx = tx.clone();
-        crate::child::shared::seams::on_lock_contended(move || {
+        crate::child::owned::seams::on_lock_contended(move || {
             _ = tx.send(Waiter::Blocked);
         })
     };

@@ -1088,31 +1088,6 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     );
 }
 
-// A failed adoption tears the child down like any other failed spawn step =====
-
-/// Windows: a failed `DuplicateHandle` fails the spawn, and the child is torn down.
-///
-/// Mutant: an `adopt` that `.expect()`s the duplication (the test panics instead of getting
-/// `Err((e, child))` and a torn-down child).
-#[cfg(windows)]
-#[skuld::test]
-fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
-    let (mut cmd, teardown) = teardown_blocker();
-    let forced = crate::child::shared::seams::force_duplicate_handle_error_once();
-    let err = cmd.spawn().err();
-    drop(forced);
-
-    let (err, fate) = expect_may_have_started_with(err.expect("a failed adoption fails the spawn"));
-    assert!(matches!(err, Error::Io(_)), "{err:?}");
-    assert_eq!(
-        fate,
-        ChildFate::Reaped,
-        "the handle still pins the process, so the teardown reaps it"
-    );
-    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
-    teardown.assert_killed();
-}
-
 /// macOS: a unique-id read the child itself is refused fails the spawn as `Unassessable`, naming
 /// the errno, and the hook stops the child before `exec`: the program did not run, and there is no
 /// child to leave behind.

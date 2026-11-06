@@ -1,14 +1,16 @@
 //! Backend-agnostic owned-process handle. A `Child` holds one of these and
 //! forwards its wait/kill/identity operations to whichever backend spawned it:
-//! the std path's [`SharedChild`], or (Windows only) the raw `CreateProcessW`
-//! child [`RawChild`]. Keeping the fan-out here lets `Child` stay backend-blind.
+//! the std path's [`OwnedChild`], or (Windows only) the raw `CreateProcessW`
+//! child [`RawChild`]. Keeping the fan-out here lets `Child` stay backend-blind. The `Std` arm
+//! also maps an [`OwnedChild`]'s outcomes to the `io::Result`s `Child` expects.
 
 use std::io;
 use std::process::ExitStatus;
 use std::time::Instant;
 
-use super::shared::SharedChild;
-use crate::error::ChildFate;
+use super::owned::{ChildWaitOutcome, OwnedChild};
+use crate::error::{ChildFate, Error};
+use crate::signal::Sig;
 
 #[cfg(windows)]
 use super::spawn::windows_raw::RawChild;
@@ -31,31 +33,34 @@ impl Torn {
 /// The process backend behind an owned [`Child`](super::Child).
 #[derive(Debug)]
 pub(crate) enum ProcHandle {
-    /// std-spawned child, adopted into a [`SharedChild`] for concurrent wait/kill.
-    Std(SharedChild),
+    /// std-spawned child, adopted into an [`OwnedChild`] for concurrent wait/kill, and its pid.
+    Std(OwnedChild, u32),
     /// Raw `CreateProcessW` child owning the process handle directly.
     #[cfg(windows)]
     Raw(RawChild),
 }
 
-impl ProcHandle {
-    /// Adopt a std-spawned child. Adoption never reaps, so nothing is reaped yet.
-    pub(crate) fn std(shared: SharedChild) -> ProcHandle {
-        ProcHandle::Std(shared)
-    }
+/// Whether a wait that finds the child's zombie held by launchd (macOS) says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Orphaned {
+    /// The wait reports it: the caller has nobody else to.
+    Warn,
+    /// The caller reports it itself, with the refusal it goes on to make, or has nothing to report.
+    Quiet,
+}
 
-    /// The unique id the handle checks its by-pid actions against. Tests only.
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn adopted_unique(&self) -> Option<u64> {
-        let ProcHandle::Std(shared) = self;
-        shared.adopted_unique()
+impl ProcHandle {
+    /// Adopt the std-spawned child `pid`. Adoption never reaps, so nothing is reaped yet.
+    pub(crate) fn std(owned: OwnedChild, pid: u32) -> ProcHandle {
+        ProcHandle::Std(owned, pid)
     }
 
     /// The process handle, borrowed from `self`.
     #[cfg(windows)]
     pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
         match self {
-            ProcHandle::Std(s) => s.raw_handle(),
+            ProcHandle::Std(s, _) => s.os_handle().as_raw_handle(),
             ProcHandle::Raw(r) => r.raw_handle(),
         }
     }
@@ -67,7 +72,7 @@ impl ProcHandle {
     /// nobody waited on yet is not a reap.
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
-            ProcHandle::Std(s) => s.is_reaped(),
+            ProcHandle::Std(s, _) => s.is_reaped(),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.is_reaped(),
         }
@@ -77,14 +82,14 @@ impl ProcHandle {
     /// [`RootState`](crate::signal::RootState).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        let ProcHandle::Std(s) = self;
-        s.state()
+        let ProcHandle::Std(s, _) = self;
+        s.hold().state()
     }
 
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {
-            ProcHandle::Std(s) => s.wait(),
+            ProcHandle::Std(s, pid) => wait_unbounded(s, *pid),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait(),
         }
@@ -93,7 +98,8 @@ impl ProcHandle {
     /// The exit status if the child has already exited, else `None`.
     pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         match self {
-            ProcHandle::Std(s) => s.try_wait(),
+            // One look at the present moment.
+            ProcHandle::Std(s, pid) => wait_std(s, *pid, Some(crate::wait::now()), Orphaned::Quiet),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.try_wait(),
         }
@@ -102,8 +108,8 @@ impl ProcHandle {
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         match self {
-            // `SharedChild` decides expiry itself, from `crate::wait::now()`, never early.
-            ProcHandle::Std(s) => s.wait_deadline(deadline),
+            // `OwnedChild` decides expiry itself, from `crate::wait::now()`, never early.
+            ProcHandle::Std(s, pid) => wait_std(s, *pid, Some(deadline), Orphaned::Warn),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait_deadline(deadline),
         }
@@ -113,14 +119,14 @@ impl ProcHandle {
     /// (macOS) unreported: the caller reports it with the refusal it goes on to make.
     #[cfg(unix)]
     pub(crate) fn wait_until_quiet(&self, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
-        let ProcHandle::Std(s) = self;
-        s.wait_until_quiet(deadline)
+        let ProcHandle::Std(s, pid) = self;
+        wait_std(s, *pid, deadline, Orphaned::Quiet)
     }
 
     /// Hard-kill the process (already-exited is success).
     pub(crate) fn kill(&self) -> io::Result<()> {
         match self {
-            ProcHandle::Std(s) => s.kill(),
+            ProcHandle::Std(s, _) => s.signal(Sig::Kill).map(drop).map_err(Error::into_io),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.kill(),
         }
@@ -129,44 +135,37 @@ impl ProcHandle {
     /// [`kill`](ProcHandle::kill), reporting whether a signal was sent.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
-        match self {
-            ProcHandle::Std(s) => s.kill_sent(),
-        }
+        let ProcHandle::Std(s, _) = self;
+        s.signal(Sig::Kill).map_err(Error::into_io)
     }
 
     /// [`kill_sent`](Self::kill_sent) for any `sig`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn signal_sent(&self, sig: crate::signal::Sig) -> io::Result<crate::signal::Sent> {
-        match self {
-            ProcHandle::Std(s) => s.signal_sent(sig),
-        }
+    pub(crate) fn signal_sent(&self, sig: Sig) -> io::Result<crate::signal::Sent> {
+        let ProcHandle::Std(s, _) = self;
+        s.signal(sig).map_err(Error::into_io)
     }
 
     /// Whether this thread holds the handle's lock. Tests only.
     #[cfg(all(unix, test))]
     pub(crate) fn is_held_by_current_thread(&self) -> bool {
-        let ProcHandle::Std(s) = self;
+        let ProcHandle::Std(s, _) = self;
         s.is_held_by_current_thread()
     }
 
-    /// Hold off this handle's own reaps until the result drops (see
-    /// [`SharedChild::hold_reaps`](crate::child::shared::SharedChild::hold_reaps)).
+    /// Hold off this handle's own reaps until the result drops (see [`OwnedChild::hold`]).
     #[cfg(unix)]
-    pub(crate) fn hold_reaps(&self) -> crate::child::shared::ReapsHeld<'_> {
-        let ProcHandle::Std(s) = self;
-        s.hold_reaps()
+    pub(crate) fn hold_reaps(&self) -> super::owned::ReapHold<'_> {
+        let ProcHandle::Std(s, _) = self;
+        s.hold()
     }
 
-    /// Whether the process has exited by the time `grace` is over, read only through its pidfd: no
-    /// state is read and nothing is reaped. A process with no pidfd was gone when adopted.
+    /// Whether the process has exited by the time `grace` is over, read through its handle's own
+    /// look: nothing is reaped, and a zombie its tracer holds counts.
     #[cfg(target_os = "linux")]
     pub(crate) fn exited_within(&self, grace: std::time::Duration) -> io::Result<bool> {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a process to exit");
-        let Some(pidfd) = self.pidfd() else {
-            return Ok(true);
-        };
-        crate::os_process::poll::poll_readable(pidfd, crate::wait::deadline_from(grace))
+        let ProcHandle::Std(s, _) = self;
+        s.exited_by(crate::wait::deadline_from(grace)).map_err(Error::into_io)
     }
 
     /// The pidfd naming the process, if it holds one (Linux).
@@ -174,18 +173,18 @@ impl ProcHandle {
     pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         match self {
             #[cfg(target_os = "linux")]
-            ProcHandle::Std(s) => s.pidfd(),
+            ProcHandle::Std(s, _) => Some(s.os_handle()),
             #[cfg(not(target_os = "linux"))]
-            ProcHandle::Std(_) => None,
+            ProcHandle::Std(..) => None,
         }
     }
 
     /// Whether the process is still running, read without reaping it.
     #[cfg(unix)]
     pub(crate) fn is_running(&self) -> io::Result<bool> {
-        match self {
-            ProcHandle::Std(s) => s.is_running(),
-        }
+        let ProcHandle::Std(s, _) = self;
+        let peeked = s.hold().peek().map_err(Error::into_io)?;
+        Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
@@ -194,31 +193,28 @@ impl ProcHandle {
     #[cfg(unix)]
     pub(crate) fn reap_after_tree_kill(&self) -> Torn {
         use crate::error::ChildFate;
-        match self {
-            ProcHandle::Std(s) => {
-                #[cfg(test)]
-                crate::child::spawn::fault::run_between_kill_and_wait();
-                match s.wait() {
-                    Ok(_) => Torn::new(ChildFate::Reaped),
-                    // The tree kill was delivered: a wait that finds the exit collected elsewhere, or
-                    // fails, is `Killed` (see `Foreign::fate`).
-                    Err(e) => Torn {
-                        fate: if e.raw_os_error() == Some(libc::ECHILD) {
-                            crate::os_process::child::Foreign::Gone.fate(true)
-                        } else {
-                            ChildFate::Killed
-                        },
-                        left: teardown_wait_failure(s.id(), &e),
-                    },
-                }
-            }
+        let ProcHandle::Std(s, pid) = self;
+        #[cfg(test)]
+        crate::child::spawn::fault::run_between_kill_and_wait();
+        match wait_unbounded(s, *pid) {
+            Ok(_) => Torn::new(ChildFate::Reaped),
+            // The tree kill was delivered: a wait that finds the exit collected elsewhere, or
+            // fails, is `Killed` (see `Foreign::fate`).
+            Err(e) => Torn {
+                fate: if e.raw_os_error() == Some(libc::ECHILD) {
+                    crate::os_process::child::Foreign::Gone.fate(true)
+                } else {
+                    ChildFate::Killed
+                },
+                left: teardown_wait_failure(*pid, &e),
+            },
         }
     }
 
     /// The OS process id.
     pub(crate) fn id(&self) -> u32 {
         match self {
-            ProcHandle::Std(s) => s.id(),
+            ProcHandle::Std(_, pid) => *pid,
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.id(),
         }
@@ -243,27 +239,23 @@ impl ProcHandle {
         #[cfg(all(test, windows))]
         crate::test_frozen::note_root_teardown();
         match self {
-            ProcHandle::Std(s) => {
+            ProcHandle::Std(s, pid) => {
+                let sent = s.signal(Sig::Kill).map_err(Error::into_io);
                 #[cfg(unix)]
-                let (kill_result, delivered) = {
-                    let sent = s.kill_sent();
-                    let delivered = matches!(sent, Ok(crate::signal::Sent::Delivered));
-                    (sent.map(drop), delivered)
-                };
-                #[cfg(not(unix))]
-                let kill_result = s.kill();
+                let delivered = matches!(sent, Ok(crate::signal::Sent::Delivered));
+                let kill_result = sent.map(drop);
                 match std_teardown_action(&kill_result) {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
-                    StdTeardown::ReapBlocking => match wait_after_drop_kill(s) {
+                    StdTeardown::ReapBlocking => match wait_after_drop_kill(s, *pid) {
                         Ok(_status) => {
                             #[cfg(test)]
-                            crate::child::spawn::fault::record_teardown_reap(s.id(), _status);
+                            crate::child::spawn::fault::record_teardown_reap(*pid, _status);
                             Torn::new(ChildFate::Reaped)
                         }
                         Err(e) => {
-                            let left = teardown_wait_failure(s.id(), &e);
+                            let left = teardown_wait_failure(*pid, &e);
                             #[cfg(unix)]
                             if e.raw_os_error() == Some(libc::ECHILD) {
                                 // Delivered, the kill is `Killed`; found nothing to signal, `Gone`.
@@ -287,14 +279,13 @@ impl ProcHandle {
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
                     // child is still running (an elevated child we cannot signal), report it.
                     StdTeardown::ReapNonBlocking => {
-                        let looked = s.try_wait();
+                        let looked = wait_std(s, *pid, Some(crate::wait::now()), Orphaned::Quiet);
                         let still_running = !matches!(looked, Ok(Some(_)));
                         let permission_denied =
                             matches!(&kill_result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied);
                         let left = (still_running && permission_denied).then(|| {
                             format!(
-                                "elevated child {} could not be terminated on drop (permission denied); leaving it running",
-                                s.id()
+                                "elevated child {pid} could not be terminated on drop (permission denied); leaving it running"
                             )
                         });
                         Torn {
@@ -310,11 +301,60 @@ impl ProcHandle {
     }
 }
 
+/// A wait on `owned` as the `io::Result` `Child` expects: `deadline` is absolute (`None`: for ever),
+/// and `Ok(None)` is a deadline that passed with the child still running.
+fn wait_std(
+    owned: &OwnedChild,
+    pid: u32,
+    deadline: Option<Instant>,
+    orphaned: Orphaned,
+) -> io::Result<Option<ExitStatus>> {
+    match owned.wait(deadline).map_err(Error::into_io)? {
+        ChildWaitOutcome::Exited(record) => status_of(record).map(Some),
+        ChildWaitOutcome::Foreign(foreign) => {
+            if foreign == crate::os_process::child::Foreign::Orphaned && orphaned == Orphaned::Warn {
+                log::warn!("pid {pid}: not ours to reap (launchd holds its zombie, because its tracer died)");
+            }
+            Err(echild())
+        }
+        ChildWaitOutcome::DeadlinePassed => Ok(None),
+    }
+}
+
+/// Block until `owned` is reaped.
+fn wait_unbounded(owned: &OwnedChild, pid: u32) -> io::Result<ExitStatus> {
+    wait_std(owned, pid, None, Orphaned::Warn)?.ok_or_else(|| io::Error::other("an unbounded wait ended with no exit"))
+}
+
+/// The `ECHILD` every method answers when the child was reaped by someone else.
+fn echild() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::ECHILD)
+    }
+    #[cfg(windows)]
+    {
+        io::Error::other("the child was already reaped elsewhere")
+    }
+}
+
+/// The status a cached outcome answers.
+fn status_of(record: crate::os_process::child::ExitRecord) -> io::Result<ExitStatus> {
+    use crate::os_process::child::ExitRecord;
+    match record {
+        ExitRecord::Status(status) => Ok(status),
+        ExitRecord::Unreadable { si_code } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the child's exit record was unreadable (si_code {si_code})"),
+        )),
+    }
+}
+
 /// The blocking reap that follows the drop's delivered kill.
-fn wait_after_drop_kill(s: &crate::child::shared::SharedChild) -> io::Result<std::process::ExitStatus> {
+fn wait_after_drop_kill(s: &OwnedChild, pid: u32) -> io::Result<ExitStatus> {
     #[cfg(test)]
     crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterDropKill);
-    s.wait()
+    wait_unbounded(s, pid)
 }
 
 /// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected
