@@ -305,7 +305,7 @@ pub(crate) fn assert_down_without_status(result: Result<std::process::ExitStatus
         }
         other => panic!("expected the tree down without the root's status, got {other:?}"),
     }
-    let mut warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let mut warns = crate::log_capture::warns_since(mark, "");
     warns.retain(|warn| !warn.contains("forgetting tokio's handle for it leaks"));
     assert_eq!(warns, Vec::<String>::new(), "nothing was left behind");
 }

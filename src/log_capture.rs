@@ -97,15 +97,6 @@ pub(crate) fn levels_since(mark: usize, marker: &str) -> Vec<log::Level> {
         .collect()
 }
 
-/// The text of every record at `Warn` or worse emitted at or after `mark`.
-pub(crate) fn warnings_since(mark: usize) -> Vec<String> {
-    RECORDS.lock().unwrap()[mark..]
-        .iter()
-        .filter(|(level, _, _)| *level <= log::Level::Warn)
-        .map(|(_, m, _)| m.clone())
-        .collect()
-}
-
 /// Pins a test's log output: no record at `Warn` or worse may be emitted while it lives. Declare it
 /// FIRST in a test, so it drops last, after the test's children have been torn down and their
 /// teardown has logged. Skipped while the test is already panicking, so it never masks the real
@@ -130,7 +121,11 @@ impl Drop for WarnWatch {
         if std::thread::panicking() {
             return;
         }
-        let warnings = warnings_since(self.mark);
+        let warnings: Vec<String> = RECORDS.lock().unwrap()[self.mark..]
+            .iter()
+            .filter(|(level, _, _)| *level <= log::Level::Warn)
+            .map(|(_, m, _)| m.clone())
+            .collect();
         assert!(
             warnings.is_empty(),
             "unexpected warning(s) at Warn or above: {warnings:#?}"
@@ -151,12 +146,16 @@ pub(crate) fn records_since_on_current_thread(mark: usize, marker: &str) -> Vec<
         .collect()
 }
 
-/// [`records_since_on_current_thread`], the `Warn` records only.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn warns_since_on_current_thread(mark: usize, marker: &str) -> Vec<(log::Level, String)> {
-    let mut records = records_since_on_current_thread(mark, marker);
-    records.retain(|(level, _)| *level == log::Level::Warn);
-    records
+/// The text of every record at `Warn` or worse that the CALLING thread logged since `mark` and
+/// that contains `marker`. Pass `""` for every such record.
+#[cfg(test)]
+pub(crate) fn warns_since(mark: usize, marker: &str) -> Vec<String> {
+    let me = std::thread::current().id();
+    RECORDS.lock().unwrap()[mark..]
+        .iter()
+        .filter(|(level, m, t)| *t == me && *level <= log::Level::Warn && m.contains(marker))
+        .map(|(_, m, _)| m.clone())
+        .collect()
 }
 
 #[cfg(test)]

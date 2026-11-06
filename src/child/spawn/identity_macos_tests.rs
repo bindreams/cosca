@@ -200,26 +200,18 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     );
     assert!(left, "the child must be left running, unreaped");
     // The failed re-read and the teardown that leaves the child are one event: one warn.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0]
-            .1
-            .contains("could not be checked against its handle (forced re-read refusal 5d1b)")
-            && warns[0].1.contains("leaving it unreaped"),
+        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)")
+            && warns[0].contains("leaving it unreaped"),
         "the one warn names the failed re-read and what became of the child: {warns:?}"
     );
 }
 
 /// Spawns a blocker contained by `mode`, launched by `front`, whose identity re-read is refused:
 /// its pid, once ended, and the warns the spawn logged.
-fn refused_reread_warns(
-    mode: crate::ContainMode,
-    front: Option<crate::elevation::front::Front>,
-) -> (u32, Vec<(log::Level, String)>) {
+fn refused_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation::front::Front>) -> (u32, Vec<String>) {
     crate::log_capture::install();
     let (mut cmd, _writer) = sync_blocker();
     cmd.contain_with(mode);
@@ -241,11 +233,7 @@ fn refused_reread_warns(
     assert_ne!(pid.get(), 0, "the hook must have run");
     end_unsignalled_and_reap(pid.get());
     let _ = outcome.expect_err("a refused re-read fails the spawn");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
-    (pid.get(), warns)
+    (pid.get(), crate::log_capture::warns_since(mark, ""))
 }
 
 /// A spawn whose identity re-read is refused leaves a session root unsignalled. macOS has no exact
@@ -257,7 +245,7 @@ fn macos_sync_spawn_identity_failure_of_a_group_root_warns_that_its_members_may_
     let (pid, warns) = refused_reread_warns(crate::ContainMode::Session, None);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].1.contains(&format!(
+        warns[0].contains(&format!(
             "members of the process group of pid {pid} may be left running"
         )),
         "the one warn says the group's members may be left running: {warns:?}"
@@ -265,10 +253,8 @@ fn macos_sync_spawn_identity_failure_of_a_group_root_warns_that_its_members_may_
 }
 
 /// Whether any of `warns` says a process group's members may be left running.
-fn notes_a_group(warns: &[(log::Level, String)]) -> bool {
-    warns
-        .iter()
-        .any(|(_, text)| text.contains("members of the process group"))
+fn notes_a_group(warns: &[String]) -> bool {
+    warns.iter().any(|text| text.contains("members of the process group"))
 }
 
 /// A tree walk's root leads no group of its own, so the cleanup notes none. Mutant: the note is
@@ -338,16 +324,11 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
     );
     assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
     // The hold and the teardown that leaves the child are one event: one warn.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0]
-            .1
-            .contains(&format!("child {}: launchd holds its zombie", pid.get()))
-            && warns[0].1.contains("reaped by someone else"),
+        warns[0].contains(&format!("child {}: launchd holds its zombie", pid.get()))
+            && warns[0].contains("reaped by someone else"),
         "the one warn names the hold and the pid, and what became of the child: {warns:?}"
     );
 }

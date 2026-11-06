@@ -258,7 +258,7 @@ fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
     let dropped = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        crate::test_child::reaped_elsewhere::warns_since(dropped),
+        crate::log_capture::warns_since(dropped, ""),
         Vec::<String>::new(),
         "the group is empty, so the tree counts as killed: the drop does not warn"
     );
@@ -322,7 +322,7 @@ fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
         "no killpg by a reaped root's number"
     );
     assert_eq!(
-        crate::test_child::reaped_elsewhere::warns_since(mark),
+        crate::log_capture::warns_since(mark, ""),
         Vec::<String>::new(),
         "the group is empty: nothing to warn about"
     );
@@ -365,7 +365,7 @@ fn terminate_tree_after_own_wait_and_reuse_body() {
         "no SIGTERM by a reaped root's number"
     );
     assert_eq!(
-        crate::test_child::reaped_elsewhere::warns_since(mark),
+        crate::log_capture::warns_since(mark, ""),
         Vec::<String>::new(),
         "the group is empty: nothing to warn about"
     );

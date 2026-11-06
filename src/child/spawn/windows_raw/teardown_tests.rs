@@ -259,13 +259,10 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait(
         [],
         "a failed kill is never followed by a wait"
     );
-    let warned = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect::<Vec<_>>();
+    let warned = crate::log_capture::warns_since(mark, "");
     assert_eq!(warned.len(), 1, "one warn for one refusal: {warned:?}");
     assert!(
-        warned[0].1.starts_with(&format!(
+        warned[0].starts_with(&format!(
             "teardown after a failed spawn: child {} could not be terminated",
             owner.pid
         )),
@@ -299,11 +296,8 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
             "a collected child is handed back by none: {disposition:?}"
         );
         assert_eq!(fake.looks(), 1);
-        let warned = crate::log_capture::records_since_on_current_thread(mark, "")
-            .into_iter()
-            .filter(|(level, _)| *level <= log::Level::Warn)
-            .collect::<Vec<_>>();
-        assert_eq!(warned, [], "nothing is left running: {disposition:?}");
+        let warned = crate::log_capture::warns_since(mark, "");
+        assert_eq!(warned, Vec::<String>::new(), "nothing is left running: {disposition:?}");
     }
 }
 
@@ -583,11 +577,12 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
         "{torn:?}"
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
-    let warned = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect::<Vec<_>>();
-    assert_eq!(warned, [], "the teardown leaves the one warn to its caller");
+    let warned = crate::log_capture::warns_since(mark, "");
+    assert_eq!(
+        warned,
+        Vec::<String>::new(),
+        "the teardown leaves the one warn to its caller"
+    );
     assert!(
         matches!(
             handle.wait(Some(crate::wait::now())),
