@@ -14,6 +14,7 @@ use std::io;
 
 use super::teardown::{child_with_an_unreadable_exit, exit, fake, id};
 use crate::child::owned::teardown::{Disposition, TeardownOutcome};
+pub(crate) use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
 use crate::child::owned::OwnedChild;
 use crate::error::Error;
 use crate::os_process::child::Foreign;
@@ -22,14 +23,6 @@ use crate::signal::Sent;
 
 /// The pid of the child every row tears down.
 pub(crate) const PID: u32 = super::teardown::PID;
-
-/// Where a child goes that a caller leaves: a zombie once it exits on Unix, and on Windows, which
-/// has none, nothing that waits for it.
-pub(crate) const LEFT: &str = if cfg!(unix) {
-    "; left unreaped"
-} else {
-    "; nothing waits for it"
-};
 
 /// Where a child goes that a caller hands back.
 pub(crate) const HANDED_BACK: &str = "; handed back to the caller in the error";
@@ -201,14 +194,14 @@ pub(crate) fn rows() -> Vec<Row> {
             format!("{after_a_refusal}: {orphaned}"),
         ),
         by_disposition(Kill::Refused, Found::WaitFailed, format!("{after_a_refusal}: {failed}")),
-        // Still running: a caller that leaves it says it keeps running, and one that hands it back
-        // says so.
+        // Still running: a caller that leaves it says it keeps running and nothing reaps it, and one
+        // that hands it back says so.
         Row {
             kill: Kill::Refused,
             found: Found::Running,
             level: Warn,
             uncollected: true,
-            leave: format!("{after_a_refusal}; leaving it running"),
+            leave: format!("{after_a_refusal}{LEAVING_RUNNING}"),
             hand_back: format!("{after_a_refusal}{HANDED_BACK}"),
         },
     ]
@@ -280,7 +273,7 @@ const NEVER_SAID: [&str; 3] = ["not waited on", "torn down through", "left uncol
 
 /// What a clause says of where the child goes, or what is done to it: it says at most one.
 fn fates() -> [&'static str; 3] {
-    [HANDED_BACK, LEFT, "; leaving it running"]
+    [HANDED_BACK, LEFT, LEAVING_RUNNING]
 }
 
 /// The clause says one thing of the child's fate, in the one wording, and no wording of an earlier

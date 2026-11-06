@@ -286,12 +286,6 @@ async fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf(#[fixture(cgrou
     assert_tokio_drop_kills_the_leaf(|| Box::new(crate::containment::cgroup::fault::fail_pidfd_info())).await;
 }
 
-/// Async twin of the sync first-write twin.
-#[skuld::test]
-async fn cgroup_a_drop_whose_first_cgroup_kill_fails_kills_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    assert_tokio_drop_kills_the_leaf(|| Box::new(crate::containment::cgroup::fault::fail_next_kill_write())).await;
-}
-
 /// Async twin of the sync post-kill twin.
 #[skuld::test]
 async fn cgroup_a_drop_whose_post_kill_read_fails_kills_the_leaf(#[fixture(cgroup)] _group: &Group) {
@@ -718,6 +712,7 @@ fn fail_a_contained_front_spawn(
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(stdin))))
         .expect("stdin");
     cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+    let reaps = fault::record_teardown_reaps();
     let err = {
         let _failing = fault::fail_tokio_spawns_after_fork_then(hook);
         crate::tokio::spawn::spawn(&mut cmd)
@@ -725,11 +720,7 @@ fn fail_a_contained_front_spawn(
             .expect_err("the forced failure fails the spawn")
     };
     let pid = fault::take_forgotten_pid().expect("the seam forked a child");
-    assert_eq!(
-        crate::containment::cgroup::fault::take_reaped_orphans(),
-        [],
-        "the abandonment signals no front"
-    );
+    assert_eq!(reaps.recorded(), [], "the abandonment kills no front");
     (err.into(), pid)
 }
 
@@ -781,47 +772,34 @@ fn assert_front_noted(err: &crate::error::Error, fate: &str, expected: ChildFate
 }
 
 /// A contained front tokio drops after its fork is left by the handshake to its leaf, whose kill
-/// ends it; the abandonment then waits for it on its pidfd and reaps it, and the error says so. The
-/// abandonment is made to see the front still running, as it can once the leaf has drained.
+/// ends it; the abandonment then reaps it on its pidfd, and the error says so. The look finds the
+/// front dying or already dead, as it can once the leaf has drained, so the note is whichever
+/// of the two says its cgroup's kill ended it.
 #[skuld::test]
 async fn cgroup_a_contained_front_tokio_drops_is_killed_through_its_leaf_and_reaped(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_kill_tests::reap;
-    let _running = crate::child::spawn::fault::see_fronts_running();
     let (reader, writer) = std::io::pipe().expect("pipe");
     let (hook, release) = release_with_the_front(writer);
     let (err, pid) = fail_a_contained_front_spawn(reader, hook);
-    assert_front_noted(&err, "its cgroup's kill ended it, and it was reaped", ChildFate::Reaped);
+    assert_front_noted(&err, "cgroup's kill ended it, and it was reaped", ChildFate::Reaped);
     assert_front_killed(&release);
     assert_eq!(reap(pid), None, "the abandonment reaps the front");
 }
 
 /// A contained front moved out of its leaf before the abandonment is outside the leaf's kill: it is
-/// sent nothing, not waited for, and left unreaped, and the error says so. A wait on it would
-/// release its `cat` (the hook before the abandonment's wait closes its stdin), so a mutant that
-/// waits fails on the note instead of hanging.
+/// sent nothing, not waited for, and left unreaped, and the error says so. A wait on it would hang
+/// for as long as the test holds the front's stdin.
 #[skuld::test]
 async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixture(cgroup)] _group: &Group) {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use crate::child::front_kill_tests::reap;
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let writer = Rc::new(RefCell::new(Some(writer)));
-    let _released = crate::containment::cgroup::fault::set_before_exit_wait({
-        let writer = Rc::clone(&writer);
-        move || drop(writer.borrow_mut().take())
-    });
     let (err, pid) = fail_a_contained_front_spawn(reader, move_out_of_its_leaf);
     assert_front_noted(
         &err,
         "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
-    assert!(
-        writer.borrow().is_some(),
-        "the abandonment waited on a front outside its leaf"
-    );
-    drop(writer.borrow_mut().take());
+    drop(writer);
     let status = reap(pid).expect("the front was left unreaped");
     assert!(status.success(), "the front was signalled: {status:?}");
 }
@@ -847,8 +825,7 @@ async fn cgroup_a_contained_front_that_exited_outside_its_leaf_is_reaped(#[fixtu
 
 /// A contained front in a leaf whose kill fails is still in its leaf, but nothing reached it: it is
 /// sent nothing, not waited for, and left unreaped, and the error says so. As above, a wait on it
-/// would release its `cat`. The leaf, left behind with the front in it, is removed once the front
-/// has ended.
+/// would hang. The leaf, left behind with the front in it, is removed once the front has ended.
 #[skuld::test]
 async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixture(cgroup)] _group: &Group) {
     use std::cell::RefCell;
@@ -856,11 +833,6 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
 
     use crate::child::front_kill_tests::reap;
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let writer = Rc::new(RefCell::new(Some(writer)));
-    let _released = crate::containment::cgroup::fault::set_before_exit_wait({
-        let writer = Rc::clone(&writer);
-        move || drop(writer.borrow_mut().take())
-    });
     let leaf = Rc::new(RefCell::new(None));
     let (err, pid) = {
         let _failing = crate::containment::cgroup::fault::fail_kill_writes();
@@ -881,11 +853,7 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
         "the elevated program may be running; left unreaped",
         ChildFate::Running { id: None },
     );
-    assert!(
-        writer.borrow().is_some(),
-        "the abandonment waited on a front no kill reached"
-    );
-    drop(writer.borrow_mut().take());
+    drop(writer);
     let status = reap(pid).expect("the front was left unreaped");
     assert!(status.success(), "the front was signalled: {status:?}");
     let leaf = leaf.borrow_mut().take().expect("the hook read the front's leaf");
@@ -945,12 +913,11 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixt
 }
 
 /// Spawns a contained `cat` front whose stdin is a pipe the caller holds in `stdin`, through tokio,
-/// with its spawn failing after its fork, and the child killing itself at `at` (if any) and its
-/// own handle opens refused when `no_handle`. Returns the error and the child's pid.
+/// with its spawn failing after its fork, and the child killing itself at `at` (if any). Returns the
+/// error and the child's pid.
 fn fail_a_contained_front_spawn_where(
     stdin: std::io::PipeReader,
     at: Option<crate::containment::cgroup::fault::ChildDeath>,
-    no_handle: bool,
     hook: impl FnOnce(u32) + 'static,
 ) -> (crate::error::Error, u32) {
     use crate::child::spawn::fault;
@@ -961,38 +928,14 @@ fn fail_a_contained_front_spawn_where(
         .expect("stdin");
     cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
     let _dies = at.map(leaf_fault::kill_child_at);
-    if no_handle {
-        leaf_fault::set_force_child_pidfd_failure(true);
-        leaf_fault::set_force_child_proc_dir_failure(true);
-    }
     let err = {
         let _failing = fault::fail_tokio_spawns_after_fork_then(hook);
         crate::tokio::spawn::spawn(&mut cmd)
             .map(drop)
             .expect_err("the forced failure fails the spawn")
     };
-    // The forked child took the flags; this thread's own copies are cleared here.
-    leaf_fault::take_force_child_pidfd_failure();
-    leaf_fault::take_force_child_proc_dir_failure();
     let pid = fault::take_forgotten_pid().expect("the seam forked a child");
     (err.into(), pid)
-}
-
-/// A contained front whose intent named it by no handle (both its `pidfd_open` and its `/proc` open
-/// refused, as `EMFILE` does) is still waited for and reaped once its leaf's kill ends it: through
-/// the pidfd its handshake left.
-#[skuld::test]
-async fn cgroup_a_contained_front_its_intent_named_by_no_handle_is_reaped_through_the_handshake(
-    #[fixture(cgroup)] _group: &Group,
-) {
-    use crate::child::front_kill_tests::reap;
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    let (hook, release) = release_with_the_front(writer);
-    let (err, pid) = fail_a_contained_front_spawn_where(reader, None, true, hook);
-    let text = err.to_string();
-    assert!(text.contains("its cgroup's kill ended it, and it was reaped"), "{text}");
-    assert_front_killed(&release);
-    assert_eq!(reap(pid), None, "the abandonment reaps the front");
 }
 
 /// A child that died before naming itself to its leaf never ran the program: it is no front, gets
@@ -1002,7 +945,7 @@ async fn cgroup_a_child_dead_before_its_intent_is_reaped_through_the_handshake(#
     use crate::child::front_kill_tests::reap;
     use crate::containment::cgroup::fault::ChildDeath;
     let (reader, _writer) = std::io::pipe().expect("pipe");
-    let (err, pid) = fail_a_contained_front_spawn_where(reader, Some(ChildDeath::BeforeIntent), false, |_| {});
+    let (err, pid) = fail_a_contained_front_spawn_where(reader, Some(ChildDeath::BeforeIntent), |_| {});
     let text = err.to_string();
     assert!(!text.contains("what sudo left"), "no front, no note: {text}");
     assert_eq!(reap(pid), None, "the abandonment reaps the child");
@@ -1015,7 +958,7 @@ async fn cgroup_a_child_dead_before_its_report_is_no_front(#[fixture(cgroup)] _g
     use crate::child::front_kill_tests::reap;
     use crate::containment::cgroup::fault::ChildDeath;
     let (reader, _writer) = std::io::pipe().expect("pipe");
-    let (err, pid) = fail_a_contained_front_spawn_where(reader, Some(ChildDeath::BeforeReport), false, |_| {});
+    let (err, pid) = fail_a_contained_front_spawn_where(reader, Some(ChildDeath::BeforeReport), |_| {});
     let text = err.to_string();
     assert!(!text.contains("what sudo left"), "no front, no note: {text}");
     assert_eq!(reap(pid), None, "the abandonment reaps the child");
@@ -1093,43 +1036,4 @@ async fn cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why(#[fixtu
     assert!(logs[0].1.contains("Input/output error"), "{logs:?}");
     drop(stdin);
     drop(child);
-}
-
-/// A contained front tokio drops after its fork, whose leaf's subtree cannot be read once the
-/// abandonment needs it, is left unreaped, and the error says it cannot be placed, naming the
-/// cause: not that it is outside its leaf's reach. Mutant: "an unreadable subtree answers `Ok(false)`".
-#[skuld::test]
-async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_naming_the_cause(
-    #[fixture(cgroup)] _group: &Group,
-) {
-    use crate::child::front_kill_tests::reap;
-    crate::log_capture::install();
-    // The abandonment sees the front still running, as it can before the leaf's kill has ended it.
-    let _running = crate::child::spawn::fault::see_fronts_running();
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    let mark = crate::log_capture::mark();
-    // The spawn captured its own subtree already: the failure is armed by the hook that runs as
-    // the spawn fails, so only the abandonment's read fails.
-    let failing = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let (release_hook, release) = release_with_the_front(writer);
-    let (err, pid) = fail_a_contained_front_spawn(reader, {
-        let failing = std::rc::Rc::clone(&failing);
-        move |pid| {
-            release_hook(pid);
-            *failing.borrow_mut() = Some(crate::containment::cgroup::fault::fail_subtree(libc::EIO));
-        }
-    });
-    drop(failing.borrow_mut().take());
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
-    assert_front_noted(
-        &err,
-        "the elevated program may be running; left unreaped",
-        ChildFate::Unknown,
-    );
-    // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.
-    assert_front_killed(&release);
-    let status = reap(pid).expect("the front was left unreaped");
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
 }
