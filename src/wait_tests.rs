@@ -680,14 +680,12 @@ mod pidfd_exit_visible {
             crate::os_process::poll::is_readable(pidfd.as_fd()).is_err(),
             "the precondition: poll fails"
         );
-        crate::wait::block_probe::take();
+        // Assert via the on_blocking hook: the probe record also holds recheck pauses.
+        let blocking = crate::wait::block_probe::on_blocking(|| panic!("a block after a failed poll"));
         let until = Instant::now() + Duration::from_millis(30);
         assert!(!pidfd_exit_visible_by(pidfd.as_fd(), until));
         assert!(Instant::now() >= until, "reported before the deadline");
-        assert!(
-            crate::wait::block_probe::take().is_empty(),
-            "no block after a failed poll"
-        );
+        drop(blocking);
         // SAFETY: puts back the limit read above.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &before) }, 0);
         child.kill().expect("kill");

@@ -59,16 +59,6 @@ impl<'a> HolderGuard<'a> {
         );
     }
 
-    /// Sleep on the handle's `Condvar` for at most `dur`, releasing the lock atomically and
-    /// taking it back. A `notify_all` wakes the sleep at once.
-    pub(super) fn sleep(&mut self, dur: std::time::Duration) {
-        let lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
-        #[cfg(test)]
-        super::seams::before_condvar_block(Some(dur));
-        self.lock = Some(self.sc.cv_wait_timeout(lock, dur));
-        self.assert_own();
-    }
-
     /// Write `state`, wake the waiters, and hand back the lock with no guard left, in one
     /// critical section. Consuming the guard makes it impossible for a normal return to restore
     /// `N` under a newer holder.
