@@ -13,7 +13,7 @@ use crate::error::ChildFate;
 use crate::error::Error;
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, pidfd_group_signal, setuid, Group};
+use crate::test_groups::{cgroup, setuid, Group};
 
 /// A command for a child that only a real kill ends and that the test never holds, for the macOS
 /// tests whose child is left alone: its stdin writer is leaked.
@@ -1542,7 +1542,7 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
     use crate::identity::stat_parse::stat_fixture;
-    use crate::identity::Resolved;
+    use crate::identity::{FakeKernel, HostKernel, Resolved};
     use crate::wait::exit_only::Target;
 
     #[allow(
@@ -1563,32 +1563,127 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
 
     let look_alike = stat_fixture("S", id.key().ticks());
-    let kernel = crate::identity::ticks_host(pid)
+    let kernel = FakeKernel::over(&HostKernel)
+        .live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"))
         .same_view()
         .on_read(&format!("{pid}/stat"), Ok(&look_alike));
-    let (unchecked, _) = super::resolve_identity_unchecked(&kernel, pid);
-    assert!(
-        matches!(unchecked, Resolved::Found(seen) if seen == id),
-        "precondition: the read by pid alone finds the child's own identity: {unchecked:?}"
-    );
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    let held = held_through(&kernel, pid);
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
     assert!(
         matches!(read, Resolved::Gone),
         "a look-alike with the child's token is not the child: {read:?}"
     );
 }
 
-/// The same read on pidfs, where the reuser's inode is its own: the read by pid alone finds the
-/// reuser's identity, and the peek through the child's pidfd, which shows it reaped, still makes the
-/// read `Gone`.
+/// A pidfd that `kernel` has handed out for `pid`, so that its rows about `pid` answer for the
+/// descriptor a test then holds.
+#[cfg(target_os = "linux")]
+fn held_through(kernel: &crate::identity::FakeKernel<'_>, pid: u32) -> std::os::fd::OwnedFd {
+    use crate::identity::Kernel as _;
+
+    let target = rustix::process::Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
+    kernel
+        .pidfd_open(target, rustix::process::PidfdFlags::empty())
+        .expect("the kernel's row hands out the pidfd")
+}
+
+/// A live child, and a pidfd to it that the test holds.
+#[cfg(target_os = "linux")]
+fn live_child_with_pidfd() -> (std::process::Child, std::os::fd::OwnedFd) {
+    #[allow(clippy::zombie_processes, reason = "the test reaps it with `release`")]
+    let child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the child");
+    let raw = rustix::process::Pid::from_raw(child.id() as i32).expect("a child's pid is nonzero");
+    let pidfd = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()).expect("pidfd_open the child");
+    (child, pidfd)
+}
+
+/// Let the child of [`live_child_with_pidfd`] exit and reap it.
+#[cfg(target_os = "linux")]
+fn release(mut child: std::process::Child) {
+    drop(child.stdin.take());
+    child.wait().expect("reap the child");
+}
+
+/// The spawn reads its child's identity from the pidfd it holds: a `pidfd_open` of the pid that
+/// fails (`EMFILE`: the process is out of descriptors) does not reach it, on pidfs or before it.
+///
+/// Mutant: `resolve_identity` opens the pid a second time to read the identity.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
+    use crate::identity::{FakeKernel, HostKernel, ProcessId, Resolved};
+    use crate::wait::exit_only::Target;
+
+    let (child, pidfd) = live_child_with_pidfd();
+    let pid = child.id();
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
+    let (read, _, why) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    let Resolved::Found(id) = read else {
+        panic!("the held pidfd answers whatever a second open would: {read:?}")
+    };
+    assert!(!why.is_owed(), "a held pidfd that answers owes no diagnosis");
+    assert_eq!(
+        ProcessId::of(pid).found(),
+        Some(id),
+        "the key read from the held pidfd is the one the by-pid read gives"
+    );
+    release(child);
+}
+
+/// A held pidfd whose `fstat` fails says nothing about the child: `Unknown`, as a by-pid read that
+/// failed the same way is.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
+    use crate::identity::{FakeKernel, HostKernel, Resolved};
+    use crate::wait::exit_only::Target;
+
+    let (child, pidfd) = live_child_with_pidfd();
+    let pid = child.id();
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
+        .on_pidfs_ino(pid, Err(rustix::io::Errno::BADF));
+    let held = held_through(&kernel, pid);
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    assert!(matches!(read, Resolved::Unknown), "{read:?}");
+    release(child);
+}
+
+/// Where the held pidfd has no inode of its own (before Linux 6.9), the identity is the `/proc`
+/// `starttime`, as it was.
+///
+/// Mutant: `resolve_identity` takes a pidfd with no inode for a failed read.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
+    use crate::identity::{FakeKernel, HostKernel, Resolved};
+    use crate::wait::exit_only::Target;
+
+    let (child, pidfd) = live_child_with_pidfd();
+    let pid = child.id();
+    let kernel =
+        FakeKernel::over(&HostKernel).live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"));
+    let held = held_through(&kernel, pid);
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    match read {
+        Resolved::Found(id) => assert_eq!(id, crate::identity::ticks_id(pid)),
+        other => panic!("{other:?}"),
+    }
+    release(child);
+}
+
+/// The held pidfd of a reaped child still names it: its inode reads as a key (the row states one, so
+/// that it does on every host), and only the peek through the pidfd, which shows the reap, makes
+/// the read `Gone`.
 ///
 /// Mutant: `resolve_identity` skips the peek through the handle.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn resolve_identity_of_a_reaped_child_whose_pid_a_reuser_holds_is_gone(#[fixture(pidfd_group_signal)] _group: &Group) {
+fn resolve_identity_of_a_reaped_child_is_gone() {
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
-    use crate::identity::{FakeKernel, HostKernel, ProcessId, Resolved};
+    use crate::identity::{FakeKernel, HostKernel, Resolved};
     use crate::wait::exit_only::Target;
 
     #[allow(
@@ -1600,30 +1695,16 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_reuser_holds_is_gone(#[fixture
     let pid = child.id();
     let raw = Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
     let pidfd = pidfd_open(raw, PidfdFlags::empty()).expect("pidfd_open the child");
-    let Resolved::Found(id) = ProcessId::of(pid) else {
-        panic!("the child must be readable before it is reaped")
-    };
-    let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
 
     drop(child.stdin.take());
     crate::test_child::pid_reuse::wait_pollin(std::os::fd::AsFd::as_fd(&pidfd));
     let reaped = waitid(WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
 
-    // The pid's new owner: a pidfd opens, with another inode.
     let kernel = FakeKernel::over(&HostKernel)
-        .on_pidfd_open(
-            pid,
-            Ok(std::os::fd::OwnedFd::from(
-                std::fs::File::open("/dev/null").expect("/dev/null opens"),
-            )),
-        )
-        .on_pidfs_ino(pid, Ok(Some(ino + 1)));
-    let (unchecked, _) = super::resolve_identity_unchecked(&kernel, pid);
-    assert!(
-        matches!(unchecked, Resolved::Found(seen) if seen != id),
-        "precondition: the read by pid alone finds the reuser: {unchecked:?}"
-    );
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
-    assert!(matches!(read, Resolved::Gone), "a reuser is not the child: {read:?}");
+        .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
+        .on_pidfs_ino(pid, Ok(Some(1)));
+    let held = held_through(&kernel, pid);
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }
