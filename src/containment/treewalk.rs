@@ -408,7 +408,7 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
         Err(Error::Unassessable { detail, source }) => identity_unread(detail, source),
         Err(e) => identity_unread(
             format!("its pidfd could not be proved to name it ({e})"),
-            Some(e.into_io()),
+            Some(e.into_os_io()),
         ),
     }
 }

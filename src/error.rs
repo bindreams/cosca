@@ -473,6 +473,29 @@ impl Error {
         }
     }
 
+    /// [`into_io`](Self::into_io) for a caller that hands the result on as a `source`, whose
+    /// [`raw_os_error`](std::io::Error::raw_os_error) is the contract: the `io::Error` that carries
+    /// the OS code, without the context [`io_context`] added to an [`Error::Io`] (whose message the
+    /// caller has already printed) and without [`Error::NotThreadGroupLeader`]'s wrapping.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_os_io(self) -> std::io::Error {
+        match self {
+            Error::Io(mut e) => {
+                // Each layer holds its `io::Error` as `source`: `io_context` nests.
+                while e.get_ref().is_some_and(|inner| inner.is::<IoContext>()) {
+                    let inner = e.into_inner().expect("a custom error, checked above");
+                    e = inner
+                        .downcast::<IoContext>()
+                        .expect("an `IoContext`, checked above")
+                        .source;
+                }
+                e
+            }
+            Error::NotThreadGroupLeader { source, .. } => source,
+            other => other.into_io(),
+        }
+    }
+
     /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
     #[cfg(any(feature = "tokio", target_os = "macos"))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
