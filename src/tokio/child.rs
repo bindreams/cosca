@@ -2166,9 +2166,9 @@ fn signal_on_drop(
                 // The leaf's release still writes `cgroup.kill`, which ends the front if it is in the
                 // leaf; nothing waits to see.
                 signals.left.push(format!(
-                    "elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the front is \
-                     killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it \
-                     once it exits"
+                    "{}: its cgroup kill is not shown to have reached it ({e}); the front is killed through its \
+                     cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it exits",
+                    crate::elevation::front::front_named(Some(pid))
                 ));
                 // Not shown to be dead: it may still be running.
                 signals.fate = ChildFate::Running { id: Some(id) };

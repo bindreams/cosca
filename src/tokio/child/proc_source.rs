@@ -1563,7 +1563,8 @@ impl ProcSource {
             // forgotten only above.
             debug_assert!(
                 false,
-                "elevation front pid {pid}: a spawn's backend is forgotten before its teardown"
+                "{}: a spawn's backend is forgotten before its teardown",
+                crate::elevation::front::front_named(Some(pid))
             );
             return (
                 FrontFate::Unaccounted.note(error, Some(front), Some(pid)),

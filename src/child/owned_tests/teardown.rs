@@ -113,7 +113,8 @@ fn assert_collected_with_an_unreadable_record(torn: &TeardownOutcome, dispositio
 #[skuld::test]
 fn a_reap_after_a_kill_whose_exit_record_was_unreadable_leaves_nothing_uncollected() {
     for disposition in [Disposition::Leave, Disposition::HandBack] {
-        let torn = child_with_an_unreadable_exit().reap_after_tree_kill(disposition);
+        let child = child_with_an_unreadable_exit();
+        let torn = child.reap_after_tree_kill(&child.teardown_subject(), disposition);
         assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it after the kill");
         assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
@@ -218,7 +219,8 @@ fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_no
 #[skuld::test]
 fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-    let torn = OwnedChild::new(Box::new(fake)).reap_after_tree_kill(Disposition::Leave);
+    let child = OwnedChild::new(Box::new(fake));
+    let torn = child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave);
     assert_eq!(torn.fate(), ChildFate::Killed);
     assert_eq!(
         said_of(&torn),
@@ -237,7 +239,8 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
 fn a_reap_after_a_tree_kill_waits_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
     let _fire = fire_on_block(&fake);
-    let torn = OwnedChild::new(Box::new(fake.clone())).reap_after_tree_kill(Disposition::Leave);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+    let torn = child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave);
     assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(warn_of(&torn), None);
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
