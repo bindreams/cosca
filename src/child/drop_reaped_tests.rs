@@ -557,6 +557,31 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_warn()
     assert_skipped_at_debug(mark);
 }
 
+/// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
+/// nothing and does not mark the tree killed: the drop still says it skips the walk, as it would
+/// without the call.
+///
+/// Mutant: a walk that found no root counts as a kill that ran.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn kill_tree_on_a_tree_walk_whose_root_is_reaped_does_not_mark_the_tree_killed() {
+    crate::log_capture::install();
+    let (child, stdin) = crate::test_child::held_treewalk_blocker();
+    drop(stdin);
+    child.wait().expect("reap the root");
+
+    child
+        .kill_tree()
+        .expect("a root that is gone leaves no tree to walk, and no member behind");
+
+    assert!(!child.tree_killed.is_set(), "a walk that found no root killed nothing");
+    let mark = crate::log_capture::mark();
+    drop(child);
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn, "{records:?}");
+}
+
 /// A drop whose walk leaves a descendant reports it once, after the root's kill; the root is killed
 /// and reaped. Mutant: the walk's per-member warn is kept beside the drop's.
 #[cfg(not(target_os = "macos"))]

@@ -346,13 +346,97 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
     }
 }
 
+// What a tree kill comes to =====
+
+/// `settle` over every kind of outcome, with and without a member or the root left, and with the
+/// root not running or not: what it answers, and whether it marks the tree killed. A kill that did not
+/// run marks nothing and answers with what its sweep by identity left.
+///
+/// Mutants: a skipped kill marks; a skip drops its sweep's error; the root is dropped from the report
+/// whatever the root's end; the root is kept when the root is not running.
+#[skuld::test]
+fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
+    use super::{Attached, SettleOutcome, TreeKillOutcome, TreeKilled, Unkilled};
+    use crate::error::Error;
+    let left = |pid| Error::MemberNotKilled {
+        pid,
+        source: Box::new(Error::Containment {
+            detail: "refused".into(),
+        }),
+        note: None,
+    };
+    let unkilled = |members: &[u32], root: Option<u32>| Unkilled {
+        members: members.iter().map(|pid| left(*pid)).collect(),
+        root: root.map(left),
+        refused_to_walk: false,
+    };
+    let skipped = |holders| TreeKillOutcome::Skipped {
+        action: "walk".into(),
+        holders,
+    };
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+
+    // (outcome, root_ended, answer: Ok(outcome) or Err((first, others)), marked)
+    type Answer = Result<SettleOutcome, (u32, Vec<u32>)>;
+    let table: Vec<(TreeKillOutcome, bool, Answer, bool)> = vec![
+        (TreeKillOutcome::Ran(Ok(())), false, Ok(SettleOutcome::Killed), true),
+        (TreeKillOutcome::NoRoot, false, Ok(SettleOutcome::Skipped), false),
+        (skipped(Ok(())), true, Ok(SettleOutcome::Skipped), false),
+        (skipped(Err(unkilled(&[7], None))), true, Err((7, vec![])), false),
+        (
+            TreeKillOutcome::Ran(Err(unkilled(&[], Some(1)))),
+            false,
+            Err((1, vec![])),
+            false,
+        ),
+        (
+            TreeKillOutcome::Ran(Err(unkilled(&[], Some(1)))),
+            true,
+            Ok(SettleOutcome::Killed),
+            true,
+        ),
+        (
+            TreeKillOutcome::Ran(Err(unkilled(&[2, 3], None))),
+            true,
+            Err((2, vec![3])),
+            false,
+        ),
+        (
+            TreeKillOutcome::Ran(Err(unkilled(&[2], Some(1)))),
+            true,
+            Err((2, vec![])),
+            false,
+        ),
+        (
+            TreeKillOutcome::Ran(Err(unkilled(&[2], Some(1)))),
+            false,
+            Err((2, vec![1])),
+            false,
+        ),
+    ];
+    let pid_of = |error: &Error| match error {
+        Error::MemberNotKilled { pid, .. } => *pid,
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    };
+    for (outcome, root_ended, want, marked) in table {
+        let label = format!("{outcome:?}, root_ended {root_ended}");
+        let killed = TreeKilled::default();
+
+        let got = attached.settle(&killed, outcome, root_ended);
+
+        let got = got.map_err(|left| (pid_of(&left.first), left.others.iter().map(pid_of).collect::<Vec<_>>()));
+        assert_eq!(got, want, "{label}");
+        assert_eq!(killed.is_set(), marked, "{label}");
+    }
+}
+
 // A tree call's report names the call =====
 
 /// The members a call's walk left besides the first are warned of under the name of the call that
 /// made it, not under `kill_tree`. Mutant: `SweepFailure::of` words every call as `kill_tree`.
 #[skuld::test]
 fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
-    use super::{Attached, SweepFailure, TreeKilled, Unkilled};
+    use super::{Attached, SweepFailure, TreeKillOutcome, TreeKilled, Unkilled};
     use crate::error::Error;
     let member = |pid| Error::MemberNotKilled {
         pid,
@@ -367,10 +451,11 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
         "graceful_shutdown_tree",
         &Attached::None,
         &TreeKilled::default(),
-        Err(Unkilled {
+        TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![member(1), member(2)],
             root: None,
-        }),
+            refused_to_walk: false,
+        })),
         Ok(()),
         false,
     )

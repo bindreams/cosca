@@ -87,7 +87,7 @@ type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
 fn id_walks() -> [(&'static str, Walk); 2] {
     [
         ("hard_kill", |k, id| {
-            super::hard_kill(k, id).map_err(Unkilled::into_error)
+            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
         }),
         ("terminate", |k, id| super::terminate(k, id)),
     ]
@@ -97,7 +97,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
 fn walks() -> [(&'static str, Walk); 4] {
     [
         ("hard_kill", |k, id| {
-            super::hard_kill(k, id).map_err(Unkilled::into_error)
+            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
         }),
         ("terminate", |k, id| super::terminate(k, id)),
         ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
@@ -240,7 +240,7 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
         let pids: Vec<u32> = members.iter().map(ProcessId::pid).collect();
         assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
-    super::hard_kill(&kernel, root).expect("the walk ran");
+    super::hard_kill(&kernel, root).into_result().expect("the walk ran");
     // Both were killed: the root by its signal, the descendant before it could print.
     let mut printed = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut printed).expect("read to EOF");
@@ -535,7 +535,9 @@ fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, Proc
 fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_and_leaves_terminate_ok() {
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let cause = format!("pid {} identity could not be read", descendant.pid());
-    let left = super::hard_kill(&kernel, root).expect_err("a descendant was left");
+    let left = super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("a descendant was left");
     assert!(!left.members.is_empty(), "a descendant was left, not only the root");
     assert_not_killed(Err(left.into_error()), descendant.pid(), &[&cause]);
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
@@ -566,7 +568,9 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let mark = crate::log_capture::mark();
-    super::hard_kill(&kernel, root).expect_err("a descendant was left");
+    super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("a descendant was left");
     assert_eq!(
         warns_naming(mark, descendant),
         Vec::<String>::new(),
@@ -610,7 +614,9 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     let second = root.pid().wrapping_add(1);
     let mark = crate::log_capture::mark();
     fault::force_incomplete_once(LeftBehind::Descendant);
-    let left = super::hard_kill(&kernel, root).expect_err("two members were left");
+    let left = super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("two members were left");
     let warned = crate::log_capture::warns_since_on_current_thread(mark, "treewalk:");
     let pids: Vec<u32> = left
         .members

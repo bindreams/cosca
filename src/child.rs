@@ -509,7 +509,7 @@ impl Child {
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
     /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
-    /// The backstop still ran; a retry walks again.
+    /// The backstop still ran.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -625,8 +625,8 @@ impl Child {
             .root_checked(
                 || held.state(),
                 || {
-                    // The number may name another process, but the root's handle still names the root
-                    // exactly: its kill ends the root, whatever the call returns.
+                    // The root's handle names the root even when its number is reused; its kill ends
+                    // the root.
                     let sent = held
                         .signal(crate::signal::Sig::Kill)
                         .map_err(Error::into_io)
@@ -647,9 +647,7 @@ impl Child {
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
-        if self.attached.hard_kill_refused_to_walk(&group_result) {
-            return group_result.map_err(|left| left.into_error().into());
-        }
+        let group_result = group_result.unless_refused()?;
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
@@ -1134,7 +1132,7 @@ impl Child {
             // Reported after the root's kill: a walk that left only the root is settled by it.
             left.extend(
                 self.attached
-                    .settle_for_drop(&self.tree_killed, tree, remains.fate.ended_by_the_kill()),
+                    .settle_for_drop(&self.tree_killed, tree, remains.fate.not_running()),
             );
             left.extend(warn);
             if !left.is_empty() {
@@ -1231,7 +1229,7 @@ impl Child {
         let remains = report.fold_clause(torn);
         report.tree = self
             .attached
-            .settle_for_drop(&self.tree_killed, kill, remains.fate.ended_by_the_kill());
+            .settle_for_drop(&self.tree_killed, kill, remains.fate.not_running());
         report.emit(&self.reported);
         remains
     }

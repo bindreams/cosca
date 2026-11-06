@@ -14,6 +14,7 @@ use super::identity_macos_tests::{
     std_blocker_with_unique, sync_blocker,
 };
 use super::unique_report;
+use super::{LateTree, Reach};
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::os_process::child::PeekOutcome;
@@ -553,6 +554,37 @@ fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() 
         &[SAID_REAPED],
         &["tree was not", "fully killed", "was not killed"],
     );
+}
+
+/// A walk that left only the root is settled by the root's kill only when that kill ended the root.
+/// A root whose kill was refused or could not be verified is still running, so the note names it.
+///
+/// Mutant: `failure_note` treats the root as ended whatever its kill did.
+#[skuld::test]
+fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
+    use crate::containment::dispatch::Unkilled;
+    let root_left = || LateTree {
+        reach: Reach::None,
+        pid: 4242,
+        unique: 1,
+        id: None,
+        sweeps: vec![Err(Unkilled {
+            members: Vec::new(),
+            root: Some(crate::error::Error::MemberNotKilled {
+                pid: 4242,
+                source: Box::new(crate::error::Error::Containment {
+                    detail: "refused".into(),
+                }),
+                note: None,
+            }),
+            refused_to_walk: false,
+        })],
+        notes: Vec::new(),
+    };
+
+    assert_eq!(root_left().failure_note(true), None, "the root's kill ended it");
+    let named = root_left().failure_note(false).expect("the root is still running");
+    assert!(named.contains("pid 4242 was not killed"), "{named}");
 }
 
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with

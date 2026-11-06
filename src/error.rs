@@ -212,9 +212,8 @@ pub enum Error {
     /// it left behind, was not. `source` says why: the member's identity could not be read, at the
     /// walk or when the kill came ([`Error::Unassessable`]), or the OS refused the kill
     /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
-    /// for [`Process::kill`](crate::Process::kill)). The other members were killed, or are further
-    /// members it left; the message names only the first. The root is named last: an error that names
-    /// the root left no other member.
+    /// for [`Process::kill`](crate::Process::kill)). It names the first member left; the call warns of
+    /// the others. The root is named only when it is the sole member left.
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
@@ -351,10 +350,13 @@ pub enum ChildFate {
 }
 
 impl ChildFate {
-    /// Whether cosca's own kill ended the child: it is dead, and its exit was collected or its kill
-    /// delivered. A child that was already gone, or that may still run, is not.
-    pub(crate) fn ended_by_the_kill(&self) -> bool {
-        matches!(self, ChildFate::Reaped | ChildFate::Killed)
+    /// Whether the child is not running: killed, reaped, or already gone. The one meaning of "the
+    /// root is dead" that settles a tree kill's report, as [`SweepFailure::killed_root`] has it for a
+    /// kill through the handle.
+    ///
+    /// [`SweepFailure::killed_root`]: crate::containment::dispatch::SweepFailure::killed_root
+    pub(crate) fn not_running(&self) -> bool {
+        matches!(self, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone)
     }
 }
 

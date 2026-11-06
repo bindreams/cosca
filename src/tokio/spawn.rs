@@ -982,7 +982,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         }
     };
     // The tree is reported after the root's kill: a walk that left only the root is settled by it.
-    let tree = tree.map(|walk| child.settle_tree(walk, fate.ended_by_the_kill()));
+    let tree = tree.map(|walk| child.settle_tree(walk, fate.not_running()));
     // The tree is settled when it was killed completely and its drain was watched, was not for the
     // cleanup to kill, or was deliberately left alone because the root is reaped or unpinned. A drain
     // that could not be watched leaves the handle armed: its drop waits for it again.

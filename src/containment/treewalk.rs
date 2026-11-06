@@ -83,7 +83,7 @@
 //! cannot tell it from a genuine child, so every walk from that root is incomplete for as long as it
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
-use crate::containment::dispatch::Unkilled;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
@@ -515,7 +515,8 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// to hold its pid after it (a root that exists but cannot be queried).
 /// Nothing is killed, the root included: killing the root first would reparent its descendants
 /// out of the ppid walk, so a retry could no longer find them. A root that no longer holds its pid
-/// is `Ok`, with nothing killed.
+/// is [`TreeKillOutcome::NoRoot`], with nothing killed. The error is an [`Unkilled`] that
+/// [`refused_to_walk`](Unkilled::refused_to_walk).
 ///
 /// [`Error::MemberNotKilled`] when the walk ran but left a member behind: a candidate whose identity
 /// could not be read (so it and its subtree were not walked), or an identity it resolved whose kill
@@ -525,25 +526,28 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// once, after the root's death by its handle has had its say ([`Attached::settle`]).
 ///
 /// [`Attached::settle`]: crate::containment::Attached::settle
-pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Unkilled> {
+pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
     #[cfg(not(test))]
     let skip_root = false;
-    let parents = crate::containment::enumerate::process_parents(kernel)?;
-    let Some(Walk {
+    let Walk {
         members: descendants,
         unassessed,
-    }) = walk_from(kernel, root, &parents, Recursive::Yes)?
-    else {
-        return Ok(());
+    } = match crate::containment::enumerate::process_parents(kernel)
+        .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
+    {
+        Ok(Some(walk)) => walk,
+        Ok(None) => return TreeKillOutcome::NoRoot,
+        Err(error) => return TreeKillOutcome::Ran(Err(Unkilled::refusing_to_walk(error))),
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
     // A candidate that could not be read is not killed, and nor is anything under it: left behind.
     let mut left: Vec<Error> = unassessed.into_iter().map(|(pid, why)| not_killed(pid, why)).collect();
     let mut root_left: Option<Error> = None;
+    // Forced-incomplete seam: fabricates a refused member.
     #[cfg(all(test, unix))]
     if let Some(forced) = fault::take_force_incomplete() {
         let forced_error = |pid| {
@@ -558,7 +562,6 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Unki
             root_left = Some(forced_error(root.pid()));
         }
         if forced.leaves_descendant() {
-            // A made-up member: the walk has no descendant to refuse.
             left.push(forced_error(root.pid().wrapping_add(1)));
         }
     }
@@ -587,12 +590,13 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Unki
     #[cfg(not(any(unix, windows)))]
     let _ = (kernel, root, descendants, skip_root);
     if left.is_empty() && root_left.is_none() {
-        return Ok(());
+        return TreeKillOutcome::Ran(Ok(()));
     }
-    Err(Unkilled {
+    TreeKillOutcome::Ran(Err(Unkilled {
         members: left,
         root: root_left,
-    })
+        refused_to_walk: false,
+    }))
 }
 
 /// The error for the member `pid` a walk left behind, `source` why.
@@ -647,11 +651,11 @@ pub(crate) mod fault {
     #[cfg(unix)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum LeftBehind {
-        /// The root alone: what `kill_tree`'s handle backstop settles.
+        /// The root only.
         Root,
-        /// A member other than the root, which nothing after the walk reaches.
+        /// A non-root member.
         Descendant,
-        /// Both: what a backstop that kills the root settles only in part.
+        /// The root and a non-root member.
         RootAndDescendant,
     }
 
@@ -666,8 +670,8 @@ pub(crate) mod fault {
         }
     }
 
-    /// Make the NEXT `hard_kill` on THIS thread leave `left` behind in its error, as a refused kill
-    /// would (the kills still run). Take semantics.
+    /// Make the next `hard_kill` on this thread leave `left` behind, as a refused kill would. Consumed
+    /// by that call.
     #[cfg(unix)]
     pub(crate) fn force_incomplete_once(left: LeftBehind) {
         FORCE_INCOMPLETE.with(|f| f.set(Some(left)));

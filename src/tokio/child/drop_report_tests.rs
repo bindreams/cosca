@@ -224,8 +224,16 @@ mod linux {
             let failure =
                 crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
                     .expect_err("the spawn fails");
-            let (cause, _, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
+            let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
 
+            assert!(fate.not_running(), "{left:?}: {fate:?}");
+            // A settled tree disarms the handle; an unsettled one is looked at again when it drops.
+            let drops = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
+            assert_eq!(
+                !drops.is_empty(),
+                reported,
+                "{left:?}: the handle is armed iff reported: {drops:?}"
+            );
             let cause = cause.to_string();
             assert_eq!(
                 cause.contains("its contained tree could not be killed"),

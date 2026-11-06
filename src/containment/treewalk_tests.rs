@@ -518,7 +518,9 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         children.iter().any(|id| id.pid() == ping),
         "{ping} not among {children:?}"
     );
-    super::hard_kill(&HostKernel, root).expect("an exited root whose handle is held is walked completely");
+    super::hard_kill(&HostKernel, root)
+        .into_result()
+        .expect("an exited root whose handle is held is walked completely");
 
     // SAFETY: `ping_handle` is our live handle with the synchronize right. The wait ends with the
     // kill just asked for, or with the child's own exit.
@@ -570,10 +572,11 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    match super::hard_kill(&crate::identity::HostKernel, id) {
+    match super::hard_kill(&crate::identity::HostKernel, id).into_result() {
         Err(super::Unkilled {
             members,
             root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
+            ..
         }) if members.is_empty() => {
             assert_eq!(pid, child.pid());
             assert!(
@@ -597,7 +600,9 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let left = super::hard_kill(&crate::identity::HostKernel, child.id()).expect_err("the kill is refused");
+    let left = super::hard_kill(&crate::identity::HostKernel, child.id())
+        .into_result()
+        .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
     let err = left.root.expect("the root was left");
     // The message reads once: the pid, then the OS's own words.
@@ -619,6 +624,149 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     // The helper exits at EOF: nothing killed it.
     drop(stdin);
     assert!(child.wait().expect("the helper exits on EOF").success());
+}
+
+/// A descendant the OS refuses the signal is left running by the walk's own loop: the error names it,
+/// with the refusal's OS error, and the root, which was killed, is not among what is left. A
+/// setuid-root helper under a plain root refuses the kill of its caller.
+///
+/// Mutants: the loop drops a refused descendant's error; the root is reported left beside it.
+#[cfg(unix)]
+#[skuld::test]
+fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_the_errno(
+    #[fixture(setuid)] _group: &crate::test_groups::Group,
+) {
+    let (child, stdin) = root_over_setuid_blockers(1);
+
+    let left = super::hard_kill(&crate::identity::HostKernel, child.id())
+        .into_result()
+        .expect_err("the helper refuses the kill");
+
+    assert!(left.root.is_none(), "the root was killed: {:?}", left.root);
+    assert_eq!(left.members.len(), 1, "{:?}", left.members);
+    match &left.members[0] {
+        crate::error::Error::MemberNotKilled { pid, source, .. } => {
+            assert_ne!(*pid, child.id().pid(), "the helper, not the root");
+            assert!(
+                matches!(**source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    }
+    // The helper exits at EOF: nothing killed it.
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
+}
+
+/// `Process::kill_tree` of a root that refuses the signal: nothing after the walk kills the root, so
+/// it is left, and the error names it with the refusal's OS error.
+///
+/// Mutant: a root the walk left is dropped from the report as if its kill had ended it.
+#[cfg(unix)]
+#[skuld::test]
+fn process_kill_tree_of_a_root_that_refuses_the_signal_names_the_root(
+    #[fixture(setuid)] _group: &crate::test_groups::Group,
+) {
+    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
+    let process = crate::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
+
+    let err = process.kill_tree().expect_err("the root refuses the kill");
+
+    match err {
+        crate::error::Error::MemberNotKilled { pid, source, .. } => {
+            assert_eq!(pid, child.id().pid());
+            assert!(
+                matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    }
+    drop(stdin);
+    assert!(child.wait().expect("the helper exits on EOF").success());
+}
+
+/// `Process::kill_tree` of a tree with two members that refuse the signal: the error names the first,
+/// and the call warns of the other once, under its own name.
+///
+/// Mutants: the other member is dropped; it is warned of by the walk as well as by the call.
+#[cfg(unix)]
+#[skuld::test]
+fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once(
+    #[fixture(setuid)] _group: &crate::test_groups::Group,
+) {
+    crate::log_capture::install();
+    let (child, stdin) = root_over_setuid_blockers(2);
+    let process = crate::Process::open_pid(child.id().pid())
+        .expect("open")
+        .expect("running");
+    let mark = crate::log_capture::mark();
+
+    let err = process.kill_tree().expect_err("two members refuse the kill");
+
+    let crate::error::Error::MemberNotKilled { pid: first, .. } = err else {
+        panic!("expected MemberNotKilled, got {err:?}");
+    };
+    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was not killed");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].1.starts_with("Process::kill_tree: pid "), "{warned:?}");
+    assert!(
+        !warned[0].1.contains(&format!("pid {first} ")),
+        "the warn names the other member, not the first: {warned:?}"
+    );
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
+}
+
+/// `terminate` is best effort: a member that refuses the `SIGTERM` is warned of once, with its pid and
+/// the OS's refusal, and the call is `Ok`.
+///
+/// Mutants: the refusal is not warned of; it is warned of twice.
+#[cfg(unix)]
+#[skuld::test]
+fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _group: &crate::test_groups::Group) {
+    crate::log_capture::install();
+    let (child, stdin) = root_over_setuid_blockers(1);
+    let mark = crate::log_capture::mark();
+
+    super::terminate(&crate::identity::HostKernel, child.id()).expect("best effort");
+
+    let os = std::io::Error::from_raw_os_error(libc::EPERM);
+    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was sent no SIGTERM");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].1.starts_with("treewalk: pid "), "{warned:?}");
+    assert!(warned[0].1.contains(&os.to_string()), "{warned:?}");
+    drop(stdin);
+    child.wait().expect("reap the root");
+}
+
+/// A plain root `sh` over `count` setuid-root helpers, each blocked on the stdin the test holds
+/// (the returned write end) and past its ready byte. A helper refuses the kill of its caller.
+#[cfg(unix)]
+fn root_over_setuid_blockers(count: usize) -> (crate::Child, std::io::PipeWriter) {
+    use std::io::Read as _;
+    // A background job's own stdin is `/dev/null`, so each helper reads fd 3.
+    let job = r#""$0" setuid-stdin-block root <&3 3<&- &"#;
+    let script = format!("exec 3<&0; {} wait", vec![job; count].join(" "));
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(["sh", "-c", &script])
+        .arg(crate::test_privilege::setuid::setuid_helper());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::null()).expect("stderr null");
+    let mut child = cmd.spawn().expect("spawn the root");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = vec![0u8; count];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("every helper reports ready");
+    assert!(ready.iter().all(|byte| *byte == b'+'), "{ready:?}");
+    (child, stdin)
 }
 
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale

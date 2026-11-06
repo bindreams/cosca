@@ -246,11 +246,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
     // The tree is reported after the root's kill: a walk that left only the root is settled by it.
-    let tree = tree.map(|kill| {
-        child
-            .attached
-            .settle(&child.tree_killed, kill, fate.ended_by_the_kill())
-    });
+    let tree = tree.map(|kill| child.attached.settle(&child.tree_killed, kill, fate.not_running()));
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree
@@ -267,10 +263,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // here. The one warn and the error's note say how the retry went.
     if hands_back && !tree_settled {
         let retry = kill_tree();
-        match child
-            .attached
-            .settle(&child.tree_killed, retry, fate.ended_by_the_kill())
-        {
+        match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(SettleOutcome::Skipped) => {}
             Ok(SettleOutcome::Killed) => {
@@ -1148,8 +1141,11 @@ impl LateTree {
                     let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
                     crate::child::tree_call::group_number_holds(pid, state)
                 };
-                self.sweeps
-                    .push(attached.hard_kill(&crate::containment::GroupRoot::new(None, &check)));
+                self.sweeps.push(
+                    attached
+                        .hard_kill(&crate::containment::GroupRoot::new(None, &check))
+                        .into_result(),
+                );
             }
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
@@ -1170,10 +1166,8 @@ impl LateTree {
     /// The `warn`'s note for the sweeps that failed, once the root's kill is known: `root_ended` says
     /// whether it ended the root, which settles a walk that left only the root
     /// ([`Unkilled::unsettled`](crate::containment::dispatch::Unkilled::unsettled), as
-    /// [`Attached::settle`](crate::containment::Attached::settle) does). The first failure stands:
-    /// no later sweep is shown to reach what it missed, since the root's kill reparents its
-    /// descendants out of a walk from its pid, a member that refused the kill can leave the group,
-    /// and a holder can close its marker.
+    /// [`Attached::settle`](crate::containment::Attached::settle) does). The first failure stands: a
+    /// later sweep is not shown to reach what it missed.
     fn failure_note(&mut self, root_ended: bool) -> Option<String> {
         let mut failed = None;
         // Whether a sweep succeeded after `failed`, and none failed since.

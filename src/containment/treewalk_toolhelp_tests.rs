@@ -24,6 +24,7 @@ fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     let walks: [(&str, Walk); 2] = [
         ("hard_kill", |p| {
             super::hard_kill(&crate::identity::HostKernel, p.id())
+                .into_result()
                 .map_err(crate::containment::dispatch::Unkilled::into_error)
         }),
         ("kill_tree", |p| p.kill_tree()),
@@ -61,7 +62,13 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     let me = ProcessId::current();
     let stale = me.with_other_value();
     let (child, _) = live_member();
-    super::hard_kill(&crate::identity::HostKernel, stale).expect("a root that lost its pid is nothing to do");
+    assert!(
+        matches!(
+            super::hard_kill(&crate::identity::HostKernel, stale),
+            crate::containment::dispatch::TreeKillOutcome::NoRoot
+        ),
+        "a root that lost its pid is nothing to do"
+    );
     release(child);
 }
 

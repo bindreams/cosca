@@ -159,12 +159,19 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
     crate::log_capture::install();
     for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
         let (child, writer) = crate::test_child::held_treewalk_blocker_leaving(left);
+        let teardowns = crate::child::owned::seams::record_root_teardowns();
         let mark = crate::log_capture::mark();
 
         let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
         let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
 
-        assert!(fate.ended_by_the_kill(), "{left:?}: {fate:?}");
+        assert!(fate.not_running(), "{left:?}: {fate:?}");
+        // A settled tree disarms the handle; an unsettled one leaves it to try again when it drops.
+        assert_eq!(
+            teardowns.count(),
+            u32::from(reported),
+            "{left:?}: the handle is armed iff reported"
+        );
         let cause = cause.to_string();
         assert_eq!(
             cause.contains("its contained tree could not be killed"),
@@ -179,6 +186,37 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
             .collect();
         assert_eq!(warns.len(), usize::from(reported), "{left:?}: {warns:?}");
     }
+}
+
+/// A teardown whose walk left only the root, and whose root someone else had reaped when the
+/// teardown's kill of it came, warns of nothing and marks the tree killed: the root is not running,
+/// whoever ended it.
+///
+/// Mutant: the root counts as ended only when this handle's own kill ended it (`Reaped`, `Killed`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Gone,
+            )])
+    });
+
+    let torn = child.tear_down(
+        crate::containment::dispatch::TeardownCaller::FailedRun,
+        crate::child::owned::teardown::Disposition::Leave,
+    );
+    child.kill_on_drop = false;
+
+    assert_eq!(torn.fate, crate::error::ChildFate::Gone);
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert!(child.tree_killed.is_set(), "the walk left nothing running");
+    drop(writer);
 }
 
 /// A failed spawn's cleanup whose root kill is refused, and whose root still runs, hands the root
@@ -727,7 +765,7 @@ fn a_teardown_that_skipped_the_tree_kill_does_not_mark_the_tree_killed() {
         crate::child::owned::teardown::Disposition::Leave,
     );
 
-    assert!(torn.fate.ended_by_the_kill(), "{:?}", torn.fate);
+    assert!(torn.fate.not_running(), "{:?}", torn.fate);
     assert!(
         !child.tree_killed.is_set(),
         "a skipped kill does not mark the tree killed"

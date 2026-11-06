@@ -360,7 +360,13 @@ fn root_proof_fails() -> FakeKernel<'static> {
 fn a_root_whose_proof_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
-    super::hard_kill(&root_changed_hands(), root()).expect("a gone root is Ok");
+    assert!(
+        matches!(
+            super::hard_kill(&root_changed_hands(), root()),
+            crate::containment::dispatch::TreeKillOutcome::NoRoot
+        ),
+        "a gone root has no tree to walk"
+    );
     super::terminate(&root_changed_hands(), root()).expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
@@ -379,7 +385,9 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails(), root()).map_err(crate::containment::dispatch::Unkilled::into_error),
+        super::hard_kill(&root_proof_fails(), root())
+            .into_result()
+            .map_err(crate::containment::dispatch::Unkilled::into_error),
         super::terminate(&root_proof_fails(), root()),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),

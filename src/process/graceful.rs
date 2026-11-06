@@ -59,6 +59,7 @@ impl Process {
         // No handle backstop: the root is left as any member is, and the first member left is the
         // error. This call's one report of the others.
         crate::containment::treewalk::hard_kill(kernel, self.id)
+            .into_result()
             .or_else(|left| left.unsettled(false))
             .map_err(|left| left.report("Process::kill_tree"))
     }

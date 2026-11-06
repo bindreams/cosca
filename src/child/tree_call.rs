@@ -1,7 +1,7 @@
 //! The tree paths' one look at the root, and what each sends by the root's number after it. Shared
 //! by the sync and async `kill_tree`, `terminate_tree` and `graceful_shutdown_tree`.
 
-use crate::containment::dispatch::{TreeSignal, Unkilled};
+use crate::containment::dispatch::{TreeKillOutcome, TreeSignal, Unkilled};
 use crate::containment::{Attached, GroupRoot, TreeKilled};
 use crate::error::Error;
 use crate::identity::RawPid;
@@ -300,10 +300,32 @@ impl TreeCall<'_> {
     /// own to end, so `root_ended` is false), through [`Attached::settle`](crate::containment::Attached::settle),
     /// the only writer of the mark. A `SIGTERM`'s is the answer as it is.
     fn answered(&self, result: Result<(), Error>) -> Result<(), Error> {
+        self.settled(result, TreeKillOutcome::Ran)
+    }
+
+    /// [`answered`](Self::answered) for a sweep that skipped what names the tree by the root's
+    /// number and reached only what names it by identity (`holders`), as a drop's kill is
+    /// [`TreeKillOutcome::Skipped`].
+    #[cfg(target_os = "macos")]
+    fn answered_skipped(&self, holders: Result<(), Error>) -> Result<(), Error> {
+        self.settled(holders, |holders| TreeKillOutcome::Skipped {
+            action: self
+                .attached
+                .named_by_root_number(self.pid, TreeSignal::Kill.verb())
+                .unwrap_or_else(|| "kill its tree".to_owned()),
+            holders,
+        })
+    }
+
+    fn settled(
+        &self,
+        result: Result<(), Error>,
+        outcome: impl FnOnce(Result<(), Unkilled>) -> TreeKillOutcome,
+    ) -> Result<(), Error> {
         match self.signal {
             TreeSignal::Kill => {
                 self.attached
-                    .settle_for_kill_tree(self.op, self.killed, result.map_err(Unkilled::from), false)
+                    .settle_for_kill_tree(self.op, self.killed, outcome(result.map_err(Unkilled::from)), false)
             }
             TreeSignal::Term => result,
         }
@@ -314,7 +336,7 @@ impl TreeCall<'_> {
     fn untrusted(&self, root: &RootState) -> Option<Result<(), Error>> {
         self.attached
             .signal_tree_untrusted(self.signal, root, self.pid, self.op, self.earlier)
-            .map(|result| self.answered(result))
+            .map(|result| self.answered_skipped(result))
     }
 
     /// The signal for [`RootNumber::NoWalk`]: the group and a macOS fd marker's holders, and no

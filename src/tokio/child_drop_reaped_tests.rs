@@ -593,6 +593,32 @@ async fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_
     assert_skipped_at_debug(mark);
 }
 
+/// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
+/// nothing and does not mark the tree killed: the drop still says it skips the walk. The sync twin
+/// is in `child::drop_reaped_tests`.
+///
+/// Mutant: a walk that found no root counts as a kill that ran.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn kill_tree_on_a_tree_walk_whose_root_is_reaped_does_not_mark_the_tree_killed() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, stdin) = crate::test_child::held_treewalk_blocker_async();
+    drop(stdin);
+    child.wait().await.expect("reap the root");
+
+    child
+        .kill_tree()
+        .expect("a root that is gone leaves no tree to walk, and no member behind");
+
+    assert!(!child.tree_killed(), "a walk that found no root killed nothing");
+    let mark = crate::log_capture::mark();
+    drop(child);
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn, "{records:?}");
+}
+
 /// The same for a `TreeWalk` whose walk left a descendant, which is an `Err` of its own variant.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]

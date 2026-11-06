@@ -268,8 +268,7 @@ impl Child {
         self.os.proc.as_mut()?.forget_for(view)
     }
 
-    /// Whether this handle already killed its tree completely: what a later call sees. A call that has
-    /// just run a kill reads the kill's own answer ([`settle_tree`](Self::settle_tree)).
+    /// Whether this handle already killed its tree completely.
     #[cfg(all(test, unix))]
     pub(super) fn tree_killed(&self) -> bool {
         self.tree_killed.is_set()
@@ -882,7 +881,7 @@ impl Child {
     /// marker), a walk that killed what it could and left a member running is an
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
     /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
-    /// The backstop still ran; a retry walks again.
+    /// The backstop still ran.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -957,8 +956,8 @@ impl Child {
             .root_checked(
                 || self.root_state(),
                 || {
-                    // The number may name another process, but the root's handle still names the root
-                    // exactly: its kill ends the root, whatever the call returns.
+                    // The root's handle names the root even when its number is reused; its kill ends
+                    // the root.
                     let sent = self.kill_root_through_handle();
                     root_ended_by_handle.set(SweepFailure::killed_root(&sent));
                     sent
@@ -974,9 +973,7 @@ impl Child {
         let group_result = self.os.attached.hard_kill(&group);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
-        if self.os.attached.hard_kill_refused_to_walk(&group_result) {
-            return group_result.map_err(|left| left.into_error().into());
-        }
+        let group_result = group_result.unless_refused()?;
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
@@ -1015,11 +1012,7 @@ impl Child {
             SweepFailure::backstop_of(self.kill_sent_gated(op, crate::elevation::front::Gate::Open))
         };
         #[cfg(not(unix))]
-        let (backstop, root_ended) = {
-            let killed = self.kill();
-            let ended = killed.is_ok();
-            (killed, ended)
-        };
+        let (backstop, root_ended) = SweepFailure::backstop_of(self.kill_sent_gated(op));
         SweepFailure::of(
             op,
             &self.os.attached,
@@ -1746,7 +1739,7 @@ impl Child {
         // Reported after the root's kill: a walk that left only the root is settled by it.
         let tree = signals.tree.take().and_then(|kill| {
             os.attached
-                .settle_for_drop(&self.tree_killed, kill, signals.fate.ended_by_the_kill())
+                .settle_for_drop(&self.tree_killed, kill, signals.fate.not_running())
         });
         #[cfg(unix)]
         let tree_failed = tree.is_some();
@@ -2095,7 +2088,7 @@ fn signal_on_drop(
     #[cfg(not(unix))]
     let tree = {
         _ = tree_killed;
-        TreeKillOutcome::from(os.attached.hard_kill(&crate::containment::GroupRoot::none()))
+        os.attached.hard_kill(&crate::containment::GroupRoot::none())
     };
     // A cgroup front's gate reads the kill's own outcome, which is handed on below.
     #[cfg(unix)]
