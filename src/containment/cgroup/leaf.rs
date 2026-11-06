@@ -1079,10 +1079,10 @@ impl CgroupLeaf {
     ///
     /// A child that exec'd outside the leaf is killed as the process group it leads first
     /// ([`kill_group_outside_leaf`]). Then, whatever the child, the leaf is killed through if the
-    /// child entered it (the write is retried once, before the child is looked at), the child is torn down (a kill its pidfd refuses is reaped if the leaf's
-    /// kill reached it), and only then is the leaf removed: a child that entered but whose report
-    /// the shut beat is still in the leaf until it is gone. A leaf whose id cannot be read places
-    /// the child through `/proc`.
+    /// child entered it (one write: a failure is final and reported), the child is torn down (a
+    /// kill its pidfd refuses is reaped if the leaf's kill reached it), and only then is the leaf
+    /// removed: a child that entered but whose report the shut beat is still in the leaf until it
+    /// is gone. A leaf whose id cannot be read places the child through `/proc`.
     ///
     /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
     /// its own, which would orphan its elevated program: it is looked at instead, and waited for
@@ -1167,12 +1167,11 @@ impl CgroupLeaf {
         Some(received)
     }
 
-    /// Kills through the leaf if the child entered it, once more if the first write failed, as the
-    /// removal does for a kill not yet made: `None` if there was none to make, else what the last
-    /// write answered. It is made before anything looks at the child, so a look that asks whether
-    /// the kill landed ([`Subtree`]) reads the retry's answer, and the removal does not kill again.
+    /// Kills through the leaf if the child entered it: `None` if there was none to make, else what
+    /// the one write answered. It is made before anything looks at the child, so a look that asks
+    /// whether the kill landed ([`Subtree`]) reads its answer, and the removal does not kill again.
     fn kill_entered(&self) -> Option<Result<(), crate::error::Error>> {
-        self.entered.then(|| self.hard_kill().or_else(|_| self.hard_kill()))
+        self.entered.then(|| self.hard_kill())
     }
 
     /// Removes the abandoned leaf: killed through, if `killed` holds the kill's answer, and
@@ -1203,13 +1202,12 @@ impl CgroupLeaf {
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf unless `killed` holds the answer of a kill the caller made (a failed
-    /// one is reported), waits however long the drain takes, with `warn`
-    /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the
-    /// leaf's child cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and
-    /// reported: after the drain and the sweep, an `EBUSY` means something another party did
-    /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
-    /// impossible.
+    /// Kills through the leaf, in one write, unless `killed` holds the answer of the write the
+    /// caller made; a failed write is final and reported. Waits however long the drain takes, with
+    /// `warn` ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the leaf's child
+    /// cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and reported:
+    /// after the drain and the sweep, an `EBUSY` means something another party did since
+    /// ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never impossible.
     fn drain_and_remove(
         &mut self,
         killed: Option<Result<(), crate::error::Error>>,

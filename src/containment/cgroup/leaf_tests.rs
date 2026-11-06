@@ -2660,22 +2660,21 @@ fn an_abandoned_child_that_entered_unreported_is_gone_before_its_leaf_is_removed
     assert!(warns.is_empty(), "no leaf is left behind: {warns:?}");
 }
 
-/// An abandoned spawn whose first `cgroup.kill` write fails has the write retried before anything
-/// else is done: the look at the child, and the leaf's removal, come after the retry, so whatever
-/// the look concludes is of the leaf as the retry left it. Runs on a plain directory whose `rmdir`
-/// hook notes how many kills were written by the removal's first `rmdir`.
+/// An abandoned spawn's `cgroup.kill` is one write: when it fails, the failure is final. The write
+/// is not made again (the fault fails only the first, so a second would be recorded as a kill), the
+/// front the leaf's kill did not reach is reported left unreaped, and the leaf that still holds it is
+/// reported left behind, once, as a failed `cgroup.kill`. Runs on a plain directory whose `rmdir`
+/// answers `EBUSY`, as cgroupfs does for a leaf with a running member.
 ///
-/// Mutant: the retry is left to the removal, after the child's look and the first `rmdir`.
+/// Mutants: the failed write is retried; the leaf's failure is not warned, or warned twice.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn an_abandoned_spawns_failed_leaf_kill_is_retried_before_its_leaf_is_removed() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
+fn an_abandoned_spawns_failed_leaf_kill_is_one_write_and_warned_once() {
     use crate::containment::cgroup::fault;
 
+    crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-kill-retried");
+    let leaf_path = dir.path().join("cosca-abandoned-kill-failed");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
     let mut child = spawn_placing(
@@ -2688,49 +2687,40 @@ fn an_abandoned_spawns_failed_leaf_kill_is_retried_before_its_leaf_is_removed() 
     let _stdin = child.stdin.take().expect("piped stdin");
     let pidfd = pidfd_of(child.id());
     fault::record_leaf_steps();
-    let kills_at_first_rmdir = Rc::new(Cell::new(None));
-    fault::set_rmdir_hook({
-        let kills_at_first_rmdir = Rc::clone(&kills_at_first_rmdir);
-        move |path| {
-            if kills_at_first_rmdir.get().is_none() {
-                kills_at_first_rmdir.set(Some(
-                    fault::peek_leaf_steps().iter().filter(|step| *step == "kill").count(),
-                ));
-            }
-            std::fs::remove_dir_all(path)
-        }
-    });
+    fault::set_rmdir_hook(|_| Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
     let _first_write_fails = fault::fail_next_kill_write();
 
-    leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
+    let mark = crate::log_capture::mark();
+    let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
 
     fault::take_rmdir_hook();
     let steps = fault::take_leaf_steps();
-    // The leaf's kill reached nothing here (a plain directory), so the child still runs.
+    // The leaf's kill reached nothing, so the child still runs.
     child.kill().expect("kill the child");
     child.wait().expect("reap the child");
     assert_eq!(
-        kills_at_first_rmdir.get(),
-        Some(1),
-        "the retry is written before the leaf's removal: {steps:?}"
+        abandoned,
+        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
     );
-    assert_eq!(
-        steps.iter().filter(|step| *step == "kill").count(),
-        1,
-        "and the removal does not write it again: {steps:?}"
+    assert!(
+        steps.iter().all(|step| step != "kill"),
+        "the failed write is not made again: {steps:?}"
     );
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
-/// An abandoned elevation front that entered a real leaf, whose first `cgroup.kill` write fails and
-/// whose retry succeeds, is reached by the leaf's kill: the look at it comes after the retry, so it
-/// is reaped, not left running. The front blocks on a stdin this test holds, so only the leaf's
-/// kill ends it.
+/// As above, on a real leaf: an abandoned elevation front whose `cgroup.kill` write fails is not
+/// reached by it. It is left unreaped and running in a leaf that is left behind, with the failed
+/// kill warned once; the leaf's kill is not made again, or the front would be reaped. The front
+/// blocks on a stdin this test holds, so only a kill through the leaf ends it.
 ///
-/// Mutant: the front is looked at after the first kill alone, leaving the retry to the leaf's
-/// removal.
+/// Mutant: the failed write is retried before the front is looked at.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_abandoned_front_whose_first_leaf_kill_failed_is_reached_by_the_retry(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_an_abandoned_front_whose_leaf_kill_failed_is_left_unreaped_in_a_leaf_left_behind(
+    #[fixture(cgroup)] _group: &Group,
+) {
     use std::os::unix::process::CommandExt;
 
     crate::log_capture::install();
@@ -2744,17 +2734,25 @@ fn cgroup_an_abandoned_front_whose_first_leaf_kill_failed_is_reached_by_the_retr
     let _stdin = child.stdin.take().expect("piped stdin");
     let pidfd = pidfd_of(child.id());
     let leaf_path = leaf.path().to_path_buf();
-    // No handle owns the front once its spawn is abandoned: the leaf looks at it through its pidfd.
-    drop(child);
-
     let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+
+    let mark = crate::log_capture::mark();
     let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
 
+    // The leaf's kill never wrote, so the front still runs in the leaf: end it, then the leaf.
+    child.kill().expect("kill the front");
+    child.wait().expect("reap the front");
+    let left = leaf_path.exists();
+    if left {
+        std::fs::remove_dir(&leaf_path).expect("remove the leaf the abandonment left");
+    }
     assert_eq!(
         abandoned,
-        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::Reaped)
+        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
     );
-    assert!(!leaf_path.exists(), "the drained leaf is removed");
+    assert!(left, "the leaf that held the running front is left behind");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
 /// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,

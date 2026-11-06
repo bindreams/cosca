@@ -2210,11 +2210,18 @@ fn signal_on_drop(
         }
         let looked = proc.try_wait();
         if !matches!(looked, Ok(Some(_))) {
-            // Still held by tokio's `Child`, which the release drops (`ProcSource::release`): its
-            // orphan queue reaps it once it exits.
-            signals.left.push(format!(
-                "async child {pid} could not be terminated on drop; leaving it running"
-            ));
+            // A running child is still held by tokio's `Child`, which the release drops
+            // (`ProcSource::release`): its orphan queue reaps it once it exits. A look that failed
+            // is a root not shown to be ours: the drop forgets tokio's `Child` next (`forget_for`),
+            // and nothing reaps it.
+            let left = if looked.is_ok() {
+                "; leaving it running"
+            } else {
+                crate::child::owned::teardown::LEAVING_RUNNING
+            };
+            signals
+                .left
+                .push(format!("async child {pid} could not be terminated on drop{left}"));
         }
         signals.fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id));
         return signals;
