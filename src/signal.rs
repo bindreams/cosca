@@ -180,13 +180,18 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
         log::debug!("child {pid} has no pidfd (it was gone when adopted); {sig:?} not sent");
         return Ok(Sent::Gone);
     };
-    send_pidfd(pidfd, pid, sig).map_err(|e| io_context("pidfd_send_signal", e.into()))
+    send_pidfd(pidfd, Some(pid), sig).map_err(|e| io_context("pidfd_send_signal", e.into()))
 }
 
 /// [`via_pidfd`] for a pidfd that is present, with the bare errno of a refused send, for a caller
-/// that promises its own caller the raw errno.
+/// that promises its own caller the raw errno. `pid` only names the child in messages and in the
+/// test send log (where `None` is 0); the send goes by `pidfd`.
 #[cfg(target_os = "linux")]
-pub(crate) fn send_pidfd(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32, sig: Sig) -> Result<Sent, rustix::io::Errno> {
+pub(crate) fn send_pidfd(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    pid: Option<u32>,
+    sig: Sig,
+) -> Result<Sent, rustix::io::Errno> {
     #[cfg(test)]
     let seam = seams::kills_refused();
     #[cfg(not(test))]
@@ -196,11 +201,14 @@ pub(crate) fn send_pidfd(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32, sig: Sig)
         None => rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()),
     };
     #[cfg(test)]
-    crate::send_log::record(pid, sig, crate::send_log::Via::Pidfd);
+    crate::send_log::record(pid.unwrap_or(0), sig, crate::send_log::Via::Pidfd);
     match sent {
         Ok(()) => Ok(Sent::Delivered),
         Err(rustix::io::Errno::SRCH) => {
-            log::debug!("pidfd_send_signal({sig:?}) to child {pid}: it is already gone");
+            log::debug!(
+                "pidfd_send_signal({sig:?}) to {}: it is already gone",
+                crate::os_process::child_named(pid)
+            );
             Ok(Sent::Gone)
         }
         Err(e) => Err(e),

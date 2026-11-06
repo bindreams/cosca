@@ -1166,7 +1166,7 @@ impl CgroupLeaf {
         }
         // Any kill through the leaf, this one or the removal's own, ends what it held.
         end_front(received, warn, |pid, pidfd| match &subtree {
-            Ok(subtree) => subtree.reached(pid, pidfd),
+            Ok(subtree) => subtree.reached_by(pid, pidfd),
             Err(e) => Err(io::Error::new(
                 e.kind(),
                 format!("its leaf's subtree cannot be read: {e}"),
