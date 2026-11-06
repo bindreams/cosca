@@ -26,6 +26,11 @@ pub(crate) trait OsChild: OsProcess {
     /// failed after the handshake opened its pidfd); acts go by the handle either way.
     fn pid(&self) -> Option<u32>;
 
+    /// What a kill through this handle may be refused for, as whatever built the handle knows it.
+    /// A teardown's contract with its caller reads it.
+    #[cfg(any(target_os = "linux", windows))]
+    fn kill_refusal(&self) -> KillRefusal;
+
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
     /// on. A stop, or a zombie only its tracer sees, is [`PeekOutcome::Running`]. Any thread, any
     /// time.
@@ -35,6 +40,27 @@ pub(crate) trait OsChild: OsProcess {
     /// one (never a stop). [`TryReapOutcome::Running`] carries the wait, which the caller waits on
     /// before it calls again. Only the one waiter that holds the reap calls it.
     fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error>;
+}
+
+/// What a kill through a handle may be refused for. The handle's constructor decides: it knows the
+/// rights it asked for or was granted.
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillRefusal {
+    /// Never: the handle can kill its process (a Windows handle holding `PROCESS_TERMINATE`), so a
+    /// refusal is a contract breach. A refusal that only says the process is exiting
+    /// (`ERROR_ACCESS_DENIED` on an exiting process) is not one: it is answered as an exit
+    /// (`Termination::Exited`).
+    Never,
+    /// For want of permission alone ([`PermissionDenied`](std::io::ErrorKind::PermissionDenied)): a
+    /// Linux pidfd (`EPERM`), a Windows handle that lacks `PROCESS_TERMINATE`.
+    Permission,
 }
 
 /// What [`OsChild::try_reap`] did.

@@ -32,6 +32,7 @@ use super::OwnedChild;
 use crate::child::lifecycle::{wait_to_exit, Settlement, Wording};
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
+use crate::os_process::child::KillRefusal;
 use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
@@ -146,14 +147,17 @@ pub(crate) struct TeardownOutcome {
     said: Option<Wording>,
     /// The look that ended after a refused kill ([`look_after_refused_kill`](OwnedChild::look_after_refused_kill)).
     refused_look: Option<Box<Settlement>>,
+    /// The kind of the error the kill was refused with, if it was.
+    refused: Option<io::ErrorKind>,
 }
 
-/// What is left of a [`TeardownOutcome`] once its clause is said: the fate, and whether the child
-/// is uncollected. The clause is gone, so nothing can say it twice.
+/// What is left of a [`TeardownOutcome`] once its clause is said: the fate, whether the child is
+/// uncollected, and the kind of the error its kill was refused with, if it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Remains {
     pub(crate) fate: ChildFate,
     pub(crate) uncollected: bool,
+    pub(crate) refused: Option<io::ErrorKind>,
 }
 
 impl Remains {
@@ -167,6 +171,7 @@ impl Remains {
         Remains {
             fate,
             uncollected: false,
+            refused: None,
         }
     }
 }
@@ -184,6 +189,7 @@ impl TeardownOutcome {
             fate,
             said: None,
             refused_look: None,
+            refused: None,
         }
     }
 
@@ -199,6 +205,7 @@ impl TeardownOutcome {
             fate,
             said: Some(said),
             refused_look: None,
+            refused: None,
         }
     }
 
@@ -235,6 +242,7 @@ impl TeardownOutcome {
         Remains {
             fate: self.fate,
             uncollected: self.uncollected(),
+            refused: self.refused,
         }
     }
 
@@ -308,63 +316,92 @@ impl TeardownOutcome {
         log::log!(level, "{label}: {text}");
         (None, remains)
     }
-
-    /// Says the clause as a failed spawn's teardown ([`failed_spawn_line`](Self::failed_spawn_line)),
-    /// logging its line at warn.
-    #[cfg(any(target_os = "linux", windows))]
-    pub(crate) fn say_as_failed_spawn(self, why: &mut crate::child::spawn::Diagnosis) -> Remains {
-        let (line, remains) = self.failed_spawn_line(why);
-        if let Some(line) = line {
-            log::warn!("{line}");
-        }
-        remains
-    }
 }
 
-/// What the caller of a teardown through a pidfd knows about the pidfd, which decides what the
-/// teardown may come to. Stated once, where the pidfd is handed over.
-///
-/// Only the Linux spawn tears a child down through a pidfd and produces these.
+/// What already happened to a handle a teardown goes over (a Linux pidfd, a Windows process handle),
+/// which the caller knows and the handle does not. What the handle allows is its constructor's
+/// ([`KillRefusal`]); the two make an [`Expect`].
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Expect {
-    /// An earlier look on the pidfd failed, or may have, so a wait on it may fail too: any outcome
-    /// stands.
-    Anything,
-    /// No earlier look on the pidfd failed, so a wait on it does not: a child the teardown left
-    /// uncollected is one whose kill was refused, and still running.
-    Waited,
-    /// As [`Waited`](Expect::Waited), and the child never ran the program, so it has this process's
+pub(crate) enum Past {
+    /// Nothing happened to the handle, which can be waited on (a Windows handle holding
+    /// `SYNCHRONIZE`), so a wait on it does not fail: a child left uncollected is one whose kill was
+    /// refused, and still running.
+    Clean,
+    /// An earlier look on the handle failed, or may have, so a wait on it may fail too: a child the
+    /// teardown left uncollected need not be one whose kill was refused. What the kill may be refused
+    /// for is the handle's.
+    WaitMayFail,
+    /// As [`Clean`](Past::Clean), and the child never ran the program, so it has this process's
     /// credentials: nothing but its being gone can refuse its kill, and the teardown collects it.
     Unexecuted,
 }
 
-/// What a teardown through a pidfd came to, and what its caller expected of it.
+/// What a teardown over a handle is expected to come to: what the handle allows, from its
+/// constructor, and what already happened to it, from the caller.
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Expect {
+    pub(crate) refusal: KillRefusal,
+    pub(crate) past: Past,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl Expect {
+    /// What `past` and the allowance of `child`'s handle make of a teardown over it.
+    pub(crate) fn of(child: &OwnedChild, past: Past) -> Expect {
+        Expect {
+            refusal: child.kill_refusal(),
+            past,
+        }
+    }
+}
+
+/// What a teardown over a handle came to, and what its caller expected of it.
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
 )]
 #[derive(Debug)]
-pub(crate) struct PidfdTeardown {
+pub(crate) struct HandleTeardown {
     pub(crate) outcome: TeardownOutcome,
     pub(crate) expect: Expect,
 }
 
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
 )]
-impl PidfdTeardown {
-    pub(crate) fn new(outcome: TeardownOutcome, expect: Expect) -> PidfdTeardown {
-        PidfdTeardown { outcome, expect }
+impl HandleTeardown {
+    pub(crate) fn new(outcome: TeardownOutcome, expect: Expect) -> HandleTeardown {
+        HandleTeardown { outcome, expect }
     }
 
     /// The teardown as an abandonment hands it on, if it left its child uncollected: its warn, for
     /// the place that logs it. Any other teardown is given back.
-    pub(crate) fn uncollected(self) -> Result<Left, PidfdTeardown> {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux spawn hands a pidfd teardown's abandonment on")
+    )]
+    pub(crate) fn uncollected(self) -> Result<Left, HandleTeardown> {
         let expect = self.expect;
         let remains = self.outcome.remains();
         self.outcome
@@ -374,20 +411,20 @@ impl PidfdTeardown {
                 remains,
                 expect,
             })
-            .map_err(|outcome| PidfdTeardown { outcome, expect })
+            .map_err(|outcome| HandleTeardown { outcome, expect })
     }
 
     /// Says the teardown as a failed spawn's
     /// ([`failed_spawn_line`](TeardownOutcome::failed_spawn_line)): its warn, if it has one, is
-    /// logged through [`warn_pidfd_teardown`], which asserts the teardown's contract with its caller.
-    #[cfg(target_os = "linux")]
+    /// logged through [`warn_teardown`], which asserts the teardown's contract with its caller.
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn say_as_failed_spawn(self, why: &mut crate::child::spawn::Diagnosis) -> Remains {
         let (line, remains) = self.outcome.failed_spawn_line(why);
-        warn_pidfd_teardown(line.as_deref(), &remains, self.expect);
+        warn_teardown(line.as_deref(), &remains, self.expect);
         remains
     }
 
-    /// Logs `line` through [`warn_pidfd_teardown`], as this teardown came out, for a caller that
+    /// Logs `line` through [`warn_teardown`], as this teardown came out, for a caller that
     /// folded the clause into its line itself.
     #[cfg_attr(
         not(feature = "tokio"),
@@ -397,12 +434,12 @@ impl PidfdTeardown {
         )
     )]
     pub(crate) fn warn(&self, line: Option<&str>) {
-        warn_pidfd_teardown(line, &self.outcome.remains(), self.expect);
+        warn_teardown(line, &self.outcome.remains(), self.expect);
     }
 }
 
-/// A pidfd teardown that left its child uncollected, as an abandonment hands it on to the place that
-/// logs it: the clause for the caller's one warn, and what [`warn_pidfd_teardown`] reads of the
+/// A handle teardown that left its child uncollected, as an abandonment hands it on to the place that
+/// logs it: the clause for the caller's one warn, and what [`warn_teardown`] reads of the
 /// teardown.
 #[cfg_attr(
     not(target_os = "linux"),
@@ -420,33 +457,58 @@ pub(crate) struct Left {
     allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
 )]
 impl Left {
-    /// Logs `line` through [`warn_pidfd_teardown`]: the teardown left the child uncollected.
+    /// Logs `line` through [`warn_teardown`]: the teardown left the child uncollected.
     pub(crate) fn warn(&self, line: &str) {
-        warn_pidfd_teardown(Some(line), &self.remains, self.expect);
+        warn_teardown(Some(line), &self.remains, self.expect);
     }
 }
 
-/// The one place the warn of a pidfd teardown is logged: `line`, then the teardown's contract
+/// The one place the warn of a handle teardown is logged: `line`, then the teardown's contract
 /// with its caller, asserted after the warn so that a panic does not lose it. That a child left
 /// uncollected has a warn is not asserted: an outcome of one cannot be built without it.
 /// `remains` is the teardown's ([`TeardownOutcome::remains`]); `expect` is its caller's.
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
 )]
-fn warn_pidfd_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
-    let Remains { fate, uncollected } = *remains;
+fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
+    let Remains {
+        fate,
+        uncollected,
+        refused,
+    } = *remains;
+    let Expect { refusal, past } = expect;
     if let Some(line) = line {
         log::warn!("{line}");
     }
     debug_assert!(
-        !uncollected || expect == Expect::Anything || matches!(fate, ChildFate::Running { .. }),
-        "a wait on a child's own pidfd failed: {fate:?}"
+        !uncollected || past == Past::WaitMayFail || matches!(fate, ChildFate::Running { .. }),
+        "a wait on a child's own handle failed: {fate:?}"
     );
     debug_assert!(
-        expect != Expect::Unexecuted || !matches!(fate, ChildFate::Running { .. }),
+        past != Past::Unexecuted || !matches!(fate, ChildFate::Running { .. }),
         "the kill of a child that never ran the program was refused"
     );
+    debug_assert!(
+        refusal != KillRefusal::Never || refused.is_none(),
+        "the kill of a handle that is never refused was refused: {refused:?}"
+    );
+    debug_assert!(
+        refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
+        "the kill of a child's own handle was refused for a reason other than permission: {refused:?}"
+    );
+}
+
+/// What a refused kill was refused for: what the OS refused it with, which is an I/O error. Any other
+/// error is another reason.
+fn refusal_kind(refused: &Error) -> io::ErrorKind {
+    match refused {
+        Error::Io(e) => e.kind(),
+        _ => io::ErrorKind::Other,
+    }
 }
 
 impl OwnedChild {
@@ -510,6 +572,7 @@ impl OwnedChild {
     ) -> TeardownOutcome {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
+        let refused_kind = refusal_kind(&refused);
         let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
         // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
         let running = match disposition {
@@ -518,6 +581,7 @@ impl OwnedChild {
         };
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
         torn.refused_look = settlement.ended().then(|| Box::new(settlement));
+        torn.refused = Some(refused_kind);
         torn
     }
 
