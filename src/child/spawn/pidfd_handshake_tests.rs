@@ -1554,10 +1554,10 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
         ChildFate::Unknown,
         "the leaf's abandonment answers, not the handshake"
     );
-    let (stashed, expect) = left.take().expect("the pidfd is left for the leaf");
+    let (stashed, past) = left.take().expect("the pidfd is left for the leaf");
     assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
     // The peek of the running front succeeded, so a wait on its pidfd is expected to.
-    assert_eq!(expect, crate::child::owned::teardown::Expect::Waited);
+    assert_eq!(past, crate::child::owned::teardown::Past::Clean);
     // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
     // reaped before this wait.
     drop(cat.stdin.take());
@@ -1568,7 +1568,7 @@ fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
 /// and the leaf gets a copy: the handshake's wait may have failed, so the copy's teardown may come
 /// to anything, whatever the peek of the original said.
 ///
-/// Mutant: the copy carries the original's expectation (`Waited` after a successful peek).
+/// Mutant: the copy carries the original's past (`Clean` after a successful peek).
 #[skuld::test]
 fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_expects_anything() {
     let (mut cat, pidfd) = cat_with_pidfd();
@@ -1587,8 +1587,8 @@ fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_expects_anything() {
         ChildFate::Reaped,
         "the handshake ended the child through the original"
     );
-    let (_copy, expect) = left.take().expect("the leaf holds a copy");
-    assert_eq!(expect, crate::child::owned::teardown::Expect::Anything);
+    let (_copy, past) = left.take().expect("the leaf holds a copy");
+    assert_eq!(past, crate::child::owned::teardown::Past::LookFailed);
     drop(cat.stdin.take());
 }
 
@@ -1773,7 +1773,7 @@ fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name()
     let fate = super::end_through_pidfd(
         Some(pid),
         pidfd,
-        super::Expect::Waited,
+        super::Past::Clean,
         None,
         &mut crate::child::spawn::Diagnosis::default(),
     )

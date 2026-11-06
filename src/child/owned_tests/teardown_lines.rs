@@ -394,8 +394,14 @@ fn callers() -> Vec<(&'static str, Say)> {
     }
     #[cfg(any(target_os = "linux", windows))]
     callers.push((TeardownCaller::FailedSpawn.label(), |torn| {
-        use crate::child::owned::teardown::{Expect, HandleTeardown};
-        HandleTeardown::new(torn, Expect::Anything).say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
+        use crate::child::owned::teardown::{Expect, HandleTeardown, Past};
+        use crate::os_process::child::KillRefusal;
+        // Any outcome of the table stands: a look on the handle failed.
+        let expect = Expect {
+            refusal: KillRefusal::Permission,
+            past: Past::LookFailed,
+        };
+        HandleTeardown::new(torn, expect).say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
     }));
     callers
 }

@@ -364,6 +364,63 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
 
+/// A refused kill is recorded in the outcome whichever way the teardown goes on: after one look, or
+/// after the wait for a child a tree kill reached. The contract check reads it.
+///
+/// Mutant: only the look path records the refusal.
+#[skuld::test]
+fn a_refused_kill_is_recorded_on_every_path_that_saw_it() {
+    for reach in [Ok(true), Ok(false)] {
+        let fake = fake()
+            .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+            .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+        let _fire = fire_on_block(&fake);
+        let reach = FakeReach::answering(reach);
+        let torn = OwnedChild::new(Box::new(fake)).tear_down(
+            Some(id()),
+            Kill {
+                disposition: Disposition::Leave,
+                tree: Some(&reach),
+            },
+            None,
+        );
+        assert_eq!(
+            torn.remains().refused,
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{:?}: {torn:?}",
+            reach.asked()
+        );
+    }
+}
+
+/// A refusal is classified by what it is: a typed refusal to signal an elevated child is a refusal of
+/// permission, one of another kind is another reason, and an I/O error is its own kind.
+///
+/// Mutant: every error that is not `Io` is another reason.
+#[skuld::test]
+fn a_refusal_is_classified_by_what_it_is() {
+    use crate::error::{ElevationErrorKind, Error};
+    let denied = || Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let unkillable = || Error::Elevation {
+        kind: ElevationErrorKind::Unkillable,
+        detail: "refused".into(),
+    };
+    let contained = || Error::Containment {
+        detail: "refused".into(),
+    };
+    let kinds = [
+        (denied(), std::io::ErrorKind::PermissionDenied),
+        (unkillable(), std::io::ErrorKind::PermissionDenied),
+        (contained(), std::io::ErrorKind::Other),
+    ];
+    for (refused, kind) in kinds {
+        let described = refused.to_string();
+        let child = OwnedChild::new(Box::new(fake().reaps([ReapAnswer::Reaped(exit())])));
+        let torn = child.look_after_refused_kill(Some(id()), refused, Disposition::Leave);
+        assert_eq!(torn.remains().refused, Some(kind), "{described}");
+    }
+}
+
 /// A refused kill of a child that no tree kill reached is looked at once, never waited for: nothing
 /// asked it to exit. A reach that cannot say is the same.
 ///

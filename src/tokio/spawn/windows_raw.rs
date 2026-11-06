@@ -18,7 +18,7 @@ use std::sync::Arc;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::child::owned::teardown::{Disposition, Expect};
+use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::windows_raw as sync_raw;
@@ -352,14 +352,11 @@ pub(crate) fn spawn_raw(
 /// thread, and warns once it passes [`slow_teardown_after`](crate::tokio::child::slow_teardown_after).
 /// A child whose kill was refused is left running, warned of, until the async child owns its teardown.
 fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::ProcessId>) -> ChildFate {
-    // `CreateProcess` gave the handle every right, so no wait on it fails, and its kill is refused
-    // only for want of permission.
-    let expect = Expect::Waited;
     let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
     let (fate, _) = tear_down_failed_spawn(
         owned,
         id,
-        expect,
+        Past::Clean,
         Disposition::Leave,
         Due::in_(crate::tokio::child::slow_teardown_after()),
         &mut Diagnosis::default(),

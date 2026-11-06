@@ -542,16 +542,21 @@ fn an_out_of_reach_child_never_told_to_go_is_said_to_have_never_run() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach() {
-    use crate::child::owned::teardown::{Expect, HandleTeardown, TeardownOutcome};
+    use crate::child::owned::teardown::{Expect, HandleTeardown, Past, TeardownOutcome};
     use crate::child::spawn::failure::SpawnFailure;
     use crate::containment::AbandonedChild;
+    use crate::os_process::child::KillRefusal;
 
     crate::log_capture::install();
     let marker = "cosca-abandoned-uncollected-probe-4e19";
     let clause = "child could not be terminated (Operation not permitted); leaving it running";
     let error = || Error::Io(std::io::Error::other(marker));
     let uncollected = |fate| {
-        let torn = HandleTeardown::new(TeardownOutcome::left_uncollected(fate, clause.into()), Expect::Anything);
+        let expect = Expect {
+            refusal: KillRefusal::Permission,
+            past: Past::LookFailed,
+        };
+        let torn = HandleTeardown::new(TeardownOutcome::left_uncollected(fate, clause.into()), expect);
         AbandonedChild::Uncollected(torn.uncollected().expect("an uncollected teardown is left"))
     };
     let abandon = |failure: SpawnFailure| {

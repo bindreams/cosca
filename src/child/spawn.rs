@@ -650,10 +650,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(Some(pid), pidfd))),
         )
     };
-    // Windows holds it through std's process handle, which becomes the `OwnedChild`'s own. `CreateProcess`
-    // gave it every right, so no wait on it fails, and its kill is refused only for want of permission.
-    #[cfg(windows)]
-    let expect = crate::child::owned::teardown::Expect::Waited;
+    // Windows holds it through std's process handle, which becomes the `OwnedChild`'s own.
     #[cfg(windows)]
     let (pid, owned) = {
         let pid = child.id();
@@ -687,13 +684,13 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     if front.is_some() {
         prepared.watch_front(pid);
     }
-    // Read the identity while the child is still unreaped, and check the read against the handle
-    // held since the spawn (the pidfd on Linux, the process handle on Windows, `std`'s `Child` on
-    // macOS): a pid alone does not say whom it names once something else has reaped the child. The
-    // attach takes this identity
-    // and does not re-read the root's, so a reap and reuse after the check cannot make the
-    // containment name a stranger. Nothing here reaps the child, so this is also the identity the
-    // adopted `OwnedChild` takes.
+    // Read the identity while the child is still unreaped, and check the read against what the spawn
+    // holds of the child: the pidfd on Linux, and on macOS the unique id the child reported (the
+    // pid alone does not say whom it names once something else has reaped the child). On Windows
+    // nothing is checked: the process handle held since the spawn pins the pid. The attach takes
+    // this identity and does not re-read the root's, so a reap and reuse after the check cannot
+    // make the containment name a stranger. Nothing here reaps the child, so this is also the
+    // identity the adopted `OwnedChild` takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, pid);
     #[cfg(target_os = "linux")]
@@ -770,7 +767,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             let (child_fate, unreaped) = held_teardown::tear_down_failed_spawn(
                 owned,
                 None,
-                expect,
+                crate::child::owned::teardown::Past::Clean,
                 crate::child::owned::teardown::Disposition::HandBack,
                 None,
                 &mut why,
@@ -831,7 +828,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 let (child_fate, unreaped) = held_teardown::tear_down_failed_spawn(
                     owned,
                     Some(id),
-                    expect,
+                    crate::child::owned::teardown::Past::Clean,
                     crate::child::owned::teardown::Disposition::HandBack,
                     None,
                     &mut Diagnosis::default(),

@@ -604,7 +604,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
         }
         RunasOutcome::Launched { proc, pid, id, report } => {
             let mut child = crate::child::Child::from_parts(
-                OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
+                OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid))),
                 id,
                 BTreeMap::new(),
                 kill_on_drop,

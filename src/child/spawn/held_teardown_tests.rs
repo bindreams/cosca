@@ -9,12 +9,12 @@ use std::sync::Arc;
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
-use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown};
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
-use crate::os_process::child::Foreign;
+use crate::os_process::child::{Foreign, KillRefusal};
 use crate::os_process::fake::{failed_signal, FakeProcess, ReapAnswer};
 use crate::test_child::{held_uncontained_blocker, tear_down_held_holding};
 
@@ -420,21 +420,25 @@ fn a_front_with_no_pid_is_named_as_such() {
     crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
 }
 
-/// The teardown of the table's row `kill` and `found`, as a caller that leaves the child expects
-/// `expect` of it, and the clause its row says.
-fn teardown_of(kill: teardown_lines::Kill, found: teardown_lines::Found, expect: Expect) -> (HandleTeardown, String) {
+/// The teardown of the table's row `kill` and `found` over a pidfd, as a caller that leaves the child
+/// and knows `past` of the pidfd, and the clause its row says.
+fn teardown_of(kill: teardown_lines::Kill, found: teardown_lines::Found, past: Past) -> (HandleTeardown, String) {
     let row = teardown_lines::rows()
         .into_iter()
         .find(|row| row.kill == kill && row.found == found)
         .expect("the table has the row");
+    let expect = Expect {
+        refusal: KillRefusal::Permission,
+        past,
+    };
     let torn = HandleTeardown::new(teardown_lines::outcome(&row, Disposition::Leave), expect);
     (torn, row.leave)
 }
 
 /// The teardown whose kill was delivered and whose wait then failed: uncollected, and `Killed`, as a
 /// failed wait on a pidfd leaves it.
-fn after_a_failed_wait(expect: Expect) -> HandleTeardown {
-    teardown_of(Kill::Delivered, Found::WaitFailed, expect).0
+fn after_a_failed_wait(past: Past) -> HandleTeardown {
+    teardown_of(Kill::Delivered, Found::WaitFailed, past).0
 }
 
 /// A failed wait on a pidfd no look failed on is a breach of the contract, asserted where the warn is
@@ -446,32 +450,70 @@ fn after_a_failed_wait(expect: Expect) -> HandleTeardown {
 #[should_panic(expected = "a wait on a child's own handle failed")]
 fn a_failed_wait_on_a_pidfd_nothing_looked_at_breaks_the_contract() {
     crate::log_capture::install();
-    after_a_failed_wait(Expect::Waited).say_as_failed_spawn(&mut Diagnosis::default());
+    after_a_failed_wait(Past::Clean).say_as_failed_spawn(&mut Diagnosis::default());
 }
 
 /// A kill of a child that never ran the program is not refused: a child left running breaks the
 /// contract.
 ///
-/// Mutant: `Expect::Unexecuted` asserts no more than `Expect::Waited`.
+/// Mutant: `Past::Unexecuted` asserts no more than `Past::Clean`.
 #[cfg(debug_assertions)]
 #[skuld::test]
 #[should_panic(expected = "never ran the program was refused")]
 fn a_refused_kill_of_a_child_that_never_ran_breaks_the_contract() {
     crate::log_capture::install();
-    let (torn, _) = teardown_of(Kill::Refused, Found::Running, Expect::Unexecuted);
+    let (torn, _) = teardown_of(Kill::Refused, Found::Running, Past::Unexecuted);
     torn.say_as_failed_spawn(&mut Diagnosis::default());
 }
 
 /// A caller that knows a look on the pidfd failed expects nothing of a wait on it: the same
 /// teardown is no breach.
 ///
-/// Mutant: `Expect::Anything` asserts like `Expect::Waited`.
+/// Mutant: `Past::LookFailed` asserts like `Past::Clean`.
 #[skuld::test]
 fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    after_a_failed_wait(Expect::Anything).say_as_failed_spawn(&mut Diagnosis::default());
+    after_a_failed_wait(Past::LookFailed).say_as_failed_spawn(&mut Diagnosis::default());
     assert_eq!(warns_since(mark).len(), 1);
+}
+
+/// The pidfd states what its kill may be refused for: permission alone (`EPERM`).
+///
+/// Mutant: `LinuxProcess` allows no refusal, or any.
+#[skuld::test]
+fn a_pidfd_allows_a_refusal_of_permission_alone() {
+    let (owned, stdin) = held_blocker(|f| f);
+    assert_eq!(owned.kill_refusal(), KillRefusal::Permission);
+    drop(stdin);
+}
+
+/// A failed spawn's teardown of a pidfd whose kill is refused with `errno`: the fate, which the
+/// refusal leaves `Running`.
+fn after_a_pidfd_kill_refused_with(errno: i32, past: Past) -> ChildFate {
+    crate::log_capture::install();
+    let (owned, _stdin) = held_blocker(|f| f.signals([failed_signal(errno)]));
+    super::held_teardown::tear_down_failed_spawn(owned, None, past, Disposition::Leave, None, &mut Diagnosis::default())
+        .0
+}
+
+/// A kill of a pidfd refused with `EPERM` is within the contract, a setuid child's.
+///
+/// Mutant: the contract refuses every refusal of a pidfd.
+#[skuld::test]
+fn a_pidfd_kill_refused_with_eperm_is_no_breach() {
+    let fate = after_a_pidfd_kill_refused_with(libc::EPERM, Past::Clean);
+    assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
+}
+
+/// A kill of a pidfd refused with anything else breaks the contract.
+///
+/// Mutant: the contract allows any refusal of a pidfd.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "for a reason other than permission")]
+fn a_pidfd_kill_refused_with_another_errno_breaks_the_contract() {
+    after_a_pidfd_kill_refused_with(libc::EIO, Past::Clean);
 }
 
 /// A teardown that collected the child, said with a diagnosis still owed, is the event's one warn:
@@ -482,7 +524,7 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
 #[skuld::test]
 fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
     crate::log_capture::install();
-    let (torn, clause) = teardown_of(Kill::Delivered, Found::Exited, Expect::Waited);
+    let (torn, clause) = teardown_of(Kill::Delivered, Found::Exited, Past::Clean);
     let mut why = Diagnosis::default();
     why.add("the identity check failed");
     let mark = crate::log_capture::mark();

@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use crate::child::drop_report::Forgot;
 use crate::child::owned::teardown::HandleTeardown;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, Expect};
+use crate::child::owned::teardown::{Disposition, Past};
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
@@ -1538,13 +1538,13 @@ impl ProcSource {
     /// already.
     #[cfg(target_os = "linux")]
     fn tear_down_forgotten(mut self, pid: u32, id: Option<ProcessId>, forgot: Option<Forgetting>) -> TornDown {
-        let (expect, leak, why) = match forgot {
-            Some(forgot) => (Expect::Anything, Some(forgot.leak), Some(forgot.why)),
+        let (past, leak, why) = match forgot {
+            Some(forgot) => (Past::LookFailed, Some(forgot.leak), Some(forgot.why)),
             None => match self.forget_quietly(Forgotten::Unproven) {
-                Some((_, leak)) => (Expect::Waited, Some(leak), None),
+                Some((_, leak)) => (Past::Clean, Some(leak), None),
                 // Forgotten before ([`reap_now`](ProcSource::reap_now) takes any backend): whatever
                 // look did it says nothing of a wait on the pidfd, and nothing more leaks.
-                None => (Expect::Anything, None, None),
+                None => (Past::LookFailed, None, None),
             },
         };
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
@@ -1552,7 +1552,7 @@ impl ProcSource {
             Some(pid),
             self.take_forgotten_pidfd(),
             id,
-            expect,
+            past,
             Due::in_(super::slow_teardown_after()),
         );
         TornDown { torn, leak, why }
@@ -1626,7 +1626,7 @@ impl ProcSource {
     /// `why`: what the spawn's identity check found, if that is why the child is torn down; the
     /// forget owes it a warn, so the teardown's one warn carries it and the forget's leak, and says
     /// what became of the child, whatever the teardown's own level. A failed check is a failed look
-    /// on the pidfd, so no wait on it is expected to succeed ([`Expect::Anything`]).
+    /// on the pidfd, so no wait on it is expected to succeed ([`Past::LookFailed`]).
     #[cfg(target_os = "linux")]
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("teardown_through_pidfd");
@@ -1635,7 +1635,7 @@ impl ProcSource {
             Some(pid),
             self.take_forgotten_pidfd(),
             id,
-            Expect::Anything,
+            Past::LookFailed,
             Due::in_(super::slow_teardown_after()),
         )
         .say_as_failed_spawn(why)

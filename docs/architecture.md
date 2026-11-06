@@ -104,15 +104,16 @@ In order:
      `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
      The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
      to `tear_down`, sending no kill of its own. A teardown through a pidfd
-     (`held_teardown::tear_down_pidfd`) is told once what its caller knows of the pidfd
-     (`Expect`, in `child::owned::teardown`), and its warn is logged through
-     `warn_teardown`, which then asserts that contract (the Windows spawns' teardown,
-     `held_teardown::tear_down_failed_spawn`, is told the same once, where each spawn builds its
-     `OwnedChild`, and logs through it too); a front left to the leaf
-     (`ToLeaf`) hands the leaf its original pidfd with the `Expect`, and a child the leaf holds
-     (`LeafHeld`) hands it a copy, with `Expect::Anything` since the handshake tears down through
-     the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to where
-     it is logged.
+     (`held_teardown::tear_down_pidfd`) is told once what its caller knows became of the pidfd
+     (`Past`, in `child::owned::teardown`); what the handle allows is its constructor's
+     (`OsChild::kill_refusal`: a pidfd is refused for permission alone, a `CreateProcess` handle
+     never, a UAC handle by the access it was granted), and the two make the `Expect` that
+     `warn_teardown`, which logs the teardown's warn, asserts (the Windows spawns' teardown,
+     `held_teardown::tear_down_failed_spawn`, is told the same, and logs through it too); a front
+     left to the leaf (`ToLeaf`) hands the leaf its original pidfd with the `Past`, and a child the
+     leaf holds (`LeafHeld`) hands it a copy, with `Past::LookFailed` since the handshake tears down
+     through the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to
+     where it is logged.
      Apart from these,
      only the cgroup leaf's `end_child` (both spawns) starts a background reaping thread.
      `Settlement` is the one
@@ -142,5 +143,8 @@ In order:
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
    `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
    those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
-   [#877](https://github.com/bindreams/cosca/issues/877) on macOS).
+   [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes the Windows
+   exiting-refusal hook (`identity::windows_fault::refuse_next_terminate_as_exiting`), which answers
+   in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
+   enter with their first caller, and those tests state rows (owner, 2026-11-06).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.

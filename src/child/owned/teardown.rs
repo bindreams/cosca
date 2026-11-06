@@ -30,8 +30,9 @@ use std::io;
 
 use super::OwnedChild;
 use crate::child::lifecycle::{wait_to_exit, Settlement, Wording};
-use crate::error::{ChildFate, Error};
+use crate::error::{ChildFate, ElevationErrorKind, Error};
 use crate::identity::ProcessId;
+use crate::os_process::child::KillRefusal;
 use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 use crate::wait::teardown_warn::Due;
@@ -318,11 +319,11 @@ impl TeardownOutcome {
     }
 }
 
-/// What the caller of a teardown over a handle it owns (a Linux pidfd, a Windows process handle)
-/// knows about the handle, which decides what the teardown may come to. Stated once, where the
-/// handle is handed over.
+/// What already happened to a handle a teardown goes over (a Linux pidfd, a Windows process handle),
+/// which the caller knows and the handle does not. What the handle allows is its constructor's
+/// ([`KillRefusal`]); the two make an [`Expect`].
 ///
-/// Only the Linux and Windows spawns tear a child down over a handle and produce these.
+/// Only the Linux and Windows spawns tear a child down over a handle and state these.
 #[cfg_attr(
     not(any(target_os = "linux", windows)),
     allow(
@@ -331,18 +332,43 @@ impl TeardownOutcome {
     )
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Expect {
-    /// An earlier look on the handle failed, or may have, so a wait on it may fail too: any outcome
-    /// stands.
-    Anything,
-    /// No earlier look on the handle failed, and the handle may be waited on and killed (a
-    /// Windows process handle from `CreateProcess` has `SYNCHRONIZE` and `PROCESS_TERMINATE`), so a
-    /// wait on it does not fail: a child the teardown left uncollected is one whose kill was
-    /// refused, and still running, and a kill is refused only for want of permission.
-    Waited,
-    /// As [`Waited`](Expect::Waited), and the child never ran the program, so it has this process's
+pub(crate) enum Past {
+    /// Nothing happened to the handle. The handle may be waited on (a pidfd; a Windows handle from
+    /// `CreateProcess` or `ShellExecuteEx`, which has `SYNCHRONIZE`), so a wait on it does not fail:
+    /// a child the teardown left uncollected is one whose kill was refused, and still running.
+    Clean,
+    /// An earlier look on the handle failed, or may have, so a wait on it may fail too, and the
+    /// handle may be in any state: any outcome stands.
+    LookFailed,
+    /// As [`Clean`](Past::Clean), and the child never ran the program, so it has this process's
     /// credentials: nothing but its being gone can refuse its kill, and the teardown collects it.
     Unexecuted,
+}
+
+/// What a teardown over a handle is expected to come to: what the handle allows, from its
+/// constructor, and what already happened to it, from the caller.
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows spawns tear a child down over a handle"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Expect {
+    pub(crate) refusal: KillRefusal,
+    pub(crate) past: Past,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl Expect {
+    /// What `past` and the allowance of `child`'s handle make of a teardown over it.
+    pub(crate) fn of(child: &OwnedChild, past: Past) -> Expect {
+        Expect {
+            refusal: child.kill_refusal(),
+            past,
+        }
+    }
 }
 
 /// What a teardown over a handle came to, and what its caller expected of it.
@@ -456,21 +482,40 @@ fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
         uncollected,
         refused,
     } = *remains;
+    let Expect { refusal, past } = expect;
     if let Some(line) = line {
         log::warn!("{line}");
     }
     debug_assert!(
-        !uncollected || expect == Expect::Anything || matches!(fate, ChildFate::Running { .. }),
+        !uncollected || past == Past::LookFailed || matches!(fate, ChildFate::Running { .. }),
         "a wait on a child's own handle failed: {fate:?}"
     );
     debug_assert!(
-        expect != Expect::Unexecuted || !matches!(fate, ChildFate::Running { .. }),
+        past != Past::Unexecuted || !matches!(fate, ChildFate::Running { .. }),
         "the kill of a child that never ran the program was refused"
     );
     debug_assert!(
-        expect == Expect::Anything || refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
+        past == Past::LookFailed || refusal != KillRefusal::Never || refused.is_none(),
+        "the kill of a handle that is never refused was refused: {refused:?}"
+    );
+    debug_assert!(
+        past == Past::LookFailed || refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
         "the kill of a child's own handle was refused for a reason other than permission: {refused:?}"
     );
+}
+
+/// What a refused kill was refused for: an I/O error is its own kind, and the typed refusal to
+/// signal an elevated child ([`ElevationErrorKind::Unkillable`]) is a refusal of permission (`EPERM`
+/// or `ACCESS_DENIED`, or a front, which is sent nothing). Any other error is another reason.
+fn refusal_kind(refused: &Error) -> io::ErrorKind {
+    match refused {
+        Error::Io(e) => e.kind(),
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            ..
+        } => io::ErrorKind::PermissionDenied,
+        _ => io::ErrorKind::Other,
+    }
 }
 
 impl OwnedChild {
@@ -500,8 +545,14 @@ impl OwnedChild {
             }
             Err(refused) => match tree.map(|tree| tree.reached(self)) {
                 // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
-                // follows, so the reap is the wait that kill bounds.
-                Some(Ok(true)) => self.reap_after_tree_kill(disposition),
+                // follows, so the reap is the wait that kill bounds. The refusal is recorded all the
+                // same.
+                Some(Ok(true)) => {
+                    let kind = refusal_kind(&refused);
+                    let mut torn = self.reap_after_tree_kill(disposition);
+                    torn.refused = Some(kind);
+                    torn
+                }
                 // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
                 // is shown to be ending it.
                 _ => self.look_after_refused_kill(id, refused, disposition),
@@ -534,10 +585,7 @@ impl OwnedChild {
     ) -> TeardownOutcome {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
-        let refused_kind = match &refused {
-            Error::Io(e) => e.kind(),
-            _ => io::ErrorKind::Other,
-        };
+        let refused_kind = refusal_kind(&refused);
         let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
         // Still running: the caller that leaves it says it keeps running, not that it is left unreaped.
         let running = match disposition {

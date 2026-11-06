@@ -198,7 +198,7 @@ pub(crate) fn exit_look(handle: HANDLE, has_synchronize: bool) -> windows::core:
 }
 
 /// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`.
-fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
+pub(crate) fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
     let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
     // SAFETY: `handle` is live; `info` is the buffer the class describes, and its size is passed.
     let status = unsafe {
@@ -225,7 +225,7 @@ pub(crate) const TERMINATE_EXIT_CODE: u32 = 1;
 
 fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
     #[cfg(test)]
-    if fault::take_exiting_refusal() {
+    if fault::fire_exiting_refusal() {
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
             windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
         )));
@@ -237,41 +237,23 @@ fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
 /// Test seam for the window Windows leaves open while a process exits.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use crate::oneshot_hook::{self, Armed, OneShotHook};
 
     thread_local! {
-        static EXITING: Cell<bool> = const { Cell::new(false) };
+        static EXITING: OneShotHook = const { OneShotHook::new() };
     }
 
     /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
     /// calling `TerminateProcess`; the process stays alive. The guard clears the refusal on drop,
-    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread.
-    pub(crate) fn refuse_next_terminate_as_exiting() -> ExitingRefusal {
-        EXITING.with(|e| e.set(true));
-        ExitingRefusal(())
+    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread;
+    /// [`assert_fired`](Armed::assert_fired) asks whether a kill used it.
+    pub(crate) fn refuse_next_terminate_as_exiting() -> Armed {
+        oneshot_hook::arm(&EXITING, || {})
     }
 
-    #[must_use = "the refusal is cleared as soon as the guard is dropped"]
-    pub(crate) struct ExitingRefusal(());
-
-    impl ExitingRefusal {
-        /// A kill reached `TerminateProcess` and was refused: the refusal is used up.
-        pub(crate) fn assert_reached(&self) {
-            assert!(
-                !EXITING.with(|e| e.get()),
-                "no kill reached TerminateProcess to be refused"
-            );
-        }
-    }
-
-    impl Drop for ExitingRefusal {
-        fn drop(&mut self) {
-            EXITING.with(|e| e.set(false));
-        }
-    }
-
-    pub(super) fn take_exiting_refusal() -> bool {
-        EXITING.with(|e| e.replace(false))
+    /// Whether an armed refusal was waiting, which this answers.
+    pub(super) fn fire_exiting_refusal() -> bool {
+        oneshot_hook::fire_with(&EXITING, ()).is_some()
     }
 }
 

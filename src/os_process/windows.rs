@@ -11,12 +11,12 @@ use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
 
-use super::child::{OsChild, OsHandle, PeekOutcome, TryReapOutcome};
+use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{
-    windows_exit_look, windows_open_dropping_refused, windows_terminate_held, HandleIdentity, Liveness, Look, Opened,
-    ProcessId, Termination,
+    windows_exit_look, windows_granted_access, windows_open_dropping_refused, windows_terminate_held, HandleIdentity,
+    Liveness, Look, Opened, ProcessId, Termination,
 };
 use crate::signal::{Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
@@ -29,6 +29,8 @@ pub(crate) struct WindowsProcess {
     handle: OwnedHandle,
     /// Whether the handle was granted `SYNCHRONIZE`: it decides how a look reads the exit.
     has_synchronize: bool,
+    /// Whether the handle was granted `PROCESS_TERMINATE`: it decides what a refused kill means.
+    can_terminate: bool,
 }
 
 impl WindowsProcess {
@@ -44,17 +46,37 @@ impl WindowsProcess {
             // SAFETY: `open_verified` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
             has_synchronize: granted.0 & PROCESS_SYNCHRONIZE.0 != 0,
+            can_terminate: granted.0 & PROCESS_TERMINATE.0 != 0,
         }))
     }
 
-    /// The child `pid` that a spawn created, by the handle the spawn returned. That handle carries
-    /// `SYNCHRONIZE`; it carries `PROCESS_TERMINATE` too unless the spawn was a UAC elevation,
-    /// whose handle may lack it (a kill then fails with the Win32 error).
+    /// The child `pid` that `CreateProcess` created, by the handle it returned. That handle holds
+    /// every right, `SYNCHRONIZE` and `PROCESS_TERMINATE` among them: its kill is never refused.
     pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
         Self {
             pid,
             handle,
             has_synchronize: true,
+            can_terminate: true,
+        }
+    }
+
+    /// The child `pid` that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned.
+    /// That handle carries `SYNCHRONIZE`, and `PROCESS_TERMINATE` only as it was granted: the access
+    /// is read from the handle, and one that cannot be read is taken to lack it.
+    pub(crate) fn for_uac(handle: OwnedHandle, pid: u32) -> Self {
+        let can_terminate = match windows_granted_access(HANDLE(handle.as_raw_handle())) {
+            Ok(access) => access & PROCESS_TERMINATE.0 != 0,
+            Err(e) => {
+                log::debug!("wait: the access granted to the elevated child {pid}'s handle could not be read ({e})");
+                false
+            }
+        };
+        Self {
+            pid,
+            handle,
+            has_synchronize: true,
+            can_terminate,
         }
     }
 
@@ -173,6 +195,14 @@ impl OsProcess for WindowsProcess {
 impl OsChild for WindowsProcess {
     fn pid(&self) -> Option<u32> {
         Some(self.pid)
+    }
+
+    fn kill_refusal(&self) -> KillRefusal {
+        if self.can_terminate {
+            KillRefusal::Never
+        } else {
+            KillRefusal::Permission
+        }
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {

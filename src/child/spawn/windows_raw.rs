@@ -86,7 +86,7 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-use crate::child::owned::teardown::{Disposition, Expect};
+use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::{
@@ -214,9 +214,6 @@ pub(crate) fn spawn_raw(
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
     };
-    // `CreateProcess` gave the handle every right, so no wait on it fails, and its kill is refused
-    // only for want of permission.
-    let expect = Expect::Waited;
     let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
     let raw_handle = owned.os_handle().as_raw_handle();
     let (resolved, cause, _) = resolve_identity(
@@ -232,7 +229,7 @@ pub(crate) fn spawn_raw(
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
                 None,
-                expect,
+                Past::Clean,
                 Disposition::HandBack,
                 None,
                 &mut Diagnosis::default(),
@@ -250,7 +247,7 @@ pub(crate) fn spawn_raw(
             let (fate, unreaped) = tear_down_failed_spawn(
                 owned,
                 Some(id),
-                expect,
+                Past::Clean,
                 Disposition::HandBack,
                 None,
                 &mut Diagnosis::default(),

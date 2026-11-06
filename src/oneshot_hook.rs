@@ -66,6 +66,21 @@ pub(crate) struct Armed<A: 'static = (), R: 'static = ()> {
     generation: u64,
 }
 
+impl<A: 'static, R: 'static> Armed<A, R> {
+    /// Panics unless the hook this guard armed has fired: a test that counts on its fire point being
+    /// reached asserts it.
+    #[track_caller]
+    pub(crate) fn assert_fired(&self) {
+        let pending = self
+            .key
+            .with(|h| matches!(&*h.slot.borrow(), Some((generation, _)) if *generation == self.generation));
+        assert!(
+            !pending,
+            "the armed one-shot hook never fired: its fire point was not reached"
+        );
+    }
+}
+
 impl<A: 'static, R: 'static> Drop for Armed<A, R> {
     fn drop(&mut self) {
         let mine = self.key.with(|h| {

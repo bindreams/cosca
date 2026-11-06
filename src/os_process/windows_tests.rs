@@ -142,6 +142,7 @@ fn signal_failure_carries_the_win32_code() {
         pid: std::process::id(),
         handle: super::cancel::new_cancel_event().expect("create an event handle"),
         has_synchronize: true,
+        can_terminate: true,
     };
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {
