@@ -143,3 +143,7 @@ impl OsChild for MacChild {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "f2_probe_tests.rs"]
+mod f2_probe_tests;
