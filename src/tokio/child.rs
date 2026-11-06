@@ -213,7 +213,7 @@ impl Drop for Draining {
 #[derive(Debug)]
 pub struct Child {
     os: OsResources,
-    /// Stable identity resolved immediately after spawn; `None` when the OS refused to report it.
+    /// See [`Child::id`](Self::id).
     id: Option<ProcessId>,
     kill_on_drop: bool,
     containment: Containment,
@@ -318,7 +318,6 @@ impl Child {
     pub(super) fn proc_mut(&mut self) -> &mut ProcSource {
         self.os.proc_mut()
     }
-    /// Shared read-only accessor for the callers that hold `&self`.
     pub(super) fn proc(&self) -> &ProcSource {
         self.os.proc.as_ref().expect(PROC_TAKEN)
     }
@@ -483,8 +482,7 @@ impl Child {
         }
     }
 
-    /// The child's stable identity — valid after `wait` — or `None` when the OS refused to report it
-    /// at spawn; see [`Child::id`](crate::Child::id).
+    /// The child's stable identity; see [`Child::id`](crate::Child::id).
     pub fn id(&self) -> Option<ProcessId> {
         self.id
     }

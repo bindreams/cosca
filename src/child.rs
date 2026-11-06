@@ -131,7 +131,7 @@ pub struct Child {
     /// Empty only inside [`tear_down_or_hand_back`](Child::tear_down_or_hand_back), which consumes
     /// the child.
     proc: ChildSlot,
-    /// Stable identity resolved immediately after spawn; `None` when the OS refused to report it.
+    /// See [`Child::id`].
     id: Option<ProcessId>,
     pipes: BTreeMap<Fd, ParentEnd>,
     kill_on_drop: bool,
@@ -255,6 +255,9 @@ impl Child {
 
     /// The pid the child had at spawn. A number only: it does not say the process still holds it
     /// (an identity is [`id`](Self::id)).
+    ///
+    /// The handle's pid is an `Option` because a handle exists pid-less before the spawn handshake;
+    /// a `Child` always has one, asserted in `from_parts`.
     pub fn pid(&self) -> u32 {
         self.proc
             .pid()
@@ -267,13 +270,10 @@ impl Child {
     /// handle of a UAC-elevated child may not be readable by an unelevated parent, and the honest
     /// answer there is not "dead".
     pub fn is_alive(&self) -> crate::identity::Liveness {
-        use crate::identity::Liveness;
-        use crate::os_process::child::PeekOutcome;
-        match self.proc.peek() {
-            Ok(PeekOutcome::Running) => Liveness::Alive,
-            Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => Liveness::Dead,
-            Err(_) => Liveness::Unknown,
-        }
+        self.proc.liveness().unwrap_or_else(|e| {
+            log::debug!("child {}: its liveness could not be read ({e})", self.pid());
+            crate::identity::Liveness::Unknown
+        })
     }
 
     /// Block until the child exits, returning its status.

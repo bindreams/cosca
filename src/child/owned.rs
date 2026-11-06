@@ -222,6 +222,23 @@ impl OwnedChild {
         self.peek_locked(&self.lock())
     }
 
+    /// Whether the child is running, answered from its exit edge (see
+    /// [`OsProcess::exited`](crate::os_process::OsProcess::exited)), so a zombie only a tracer sees
+    /// is `Dead`. The reap peek is read only where the edge is silent: an exit record or a reap
+    /// elsewhere, and (macOS) the zombie the edge withholds.
+    pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
+        use crate::identity::Liveness;
+        use crate::os_process::Exit;
+        if matches!(self.os.exited()?, Exit::Exited) {
+            return Ok(Liveness::Dead);
+        }
+        Ok(match self.peek()? {
+            PeekOutcome::Exit(_) | PeekOutcome::Foreign(_) => Liveness::Dead,
+            PeekOutcome::Running if self.os.exited_unannounced()? => Liveness::Dead,
+            PeekOutcome::Running => Liveness::Alive,
+        })
+    }
+
     /// Whether the root is still this handle's child to act on, from the handle's own evidence; see
     /// [`ReapHold::state`].
     #[cfg(unix)]

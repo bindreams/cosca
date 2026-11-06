@@ -18,6 +18,8 @@ use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::signal::Sent;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{tracer_group, Group};
 
 /// The second teardown of a refused child, as `OwnedChild` runs it for a caller that leaves the child
 /// (`tear_down_pidfd`'s), over a child 7 whose kill answers `kill` and whose wait or look answers
@@ -573,4 +575,75 @@ async fn an_unproven_child_is_sent_no_sigterm_and_cannot_be_looked_at_on_macos()
     drop(writer);
     crate::test_child::reaped_elsewhere::kill_own_child(pid);
     crate::test_child::reaped_elsewhere::reap_behind(pid);
+}
+
+/// `graceful_shutdown` of a macOS child forgotten as not shown to be ours sends it nothing, neither
+/// the `SIGTERM` nor the kill, and returns `ECHILD` at once, with no grace waited.
+///
+/// Mutants: the child is sent a signal by number; the call waits out the grace or kills.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn graceful_shutdown_of_an_unproven_child_sends_nothing_and_is_echild_on_macos() {
+    use crate::os_process::child::PeekOutcome;
+    use crate::wait::exit_only::{peek, Target};
+
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.pid();
+    child
+        .proc_mut()
+        .forget_as("was forgotten by a test", super::Forgotten::Unproven);
+
+    let outcome = child.graceful_shutdown(std::time::Duration::from_secs(3600)).await;
+    let peeked = peek(&Target::pid(pid, None));
+
+    // Forgotten, the child is out of tokio's reach: end and reap the blocker by pid, whatever the
+    // assertions below say.
+    drop(writer);
+    crate::test_child::reaped_elsewhere::kill_own_child(pid);
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
+    assert!(
+        matches!(&outcome, Err(Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD)),
+        "{outcome:?}"
+    );
+    assert!(
+        matches!(peeked, Ok(PeekOutcome::Running)),
+        "nothing was sent, so the child still runs: {peeked:?}"
+    );
+}
+
+/// A zombie a foreign tracer holds has exited, so the child reads `Dead` from its pidfd's edge,
+/// though the parent's peek finds no record to show for it.
+///
+/// Mutant: liveness answered from the peek, which reads the held zombie as `Running`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_zombie_a_foreign_tracer_holds_is_dead(#[fixture(tracer_group)] _group: &Group) {
+    use crate::identity::Liveness;
+    use crate::test_support::foreign_tracer::{self, REAP};
+
+    let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
+    let mut tracer = foreign_tracer::spawn_helper(child.pid());
+    assert_eq!(child.is_alive(), Liveness::Alive, "a running child");
+
+    crate::test_child::reaped_elsewhere::kill_own_child(child.pid());
+    let pidfd = child.proc().pidfd().expect("a Linux backend has its pidfd");
+    let mut fds = [rustix::event::PollFd::new(&pidfd, rustix::event::PollFlags::IN)];
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
+    let peeked_running = child.proc().is_running().expect("the peek answers");
+    let held = child.is_alive();
+
+    // Asserted only after the tracer lets go: the child's drop waits for a zombie the tracer holds.
+    tracer.send(REAP);
+    tracer.expect("reaped");
+    let handed_back = child.is_alive();
+    drop(child);
+    drop(stdin);
+    tracer.finish();
+    assert!(peeked_running, "the tracer holds it, so the peek finds no record");
+    assert_eq!(held, Liveness::Dead);
+    assert_eq!(handed_back, Liveness::Dead, "and once handed back");
 }
