@@ -546,12 +546,12 @@ impl OwnedChild {
                     // An unknown pid records as 0.
                     crate::child::spawn::fault::record_teardown_reap(self.pid().unwrap_or(0), status);
                 }
-                self.concluded(&settlement, id, disposition)
+                TeardownOutcome::of_settlement(&settlement, id, &self.teardown_subject(), None, disposition)
             }
             Err(refused) => match tree.map(|tree| tree.reached(self)) {
                 // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
                 // follows, so the reap is the wait that kill bounds.
-                Some(Ok(true)) => self.reap_after_tree_kill(disposition),
+                Some(Ok(true)) => self.reap_after_tree_kill(&self.teardown_subject(), disposition),
                 // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
                 // is shown to be ending it.
                 _ => self.look_after_refused_kill(id, refused, disposition),
@@ -561,16 +561,18 @@ impl OwnedChild {
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
     /// A failed reap comes back in [`TeardownOutcome::said`], as for [`tear_down`](Self::tear_down).
-    pub(crate) fn reap_after_tree_kill(&self, disposition: Disposition) -> TeardownOutcome {
+    /// `subject` is what the clause calls the child: [`teardown_subject`](Self::teardown_subject)
+    /// for a plain child, and the elevation front's name for a front.
+    pub(crate) fn reap_after_tree_kill(&self, subject: &str, disposition: Disposition) -> TeardownOutcome {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        self.concluded(&Settlement::new(wait_to_exit(self, None), true), None, disposition)
+        let settlement = Settlement::new(wait_to_exit(self, None), true);
+        TeardownOutcome::of_settlement(&settlement, None, subject, None, disposition)
     }
 
-    /// The outcome of a root teardown whose wait after a kill ended as `settlement` says.
-    fn concluded(&self, settlement: &Settlement, id: Option<ProcessId>, disposition: Disposition) -> TeardownOutcome {
-        let subject = format!("teardown of {}", child_named(self.pid()));
-        TeardownOutcome::of_settlement(settlement, id, &subject, None, disposition)
+    /// What the clause of a root teardown calls a plain child.
+    pub(crate) fn teardown_subject(&self) -> String {
+        format!("teardown of {}", child_named(self.pid()))
     }
 
     /// The one look after a kill that failed with `refused`, never a wait. `id` is the child's

@@ -227,7 +227,7 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
         let child = child_with_an_unreadable_exit();
         return match row.kill {
             // A kill sent elsewhere reached it: the reap that follows.
-            Kill::Delivered => child.reap_after_tree_kill(disposition),
+            Kill::Delivered => child.reap_after_tree_kill(&child.teardown_subject(), disposition),
             Kill::Nothing => child.tear_down(Some(id()), kill, None),
             Kill::Refused => child.look_after_refused_kill(Some(id()), Error::Io(refused()), disposition),
         };
@@ -257,15 +257,15 @@ fn reap_answer(found: Found) -> ReapAnswer {
 }
 
 /// The outcome of the reap of a child a tree kill has just ended ([`OwnedChild::reap_after_tree_kill`]),
-/// for the row whose kill was delivered, for a caller that does `disposition`. It sends the child
-/// nothing: the kill was sent elsewhere.
-pub(crate) fn outcome_after_a_tree_kill(row: &Row, disposition: Disposition) -> TeardownOutcome {
+/// for the row whose kill was delivered, for a caller that does `disposition` and names the child
+/// `subject`. It sends the child nothing: the kill was sent elsewhere.
+pub(crate) fn outcome_after_a_tree_kill(row: &Row, subject: &str, disposition: Disposition) -> TeardownOutcome {
     assert_eq!(row.kill, Kill::Delivered, "a tree kill reached the child");
     let child = match row.found {
         Found::Unreadable => child_with_an_unreadable_exit(),
         found => OwnedChild::new(Box::new(fake().reaps([reap_answer(found)]))),
     };
-    child.reap_after_tree_kill(disposition)
+    child.reap_after_tree_kill(subject, disposition)
 }
 
 /// What no clause says, whoever says it.
@@ -328,11 +328,34 @@ fn the_teardown_says_every_row_as_the_table_states_it() {
 fn the_reap_after_a_tree_kill_says_every_delivered_row_as_the_table_states_it() {
     for row in rows().into_iter().filter(|row| row.kill == Kill::Delivered) {
         for disposition in [Disposition::Leave, Disposition::HandBack] {
-            let torn = outcome_after_a_tree_kill(&row, disposition);
+            let torn = outcome_after_a_tree_kill(&row, &format!("teardown of child {PID}"), disposition);
             assert_eq!(torn.uncollected(), row.uncollected, "{:?} {disposition:?}", row.found);
             assert_eq!(
                 said_of(&torn),
                 Some((row.level, row.clause(disposition).to_owned())),
+                "{:?} {disposition:?}",
+                row.found
+            );
+        }
+    }
+}
+
+/// The reap after a tree kill is said of the subject its caller names, every delivered row alike: a
+/// drop whose cgroup kill ended an elevation front says it of the front, not of a plain child's
+/// teardown.
+///
+/// Mutant: the reap words the clause of a plain child's teardown whatever subject it is given.
+#[skuld::test]
+fn the_reap_after_a_tree_kill_is_said_of_the_subject_its_caller_names() {
+    let plain = format!("teardown of child {PID}");
+    let front = crate::elevation::front::front_named(Some(PID));
+    assert_eq!(front, format!("elevation front pid {PID}"));
+    for row in rows().into_iter().filter(|row| row.kill == Kill::Delivered) {
+        for disposition in [Disposition::Leave, Disposition::HandBack] {
+            let torn = outcome_after_a_tree_kill(&row, &front, disposition);
+            assert_eq!(
+                said_of(&torn),
+                Some((row.level, row.clause(disposition).replacen(&plain, &front, 1))),
                 "{:?} {disposition:?}",
                 row.found
             );
