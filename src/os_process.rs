@@ -80,11 +80,9 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
     pid.map_or_else(|| PIDLESS_CHILD.to_owned(), |pid| format!("child {pid}"))
 }
 
-/// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-#[cfg_attr(
-    not(any(unix, feature = "tokio")),
-    allow(dead_code, reason = "Windows opens by `open_with`, except in the async drive")
-)]
+/// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process. The
+/// tests' entry; the library opens through [`open_with`].
+#[cfg(test)]
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
     open_with(&crate::identity::HostKernel, id)
 }
@@ -127,25 +125,5 @@ pub(crate) fn terminate(p: &dyn OsProcess) -> Result<(), Error> {
 /// There is no [`Sig`] to send for it on Windows: `Unsupported`.
 #[cfg(windows)]
 pub(crate) fn terminate(_p: &dyn OsProcess) -> Result<(), Error> {
-    Err(windows::terminate_unsupported())
-}
-
-/// [`terminate`] the process `id` names, identity-verified. Already gone: `Ok`. Windows: `Unsupported`,
-/// with nothing opened.
-#[cfg(unix)]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "only the async child sends its graceful signal by number")
-)]
-pub(crate) fn terminate_by_id(id: ProcessId) -> Result<(), Error> {
-    match open(id)? {
-        Some(process) => terminate(&*process),
-        None => Ok(()),
-    }
-}
-
-/// There is no [`Sig`] to send for it on Windows: `Unsupported`, with nothing opened.
-#[cfg(windows)]
-pub(crate) fn terminate_by_id(_id: ProcessId) -> Result<(), Error> {
-    Err(windows::terminate_unsupported())
+    Err(Error::terminate_unsupported())
 }

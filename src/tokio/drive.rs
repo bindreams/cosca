@@ -11,8 +11,7 @@
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::identity::ProcessId;
-use crate::os_process::{open, Exit, OsProcess, WaitFor};
+use crate::os_process::{Exit, OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
 /// What the entry point does before any open or look: the watch-fault seam.
@@ -24,22 +23,25 @@ fn enter() -> Result<(), Error> {
     Ok(())
 }
 
-/// Wait until the process `id` names has exited or `timeout` has passed, and say which.
-/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; a process that
-/// is gone, or whose pid now names another process, has exited, with no wait. `None` = until exit;
+/// Wait until the process `open` yields has exited or `timeout` has passed, and say which.
+/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; `open`
+/// yielding `None` (a process that is gone) has exited, with no wait. `None` = until exit;
 /// `Some(ZERO)` = one look, no wait; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. The watch-fault seam and the deadline come before the open, so the timeout counts
-/// from the call and the seam holds for a gone id too.
-pub(crate) async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+/// Non-reaping. The watch-fault seam and the deadline come before `open` runs, so the timeout
+/// counts from the call and the seam holds for a gone process too.
+pub(crate) async fn exited_opening(
+    open: impl FnOnce() -> Result<Option<Box<dyn OsProcess>>, Error>,
+    timeout: Option<Duration>,
+) -> Result<bool, Error> {
     enter()?;
     let deadline = absolute(timeout);
-    match open(id)? {
+    match open()? {
         None => Ok(true),
         Some(process) => drive(&*process, deadline).await,
     }
 }
 
-/// [`exited_by_id`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
+/// [`exited_opening`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
 /// after the deadline's final look.
 pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
