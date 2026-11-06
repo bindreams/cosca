@@ -88,7 +88,7 @@ impl OwnedChild {
 }
 
 /// The holder's wait loop, for [`run`]: each look reaps if there is a record, and the wait it
-/// returns is waited on with the lock released.
+/// returns, or the recheck pause, runs with the lock released.
 struct Holder<'c> {
     child: &'c OwnedChild,
     /// `None` once the look has finished the holder.
@@ -126,22 +126,14 @@ impl<'c> Waitable for Holder<'c> {
                 self.finish(State::N);
                 Ok(Step::Done(ChildWaitOutcome::Foreign(foreign)))
             }
-            TryReapOutcome::Recheck => Ok(Step::Recheck),
+            TryReapOutcome::Recheck => {
+                self.guard().unlock();
+                Ok(Step::Recheck)
+            }
             TryReapOutcome::Running(wait_for) => {
                 self.guard().unlock();
                 Ok(Step::Wait(wait_for))
             }
         }
-    }
-
-    /// Sleep on the handle's `Condvar`, so a `notify_all` ends the backoff at once.
-    fn pause(&mut self, d: Duration) {
-        #[cfg(test)]
-        crate::wait::block_probe::record(Some(d));
-        #[cfg(test)]
-        let started = Instant::now();
-        self.guard().sleep(d);
-        #[cfg(test)]
-        crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
     }
 }

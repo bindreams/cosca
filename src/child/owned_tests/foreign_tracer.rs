@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::fixtures::{status, try_wait, Blocker};
-use crate::child::owned::{seams, ChildWaitOutcome};
+use crate::child::owned::ChildWaitOutcome;
 use crate::error::Error;
 use crate::identity::Liveness;
 use crate::test_child::reaped_elsewhere::kill_own_child;
@@ -148,7 +148,7 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
             crate::wait::block_probe::take();
             // Fires just before the holder's first backoff sleep: the look found the zombie held.
             let at = tx.clone();
-            let _hook = seams::on_condvar_block_with(move |_| _ = at.send(Msg::AtBackoff));
+            let _hook = crate::wait::block_probe::on_pause(move || _ = at.send(Msg::AtBackoff));
             let result = match wait {
                 Wait::Unbounded => owned.wait(None),
                 Wait::Deadline => owned.wait(Some(std::time::Instant::now() + Duration::from_secs(3600))),
