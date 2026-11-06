@@ -687,6 +687,51 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     child.kill_tree().expect("cleanup sweep");
 }
 
+/// A sweep that left a descendant behind but whose backstop killed the root has killed the root: it
+/// is reaped, its status is kept, and the sweep's error is what returns. The root ignores `SIGTERM`,
+/// so the grace ends with it running and the sweep is what kills it. A reap of a root nothing
+/// killed would not return. Mutant: the error is returned before the root is reaped.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+fn graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_returns_the_error() {
+    use std::io::Read as _;
+
+    use crate::containment::treewalk::fault::{self, LeftBehind};
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    let _stdin = child.stdin().expect("piped stdin");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .expect("readiness byte");
+    let id = child.id();
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "precondition: the root runs"
+    );
+
+    fault::force_incomplete_once(LeftBehind::Descendant);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_millis(200))
+        .expect_err("a descendant was left");
+
+    assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "the root the backstop killed must be reaped before the error returns"
+    );
+    crate::test_child::assert_killed("the root", child.wait().expect("the reaped root's status is kept"));
+}
+
 // Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above,
 // reached via a job object instead of cgroup/process-group — but NOT a check on the same
 // postcondition, because that postcondition does not translate. The Unix test proves an

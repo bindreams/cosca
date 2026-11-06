@@ -263,23 +263,55 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
     }
 }
 
-/// The warn for that child names the parent whose proof failed, and the child's pid once. Mutant:
-/// "the warn blames the child's pid".
+/// The error for that child names the parent whose proof failed and the child it dropped. The walk
+/// and `children`' list of a walk (`ProcessId::children` is a query) log nothing; the warn of a
+/// caller with no error to return ([`super::warn_unassessed`]) says it once. Mutants: "the error
+/// names the parent alone"; "the walk or `children` warns".
 #[skuld::test]
-fn the_warn_for_a_child_whose_parent_cannot_be_proved_names_the_parent() {
+fn a_child_whose_parent_cannot_be_proved_is_reported_by_an_error_naming_both() {
     crate::log_capture::install();
-    let kernel = table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let kernel = || table().on_pidfs_ino_after_read(ROOT, &format!("{CHILD}/stat"), Err(Errno::BADF));
+    let names_both = |detail: &str| {
+        detail.contains(&format!("ppid {ROOT} identity could not be read")) && detail.contains(&format!("pid {CHILD}"))
+    };
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, CHILD, root(), None).is_err());
-    let warned = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {CHILD}"));
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    let (level, message) = &warned[0];
-    assert_eq!(*level, log::Level::Warn);
-    assert!(
-        message.contains(&format!("ppid {ROOT} identity could not be read")),
-        "{message}"
+    for depth in [Recursive::No, Recursive::Yes] {
+        let walked = super::walk_from(&kernel(), root(), &EDGES, depth)
+            .expect("the root reads")
+            .expect("the root is live");
+        let [(_, Error::Unassessable { detail, .. })] = &walked.unassessed[..] else {
+            panic!(
+                "{depth:?}: expected one Unassessable entry, got {:?}",
+                walked.unassessed
+            );
+        };
+        // The entry is the cause, which names the parent and the candidate whose read it left unanswered.
+        assert!(
+            detail.contains(&format!("ppid {ROOT} identity could not be read"))
+                && detail.contains(&format!("reading pid {CHILD}")),
+            "{depth:?}: {detail}"
+        );
+        let err = walked.complete_members().expect_err("the list would be short");
+        let Error::Unassessable { detail, .. } = &err else {
+            panic!("{depth:?}: expected Unassessable, got {err:?}");
+        };
+        assert!(names_both(detail), "{depth:?}: {detail}");
+    }
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "a query logs nothing"
     );
-    assert_eq!(message.matches(&format!("pid {CHILD}")).count(), 1, "{message}");
+
+    let walked = super::walk_from(&kernel(), root(), &EDGES, Recursive::Yes)
+        .expect("the root reads")
+        .expect("the root is live");
+    let mark = crate::log_capture::mark();
+    super::warn_unassessed(&walked.unassessed);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0].0, log::Level::Warn);
+    assert!(names_both(&warned[0].1), "{warned:?}");
 }
 
 /// On a host whose pidfds have no inode the proof is the ticks compare: the root's `stat` shows the
@@ -328,7 +360,13 @@ fn root_proof_fails() -> FakeKernel<'static> {
 fn a_root_whose_proof_finds_another_process_walks_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
-    assert!(super::hard_kill(&root_changed_hands(), root()).expect("a gone root is Ok"));
+    assert!(
+        matches!(
+            super::hard_kill(&root_changed_hands(), root()),
+            crate::containment::dispatch::TreeKillOutcome::NoRoot
+        ),
+        "a gone root has no tree to walk"
+    );
     super::terminate(&root_changed_hands(), root()).expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
@@ -347,7 +385,9 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails(), root()).map(|_| ()),
+        super::hard_kill(&root_proof_fails(), root())
+            .into_result()
+            .map_err(crate::containment::dispatch::Unkilled::into_error),
         super::terminate(&root_proof_fails(), root()),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),
@@ -394,10 +434,8 @@ fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
     use std::os::unix::process::ExitStatusExt as _;
     let (mut child, id, kernel) = live_child_in_a_table();
     let sends = crate::send_log::Capture::start();
-    assert_eq!(
-        super::kill_by_identity(&kernel, id, Signal::SIGTERM),
-        super::KillOutcome::Terminated
-    );
+    let outcome = super::kill_by_identity(&kernel, id, Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
     assert_eq!(
         sends.group_steps(),
         vec![crate::send_log::GroupStep::Member(
@@ -420,8 +458,6 @@ fn a_kill_by_identity_of_a_process_reaped_after_the_proof_is_already_gone() {
     let (mut child, id, kernel) = live_child_in_a_table();
     drop(child.stdin.take());
     child.wait().expect("the child exits at EOF");
-    assert_eq!(
-        super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
-    );
+    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }

@@ -90,3 +90,39 @@ impl Checked {
 pub(crate) fn run_hook(point: HookPoint) {
     fire(slot(point));
 }
+
+/// A watch for the look at the root that follows the first one of the call under test
+/// ([`HookPoint::AfterRootLook`]). A failed spawn's cleanup looks once for its own kill, and an armed
+/// handle's drop starts with a look of its own, whatever it then logs: that second look shows the
+/// handle was armed, and its absence that it was not.
+#[cfg(unix)]
+#[must_use = "dropping this immediately clears the watch"]
+pub(crate) struct SecondLook {
+    seen: std::rc::Rc<std::cell::Cell<bool>>,
+    _first: Armed,
+    _second: std::rc::Rc<std::cell::RefCell<Option<Armed>>>,
+}
+
+/// Start a [`SecondLook`] watch; arm it before the call.
+#[cfg(unix)]
+pub(crate) fn watch_for_a_second_look() -> SecondLook {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+    let second: std::rc::Rc<std::cell::RefCell<Option<Armed>>> = std::rc::Rc::default();
+    let first = at(HookPoint::AfterRootLook, {
+        let (seen, second) = (std::rc::Rc::clone(&seen), std::rc::Rc::clone(&second));
+        move || *second.borrow_mut() = Some(at(HookPoint::AfterRootLook, move || seen.set(true)))
+    });
+    SecondLook {
+        seen,
+        _first: first,
+        _second: second,
+    }
+}
+
+#[cfg(unix)]
+impl SecondLook {
+    /// Whether a second look followed the first.
+    pub(crate) fn seen(&self) -> bool {
+        self.seen.get()
+    }
+}

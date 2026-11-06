@@ -183,6 +183,19 @@ pub(crate) fn assert_tree_refused(err: &Error, op: &str, state: Untrusted) {
     }
 }
 
+/// `err` is the `Unassessable` of an fd marker's kill that signalled only its holders, for a root in
+/// `state`.
+#[track_caller]
+pub(crate) fn assert_holders_only(err: &Error, op: &str, state: Untrusted) {
+    match err {
+        Error::Unassessable { detail, source: None } => assert!(
+            detail.contains(state.why()) && detail.contains(&format!("{op} signalled only the marker holders")),
+            "{state:?}: {detail}"
+        ),
+        other => panic!("{state:?}: expected Unassessable without a source, got {other:?}"),
+    }
+}
+
 /// Nothing was sent to the root by pid or by identity.
 #[track_caller]
 pub(crate) fn assert_nothing_sent(sends: &Capture) {
@@ -370,11 +383,11 @@ fn kill_tree_of_an_untrusted_group_root_sends_no_killpg() {
 }
 
 /// An fd marker names its holders by identity, so the sweep still runs on them: the descendant is
-/// killed, the root only while it may be (`Unknown`, not `Unpinned`), and the answer is `Ok`. No
-/// `killpg`, no walk from the root's pid.
+/// killed, the root only while it may be (`Unknown`, not `Unpinned`), and the answer is
+/// `Unassessable` all the same, as the kill skipped the rest. No `killpg`, no walk from the root's pid.
 ///
 /// Mutants: the sweep is skipped; it signals the `Unpinned` root; it spares the `Unknown` root; it
-/// fires `killpg` or walks from the root's pid.
+/// fires `killpg` or walks from the root's pid; the answer is `Ok`.
 #[skuld::test]
 fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
     crate::log_capture::install();
@@ -388,9 +401,10 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let mark = crate::log_capture::mark();
         let fake = state.script(&mut child);
 
-        child
+        let err = child
             .kill_tree()
-            .expect("every holder was reached, so the tree is down");
+            .expect_err("every holder was reached, but the kill skipped the rest of the tree");
+        assert_holders_only(&err, "kill_tree", state);
 
         fake.assert_peeks_exhausted();
         assert_eq!(groups.killed(), Vec::<i32>::new(), "{state:?}");

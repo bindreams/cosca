@@ -146,5 +146,8 @@ In order:
    [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes the Windows
    exiting-refusal hook (`identity::windows_fault::refuse_next_terminate_as_exiting`), which answers
    in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
-   enter with their first caller, and those tests state rows (owner, 2026-11-06).
+   enter with their first caller, and those tests state rows (owner, 2026-11-06). The sweep bodies of
+   the sync and tokio `kill_tree_after` (the front gate, the root check, the refusal to walk, the
+   cgroup-front arm, the handle backstop and `SweepFailure::of`) merge there: today each is written
+   twice.
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.

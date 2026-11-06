@@ -565,12 +565,16 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     let root = linux::Pidfd::of(&child);
     // The root stays alive: only the tree is killed.
     let view = child.read_root_view(crate::containment::dispatch::TeardownCaller::Drop);
-    child.kill_tree_members_unless_reaped(&view).expect("kill the tree");
+    let killed = child.kill_tree_members_unless_reaped(&view);
+    assert!(killed.completed(), "kill the tree: {killed:?}");
     assert_eq!(
         fake.kill_written(),
         crate::containment::cgroup::KILL_PAYLOAD,
         "this handle's tree kill must write cgroup.kill"
     );
+    // The handle's own kill, as `kill_tree` settles it: the premise of the drop below.
+    child.settle_tree(killed, false).expect("the tree kill left nothing");
+    assert!(child.tree_killed(), "this handle killed the tree");
     fake.clear_kill();
     let (steps, levels) = linux::dropped(child, name);
 
@@ -587,6 +591,24 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
         linux::Ended::Exited(0),
         "an opted-out drop must not signal the root"
     );
+}
+
+/// A teardown that ran no tree kill (`kill_on_drop(false)`) has nothing to settle, so it does not
+/// mark the tree killed: a handle that killed nothing must not read as one that killed its tree.
+///
+/// Mutant: the teardown settles a placeholder outcome, `Ran(Ok(()))`, which marks.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_teardown_that_ran_no_tree_kill_does_not_mark_the_tree_killed() {
+    let name = "cosca-async-teardown-no-kill";
+    let (_fake, leaf) = linux::fake_leaf(name, true);
+    let (child, stdin) = blocker();
+    let mut child = linux::contained_by(child, leaf);
+    child.detach();
+    child.tear_down_now(crate::containment::dispatch::TeardownCaller::Drop);
+    crate::containment::cgroup::fault::take_rmdir_hook();
+    assert!(!child.tree_killed(), "no tree kill ran, so none is marked");
+    drop(stdin);
 }
 
 #[cfg(target_os = "linux")]
