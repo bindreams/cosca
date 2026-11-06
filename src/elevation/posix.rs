@@ -454,29 +454,19 @@ fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
     }
 }
 
-/// Block until `fd` is writable, or report that the reader hung up. The `-1` timeout is a
-/// real readiness wait on a genuine fd event (no time-based polling). `Ok(true)` =
-/// writable, `Ok(false)` = the reader closed / errored (`POLLHUP`/`POLLERR`).
-fn wait_writable(fd: std::os::fd::RawFd) -> Result<bool, std::io::Error> {
+/// Block until `writer` is writable, or report that the reader hung up: `Ok(true)` = writable,
+/// `Ok(false)` = hung up or errored (`POLLHUP`/`POLLERR`).
+fn wait_writable(writer: &std::io::PipeWriter) -> Result<bool, std::io::Error> {
+    use rustix::event::{PollFd, PollFlags};
+
     loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd; `-1` blocks until a readiness event.
-        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, -1) };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: reissue the wait (no arbitrary retry bound)
-            }
-            return Err(err);
-        }
-        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        let mut fds = [PollFd::new(writer, PollFlags::OUT)];
+        crate::wait::poll_ready(&mut fds)?;
+        let revents = fds[0].revents();
+        if revents.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Ok(false);
         }
-        if pfd.revents & libc::POLLOUT != 0 {
+        if revents.contains(PollFlags::OUT) {
             return Ok(true);
         }
     }
@@ -494,7 +484,7 @@ fn auth_failed(detail: String) -> Error {
 /// WouldBlock/BrokenPipe with ZERO bytes written means the backend never read fd0
 /// (cached credentials) → success; the SAME error after a partial write is a real
 /// truncation → `AuthFailed`.
-fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd, bytes: &[u8]) -> Result<(), Error> {
+fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Result<(), Error> {
     use std::io::Write;
     let mut written = 0usize;
     while written < bytes.len() {
@@ -516,7 +506,7 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, fd: std::os::fd::RawFd
                     log::debug!("elevation backend did not consume the password (fd0 would block, no read): {e}");
                     return Ok(());
                 }
-                match wait_writable(fd) {
+                match wait_writable(writer) {
                     Ok(true) => continue,
                     Ok(false) => {
                         return Err(auth_failed(
@@ -553,11 +543,9 @@ impl PendingPassword {
     /// the writer dropped (EOF) on EVERY path. On a genuine failure the CALLER (the spawn
     /// arm) kills and reaps the running child.
     pub(crate) fn write_after_spawn(mut self) -> Result<(), Error> {
-        use std::os::fd::AsRawFd;
         let mut bytes = password_line(self.secret.expose());
         set_writer_nonblocking(&self.writer);
-        let fd = self.writer.as_raw_fd();
-        let result = write_password_bytes(&mut self.writer, fd, &bytes);
+        let result = write_password_bytes(&mut self.writer, &bytes);
         bytes.zeroize();
         drop(self.writer); // EOF after the password line
         result

@@ -9,26 +9,29 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 /// One look at `fd` with a zero timeout: `Ok(true)` once it is readable. Never blocks.
 pub(crate) fn is_readable(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    loop {
-        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-        match poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })) {
-            Ok(0) => return Ok(false),
-            Ok(_) => return readable(fds[0].revents()).map(|()| true),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(std::io::Error::from(e)),
-        }
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    if !crate::wait::any_ready_now(&mut fds)? {
+        return Ok(false);
     }
+    readable(fds[0].revents()).map(|()| true)
 }
 
 /// `poll(2)` takes its timeout as an `int` of milliseconds; where there is no `ppoll` (macOS) rustix
 /// turns a longer `Timespec` into `EINVAL` before the call.
 const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 
-/// Polls `fd` until it is readable or `deadline` passes, and says which. `None` is unbounded. Reads
-/// no state and reaps nothing: a pidfd names its process for good, so a reused pid cannot answer
-/// it.
+/// Polls `fd` until it is readable or `deadline` passes, and says which. `None` is unbounded: one
+/// [`poll_ready`](crate::wait::poll_ready), always `true`. Reads no state and reaps nothing: a pidfd
+/// names its process for good, so a reused pid cannot answer it.
 pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
-    let seen = crate::wait::rearm_until(deadline, |remaining| {
+    let Some(deadline) = deadline else {
+        #[cfg(test)]
+        crate::wait::block_probe::record(None);
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        crate::wait::poll_ready(&mut fds)?;
+        return readable(fds[0].revents()).map(|()| true);
+    };
+    let seen = crate::wait::rearm_until(Some(deadline), |remaining| {
         let remaining = remaining.map(|d| d.min(MAX_POLL_BLOCK));
         #[cfg(test)]
         crate::wait::block_probe::record(remaining);
@@ -36,10 +39,7 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> st
             tv_sec: d.as_secs() as i64,
             tv_nsec: d.subsec_nanos() as _,
         });
-        debug_assert!(
-            deadline.is_none() || ts.is_some(),
-            "a deadline wait armed an unbounded poll"
-        );
+        debug_assert!(ts.is_some(), "a deadline wait armed an unbounded poll");
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         match poll(&mut fds, ts.as_ref()) {
             Ok(0) => Ok(None),

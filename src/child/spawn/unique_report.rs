@@ -1077,23 +1077,11 @@ pub(crate) mod seams {
     }
 
     pub(super) fn before_first_read(read_end: &std::os::fd::OwnedFd) {
-        use std::os::fd::AsRawFd;
         if !REPORT_FIRST.with(Cell::get) {
             return;
         }
-        let mut fd = libc::pollfd {
-            fd: read_end.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            // SAFETY: one valid `pollfd`; no timeout, so it returns on data, EOF or a signal.
-            let n = unsafe { libc::poll(&mut fd, 1, -1) };
-            if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                assert_eq!(n, 1, "poll the report pipe: {}", std::io::Error::last_os_error());
-                return;
-            }
-        }
+        let mut fds = [rustix::event::PollFd::new(read_end, rustix::event::PollFlags::IN)];
+        crate::wait::poll_ready(&mut fds).expect("poll the report pipe");
     }
 
     /// While the guard lives, a wait for a report on this thread warns after `after`, and records the

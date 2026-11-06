@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
 
@@ -289,8 +289,7 @@ pub(super) fn read_some(conn: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
 }
 
 /// Blocks until `conn` is readable (or hung up, or in error) or `settled` is. `on_armed` gets the
-/// number of descriptors about to be polled. Returns on `EINTR` too: the caller re-checks the
-/// outcome after every wake.
+/// number of descriptors about to be polled.
 pub(super) fn wait_for_frame_or_outcome(
     conn: BorrowedFd<'_>,
     settled: &PipeReader,
@@ -298,15 +297,5 @@ pub(super) fn wait_for_frame_or_outcome(
 ) -> Result<(), Errno> {
     let mut fds = [PollFd::new(&conn, PollFlags::IN), PollFd::new(settled, PollFlags::IN)];
     on_armed(fds.len());
-    match poll(&mut fds, None) {
-        Ok(_) | Err(Errno::INTR) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Whether `fd` is readable now, without blocking.
-pub(super) fn is_readable(fd: &PipeReader) -> bool {
-    let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
-    let mut fds = [PollFd::new(fd, PollFlags::IN)];
-    matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
+    crate::wait::poll_ready(&mut fds)
 }

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 
 use super::outcome::{classify, AcceptorFailure, KillError, KillOutcome, LinkOutcome, NotStarted, NotStartedCause};
@@ -301,7 +302,8 @@ impl Shared {
             let armed = |fds| {
                 self.probe.event(|| LinkEvent::Polling {
                     fds,
-                    settled_readable: sys::is_readable(&self.settled.0),
+                    settled_readable: crate::wait::any_ready_now(&mut [PollFd::new(&self.settled.0, PollFlags::IN)])
+                        .expect("a look at the settled pipe"),
                 });
             };
             let waited = match self.probe.wait_poll_error() {

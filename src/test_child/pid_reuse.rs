@@ -10,7 +10,7 @@
 use std::os::fd::{AsFd, BorrowedFd};
 use std::process::Child;
 
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags};
 use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use super::namespaces as ns;
@@ -71,13 +71,7 @@ fn pid_of(pid: u32) -> Pid {
 /// Blocks until `pidfd` reports the process has exited.
 pub(crate) fn wait_pollin(pidfd: BorrowedFd<'_>) {
     let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
-    loop {
-        match poll(&mut fds, None) {
-            Ok(n) if n > 0 => return,
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(e) => panic!("poll(pidfd): {e}"),
-        }
-    }
+    crate::wait::poll_ready(&mut fds).expect("poll(pidfd)");
 }
 
 /// Waits for `pid`'s exit on a pidfd of the test's own, then reaps it with a raw `waitid(P_PID)`
