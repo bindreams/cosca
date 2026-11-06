@@ -160,8 +160,9 @@ impl<'a> DropReport<'a> {
             parts.push((
                 PartKey::Described,
                 format!(
-                    "elevation front pid {pid}: {why}; the front is killed through its cgroup if it is still in it; \
-                     cosca does not wait for it, and tokio reaps it once it exits"
+                    "{}: {why}; the front is killed through its cgroup if it is still in it; cosca does not wait for \
+                     it, and tokio reaps it once it exits",
+                    crate::elevation::front::front_named(Some(pid))
                 ),
             ));
         }

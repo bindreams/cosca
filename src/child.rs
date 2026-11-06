@@ -1225,8 +1225,10 @@ impl Child {
                     failure => failure,
                 };
                 match not_reached {
-                    // The cgroup kill ended it: reap it, sending nothing.
-                    None => self.proc.reap_after_tree_kill(disposition),
+                    // The cgroup kill ended it: reap it, sending nothing. The reap is the front's.
+                    None => self
+                        .proc
+                        .reap_after_tree_kill(&crate::elevation::front::front_named(Some(self.pid())), disposition),
                     // Never waited for. A kill that failed is final: the armed leaf writes no
                     // other. The front is looked at once the leaf is torn down.
                     Some(why) => self.tear_down_leaf_and_look_at_front(&why, disposition),
@@ -1268,10 +1270,7 @@ fn word_front(
 ) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
 
-    let front = pid.into().map_or_else(
-        || "the elevation front (pid unknown)".to_owned(),
-        |pid| format!("elevation front pid {pid}"),
-    );
+    let front = crate::elevation::front::front_named(pid.into());
     let FrontLook { fate, look } = look;
     // A front seen running whose reach cannot be read: it is not known whether the cgroup kill ended it.
     let unreadable = |cause: String| match disposition {
