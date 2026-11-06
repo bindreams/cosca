@@ -685,8 +685,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         prepared.watch_front(pid);
     }
     // Read the identity while the child is still unreaped, and check the read against what the spawn
-    // holds of the child: the pidfd on Linux, and on macOS the unique id the child reported (the
-    // pid alone does not say whom it names once something else has reaped the child). The attach takes
+    // holds of the child: the pidfd on Linux, the process handle on Windows (`Target::Handle`), and on
+    // macOS the unique id the child reported (the pid alone does not say whom it names once something
+    // else has reaped the child). The attach takes
     // this identity and does not re-read the root's, so a reap and reuse after the check cannot
     // make the containment name a stranger. Nothing here reaps the child, so this is also the
     // identity the adopted `OwnedChild` takes.

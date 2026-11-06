@@ -259,7 +259,7 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait(
         [],
         "a failed kill is never followed by a wait"
     );
-    let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect::<Vec<_>>();
@@ -286,7 +286,6 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
         crate::log_capture::install();
         let mark = crate::log_capture::mark();
         let fake = FakeProcess::new([])
-            .with_pid(owner.pid)
             .with_kill_refusal(KillRefusal::Permission)
             .reaps([ReapAnswer::Reaped(ExitRecord::Status(
                 std::process::ExitStatus::default(),
@@ -300,8 +299,7 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
             "a collected child is handed back by none: {disposition:?}"
         );
         assert_eq!(fake.looks(), 1);
-        // The fake answers `owner`'s pid, so a warn about the child names it.
-        let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
+        let warned = crate::log_capture::records_since_on_current_thread(mark, "")
             .into_iter()
             .filter(|(level, _)| *level <= log::Level::Warn)
             .collect::<Vec<_>>();
@@ -338,7 +336,7 @@ fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_kille
             "the teardown's kill must have ended it"
         );
         // Said as every teardown says a failed wait, under the failed spawn's name.
-        let warns = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string());
+        let warns = crate::log_capture::records_since_on_current_thread(mark, "");
         let where_it_went = match disposition {
             Disposition::Leave => LEFT,
             Disposition::HandBack => HANDED_BACK,
@@ -585,7 +583,7 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
         "{torn:?}"
     );
     assert_eq!(fake.looks(), 1, "teardown looked once and did not wait");
-    let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
         .collect::<Vec<_>>();

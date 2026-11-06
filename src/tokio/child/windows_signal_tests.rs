@@ -102,7 +102,7 @@ fn a_terminate_failure_carries_its_win32_code() {
     let event = crate::os_process::windows::cancel::new_cancel_event().expect("create an event");
     let err = terminate_unreaped(
         HANDLE(event.as_raw_handle()),
-        windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
+        crate::os_process::windows::CREATE_PROCESS_ACCESS,
     )
     .expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {

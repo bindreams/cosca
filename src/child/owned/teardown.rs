@@ -330,8 +330,9 @@ impl TeardownOutcome {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Past {
-    /// Nothing happened to the handle, which can be waited on, so a wait on it does not fail: a child
-    /// left uncollected is one whose kill was refused, and still running.
+    /// Nothing happened to the handle, which can be waited on (a Windows handle holding
+    /// `SYNCHRONIZE`), so a wait on it does not fail: a child left uncollected is one whose kill was
+    /// refused, and still running.
     Clean,
     /// An earlier look on the handle failed, or may have, so a wait on it may fail too: a child the
     /// teardown left uncollected need not be one whose kill was refused. What the kill may be refused

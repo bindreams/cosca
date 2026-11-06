@@ -1,12 +1,12 @@
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::Threading::{
-    PROCESS_ACCESS_RIGHTS, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
 use crate::identity::windows_fixture::{spawn_restricted, spawn_restricted_shell};
 use crate::identity::{Key, Liveness, Resolved};
+use crate::os_process::windows::CREATE_PROCESS_ACCESS;
 
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
 /// is exited.
@@ -424,7 +424,7 @@ impl Drop for Limited {
 fn a_refusal_on_a_handle_holding_terminate_is_the_exit() {
     let child = spawn_blocked_child();
     let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = super::terminate_held(handle_of(&child), PROCESS_ALL_ACCESS);
+    let outcome = super::terminate_held(handle_of(&child), CREATE_PROCESS_ACCESS);
     end(child);
     assert!(
         matches!(outcome, super::Termination::Exited),
@@ -440,7 +440,7 @@ fn a_real_refusal_on_a_handle_holding_terminate_of_an_exited_process_is_the_exit
     let mut child = spawn_blocked_child();
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
-    let outcome = super::terminate_held(handle_of(&child), PROCESS_ALL_ACCESS);
+    let outcome = super::terminate_held(handle_of(&child), CREATE_PROCESS_ACCESS);
     assert!(
         matches!(outcome, super::Termination::Exited),
         "got a failure or a terminate"

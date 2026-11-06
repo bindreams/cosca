@@ -285,8 +285,8 @@ fn the_diagnosis_leads_the_one_warn_of_the_teardown() {
 #[skuld::test]
 fn a_front_that_has_exited_is_reaped_without_waiting() {
     let (owned, stdin) = held_blocker(|f| f);
-    let pid = owned.pid().expect("the held child has a pid");
-    drop(stdin);
+    let mut blocker = ReapsBlocker::new(&owned, stdin);
+    blocker.close_stdin();
     assert!(owned.exited_by(None).expect("watch the front"), "the front exited");
 
     let (error, fate, handed_back) = tear_down_held_holding(
@@ -303,11 +303,7 @@ fn a_front_that_has_exited_is_reaped_without_waiting() {
     assert!(handed_back.is_none());
     let error = error.to_string();
     assert!(error.contains("and it was reaped"), "{error}");
-    assert_eq!(
-        crate::child::front_kill_tests::reap(pid),
-        None,
-        "the teardown reaped the front"
-    );
+    assert_eq!(blocker.finish(), None, "the teardown reaped the front");
 }
 
 /// `tear_down_held` for a caller that leaves what it could not end: `front`, with what the teardown
@@ -339,7 +335,7 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
         f.signals([Err(io::Error::from(io::ErrorKind::PermissionDenied))])
             .reaps([ReapAnswer::Running])
     });
-    let pid = owned.pid().expect("the held child has a pid");
+    let blocker = ReapsBlocker::new(&owned, stdin);
     let mark = crate::log_capture::mark();
 
     let (_, fate, unreaped) = tear_down_leaving(owned, None, &mut Diagnosis::default());
@@ -352,9 +348,7 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
         warns[0].contains("leaving it running") && !warns[0].contains("handed back"),
         "{warns:?}"
     );
-    // The test's own cleanup: the blocker exits on its stdin's close, and is the test's to reap.
-    drop(stdin);
-    crate::child::front_kill_tests::reap(pid).expect("the left child is still unreaped");
+    blocker.finish().expect("the left child is still unreaped");
 }
 
 /// A front still running, under a caller that leaves it, is noted as left unreaped, and nothing is
@@ -365,7 +359,7 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
 fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_back() {
     crate::log_capture::install();
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running]));
-    let pid = owned.pid().expect("the held child has a pid");
+    let blocker = ReapsBlocker::new(&owned, stdin);
     let mark = crate::log_capture::mark();
 
     let (error, fate, unreaped) = tear_down_leaving(owned, Some(Front::Sudo), &mut Diagnosis::default());
@@ -383,8 +377,7 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
         warns[0].contains("is left running and unreaped") && !warns[0].contains("handed back"),
         "{warns:?}"
     );
-    drop(stdin);
-    crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
+    blocker.finish().expect("the left front is still unreaped");
 }
 
 /// A front whose pid is not known (tokio's spawn failed before it returned one) is named so, in the
@@ -395,7 +388,7 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
 fn a_front_with_no_pid_is_named_as_such() {
     crate::log_capture::install();
     let (owned, stdin) = held_blocker(|f| f);
-    let pid = owned.pid().expect("the held child has a pid");
+    let blocker = ReapsBlocker::new(&owned, stdin);
     // The same child, named by its pidfd alone: the copy is the pid-less handle's own.
     let pidfd = owned.pidfd().expect("a Linux child has its pidfd");
     let pidless = OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
@@ -415,9 +408,8 @@ fn a_front_with_no_pid_is_named_as_such() {
         warns[0].starts_with("teardown after a failed spawn: the elevation front (pid unknown)"),
         "{warns:?}"
     );
-    drop(stdin);
     drop(owned);
-    crate::child::front_kill_tests::reap(pid).expect("the left front is still unreaped");
+    blocker.finish().expect("the left front is still unreaped");
 }
 
 /// The teardown of the table's row `kill` and `found` over a pidfd, as a caller that leaves the child
@@ -478,26 +470,42 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     assert_eq!(warns_since(mark).len(), 1);
 }
 
-/// The test's cleanup of a blocker that a teardown left running, on unwind too: it exits on its
-/// stdin's close, and is the test's to reap.
+/// The test's cleanup of a blocker that a teardown may leave running: it exits on its stdin's
+/// close, and is the test's to reap. A test that asserts the reap calls [`ReapsBlocker::finish`];
+/// otherwise the drop reaps. On unwind the drop closes stdin and neither blocks nor asserts.
 struct ReapsBlocker {
     stdin: Option<std::io::PipeWriter>,
-    pid: u32,
+    pid: Option<u32>,
 }
 
 impl ReapsBlocker {
     fn new(owned: &OwnedChild, stdin: std::io::PipeWriter) -> ReapsBlocker {
         ReapsBlocker {
             stdin: Some(stdin),
-            pid: owned.pid().expect("the held child has a pid"),
+            pid: Some(owned.pid().expect("the held child has a pid")),
         }
+    }
+
+    /// Lets the blocker exit, before the test is done with it.
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// Closes stdin and reaps: how the blocker ended, or `None` if something reaped it already.
+    fn finish(mut self) -> Option<std::process::ExitStatus> {
+        self.close_stdin();
+        crate::child::front_kill_tests::reap(self.pid.take().expect("the blocker is not yet reaped"))
     }
 }
 
 impl Drop for ReapsBlocker {
     fn drop(&mut self) {
-        drop(self.stdin.take());
-        crate::child::front_kill_tests::reap(self.pid);
+        self.close_stdin();
+        if let Some(pid) = self.pid.take() {
+            if !std::thread::panicking() {
+                crate::child::front_kill_tests::reap(pid);
+            }
+        }
     }
 }
 
