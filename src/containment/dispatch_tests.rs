@@ -2014,6 +2014,48 @@ mod frozen_attach {
         attach(Ok(id), raw(child), prepared)
     }
 
+    /// The identity read the OS refused, as the spawn hands it to the attach.
+    fn refused_identity() -> Error {
+        Error::Unassessable {
+            detail: "the OS refused to report the spawned child's identity".into(),
+            source: None,
+        }
+    }
+
+    /// A job needs no identity: a Strongest root whose identity could not be read still gets one.
+    ///
+    /// Mutant: the attach fails early for want of an identity, whatever the mechanism.
+    #[skuld::test]
+    fn attach_assigns_a_strongest_roots_job_though_its_identity_could_not_be_read() {
+        let child = spawn_suspended_blocker();
+        let prepared = prepared(Some(ContainMode::Strongest), true, false);
+
+        let attachment = attach(Err(refused_identity()), raw(&child), prepared).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::JobObject);
+        dispose(child);
+        drop(attachment);
+    }
+
+    /// A tree walk names its tree by the root's identity, so it fails the attach with the read's error.
+    ///
+    /// Mutant: the attach succeeds with a tree walk that has no root.
+    #[skuld::test]
+    fn attach_fails_a_tree_walk_root_with_the_identity_reads_error() {
+        let child = spawn_suspended_blocker();
+
+        let err = attach(
+            Err(refused_identity()),
+            raw(&child),
+            prepared(Some(ContainMode::TreeWalk), true, false),
+        )
+        .err()
+        .expect("a tree walk without an identity must fail the attach");
+
+        assert!(matches!(err, Error::Unassessable { source: None, .. }), "got {err:?}");
+        dispose(child);
+    }
+
     fn dispose(mut child: std::process::Child) {
         child.kill().expect("kill the test child");
         child.wait().expect("reap the test child");
