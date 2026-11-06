@@ -587,13 +587,14 @@ impl Child {
     /// [`CgroupV2`](crate::Containment::CgroupV2), whose kill names no pid. An fd marker's walk from
     /// the root's pid checks each process it signals by its identity.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.kill_tree_after(None).map_err(|failure| failure.error)
+        self.kill_tree_after("kill_tree", None).map_err(|failure| failure.error)
     }
 
-    /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
-    /// error never claims the whole operation sent nothing. A failure says whether the root is dead
-    /// all the same ([`SweepFailure`]): a caller may wait for it before it returns the error.
-    pub(crate) fn kill_tree_after(&self, earlier: Option<&str>) -> Result<(), SweepFailure> {
+    /// [`kill_tree`](Self::kill_tree) for the operation `op`, as a step of it that already sent
+    /// `earlier`, so an error never claims the whole operation sent nothing. `op` names the call in
+    /// what it reports. A failure says whether the root is dead all the same ([`SweepFailure`]): a
+    /// caller may wait for it before it returns the error.
+    pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
         #[cfg(not(unix))]
         let _ = earlier;
         self.require_contained()?;
@@ -620,7 +621,7 @@ impl Child {
         let root_ended_by_handle = std::cell::Cell::new(false);
         #[cfg(unix)]
         if let Some(result) = self
-            .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+            .tree_call(crate::containment::dispatch::TreeSignal::Kill, op, earlier)
             .root_checked(
                 || held.state(),
                 || {
@@ -656,7 +657,7 @@ impl Child {
         if let Some(in_cgroup) = front {
             return match self
                 .attached
-                .settle_for_kill_tree("kill_tree", &self.tree_killed, group_result, false)
+                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
             {
                 Ok(()) if in_cgroup => self.cgroup_kill_reached(),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
@@ -675,7 +676,7 @@ impl Child {
         // launchd holds, so there is nothing left for the backstop to kill.
         let (backstop, root_ended) = if self.root_is_unpinned() {
             log::debug!(
-                "kill_tree({}): launchd holds the root's zombie, so the handle backstop is skipped",
+                "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
                 self.id.pid()
             );
             (Ok(()), true)
@@ -685,7 +686,14 @@ impl Child {
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             )
         };
-        SweepFailure::of(&self.attached, &self.tree_killed, group_result, backstop, root_ended)
+        SweepFailure::of(
+            op,
+            &self.attached,
+            &self.tree_killed,
+            group_result,
+            backstop,
+            root_ended,
+        )
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via

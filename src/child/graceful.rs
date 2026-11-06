@@ -426,10 +426,10 @@ impl Child {
             let sweep_result = if fault::take_force_kill_tree_error() {
                 Err(fault::forced_kill_tree_error().into())
             } else {
-                self.kill_tree_after(earlier)
+                self.kill_tree_after("graceful_shutdown_tree", earlier)
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after(earlier);
+            let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
                 if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {

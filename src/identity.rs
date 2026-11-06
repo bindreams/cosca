@@ -175,34 +175,7 @@ type Ordered = (Resolved<(ProcessId, Option<OrderKey>)>, UnknownCause);
 
 /// What a read of a candidate under its parent says: `Ok(None)` for one that is gone (or no longer
 /// its parent's child, or not ordered after the bound), `Err` for one that could not be read.
-pub(crate) type Resolution = Result<Option<(ProcessId, Option<OrderKey>)>, Unread>;
-
-/// A candidate that could not be read, and why. The error names the candidate itself when its own
-/// read failed, and the parent when the proof of that one did (`parent_blamed`): a caller that shows
-/// the error apart from the candidate's pid adds that pid in the second case, and only then.
-#[derive(Debug)]
-pub(crate) struct Unread {
-    pub(crate) why: Error,
-    pub(crate) parent_blamed: bool,
-}
-
-impl Unread {
-    /// The error, for a caller that shows it apart from the candidate `pid`: it names `pid` where it
-    /// does not already.
-    pub(crate) fn naming(self, pid: RawPid) -> Error {
-        if self.parent_blamed {
-            self.why.with_note(&format!("reading pid {pid}"))
-        } else {
-            self.why
-        }
-    }
-}
-
-/// [`resolution_of`], keeping whose read was left unanswered ([`Unread`]).
-pub(crate) fn unread_of<T>(label: &str, pid: RawPid, read: (Resolved<T>, UnknownCause)) -> Result<Option<T>, Unread> {
-    let parent_blamed = read.1.blamed_parent().is_some();
-    resolution_of(label, pid, read).map_err(|why| Unread { why, parent_blamed })
-}
+pub(crate) type Resolution = Result<Option<(ProcessId, Option<OrderKey>)>, Error>;
 
 /// What `read`, the answer of an ordered read of `pid`, says: `Unknown` is the error of
 /// [`unqueryable_read`], `label` (`pid` or `ppid`) naming the subject. The one mapping of the
@@ -229,11 +202,11 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 }
 
 /// [`unqueryable`] for the ordered read of `pid` that left `Unknown` with `cause`: the subject is
-/// `label pid`, or the parent whose proof failed when `cause` blames it. In that case the error does
-/// not name `pid`: a caller that shows it apart from `pid` adds it ([`Unread::naming`]).
+/// `label pid`, or the parent whose proof failed when `cause` blames it, in which case a note says
+/// which read was left unanswered: `pid`'s. This is the one place that words it.
 pub(crate) fn unqueryable_read(label: &str, pid: RawPid, cause: UnknownCause) -> Error {
     match cause.blamed_parent() {
-        Some(parent) => unqueryable(&format!("ppid {parent}"), cause),
+        Some(parent) => unqueryable(&format!("ppid {parent}"), cause).with_note(&format!("reading pid {pid}")),
         None => unqueryable(&format!("{label} {pid}"), cause),
     }
 }

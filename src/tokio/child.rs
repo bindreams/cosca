@@ -791,14 +791,21 @@ impl Child {
             self.refuse_unpinned("kill", None)?;
         }
         self.kill_sent_gated(
+            "kill",
             #[cfg(unix)]
             gate,
         )
     }
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's kill gate read by the caller.
-    pub(crate) fn kill_sent_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
+    /// `caller` names the call in what a cgroup front's kill warns of.
+    pub(crate) fn kill_sent_gated(
+        &mut self,
+        caller: &str,
+        #[cfg(unix)] gate: crate::elevation::front::Gate,
+    ) -> Result<Sent, Error> {
         let sent = self.signal_gated(
+            caller,
             #[cfg(unix)]
             gate,
         );
@@ -812,7 +819,15 @@ impl Child {
 
     /// [`kill_sent_gated`](Child::kill_sent_gated) without forgetting a child that is gone: for a
     /// caller that decides what to do with it, and what to log.
-    pub(crate) fn signal_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
+    #[cfg_attr(
+        not(unix),
+        allow(unused_variables, reason = "only a Unix cgroup front's kill names its caller")
+    )]
+    pub(crate) fn signal_gated(
+        &mut self,
+        caller: &str,
+        #[cfg(unix)] gate: crate::elevation::front::Gate,
+    ) -> Result<Sent, Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
@@ -830,7 +845,7 @@ impl Child {
                 self.os
                     .attached
                     .hard_kill_settled(
-                        "kill",
+                        caller,
                         &self.tree_killed,
                         &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
                     )
@@ -902,13 +917,14 @@ impl Child {
     /// look.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree). On Linux the handle
     /// keeps the root's pidfd when it forgets tokio's `Child`, whatever it saw.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
-        self.kill_tree_after(None).map_err(|failure| failure.error)
+        self.kill_tree_after("kill_tree", None).map_err(|failure| failure.error)
     }
 
-    /// [`kill_tree`](Self::kill_tree), as a step of an operation that already sent `earlier`, so an
-    /// error never claims the whole operation sent nothing. A failure says whether the root is dead
-    /// all the same ([`SweepFailure`]): a caller may wait for it before it returns the error.
-    pub(crate) fn kill_tree_after(&mut self, earlier: Option<&str>) -> Result<(), SweepFailure> {
+    /// [`kill_tree`](Self::kill_tree) for the operation `op`, as a step of it that already sent
+    /// `earlier`, so an error never claims the whole operation sent nothing. `op` names the call in
+    /// what it reports. A failure says whether the root is dead all the same ([`SweepFailure`]): a
+    /// caller may wait for it before it returns the error.
+    pub(crate) fn kill_tree_after(&mut self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
         #[cfg(not(unix))]
         let _ = earlier;
         self.require_contained()?;
@@ -937,7 +953,7 @@ impl Child {
         let root_ended_by_handle = std::cell::Cell::new(false);
         #[cfg(unix)]
         if let Some(result) = self
-            .tree_call(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
+            .tree_call(crate::containment::dispatch::TreeSignal::Kill, op, earlier)
             .root_checked(
                 || self.root_state(),
                 || {
@@ -969,7 +985,7 @@ impl Child {
             return match self
                 .os
                 .attached
-                .settle_for_kill_tree("kill_tree", &self.tree_killed, group_result, false)
+                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
             {
                 Ok(()) if in_cgroup => cgroup_kill_reached(self.front, &self.os, self.id.pid()),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
@@ -990,13 +1006,13 @@ impl Child {
         #[cfg(unix)]
         let (backstop, root_ended) = if self.root_is_unpinned() {
             log::debug!(
-                "kill_tree({}): launchd holds the root's zombie, so the handle backstop is skipped",
+                "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
                 self.id.pid()
             );
             (Ok(()), true)
         } else {
             // `front` was `None`, so the gate was open.
-            SweepFailure::backstop_of(self.kill_sent_gated(crate::elevation::front::Gate::Open))
+            SweepFailure::backstop_of(self.kill_sent_gated(op, crate::elevation::front::Gate::Open))
         };
         #[cfg(not(unix))]
         let (backstop, root_ended) = {
@@ -1004,7 +1020,14 @@ impl Child {
             let ended = killed.is_ok();
             (killed, ended)
         };
-        SweepFailure::of(&self.os.attached, &self.tree_killed, group_result, backstop, root_ended)
+        SweepFailure::of(
+            op,
+            &self.os.attached,
+            &self.tree_killed,
+            group_result,
+            backstop,
+            root_ended,
+        )
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -2074,6 +2097,9 @@ fn signal_on_drop(
         _ = tree_killed;
         TreeKillOutcome::from(os.attached.hard_kill(&crate::containment::GroupRoot::none()))
     };
+    // A cgroup front's gate reads the kill's own outcome, which is handed on below.
+    #[cfg(unix)]
+    let front_gate = cgroup_front.map(|front| (front, tree.incomplete()));
     // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on, once
     // the root is killed ([`Child::report`]).
     signals.tree = Some(tree);
@@ -2093,9 +2119,8 @@ fn signal_on_drop(
     // The cgroup kill ended the front, and the drop reaps it. One the kill did not end may still
     // have its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
-    if let Some(front) = cgroup_front {
-        // The gate reads the kill's own outcome.
-        let reached = match signals.tree.as_ref().expect("the tree kill ran above").incomplete() {
+    if let Some((front, incomplete)) = front_gate {
+        let reached = match incomplete {
             None => cgroup_kill_reached(Some(front), os, pid).map_err(|e| e.to_string()),
             Some(failure) => Err(failure),
         };

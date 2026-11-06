@@ -929,7 +929,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
             crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
             gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
-                child.signal_gated(gate)
+                child.signal_gated("kill", gate)
             }
         };
         // A child that is gone, or not verified to be ours, is forgotten here, not by the kill: tokio's
@@ -991,29 +991,29 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)) && drain_failure.is_none())
         || (skipped.is_some() && view.leaves_root_alone());
     let subject = child.teardown_subject();
-    let (mut tree_note, mut tree_warn) = crate::child::spawn::report_tree_teardown(tree, &subject);
-    if let Some(drain) = &drain_failure {
+    let (mut tree_note, tree_warn) = crate::child::spawn::report_tree_teardown(tree, &subject);
+    // A drain is watched only after a kill that left nothing, which `settle` answers `Killed`.
+    debug_assert!(
+        drain_failure.is_none() || tree_warn.is_none(),
+        "a drain watch failed after a kill that is reported as failed"
+    );
+    let drain_warn = drain_failure.as_ref().map(|drain| {
         tree_note.push_str(&format!(
             "; its contained tree was killed, but its drain could not be watched ({subject}: {drain}); the handle \
              stays armed to watch it again"
         ));
-        let said = format!("the kill succeeded, but its drain could not be watched ({drain})");
-        match tree_warn.as_mut() {
-            Some(warn) => warn.push_str(&format!("; {said}")),
-            None => {
-                tree_warn = Some(format!(
-                    "{} ({subject}): {said}",
-                    crate::child::spawn::TREE_TEARDOWN_WARN
-                ));
-            }
-        }
-    }
+        crate::child::spawn::tree_teardown_warn(
+            &subject,
+            &format_args!("the kill succeeded, but its drain could not be watched ({drain})"),
+        )
+    });
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let mut report = crate::child::drop_report::DropReport::new(&view);
     report.forgot = forgot;
     report.tree = tree_warn;
+    report.drain = drain_warn;
     let warned = report.emit(&[]);
     child.end_cleanup(tree_settled && root_settled, warned);
     Err(SpawnFailure::started(

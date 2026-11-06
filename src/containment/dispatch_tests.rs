@@ -346,6 +346,45 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
     }
 }
 
+// A tree call's report names the call =====
+
+/// The members a call's walk left besides the first are warned of under the name of the call that
+/// made it, not under `kill_tree`. Mutant: `SweepFailure::of` words every call as `kill_tree`.
+#[skuld::test]
+fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
+    use super::{Attached, SweepFailure, TreeKilled, Unkilled};
+    use crate::error::Error;
+    let member = |pid| Error::MemberNotKilled {
+        pid,
+        source: Box::new(Error::Containment {
+            detail: "refused".into(),
+        }),
+        note: None,
+    };
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let failure = SweepFailure::of(
+        "graceful_shutdown_tree",
+        &Attached::None,
+        &TreeKilled::default(),
+        Err(Unkilled {
+            members: vec![member(1), member(2)],
+            root: None,
+        }),
+        Ok(()),
+        false,
+    )
+    .expect_err("two members were left");
+    assert!(
+        matches!(failure.error, Error::MemberNotKilled { pid: 1, .. }),
+        "{:?}",
+        failure.error
+    );
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "pid 2 was not killed");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].1.starts_with("graceful_shutdown_tree: "), "{warned:?}");
+}
+
 // fd marker install policy (macOS) =====
 
 /// The install policy, exhaustively: every mode installs a marker for a ROOT spawn, no

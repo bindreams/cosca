@@ -49,6 +49,9 @@ pub(crate) enum PartKey {
     Described,
     /// The contained tree's teardown failure.
     Tree,
+    /// The failure to watch a drain after a tree kill that landed: not a repeat of a later kill's
+    /// failure.
+    Drain,
     /// A failure of the signals, by its text: a different one is new.
     Left(String),
 }
@@ -66,6 +69,8 @@ pub(crate) struct DropReport<'a> {
     pub(crate) forgot: Option<Forgot>,
     /// The contained tree's teardown failure, if it failed.
     pub(crate) tree: Option<String>,
+    /// The failure to watch the tree's drain after a kill that landed, if it failed.
+    pub(crate) drain: Option<String>,
     /// What the signals could not do: a refused kill, a failed reap.
     pub(crate) left: Vec<String>,
 }
@@ -78,6 +83,7 @@ impl<'a> DropReport<'a> {
             skipped: None,
             forgot: None,
             tree: None,
+            drain: None,
             left: Vec::new(),
         }
     }
@@ -160,6 +166,7 @@ impl<'a> DropReport<'a> {
             ));
         }
         parts.extend(self.tree.iter().map(|tree| (PartKey::Tree, tree.clone())));
+        parts.extend(self.drain.iter().map(|drain| (PartKey::Drain, drain.clone())));
         parts.extend(self.left.iter().map(|left| (PartKey::Left(left.clone()), left.clone())));
         if let Some(forgot) = &self.forgot {
             if let Some(cause) = &forgot.cause {

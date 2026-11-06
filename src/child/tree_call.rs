@@ -303,7 +303,7 @@ impl TreeCall<'_> {
         match self.signal {
             TreeSignal::Kill => {
                 self.attached
-                    .settle_for_kill_tree("kill_tree", self.killed, result.map_err(Unkilled::from), false)
+                    .settle_for_kill_tree(self.op, self.killed, result.map_err(Unkilled::from), false)
             }
             TreeSignal::Term => result,
         }

@@ -581,10 +581,6 @@ pub(crate) enum SettleOutcome {
     Killed,
     /// The kill was skipped (and the sweep by identity of a macOS fd marker left nothing): it killed
     /// nothing, and marks nothing.
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "only a Unix drop or cleanup skips a kill by the root's number")
-    )]
     Skipped,
 }
 
@@ -624,30 +620,32 @@ impl TreeKillOutcome {
         }
     }
 
-    /// Why the kill did not leave the tree killed, or `None` when it did: it ran and left nothing, the
-    /// root included. The first member a kill left, or what a skip left undone. Written once for
-    /// [`completed`](Self::completed), and for the text of a gate that reads it.
-    #[cfg(unix)]
-    pub(crate) fn incomplete(&self) -> Option<String> {
-        match self {
-            TreeKillOutcome::Ran(Ok(())) => None,
-            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Skipped { holders: Err(left), .. } => {
-                Some(left.first().to_string())
-            }
-            TreeKillOutcome::Skipped {
-                action,
-                holders: Ok(()),
-            } => Some(format!("the kill was skipped, and would {action}")),
-        }
-    }
-
     /// Whether the kill reached the front it was made for: it ran and left nothing, the root
     /// included, so the tree is killed. The one predicate of every gate that asks, with a cgroup
     /// front, whether the cgroup kill ended it. A caller reads this, not the handle's mark
     /// ([`TreeKilled`]), which only [`Attached::settle`] sets and only a later call reads.
     #[cfg(unix)]
     pub(crate) fn completed(&self) -> bool {
-        self.incomplete().is_none()
+        matches!(self, TreeKillOutcome::Ran(Ok(())))
+    }
+
+    /// Why the kill did not leave the tree killed, or `None` when it [`completed`](Self::completed):
+    /// the first member a kill left, or what a skip left undone. For the text of a gate that reads it.
+    #[cfg(unix)]
+    pub(crate) fn incomplete(&self) -> Option<String> {
+        if self.completed() {
+            return None;
+        }
+        Some(match self {
+            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Skipped { holders: Err(left), .. } => {
+                left.first().to_string()
+            }
+            TreeKillOutcome::Skipped {
+                action,
+                holders: Ok(()),
+            } => format!("the kill was skipped, and would {action}"),
+            TreeKillOutcome::Ran(Ok(())) => unreachable!("a completed kill has nothing left"),
+        })
     }
 
     /// What the kill skipped, as an action, when it was skipped.
@@ -712,18 +710,19 @@ impl SweepFailure {
     /// The answer of a `kill_tree` sweep: the walk's error, settled by the root's death
     /// ([`Attached::settle`]), else the backstop's. `root_ended`: the backstop ended the root. This is
     /// the call's one report of the members the walk left: the error names the first, and each other
-    /// is warned of here.
+    /// is warned of here. `op` names the call.
     pub(crate) fn of(
+        op: &str,
         attached: &Attached,
         killed: &TreeKilled,
         walk: Result<(), Unkilled>,
         backstop: Result<(), Error>,
         root_ended: bool,
     ) -> Result<(), SweepFailure> {
-        let walk = attached.settle_for_kill_tree("kill_tree", killed, walk, root_ended);
+        let walk = attached.settle_for_kill_tree(op, killed, walk, root_ended);
         if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
             // Both-fail: the walk's error is surfaced; subsuming the backstop's is deliberate.
-            log::debug!("kill_tree handle backstop also failed ({backstop}); surfacing the walk's error: {walk}");
+            log::debug!("{op} handle backstop also failed ({backstop}); surfacing the walk's error: {walk}");
         }
         walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
     }

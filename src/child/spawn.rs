@@ -410,8 +410,9 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// are one event). `subject` names the tree, because the teardown error itself may not (see
 /// `Attached::teardown_subject`).
 ///
-/// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok)`: it worked.
-/// Neither is reported.
+/// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
+/// tree was killed. `Some(Ok(Skipped))`: a kill that killed nothing; its skip note says so (the
+/// caller's). None of these is reported here.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(
     tree: Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
@@ -422,8 +423,15 @@ pub(crate) fn report_tree_teardown(
     };
     (
         format!("; its contained tree could not be killed ({subject}: {e})"),
-        Some(format!("{TREE_TEARDOWN_WARN} ({subject}): {e}")),
+        Some(tree_teardown_warn(subject, &e)),
     )
+}
+
+/// The text of the cleanup's `warn` about the tree's teardown: `said`, about `subject`, under
+/// [`TREE_TEARDOWN_WARN`].
+#[cfg(unix)]
+pub(crate) fn tree_teardown_warn(subject: &dyn std::fmt::Display, said: &dyn std::fmt::Display) -> String {
+    format!("{TREE_TEARDOWN_WARN} ({subject}): {said}")
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`

@@ -85,7 +85,7 @@
 
 use crate::containment::dispatch::Unkilled;
 use crate::error::Error;
-use crate::identity::{resolution_of, unread_of, Kernel, OrderKey, ProcessId, RawPid, Resolution, Unread};
+use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
@@ -124,7 +124,7 @@ pub(crate) struct Walk {
     pub(crate) members: Vec<ProcessId>,
     /// Each candidate dropped for an `Unknown` read, with why ([`unqueryable_read`](crate::identity::unqueryable_read)):
     /// the candidate's own failure, or the proof of the parent it was read under.
-    pub(crate) unassessed: Vec<(RawPid, Unread)>,
+    pub(crate) unassessed: Vec<(RawPid, Error)>,
 }
 
 impl Walk {
@@ -134,14 +134,11 @@ impl Walk {
     pub(crate) fn complete_members(self) -> Result<Vec<ProcessId>, Error> {
         let Walk { members, unassessed } = self;
         let mut unassessed = unassessed.into_iter();
-        let Some((pid, first)) = unassessed.next() else {
+        let Some((_, first)) = unassessed.next() else {
             return Ok(members);
         };
-        // The error names the candidate when its own read failed, and the parent when that one's
-        // proof did: only then does a note name the candidate dropped.
-        let first = first.naming(pid);
         let others: Vec<String> = unassessed
-            .map(|(pid, Unread { why, .. })| format!("pid {pid} ({})", cause_text(&why)))
+            .map(|(pid, why)| format!("pid {pid} ({})", cause_text(&why)))
             .collect();
         Err(if others.is_empty() {
             first
@@ -166,8 +163,8 @@ fn cause_text(why: &Error) -> String {
 /// return for them (`terminate`, the fd marker's sweep). The others report theirs in the error
 /// ([`hard_kill`], `ProcessId::children`), so a member is reported once.
 #[cfg(unix)]
-pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Unread)]) {
-    for (pid, Unread { why, .. }) in unassessed {
+pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Error)]) {
+    for (pid, why) in unassessed {
         log::warn!("treewalk: pid {pid} dropped from the walk ({})", cause_text(why));
     }
 }
@@ -189,7 +186,7 @@ pub(crate) fn resolve_or_drop(
     parent: ProcessId,
     bound: Option<OrderKey>,
 ) -> Resolution {
-    unread_of(
+    resolution_of(
         "pid",
         pid,
         ProcessId::of_ordered_with(kernel, pid, Some(parent), None, bound),
@@ -545,10 +542,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Unki
     #[cfg(test)]
     fault::note_walk(root.pid());
     // A candidate that could not be read is not killed, and nor is anything under it: left behind.
-    let mut left: Vec<Error> = unassessed
-        .into_iter()
-        .map(|(pid, Unread { why, .. })| not_killed(pid, why))
-        .collect();
+    let mut left: Vec<Error> = unassessed.into_iter().map(|(pid, why)| not_killed(pid, why)).collect();
     let mut root_left: Option<Error> = None;
     #[cfg(all(test, unix))]
     if let Some(forced) = fault::take_force_incomplete() {
