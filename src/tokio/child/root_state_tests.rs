@@ -383,7 +383,9 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
     super::child_reap_tests::reap_behind_the_owner(child.pid());
     let mark = crate::log_capture::mark();
     // The number still reads as the root, as after a same-tick reuse.
-    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(child.id()));
+    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(
+        child.id().expect(crate::test_child::IDENTITY_READ),
+    ));
     let _failed = force_peeks([failed_peek("forced"), failed_peek("forced")]);
 
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))

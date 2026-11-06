@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use super::{accept_or_die, ack, fixture_argv, Console};
+use super::{accept_or_die, ack, fixture_argv, Console, IDENTITY_READ};
 
 pub(crate) mod console_less;
 pub(crate) mod nested;
@@ -189,7 +189,7 @@ pub(crate) fn spawn_member(
     cmd.contain_with(mode);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
-    let mut sock = accept_root(&listener, child.id());
+    let mut sock = accept_root(&listener, child.id().expect(IDENTITY_READ));
     let grand = grandchild.map(|_| accept_grandchild(&listener, &mut sock));
     (child, sock, grand)
 }
@@ -259,7 +259,7 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();
     let child = cmd.spawn().expect("spawn the GUI-subsystem root");
-    let sock = accept_tagged(&listener, child.id(), b'G');
+    let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
     (child, sock)
 }
 
@@ -273,7 +273,7 @@ pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream)
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();
     let child = cmd.spawn().expect("spawn the GUI-subsystem root");
-    let sock = accept_tagged(&listener, child.id(), b'G');
+    let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
     (child, sock)
 }
 
@@ -338,7 +338,7 @@ pub(crate) fn spawn_member_async(
     cmd.contain_with(mode);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
-    let mut sock = accept_root(&listener, child.id());
+    let mut sock = accept_root(&listener, child.id().expect(IDENTITY_READ));
     let grand = grandchild.map(|_| accept_grandchild(&listener, &mut sock));
     (child, sock, grand)
 }
@@ -419,7 +419,7 @@ pub(crate) fn drive_reporter(test: &str, addr_env: &str, configure: impl FnOnce(
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the reporter");
-    let mut sock = accept_or_die(&listener, child.id());
+    let mut sock = accept_or_die(&listener, child.id().expect(IDENTITY_READ));
     let mut report = Vec::new();
     sock.read_to_end(&mut report).expect("read the report");
     assert_eq!(

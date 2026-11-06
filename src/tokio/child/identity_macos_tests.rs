@@ -5,11 +5,11 @@ use std::cell::{Cell, RefCell};
 use crate::test_child::Console;
 use std::rc::Rc;
 
-use super::{drop_fault, fault as backend_fault};
+use super::fault as backend_fault;
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
-    arm_launchd_hold, assert_program_did_not_run, end_unsignalled_and_reap, has_not_exited, other_unique_id,
-    ran_marker, reap_by_pid, vanished, RAN_ARGV,
+    arm_launchd_hold, assert_program_did_not_run, has_not_exited, other_unique_id, ran_marker, reap_by_pid, vanished,
+    RAN_ARGV,
 };
 use crate::child::spawn::unique_report;
 use crate::error::Error;
@@ -108,13 +108,12 @@ async fn macos_tokio_spawn_identity_held_by_launchd_is_gone() {
     );
 }
 
-/// As the sync twin: the failed re-read fails the spawn `Unassessable` and warns. Nothing pins
-/// the pid, so the child is left running and unsignalled, and tokio's `Child` is forgotten.
+/// As the sync twin: a re-read the OS refuses keeps the uncontained child with no identity,
+/// unsignalled and unreaped, and the spawn warns naming the error.
 ///
-/// Mutants: a failed re-read keeps the read; the teardown kills or drops the child (it is gone,
-/// or `backend_drops` is 1).
+/// Mutants: the spawn fails, or leaves the child unadopted; the warn drops the error.
 #[skuld::test]
-async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_leaves_the_child() {
+async fn macos_tokio_spawn_identity_with_a_refused_reread_keeps_the_child_without_an_identity() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut cmd, _writer) = tokio_blocker();
@@ -129,13 +128,57 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
             )))));
         }
     });
-    let forgets = drop_fault::record();
-    let backend_drops = backend_fault::count_backend_drops();
     let mark = crate::log_capture::mark();
     let outcome = cmd.spawn();
     drop(armed);
+    assert_ne!(pid.get(), 0, "the hook must have run");
+    let mut child = outcome.expect("a refused re-read keeps the child");
+    assert_eq!(
+        child.id(),
+        None,
+        "the read could not be checked, so the child has no identity"
+    );
+    assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
+    assert!(has_not_exited(pid.get()), "the child must be left running, unreaped");
+    // The failed re-read is the event's one warn, logged when the spawn ends.
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)"),
+        "the one warn names the failed re-read: {warns:?}"
+    );
+    // A kept child is killed through its handle like any other.
+    child.kill().expect("a kept child is killed through its unique id");
+    child.wait().await.expect("a kept child is waited on");
+}
+
+/// As the sync twin: a contained root names its tree by its identity, so a re-read the OS refuses
+/// fails the spawn with the read's own error (`Unassessable`), and the child is killed and reaped
+/// through its verified unique id.
+///
+/// Mutant: the contained spawn is kept without a marker root.
+#[skuld::test]
+async fn macos_tokio_spawn_identity_with_a_refused_reread_fails_a_contained_spawn_and_ends_the_child() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, _writer) = tokio_blocker();
+    cmd.contain_with(crate::ContainMode::Session);
+    let pid = Rc::new(Cell::new(0));
+    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        move || {
+            pid.set(fault::spawn_pid());
+            *armed.borrow_mut() = Some(Box::new(force_peek_once(Err(std::io::Error::other(
+                "forced re-read refusal 2f9a",
+            )))));
+        }
+    });
+    let outcome = cmd.spawn();
+    drop(armed);
+    assert_ne!(pid.get(), 0, "the hook must have run");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-        outcome.expect_err("a refused re-read fails the spawn"),
+        outcome.expect_err("a contained spawn without an identity fails"),
     );
     assert!(
         matches!(err, Error::Unassessable { .. }),
@@ -143,24 +186,9 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
     );
     assert_eq!(
         fate,
-        crate::error::ChildFate::Running { id: None },
-        "the child is left, its identity unread"
+        crate::error::ChildFate::Reaped,
+        "the unique id pins the child, so it is reaped"
     );
-    // The failed re-read and the forget that leaves the child are one event: one warn.
-    let warns = crate::log_capture::warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)")
-            && warns[0].contains("leaks"),
-        "the one warn names the failed re-read and the leak: {warns:?}"
-    );
-    assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
-    assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
-    assert!(
-        has_not_exited(pid.get()),
-        "the child must be left running, unsignalled and unreaped"
-    );
-    end_unsignalled_and_reap(pid.get());
 }
 
 /// As the sync twin: the unique id is the child's own report, and its only by-pid unique-id read
@@ -304,7 +332,7 @@ async fn macos_tokio_fdmarker_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_marker_root(),
-        Some(child.id()),
+        child.id(),
         "the marker's root is the verified identity"
     );
 }
@@ -364,7 +392,7 @@ async fn macos_tokio_treewalk_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_treewalk_root(),
-        Some(child.id()),
+        child.id(),
         "the walk's root is the verified identity"
     );
 }

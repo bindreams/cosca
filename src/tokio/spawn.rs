@@ -61,12 +61,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     granted,
                     id,
                     report,
-                    ..
+                    pid,
                 } => {
-                    let raw = windows_raw::RawAsyncChild::new(proc, granted);
+                    let raw = windows_raw::RawAsyncChild::new(proc, pid, granted);
                     let mut child = Child::from_parts(
                         ProcSource::Raw(raw),
-                        id,
+                        Some(id),
                         kill_on_drop,
                         crate::containment::Attachment::uac_elevated(),
                         super::child::FdPipes::new(),
@@ -568,17 +568,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     let proc = {
         // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.
         let held_pidfd = held_pidfd.expect("a spawned child holds the pidfd its handshake opened");
-        ProcSource::new(child, held_pidfd)
+        ProcSource::new(child, pid, held_pidfd)
     };
     #[cfg(target_os = "macos")]
-    let mut proc = ProcSource::new(child, identity);
+    let mut proc = ProcSource::new(child, pid, identity);
     #[cfg(windows)]
-    let proc = ProcSource::new(child);
+    let proc = ProcSource::new(child, pid);
     #[cfg(target_os = "macos")]
     if let Some(not_adopted) = not_adopted {
         #[cfg(test)]
         crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
-        prepared.settle_verdict(pid);
+        prepared.settle_verdict();
         use crate::child::spawn::unique_report::Unadoptable;
         let error = not_adopted.error;
         let left = crate::child::spawn::FrontFate::LeftUnreaped;
@@ -657,7 +657,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         }
     };
     let id = match resolved {
-        Resolved::Found(id) => id,
+        Resolved::Found(id) => Ok(id),
+        // Kept with no identity; see `Child::id`.
+        Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
         // Tear the child down so a vanished-identity error never leaks a live (Windows: still
         // CREATE_SUSPENDED) process.
         other => {
@@ -666,8 +668,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
-                #[cfg(not(target_os = "linux"))]
-                pid,
             );
             // An elevation front is sent nothing (see `ProcSource::leave_front`). Its containment
             // goes first: a cgroup leaf's drop kills it, so the teardown waits for a contained front
@@ -676,18 +676,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             if let Some(front) = front {
                 #[cfg(target_os = "linux")]
                 drop(prepared);
-                // macOS: a front whose identity was refused or found gone is left unverified, as the
-                // sync spawn leaves it.
+                // macOS: a front found gone is left unverified, as the sync spawn leaves it.
                 #[cfg(target_os = "macos")]
-                let (fate, child_fate) = leave_unverified_front(
-                    &mut proc,
-                    if matches!(other, Resolved::Gone) {
-                        crate::containment::RootIdentity::Gone
-                    } else {
-                        crate::containment::RootIdentity::Unknown
-                    },
-                    &mut why,
-                );
+                let (fate, child_fate) = leave_unverified_front(&mut proc, &mut why);
                 #[cfg(target_os = "macos")]
                 return Err(SpawnFailure::started(
                     fate.note(
@@ -698,7 +689,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     child_fate,
                     None,
                 ));
-                // The read failed, so no identity is known.
                 #[cfg(not(target_os = "macos"))]
                 {
                     let (error, child_fate) = proc.leave_front_noting(
@@ -718,27 +708,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // macOS: nothing kills the group, which the teardown's one warn says.
             #[cfg(target_os = "macos")]
             crate::child::spawn::note_group_left_running(&prepared, pid, &mut why);
-            // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
-            // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
-            #[cfg(target_os = "linux")]
-            if matches!(other, Resolved::Unknown) {
-                let child_fate = proc.teardown_through_pidfd(pid, None, &mut why);
-                return Err(SpawnFailure::started(
-                    crate::child::spawn::spawn_identity_error(other, cause),
-                    child_fate,
-                    None,
-                ));
-            }
-            // macOS: nothing pins the pid, so a child the handle still cannot show ours is
-            // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
-            #[cfg(target_os = "macos")]
-            let forgotten = matches!(other, Resolved::Unknown).then(|| {
-                proc.forget_foreign_noting(&mut why);
-                ChildFate::Running { id: None }
-            });
             let child_fate = proc.reap_now_noting(pid, None, &mut why);
-            #[cfg(target_os = "macos")]
-            let child_fate = forgotten.unwrap_or(child_fate);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 child_fate,
@@ -748,7 +718,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
+    // What the attach does not consume of the identity read: what the child becomes, and what the
+    // failure arms tear down by.
+    let id_read = id.as_ref().ok().copied();
     let attach = crate::child::spawn::attach_or_fault(
+        #[cfg(unix)]
+        pid,
         id,
         #[cfg(target_os = "linux")]
         handle,
@@ -760,7 +735,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         Ok(v) => v,
         Err(error) => {
             #[cfg(target_os = "macos")]
-            crate::child::spawn::assert_attach_cannot_fail(&error);
+            if id_read.is_some() {
+                crate::child::spawn::assert_attach_cannot_fail(&error);
+            }
             #[cfg(unix)]
             if let Some(front) = front {
                 // macOS: a front is sent nothing and left unreaped, as the sync spawn leaves it.
@@ -769,14 +746,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     proc.forget_because("is an elevation front whose attach failed, sent nothing, and left unreaped");
                     (
                         crate::child::spawn::FrontFate::LeftUnreaped,
-                        ChildFate::Running { id: Some(id) },
+                        ChildFate::Running { id: id_read },
                     )
                 };
                 // Elsewhere the failed attach has dropped the containment: a cgroup leaf's drop kills
                 // and drains it, so a front in it is dying, and is waited for.
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let (error, child_fate) = proc.leave_front(pid, Some(id), subtree.as_ref(), error, front);
+                    let (error, child_fate) =
+                        proc.leave_front_noting(pid, id_read, subtree.as_ref(), &mut why, error, front);
                     return Err(SpawnFailure::started(error, child_fate, None));
                 }
                 #[cfg(target_os = "macos")]
@@ -793,7 +771,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 let fate = crate::child::spawn::kill_and_reap_verified(
                     pid,
                     identity.expect("a spawn that reached the attach adopted its unique id"),
-                    Some(id),
+                    id_read,
                     &format!("is {}", crate::tokio::child::HANDED_TO_ORPHAN_REAPER),
                     crate::tokio::child::slow_teardown_after(),
                 );
@@ -809,7 +787,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
             // attach never leaks a live/suspended process.
             #[cfg(not(target_os = "macos"))]
-            let child_fate = proc.reap_now(pid, Some(id));
+            let child_fate = proc.reap_now_noting(pid, id_read, &mut why);
             return Err(SpawnFailure::started(error, child_fate, None));
         }
     };
@@ -829,37 +807,26 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         super::child::FdPipes::new()
     };
 
-    let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
+    let mut child = Child::from_parts(proc, id_read, kill_on_drop, attachment, pipes, owned_std);
     #[cfg(windows)]
     child.set_elevation(elevation_report);
     child.set_front(cmd.elevation_front());
     Ok(child)
 }
 
-/// macOS: a front whose identity read found it reaped elsewhere (`Gone`) or could not be read
-/// (`Unknown`) is left unverified, as the sync spawn's `leave_unverified_child` leaves any child:
-/// sent nothing, and tokio's `Child` forgotten, since its drop reaps by pid.
+/// macOS: a front whose identity read found it reaped elsewhere (`Gone`) is left unverified, as the
+/// sync spawn's `leave_unverified_child` leaves any child: sent nothing, and tokio's `Child`
+/// forgotten, since its drop reaps by pid.
 #[cfg(target_os = "macos")]
 fn leave_unverified_front(
     proc: &mut ProcSource,
-    identity: crate::containment::RootIdentity,
     why: &mut crate::child::spawn::Diagnosis,
 ) -> (crate::child::spawn::FrontFate, ChildFate) {
-    proc.forget_noting(
-        match identity {
-            crate::containment::RootIdentity::Gone => "was reaped by someone else",
-            crate::containment::RootIdentity::Unknown => {
-                "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
-            }
-        },
-        super::child::Forgotten::Unproven,
-        why,
-    );
-    let fate = match identity {
-        crate::containment::RootIdentity::Gone => ChildFate::Gone,
-        crate::containment::RootIdentity::Unknown => ChildFate::Running { id: None },
-    };
-    (crate::child::spawn::FrontFate::of_unverified(identity), fate)
+    proc.forget_noting("was reaped by someone else", super::child::Forgotten::Unproven, why);
+    (
+        crate::child::spawn::FrontFate::of_unverified(crate::containment::RootIdentity::Gone),
+        ChildFate::Gone,
+    )
 }
 
 /// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
@@ -959,14 +926,14 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 (
                     "the elevated child could not be terminated (it could not be verified, and may still be running)"
                         .to_string(),
-                    ChildFate::Running { id: Some(child.id()) },
+                    ChildFate::Running { id: child.id() },
                 )
             }
             Err(e) => {
                 root_settled = front_closed;
                 // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
                 forgot = child.forget_for(&view);
-                let id = Some(child.id());
+                let id = child.id();
                 let fate = match &forgot {
                     Some(forgot) if forgot.reaped_elsewhere() => ChildFate::Gone,
                     Some(_) => ChildFate::Running { id },

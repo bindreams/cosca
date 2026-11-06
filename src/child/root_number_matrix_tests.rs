@@ -663,7 +663,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         }
     }
     let scripted = reap.script(&mut child);
-    let mut forced = reap.force_reads(child.id());
+    let mut forced = reap.force_reads(child.id().expect(crate::test_child::IDENTITY_READ));
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
@@ -798,7 +798,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             }
         }
     }
-    let mut forced = reap.force(child.id());
+    let mut forced = reap.force(child.id().expect(crate::test_child::IDENTITY_READ));
 
     // A teardown that does not wait for the drain leaves the leaf, so the cell removes it.
     #[cfg(target_os = "linux")]

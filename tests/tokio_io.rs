@@ -32,7 +32,7 @@ async fn async_id_is_a_real_stable_identity() {
     // own Child::id() would be None after reap).
     use std::io::Write as _;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
-    let id = child.id();
+    let id = child.id().expect("the spawn read the child's identity");
     let p = cosca::Process::open(id).expect("open").expect("the child is running");
     assert_eq!(p.id(), id);
     assert_eq!(
@@ -42,7 +42,7 @@ async fn async_id_is_a_real_stable_identity() {
     );
     sock.write_all(b"x").expect("release");
     child.wait().await.expect("wait");
-    assert_eq!(child.id(), id, "id() stays the stable ProcessId after wait");
+    assert_eq!(child.id(), Some(id), "id() stays the stable ProcessId after wait");
 }
 
 #[cfg(feature = "tokio")]
@@ -337,7 +337,7 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
     common::install_log_capture();
     let (mut child, root, grand) = common::spawn_released_tree_async().await;
-    let root_id = child.id();
+    let root_id = child.id().expect("the spawn read the child's identity");
     // The echoing root leaves only when its socket closes.
     root.sock
         .shutdown(std::net::Shutdown::Both)
@@ -382,7 +382,7 @@ async fn async_detach_leaves_the_tree_running() {
     let (mut child, mut root, grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
-    let root_id = child.id();
+    let root_id = child.id().expect("the spawn read the child's identity");
     child.detach();
     drop(child); // detached → Drop must NOT kill
                  // Positive liveness (no race — we never signaled it): a buggy detach that let Drop kill the
@@ -414,7 +414,7 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
     let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false).await;
-    let root_id = child.id();
+    let root_id = child.id().expect("the spawn read the child's identity");
     drop(child); // kill_on_drop(false) → Drop early-returns; teardown must NOT run
     assert_eq!(
         root_id.is_alive(),
@@ -446,7 +446,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     );
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
-    let root_id = child.id();
+    let root_id = child.id().expect("the spawn read the child's identity");
     drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
     assert_eq!(
         root_id.is_alive(),

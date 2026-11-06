@@ -40,7 +40,7 @@ fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) -> std::
 fn a_failed_peek_answers_what_the_drop_did(kill_on_drop: bool) {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = live(kill_on_drop);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let looks = force_peeks((0..4).map(|_| Err(std::io::Error::other("forced peek failure 5d1b"))));
     let fate = child.tear_down_now(TeardownCaller::Drop);
     drop(looks);
@@ -76,7 +76,7 @@ async fn a_disarmed_teardown_with_a_failed_peek_looks_and_warns_once() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = live(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let looks = force_peeks((0..4).map(|_| Err(std::io::Error::other("forced peek failure 8e2a"))));
     let mark = crate::log_capture::mark();
     let fate = child.tear_down_now(TeardownCaller::Drop);
@@ -124,7 +124,7 @@ fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, std::io::PipeWrite
 async fn a_backend_forgotten_as_reaped_elsewhere_is_not_an_own_reap() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let state = child.os.proc_mut().state();
     let _fate = child.tear_down_now(TeardownCaller::Drop);
     collect(id, writer);
@@ -144,7 +144,7 @@ async fn a_backend_forgotten_as_reaped_elsewhere_is_not_an_own_reap() {
 async fn the_drop_of_a_child_forgotten_unproven_claims_no_reap() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let fate = child.tear_down_now(TeardownCaller::Drop);
     // Released after the drop's kill, so a kill that sent nothing fails the assertion on how the
     // child ended.
@@ -196,7 +196,7 @@ async fn a_refused_kill_of_an_unproven_backend_at_drop_is_named() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = forgotten(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = super::fault::force_kill_failure();
     let mark = crate::log_capture::mark();
     let fate = child.tear_down_now(TeardownCaller::Drop);
@@ -227,7 +227,7 @@ async fn a_refused_kill_whose_look_at_drop_fails_is_left_running_and_unreaped() 
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = super::fault::force_kill_failure();
     let fail = || Err(std::io::Error::other("forced peek failure 6c4e"));
     let looks = force_peeks([fail(), Ok(PeekOutcome::Running), fail(), fail()]);
@@ -268,7 +268,7 @@ async fn a_refused_kill_of_a_child_released_to_tokio_is_left_running_and_not_unr
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = super::fault::force_kill_failure();
     let looks = force_peeks((0..4).map(|_| Ok(PeekOutcome::Running)));
     let mark = crate::log_capture::mark();
@@ -298,7 +298,7 @@ async fn a_refused_kill_of_a_child_shown_reaped_elsewhere_at_drop_says_it_is_gon
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = super::fault::force_kill_failure();
     // The read and the forget's look show it ours; the gate shows it reaped elsewhere.
     let looks = force_peeks([
@@ -334,7 +334,7 @@ async fn an_unproven_backend_reads_its_kept_pidfd_for_whether_the_child_runs() {
     use crate::signal::Sig;
     crate::tokio::test_runtime::assert_current_thread();
     let (child, writer) = forgotten(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let proc = child.os.proc.as_ref().expect("backend");
     assert!(proc.is_running().expect("the pidfd answers"), "the child lives");
     proc.signal(Sig::Kill).expect("kill through the pidfd");
@@ -350,7 +350,7 @@ async fn an_unproven_backend_reads_its_kept_pidfd_for_whether_the_child_runs() {
 async fn the_drop_of_a_child_forgotten_as_reaped_elsewhere_says_gone() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = forgotten(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let fate = child.tear_down_now(TeardownCaller::Drop);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Gone);
@@ -392,8 +392,8 @@ async fn a_kill_of_a_forgotten_backend_is_gone_only_with_proof() {
             .expect("sends nothing"),
         Sent::Gone
     );
-    collect(unproven.id(), w1);
-    collect(proven.id(), w2);
+    collect(unproven.id().expect(crate::test_child::IDENTITY_READ), w1);
+    collect(proven.id().expect(crate::test_child::IDENTITY_READ), w2);
 }
 
 /// The failed password write of an elevated child whose backend was forgotten: `Gone` only with
@@ -412,7 +412,7 @@ async fn a_failed_password_write_on_a_forgotten_backend_is_gone_only_with_proof(
     };
     for (reaped_elsewhere, expected) in [(false, unproven), (true, Some(ChildFate::Gone))] {
         let (child, writer) = forgotten(reaped_elsewhere);
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let (_err, fate) = crate::tokio::spawn::finish_elevated(
             child,
             Err(crate::error::Error::Elevation {
@@ -462,7 +462,7 @@ async fn reaped_is_reported_only_for_a_status_that_was_collected() {
     crate::tokio::test_runtime::assert_current_thread();
     // `wait_and_reap_blocking`, after a kill.
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     child.kill().expect("kill");
     // Released after the kill, so a `kill` that sent nothing fails the assertion on how the child
     // ended, not the blocking wait below.
@@ -478,7 +478,7 @@ async fn reaped_is_reported_only_for_a_status_that_was_collected() {
 
     // `reap_now`, which kills itself.
     let (mut child, _writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let proc = child.os.proc.take().expect("backend");
     let fate = proc.reap_now(id.pid(), Some(id));
     let waiting = record_waits(id);
@@ -496,7 +496,7 @@ async fn macos_an_orphaned_child_at_drop_is_gone() {
     use crate::os_process::child::{Foreign, PeekOutcome};
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = live(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let looks = force_peeks((0..4).map(|_| Ok(PeekOutcome::Foreign(Foreign::Orphaned))));
     let fate = child.tear_down_now(TeardownCaller::Drop);
     drop(looks);
@@ -512,7 +512,7 @@ async fn a_teardown_named_a_failed_run_words_its_warn_as_one() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = super::fault::force_kill_failure();
     let mark = crate::log_capture::mark();
 

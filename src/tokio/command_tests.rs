@@ -176,7 +176,7 @@ async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
 #[skuld::test]
 async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     let (mut child, writer) = held_blocker(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child).await;
     assert_eq!(
         error.fate(),
@@ -199,7 +199,7 @@ async fn a_failure_after_the_spawn_whose_kill_is_refused_leaves_the_child_runnin
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = held_blocker(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let refused = crate::tokio::child::fault::force_kill_failure();
     let mark = crate::log_capture::mark();
 

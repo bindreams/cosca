@@ -156,14 +156,13 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
     end_unsignalled_and_reap(pid.get());
 }
 
-/// A re-read the OS refuses (forced: the peek fails) cannot show the child ours: the spawn fails
-/// `Unassessable`, warns at the call naming the error, and leaves the child running, unsignalled
-/// and unreaped.
+/// A re-read the OS refuses (forced: the peek fails) cannot show the child ours, but the spawn does
+/// not end it: the uncontained child is kept with no identity, unsignalled and unreaped, and the
+/// spawn warns naming the error.
 ///
-/// Mutants: a failed re-read keeps the read, so the spawn is `Ok`; the call-site warn drops the
-/// error.
+/// Mutants: the spawn fails, or leaves the child unadopted; the warn drops the error.
 #[skuld::test]
-fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
+fn macos_sync_spawn_identity_with_a_refused_reread_keeps_the_child_without_an_identity() {
     crate::log_capture::install();
     let (mut cmd, _writer) = sync_blocker();
     let pid = Rc::new(Cell::new(0));
@@ -181,41 +180,36 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     let outcome = cmd.spawn();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
-    let adopted = outcome.as_ref().ok().map(|child| child.id());
-    let left = has_not_exited(pid.get());
-    if adopted.is_none() {
-        end_unsignalled_and_reap(pid.get());
-    }
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-        outcome.expect_err("a refused re-read fails the spawn"),
-    );
-    assert!(
-        matches!(err, Error::Unassessable { .. }),
-        "a refusal is Unassessable, not a vanish: {err:?}"
-    );
+    let child = outcome.expect("a refused re-read keeps the child");
     assert_eq!(
-        fate,
-        crate::error::ChildFate::Running { id: None },
-        "the child is left, its identity unread"
+        child.id(),
+        None,
+        "the read could not be checked, so the child has no identity"
     );
-    assert!(left, "the child must be left running, unreaped");
-    // The failed re-read and the teardown that leaves the child are one event: one warn.
+    assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
+    assert!(has_not_exited(pid.get()), "the child must be left running, unreaped");
+    // The failed re-read is the event's one warn, logged when the spawn ends.
     let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)")
-            && warns[0].contains("leaving it unreaped"),
-        "the one warn names the failed re-read and what became of the child: {warns:?}"
+        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)"),
+        "the one warn names the failed re-read: {warns:?}"
     );
+    // A kept child is killed through its handle like any other.
+    child.kill().expect("a kept child is killed through its unique id");
+    child.wait().expect("a kept child is waited on");
 }
 
-/// Spawns a blocker contained by `mode`, launched by `front`, whose identity re-read is refused:
-/// its pid, once ended, and the warns the spawn logged.
-fn refused_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation::front::Front>) -> (u32, Vec<String>) {
+/// A contained root names its tree by its identity (the fd marker), so a re-read the OS refuses fails
+/// the spawn with the read's own error (`Unassessable`), and the child is killed and reaped through
+/// its verified unique id.
+///
+/// Mutant: the contained spawn is kept without a marker root.
+#[skuld::test]
+fn macos_sync_spawn_identity_with_a_refused_reread_fails_a_contained_spawn_and_ends_the_child() {
     crate::log_capture::install();
     let (mut cmd, _writer) = sync_blocker();
-    cmd.contain_with(mode);
-    cmd.set_elevation_front(front);
+    cmd.contain_with(crate::ContainMode::Session);
     let pid = Rc::new(Cell::new(0));
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
@@ -223,8 +217,43 @@ fn refused_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation
         move || {
             pid.set(fault::spawn_pid());
             *armed.borrow_mut() = Some(Box::new(force_peek_once(Err(std::io::Error::other(
-                "forced re-read refusal 7c2e",
+                "forced re-read refusal 2f9a",
             )))));
+        }
+    });
+    let outcome = cmd.spawn();
+    drop(armed);
+    assert_ne!(pid.get(), 0, "the hook must have run");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        outcome.expect_err("a contained spawn without an identity fails"),
+    );
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "a refusal is Unassessable, not a vanish: {err:?}"
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the unique id pins the child, so it is reaped"
+    );
+}
+
+/// Spawns a blocker contained by `mode`, launched by `front`, whose identity re-read finds the pid
+/// holding another unique id (a reap and a reuse), so the child is `Gone`: its pid, once ended, and
+/// the warns the spawn logged.
+fn foreign_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation::front::Front>) -> (u32, Vec<String>) {
+    crate::log_capture::install();
+    let (mut cmd, _writer) = sync_blocker();
+    cmd.contain_with(mode);
+    cmd.set_elevation_front(front);
+    let pid = Rc::new(Cell::new(0));
+    let armed: Rc<RefCell<Option<uniq_fault::Forced>>> = Rc::default();
+    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        move || {
+            pid.set(fault::spawn_pid());
+            let other = other_unique_id(pid.get());
+            *armed.borrow_mut() = Some(uniq_fault::force_uniq_read_once(ReadPurpose::Running, other));
         }
     });
     let mark = crate::log_capture::mark();
@@ -232,17 +261,18 @@ fn refused_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     end_unsignalled_and_reap(pid.get());
-    let _ = outcome.expect_err("a refused re-read fails the spawn");
+    let _ = outcome.expect_err("a pid with another unique id fails the spawn");
     (pid.get(), crate::log_capture::warns_since(mark, ""))
 }
 
-/// A spawn whose identity re-read is refused leaves a session root unsignalled. macOS has no exact
-/// kill of its process group, so the one warn also says the group's members may be left running.
+/// A spawn whose identity re-read finds another process leaves a session root unsignalled. macOS has
+/// no exact kill of its process group, so the one warn also says the group's members may be left
+/// running.
 ///
 /// Mutant: the group's note is dropped.
 #[skuld::test]
 fn macos_sync_spawn_identity_failure_of_a_group_root_warns_that_its_members_may_be_left_running() {
-    let (pid, warns) = refused_reread_warns(crate::ContainMode::Session, None);
+    let (pid, warns) = foreign_reread_warns(crate::ContainMode::Session, None);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains(&format!(
@@ -261,7 +291,7 @@ fn notes_a_group(warns: &[String]) -> bool {
 /// made for any root.
 #[skuld::test]
 fn macos_sync_spawn_identity_failure_under_a_tree_walk_notes_no_group() {
-    let (_, warns) = refused_reread_warns(crate::ContainMode::TreeWalk, None);
+    let (_, warns) = foreign_reread_warns(crate::ContainMode::TreeWalk, None);
     assert!(!notes_a_group(&warns), "{warns:?}");
 }
 
@@ -280,7 +310,7 @@ fn macos_sync_spawn_identity_failure_of_a_nested_root_notes_no_group() {
         return;
     };
     std::env::set_var(crate::containment::NESTED_ENV, "1");
-    let (_, warns) = refused_reread_warns(crate::ContainMode::Session, None);
+    let (_, warns) = foreign_reread_warns(crate::ContainMode::Session, None);
     assert!(!notes_a_group(&warns), "{warns:?}");
 }
 
@@ -291,7 +321,7 @@ fn macos_sync_spawn_identity_failure_of_a_front_notes_no_group() {
     use crate::elevation::{Backend, ElevatedVia};
     let front = crate::elevation::front::front(Some(&ElevatedVia::Wrapped(Backend::Sudo)));
     assert!(front.is_some(), "sudo launches a front");
-    let (_, warns) = refused_reread_warns(crate::ContainMode::Session, front);
+    let (_, warns) = foreign_reread_warns(crate::ContainMode::Session, front);
     assert!(!notes_a_group(&warns), "{warns:?}");
 }
 
@@ -505,7 +535,7 @@ fn macos_fdmarker_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_marker_root(),
-        Some(child.id()),
+        child.id(),
         "the marker's root is the verified identity"
     );
 }
@@ -515,7 +545,7 @@ fn macos_fdmarker_attach_reads_nothing_by_pid() {
 /// [`teardown_after_attach_failure`](super::teardown_after_attach_failure) of `child`, as a spawn
 /// that read the current process's identity (a stand-in: the test cannot read a reaped child's).
 fn teardown(child: std::process::Child, unique: u64) -> crate::error::ChildFate {
-    super::teardown_after_attach_failure(child, unique, crate::identity::ProcessId::current())
+    super::teardown_after_attach_failure(child, unique, Some(crate::identity::ProcessId::current()))
 }
 
 /// A `std` blocker, its stdin writer, and its unique id.
@@ -889,7 +919,7 @@ fn macos_treewalk_attach_reads_nothing_by_pid() {
     );
     assert_eq!(
         child.test_treewalk_root(),
-        Some(child.id()),
+        child.id(),
         "the walk's root is the verified identity"
     );
 }

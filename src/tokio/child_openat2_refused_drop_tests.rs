@@ -23,7 +23,7 @@ fn a_seccomp_refused_openat2_makes_an_async_treewalk_drop_kill_the_root_and_warn
                     let (child, stdin) = crate::test_child::held_treewalk_blocker_async();
                     assert_eq!(child.containment(), crate::containment::Containment::TreeWalk);
                     let released = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
-                    let id = child.id();
+                    let id = child.id().expect(crate::test_child::IDENTITY_READ);
                     let sends = crate::send_log::Capture::start();
                     deny_openat2_on_this_thread(errno);
                     drop(child);

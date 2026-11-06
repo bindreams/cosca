@@ -965,6 +965,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::FailedRun,
+        child.pid(),
         child.id,
         || child.proc.state(),
         &child.tree_killed,
