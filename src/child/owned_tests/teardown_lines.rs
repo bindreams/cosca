@@ -13,8 +13,8 @@
 use std::io;
 
 use super::teardown::{child_with_an_unreadable_exit, exit, fake, id};
-pub(crate) use crate::child::owned::teardown::LEAVING_RUNNING;
 use crate::child::owned::teardown::{Disposition, TeardownOutcome};
+pub(crate) use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
 use crate::child::owned::OwnedChild;
 use crate::error::Error;
 use crate::os_process::child::Foreign;
@@ -23,14 +23,6 @@ use crate::signal::Sent;
 
 /// The pid of the child every row tears down.
 pub(crate) const PID: u32 = super::teardown::PID;
-
-/// Where a child goes that a caller leaves: a zombie once it exits on Unix, and on Windows, which
-/// has none, nothing that waits for it.
-pub(crate) const LEFT: &str = if cfg!(unix) {
-    "; left unreaped"
-} else {
-    "; nothing waits for it"
-};
 
 /// Where a child goes that a caller hands back.
 pub(crate) const HANDED_BACK: &str = "; handed back to the caller in the error";

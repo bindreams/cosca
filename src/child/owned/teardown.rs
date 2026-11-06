@@ -70,7 +70,7 @@ impl Disposition {
 
 /// What a child that a caller leaves is, after the semicolon. Unix: a zombie once it exits, until
 /// someone reaps it. Windows has no zombies: what is true is that nothing waits for it.
-const LEFT: &str = if cfg!(unix) {
+pub(crate) const LEFT: &str = if cfg!(unix) {
     "; left unreaped"
 } else {
     "; nothing waits for it"

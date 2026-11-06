@@ -977,10 +977,10 @@ impl CgroupLeaf {
                 // waiting on its drain. An occupant that migrated in after the first kill was
                 // never targeted, and on a kernel before 6.14 a process that forked while that
                 // kill was in flight could escape it (`cgroup: fix race between fork and
-                // cgroup.kill`, Linux 6.14) — either way, `drain_and_remove(false, ..)` re-runs
+                // cgroup.kill`, Linux 6.14) — either way, `drain_and_remove(None, ..)` re-runs
                 // `hard_kill()` first, exactly as the armed path's own kill-then-wait does.
                 self.drain_and_remove(
-                    false,
+                    None,
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
                     warn,
                 );
@@ -1023,7 +1023,7 @@ impl CgroupLeaf {
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(false, "after its handle's teardown", warn);
+            self.drain_and_remove(None, "after its handle's teardown", warn);
         }
     }
 }
@@ -1079,7 +1079,7 @@ impl CgroupLeaf {
     ///
     /// A child that exec'd outside the leaf is killed as the process group it leads first
     /// ([`kill_group_outside_leaf`]). Then, whatever the child, the leaf is killed through if the
-    /// child entered it, the child is torn down (a kill its pidfd refuses is reaped if the leaf's
+    /// child entered it (the write is retried once, before the child is looked at), the child is torn down (a kill its pidfd refuses is reaped if the leaf's
     /// kill reached it), and only then is the leaf removed: a child that entered but whose report
     /// the shut beat is still in the leaf until it is gone. A leaf whose id cannot be read places
     /// the child through `/proc`.
@@ -1167,15 +1167,17 @@ impl CgroupLeaf {
         Some(received)
     }
 
-    /// Kills through the leaf if the child entered it: whether the kill was delivered, `None` if
-    /// there was none to make.
-    fn kill_entered(&self) -> Option<bool> {
-        self.entered.then(|| self.hard_kill().is_ok())
+    /// Kills through the leaf if the child entered it, once more if the first write failed, as the
+    /// removal does for a kill not yet made: `None` if there was none to make, else what the last
+    /// write answered. It is made before anything looks at the child, so a look that asks whether
+    /// the kill landed ([`Subtree`]) reads the retry's answer, and the removal does not kill again.
+    fn kill_entered(&self) -> Option<Result<(), crate::error::Error>> {
+        self.entered.then(|| self.hard_kill().or_else(|_| self.hard_kill()))
     }
 
-    /// Removes the abandoned leaf: killed through, if `killed` says the kill was made, and
+    /// Removes the abandoned leaf: killed through, if `killed` holds the kill's answer, and
     /// otherwise holding nothing of the child's.
-    fn remove_abandoned(&mut self, killed: Option<bool>, warn: &mut dyn TeardownWarn) {
+    fn remove_abandoned(&mut self, killed: Option<Result<(), crate::error::Error>>, warn: &mut dyn TeardownWarn) {
         match killed {
             Some(killed) => self.remove_killing_through(killed, "after its spawn was abandoned", warn),
             None => self.remove_holding_nothing(),
@@ -1184,32 +1186,41 @@ impl CgroupLeaf {
 
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
-    /// says whether the caller's own kill through it succeeded; `context` says what removal this
+    /// is the answer of the caller's own kill through it; `context` says what removal this
     /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
-    fn remove_killing_through(&mut self, killed: bool, context: &str, warn: &mut dyn TeardownWarn) {
+    fn remove_killing_through(
+        &mut self,
+        killed: Result<(), crate::error::Error>,
+        context: &str,
+        warn: &mut dyn TeardownWarn,
+    ) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
-            Err(_) => self.drain_and_remove(killed, context, warn),
+            Err(_) => self.drain_and_remove(Some(killed), context, warn),
         }
     }
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf, waits however long the drain takes, with `warn`
+    /// Kills through the leaf unless `killed` holds the answer of a kill the caller made (a failed
+    /// one is reported), waits however long the drain takes, with `warn`
     /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the
     /// leaf's child cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and
     /// reported: after the drain and the sweep, an `EBUSY` means something another party did
     /// since ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never
     /// impossible.
-    fn drain_and_remove(&mut self, killed: bool, context: &str, warn: &mut dyn TeardownWarn) {
-        if !killed {
-            if let Err(e) = self.hard_kill() {
-                return warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
-                );
-            }
+    fn drain_and_remove(
+        &mut self,
+        killed: Option<Result<(), crate::error::Error>>,
+        context: &str,
+        warn: &mut dyn TeardownWarn,
+    ) {
+        if let Err(e) = killed.unwrap_or_else(|| self.hard_kill()) {
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
+            );
         }
         if let Err(e) = self.wait_drained_then_warn(warn) {
             return warn_leaf_left_behind(

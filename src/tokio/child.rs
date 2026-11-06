@@ -2189,14 +2189,16 @@ fn signal_on_drop(
                 return signals;
             }
             // Forgotten earlier and unproven: only a Linux backend's kept pidfd is signalled, and it
-            // refused. Not reaped, so the child may be running.
+            // refused. Not reaped, so the child may be running: tokio's `Child` was forgotten
+            // (`ProcSource::forget_quietly`), so its orphan queue never gets it, and nothing reaps it.
             if let Some(fate) = proc.forgotten_fate(Some(id)) {
                 debug_assert!(
                     matches!(fate, ChildFate::Running { .. }),
                     "only an unproven backend's signal fails"
                 );
                 signals.left.push(format!(
-                    "async child {pid} could not be terminated on drop; leaving it running"
+                    "async child {pid} could not be terminated on drop{}",
+                    crate::child::owned::teardown::LEAVING_RUNNING
                 ));
                 signals.fate = fate;
                 return signals;
@@ -2208,6 +2210,8 @@ fn signal_on_drop(
         }
         let looked = proc.try_wait();
         if !matches!(looked, Ok(Some(_))) {
+            // Still held by tokio's `Child`, which the release drops (`ProcSource::release`): its
+            // orphan queue reaps it once it exits.
             signals.left.push(format!(
                 "async child {pid} could not be terminated on drop; leaving it running"
             ));
