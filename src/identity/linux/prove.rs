@@ -12,7 +12,6 @@ use rustix::process::{Pid, PidfdFlags};
 use super::kernel::{Kernel, PIDFD_THREAD};
 use crate::identity::RawPid;
 
-/// Which call failed.
 #[derive(Debug, Clone, Copy)]
 enum Call {
     PidfdOpen,

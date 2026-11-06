@@ -4,8 +4,7 @@
 //! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
 //! classification is documented once, on [`Error::Unsupported`]. [`open_verified_with`] keeps a
 //! failed pidfd call apart from the errors it has finished ([`OpenFailure`]), so each consumer builds
-//! its error from the call and its errno: [`open_verified_error_with`] for
-//! [`Process::open`](crate::Process::open), the tree walk's by-identity kill for the walk's own.
+//! its error from the call and its errno.
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
@@ -23,6 +22,7 @@ use crate::error::Error;
 use crate::identity::{
     Existence, FailedCall, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, ViewUnreadable,
 };
+use crate::os_process::poll::{look_readable, PollFailure};
 use crate::os_process::OPEN_CONSEQUENCE;
 
 /// The operation an `Unsupported` open names.
@@ -104,33 +104,29 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
         Proof::Holds {
             fd,
             thread: Some(errno),
-        } => match crate::os_process::poll::is_readable(fd.as_fd()) {
+        } => match look_readable(fd.as_fd()) {
             Ok(true) => Ok(None),
             Ok(false) => Err(OpenFailure::Finished(Error::NotThreadGroupLeader {
                 pid: id.pid(),
                 detail: OPEN_CONSEQUENCE.into(),
                 source: std::io::Error::from(errno),
             })),
-            // A `poll` that failed with an errno is a failed call; `POLLERR` and `POLLNVAL` have none.
-            Err(e) => Err(match e.raw_os_error() {
-                Some(raw) => OpenFailure::Call(FailedCall::poll(rustix::io::Errno::from_raw_os_error(raw))),
-                None => OpenFailure::Finished(Error::Io(crate::error::io_context("poll", e))),
-            }),
+            Err(PollFailure::Call(errno)) => Err(OpenFailure::Call(FailedCall::poll(errno))),
+            // `POLLERR` and `POLLNVAL` carry no errno.
+            Err(PollFailure::Revents(e)) => Err(OpenFailure::Finished(Error::Io(crate::error::io_context("poll", e)))),
         },
         Proof::Lost => Ok(None),
         Proof::Unknown(call) => Err(OpenFailure::Call(call)),
     }
 }
 
-/// The error for a pidfd call that failed for a reason that says nothing about the target: a
-/// refused `pidfd_open` is [`Error::Unsupported`], anything else [`Error::Io`] prefixed with the
-/// call's name.
+/// A failed pidfd call as the error [`Process::open`](crate::Process::open) returns; see
+/// [`io_or_unsupported`].
 pub(crate) fn open_error(call: FailedCall) -> Error {
     io_or_unsupported(OP_NAME, call)
 }
 
-/// `call` as [`Error::Unsupported`] naming `op` when [`FailedCall::refusal`] says it was refused,
-/// else [`Error::Io`] prefixed with the call's name. The classification is documented on
+/// `call` as [`Error::Unsupported`] naming `op` if refused, else `Io`. Classification: see
 /// [`Error::Unsupported`].
 fn io_or_unsupported(op: &str, call: FailedCall) -> Error {
     match call.refusal() {

@@ -101,6 +101,25 @@ fn a_thread_that_has_exited_is_none() {
     assert!(matches!(open_verified_error_with(&kernel, id(100)), Ok(None)));
 }
 
+/// A `poll` of a `PIDFD_THREAD` pidfd that reports `POLLERR` has no errno to carry: it is `Io`
+/// naming `poll`, not a thread that leads no group and not gone. A pipe's write end with no reader
+/// reports `POLLERR`. The `poll` that fails with an errno cannot be stated: the kernel's rows answer
+/// the opens and the inode read, and the `poll` is of the descriptor they return.
+#[skuld::test]
+fn a_poll_that_reports_pollerr_is_io_naming_poll() {
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    let kernel = FakeKernel::new()
+        .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(Errno::INVAL))
+        .on_pidfd_open_flags(PID, THREAD, Ok(writer.into()))
+        .on_pidfs_ino(PID, Ok(Some(100)));
+    let result = open_verified_error_with(&kernel, id(100));
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.to_string().starts_with("poll: ")),
+        "{result:?}"
+    );
+}
+
 /// A refusal is `Unsupported`; anything else the open fails with stays `Io`. The group's resend
 /// reaches neither (it is `Reached::Unknown` for both) and does not fall back to a send by number.
 #[skuld::test]

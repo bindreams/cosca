@@ -98,8 +98,10 @@ pub(crate) enum KillOutcome {
     /// The pid holds no process, or holds a different one - nothing to kill.
     AlreadyGone,
     /// A live-or-unassessable process we did not signal, with why: [`Error::Unassessable`] when its
-    /// identity could not be read at kill time, [`Error::Io`] with the OS error when the OS refused
-    /// the signal. The only outcome that can leave a process running. It warns of nothing: the caller
+    /// identity could not be read at kill time, [`Error::Unsupported`] when the OS refuses the pidfd
+    /// it is read through, [`Error::Io`] with the OS error when the OS refused the signal. On Linux
+    /// any other error the proof of the pidfd finished with is wrapped as `Unassessable`, so an `Io`
+    /// here is always the OS's answer to the signal. The only outcome that can leave a process running. It warns of nothing: the caller
     /// that reports the outcome ([`hard_kill`]) or cannot ([`warn_if_not_attempted`]) says it.
     NotAttempted(Error),
 }
@@ -411,7 +413,21 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
         Err(OpenFailure::Call(call)) => {
             KillOutcome::NotAttempted(crate::identity::call_error(&format!("pid {}", id.pid()), call))
         }
-        Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(error),
+        Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(match error {
+            error @ (Error::Unassessable { .. } | Error::Unsupported { .. }) => error,
+            other => unproved(id.pid(), other),
+        }),
+    }
+}
+
+/// `error`, which the open of `pid`'s pidfd finished with and which is no refusal of a signal (a
+/// live thread that leads no group, a `poll` that reported `POLLERR`), as [`Error::Unassessable`]
+/// with `error` as its source.
+#[cfg(target_os = "linux")]
+fn unproved(pid: RawPid, error: Error) -> Error {
+    Error::Unassessable {
+        detail: format!("pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {error}"),
+        source: Some(std::io::Error::other(error)),
     }
 }
 

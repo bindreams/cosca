@@ -726,17 +726,26 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
             .on_pidfd_open(PID, Ok(reader.into()))
             .on_pidfs_ino(PID, Err(errno))
     };
+    // A refusal is `Unsupported`; every other failure is `Unassessable` carrying the raw errno.
     let kernels = [
-        ("EPERM", FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM))),
-        ("ENOSYS", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NOSYS))),
-        ("EACCES", FakeKernel::new().on_pidfd_open(PID, Err(Errno::ACCESS))),
-        ("ENODEV", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NODEV))),
-        ("EMFILE", FakeKernel::new().on_pidfd_open(PID, Err(Errno::MFILE))),
-        ("EBADF from pidfs_ino", from_pidfs_ino(Errno::BADF)),
-        ("EPERM from pidfs_ino", from_pidfs_ino(Errno::PERM)),
-        ("ENOSYS from pidfs_ino", from_pidfs_ino(Errno::NOSYS)),
+        ("EPERM", FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM)), None),
+        ("ENOSYS", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NOSYS)), None),
+        ("EACCES", FakeKernel::new().on_pidfd_open(PID, Err(Errno::ACCESS)), None),
+        ("ENODEV", FakeKernel::new().on_pidfd_open(PID, Err(Errno::NODEV)), None),
+        (
+            "EMFILE",
+            FakeKernel::new().on_pidfd_open(PID, Err(Errno::MFILE)),
+            Some(Errno::MFILE),
+        ),
+        ("EBADF from pidfs_ino", from_pidfs_ino(Errno::BADF), Some(Errno::BADF)),
+        ("EPERM from pidfs_ino", from_pidfs_ino(Errno::PERM), Some(Errno::PERM)),
+        (
+            "ENOSYS from pidfs_ino",
+            from_pidfs_ino(Errno::NOSYS),
+            Some(Errno::NOSYS),
+        ),
     ];
-    for (row, kernel) in kernels {
+    for (row, kernel, errno) in kernels {
         let (_, cause) = ProcessId::of_with(&kernel, PID);
         let walk = crate::identity::unqueryable(&format!("pid {PID}"), cause);
         let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
@@ -744,7 +753,66 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
             panic!("{row}: expected NotAttempted, got {outcome:?}");
         };
         assert_eq!(format!("{kill:?}"), format!("{walk:?}"), "{row}");
+        match (errno, &kill) {
+            (None, Error::Unsupported { .. }) => {}
+            (Some(errno), Error::Unassessable { source, .. }) => assert_eq!(
+                source.as_ref().and_then(std::io::Error::raw_os_error),
+                Some(errno.raw_os_error()),
+                "{row}"
+            ),
+            (_, other) => panic!("{row}: wrong shape: {other:?}"),
+        }
     }
+}
+
+/// What the kill of a member leaves, when the open finished with an error that is no OS refusal of
+/// the signal: `Unassessable` naming the pid and that its pidfd could not be proved to name it, the
+/// finished error as the source. Neither a live thread nor a `poll` that reported `POLLERR` is a
+/// refusal. Mutant: "a finished open error is the kill's own error".
+#[track_caller]
+fn assert_unproved(row: &str, outcome: super::KillOutcome, pid: u32) {
+    let super::KillOutcome::NotAttempted(Error::Unassessable { detail, source }) = outcome else {
+        panic!("{row}: expected NotAttempted(Unassessable), got {outcome:?}");
+    };
+    assert!(
+        detail.contains(&format!("pid {pid}")) && detail.contains("its pidfd could not be proved to name it"),
+        "{row}: {detail}"
+    );
+    assert!(source.is_some(), "{row}: the finished error is the source");
+}
+
+#[skuld::test]
+fn the_kill_of_a_live_thread_that_leads_no_group_is_unassessable_not_a_refusal() {
+    use rustix::io::Errno;
+    use rustix::process::PidfdFlags;
+    const PID: u32 = 4242;
+    // The writer keeps the stand-in from polling readable: the thread is live.
+    let (reader, _writer) = std::io::pipe().expect("a pipe");
+    let kernel = FakeKernel::new()
+        .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(Errno::INVAL))
+        .on_pidfd_open_flags(PID, crate::identity::PIDFD_THREAD, Ok(reader.into()))
+        .on_pidfs_ino(PID, Ok(Some(100)));
+    let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
+    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert_unproved("live thread", outcome, PID);
+}
+
+/// `POLLERR` has no errno: a pipe's write end with no reader reports it. Mutant: "a finished open
+/// error is the kill's own error".
+#[skuld::test]
+fn the_kill_of_a_member_whose_poll_reports_pollerr_is_unassessable_not_a_refusal() {
+    use rustix::io::Errno;
+    use rustix::process::PidfdFlags;
+    const PID: u32 = 4242;
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    let kernel = FakeKernel::new()
+        .on_pidfd_open_flags(PID, PidfdFlags::empty(), Err(Errno::INVAL))
+        .on_pidfd_open_flags(PID, crate::identity::PIDFD_THREAD, Ok(writer.into()))
+        .on_pidfs_ino(PID, Ok(Some(100)));
+    let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
+    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert_unproved("POLLERR", outcome, PID);
 }
 
 /// A failed inode read says it is the inode read that failed, not `pidfd_open`, and keeps its errno,
