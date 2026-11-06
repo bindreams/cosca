@@ -2776,16 +2776,6 @@ fn an_abandoned_spawns_failed_leaf_kill_is_warned_when_the_removal_succeeds() {
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
-/// The warns on the calling thread since `mark`.
-#[cfg(target_os = "linux")]
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
-}
-
 /// An abandoned elevation front's teardown warns (the leaf's failed kill did not reach it), and
 /// that one warn carries the failed kill, which is known when the kill is made. The `rmdir`
 /// succeeds.
@@ -2821,7 +2811,7 @@ fn an_abandoned_fronts_failed_leaf_kill_is_in_the_warn_of_its_teardown() {
         crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
     );
     assert!(!leaf_path.exists(), "the leaf is removed");
-    let warns = warns_since(mark);
+    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
     assert_eq!(warns.len(), 1, "one warn: {warns:?}");
     assert!(
         warns[0].contains("cgroup.kill failed"),

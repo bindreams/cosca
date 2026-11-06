@@ -171,7 +171,7 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
         // A failed kill leaves the handle armed to try again: the look at the tree when it drops is the
-        // armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+        // armed drop's first act, whatever it then logs. No tree kill is made early over an unvouched tree.
         assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
         let cause = cause.to_string();
         assert_eq!(
@@ -196,14 +196,14 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
 }
 
 /// A failed spawn's cleanup that hands the root back (its exit was not collected) over a walk that
-/// left only the root: an unvouched tree is not a failed kill, so the cleanup does not retry it, says
-/// once that the tree could not be vouched for, and the handle is disarmed.
+/// left only the root: an unvouched tree is not a failed kill, so the cleanup makes no early tree
+/// kill over it, says once that the tree could not be vouched for, and the handle is disarmed.
 ///
-/// Mutants: the cleanup kills again over an unvouched tree and reports it failed too; the warn
-/// is not said, or said again by the drop.
+/// Mutants: the cleanup makes the drop's tree kill early over an unvouched tree and reports it
+/// made early or failed too; the warn is not said, or said again by the drop.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back() {
+fn finish_elevated_makes_no_early_tree_kill_over_an_unvouched_tree_when_it_hands_the_root_back() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -220,7 +220,10 @@ fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back(
 
     let cause = cause.to_string();
     assert!(cause.contains("could not be vouched for"), "{cause}");
-    assert!(!cause.contains("retry"), "{cause}");
+    assert!(
+        !cause.contains("made early") && !cause.contains("failed too"),
+        "{cause}"
+    );
     assert!(!drop_looks.seen(), "the handle is disarmed");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
     let warns = warns_since(mark);
@@ -229,21 +232,26 @@ fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back(
         .filter(|warn| warn.contains("could not be vouched for"))
         .count();
     assert_eq!(unvouched, 1, "{warns:?}");
-    assert!(warns.iter().all(|warn| !warn.contains("retry")), "{warns:?}");
+    assert!(
+        warns
+            .iter()
+            .all(|warn| !warn.contains("made early") && !warn.contains("failed too")),
+        "{warns:?}"
+    );
     handed_back.wait();
 }
 
 /// A failed spawn's cleanup whose first tree kill left the root running (its own kill of the root was
-/// refused) and whose root was reaped by someone else before the retry: the retry finds no root to
-/// walk, and the one report says what the first walk found, that it saw the root running, not that
-/// "something" was left. The handle is disarmed (the root is handed back).
+/// refused) and whose root was reaped by someone else before the drop's tree kill, made early: that
+/// kill finds no root to walk, and the one report says what the first walk found, that it saw the
+/// root running, not that "something" was left. The handle is disarmed (the root is handed back).
 ///
 /// Mutants: the kind of the unvouched tree is not the latest fact (the root seen running), so the
-/// retry's text names an earlier kill's leftovers instead; the handle stays armed, so its drop says
-/// it again.
+/// early tree kill's text names an earlier kill's leftovers instead; the handle stays armed, so its
+/// drop says it again.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_finds_it_gone() {
+fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree_kill_finds_it_gone() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -253,7 +261,7 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
         f.signals([refused()])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
-    // The first walk killed the root: someone else reaps it before the retry, which finds no root.
+    // The first walk killed the root: someone else reaps it before the early tree kill, which finds no root.
     let pid = child.id().pid();
     let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         crate::test_child::wait_until_zombie(pid);
@@ -290,16 +298,16 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
 }
 
 /// A failed spawn's cleanup whose first tree kill left a member that refuses the kill, whose root
-/// kill ended the root without collecting its exit (so it is handed back and the kill is retried), and
-/// whose retry finds the member gone but its walk leaves the root, whose own end the cleanup saw: the
-/// retry ends unvouched, not failed. The cleanup's one report says what the first attempt left and
-/// that the retry could not vouch for the tree. Needs the `setuid` group: the member is a setuid-root
-/// helper.
+/// kill ended the root without collecting its exit (so it is handed back and the drop's tree kill is
+/// made early), and whose early tree kill finds the member gone but its walk leaves the root, whose
+/// own end the cleanup saw: the early tree kill ends unvouched, not failed. The cleanup's one report
+/// says what the first attempt left and that the early tree kill could not vouch for the tree. Needs
+/// the `setuid` group: the member is a setuid-root helper.
 ///
-/// Mutant: a retry that ends unvouched is dropped from the report (as a skipped one is).
+/// Mutant: an early tree kill that ends unvouched is dropped from the report (as a skipped one is).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_the_first_kill(
+fn finish_elevated_reports_an_early_tree_kill_that_ends_unvouched_after_a_member_refused_the_first_kill(
     #[fixture(setuid)] _group: &Group,
 ) {
     use crate::containment::treewalk::fault::{force_incomplete_once, LeftBehind};
@@ -320,7 +328,7 @@ fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_th
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
     // The first walk killed the root and was refused by the member. Let the member exit, and wait until
-    // nothing names it, and make the retry's walk leave the root, before the retry.
+    // nothing names it, and make the early tree kill's walk leave the root, before that kill.
     let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         drop(writer);
         while std::path::Path::new(&format!("/proc/{member}")).exists() {

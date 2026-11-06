@@ -421,11 +421,11 @@ impl Child {
 
     /// A drop's end for an elevation front it cannot be sure its cgroup kill reached: its leaf is
     /// torn down (killed through unless a kill was made, whose failure is final; drained; removed),
-    /// and then the front is looked at through [`look_at_front`](OwnedChild::look_at_front), which waits for it only if
-    /// its place says the kill reached it. A front is never killed through [`tear_down`](OwnedChild::tear_down):
-    /// that would orphan its program. The leaf's subtree is captured while the leaf exists, since
-    /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
-    /// with `why` and `disposition`.
+    /// and then the front is looked at through [`look_at_front`](OwnedChild::look_at_front), which
+    /// waits for it only if its place says the kill reached it. A front is never killed through
+    /// [`tear_down`](OwnedChild::tear_down): that would orphan its program. The leaf's subtree is
+    /// captured while the leaf exists, since it places the front once the leaf is gone. How the
+    /// look went is worded by [`word_front`], with `why` and `disposition`.
     #[cfg(unix)]
     fn tear_down_leaf_and_look_at_front(
         &mut self,
