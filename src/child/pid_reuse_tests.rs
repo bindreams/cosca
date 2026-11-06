@@ -95,7 +95,10 @@ fn treewalk_root_is_the_verified_identity_body() {
         Some(child.id()),
         "the walk's root must be the verified identity, not whoever holds the pid now"
     );
-    child.kill_tree().expect("a tree whose root was reaped answers Ok");
+    let err = child
+        .kill_tree()
+        .expect_err("a never-settled tree whose root was reaped is not assessable");
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
         sigusr1_and_wait(stranger),
         Some(libc::SIGUSR1),
