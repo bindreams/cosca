@@ -782,8 +782,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
-                #[cfg(not(target_os = "linux"))]
-                pid,
             );
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
@@ -844,6 +842,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // failure arms tear down by.
     let id_read = id.as_ref().ok().copied();
     let attachment = match attach_or_fault(
+        #[cfg(unix)]
         pid,
         id,
         #[cfg(target_os = "linux")]
@@ -859,6 +858,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
+                if id_read.is_some() {
+                    assert_attach_cannot_fail(&error);
+                }
                 if front.is_some() {
                     (
                         Some(leave_front_after_attach_failure(child)),
@@ -2371,11 +2373,7 @@ pub(crate) fn resolve_identity_unchecked(
 /// (`id` is the read's error, which a containment that needs the identity fails with), with a
 /// test-only seam to force its failure.
 pub(crate) fn attach_or_fault(
-    #[cfg_attr(
-        not(any(test, unix)),
-        expect(unused_variables, reason = "only the Unix attach and the test seam read it")
-    )]
-    pid: u32,
+    #[cfg(unix)] pid: u32,
     id: Result<ProcessId, Error>,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
@@ -2386,16 +2384,13 @@ pub(crate) fn attach_or_fault(
         // Capture identity for the test to check what became of the child, then simulate an attach
         // failure so `spawn` takes the attach-error arm. The caller still holds the child, so the
         // verdict is taken before `prepared` drops, as a real attach takes it.
-        fault::capture(match &id {
-            Ok(id) => crate::identity::Resolved::Found(*id),
-            Err(_) => ProcessId::of(pid),
-        });
+        if let Ok(id) = &id {
+            fault::capture(crate::identity::Resolved::Found(*id));
+        }
         let mut prepared = prepared;
         prepared.settle_verdict(
             #[cfg(target_os = "linux")]
             child,
-            #[cfg(not(target_os = "linux"))]
-            pid,
         );
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
@@ -2409,8 +2404,6 @@ pub(crate) fn attach_or_fault(
         prepared.settle_verdict(
             #[cfg(target_os = "linux")]
             child,
-            #[cfg(not(target_os = "linux"))]
-            pid,
         );
         return Ok(attachment);
     }
@@ -2574,13 +2567,10 @@ fn note_front(
 pub(crate) fn settle_before_teardown(
     prepared: &mut crate::containment::Prepared,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
-    #[cfg(not(target_os = "linux"))] pid: u32,
 ) {
     prepared.settle_verdict(
         #[cfg(target_os = "linux")]
         child,
-        #[cfg(not(target_os = "linux"))]
-        pid,
     );
 }
 
@@ -2810,6 +2800,7 @@ pub(crate) mod fault {
         FORCE_VANISH.with(|f| f.set(on));
     }
     /// As [`set_force_identity_vanished`], but the identity read is refused (`Unknown`).
+    #[cfg(unix)]
     pub(crate) fn set_force_identity_unknown(on: bool) {
         FORCE_UNKNOWN.with(|f| f.set(on));
     }

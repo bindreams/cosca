@@ -578,7 +578,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     if let Some(not_adopted) = not_adopted {
         #[cfg(test)]
         crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
-        prepared.settle_verdict(pid);
+        prepared.settle_verdict();
         use crate::child::spawn::unique_report::Unadoptable;
         let error = not_adopted.error;
         let left = crate::child::spawn::FrontFate::LeftUnreaped;
@@ -673,8 +673,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
-                #[cfg(not(target_os = "linux"))]
-                pid,
             );
             // An elevation front is sent nothing (see `ProcSource::leave_front`). Its containment
             // goes first: a cgroup leaf's drop kills it, so the teardown waits for a contained front
@@ -730,6 +728,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // failure arms tear down by.
     let id_read = id.as_ref().ok().copied();
     let attach = crate::child::spawn::attach_or_fault(
+        #[cfg(unix)]
         pid,
         id,
         #[cfg(target_os = "linux")]
@@ -741,6 +740,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     let attachment = match attach {
         Ok(v) => v,
         Err(error) => {
+            #[cfg(target_os = "macos")]
+            if id_read.is_some() {
+                crate::child::spawn::assert_attach_cannot_fail(&error);
+            }
             #[cfg(unix)]
             if let Some(front) = front {
                 // macOS: a front is sent nothing and left unreaped, as the sync spawn leaves it.

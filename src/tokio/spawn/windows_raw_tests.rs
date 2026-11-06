@@ -175,24 +175,6 @@ async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
 
-/// The async twin of `a_raw_spawn_whose_identity_is_unreadable_keeps_its_child`.
-#[cfg(windows)]
-#[skuld::test]
-async fn an_async_raw_spawn_whose_identity_is_unreadable_keeps_its_child() {
-    crate::tokio::test_runtime::assert_current_thread();
-    use crate::child::spawn::fault;
-    let (mut c, _teardown) = raw_blocker();
-    fault::set_force_identity_unknown(true);
-    let spawned = c.spawn();
-    fault::set_force_identity_unknown(false);
-    let mut child = spawned.expect("an unreadable identity keeps the child");
-    assert_eq!(child.id(), None);
-    assert_eq!(child.try_wait().expect("try_wait"), None, "the child is still running");
-    child.kill().expect("a kept child is killed through its handle");
-    let status = child.wait().await.expect("a kept child is waited on");
-    assert!(!status.success(), "the kill ended the child: {status:?}");
-}
-
 /// The async twin of `a_raw_spawn_whose_attach_fails_tears_its_child_down`.
 #[cfg(windows)]
 #[skuld::test]

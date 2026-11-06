@@ -79,19 +79,13 @@ impl Prepared {
     /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
     /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
     /// tree either way.
-    pub(crate) fn settle_verdict(
-        &mut self,
-        #[cfg(target_os = "linux")] child: ChildHandle<'_>,
-        #[cfg(not(target_os = "linux"))] pid: u32,
-    ) {
+    pub(crate) fn settle_verdict(&mut self, #[cfg(target_os = "linux")] child: ChildHandle<'_>) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
             if let Err(e) = leaf.take_placement(child) {
                 log::debug!("cgroup v2: a failed spawn's child is not placed in its leaf: {e}");
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = pid;
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group

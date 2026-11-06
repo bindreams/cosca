@@ -108,7 +108,6 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
             cmd.stdout(crate::stdio::Stdio::from_file(out)).expect("set stdout");
             let spawned = cmd.spawn().map(drop);
             fault::set_force_attach_failure(false);
-            fault::set_force_identity_unknown(false);
             (spawned, blocker.map(|blocker| blocker.recorded()).unwrap_or_default())
         },
         || tracer_rx.recv().expect("the tracer seized the child"),

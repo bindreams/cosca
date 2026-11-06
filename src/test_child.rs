@@ -265,7 +265,7 @@ pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate:
 #[cfg(windows)]
 pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::identity::ProcessId) {
     let (child, stdin) = held_contained_blocker(crate::Stdio::null());
-    let id = child.id().expect("the spawn read the blocker's identity");
+    let id = child.id().expect(IDENTITY_READ);
     (child, stdin, id)
 }
 

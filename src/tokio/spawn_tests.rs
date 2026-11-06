@@ -59,6 +59,7 @@ async fn identity_failure_reaps_the_spawned_child() {
 ///
 /// Mutants: the arm still tears the child down and fails the spawn; the kept child's pid is not the
 /// spawned one; its kill or wait is unusable.
+#[cfg(unix)]
 #[skuld::test]
 async fn an_unreadable_identity_keeps_the_async_child_without_one() {
     fault::set_force_identity_unknown(true);
@@ -110,7 +111,7 @@ async fn a_kept_async_child_without_an_identity_is_killed_and_reaped_on_drop() {
 /// the async spawn with the read's own error, and the child is killed and reaped.
 ///
 /// Mutants: the spawn succeeds with a tree walk that has no root; the arm leaves the child running.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[skuld::test]
 async fn an_unreadable_identity_fails_an_async_tree_walk_spawn_and_reaps_the_child() {
     fault::set_force_identity_unknown(true);

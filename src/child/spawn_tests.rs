@@ -105,7 +105,7 @@ fn identity_failure_reaps_the_spawned_child() {
 /// child is killed and reaped: a refusal says nothing against the child.
 ///
 /// Mutants: the spawn succeeds with a tree walk that has no root; the arm leaves the child running.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[skuld::test]
 fn an_unreadable_identity_fails_a_tree_walk_spawn_and_reaps_the_child() {
     let (mut cmd, teardown) = teardown_blocker();
@@ -130,6 +130,7 @@ fn an_unreadable_identity_fails_a_tree_walk_spawn_and_reaps_the_child() {
 ///
 /// Mutants: the arm still tears the child down and fails the spawn; the kept child's pid is not the
 /// spawned one; its kill or wait is unusable.
+#[cfg(unix)]
 #[skuld::test]
 fn an_unreadable_identity_keeps_the_child_without_one() {
     let (mut cmd, _teardown) = teardown_blocker();
@@ -158,6 +159,7 @@ fn an_unreadable_identity_keeps_the_child_without_one() {
 /// A kept child with no identity is torn down by its drop like any other: killed and reaped.
 ///
 /// Mutants: the drop of a child with no identity kills nothing; it panics for want of an identity.
+#[cfg(unix)]
 #[skuld::test]
 fn a_kept_child_without_an_identity_is_killed_and_reaped_on_drop() {
     let (mut cmd, teardown) = teardown_blocker();

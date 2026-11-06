@@ -344,7 +344,7 @@ pub(crate) fn spawn_raw(
         }
     };
     let id_read = id.as_ref().ok().copied();
-    let attachment = match attach_or_fault(pid, id, raw_handle, prepared) {
+    let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
             let fate = raw_spawn_teardown(proc, pid, id_read);
