@@ -61,9 +61,8 @@ impl WindowsProcess {
     }
 
     /// The child `pid` that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned,
-    /// with the access that handle was granted ([`uac_access`]).
-    pub(crate) fn for_uac(handle: OwnedHandle, pid: u32) -> Self {
-        let granted = uac_access(HANDLE(handle.as_raw_handle()));
+    /// with the access that handle was granted (read once, by [`uac_access`]).
+    pub(crate) fn for_uac(handle: OwnedHandle, pid: u32, granted: PROCESS_ACCESS_RIGHTS) -> Self {
         Self { pid, handle, granted }
     }
 
@@ -76,17 +75,29 @@ impl WindowsProcess {
     }
 }
 
-/// The access the process handle `ShellExecuteEx` returned was granted, read from the handle once.
-/// One whose access cannot be read is taken to hold `SYNCHRONIZE` (a UAC child's handle is waited on)
-/// and no more, so a refused kill of it is a refusal of permission.
+/// The access the process handle `ShellExecuteEx` returned was granted, read from the handle once,
+/// where it is handed over: the kill, the wait and the spawn all take it from there.
 pub(crate) fn uac_access(handle: HANDLE) -> PROCESS_ACCESS_RIGHTS {
-    match windows_granted_access(handle) {
+    access_of_uac_read(windows_granted_access(handle))
+}
+
+/// What a UAC handle is taken to be granted, from the result of reading its access. A handle holds
+/// `SYNCHRONIZE`: a look and a wait on it depend on that, so one that does not breaks the contract.
+/// One whose access cannot be read is taken to hold `SYNCHRONIZE` and no more, so a refused kill of
+/// it is a refusal of permission ([`KillRefusal::Permission`]).
+pub(crate) fn access_of_uac_read(read: Result<u32, impl std::fmt::Display>) -> PROCESS_ACCESS_RIGHTS {
+    let granted = match read {
         Ok(access) => PROCESS_ACCESS_RIGHTS(access),
         Err(e) => {
-            log::debug!("wait: the access granted to an elevated child's handle could not be read ({e})");
+            log::debug!("uac_access: the access granted to an elevated child's handle could not be read ({e})");
             PROCESS_SYNCHRONIZE
         }
+    };
+    if granted.0 & PROCESS_SYNCHRONIZE.0 == 0 {
+        log::warn!("uac_access: an elevated child's handle was not granted SYNCHRONIZE; it cannot be waited on");
+        debug_assert!(false, "an elevated child's handle holds SYNCHRONIZE");
     }
+    granted
 }
 
 fn close(handle: HANDLE) {

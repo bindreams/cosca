@@ -61,7 +61,8 @@ pub(crate) fn tear_down_held(
         due,
     } = how;
     let pid = child.pid();
-    // Nothing here states what became of the held child's handle, so a wait on it may fail.
+    // Nothing here states what became of the held child's handle, so a wait on it may fail: only the
+    // uncollected-after-wait check is waived, not what a kill may be refused for.
     if front.is_none() {
         let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, due, why);
         return (error, fate, unreaped);

@@ -23,7 +23,7 @@ use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
-use crate::os_process::windows::WindowsProcess;
+use crate::os_process::windows::{uac_access, WindowsProcess};
 use crate::test_spawn::console_flags::NO_WINDOW;
 use crate::wait::teardown_warn::Due;
 
@@ -120,9 +120,16 @@ fn real(handle: OwnedHandle, pid: u32) -> FakeProcess {
     FakeProcess::over(Box::new(WindowsProcess::for_child(handle, pid)))
 }
 
-/// [`real`] for a handle a UAC elevation returned: it allows what it was granted.
+/// A [`WindowsProcess`] over a handle a UAC elevation returned, which allows what it was granted:
+/// the access is read from `handle`, as the launch reads it.
+fn uac_process(handle: OwnedHandle, pid: u32) -> WindowsProcess {
+    let granted = uac_access(HANDLE(handle.as_raw_handle()));
+    WindowsProcess::for_uac(handle, pid, granted)
+}
+
+/// [`real`] for a handle a UAC elevation returned.
 fn uac(handle: OwnedHandle, pid: u32) -> FakeProcess {
-    FakeProcess::over(Box::new(WindowsProcess::for_uac(handle, pid)))
+    FakeProcess::over(Box::new(uac_process(handle, pid)))
 }
 
 /// An [`OwnedChild`] over `fake`, and `fake` for the test to read what it was asked.
@@ -378,12 +385,12 @@ fn each_windows_handle_kind_states_what_its_kill_may_be_refused_for() {
         KillRefusal::Never
     );
     assert_eq!(
-        kind(WindowsProcess::for_uac(owner.duplicate(), owner.pid)),
+        kind(uac_process(owner.duplicate(), owner.pid)),
         KillRefusal::Never,
         "a UAC handle granted PROCESS_TERMINATE"
     );
     assert_eq!(
-        kind(WindowsProcess::for_uac(owner.without_terminate_right(), owner.pid)),
+        kind(uac_process(owner.without_terminate_right(), owner.pid)),
         KillRefusal::Permission,
         "a UAC handle that was not"
     );
@@ -491,10 +498,7 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_hands_the_child_back() {
     let id = owner.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let child = OwnedChild::new(Box::new(WindowsProcess::for_uac(
-        owner.without_terminate_right(),
-        owner.pid,
-    )));
+    let child = OwnedChild::new(Box::new(uac_process(owner.without_terminate_right(), owner.pid)));
 
     let (fate, unreaped) = after_a_failed_spawn(child, Some(id), Past::Clean, Disposition::HandBack, None);
 

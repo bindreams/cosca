@@ -396,7 +396,7 @@ fn callers() -> Vec<(&'static str, Say)> {
     callers.push((TeardownCaller::FailedSpawn.label(), |torn| {
         use crate::child::owned::teardown::{Expect, HandleTeardown, Past};
         use crate::os_process::child::KillRefusal;
-        // Any outcome of the table stands: a look on the handle failed.
+        // A look on the handle failed, so only the wait check is waived; the refusal is the handle's.
         let expect = Expect {
             refusal: KillRefusal::Permission,
             past: Past::WaitMayFail,

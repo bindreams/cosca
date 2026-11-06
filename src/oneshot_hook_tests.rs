@@ -57,8 +57,8 @@ fn a_guard_dropping_after_a_foreign_rearm_leaves_the_foreign_hook() {
 
 /// A guard whose hook fired is satisfied, and a later arming does not unsatisfy it.
 ///
-/// Mutant: `assert_fired` reads the slot without the guard's generation, so a foreign hook armed
-/// after the fire makes the fired guard panic.
+/// Mutant: `assert_fired` reads the slot, not the guard's own flag, so a foreign hook armed after
+/// the fire makes the fired guard panic.
 #[skuld::test]
 fn assert_fired_is_satisfied_by_a_hook_that_fired() {
     let first = arm(&HOOK, || {});
@@ -71,8 +71,8 @@ fn assert_fired_is_satisfied_by_a_hook_that_fired() {
 /// A hook that left the slot without firing (replaced by an arming over it) is not fired, and a
 /// later hook's fire does not make it so.
 ///
-/// Mutant: `assert_fired` reads whether the guard's generation is still in the slot, so a hook that
-/// left it any other way passes.
+/// Mutant: `assert_fired` reads whether the guard's hook is still in the slot, so a hook that left
+/// it any other way passes.
 #[cfg(debug_assertions)]
 #[skuld::test]
 #[should_panic(expected = "never fired")]
