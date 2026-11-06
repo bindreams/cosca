@@ -528,6 +528,8 @@ jobs:
       # labelled `cgroup` explicitly, which keep in this lane what the old `test(/cgroup/)` name filter selected;
       # most use fake leaves and also run in the main lanes) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
       # CI runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
+      # A test that is also in the `setuid` group needs a caller that is not root, so this root run leaves
+      # it out (`!setuid`); "Run cgroup tests that also need the setuid group" runs it.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
       # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
@@ -580,7 +582,7 @@ jobs:
             # For the namespace tests that also attach a foreign tracer; no other test here takes it.
             export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
             status=0
-            SKULD_LABELS="cgroup | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
+            SKULD_LABELS="(cgroup | namespaces) & !setuid" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.
             chown -R "$2" "$PWD/target"
             exit "$status"
@@ -628,6 +630,44 @@ jobs:
           COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
+
+      # The tests that are in both the `cgroup` and the `setuid` group: they need a delegated cgroup, and a
+      # caller that is not root (the helper is only unsignalable by one). The cgroup lane above runs as root and
+      # leaves them out; this one runs the same archive as the runner user, in a cgroup the user owns. Root
+      # makes that cgroup, hands it over and moves this shell into it: the user cannot move itself out of
+      # the cgroup the runner started it in.
+      - name: Run cgroup tests that also need the setuid group (Linux)
+        if: matrix.os == 'linux'
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_TEST_CGROUP: "1"
+          COSCA_TEST_CGROUP_CONSENT: "1"
+          COSCA_TEST_SETUID: "1"
+          COSCA_TEST_SETUID_CONSENT: "1"
+          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
+          SKULD_LABELS: cgroup & setuid
+        run: |
+          # shellcheck disable=SC2016 # the inner shell expands its own variables
+          exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -uxc '
+            CG=/sys/fs/cgroup/cosca-ci-user
+            PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+            sudo mkdir "$CG" || exit 1
+            # Back out of the lane cgroup and remove it on every exit. If a test left processes or cgroups in it,
+            # report them, kill the subtree and still fail; the runner is thrown away after the job.
+            leave() {
+              echo $$ | sudo tee "$PRIOR/cgroup.procs" > /dev/null || { echo "could not leave $CG" >&2; exit 1; }
+              sudo find "$CG" -depth -type d -exec rmdir {} \; && return
+              echo "could not remove $CG; left in it:" >&2
+              sudo grep -r "" "$CG" --include=cgroup.procs >&2 || true
+              echo 1 | sudo tee "$CG/cgroup.kill" > /dev/null || echo "could not kill $CG" >&2
+              exit 1
+            }
+            trap leave EXIT
+            sudo chown "$(id -u):$(id -g)" "$CG" "$CG/cgroup.procs" "$CG/cgroup.subtree_control" "$CG/cgroup.threads"
+            echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null
+            "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup-setuid --no-tests=fail -E "binary(cosca)"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
