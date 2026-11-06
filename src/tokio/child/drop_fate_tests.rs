@@ -171,14 +171,11 @@ async fn the_drop_of_an_unproven_backend_whose_root_its_pidfd_shows_gone_says_go
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = live(true);
-    let id = child.id();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     // Released after the kill, so a kill that sent nothing fails the assertion on how the root ended.
     drop(writer);
-    crate::test_child::assert_killed(
-        "the root",
-        crate::test_child::reaped_elsewhere::reap_behind_status(id.pid()),
-    );
+    crate::test_child::assert_killed("the root", crate::test_child::reaped_elsewhere::reap_behind_status(pid));
     let failed = force_peek_once(Err(std::io::Error::other("forced peek failure 3c7f")));
     child.kill().expect("a root reaped elsewhere has nothing left to kill");
     assert_peeks_exhausted();

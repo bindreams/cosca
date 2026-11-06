@@ -31,7 +31,7 @@ pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWrit
 /// [`kill_own_child`], which no route under test can turn into a no-op. `release` is dropped once
 /// the root is dead.
 pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: std::io::PipeWriter) {
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     drop(release);
     crate::test_child::assert_killed("the root", reap_behind_status(pid));
