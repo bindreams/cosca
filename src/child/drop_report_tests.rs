@@ -73,7 +73,8 @@ fn an_unknown_root_with_a_refused_kill_warns_once() {
 }
 
 /// The teardown of a root says what became of it under the caller's own name: a teardown after a
-/// failed run leads its `debug` reap line with that name, not a drop's.
+/// failed run leads its `debug` reap line with that name, not a drop's. Only the teardown's own
+/// line is read: on macOS the reap's second look logs a line of its own at `debug`.
 ///
 /// Mutant: `Child::tear_down` leads the clause with `TeardownCaller::Drop.label()`, whoever called.
 #[skuld::test]
@@ -92,7 +93,7 @@ fn a_roots_reap_is_said_under_the_name_of_the_caller_that_tore_it_down() {
 
     assert_eq!(torn.fate, crate::error::ChildFate::Reaped);
     assert_eq!(
-        crate::log_capture::records_since_on_current_thread(mark, ""),
+        crate::log_capture::records_since_on_current_thread(mark, "teardown of child"),
         [(
             log::Level::Debug,
             format!("teardown after a failed run: teardown of child {pid}: reaped it after the kill")
@@ -879,7 +880,12 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
 /// skips on every kernel; a process group does not skip on Linux 6.9+, where the root's pidfd names
 /// it.
 ///
+/// Linux only: a macOS root holds its fd marker whatever the mode, and the skipped kill still sweeps
+/// the marker's holders by identity, so the root is dead before its refused kill and nothing is
+/// handed back.
+///
 /// Mutant: the early kill's `Ok` clears the note whether or not it killed the tree.
+#[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
     crate::log_capture::install();
