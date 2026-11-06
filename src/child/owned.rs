@@ -188,6 +188,12 @@ impl OwnedChild {
         self.os.pid()
     }
 
+    /// What a kill of the child may be refused for; see [`OsChild::kill_refusal`].
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn kill_refusal(&self) -> crate::os_process::child::KillRefusal {
+        self.os.kill_refusal()
+    }
+
     /// The OS object that names the child, borrowed from `self`.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn os_handle(&self) -> crate::os_process::child::OsHandle<'_> {

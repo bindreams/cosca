@@ -655,9 +655,9 @@ impl ProcessId {
 
 #[cfg(windows)]
 pub(crate) use backend::{
-    close as windows_close, exit_look as windows_exit_look, open_classified as windows_open_classified,
-    open_dropping_refused as windows_open_dropping_refused, terminate_held as windows_terminate_held, Look, Opened,
-    Termination,
+    close as windows_close, exit_look as windows_exit_look, granted_access as windows_granted_access,
+    open_classified as windows_open_classified, open_dropping_refused as windows_open_dropping_refused,
+    terminate_held as windows_terminate_held, Look, Opened, Termination,
 };
 
 #[cfg(all(windows, test))]

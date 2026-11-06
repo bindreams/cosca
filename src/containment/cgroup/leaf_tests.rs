@@ -2548,9 +2548,10 @@ fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
 
 /// An intent that names no pid (a negative one) but carries a pidfd is the child's own handle on a
 /// child that never named itself: it is killed and reaped through that pidfd, and the abandonment
-/// answers `Ended`. The pidfd is the child's own, so the teardown expects `Expect::Anything` of
-/// it; a row that tells that from the handshake's expectations needs a kill the child refuses (a
-/// setuid helper), which the leaf's tests have no fixture for.
+/// answers `Ended`. The pidfd is the child's own, so the teardown's past is `Past::WaitMayFail`, which
+/// waives only the check that a child left uncollected was refused its kill; a row that tells that
+/// from the handshake's pasts needs a kill the child refuses (a setuid helper), which the leaf's
+/// tests have no fixture for.
 ///
 /// Mutant: a pid-less intent with a pidfd is out of reach, or its child is left unreaped.
 #[cfg(target_os = "linux")]
