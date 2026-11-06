@@ -29,6 +29,14 @@ use std::io;
 use super::{Backend, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error};
 
+/// How a message names the elevation front `pid` (`None`: not known).
+pub(crate) fn front_named(pid: Option<u32>) -> String {
+    pid.map_or_else(
+        || "the elevation front (pid unknown)".to_owned(),
+        |pid| format!("elevation front pid {pid}"),
+    )
+}
+
 /// How a signal to a child may go.
 #[derive(Debug)]
 pub(crate) enum Gate {
