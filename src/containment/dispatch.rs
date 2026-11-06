@@ -148,7 +148,7 @@ impl Prepared {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        #[cfg(target_os = "linux")] handshake: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Expect)>,
+        #[cfg(target_os = "linux")] handshake: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Past)>,
     ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {

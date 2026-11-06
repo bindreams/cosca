@@ -428,7 +428,8 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 
     // Open for terminate AND query, so the SAME held handle both pins the kernel object
     // (pid-reuse-safe) and lets us re-verify identity before terminating, race-free.
-    let handle = match windows_open_classified(id.pid(), PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) {
+    let rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle = match windows_open_classified(id.pid(), rights) {
         Opened::Found(h) => h,
         Opened::Gone => return KillOutcome::AlreadyGone,
         Opened::Denied(e) => {
@@ -443,7 +444,7 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
         HandleIdentity::Same => {
             #[cfg(test)]
             fault::run_before_terminate();
-            match windows_terminate_held(handle) {
+            match windows_terminate_held(handle, rights) {
                 Termination::Terminated => KillOutcome::Terminated,
                 Termination::Exited => KillOutcome::AlreadyGone,
                 Termination::Failed(e) => {

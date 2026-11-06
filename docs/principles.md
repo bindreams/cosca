@@ -39,8 +39,6 @@ past 1 s, as the drop's does, each naming what it waits for:
 - the wait for the root, once the spawn has a child handle (on Linux and Windows, and on macOS
   including the teardown of a child whose unique-id report came after the spawn returned,
   [`reap_unreported`](../src/tokio/child/proc_source.rs));
-- on Windows, the wait for a process the raw backend's teardown terminated
-  (`raw_spawn_teardown` in [`windows_raw.rs`](../src/child/spawn/windows_raw.rs));
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
   leaf's abandonment: `end_child` for a child that named itself, and the pidfd teardown of one that

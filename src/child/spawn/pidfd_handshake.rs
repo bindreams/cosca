@@ -75,7 +75,7 @@ use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, So
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{Disposition, Expect, Remains};
+use crate::child::owned::teardown::{Disposition, Past, Remains};
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
@@ -277,9 +277,9 @@ impl Drop for ShutOnDrop<'_> {
 
 /// Where a child spawned for a cgroup leaf leaves the handshake's pidfd, or a copy of it, when its
 /// spawn fails after its fork: for the leaf's abandonment, which uses it for a child the leaf cannot
-/// name (see [`Handshake::leaving_front`]). It goes with the [`Expect`] of a teardown through it,
+/// name (see [`Handshake::leaving_front`]). It goes with the [`Past`] of a teardown through it,
 /// which the handshake knows and the leaf does not.
-pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<(OwnedFd, Expect)>>>;
+pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<(OwnedFd, Past)>>>;
 
 /// Who answers for a child whose spawn failed after its fork, when that child is an elevation
 /// front (see [`Handshake::leaving_front`]).
@@ -884,20 +884,20 @@ fn conclude<T: Spawned>(
         use std::os::fd::AsFd as _;
         // A child std collected never ran the program. A peek that fails tells nothing, so the
         // child is taken for a front still there, which is sent nothing; and a look on the pidfd
-        // having failed, a wait on it may too.
-        let (collected, expect) = match peek(&Target::PidFd(pidfd.as_fd())) {
-            Ok(PeekOutcome::Foreign(_)) => (true, Expect::Waited),
-            Ok(_) => (false, Expect::Waited),
+        // having failed, a wait on it may fail too.
+        let (collected, past) = match peek(&Target::PidFd(pidfd.as_fd())) {
+            Ok(PeekOutcome::Foreign(_)) => (true, Past::Clean),
+            Ok(_) => (false, Past::Clean),
             Err(e) => {
                 log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
-                (false, Expect::Anything)
+                (false, Past::WaitMayFail)
             }
         };
         let teardown =
-            |pidfd: OwnedFd| end_through_pidfd(None, pidfd, expect, warn_after, &mut super::Diagnosis::default());
+            |pidfd: OwnedFd| end_through_pidfd(None, pidfd, past, warn_after, &mut super::Diagnosis::default());
         match front {
             LeftFront::ToLeaf(leaf) => {
-                leaf.set(Some((pidfd, expect)));
+                leaf.set(Some((pidfd, past)));
                 (error, ChildFate::Unknown)
             }
             LeftFront::Here(front) if !collected => {
@@ -920,15 +920,15 @@ fn conclude<T: Spawned>(
                 if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
                     super::note_refused_group_kill(None, e, collected, &mut why);
                 }
-                let child_fate = end_through_pidfd(None, pidfd, expect, warn_after, &mut why).fate;
+                let child_fate = end_through_pidfd(None, pidfd, past, warn_after, &mut why).fate;
                 (error, child_fate)
             }
             LeftFront::LeafHeld(leaf) => {
                 // The leaf's copy names a child this teardown, through the original, is about to
-                // wait for: if that wait fails, so may the leaf's later one on the same child, so
-                // the copy's teardown may come to anything. `expect` is the original's, not its.
+                // wait for: if that wait fails, so may the leaf's later one on the same child.
+                // `past` is the original's, not the copy's.
                 match pidfd.try_clone() {
-                    Ok(copy) => leaf.set(Some((copy, Expect::Anything))),
+                    Ok(copy) => leaf.set(Some((copy, Past::WaitMayFail))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
                 (error, teardown(pidfd).fate)
@@ -1019,27 +1019,27 @@ fn conclude<T: Spawned>(
 }
 
 /// [`tear_down_pidfd`] for the child `pidfd` names, whose pid is `pid` if known: a child it could
-/// not end is left running and warned of, the warn led by `why`; the fate says so. `expect`: see
-/// [`Expect`]. With `warn_after`, the wait for the killed child warns once it passes that long.
+/// not end is left running and warned of, the warn led by `why`; the fate says so. `past`: see
+/// [`Past`]. With `warn_after`, the wait for the killed child warns once it passes that long.
 /// Answers what is left of the teardown, whose clause is said.
 fn end_through_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
-    expect: Expect,
+    past: Past,
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> Remains {
-    tear_down_pidfd(pid, pidfd, None, expect, Due::in_(warn_after)).say_as_failed_spawn(why)
+    tear_down_pidfd(pid, pidfd, None, past, Due::in_(warn_after)).say_as_failed_spawn(why)
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program
-/// ([`Expect::Unexecuted`]): nothing has looked at its pidfd, and nothing but its being gone can
+/// ([`Past::Unexecuted`]): nothing has looked at its pidfd, and nothing but its being gone can
 /// refuse its kill.
 fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
     end_through_pidfd(
         pid,
         pidfd,
-        Expect::Unexecuted,
+        Past::Unexecuted,
         warn_after,
         &mut super::Diagnosis::default(),
     )
