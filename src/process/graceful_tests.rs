@@ -133,7 +133,7 @@ fn foreign_graceful_shutdown_tree_graceful_path() {
 // that sent nothing lets it exit 0 and fails the assertion instead of the grace running out first.
 // A sent `SIGTERM` is already pending then, so it beats the release.
 //
-// Mutants: `terminate_by_id` sends nothing; `graceful_shutdown` skips it.
+// Mutants: `os_process::terminate` sends nothing; `graceful_shutdown` skips it.
 #[skuld::test]
 fn foreign_graceful_shutdown_graceful_path() {
     let mut child = foreign::blocker();
