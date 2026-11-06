@@ -151,8 +151,8 @@ impl std::fmt::Display for StateUnknown {
 
 #[cfg(target_os = "linux")]
 fn read_proc_state(pid: u32) -> Result<char, StateUnknown> {
-    use crate::identity::ProcView;
-    let proc_dir = match crate::identity::proc_view() {
+    use crate::identity::{proc_view_with, HostKernel, ProcView};
+    let proc_dir = match proc_view_with(&HostKernel) {
         ProcView::Same(proc_dir) => proc_dir,
         ProcView::Diverged => return Err(StateUnknown::OuterProcfs),
         ProcView::Unassessable(why) => return Err(StateUnknown::ViewUnassessable(why)),

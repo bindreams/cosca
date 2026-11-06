@@ -214,18 +214,17 @@ pub(crate) fn spawn_raw(
         frozen: cmd.flags_request().suspended,
     };
     let raw_handle = proc.as_raw_handle();
-    let id = match resolve_identity(
+    let (resolved, cause, _) = resolve_identity(
         pid,
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
-    )
-    .0
-    {
+    );
+    let id = match resolved {
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
             let fate = raw_spawn_teardown(proc, pid, None, None);
             return Err(SpawnFailure::started(
-                crate::child::spawn::spawn_identity_error(other),
+                crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
             ));
         }
