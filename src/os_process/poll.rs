@@ -9,11 +9,34 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 /// One look at `fd` with a zero timeout: `Ok(true)` once it is readable. Never blocks.
 pub(crate) fn is_readable(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
+    look_readable(fd).map_err(std::io::Error::from)
+}
+
+/// How a look at a descriptor failed.
+#[derive(Debug)]
+pub(crate) enum PollFailure {
+    /// The `poll` answered an errno.
+    Call(rustix::io::Errno),
+    /// The `poll` reported `POLLERR` or `POLLNVAL`, which carry no errno.
+    Revents(std::io::Error),
+}
+
+impl From<PollFailure> for std::io::Error {
+    fn from(failure: PollFailure) -> std::io::Error {
+        match failure {
+            PollFailure::Call(errno) => errno.into(),
+            PollFailure::Revents(error) => error,
+        }
+    }
+}
+
+/// [`is_readable`], with a failure that keeps the errno of the `poll`.
+pub(crate) fn look_readable(fd: BorrowedFd<'_>) -> Result<bool, PollFailure> {
     let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-    if !crate::wait::any_ready_now(&mut fds)? {
+    if !crate::wait::any_ready_now(&mut fds).map_err(PollFailure::Call)? {
         return Ok(false);
     }
-    readable(fds[0].revents()).map(|()| true)
+    readable(fds[0].revents()).map(|()| true).map_err(PollFailure::Revents)
 }
 
 /// `poll(2)` takes its timeout as an `int` of milliseconds; where there is no `ppoll` (macOS) rustix
