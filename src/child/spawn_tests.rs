@@ -1673,8 +1673,9 @@ fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
     release(child);
 }
 
-/// The same on a host with the real kernel: the held pidfd of a reaped child still names it, so the
-/// read finds it, and the peek through the pidfd, which shows the reap, makes the read `Gone`.
+/// The held pidfd of a reaped child still names it: its inode reads as a key (the row states one, so
+/// that it does on every host), and only the peek through the pidfd, which shows the reap, makes
+/// the read `Gone`.
 ///
 /// Mutant: `resolve_identity` skips the peek through the handle.
 #[cfg(target_os = "linux")]
@@ -1682,7 +1683,7 @@ fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
 fn resolve_identity_of_a_reaped_child_is_gone() {
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
-    use crate::identity::{HostKernel, Resolved};
+    use crate::identity::{FakeKernel, HostKernel, Resolved};
     use crate::wait::exit_only::Target;
 
     #[allow(
@@ -1700,6 +1701,10 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let reaped = waitid(WaitId::PidFd(std::os::fd::AsFd::as_fd(&pidfd)), WaitIdOptions::EXITED).expect("raw reap");
     assert!(reaped.is_some(), "the raw reap must consume an exit record");
 
-    let (read, _, _) = super::resolve_identity(&HostKernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
+        .on_pidfs_ino(pid, Ok(Some(1)));
+    let held = held_through(&kernel, pid);
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }

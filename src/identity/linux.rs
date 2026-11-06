@@ -1,6 +1,7 @@
 //! Linux process-identity backend. A process's [`Key`] is the inode of its pidfd on pidfs (6.9+),
-//! proved by opening the pid again ([`prove`]) or read from a pidfd the caller holds, else the raw field-22 `starttime` (jiffies) from
-//! `/proc/<pid>/stat`. `is_running` polls the pidfd, or reads the process state before 6.9;
+//! else the raw field-22 `starttime` (jiffies) from `/proc/<pid>/stat`. Opening the pid ([`prove`])
+//! gives a proven key. Reading the pidfd the caller holds gives a key that the caller's later peek
+//! through that pidfd checks. `is_running` polls the pidfd, or reads the process state before 6.9;
 //! `created_at` reads the `starttime` (bracketed for a pidfs id) and uses `/proc/stat` `btime` and
 //! `_SC_CLK_TCK`.
 
@@ -233,7 +234,23 @@ pub(super) fn of_held(
     pid: RawPid,
     held: std::os::fd::BorrowedFd<'_>,
 ) -> (Resolved<Key>, UnknownCause) {
+    debug_assert!(
+        !held_names_another_pid(kernel, pid, held),
+        "`held` is a pidfd of another process than {pid}"
+    );
     key_of(kernel, pid, look_at(kernel, held))
+}
+
+/// Whether the fdinfo of `held` shows a pid other than `pid`. A reaped target, a target the `/proc`
+/// view does not number, and an fdinfo or view that cannot be read show none.
+fn held_names_another_pid(kernel: &dyn Kernel, pid: RawPid, held: std::os::fd::BorrowedFd<'_>) -> bool {
+    let Ok(dir) = proc_view::proc_view_with(kernel).into_dir() else {
+        return false;
+    };
+    matches!(
+        proc_view::pidfd_pid_in(kernel, &dir, held),
+        Ok(proc_view::PidfdTarget::Pid(shown)) if shown != 0 && shown != pid
+    )
 }
 
 /// The key `look` shows for `pid`.
