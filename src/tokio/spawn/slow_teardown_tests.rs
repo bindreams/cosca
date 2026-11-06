@@ -108,7 +108,6 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
             cmd.stdout(crate::stdio::Stdio::from_file(out)).expect("set stdout");
             let spawned = cmd.spawn().map(drop);
             fault::set_force_attach_failure(false);
-            fault::set_force_identity_unknown(false);
             (spawned, blocker.map(|blocker| blocker.recorded()).unwrap_or_default())
         },
         || tracer_rx.recv().expect("the tracer seized the child"),
@@ -128,17 +127,6 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(seize: Seize, front
 fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
     assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeAttach, || {
         fault::set_force_attach_failure(true);
-    }));
-}
-
-/// The teardown after a refused identity read, through the pidfd
-/// (`ProcSource::teardown_through_pidfd`).
-///
-/// Mutant: `teardown_through_pidfd` reaps with no warn.
-#[skuld::test]
-fn a_teardown_after_a_refused_identity_read_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    assert_teardown_warns_once_before_blocking(Seize::At(SpawnPoint::BeforeIdentity, || {
-        fault::set_force_identity_unknown(true);
     }));
 }
 

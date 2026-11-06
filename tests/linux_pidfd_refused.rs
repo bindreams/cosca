@@ -47,7 +47,11 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
                     assert_refused(cosca::Process::open_pid(child.pid()), "process open", name);
-                    assert_refused(cosca::Process::open(child.id()), "process open", name);
+                    assert_refused(
+                        cosca::Process::open(child.id().expect("the spawn read the child's identity")),
+                        "process open",
+                        name,
+                    );
                     assert_refused(cosca::Process::current(), "process open", name);
                 })
                 .join()
@@ -202,7 +206,11 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
                     assert_refused(cosca::tokio::Process::open_pid(child.pid()), "process open", name);
-                    assert_refused(cosca::tokio::Process::open(child.id()), "process open", name);
+                    assert_refused(
+                        cosca::tokio::Process::open(child.id().expect("the spawn read the child's identity")),
+                        "process open",
+                        name,
+                    );
                     assert_refused(cosca::tokio::Process::current(), "process open", name);
                 })
                 .join()

@@ -173,7 +173,9 @@ fn nested_attach_is_delegated() {
             panic!("the helper child must be readable");
         };
         let attachment = attach(
-            id,
+            #[cfg(unix)]
+            child.id(),
+            Ok(id),
             #[cfg(target_os = "linux")]
             crate::containment::cgroup::test_support::handle_of(
                 child.id(),
@@ -782,7 +784,7 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
         },
         || {
             let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
-            let id = blocker.id();
+            let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
             let killed = tree_left_with(id.pid(), vec![id]);
             let after: Box<dyn FnOnce()> = Box::new(move || {
                 drop(stdin);
@@ -798,7 +800,7 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
 fn unvouched_tree() -> (super::TreeKilled, Box<dyn FnOnce()>) {
     use super::{Attached, TreeKillOutcome};
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
-    let id = blocker.id();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     let killed = tree_left_with(id.pid(), vec![id]);
     Attached::TreeWalk(crate::identity::ProcessId::current())
         .settle(&killed, TreeKillOutcome::NoRoot, true)
@@ -857,7 +859,7 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_refuses_the_kill(
 ) {
     check_table("left, refusing", holding_rows, || {
         let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let killed = tree_left_with(id.pid(), vec![id]);
         let after: Box<dyn FnOnce()> = Box::new(move || {
             // The helper exits at EOF: nothing killed it.
@@ -1115,7 +1117,7 @@ fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled(
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
     let killed = TreeKilled::default();
-    let id = blocker.id();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
 
     let first = attached
         .settle(
@@ -1151,7 +1153,7 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
     let killed = TreeKilled::default();
-    let id = blocker.id();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     attached
         .settle(
             &killed,
@@ -1228,7 +1230,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
 
     // Held members that the settlement found gone.
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
-    let id = blocker.id();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     let held_gone = tree_left_with(id.pid(), vec![id]);
     let warn = attached
         .settle_for_drop(&held_gone, skipped(), true)
@@ -1450,7 +1452,7 @@ fn a_member_that_exited_since_it_was_left_stops_failing_the_call() {
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
     let killed = TreeKilled::default();
-    let id = blocker.id();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     attached
         .settle(
             &killed,
@@ -1809,7 +1811,8 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         teardown_warn_after: None,
     };
     super::attach_tree(
-        crate::identity::ProcessId::current(),
+        std::process::id(),
+        Ok(crate::identity::ProcessId::current()),
         crate::containment::cgroup::test_support::handle_of(
             std::process::id(),
             &crate::containment::cgroup::test_support::pidfd_of(std::process::id()),
@@ -2008,7 +2011,49 @@ mod frozen_attach {
         let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
             panic!("the suspended child must be readable");
         };
-        attach(id, raw(child), prepared)
+        attach(Ok(id), raw(child), prepared)
+    }
+
+    /// The identity read the OS refused, as the spawn hands it to the attach.
+    fn refused_identity() -> Error {
+        Error::Unassessable {
+            detail: "the OS refused to report the spawned child's identity".into(),
+            source: None,
+        }
+    }
+
+    /// A job needs no identity: a Strongest root whose identity could not be read still gets one.
+    ///
+    /// Mutant: the attach fails early for want of an identity, whatever the mechanism.
+    #[skuld::test]
+    fn attach_assigns_a_strongest_roots_job_though_its_identity_could_not_be_read() {
+        let child = spawn_suspended_blocker();
+        let prepared = prepared(Some(ContainMode::Strongest), true, false);
+
+        let attachment = attach(Err(refused_identity()), raw(&child), prepared).expect("attach");
+
+        assert_eq!(attachment.containment, Containment::JobObject);
+        dispose(child);
+        drop(attachment);
+    }
+
+    /// A tree walk names its tree by the root's identity, so it fails the attach with the read's error.
+    ///
+    /// Mutant: the attach succeeds with a tree walk that has no root.
+    #[skuld::test]
+    fn attach_fails_a_tree_walk_root_with_the_identity_reads_error() {
+        let child = spawn_suspended_blocker();
+
+        let err = attach(
+            Err(refused_identity()),
+            raw(&child),
+            prepared(Some(ContainMode::TreeWalk), true, false),
+        )
+        .err()
+        .expect("a tree walk without an identity must fail the attach");
+
+        assert!(matches!(err, Error::Unassessable { source: None, .. }), "got {err:?}");
+        dispose(child);
     }
 
     fn dispose(mut child: std::process::Child) {

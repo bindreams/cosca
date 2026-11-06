@@ -82,7 +82,7 @@ pub(crate) enum ReadPurpose {
     Open,
     /// A peek that found an exit record, just before its consume.
     Peek,
-    /// A peek that found the child running.
+    /// A peek that found the child running, and the liveness read that follows it.
     Running,
     /// A peek that got `ECHILD`: does the pid still name our child, and who holds it?
     Echild,
@@ -230,33 +230,73 @@ pub(crate) enum Held {
 /// `PROC_PIDT_SHORTBSDINFO`, between two unique-id reads: the same id before and after proves the
 /// parent read was of that process, because a unique id is never reused.
 pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held {
+    match short_read(pid, expected, purpose, short_ppid) {
+        Ok(ppid) => Held::Parent(ppid),
+        Err(Mismatch::Other) => Held::Other,
+        Err(Mismatch::Gone) => Held::Gone,
+        Err(Mismatch::Refused(errno)) => Held::Refused(errno),
+    }
+}
+
+/// Whether the process whose unique id is `expected` has exited, read as a zombie
+/// (`PROC_PIDT_SHORTBSDINFO`'s `SZOMB`) between two unique-id reads, as in [`held_by`]. A pid that
+/// names another process now, or none, has had its process reaped: exited. `Err` is the errno of a
+/// refused read.
+pub(crate) fn has_exited(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Result<bool, i32> {
+    match short_read(pid, expected, purpose, short_status) {
+        Ok(status) => Ok(status == libc::SZOMB),
+        Err(Mismatch::Other | Mismatch::Gone) => Ok(true),
+        Err(Mismatch::Refused(errno)) => Err(errno),
+    }
+}
+
+/// The error of a [`has_exited`] that was refused with `errno`: the child cannot be shown to be
+/// running.
+pub(crate) fn has_exited_error(pid: RawPid, errno: i32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::Error::from_raw_os_error(errno).kind(),
+        format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be running"),
+    )
+}
+
+/// Why a [`short_read`] did not read the process it was asked for.
+enum Mismatch {
+    /// The pid names another process now.
+    Other,
+    /// Reaped.
+    Gone,
+    /// A read failed with this errno.
+    Refused(i32),
+}
+
+/// `read` of `pid`, between two unique-id reads: the same id before and after proves the read was of
+/// the process whose unique id is `expected`, because a unique id is never reused.
+fn short_read<T>(
+    pid: RawPid,
+    expected: u64,
+    purpose: ReadPurpose,
+    read: impl FnOnce(RawPid) -> Result<T, ReadErr>,
+) -> Result<T, Mismatch> {
     let same = |read: UniqRead| match read {
         UniqRead::Found(info) if info.unique_id == expected => Ok(()),
-        UniqRead::Found(_) => Err(Held::Other),
-        UniqRead::Gone => Err(Held::Gone),
-        UniqRead::Refused(errno) => Err(Held::Refused(errno)),
+        UniqRead::Found(_) => Err(Mismatch::Other),
+        UniqRead::Gone => Err(Mismatch::Gone),
+        UniqRead::Refused(errno) => Err(Mismatch::Refused(errno)),
     };
-    if let Err(held) = same(uniq_info(pid, purpose)) {
-        return held;
-    }
-    let ppid = short_ppid(pid);
-    if let Err(held) = same(uniq_info(pid, purpose)) {
-        return held;
-    }
-    match ppid {
-        Ok(ppid) => Held::Parent(ppid),
+    same(uniq_info(pid, purpose))?;
+    let read = read(pid);
+    same(uniq_info(pid, purpose))?;
+    match read {
+        Ok(read) => Ok(read),
         // The id matched before and after this read, so the process was in the pid hash at both
         // ends and cannot have been reaped in between. Flavors 13 and 17 share one lookup
         // (`proc_find`, then `proc_find_zombref`, `proc_info.c:2199-2215`) and one
         // `NO_CHECK_SAME_USER` policy (`:2230-2236`), so xnu cannot answer `ESRCH` here.
         Err(ReadErr::Gone) => {
-            debug_assert!(
-                false,
-                "pid {pid}: its parent read said ESRCH between two matching id reads"
-            );
-            Held::Gone
+            debug_assert!(false, "pid {pid}: a read said ESRCH between two matching id reads");
+            Err(Mismatch::Gone)
         }
-        Err(ReadErr::Refused(errno)) => Held::Refused(errno),
+        Err(ReadErr::Refused(errno)) => Err(Mismatch::Refused(errno)),
     }
 }
 
@@ -373,6 +413,12 @@ fn short_ppid(pid: RawPid) -> Result<u32, ReadErr> {
     // SAFETY: all-zero is a valid `ProcBsdShortInfo`.
     let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
     pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info.pbsi_ppid)
+}
+
+fn short_status(pid: RawPid) -> Result<u32, ReadErr> {
+    // SAFETY: all-zero is a valid `ProcBsdShortInfo`.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info.pbsi_status)
 }
 
 /// Forces [`uniq_info`] of a purpose below the syscall.

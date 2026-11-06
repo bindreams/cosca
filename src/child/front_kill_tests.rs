@@ -196,7 +196,7 @@ fn drop_of_a_live_front_without_a_group_sends_nothing() {
 fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
     for cmd in uncontained_cats() {
         let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-        let id = child.id();
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let pid = id.pid();
         let (detail, fate, handed_back) = failed_password_write_detail(child, stdin);
         assert_eq!(
@@ -403,7 +403,7 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let pid = id.pid();
     let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
         child,
@@ -463,7 +463,7 @@ fn failed_password_write_fate<R>(
 #[skuld::test]
 fn a_failed_password_write_hands_back_a_live_front_and_names_it() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let (fate, handed_back) = failed_password_write_fate(child, stdin);
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
     assert_eq!(handed_back.unreaped().id(), Some(id));
@@ -861,12 +861,18 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
     assert_unadopted_front_noted(&err, id.pid());
 }
 
-/// macOS: a spawn whose check of the front's identity is refused (`Unknown`) leaves it unverified:
-/// sent nothing, and unreaped. The error says so, as for a report it could not read.
+/// macOS: a contained spawn whose check of the front's identity is refused (`Unknown`) cannot attach
+/// its marker, which needs the identity, so it fails the attach with the read's error and leaves the
+/// front unverified: sent nothing, and unreaped. The error says so, as for a report it could not
+/// read. (An uncontained front is kept, with no identity.)
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
-    let (err, id, fate) = fail_a_front_spawn(|_| {}, refuse_the_identity, |cmd| cmd.spawn().map(drop));
+fn macos_a_contained_front_whose_identity_is_refused_is_left_and_noted() {
+    let (err, id, fate) = fail_a_front_spawn(
+        |cmd| _ = cmd.contain(),
+        refuse_the_identity,
+        |cmd| cmd.spawn().map(drop),
+    );
     // Its identity is what could not be read.
     assert_eq!(
         fate,

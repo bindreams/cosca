@@ -797,7 +797,7 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
 #[skuld::test]
 fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let pid = id.pid();
     let leaf = leaf_of(&child).path().to_path_buf();
     let stdin = Rc::new(std::cell::Cell::new(Some(stdin)));

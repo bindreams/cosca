@@ -91,7 +91,7 @@ async fn async_foreign_concurrent_waits_both_resolve_on_exit() {
 async fn async_foreign_introspection_delegates() {
     let (child, sock) = common::spawn_blocker();
     let p = Process::open_pid(child.pid()).expect("open").expect("running");
-    assert_eq!(p.id(), child.id());
+    assert_eq!(Some(p.id()), child.id());
     assert_eq!(p.is_alive(), cosca::identity::Liveness::Alive);
     assert_eq!(Process::open(p.id()).expect("open").expect("running").id(), p.id());
     assert_eq!(p.id().exists(), cosca::identity::Existence::Present);

@@ -265,8 +265,9 @@ pub enum Error {
     /// variant says it may have. Any other variant from a spawn says it did not, and cosca has
     /// proved it. Where cosca cannot prove it, the answer is this variant:
     ///
-    /// - every failure after `exec`, such as an identity read, a containment attach, or a password
-    ///   write to the elevation backend;
+    /// - every failure after `exec`, such as an identity read that finds the child gone, a
+    ///   containment attach (one that needs the child's identity fails with the error of the read
+    ///   the OS refused), or a password write to the elevation backend;
     /// - on Unix, a [`tokio::Command`](crate::tokio::Command) whose child failed between its first
     ///   `pre_exec` hook and `exec` (a failed `exec`, `ENOENT` included, or a failed descriptor
     ///   mapping), and on Windows, any failed spawn of one through `std`: tokio can fail a spawn after

@@ -102,11 +102,11 @@ In order:
      pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
      tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
      `waitpid`s by pid. The async non-front attach arm and the
-     identity arms that are not unknown (`ProcSource::reap_now_noting`) make the first kill the
+     identity arm (`ProcSource::reap_now_noting`) make the first kill the
      backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, once tokio's
      `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
-     The unknown identity arm (`teardown_through_pidfd`) forgets tokio's `Child` and goes straight
-     to `tear_down`, sending no kill of its own. A teardown through a pidfd
+     An identity read the OS refuses fails no spawn: the child is kept with no identity, and only
+     a containment that needs one fails the attach. A teardown through a pidfd
      (`held_teardown::tear_down_pidfd`) is told once what its caller knows became of the pidfd
      (`Past`, in `child::owned::teardown`); what the handle allows is its constructor's
      (`OsChild::kill_refusal`: a pidfd is refused for permission alone, a `CreateProcess` handle

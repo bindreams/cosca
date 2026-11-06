@@ -245,6 +245,10 @@ pub(crate) fn contain_without_cgroup_async(cmd: &mut crate::tokio::Command) -> &
     cmd.contain()
 }
 
+/// The `expect` message of a test that needs a spawned child's identity, which a spawn reads for every
+/// child a test makes (only a refused read leaves a child without one).
+pub(crate) const IDENTITY_READ: &str = "the spawn read the child's identity";
+
 /// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin. On Windows it has
 /// a windowless console of its own, which a `CTRL_BREAK` from this process cannot reach: a test
 /// of the graceful signals takes [`held_contained_blocker_on_console`].
@@ -261,7 +265,7 @@ pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate:
 #[cfg(windows)]
 pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::identity::ProcessId) {
     let (child, stdin) = held_contained_blocker(crate::Stdio::null());
-    let id = child.id();
+    let id = child.id().expect(IDENTITY_READ);
     (child, stdin, id)
 }
 
@@ -1917,9 +1921,8 @@ pub(crate) fn exited_through_open(
     }
 }
 
-/// The first Toolhelp snapshot that no longer lists `pid`, an exited process whose handle is held. CI has seen
-/// Toolhelp still list such a process in the first snapshot after its exit was signalled, under a full test
-/// run's load; a row that stays would hang here, and fail at the test's bound.
+/// The first Toolhelp snapshot that no longer lists `pid`, an exited process whose handle is held.
+/// Toolhelp can still list such a process for a moment after its exit; poll until it drops the row.
 #[cfg(windows)]
 pub(crate) fn parents_once_unlisted(
     pid: crate::identity::RawPid,

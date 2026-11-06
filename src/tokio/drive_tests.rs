@@ -202,7 +202,9 @@ fn a_wait_round_adds_only_a_duplicate_of_the_held_pidfd() {
     use crate::test_child::held_contained_blocker_without_cgroup;
 
     let (child, stdin) = held_contained_blocker_without_cgroup(crate::Stdio::null());
-    let process = open(child.id()).unwrap().expect("a live process opens");
+    let process = open(child.id().expect(crate::test_child::IDENTITY_READ))
+        .unwrap()
+        .expect("a live process opens");
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

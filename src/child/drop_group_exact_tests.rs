@@ -199,7 +199,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
     use crate::identity::Resolved;
     crate::log_capture::install();
     let mut child = session_sleep().spawn().expect("spawn");
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();

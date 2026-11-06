@@ -18,7 +18,9 @@ fn exiting_child() -> ::tokio::process::Child {
 /// Mutant: `signal` terminates a handle that is gone, or answers an error.
 #[skuld::test]
 async fn a_kill_after_the_child_was_reaped_is_gone() {
-    let mut proc = super::proc_source::ProcSource::new(exiting_child());
+    let child = exiting_child();
+    let pid = child.id().expect("tokio holds an un-reaped child");
+    let mut proc = super::proc_source::ProcSource::new(child, pid);
     proc.wait().await.expect("wait");
 
     assert_eq!(proc.signal(Sig::Kill).expect("a kill of a reaped child"), Sent::Gone);
@@ -37,7 +39,8 @@ async fn a_kill_of_an_exited_unreaped_child_is_a_success() {
     let handle = child.raw_handle().expect("tokio holds the handle");
     // SAFETY: tokio owns the live process handle; this only waits on it, without reaping.
     unsafe { WaitForSingleObject(HANDLE(handle), INFINITE) };
-    let proc = super::proc_source::ProcSource::new(child);
+    let pid = child.id().expect("tokio holds an un-reaped child");
+    let proc = super::proc_source::ProcSource::new(child, pid);
 
     assert_eq!(
         proc.signal(Sig::Kill).expect("a kill of an exited child"),

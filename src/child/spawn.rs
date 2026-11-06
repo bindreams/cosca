@@ -146,6 +146,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // The look at the root, right before the tree kill it decides.
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::FinishElevated,
+        child.pid(),
         child.id,
         || child.proc.state(),
         &child.tree_killed,
@@ -208,7 +209,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
                 let torn = TeardownOutcome::left_uncollected(
-                    ChildFate::Running { id: Some(child.id()) },
+                    ChildFate::Running { id: child.id() },
                     format!(
                         "the elevated child pid {pid} could not be terminated (it could not be verified, and may \
                          still be running){}",
@@ -237,9 +238,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
                 let note = format!("the elevated child could not be terminated ({e})");
-                let looked = child
-                    .proc
-                    .look_after_refused_kill(Some(child.id()), e, Disposition::HandBack);
+                let looked = child.proc.look_after_refused_kill(child.id(), e, Disposition::HandBack);
                 (
                     root_after_a_refused_kill(note, looked.refused_look()),
                     report.fold_clause(looked),
@@ -334,7 +333,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
 #[cfg(unix)]
 fn root_after_a_delivered_kill(
     pid: u32,
-    id: ProcessId,
+    id: Option<ProcessId>,
     exited_front: bool,
     settlement: &Settlement,
 ) -> (String, TeardownOutcome) {
@@ -354,7 +353,7 @@ fn root_after_a_delivered_kill(
     } else {
         settlement.wording(&subject, None, None).text().to_owned()
     };
-    let torn = TeardownOutcome::of_settlement(settlement, Some(id), &subject, None, Disposition::HandBack);
+    let torn = TeardownOutcome::of_settlement(settlement, id, &subject, None, Disposition::HandBack);
     (note, torn)
 }
 
@@ -768,16 +767,16 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid, &through);
     let id = match resolved {
-        crate::identity::Resolved::Found(id) => id,
-        // Different diagnosis per arm: an OS refusal is not a vanish.
+        crate::identity::Resolved::Found(id) => Ok(id),
+        // Kept with no identity; see `Child::id`.
+        crate::identity::Resolved::Unknown => Err(kept_without_identity(pid, cause, &mut why)),
+        // A vanish is not a refusal: the child was reaped by another party.
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
             settle_before_teardown(
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
-                #[cfg(not(target_os = "linux"))]
-                pid,
             );
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
@@ -796,21 +795,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             }
             #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
-                let identity = if matches!(other, crate::identity::Resolved::Gone) {
-                    crate::containment::RootIdentity::Gone
-                } else {
-                    crate::containment::RootIdentity::Unknown
-                };
-                // The read failed, so no identity is known.
+                let identity = crate::containment::RootIdentity::Gone;
                 let child_fate = leave_unverified_child(child, identity, None, &mut why);
                 (front.map(|_| FrontFate::of_unverified(identity)), child_fate)
             };
-            // The distinction must survive as a VARIANT, not as prose: a supervisor matching
-            // on `Unassessable` to retry elevated would otherwise see an I/O failure and
-            // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
             let error = spawn_identity_error(other, cause);
-            // The read failed, so no identity is known. A child the teardown could not end comes
-            // back in the error.
+            // A child the teardown could not end comes back in the error.
             #[cfg(target_os = "linux")]
             let (error, child_fate, unreaped) = held_teardown::tear_down_held(
                 owned,
@@ -841,7 +831,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeAttach, pid);
+    // What the attach did not consume of the identity read: what the child becomes, and what the
+    // failure arms tear down by.
+    let id_read = id.as_ref().ok().copied();
     let attachment = match attach_or_fault(
+        #[cfg(unix)]
+        pid,
         id,
         #[cfg(target_os = "linux")]
         handle,
@@ -856,14 +851,16 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
             let (fate, child_fate) = {
-                assert_attach_cannot_fail(&error);
+                if id_read.is_some() {
+                    assert_attach_cannot_fail(&error);
+                }
                 if front.is_some() {
                     (
                         Some(leave_front_after_attach_failure(child)),
-                        ChildFate::Running { id: Some(id) },
+                        ChildFate::Running { id: id_read },
                     )
                 } else {
-                    (None, teardown_after_attach_failure(child, unique, id))
+                    (None, teardown_after_attach_failure(child, unique, id_read))
                 }
             };
             // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
@@ -875,12 +872,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 owned,
                 held_teardown::HeldTeardown {
                     front,
-                    id: Some(id),
+                    id: id_read,
                     subtree: subtree.as_ref(),
                     disposition: crate::child::owned::teardown::Disposition::HandBack,
                     due: None,
                 },
-                &mut Diagnosis::default(),
+                &mut why,
                 error,
             );
             #[cfg(target_os = "linux")]
@@ -889,11 +886,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             {
                 let (child_fate, unreaped) = held_teardown::tear_down_failed_spawn(
                     owned,
-                    Some(id),
+                    id_read,
                     crate::child::owned::teardown::Past::Clean,
                     crate::child::owned::teardown::Disposition::HandBack,
                     None,
-                    &mut Diagnosis::default(),
+                    &mut why,
                 );
                 return Err(SpawnFailure::started(error, child_fate, unreaped));
             }
@@ -918,10 +915,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             let (fate, child_fate) = if front.is_some() {
                 (
                     Some(leave_front_after_attach_failure(child)),
-                    ChildFate::Running { id: Some(id) },
+                    ChildFate::Running { id: id_read },
                 )
             } else {
-                (None, teardown_after_attach_failure(child, unique, id))
+                (None, teardown_after_attach_failure(child, unique, id_read))
             };
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
@@ -930,13 +927,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             ));
         }
     };
-    let mut child = Child::from_parts(owned, id, parent_ends, kill_on_drop, attachment);
+    let mut child = Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment);
     child.set_front(cmd.elevation_front());
     Ok(child)
 }
 
-/// macOS: the identity is verified and the attach reads nothing, so an attach cannot fail. Only a
-/// test seam makes it.
+/// macOS: an attach given a verified identity reads nothing, so it cannot fail.
 #[cfg(target_os = "macos")]
 pub(crate) fn assert_attach_cannot_fail(error: &Error) {
     #[cfg(test)]
@@ -972,8 +968,8 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
-    let fate = kill_and_reap_verified(child.id(), unique, Some(id), ZOMBIE_NOTE, None);
+fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Option<ProcessId>) -> ChildFate {
+    let fate = kill_and_reap_verified(child.id(), unique, id, ZOMBIE_NOTE, None);
     drop(child);
     fate
 }
@@ -1146,7 +1142,7 @@ impl LateTree {
         let unshown = match resolved {
             Resolved::Found(id) => {
                 tree.id = Some(id);
-                match attach_or_fault(id, prepared) {
+                match attach_or_fault(pid, Ok(id), prepared) {
                     Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
                     Err(e) => {
                         assert_attach_cannot_fail(&e);
@@ -2209,9 +2205,10 @@ pub(crate) fn spawn_identity_error(
 /// - **Linux:** the key is read from the held pidfd, with no second `pidfd_open` of the pid: on
 ///   pidfs (6.9+) its inode, else (no inode of its own) the `/proc` `starttime` by pid. Then a peek
 ///   through the pidfd. `Running` and `Exit` keep the read (a reap is irreversible, so the pid
-///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, warned. On pidfs
-///   the pidfd, not the pid, named the read, so the peek does not check it: it shows whether
-///   another party reaped the child.
+///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, and the child is
+///   kept without an identity ([`kept_without_identity`]): the check is logged at debug, and warned
+///   only if a failing attach's teardown folds it into its warn. On pidfs the pidfd, not the pid,
+///   named the read, so the peek does not check it: it shows whether another party reaped the child.
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
@@ -2220,7 +2217,8 @@ pub(crate) fn spawn_identity_error(
 /// On macOS the `through` id is the one the child reported before `exec`.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
-/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`. The
+/// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`, unless the child is kept
+/// (see the `Diagnosis` keep rule). The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
     kernel: &dyn crate::identity::Kernel,
@@ -2266,9 +2264,12 @@ pub(crate) fn resolve_identity(
             Err(e) => (
                 Resolved::Unknown,
                 cause,
-                Diagnosis::of(format!(
-                    "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
-                )),
+                Diagnosis::of_failed_check(
+                    format!(
+                        "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
+                    ),
+                    e,
+                ),
             ),
         }
     }
@@ -2280,54 +2281,104 @@ pub(crate) fn resolve_identity(
 }
 
 /// What the identity check found when it could not show the spawned child to be ours, owed to the
-/// failed spawn's one `warn`.
+/// failed spawn's one `warn`, and the notes the failed spawn's teardown adds.
 ///
 /// The spawn's failure arm hands it to the teardown it runs. A step of that teardown that warns
 /// [`fold`](Diagnosis::fold)s it into its text, so the check and the teardown are one record. When
 /// no step warns, the diagnosis is logged on its own when it is dropped.
+///
+/// The keep rule: a child kept without an identity ([`kept_without_identity`]) owes no failure for
+/// the check that left it so, so that text is held apart. It leads a fold, and is logged at `debug`
+/// if nothing folds it. A note added after the keep is the failure's own, and still warns.
 #[derive(Debug, Default)]
-pub(crate) struct Diagnosis(Option<String>);
+pub(crate) struct Diagnosis {
+    owed: Option<String>,
+    /// The text of the check that left the child kept, taken out of `owed` by the keep.
+    kept_check: Option<String>,
+    /// The error of the failed check, until [`kept_without_identity`] builds the spawn's error from it.
+    failed_check: Option<std::io::Error>,
+}
 
 impl Diagnosis {
     /// A diagnosis to carry.
     #[cfg(unix)]
     fn of(text: String) -> Diagnosis {
-        Diagnosis(Some(text))
+        Diagnosis {
+            owed: Some(text),
+            kept_check: None,
+            failed_check: None,
+        }
+    }
+
+    /// A diagnosis of a check that failed with `error`.
+    #[cfg(unix)]
+    fn of_failed_check(text: String, error: std::io::Error) -> Diagnosis {
+        Diagnosis {
+            owed: Some(text),
+            kept_check: None,
+            failed_check: Some(error),
+        }
     }
 
     /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
     #[cfg(unix)]
     pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
-        match &mut self.0 {
+        match &mut self.owed {
             Some(owed) => owed.push_str(&format!("; {text}")),
-            None => self.0 = Some(text.to_string()),
+            None => self.owed = Some(text.to_string()),
         }
     }
 
-    /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn.
+    /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn. The
+    /// kept check counts: a teardown only runs for a failed spawn, which it is then part of.
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn is_owed(&self) -> bool {
-        self.0.is_some()
+        self.owed.is_some() || self.kept_check.is_some()
     }
 
-    /// `text`, led by the diagnosis if it is still owed, which it then no longer is.
+    /// `text`, led by the kept check and the diagnosis if either is still owed, which they then no
+    /// longer are.
     pub(crate) fn fold(&mut self, text: impl std::fmt::Display) -> String {
-        match self.0.take() {
-            Some(diagnosis) => format!("{diagnosis}; {text}"),
-            None => text.to_string(),
-        }
+        let mut parts: Vec<String> = [self.kept_check.take(), self.owed.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        parts.push(text.to_string());
+        parts.join("; ")
     }
 }
 
 impl Drop for Diagnosis {
     fn drop(&mut self) {
         // Not while unwinding: a logger that panics there would abort.
-        if let Some(diagnosis) = self.0.take() {
-            if !std::thread::panicking() {
-                log::warn!("{diagnosis}");
-            }
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(check) = self.kept_check.take() {
+            log::debug!("{check}");
+        }
+        if let Some(diagnosis) = self.owed.take() {
+            log::warn!("{diagnosis}");
         }
     }
+}
+
+/// The `Unknown` arm of an identity read, for every spawn: the child is kept with no identity, and
+/// a containment that needs one fails the attach with the returned error. The error is the failed
+/// check's own when the read was `Found` and the check through the handle failed (its error is the
+/// source), and the read's `cause` otherwise. The keep is logged at `debug`. The failed check then
+/// warns only if a failed attach's teardown folds it in; a note added after the keep warns as usual.
+pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCause, why: &mut Diagnosis) -> Error {
+    let error = match why.failed_check.take() {
+        Some(source) => Error::Unassessable {
+            detail: "the spawned child's identity could not be checked against its handle".into(),
+            source: Some(source),
+        },
+        None => spawn_identity_error(crate::identity::Resolved::Unknown, cause),
+    };
+    log::debug!("child {pid}: {error}; the child is kept without an identity");
+    why.kept_check = why.owed.take();
+    error
 }
 
 /// The unchecked half of [`resolve_identity`]: the read, which nothing has yet shown to name our
@@ -2365,10 +2416,12 @@ pub(crate) fn resolve_identity_unchecked(
     }
 }
 
-/// `containment::attach` for the child whose identity `id` the spawn verified, with a test-only
-/// seam to force its failure.
+/// `containment::attach` for the child `pid`, whose identity the spawn read (`id`) or could not read
+/// (`id` is the read's error, which a containment that needs the identity fails with), with a
+/// test-only seam to force its failure.
 pub(crate) fn attach_or_fault(
-    id: ProcessId,
+    #[cfg(unix)] pid: u32,
+    id: Result<ProcessId, Error>,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: crate::containment::Prepared,
@@ -2378,13 +2431,13 @@ pub(crate) fn attach_or_fault(
         // Capture identity for the test to check what became of the child, then simulate an attach
         // failure so `spawn` takes the attach-error arm. The caller still holds the child, so the
         // verdict is taken before `prepared` drops, as a real attach takes it.
-        fault::capture(crate::identity::Resolved::Found(id));
+        if let Ok(id) = &id {
+            fault::capture(crate::identity::Resolved::Found(*id));
+        }
         let mut prepared = prepared;
         prepared.settle_verdict(
             #[cfg(target_os = "linux")]
             child,
-            #[cfg(not(target_os = "linux"))]
-            id.pid(),
         );
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
@@ -2398,12 +2451,12 @@ pub(crate) fn attach_or_fault(
         prepared.settle_verdict(
             #[cfg(target_os = "linux")]
             child,
-            #[cfg(not(target_os = "linux"))]
-            id.pid(),
         );
         return Ok(attachment);
     }
     crate::containment::attach(
+        #[cfg(unix)]
+        pid,
         id,
         #[cfg(target_os = "linux")]
         child,
@@ -2561,13 +2614,10 @@ fn note_front(
 pub(crate) fn settle_before_teardown(
     prepared: &mut crate::containment::Prepared,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
-    #[cfg(not(target_os = "linux"))] pid: u32,
 ) {
     prepared.settle_verdict(
         #[cfg(target_os = "linux")]
         child,
-        #[cfg(not(target_os = "linux"))]
-        pid,
     );
 }
 

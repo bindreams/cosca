@@ -90,7 +90,7 @@ fn open_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // assertion sound — an exit event alone would not (see the module doc).
     let (child, sock) = spawn_blocker();
     let p = cosca::Process::open_pid(child.pid()).expect("open").expect("running");
-    assert_eq!(p.id(), child.id());
+    assert_eq!(Some(p.id()), child.id());
     assert_eq!(
         p.is_alive(),
         cosca::identity::Liveness::Alive,
@@ -125,7 +125,7 @@ fn a_held_process_reads_dead_and_its_acts_return_after_it_is_reaped() {
 #[skuld::test]
 fn open_pid_of_a_reaped_child_is_none_or_another_process() {
     let (child, sock) = spawn_blocker();
-    let id = child.id();
+    let id = child.id().expect("the spawn read the child's identity");
     common::kill_release_reap(&child, sock);
     drop(child); // on Windows its own handles would keep the exited process openable
     match cosca::Process::open_pid(id.pid()).expect("a reaped pid is not an error") {
@@ -177,7 +177,7 @@ fn assert_no_handle_of_this_process_names(pid: u32) {
 #[skuld::test]
 fn a_reaped_child_held_by_another_handle_opens_dead_on_windows() {
     let (child, sock) = spawn_blocker();
-    let id = child.id();
+    let id = child.id().expect("the spawn read the child's identity");
     let holder = cosca::Process::open(id).expect("open").expect("running");
     common::kill_release_reap(&child, sock);
     drop(child);
