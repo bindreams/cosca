@@ -1,21 +1,32 @@
-//! Linux: the teardown of the child a spawn holds through its pidfd after the handshake, when the
-//! identity read or the attach that follows fails (sync and async), and of the child the handshake
-//! itself abandons.
+//! A failed spawn's teardown of the child it holds after the spawn: on Linux, through its pidfd when
+//! the identity read or the attach that follows fails (sync and async) and of the child the
+//! handshake itself abandons; on Windows, the std and raw spawns' child over its process handle.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
-use super::{Diagnosis, FrontFate};
-use crate::child::owned::teardown::{Disposition, Expect, Kill, PidfdTeardown, Reach};
+use super::Diagnosis;
+#[cfg(target_os = "linux")]
+use super::FrontFate;
+#[cfg(target_os = "linux")]
+use crate::child::owned::teardown::Reach;
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, TeardownOutcome};
 use crate::child::owned::OwnedChild;
+#[cfg(target_os = "linux")]
 use crate::containment::cgroup::Subtree;
+#[cfg(target_os = "linux")]
 use crate::elevation::front::Front;
-use crate::error::{ChildFate, Error};
+use crate::error::ChildFate;
+#[cfg(target_os = "linux")]
+use crate::error::Error;
 use crate::identity::ProcessId;
+#[cfg(target_os = "linux")]
 use crate::os_process::linux::LinuxProcess;
 use crate::wait::teardown_warn::Due;
 use crate::Unreaped;
 
 /// What a held child's teardown is told.
+#[cfg(target_os = "linux")]
 pub(crate) struct HeldTeardown<'a> {
     /// The elevation front the child is, if it is one: sent nothing and looked at.
     pub(crate) front: Option<Front>,
@@ -35,6 +46,7 @@ pub(crate) struct HeldTeardown<'a> {
 /// A child that is not a front is killed and reaped. A front is sent nothing and looked at: reaped
 /// if it has exited, waited for if `how.subtree`, where its leaf's kill went, shows that kill
 /// reached it, and otherwise running. `why` leads the teardown's one warn, if it has one.
+#[cfg(target_os = "linux")]
 pub(crate) fn tear_down_held(
     child: OwnedChild,
     how: HeldTeardown<'_>,
@@ -49,43 +61,79 @@ pub(crate) fn tear_down_held(
         due,
     } = how;
     let pid = child.pid();
-    let (front_fate, torn) = if front.is_some() {
-        let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
-        let look = child.look_at_front(id, reach, due);
-        let fate = FrontFate::of_look(&look.look);
-        let worded = crate::child::word_front(pid, &"its spawn failed", disposition, look);
-        (Some(fate), worded)
+    // Nothing here states what became of the held child's handle, so a wait on it may fail: only the
+    // uncollected-after-wait check is waived, not what a kill may be refused for.
+    if front.is_none() {
+        let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, due, why);
+        return (error, fate, unreaped);
+    }
+    let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
+    let look = child.look_at_front(id, reach, due);
+    let front_fate = FrontFate::of_look(&look.look);
+    let torn = crate::child::word_front(pid, &"its spawn failed", disposition, look);
+    let (fate, unreaped) = say_failed_spawn(child, id, torn, Past::WaitMayFail, disposition, why);
+    let error = if unreaped.is_some() {
+        front_fate.note_handed_back(error, front, pid)
     } else {
-        let tree = None;
-        (None, child.tear_down(id, Kill { disposition, tree }, due))
+        front_fate.note(error, front, pid)
     };
-    let remains = torn.say_as_failed_spawn(why);
+    (error, fate, unreaped)
+}
+
+/// Kills `child`, which a failed spawn holds, and reaps it, and says how that went as the failed
+/// spawn's one warn, `why` leading it. The child itself comes back if `disposition` hands back one
+/// the teardown could not collect. With `due`, the wait for the killed child warns once it passes.
+/// `past`: what the caller knows became of the child's handle, see [`Past`]; what the handle allows is
+/// its own.
+pub(crate) fn tear_down_failed_spawn(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    past: Past,
+    disposition: Disposition,
+    due: Option<Due>,
+    why: &mut Diagnosis,
+) -> (ChildFate, Option<Unreaped>) {
+    let kill = Kill {
+        disposition,
+        tree: None,
+    };
+    let torn = child.tear_down(id, kill, due);
+    say_failed_spawn(child, id, torn, past, disposition, why)
+}
+
+/// Says `torn` as the failed spawn's one warn; hands `child` back per `disposition` if it is
+/// uncollected.
+fn say_failed_spawn(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    torn: TeardownOutcome,
+    past: Past,
+    disposition: Disposition,
+    why: &mut Diagnosis,
+) -> (ChildFate, Option<Unreaped>) {
+    let remains = HandleTeardown::new(torn, Expect::of(&child, past)).say_as_failed_spawn(why);
     let unreaped = disposition.hands_back(&remains).then(|| Unreaped::new(child, id));
-    let error = match front_fate {
-        Some(fate) if unreaped.is_some() => fate.note_handed_back(error, front, pid),
-        Some(fate) => fate.note(error, front, pid),
-        None => error,
-    };
-    (error, remains.fate, unreaped)
+    (remains.fate, unreaped)
 }
 
 /// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
 /// [`OwnedChild`] over the pidfd. A child it could not collect (its kill refused and it still
 /// running, a look or a wait that failed) is left, which the outcome's `uncollected` says, not the
-/// fate; the caller owns the one warn, and says it with [`PidfdTeardown::say_as_failed_spawn`], or
-/// logs its own line through [`PidfdTeardown::warn`]. `expect`: see [`Expect`]. With `due`, the wait for the
+/// fate; the caller owns the one warn, and says it with [`HandleTeardown::say_as_failed_spawn`], or
+/// logs its own line through [`HandleTeardown::warn`]. `past`: see [`Past`]. With `due`, the wait for the
 /// killed child warns once it passes.
+#[cfg(target_os = "linux")]
 pub(crate) fn tear_down_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
     id: Option<ProcessId>,
-    expect: Expect,
+    past: Past,
     due: Option<Due>,
-) -> PidfdTeardown {
+) -> HandleTeardown {
     let child = OwnedChild::new(Box::new(LinuxProcess::new(pid, pidfd)));
     let kill = Kill {
         disposition: Disposition::Leave,
         tree: None,
     };
-    PidfdTeardown::new(child.tear_down(id, kill, due), expect)
+    HandleTeardown::new(child.tear_down(id, kill, due), Expect::of(&child, past))
 }

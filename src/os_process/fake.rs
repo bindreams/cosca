@@ -10,6 +10,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+#[cfg(any(target_os = "linux", windows))]
+use super::child::KillRefusal;
 use super::child::{ExitRecord, Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
@@ -65,6 +67,10 @@ struct Shared {
 struct Script {
     /// What [`OsChild::pid`] answers. `None`: the real child's, if there is one, else no pid.
     pid: Option<u32>,
+    /// What [`OsChild::kill_refusal`] answers. `None`: the real child's, if there is one; a fake
+    /// with none states it or panics.
+    #[cfg(any(target_os = "linux", windows))]
+    kill_refusal: Option<KillRefusal>,
     exits: VecDeque<Answer>,
     peeks: VecDeque<PeekAnswer>,
     reaps: VecDeque<ReapAnswer>,
@@ -99,6 +105,8 @@ impl FakeProcess {
         Self(Arc::new(Shared {
             script: Mutex::new(Script {
                 pid: None,
+                #[cfg(any(target_os = "linux", windows))]
+                kill_refusal: None,
                 exits: exits.into_iter().collect(),
                 peeks: VecDeque::new(),
                 reaps: VecDeque::new(),
@@ -120,6 +128,14 @@ impl FakeProcess {
     /// and any other has no pid.
     pub(crate) fn with_pid(self, pid: u32) -> Self {
         self.script().pid = Some(pid);
+        self
+    }
+
+    /// Answer `refusal` to [`OsChild::kill_refusal`]. Without it, a fake over a real child answers
+    /// that child's, and any other panics.
+    #[cfg(windows)]
+    pub(crate) fn with_kill_refusal(self, refusal: KillRefusal) -> Self {
+        self.script().kill_refusal = Some(refusal);
         self
     }
 
@@ -290,6 +306,16 @@ impl OsChild for FakeProcess {
     fn pid(&self) -> Option<u32> {
         let stated = self.script().pid;
         stated.or_else(|| self.0.real.as_ref().and_then(|real| real.pid()))
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn kill_refusal(&self) -> KillRefusal {
+        let stated = self.script().kill_refusal;
+        match (stated, &self.0.real) {
+            (Some(refusal), _) => refusal,
+            (None, Some(real)) => real.kill_refusal(),
+            (None, None) => panic!("FakeProcess: a kill refusal was asked past the stated facts"),
+        }
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {
