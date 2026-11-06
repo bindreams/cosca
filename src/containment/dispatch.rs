@@ -448,26 +448,30 @@ pub(crate) struct TreeKilled {
     state: std::sync::Mutex<TreeState>,
 }
 
-/// The settlement of a tree ([`TreeKilled`]), and the one rule for when it counts as killed.
+/// The settlement of a tree ([`TreeKilled`]): each state is a fact the handle knows, and one rule
+/// moves them. Only a walk that leaves nothing vouches for the tree; only a member seen running
+/// un-vouches it.
 ///
-/// A settlement leaves the state `Killed` only when (a) it walked (`Ran`) and nothing is left, held
-/// members included, or (b) the state was already `Killed`, nothing was held, and the outcome left
-/// nothing (a gone root over a killed tree). Any other settlement leaves `Never`, or `Left` when it
-/// left members a `TreeWalk` handle holds. A held member is held because its kill was refused: it ran
-/// on and may have forked, and killing it again by identity does not reach its children, so only a
-/// walk that finds nothing settles it. A handle that is not a walk holds no identities, so a member
-/// it leaves sends a killed tree back to `Never`.
+/// - A settlement that leaves members is `Left` (a `TreeWalk` handle holds their identities; any
+///   other handle holds none, so a member it leaves sends a killed tree back to `Never`).
+/// - A walk (`Ran`) that leaves nothing, held members included, is `Killed`, from any state.
+/// - Any other settlement that leaves no member keeps the state, except that `Left` whose held
+///   members all dropped out is `Unvouched`. A held member is held because its kill was refused: it
+///   ran on and may have forked, and killing it again by identity does not reach its children.
 #[derive(Debug, Default)]
 enum TreeState {
-    /// Not settled: no walk has left the tree killed, or a settlement that walked nothing came last.
+    /// No walk has settled the tree.
     #[default]
     Never,
-    /// Killed, by the rule above.
+    /// A walk left nothing: vouched for.
     Killed,
-    /// A walk ran and left these members, never none, so every later kill and drop answers them
-    /// first: the root's death reparents them out of a later walk, so the handle kills the ones whose
-    /// identity was read again and reports the others again.
+    /// A walk left these members, never none, so every later kill and drop answers them first: the
+    /// root's death reparents them out of a later walk, so the handle kills the ones whose identity
+    /// was read again and reports the others again.
     Left(Vec<crate::containment::treewalk::Left>),
+    /// A walk ran and every member it left is now gone, but no walk since has vouched for the tree: a
+    /// held member ran on and may have forked, and its children were never looked for.
+    Unvouched,
 }
 
 impl TreeKilled {
@@ -624,7 +628,9 @@ pub(crate) enum TreeKillOutcome {
     /// [`Error::MemberNotKilled`] included.
     Unwalked(Error),
     /// A `TreeWalk` walk found its root gone, or holding its pid no longer: there is no tree to walk
-    /// from, so nothing was killed. It is [`Error::Unassessable`] ([`no_root_error`](Self::no_root_error)).
+    /// from, so this kill killed nothing. It is [`Error::Unassessable`]: [`no_root_error`](Self::no_root_error)
+    /// over a tree never settled, [`no_root_after_kills_error`](Self::no_root_after_kills_error) over
+    /// one whose left members are gone.
     NoRoot,
     /// The root's number is untrusted, so the kill skipped what names the tree by it. The tree is
     /// not killed.
@@ -656,12 +662,13 @@ impl TreeKillOutcome {
         }
     }
 
-    /// What a [`NoRoot`](Self::NoRoot) is as an error over members an earlier walk left, which this
-    /// settlement killed again: the tree could not be walked, but not nothing was killed.
+    /// What a [`NoRoot`](Self::NoRoot) is as an error over members an earlier kill left, which are
+    /// gone now (killed, or exited on their own): the tree could not be walked, but not nothing was
+    /// killed.
     pub(crate) fn no_root_after_kills_error() -> Error {
         Error::Unassessable {
-            detail: "the members left earlier were killed again, and the tree could not be walked from its gone \
-                     root, so what they forked is unknown"
+            detail: "the members an earlier kill left are gone; the tree could not be walked from its gone root, so \
+                     what they forked is unknown"
                 .to_owned(),
             source: None,
         }
@@ -930,7 +937,8 @@ impl Attached {
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever
     /// the outcome. A gone root over a killed tree is `Ok`, and over held members still left it adds no
     /// error of its own; over a tree never settled it is [`TreeKillOutcome::no_root_error`], and over
-    /// held members that are all gone it is [`TreeKillOutcome::no_root_after_kills_error`].
+    /// an unvouched one (held members that are all gone, or left so earlier) it is
+    /// [`TreeKillOutcome::no_root_after_kills_error`].
     ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
@@ -947,11 +955,12 @@ impl Attached {
         // The state is read here and written once, at the end, so an unwind leaves it as it was.
         let held = match &*state {
             TreeState::Left(held) => held.clone(),
-            TreeState::Never | TreeState::Killed => Vec::new(),
+            TreeState::Never | TreeState::Killed | TreeState::Unvouched => Vec::new(),
         };
-        let held_any = !held.is_empty();
         let gone_root = matches!(outcome, TreeKillOutcome::NoRoot);
         let ran = matches!(outcome, TreeKillOutcome::Ran(_));
+        // What a walk not made or a gone root leaves is its error, not a member seen running.
+        let member_free = matches!(outcome, TreeKillOutcome::NoRoot | TreeKillOutcome::Unwalked(_));
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && !matches!(*state, TreeState::Never);
         let mut result = if covered { Ok(()) } else { outcome.into_result() };
@@ -962,8 +971,8 @@ impl Attached {
                 left_now = crate::containment::treewalk::Left::of(left);
             }
         }
-        if gone_root && held_any && result.is_ok() {
-            // The held members are gone, but nothing walked the tree for what they forked.
+        if gone_root && result.is_ok() && !was_killed {
+            // The members an earlier walk left are gone, but nothing walked the tree for what they forked.
             result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error()));
         }
         let unsettled = match result {
@@ -975,12 +984,17 @@ impl Attached {
         };
         // A gone root answers `Ok` only over a killed tree.
         let answers_killed = unsettled.is_ok() && (ran || gone_root);
-        *state = if unsettled.is_ok() && (ran || was_killed) {
-            TreeState::Killed
-        } else if !left_now.is_empty() {
+        let nothing_left = unsettled.is_ok();
+        *state = if !left_now.is_empty() {
             TreeState::Left(left_now)
+        } else if ran && nothing_left {
+            TreeState::Killed
         } else {
-            TreeState::Never
+            match &*state {
+                TreeState::Killed if nothing_left || member_free => TreeState::Killed,
+                TreeState::Left(_) | TreeState::Unvouched => TreeState::Unvouched,
+                TreeState::Never | TreeState::Killed => TreeState::Never,
+            }
         };
         if answers_killed {
             Ok(SettleOutcome::Killed)
@@ -1036,9 +1050,16 @@ impl Attached {
             TreeKillOutcome::Unwalked(_) => "; the root is killed regardless, so its descendants may be orphaned",
             TreeKillOutcome::Ran(_) | TreeKillOutcome::NoRoot | TreeKillOutcome::Skipped { .. } => "",
         };
-        self.settle(killed, outcome, root_ended)
-            .err()
-            .map(|left| format!("contained-tree teardown did not fully succeed: {left}{after}"))
+        let settled = self.settle(killed, outcome, root_ended);
+        let left = match settled {
+            Err(left) => left.to_string(),
+            // A settlement without an error of its own leaves the tree unvouched only when it walked nothing.
+            Ok(_) if matches!(*killed.lock(), TreeState::Unvouched) => {
+                "the members an earlier kill left are gone, and the tree could not be vouched for".to_owned()
+            }
+            Ok(_) => return None,
+        };
+        Some(format!("contained-tree teardown did not fully succeed: {left}{after}"))
     }
 
     /// Send the graceful termination signal to the group (signal-only).

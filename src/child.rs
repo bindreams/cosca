@@ -512,9 +512,10 @@ impl Child {
     /// [`Error::MemberNotKilled`] naming the first and why: its identity could not be read, or its
     /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
     /// The backstop still ran. The handle keeps the members the walk left: a later `kill_tree`, or the
-    /// drop, kills those whose identity was read again, and reports the others again. That holds whatever the later walk
-    /// finds, a root that is gone included: the answer then says the members were killed again and
-    /// the tree could not be walked.
+    /// drop, kills those whose identity was read again, and reports the others again. That holds
+    /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
+    /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
+    /// gone and the tree could not be walked: the tree cannot be vouched for again.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
