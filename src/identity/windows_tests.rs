@@ -1,6 +1,7 @@
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::Threading::{
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    PROCESS_ACCESS_RIGHTS, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
@@ -391,14 +392,22 @@ fn end(mut child: std::process::Child) {
 
 /// A second handle to `child`'s process opened with `rights` (never `PROCESS_TERMINATE`), closed
 /// on drop.
-struct Limited(windows::Win32::Foundation::HANDLE);
+struct Limited(
+    windows::Win32::Foundation::HANDLE,
+    windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+);
 
 impl Limited {
     fn of(child: &std::process::Child, rights: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS) -> Limited {
         // SAFETY: `child` is live and its handle pins the pid, so the open names this process.
         let h = unsafe { windows::Win32::System::Threading::OpenProcess(rights, false, child.id()) }
             .expect("open a limited handle on the fixture");
-        Limited(h)
+        Limited(h, rights)
+    }
+
+    /// `terminate_held` on the handle, as the one that opened it with the rights it asked for.
+    fn terminate(&self) -> super::Termination {
+        super::terminate_held(self.0, self.1)
     }
 }
 
@@ -415,7 +424,7 @@ impl Drop for Limited {
 fn a_refusal_on_a_handle_holding_terminate_is_the_exit() {
     let child = spawn_blocked_child();
     let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = super::terminate_held(handle_of(&child));
+    let outcome = super::terminate_held(handle_of(&child), PROCESS_ALL_ACCESS);
     end(child);
     assert!(
         matches!(outcome, super::Termination::Exited),
@@ -431,7 +440,7 @@ fn a_real_refusal_on_a_handle_holding_terminate_of_an_exited_process_is_the_exit
     let mut child = spawn_blocked_child();
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
-    let outcome = super::terminate_held(handle_of(&child));
+    let outcome = super::terminate_held(handle_of(&child), PROCESS_ALL_ACCESS);
     assert!(
         matches!(outcome, super::Termination::Exited),
         "got a failure or a terminate"
@@ -446,7 +455,7 @@ fn a_real_refusal_on_a_handle_holding_terminate_of_an_exited_process_is_the_exit
 fn a_refusal_on_a_handle_without_terminate_is_failed_while_the_process_runs() {
     let child = spawn_blocked_child();
     let limited = Limited::of(&child, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
-    let outcome = super::terminate_held(limited.0);
+    let outcome = limited.terminate();
     drop(limited);
     end(child);
     let super::Termination::Failed(e) = outcome else {
@@ -458,13 +467,13 @@ fn a_refusal_on_a_handle_without_terminate_is_failed_while_the_process_runs() {
 /// As above with the seam's refusal, the process being exiting but unsignalled: a handle without
 /// the right cannot show the exit.
 ///
-/// Mutant: the granted access is not read, so the seam's refusal reads as the exit.
+/// Mutant: the granted access is not consulted, so the seam's refusal reads as the exit.
 #[skuld::test]
 fn an_exiting_refusal_on_a_handle_without_terminate_is_failed_while_unsignalled() {
     let child = spawn_blocked_child();
     let limited = Limited::of(&child, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
     let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = super::terminate_held(limited.0);
+    let outcome = limited.terminate();
     drop(limited);
     end(child);
     let super::Termination::Failed(e) = outcome else {
@@ -481,7 +490,7 @@ fn an_exiting_refusal_on_a_handle_without_terminate_is_failed_while_unsignalled(
 fn a_refusal_on_a_handle_without_terminate_or_synchronize_is_failed() {
     let child = spawn_blocked_child();
     let limited = Limited::of(&child, PROCESS_QUERY_LIMITED_INFORMATION);
-    let outcome = super::terminate_held(limited.0);
+    let outcome = limited.terminate();
     drop(limited);
     end(child);
     let super::Termination::Failed(e) = outcome else {
@@ -501,7 +510,7 @@ fn a_refusal_on_a_handle_without_terminate_is_the_exit_once_the_process_is_signa
     child.kill().expect("end the fixture");
     // Reap through a real wait: the process object is signalled when this returns.
     child.wait().expect("reap the fixture");
-    let outcome = super::terminate_held(limited.0);
+    let outcome = limited.terminate();
     drop(limited);
     assert!(
         matches!(outcome, super::Termination::Exited),
@@ -520,28 +529,11 @@ fn a_refusal_on_a_handle_without_terminate_or_synchronize_is_the_exit_once_the_c
     child.kill().expect("end the fixture");
     // Reap through a real wait: the exit code is recorded when this returns.
     child.wait().expect("reap the fixture");
-    let outcome = super::terminate_held(limited.0);
+    let outcome = limited.terminate();
     drop(limited);
     assert!(
         matches!(outcome, super::Termination::Exited),
         "an exit code other than STILL_ACTIVE is the exit"
-    );
-}
-
-/// A handle whose granted access cannot be read is `Failed` with that error: the refusal is not
-/// guessed to be the exit. A null handle is a real `STATUS_INVALID_HANDLE`.
-///
-/// Mutant: a failed read of the granted access is treated as holding the right.
-#[skuld::test]
-fn a_refusal_on_a_handle_whose_rights_cannot_be_read_is_failed() {
-    let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = super::terminate_held(windows::Win32::Foundation::HANDLE::default());
-    let super::Termination::Failed(e) = outcome else {
-        panic!("a handle that cannot be read is not shown to be of an exiting process");
-    };
-    assert!(
-        !super::is_access_denied(&e),
-        "the failure is the rights read's own: {e:?}"
     );
 }
 

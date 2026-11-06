@@ -364,53 +364,19 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
     assert_eq!(crate::wait::block_probe::take(), [None], "one unbounded block");
 }
 
-/// A refused kill is recorded in the outcome whichever way the teardown goes on: after one look, or
-/// after the wait for a child a tree kill reached. The contract check reads it.
-///
-/// Mutant: only the look path records the refusal.
-#[skuld::test]
-fn a_refused_kill_is_recorded_on_every_path_that_saw_it() {
-    for reach in [Ok(true), Ok(false)] {
-        let fake = fake()
-            .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
-            .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-        let _fire = fire_on_block(&fake);
-        let reach = FakeReach::answering(reach);
-        let torn = OwnedChild::new(Box::new(fake)).tear_down(
-            Some(id()),
-            Kill {
-                disposition: Disposition::Leave,
-                tree: Some(&reach),
-            },
-            None,
-        );
-        assert_eq!(
-            torn.remains().refused,
-            Some(std::io::ErrorKind::PermissionDenied),
-            "{:?}: {torn:?}",
-            reach.asked()
-        );
-    }
-}
-
-/// A refusal is classified by what it is: a typed refusal to signal an elevated child is a refusal of
-/// permission, one of another kind is another reason, and an I/O error is its own kind.
+/// A refusal is classified by what the OS refused with: an I/O error is its own kind, any other
+/// error is another reason.
 ///
 /// Mutant: every error that is not `Io` is another reason.
 #[skuld::test]
 fn a_refusal_is_classified_by_what_it_is() {
-    use crate::error::{ElevationErrorKind, Error};
+    use crate::error::Error;
     let denied = || Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    let unkillable = || Error::Elevation {
-        kind: ElevationErrorKind::Unkillable,
-        detail: "refused".into(),
-    };
     let contained = || Error::Containment {
         detail: "refused".into(),
     };
     let kinds = [
         (denied(), std::io::ErrorKind::PermissionDenied),
-        (unkillable(), std::io::ErrorKind::PermissionDenied),
         (contained(), std::io::ErrorKind::Other),
     ];
     for (refused, kind) in kinds {

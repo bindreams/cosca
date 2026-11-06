@@ -123,36 +123,34 @@ pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
 }
 
 /// `TerminateProcess` on `handle`, a live process handle the caller closes afterwards. Never
-/// blocks.
+/// blocks. `granted` is the access the handle holds, which its opener knows (it asked for it, or
+/// read it from the handle once: [`granted_access`]).
 ///
 /// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` both a handle that lacks
 /// `PROCESS_TERMINATE` and a process that has terminated (Microsoft's `TerminateProcess` page), so
-/// the handle's own granted access, read with `NtQueryObject`, decides what a refusal means:
+/// `granted` decides what a refusal means:
 /// - It holds the right: the refusal is the exit, [`Termination::Exited`]. The refusal is already
 ///   given while the process object is not signalled yet (measured on Windows 11 26100), so
 ///   reading the signalled state instead would miss that window.
 /// - It lacks the right: only an [`exit_look`] that finds the process exited proves an exit. The
 ///   exit code is read to prove an exit, never to prove liveness, because 259 cannot be told from a
 ///   live process. Anything else is [`Termination::Failed`] with the refusal.
-///
-/// A handle whose granted access cannot be read is [`Termination::Failed`] with that error.
-pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
+pub(crate) fn terminate_held(handle: HANDLE, granted: PROCESS_ACCESS_RIGHTS) -> Termination {
     let refusal = match terminate_process(handle) {
         Ok(()) => return Termination::Terminated,
         Err(e) if !is_access_denied(&e) => return Termination::Failed(e),
         Err(e) => e,
     };
-    match granted_access(handle) {
-        Err(e) => Termination::Failed(e),
-        Ok(access) if access & PROCESS_TERMINATE.0 != 0 => Termination::Exited,
-        Ok(access) => match exit_look(handle, access & PROCESS_SYNCHRONIZE.0 != 0) {
-            Ok(Look::Exited) => Termination::Exited,
-            Ok(Look::Running) => Termination::Failed(refusal),
-            Err(e) => {
-                log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
-                Termination::Failed(refusal)
-            }
-        },
+    if granted.0 & PROCESS_TERMINATE.0 != 0 {
+        return Termination::Exited;
+    }
+    match exit_look(handle, granted.0 & PROCESS_SYNCHRONIZE.0 != 0) {
+        Ok(Look::Exited) => Termination::Exited,
+        Ok(Look::Running) => Termination::Failed(refusal),
+        Err(e) => {
+            log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
+            Termination::Failed(refusal)
+        }
     }
 }
 
@@ -197,7 +195,8 @@ pub(crate) fn exit_look(handle: HANDLE, has_synchronize: bool) -> windows::core:
     )))
 }
 
-/// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`.
+/// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`. For a handle whose
+/// opener did not choose its access (`ShellExecuteEx`'s): read it once, where the handle is taken.
 pub(crate) fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
     let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
     // SAFETY: `handle` is live; `info` is the buffer the class describes, and its size is passed.

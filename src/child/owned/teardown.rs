@@ -30,7 +30,7 @@ use std::io;
 
 use super::OwnedChild;
 use crate::child::lifecycle::{wait_to_exit, Settlement, Wording};
-use crate::error::{ChildFate, ElevationErrorKind, Error};
+use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::KillRefusal;
 use crate::os_process::child_named;
@@ -337,9 +337,10 @@ pub(crate) enum Past {
     /// `CreateProcess` or `ShellExecuteEx`, which has `SYNCHRONIZE`), so a wait on it does not fail:
     /// a child the teardown left uncollected is one whose kill was refused, and still running.
     Clean,
-    /// An earlier look on the handle failed, or may have, so a wait on it may fail too, and the
-    /// handle may be in any state: any outcome stands.
-    LookFailed,
+    /// An earlier look on the handle failed, or may have, so a wait on it may fail too: a child the
+    /// teardown left uncollected need not be one whose kill was refused. What the kill may be refused
+    /// for is the handle's.
+    WaitMayFail,
     /// As [`Clean`](Past::Clean), and the child never ran the program, so it has this process's
     /// credentials: nothing but its being gone can refuse its kill, and the teardown collects it.
     Unexecuted,
@@ -487,7 +488,7 @@ fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
         log::warn!("{line}");
     }
     debug_assert!(
-        !uncollected || past == Past::LookFailed || matches!(fate, ChildFate::Running { .. }),
+        !uncollected || past == Past::WaitMayFail || matches!(fate, ChildFate::Running { .. }),
         "a wait on a child's own handle failed: {fate:?}"
     );
     debug_assert!(
@@ -495,25 +496,20 @@ fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
         "the kill of a child that never ran the program was refused"
     );
     debug_assert!(
-        past == Past::LookFailed || refusal != KillRefusal::Never || refused.is_none(),
+        refusal != KillRefusal::Never || refused.is_none(),
         "the kill of a handle that is never refused was refused: {refused:?}"
     );
     debug_assert!(
-        past == Past::LookFailed || refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
+        refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
         "the kill of a child's own handle was refused for a reason other than permission: {refused:?}"
     );
 }
 
-/// What a refused kill was refused for: an I/O error is its own kind, and the typed refusal to
-/// signal an elevated child ([`ElevationErrorKind::Unkillable`]) is a refusal of permission (`EPERM`
-/// or `ACCESS_DENIED`, or a front, which is sent nothing). Any other error is another reason.
+/// What a refused kill was refused for: what the OS refused it with, which is an I/O error. Any other
+/// error is another reason.
 fn refusal_kind(refused: &Error) -> io::ErrorKind {
     match refused {
         Error::Io(e) => e.kind(),
-        Error::Elevation {
-            kind: ElevationErrorKind::Unkillable,
-            ..
-        } => io::ErrorKind::PermissionDenied,
         _ => io::ErrorKind::Other,
     }
 }
@@ -545,14 +541,8 @@ impl OwnedChild {
             }
             Err(refused) => match tree.map(|tree| tree.reached(self)) {
                 // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
-                // follows, so the reap is the wait that kill bounds. The refusal is recorded all the
-                // same.
-                Some(Ok(true)) => {
-                    let kind = refusal_kind(&refused);
-                    let mut torn = self.reap_after_tree_kill(disposition);
-                    torn.refused = Some(kind);
-                    torn
-                }
+                // follows, so the reap is the wait that kill bounds.
+                Some(Ok(true)) => self.reap_after_tree_kill(disposition),
                 // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
                 // is shown to be ending it.
                 _ => self.look_after_refused_kill(id, refused, disposition),

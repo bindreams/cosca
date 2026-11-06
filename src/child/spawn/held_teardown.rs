@@ -61,16 +61,16 @@ pub(crate) fn tear_down_held(
         due,
     } = how;
     let pid = child.pid();
-    // Nothing here states what became of the held child's handle, so any teardown stands.
+    // Nothing here states what became of the held child's handle, so a wait on it may fail.
     if front.is_none() {
-        let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::LookFailed, disposition, due, why);
+        let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, due, why);
         return (error, fate, unreaped);
     }
     let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
     let look = child.look_at_front(id, reach, due);
     let front_fate = FrontFate::of_look(&look.look);
     let torn = crate::child::word_front(pid, &"its spawn failed", disposition, look);
-    let (fate, unreaped) = say_failed_spawn(child, id, torn, Past::LookFailed, disposition, why);
+    let (fate, unreaped) = say_failed_spawn(child, id, torn, Past::WaitMayFail, disposition, why);
     let error = if unreaped.is_some() {
         front_fate.note_handed_back(error, front, pid)
     } else {

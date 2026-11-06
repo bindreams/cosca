@@ -111,7 +111,7 @@ In order:
      `warn_teardown`, which logs the teardown's warn, asserts (the Windows spawns' teardown,
      `held_teardown::tear_down_failed_spawn`, is told the same, and logs through it too); a front
      left to the leaf (`ToLeaf`) hands the leaf its original pidfd with the `Past`, and a child the
-     leaf holds (`LeafHeld`) hands it a copy, with `Past::LookFailed` since the handshake tears down
+     leaf holds (`LeafHeld`) hands it a copy, with `Past::WaitMayFail` since the handshake tears down
      through the original; the leaf's abandonment carries the `Expect` with the clause (`Left`) to
      where it is logged.
      Apart from these,

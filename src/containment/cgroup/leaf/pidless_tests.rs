@@ -14,7 +14,7 @@ use crate::os_process::child::KillRefusal;
 ///
 /// Each row carries the expectation its path would have: an uncollected child that is not running
 /// was left by a failed look or wait, which only a caller that knows a look failed can come to, and
-/// that caller's past is `LookFailed`; any other teardown's is what a caller that knows no look
+/// that caller's past is `WaitMayFail`; any other teardown's is what a caller that knows no look
 /// failed has, `Clean`.
 ///
 /// Mutants: every teardown of a child that never named itself answers `Ended`; an uncollected one
@@ -25,7 +25,7 @@ fn a_child_that_never_named_itself_is_ended_only_if_its_teardown_collected_it() 
     for row in rows() {
         let outcome = outcome(&row, Disposition::Leave);
         let past = if row.uncollected && !matches!(outcome.fate(), ChildFate::Running { .. }) {
-            Past::LookFailed
+            Past::WaitMayFail
         } else {
             Past::Clean
         };

@@ -16,7 +16,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Threading::{WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_ALL_ACCESS};
 
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
@@ -46,6 +46,8 @@ use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 #[derive(Debug)]
 pub(crate) struct RawAsyncChild {
     proc: Arc<OwnedHandle>,
+    /// The access `proc` was granted: it decides what a refused kill means.
+    granted: PROCESS_ACCESS_RIGHTS,
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
     /// re-read a status off a (post-close) recycled handle.
     exited: Option<ExitStatus>,
@@ -54,9 +56,11 @@ pub(crate) struct RawAsyncChild {
 }
 
 impl RawAsyncChild {
-    pub(crate) fn new(proc: OwnedHandle) -> RawAsyncChild {
+    /// The child whose process handle is `proc`, which holds `granted`.
+    pub(crate) fn new(proc: OwnedHandle, granted: PROCESS_ACCESS_RIGHTS) -> RawAsyncChild {
         RawAsyncChild {
             proc: Arc::new(proc),
+            granted,
             exited: None,
             #[cfg(test)]
             observer: None,
@@ -158,7 +162,7 @@ impl RawAsyncChild {
     pub(crate) fn start_kill(&self) -> Result<(), Error> {
         // Signal-only, never block. A handle without `PROCESS_TERMINATE` (a runas child we cannot
         // terminate) surfaces as `Io`.
-        match windows_terminate_held(self.handle()) {
+        match windows_terminate_held(self.handle(), self.granted) {
             Termination::Terminated | Termination::Exited => Ok(()),
             Termination::Failed(e) => Err(Error::Io(win32_io_error(e))),
         }
@@ -338,7 +342,8 @@ pub(crate) fn spawn_raw(
     };
 
     Ok(Child::from_parts(
-        ProcSource::Raw(RawAsyncChild::new(proc)),
+        // `CreateProcess`'s handle holds every right.
+        ProcSource::Raw(RawAsyncChild::new(proc, PROCESS_ALL_ACCESS)),
         id,
         kill_on_drop,
         attachment,

@@ -133,7 +133,11 @@ impl FakeProcess {
 
     /// Answer `refusal` to [`OsChild::kill_refusal`]. Without it, a fake over a real child answers
     /// that child's, and any other panics.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows rows state a handle's refusal")
+    )]
     pub(crate) fn with_kill_refusal(self, refusal: KillRefusal) -> Self {
         self.script().kill_refusal = Some(refusal);
         self

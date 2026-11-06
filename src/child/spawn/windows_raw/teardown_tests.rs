@@ -312,7 +312,7 @@ fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_kille
         let (child, fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
         crate::log_capture::install();
         let mark = crate::log_capture::mark();
-        let (fate, unreaped) = after_a_failed_spawn(child, None, Past::LookFailed, disposition, None);
+        let (fate, unreaped) = after_a_failed_spawn(child, None, Past::WaitMayFail, disposition, None);
         assert_eq!(fate, ChildFate::Killed, "{disposition:?}");
         assert_eq!(
             unreaped.is_some(),
@@ -441,27 +441,42 @@ fn a_kill_refused_for_another_reason_than_permission_breaks_the_contract() {
     after_a_failed_spawn(child, None, Past::Clean, Disposition::Leave, None);
 }
 
-/// A caller that knows a look on its handle failed expects nothing of the teardown: the same refusals
-/// are no breach, of a handle that is never refused or one that may be refused for permission.
+/// What a handle may be refused for is its constructor's, not its past's: a look that failed excuses a
+/// failed wait, and no refusal against the handle's allowance.
 ///
-/// Mutant: `Past::LookFailed` asserts like `Past::Clean`.
+/// Mutant: `Past::WaitMayFail` waives the check of a refusal against what the handle allows.
+#[cfg(debug_assertions)]
 #[skuld::test]
-fn a_kill_refused_against_the_allowance_is_no_breach_when_a_look_failed() {
+#[should_panic(expected = "never refused")]
+fn a_failed_look_does_not_excuse_a_refusal_of_a_handle_that_is_never_refused() {
     crate::log_capture::install();
-    for (refusal, kind) in [
-        (KillRefusal::Permission, std::io::ErrorKind::Other),
-        (KillRefusal::Never, std::io::ErrorKind::PermissionDenied),
-    ] {
-        let fake = FakeProcess::new([])
-            .with_kill_refusal(refusal)
-            .reaps([ReapAnswer::Reaped(ExitRecord::Status(
-                std::process::ExitStatus::default(),
-            ))])
-            .signals([Err(std::io::Error::from(kind))]);
-        let (child, _fake) = owned(fake);
-        let (fate, _) = after_a_failed_spawn(child, None, Past::LookFailed, Disposition::Leave, None);
-        assert_eq!(fate, ChildFate::Reaped, "{refusal:?}, {kind:?}");
-    }
+    let fake = FakeProcess::new([])
+        .with_kill_refusal(KillRefusal::Never)
+        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+            std::process::ExitStatus::default(),
+        ))])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let (child, _fake) = owned(fake);
+    after_a_failed_spawn(child, None, Past::WaitMayFail, Disposition::Leave, None);
+}
+
+/// The same for a refusal for a reason other than permission, of a handle that may be refused for
+/// permission.
+///
+/// Mutant: `Past::WaitMayFail` waives the check of a refusal's kind.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "refused for a reason other than permission")]
+fn a_failed_look_does_not_excuse_a_refusal_for_another_reason_than_permission() {
+    crate::log_capture::install();
+    let fake = FakeProcess::new([])
+        .with_kill_refusal(KillRefusal::Permission)
+        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+            std::process::ExitStatus::default(),
+        ))])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::Other))]);
+    let (child, _fake) = owned(fake);
+    after_a_failed_spawn(child, None, Past::WaitMayFail, Disposition::Leave, None);
 }
 
 /// A failed spawn that hands its child back, whose `TerminateProcess` is denied on a live child (a UAC

@@ -5,10 +5,12 @@
 //! whose hook takes an argument and answers with a value uses [`arm_with`]/[`fire_with`].
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::LocalKey;
 
-/// One armed hook, tagged with the generation that armed it.
-type Slot<A, R> = Option<(u64, Box<dyn FnOnce(A) -> R>)>;
+/// One armed hook, tagged with the generation that armed it and the flag its guard reads.
+type Slot<A, R> = Option<(u64, Arc<AtomicBool>, Box<dyn FnOnce(A) -> R>)>;
 
 /// The slot behind one seam, whose hook is given an `A` and answers an `R`. `const`-constructible,
 /// for `thread_local!`.
@@ -38,14 +40,18 @@ pub(crate) fn arm_with<A: 'static, R: 'static>(
     key: &'static LocalKey<OneShotHook<A, R>>,
     hook: impl FnOnce(A) -> R + 'static,
 ) -> Armed<A, R> {
+    let fired = Arc::new(AtomicBool::new(false));
     let generation = key.with(|h| {
         let generation = h.generation.get() + 1;
         h.generation.set(generation);
-        let previous = h.slot.borrow_mut().replace((generation, Box::new(hook)));
+        let previous = h
+            .slot
+            .borrow_mut()
+            .replace((generation, Arc::clone(&fired), Box::new(hook)));
         debug_assert!(previous.is_none(), "a one-shot hook is already armed");
         generation
     });
-    Armed { key, generation }
+    Armed { key, generation, fired }
 }
 
 /// Run and disarm `key`'s hook. Does nothing when it has already fired or was never armed.
@@ -56,7 +62,10 @@ pub(crate) fn fire(key: &'static LocalKey<OneShotHook>) {
 /// [`fire`] for a hook given `arg`: its answer, or `None` when there was no hook to run.
 pub(crate) fn fire_with<A: 'static, R: 'static>(key: &'static LocalKey<OneShotHook<A, R>>, arg: A) -> Option<R> {
     let taken = key.with(|h| h.slot.borrow_mut().take());
-    taken.map(|(_, hook)| hook(arg))
+    taken.map(|(_, fired, hook)| {
+        fired.store(true, Ordering::Relaxed);
+        hook(arg)
+    })
 }
 
 /// Clears the hook it armed, and only that one: a hook armed after this guard's fired stays.
@@ -64,6 +73,8 @@ pub(crate) fn fire_with<A: 'static, R: 'static>(key: &'static LocalKey<OneShotHo
 pub(crate) struct Armed<A: 'static = (), R: 'static = ()> {
     key: &'static LocalKey<OneShotHook<A, R>>,
     generation: u64,
+    /// Set by the fire of this guard's hook, and by nothing else.
+    fired: Arc<AtomicBool>,
 }
 
 impl<A: 'static, R: 'static> Armed<A, R> {
@@ -71,11 +82,8 @@ impl<A: 'static, R: 'static> Armed<A, R> {
     /// reached asserts it.
     #[track_caller]
     pub(crate) fn assert_fired(&self) {
-        let pending = self
-            .key
-            .with(|h| matches!(&*h.slot.borrow(), Some((generation, _)) if *generation == self.generation));
         assert!(
-            !pending,
+            self.fired.load(Ordering::Relaxed),
             "the armed one-shot hook never fired: its fire point was not reached"
         );
     }
@@ -86,7 +94,7 @@ impl<A: 'static, R: 'static> Drop for Armed<A, R> {
         let mine = self.key.with(|h| {
             let mut slot = h.slot.borrow_mut();
             match &*slot {
-                Some((generation, _)) if *generation == self.generation => slot.take(),
+                Some((generation, ..)) if *generation == self.generation => slot.take(),
                 _ => None,
             }
         });

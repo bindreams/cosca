@@ -1130,12 +1130,12 @@ impl CgroupLeaf {
         // A child that never named itself is no front, and a pidfd alone can reap it. Whether it
         // ran the program is the handshake's to say, with its pidfd's `Past`; the child's own
         // intent pidfd (`handed` is `None`) establishes neither that nor that no look failed:
-        // anything stands.
+        // a wait on it may fail.
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let past = handed.unwrap_or(Past::LookFailed);
+                let past = handed.unwrap_or(Past::WaitMayFail);
                 let torn = tear_down_pidfd(None, pidfd, None, past, warn.due());
                 return Abandoned::after_pidless_teardown(torn);
             }

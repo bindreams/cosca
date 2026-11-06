@@ -574,7 +574,10 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let Some((pid, id)) = tracked else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle));
+        let (detail, fate) = untracked_outcome(
+            pid,
+            windows_terminate_held(handle, crate::os_process::windows::uac_access(handle)),
+        );
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,

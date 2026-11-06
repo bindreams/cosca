@@ -469,12 +469,12 @@ fn a_refused_kill_of_a_child_that_never_ran_breaks_the_contract() {
 /// A caller that knows a look on the pidfd failed expects nothing of a wait on it: the same
 /// teardown is no breach.
 ///
-/// Mutant: `Past::LookFailed` asserts like `Past::Clean`.
+/// Mutant: `Past::WaitMayFail` asserts like `Past::Clean`.
 #[skuld::test]
 fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    after_a_failed_wait(Past::LookFailed).say_as_failed_spawn(&mut Diagnosis::default());
+    after_a_failed_wait(Past::WaitMayFail).say_as_failed_spawn(&mut Diagnosis::default());
     assert_eq!(warns_since(mark).len(), 1);
 }
 

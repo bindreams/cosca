@@ -554,7 +554,7 @@ fn an_uncollected_child_is_said_left_by_its_teardown_not_out_of_the_leafs_reach(
     let uncollected = |fate| {
         let expect = Expect {
             refusal: KillRefusal::Permission,
-            past: Past::LookFailed,
+            past: Past::WaitMayFail,
         };
         let torn = HandleTeardown::new(TeardownOutcome::left_uncollected(fate, clause.into()), expect);
         AbandonedChild::Uncollected(torn.uncollected().expect("an uncollected teardown is left"))

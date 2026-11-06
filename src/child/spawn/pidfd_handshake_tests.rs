@@ -1588,7 +1588,7 @@ fn the_leafs_copy_of_a_pidfd_the_handshake_ends_through_expects_anything() {
         "the handshake ended the child through the original"
     );
     let (_copy, past) = left.take().expect("the leaf holds a copy");
-    assert_eq!(past, crate::child::owned::teardown::Past::LookFailed);
+    assert_eq!(past, crate::child::owned::teardown::Past::WaitMayFail);
     drop(cat.stdin.take());
 }
 

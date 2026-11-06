@@ -884,13 +884,13 @@ fn conclude<T: Spawned>(
         use std::os::fd::AsFd as _;
         // A child std collected never ran the program. A peek that fails tells nothing, so the
         // child is taken for a front still there, which is sent nothing; and a look on the pidfd
-        // having failed, a wait on it may too.
+        // having failed, a wait on it may fail too.
         let (collected, past) = match peek(&Target::PidFd(pidfd.as_fd())) {
             Ok(PeekOutcome::Foreign(_)) => (true, Past::Clean),
             Ok(_) => (false, Past::Clean),
             Err(e) => {
                 log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
-                (false, Past::LookFailed)
+                (false, Past::WaitMayFail)
             }
         };
         let teardown =
@@ -925,10 +925,10 @@ fn conclude<T: Spawned>(
             }
             LeftFront::LeafHeld(leaf) => {
                 // The leaf's copy names a child this teardown, through the original, is about to
-                // wait for: if that wait fails, so may the leaf's later one on the same child, so
-                // the copy's teardown may come to anything. `past` is the original's, not its.
+                // wait for: if that wait fails, so may the leaf's later one on the same child.
+                // `past` is the original's, not the copy's.
                 match pidfd.try_clone() {
-                    Ok(copy) => leaf.set(Some((copy, Past::LookFailed))),
+                    Ok(copy) => leaf.set(Some((copy, Past::WaitMayFail))),
                     Err(e) => log::debug!("a failed spawn's pidfd could not be copied for its cgroup leaf ({e})"),
                 }
                 (error, teardown(pidfd).fate)

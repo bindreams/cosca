@@ -259,7 +259,7 @@ async fn async_raw_refusals_before_create_process_did_not_start() {
 fn a_failed_start_kill_is_reported_as_its_win32_code() {
     use crate::tokio::spawn::windows_raw::RawAsyncChild;
     let event = crate::os_process::windows::cancel::new_cancel_event().expect("create an event");
-    let child = RawAsyncChild::new(event);
+    let child = RawAsyncChild::new(event, windows::Win32::System::Threading::PROCESS_ALL_ACCESS);
     let err = child.start_kill().expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
@@ -298,7 +298,10 @@ fn start_kill_of_a_handle_without_terminate_to_an_exited_child_succeeds() {
     }
     .expect("open without PROCESS_TERMINATE");
     // SAFETY: `limited` is a fresh owned handle.
-    let child = RawAsyncChild::new(unsafe { OwnedHandle::from_raw_handle(limited.0) });
+    let child = RawAsyncChild::new(
+        unsafe { OwnedHandle::from_raw_handle(limited.0) },
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    );
     child
         .start_kill()
         .expect("a signalled process is the exit, not a denial");
@@ -333,7 +336,10 @@ fn start_kill_of_a_handle_without_terminate_to_a_live_child_is_denied() {
     }
     .expect("open without PROCESS_TERMINATE");
     // SAFETY: `limited` is a fresh owned handle.
-    let child = RawAsyncChild::new(unsafe { OwnedHandle::from_raw_handle(limited.0) });
+    let child = RawAsyncChild::new(
+        unsafe { OwnedHandle::from_raw_handle(limited.0) },
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    );
     let result = child.start_kill();
     std_child.kill().expect("end the fixture");
     std_child.wait().expect("reap the fixture");

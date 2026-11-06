@@ -57,7 +57,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             use crate::elevation::windows::{launch_runas, RunasOutcome};
             match launch_runas(&*cmd)? {
                 RunasOutcome::Launched { proc, id, report, .. } => {
-                    let raw = windows_raw::RawAsyncChild::new(proc);
+                    let granted = crate::os_process::windows::uac_access(windows::Win32::Foundation::HANDLE(
+                        std::os::windows::io::AsRawHandle::as_raw_handle(&proc),
+                    ));
+                    let raw = windows_raw::RawAsyncChild::new(proc, granted);
                     let mut child = Child::from_parts(
                         ProcSource::Raw(raw),
                         id,

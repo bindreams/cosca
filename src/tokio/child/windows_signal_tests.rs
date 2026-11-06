@@ -76,7 +76,7 @@ async fn a_kill_of_an_exited_child_through_an_unwaitable_handle_is_a_success() {
         )
     }
     .expect("duplicate the child's handle without SYNCHRONIZE");
-    let result = terminate_unreaped(limited);
+    let result = terminate_unreaped(limited, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 
@@ -100,7 +100,11 @@ fn a_terminate_failure_carries_its_win32_code() {
     use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 
     let event = crate::os_process::windows::cancel::new_cancel_event().expect("create an event");
-    let err = terminate_unreaped(HANDLE(event.as_raw_handle())).expect_err("an event cannot be terminated");
+    let err = terminate_unreaped(
+        HANDLE(event.as_raw_handle()),
+        windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
+    )
+    .expect_err("an event cannot be terminated");
     let crate::error::Error::Io(err) = err else {
         panic!("expected Io, got {err:?}");
     };
@@ -138,7 +142,7 @@ fn a_denied_terminate_of_an_unwaitable_handle_carries_its_win32_code() {
         )
     }
     .expect("duplicate this process's handle with reduced access");
-    let result = terminate_unreaped(limited);
+    let result = terminate_unreaped(limited, PROCESS_QUERY_LIMITED_INFORMATION);
     // SAFETY: `limited` is the owned duplicate made above.
     unsafe { CloseHandle(limited) }.expect("close the duplicate");
 

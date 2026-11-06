@@ -399,7 +399,7 @@ fn callers() -> Vec<(&'static str, Say)> {
         // Any outcome of the table stands: a look on the handle failed.
         let expect = Expect {
             refusal: KillRefusal::Permission,
-            past: Past::LookFailed,
+            past: Past::WaitMayFail,
         };
         HandleTeardown::new(torn, expect).say_as_failed_spawn(&mut crate::child::spawn::Diagnosis::default());
     }));

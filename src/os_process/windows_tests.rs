@@ -138,17 +138,40 @@ fn the_wait_is_on_the_opened_process_handle() {
 fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
-    let p = super::WindowsProcess {
-        pid: std::process::id(),
-        handle: super::cancel::new_cancel_event().expect("create an event handle"),
-        has_synchronize: true,
-        can_terminate: true,
-    };
+    let p = super::WindowsProcess::for_child(
+        super::cancel::new_cancel_event().expect("create an event handle"),
+        std::process::id(),
+    );
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
     let Error::Io(io) = err else {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// A UAC handle that was not granted `SYNCHRONIZE` cannot be waited on: its look reads the exit code,
+/// which refuses to show a running process, where a handle granted it reads `Running`.
+///
+/// Mutant: `for_uac` takes `SYNCHRONIZE` for granted whatever the handle was granted.
+#[skuld::test]
+fn a_uac_handle_without_synchronize_looks_by_the_exit_code() {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+
+    let (child, _stdin, id) = blocker();
+    // SAFETY: plain `OpenProcess` on the live pid `child` pins.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, id.pid()) }
+        .expect("open without SYNCHRONIZE");
+    // SAFETY: `handle` is a fresh owned handle from `OpenProcess`.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let p = super::WindowsProcess::for_uac(handle, id.pid());
+    let looked = p.exited();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let Err(Error::Io(io)) = looked else {
+        panic!("a handle that cannot be waited on does not show a running process: {looked:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
 }
 
 /// A kill of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the

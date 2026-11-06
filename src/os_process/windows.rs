@@ -9,7 +9,9 @@
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+use windows::Win32::System::Threading::{
+    PROCESS_ACCESS_RIGHTS, PROCESS_ALL_ACCESS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
 
 use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
@@ -27,10 +29,9 @@ pub(crate) mod cancel;
 pub(crate) struct WindowsProcess {
     pid: u32,
     handle: OwnedHandle,
-    /// Whether the handle was granted `SYNCHRONIZE`: it decides how a look reads the exit.
-    has_synchronize: bool,
-    /// Whether the handle was granted `PROCESS_TERMINATE`: it decides what a refused kill means.
-    can_terminate: bool,
+    /// The access the handle was granted: `SYNCHRONIZE` decides how a look reads the exit, and
+    /// `PROCESS_TERMINATE` what a refused kill means.
+    granted: PROCESS_ACCESS_RIGHTS,
 }
 
 impl WindowsProcess {
@@ -45,8 +46,7 @@ impl WindowsProcess {
             pid: id.pid(),
             // SAFETY: `open_verified` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
-            has_synchronize: granted.0 & PROCESS_SYNCHRONIZE.0 != 0,
-            can_terminate: granted.0 & PROCESS_TERMINATE.0 != 0,
+            granted,
         }))
     }
 
@@ -56,32 +56,36 @@ impl WindowsProcess {
         Self {
             pid,
             handle,
-            has_synchronize: true,
-            can_terminate: true,
+            granted: PROCESS_ALL_ACCESS,
         }
     }
 
-    /// The child `pid` that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned.
-    /// That handle carries `SYNCHRONIZE`, and `PROCESS_TERMINATE` only as it was granted: the access
-    /// is read from the handle, and one that cannot be read is taken to lack it.
+    /// The child `pid` that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned,
+    /// with the access that handle was granted ([`uac_access`]).
     pub(crate) fn for_uac(handle: OwnedHandle, pid: u32) -> Self {
-        let can_terminate = match windows_granted_access(HANDLE(handle.as_raw_handle())) {
-            Ok(access) => access & PROCESS_TERMINATE.0 != 0,
-            Err(e) => {
-                log::debug!("wait: the access granted to the elevated child {pid}'s handle could not be read ({e})");
-                false
-            }
-        };
-        Self {
-            pid,
-            handle,
-            has_synchronize: true,
-            can_terminate,
-        }
+        let granted = uac_access(HANDLE(handle.as_raw_handle()));
+        Self { pid, handle, granted }
     }
 
     fn raw(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
+    }
+
+    fn has_synchronize(&self) -> bool {
+        self.granted.0 & PROCESS_SYNCHRONIZE.0 != 0
+    }
+}
+
+/// The access the process handle `ShellExecuteEx` returned was granted, read from the handle once.
+/// One whose access cannot be read is taken to hold `SYNCHRONIZE` (a UAC child's handle is waited on)
+/// and no more, so a refused kill of it is a refusal of permission.
+pub(crate) fn uac_access(handle: HANDLE) -> PROCESS_ACCESS_RIGHTS {
+    match windows_granted_access(handle) {
+        Ok(access) => PROCESS_ACCESS_RIGHTS(access),
+        Err(e) => {
+            log::debug!("wait: the access granted to an elevated child's handle could not be read ({e})");
+            PROCESS_SYNCHRONIZE
+        }
     }
 }
 
@@ -166,7 +170,7 @@ pub(super) fn terminate_unsupported() -> Error {
 impl OsProcess for WindowsProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match sig {
-            Sig::Kill => match windows_terminate_held(self.raw()) {
+            Sig::Kill => match windows_terminate_held(self.raw(), self.granted) {
                 Termination::Terminated => Ok(Sent::Delivered),
                 Termination::Exited => Ok(Sent::Gone),
                 // The caller that goes on to report the refusal warns of it: a refusal warns once.
@@ -179,7 +183,7 @@ impl OsProcess for WindowsProcess {
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        match windows_exit_look(self.raw(), self.has_synchronize) {
+        match windows_exit_look(self.raw(), self.has_synchronize()) {
             Ok(Look::Exited) => Ok(Exit::Exited),
             // `exit_look` reports a running process only for a handle that can be waited on.
             Ok(Look::Running) => Ok(Exit::Running(WaitFor::Signalled(self.handle.as_handle()))),
@@ -198,7 +202,7 @@ impl OsChild for WindowsProcess {
     }
 
     fn kill_refusal(&self) -> KillRefusal {
-        if self.can_terminate {
+        if self.granted.0 & PROCESS_TERMINATE.0 != 0 {
             KillRefusal::Never
         } else {
             KillRefusal::Permission
@@ -206,12 +210,12 @@ impl OsChild for WindowsProcess {
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        debug_assert!(self.has_synchronize, "a child's handle can be waited on");
+        debug_assert!(self.has_synchronize(), "a child's handle can be waited on");
         exit_only::peek(&Target::Handle(self.handle.as_handle())).map_err(Error::Io)
     }
 
     fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
-        debug_assert!(self.has_synchronize, "a child's handle can be waited on");
+        debug_assert!(self.has_synchronize(), "a child's handle can be waited on");
         let handle = self.handle.as_handle();
         Ok(match exit_only::try_reap(&Target::Handle(handle)).map_err(Error::Io)? {
             Reap::Reaped(record) => TryReapOutcome::Reaped(record),
