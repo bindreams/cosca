@@ -5,7 +5,6 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::child::owned::seams;
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -255,7 +254,7 @@ pub(super) fn spawn_waiter<T: Send + 'static>(
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
     let owned = Arc::clone(owned);
     let thread = std::thread::spawn(move || {
-        let _hook = seams::on_condvar_block(move || {
+        let _hook = crate::wait::block_probe::on_condvar_block(move || {
             _ = blocked_tx.send(());
         });
         body(&owned)

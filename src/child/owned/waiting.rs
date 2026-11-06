@@ -48,15 +48,15 @@ impl OwnedChild {
     /// One `Condvar` block, under the lock: `remaining` is clamped, and the caller decides expiry
     /// from the clock after the wake.
     fn block<'a>(&'a self, lock: Guard<'a>, remaining: Option<Duration>) -> Guard<'a> {
-        #[cfg(test)]
-        super::seams::before_condvar_block(remaining);
         let Some(remaining) = remaining else {
+            #[cfg(test)]
+            crate::wait::block_probe::record_condvar_block(None);
             return self.cv_wait(lock);
         };
         let armed = crate::wait::clamp_block(remaining);
         debug_assert!(armed <= remaining, "a block was armed longer than the time remaining");
         #[cfg(test)]
-        crate::wait::block_probe::record(Some(armed));
+        crate::wait::block_probe::record_condvar_block(Some(armed));
         #[cfg(test)]
         let started = Instant::now();
         let lock = self.cv_wait_timeout(lock, armed);
