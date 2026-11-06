@@ -7,6 +7,7 @@
 //! status.
 
 use crate::child::front_cgroup_tests::pidfd_of;
+use crate::containment::dispatch::Unkilled;
 use crate::error::Error;
 use crate::identity::{
     ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
@@ -19,11 +20,21 @@ use crate::Recursive;
 
 use super::treewalk_pidfs_tests::{children_of, descendants};
 
-/// An identity for this process's pid that this process no longer holds: its children are the
-/// children of the pid's new owner.
-fn stale_root() -> ProcessId {
-    let me = ProcessId::current();
-    me.with_other_value()
+/// `result` is the error of a walk that left `pid` unkilled because its identity could not be read
+/// ([`Error::Unassessable`]), and its message says each of `causes`.
+#[track_caller]
+fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
+    match result {
+        Err(Error::MemberNotKilled { pid: named, source, .. }) => {
+            assert_eq!(named, pid, "the first member left behind");
+            assert!(matches!(*source, Error::Unassessable { .. }), "{source:?}");
+            let said = source.to_string();
+            for cause in causes {
+                assert!(said.contains(cause), "the error must name {cause:?}: {said}");
+            }
+        }
+        other => panic!("expected MemberNotKilled for pid {pid} naming {causes:?}, got {other:?}"),
+    }
 }
 
 fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
@@ -68,7 +79,9 @@ type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
 /// The walks that take an identity.
 fn id_walks() -> [(&'static str, Walk); 2] {
     [
-        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("hard_kill", |k, id| {
+            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
+        }),
         ("terminate", |k, id| super::terminate(k, id)),
     ]
 }
@@ -76,7 +89,9 @@ fn id_walks() -> [(&'static str, Walk); 2] {
 /// Every walk, `Process`'s included, over an open handle on the live `id`.
 fn walks() -> [(&'static str, Walk); 4] {
     [
-        ("hard_kill", |k, id| super::hard_kill(k, id).map(|_| ())),
+        ("hard_kill", |k, id| {
+            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
+        }),
         ("terminate", |k, id| super::terminate(k, id)),
         ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
         ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
@@ -156,14 +171,25 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 // The anchor guards the walk =====
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own, and are never signalled. Mutant: "walk without an anchor". A stale identity cannot be
-/// opened, so only the identity-level walks run.
+/// its own, and are never signalled. The signal-only walks are `Ok`; the kills killed nothing, and
+/// are `Unassessable` (`Process::kill_tree` included, which has no handle to settle it). Mutants:
+/// "walk without an anchor"; "a kill that found no root is `Ok`".
 #[skuld::test]
-fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
-    for (name, walk) in id_walks() {
-        let (child, _) = live_member();
-        let result = walk(&HostKernel, stale_root());
-        assert!(result.is_ok(), "{name}: {result:?}");
+fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unassessable() {
+    for (name, walk) in walks() {
+        let (child, id) = live_member();
+        // The `/proc` path: the root's `stat` shows another start time, as its pid's new owner's.
+        let id = ticks_id(id.pid());
+        let pid = id.pid();
+        let kernel = FakeKernel::over(&HostKernel)
+            .live_without_pidfs(pid, pidfd_of(pid))
+            .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
+        let result = walk(&kernel, id);
+        if name.contains("kill") {
+            assert_unassessable_naming(result, &["no walk ran"]);
+        } else {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
         release(child);
     }
 }
@@ -218,7 +244,7 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
         let pids: Vec<u32> = members.iter().map(ProcessId::pid).collect();
         assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
-    assert!(super::hard_kill(&kernel, root).expect("the walk ran"));
+    super::hard_kill(&kernel, root).into_result().expect("the walk ran");
     // Both were killed: the root by its signal, the descendant before it could print.
     let mut printed = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut printed).expect("read to EOF");
@@ -228,32 +254,36 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
 
 // The per-pid reads go through the walk's kernel =====
 
-/// A pid the kernel refuses to read is dropped from the walk and warned about, as a pid it cannot
-/// find would be. Mutant: "`resolve_or_drop` resolves through `HostKernel`".
+/// A pid the kernel refuses to read is an error, as a pid it cannot find would not be, and the walk
+/// itself says nothing of it: its caller reports it, once. Mutant: "`resolve_or_drop` resolves
+/// through `HostKernel`"; "`resolve_or_drop` warns" (the first member left behind is then reported
+/// twice, by the walk and by the error that names it).
 #[skuld::test]
-fn a_pid_the_kernel_cannot_read_is_dropped_and_warned_about() {
+fn a_pid_the_kernel_cannot_read_is_an_error_the_walk_does_not_warn_of() {
     crate::log_capture::install();
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None).is_err());
-    let warned = crate::log_capture::records_since_on_current_thread(
-        mark,
-        &format!("pid {} exists but could not be queried", id.pid()),
+    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None)
+    else {
+        panic!("an unreadable pid is Unassessable");
+    };
+    assert!(
+        detail.contains(&format!("pid {} exists but could not be queried", id.pid())),
+        "{detail}"
     );
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert_eq!(warned[0].0, log::Level::Warn);
+    let warned = crate::log_capture::records_since_on_current_thread(mark, "treewalk:");
+    assert_eq!(warned, [], "the walk's caller reports the member");
     release(child);
 }
 
-/// The warn names why the read failed when the read knows, so an unreadable view is not reported as
-/// access. The candidate's own read fails with the view, and its parent is held, so the warn names
+/// The error names why the read failed when the read knows, so an unreadable view is not reported as
+/// access. The candidate's own read fails with the view, and its parent is held, so the error names
 /// the candidate and its cause.
-/// Mutants: "`resolve_or_drop` drops the cause": the warn says "access denied?"; "a held parent's
-/// proof blames the parent": the warn names `ppid`.
+/// Mutants: "`resolve_or_drop` drops the cause": the error says "access denied?"; "a held parent's
+/// proof blames the parent": the error names `ppid`.
 #[skuld::test]
-fn the_warn_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_parent() {
-    crate::log_capture::install();
+fn the_error_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_parent() {
     let (child, id) = live_member();
     let me = ProcessId::current();
     let parent = ProcessId::from_parts_for_test(me.pid(), Key::Pidfs(9));
@@ -263,43 +293,38 @@ fn the_warn_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_paren
             .on_pidfs_ino(me.pid(), Ok(Some(9))),
         0,
     );
-    let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, None).is_err());
-    let warned = crate::log_capture::records_since_on_current_thread(
-        mark,
-        &format!("pid {} identity could not be read", id.pid()),
-    );
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].1.contains(View::Unreadable.cause()), "{warned:?}");
-    assert!(!warned[0].1.contains("access denied?"), "{warned:?}");
-    assert!(!warned[0].1.contains("ppid"), "{warned:?}");
+    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), parent, None) else {
+        panic!("an unreadable pid is Unassessable");
+    };
     assert!(
-        !warned[0].1.contains(&format!("pid {} dropped", id.pid())),
-        "{warned:?}"
+        detail.contains(&format!("pid {} identity could not be read", id.pid())),
+        "{detail}"
     );
+    assert!(detail.contains(View::Unreadable.cause()), "{detail}");
+    assert!(!detail.contains("access denied?"), "{detail}");
+    assert!(!detail.contains("ppid") && !detail.contains("reading pid"), "{detail}");
     release(child);
 }
 
 /// The view fails every read, the parent's proof too (a `Ticks` id is proved by its `stat`), so the
-/// warn blames the parent and names the dropped candidate after it. Mutants: "`resolve_or_drop`
-/// drops the cause"; "`resolve_or_drop` does not name the dropped candidate": no `pid N dropped`.
+/// error blames the parent, and says which candidate's read was left unanswered. Mutants:
+/// "`resolve_or_drop` drops the cause"; "the error does not name the candidate".
 #[skuld::test]
-fn the_warn_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
-    crate::log_capture::install();
+fn the_error_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
     let (child, id) = live_member();
     let me = ProcessId::current();
     let parent = ticks_id(me.pid());
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
-    let mark = crate::log_capture::mark();
-    assert!(super::resolve_or_drop(&kernel, id.pid(), parent, None).is_err());
-    let warned = crate::log_capture::records_since_on_current_thread(
-        mark,
-        &format!("ppid {} identity could not be read", me.pid()),
+    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), parent, None) else {
+        panic!("an unreadable parent proof is Unassessable");
+    };
+    assert!(
+        detail.contains(&format!("ppid {} identity could not be read", me.pid())),
+        "{detail}"
     );
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].1.contains(View::Unreadable.cause()), "{warned:?}");
-    assert!(!warned[0].1.contains("access denied?"), "{warned:?}");
-    assert!(warned[0].1.contains(&format!("pid {} dropped", id.pid())), "{warned:?}");
+    assert!(detail.contains(&format!("reading pid {}", id.pid())), "{detail}");
+    assert!(detail.contains(View::Unreadable.cause()), "{detail}");
+    assert!(!detail.contains("access denied?"), "{detail}");
     release(child);
 }
 
@@ -335,17 +360,13 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
     let unreadable_kernel = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Err(libc::EACCES));
-    assert_eq!(
-        super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::NotAttempted
-    );
+    let outcome = super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::NotAttempted(_)), "{outcome:?}");
     let new_owner = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
-    assert_eq!(
-        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
-    );
+    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
 
@@ -359,15 +380,24 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     let pid = id.pid();
     let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
     let refusing = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
+    // The reason is the refusal's own, so an error built from it names the process and why.
+    let outcome = super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM);
+    let super::KillOutcome::NotAttempted(why) = outcome else {
+        panic!("expected NotAttempted, got {outcome:?}");
+    };
+    // An identity that could not be read is `Unassessable`, with the refusal as its source.
+    let Error::Unassessable { detail, source } = &why else {
+        panic!("expected Unassessable, got {why:?}");
+    };
+    assert!(detail.contains("pidfd"), "{detail}");
     assert_eq!(
-        super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::NotAttempted
+        source.as_ref().and_then(std::io::Error::raw_os_error),
+        Some(libc::EMFILE),
+        "{why:?}"
     );
     let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
-    assert_eq!(
-        super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM),
-        super::KillOutcome::AlreadyGone
-    );
+    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
 
@@ -445,11 +475,16 @@ fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, sign
 /// second read, which the row lets through), "the descendant loop's kill re-verifies through
 /// `HostKernel`", "the kill ignores a start time that differs", each in `hard_kill` and in
 /// `terminate`: the descendant is signalled.
+///
+/// A member whose identity cannot be read at kill time is `Unassessable`. `hard_kill` returns it and
+/// warns of nothing; `terminate`, which cannot, warns.
 #[skuld::test]
 fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
+    crate::log_capture::install();
     for ((name, walk), signo) in id_walks().into_iter().zip([libc::SIGKILL, libc::SIGTERM]) {
         for shows_a_new_owner in [false, true] {
             let (child, root, descendant) = live_member_with_descendant();
+            let mark = crate::log_capture::mark();
             // The `/proc` path: the walk's ids are `starttime` ids.
             let root = ticks_id(root.pid());
             let new_owner = stat_of_a_new_owner(descendant.pid());
@@ -463,7 +498,23 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
                 .live_without_pidfs(descendant.pid(), pidfd_of(descendant.pid()))
                 .on_read_after(&format!("{}/stat", descendant.pid()), 2, answer);
             let result = walk(&kernel, root);
-            assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+            // A refused kill leaves the descendant running, so `hard_kill` names it; `terminate` is
+            // best effort. A descendant shown as another process is gone, not left behind.
+            let warned: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "treewalk:")
+                .into_iter()
+                .filter(|(level, said)| *level == log::Level::Warn && said.contains(&descendant.pid().to_string()))
+                .collect();
+            if name == "hard_kill" && !shows_a_new_owner {
+                assert_not_killed(result, descendant.pid(), &[]);
+                assert_eq!(warned, [], "the error is the report");
+            } else {
+                assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
+                assert_eq!(
+                    warned.len(),
+                    usize::from(name == "terminate" && !shows_a_new_owner),
+                    "{name}, new owner {shows_a_new_owner}: {warned:?}"
+                );
+            }
             release_with_a_signalled_root(name, child, signo);
         }
     }
@@ -480,19 +531,146 @@ fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, Proc
     (child, root, descendant, kernel)
 }
 
-/// A descendant the walk cannot read is not signalled, and `hard_kill` says it did not reach every
-/// member (`Ok(false)`), so its caller does not mark the tree killed. `terminate` is best effort and
-/// stays `Ok`. Mutants: "an `Unknown` read is dropped as `Gone`": `Ok(true)`; "`terminate` reports
-/// the incomplete walk".
+/// A descendant the walk cannot read is not signalled, and `hard_kill` and `Process::kill_tree`
+/// are an error naming it and why, so a caller does not take the tree for killed. `terminate` is best
+/// effort and stays `Ok`. Mutants: "an `Unknown` read is dropped as `Gone`": `Ok`; "`kill_tree`
+/// drops the walk's error"; "`terminate` reports the incomplete walk".
 #[skuld::test]
-fn a_descendant_that_cannot_be_read_makes_hard_kill_incomplete_and_leaves_terminate_ok() {
-    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
-    assert!(!super::hard_kill(&kernel, root).expect("the walk ran"));
+fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_and_leaves_terminate_ok() {
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let cause = format!("pid {} identity could not be read", descendant.pid());
+    let left = super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("a descendant was left");
+    assert!(!left.members.is_empty(), "a descendant was left, not only the root");
+    assert_not_killed(Err(left.into_error()), descendant.pid(), &[&cause]);
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let cause = format!("pid {} identity could not be read", descendant.pid());
+    assert_not_killed(open_live(root).kill_tree_with(&kernel), descendant.pid(), &[&cause]);
+    release_with_a_signalled_root("kill_tree", child, libc::SIGKILL);
 
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
     super::terminate(&kernel, root).expect("best effort");
     release_with_a_signalled_root("terminate", child, libc::SIGTERM);
+}
+
+/// A member the walk could not read is reported once, wherever it is reported from: through the real
+/// `resolve_or_drop`, `hard_kill` and `children` name it in their error and the walk warns of nothing;
+/// `terminate`, which returns none, warns of it once, with its pid and why. Mutant: "the walk warns of
+/// a candidate it drops" (the error that names it then reports it a second time).
+#[skuld::test]
+fn a_descendant_that_cannot_be_read_is_reported_once() {
+    crate::log_capture::install();
+    let warns_naming = |mark, descendant: ProcessId| -> Vec<String> {
+        crate::log_capture::warns_since_on_current_thread(mark, &format!("pid {}", descendant.pid()))
+            .into_iter()
+            .map(|(_, said)| said)
+            .collect()
+    };
+
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let mark = crate::log_capture::mark();
+    super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("a descendant was left");
+    assert_eq!(
+        warns_naming(mark, descendant),
+        Vec::<String>::new(),
+        "the error is the report"
+    );
+    release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let mark = crate::log_capture::mark();
+    root.children_with(&kernel, Recursive::Yes)
+        .expect_err("a descendant was not read");
+    assert_eq!(
+        warns_naming(mark, descendant),
+        Vec::<String>::new(),
+        "the error is the report"
+    );
+    release(child);
+
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let mark = crate::log_capture::mark();
+    super::terminate(&kernel, root).expect("best effort");
+    let warned = warns_naming(mark, descendant);
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].contains(&format!("pid {} dropped from the walk", descendant.pid())),
+        "{warned:?}"
+    );
+    assert!(warned[0].contains("identity could not be read"), "{warned:?}");
+    release_with_a_signalled_root("terminate", child, libc::SIGTERM);
+}
+
+/// Every member left behind is in what `hard_kill` returns, the one that could not be read first, and
+/// `hard_kill` warns of none: its caller reports, once. The made-up second member is `fault`'s, as no
+/// real second descendant refuses a kill without setuid. Mutants: "`hard_kill` drops every member after
+/// the first"; "`hard_kill` warns of the members after the first".
+#[skuld::test]
+fn every_member_left_behind_is_returned_and_none_is_warned_of() {
+    use super::fault::{self, LeftBehind};
+    crate::log_capture::install();
+    let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
+    let second = root.pid().wrapping_add(1);
+    let mark = crate::log_capture::mark();
+    fault::force_incomplete_once(LeftBehind::Descendant);
+    let left = super::hard_kill(&kernel, root)
+        .into_result()
+        .expect_err("two members were left");
+    let warned = crate::log_capture::warns_since_on_current_thread(mark, "treewalk:");
+    let pids: Vec<u32> = left
+        .members
+        .iter()
+        .map(|error| match error {
+            Error::MemberNotKilled { pid, .. } => *pid,
+            other => panic!("expected MemberNotKilled, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(pids, [descendant.pid(), second], "{left:?}");
+    assert!(left.root.is_none(), "{left:?}");
+    assert_eq!(warned, [], "the caller reports");
+    release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+}
+
+/// The members an earlier kill left, against a later walk that finds none of them
+/// ([`with_earlier`](super::with_earlier)): one whose identity was read is killed by it again, and
+/// is `MemberNotKilled` again while the kernel still cannot reach it; one never read is
+/// `MemberNotKilled` again with its first cause, and the kernel is not asked about it.
+///
+/// Mutants: a member left is forgotten; a read member is not killed again; a member never read is
+/// acted on by its pid.
+#[skuld::test]
+fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again() {
+    use super::{with_earlier, Left};
+    let sends = crate::send_log::Capture::start();
+    let (child, _, descendant, kernel) = root_with_an_unreadable_descendant();
+
+    let again = with_earlier(&kernel, vec![Left::Resolved(descendant)], Ok(()))
+        .expect_err("the kernel still cannot reach the descendant");
+    assert_eq!(again.members.len(), 1, "{again:?}");
+    assert_not_killed(
+        Err(again.into_error()),
+        descendant.pid(),
+        &["its pidfd could not be proved to name it"],
+    );
+    assert_eq!(sends.by_identity(), [], "nothing was sent to it");
+
+    let unread = Left::Unread {
+        pid: descendant.pid(),
+        said: "its identity could not be read".into(),
+    };
+    let again = with_earlier(&kernel, vec![unread], Ok(())).expect_err("never read, so never shown killed");
+    assert_not_killed(
+        Err(again.into_error()),
+        descendant.pid(),
+        &["its identity could not be read"],
+    );
+    assert_eq!(sends.by_identity(), [], "nothing is sent by a bare pid");
+    release(child);
 }
 
 /// `children` of a root with a descendant the walk cannot read is an error naming that pid and why,

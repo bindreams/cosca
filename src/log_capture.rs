@@ -151,6 +151,14 @@ pub(crate) fn records_since_on_current_thread(mark: usize, marker: &str) -> Vec<
         .collect()
 }
 
+/// [`records_since_on_current_thread`], the `Warn` records only.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn warns_since_on_current_thread(mark: usize, marker: &str) -> Vec<(log::Level, String)> {
+    let mut records = records_since_on_current_thread(mark, marker);
+    records.retain(|(level, _)| *level == log::Level::Warn);
+    records
+}
+
 #[cfg(test)]
 #[path = "log_capture_tests.rs"]
 mod log_capture_tests;
