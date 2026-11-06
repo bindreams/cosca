@@ -12,7 +12,8 @@ enum Written {
     /// No write was made.
     #[default]
     Never,
-    /// A write landed: the tree is dying, so waiting for its drain ends.
+    /// A write landed, or found the leaf already gone: the tree is dying or dead, so waiting for
+    /// its drain ends.
     Landed,
     /// Every write made failed, the last for this reason.
     Failed(String),

@@ -2717,6 +2717,65 @@ fn an_abandoned_spawns_failed_leaf_kill_is_one_write_and_warned_once() {
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
+/// A leaf that is already gone answers its `cgroup.kill` write `Ok`, and that answer is the
+/// teardown's one: a removal that then fails makes no second write (the fault would fail one).
+///
+/// Mutant: a write answered by a gone leaf is not recorded, so the removal writes again.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_gone_leafs_kill_is_the_teardowns_one_write() {
+    use crate::containment::cgroup::fault;
+
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-gone-leaf-kill");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    std::fs::remove_dir(&leaf_path).expect("remove the leaf behind the handle's back");
+    leaf.hard_kill().expect("a gone leaf is a completed teardown");
+    let _next_write_fails = fault::fail_next_kill_write();
+
+    let mark = crate::log_capture::mark();
+    leaf.drain_and_remove("in a test", &mut crate::containment::cgroup::NoWarn);
+
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
+    assert!(warns.is_empty(), "the removal wrote again: {warns:?}");
+}
+
+/// A failed `cgroup.kill` of an abandoned spawn is warned once when the `rmdir` then succeeds: the
+/// removal reports nothing, so the abandonment's one warn carries it.
+///
+/// Mutant: the failed kill is logged at `debug` and the successful removal says nothing.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_abandoned_spawns_failed_leaf_kill_is_warned_when_the_removal_succeeds() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-kill-failed-removed");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    // The report says `Placed`, as a child that entered the leaf sends; no child is given.
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
+    unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, leaf.placement_slot()) }
+        .expect("report a placement");
+    let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+
+    let mark = crate::log_capture::mark();
+    assert_eq!(
+        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        WithoutChild::Named
+    );
+
+    assert!(!leaf_path.exists(), "the leaf is removed");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
+}
+
 /// As above, on a real leaf: an abandoned elevation front whose `cgroup.kill` write fails is not
 /// reached by it. It is left unreaped and running in a leaf that is left behind, with the failed
 /// kill warned once; the leaf's kill is not made again, or the front would be reaped. The front
@@ -2877,8 +2936,14 @@ fn an_abandonment_without_a_child_repeated_is_a_breach() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
 
-    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
-    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
+    assert_eq!(
+        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        WithoutChild::Unnamed
+    );
+    assert_eq!(
+        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
+        WithoutChild::AlreadyAbandoned
+    );
 }
 
 /// A child that named itself always has its pidfd in the parent (the handshake's go-ahead comes

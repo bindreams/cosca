@@ -29,7 +29,7 @@ impl CgroupLeaf {
             Err(e) => e,
         };
         if !self.child_entered() {
-            self.report_left_unkilled(&first, None);
+            self.report_left_unkilled(false, &first, None);
             return;
         }
         if armed || killed {
@@ -63,7 +63,7 @@ impl CgroupLeaf {
                 ),
             );
         } else {
-            self.report_left_unkilled(&first, unread.as_ref());
+            self.report_left_unkilled(true, &first, unread.as_ref());
         }
     }
 }

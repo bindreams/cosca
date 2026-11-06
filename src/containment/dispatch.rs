@@ -163,8 +163,13 @@ impl Prepared {
                     // A child that named itself has its pidfd in the handshake before it execs, so a
                     // tokio spawn is never here with one (only a sync spawn, where `std` collected
                     // the child, is). Not claimed ended: nothing says it was collected.
-                    WithoutChild::Named | WithoutChild::AlreadyAbandoned => {
+                    WithoutChild::Named => {
                         debug_assert!(false, "a child that named itself was abandoned with no handle");
+                        AbandonedChild::MaybeUnreachable
+                    }
+                    // A repeat is a breach too; nothing says what became of the child.
+                    WithoutChild::AlreadyAbandoned => {
+                        debug_assert!(false, "a spawn's abandonment was asked for twice");
                         AbandonedChild::MaybeUnreachable
                     }
                 };
@@ -173,6 +178,10 @@ impl Prepared {
                 Abandoned::Ended(fate) => AbandonedChild::Ended(fate),
                 Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
                 Abandoned::Front(fate) => AbandonedChild::Front(fate),
+                Abandoned::Repeated => {
+                    debug_assert!(false, "a spawn's abandonment was asked for twice");
+                    AbandonedChild::MaybeUnreachable
+                }
             };
         }
         #[cfg(not(target_os = "linux"))]
