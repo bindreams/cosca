@@ -155,8 +155,8 @@ pub enum Error {
     ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
     ///   either way no pidfd is possible.
     ///
-    /// Any other failure is transient and surfaces as [`Error::Io`], prefixed `pidfd_open:`
-    /// (`EMFILE`, `ENFILE`, `ENOMEM`).
+    /// Only a failed `pidfd_open` is refused. Any other failure is [`Error::Io`] prefixed with the
+    /// call's name (`pidfd_open:`, `pidfs_ino:`, `poll:`).
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this
@@ -210,10 +210,13 @@ pub enum Error {
     },
     /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
     /// it left behind, was not. `source` says why: the member's identity could not be read, at the
-    /// walk or when the kill came ([`Error::Unassessable`]), or the OS refused the kill
+    /// walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when the OS
+    /// refuses the pidfd the identity is read through), or the OS refused the kill
     /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
     /// for [`Process::kill`](crate::Process::kill)). It names the first member left; the call warns of
-    /// the others. The root is named only when it is the sole member left.
+    /// the others. The root is named only when it is the sole member left. On Linux, any other
+    /// error that opening the member's pidfd finishes with (a live thread that leads no group, a
+    /// `poll` that reports `POLLERR`) is wrapped as [`Error::Unassessable`], the error its source.
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk

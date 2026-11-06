@@ -37,7 +37,7 @@ fn fixture_status_mounted_over() {
         return;
     }
     ns::enter_private_mount_ns();
-    // A live foreign process: opened through `open_verified_with`, then killed. Its
+    // A live foreign process: opened through `open_verified_error_with`, then killed. Its
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
@@ -57,7 +57,7 @@ fn fixture_status_mounted_over() {
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
-    let own = super::open_verified_with(&HostKernel, own_id);
+    let own = super::open_verified_error_with(&HostKernel, own_id);
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
     match proc_view_with(&HostKernel) {
@@ -114,7 +114,7 @@ fn fixture_pid_ns_inner() {
     let own = crate::identity::ProcessId::from_parts_for_test(1, crate::identity::Key::Ticks(ticks));
 
     // `pidfd_open(1)` opens this very process; the outer procfs numbers it differently.
-    match super::open_verified_with(&HostKernel, own) {
+    match super::open_verified_error_with(&HostKernel, own) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
             assert!(
@@ -248,7 +248,7 @@ fn fixture_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(pid));
-    let result = super::open_verified_with(
+    let result = super::open_verified_error_with(
         &PauseKernel::new(&HostKernel, pid, hook),
         crate::identity::ticks_id(std::process::id()),
     );
@@ -276,7 +276,7 @@ fn fixture_overmount_einval() {
     let tid = worker.id.pid();
     let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(tid));
     let refused = FakeKernel::over(&HostKernel).on_pidfd_open(tid, Err(Errno::NOENT));
-    let result = super::open_verified_with(&PauseKernel::new(&refused, tid, hook), worker.id);
+    let result = super::open_verified_error_with(&PauseKernel::new(&refused, tid, hook), worker.id);
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -307,7 +307,7 @@ fn fixture_stat_overmount_success() {
     ns::enter_private_mount_ns();
     let pid = std::process::id();
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(pid));
-    let result = super::open_verified_with(
+    let result = super::open_verified_error_with(
         &PauseKernel::new(&HostKernel, pid, hook),
         crate::identity::ticks_id(std::process::id()),
     );
@@ -335,7 +335,7 @@ fn fixture_stat_overmount_einval() {
     let tid = worker.id.pid();
     let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(tid));
     let refused = FakeKernel::over(&HostKernel).on_pidfd_open(tid, Err(Errno::NOENT));
-    let result = super::open_verified_with(&PauseKernel::new(&refused, tid, hook), worker.id);
+    let result = super::open_verified_error_with(&PauseKernel::new(&refused, tid, hook), worker.id);
     assert!(
         fired.load(Ordering::SeqCst),
         "the pause before the stat read must have run"
@@ -368,7 +368,7 @@ fn fixture_tmpfs_at_proc() {
         ProcView::Unassessable(why) => assert!(why.reason.contains("not procfs"), "{why}"),
         other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
     }
-    match super::open_verified_with(&HostKernel, id) {
+    match super::open_verified_error_with(&HostKernel, id) {
         Err(Error::Unassessable { detail, .. }) => assert!(detail.contains("not procfs"), "{detail}"),
         other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
     }
