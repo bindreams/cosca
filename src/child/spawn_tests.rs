@@ -143,8 +143,7 @@ fn attach_failure_reaps_the_spawned_child() {
 
 /// A failed spawn whose teardown kill is refused (as a setuid-root child refuses it) hands the child
 /// back in the error, running, at both arms after the handshake: the identity read (which read none)
-/// and the attach (which read one). The warn says the child is handed back; nothing is left to a
-/// background reaper.
+/// and the attach (which read one). The warn says the child is handed back.
 ///
 /// The child is a setuid-root helper that is fully root once it has written its ready byte, which
 /// is read before the teardown.

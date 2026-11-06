@@ -121,15 +121,17 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// `finish_elevated`.
 ///
 /// A root the cleanup did not show collected ([`TeardownOutcome::uncollected`]) is handed back in
-/// the error (an `Unreaped`) and the handle is disarmed. The drop that would have retried a failed
-/// tree kill does not run for it, so the cleanup retries that kill once first, and the warn and the
-/// error say how the retry went (a skipped kill is not a retry that worked). The handle is also
-/// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
-/// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
-/// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
-/// says so, and the handle is disarmed. A retry that itself ends unvouched is reported the same way,
-/// after the first failure. Only a failed tree kill with a root not handed back leaves
-/// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
+/// the error (an `Unreaped`) and the handle is disarmed, so its drop, which would make a tree kill
+/// the cleanup's failed one left undone, does not run. After a tree kill that did not settle the
+/// tree (it failed, or was skipped) the cleanup makes that drop's tree kill itself, early, and the
+/// warn and the error say how it went (a skipped kill is not one that worked); principle 3 in
+/// `docs/principles.md` says why that is the one early second write. The handle is also disarmed
+/// once the tree is settled: killed, not for the cleanup to kill, or deliberately left alone (a
+/// reaped or unpinned root). A tree that could not be vouched for (a walk saw the root running, and
+/// its end came after) is no failed kill: no tree kill is made early for it, the cleanup's one
+/// report says so, and the handle is disarmed. An early tree kill that itself ends unvouched is
+/// reported the same way, after the first failure. Only a failed tree kill with a root not handed
+/// back leaves the handle armed; its drop then makes its tree kill and does not warn of the event a
 /// second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
@@ -266,29 +268,35 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
-    // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
-    // here. The one warn and the error's note say how the retry went.
+    // A handed-back root takes the drop, which makes the tree kill, with it: that kill is made here,
+    // early. The one warn and the error's note say how it went.
     if hands_back && !tree_settled {
-        let retry = kill_tree();
-        // What the retry adds to the first attempt's report, and the outcome that report is built from.
-        let more = match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
+        let early = kill_tree();
+        // What the early tree kill adds to the first attempt's report, and the outcome that report is
+        // built from.
+        let more = match child.attached.settle(&child.tree_killed, early, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {
                     format!(
-                        "tree teardown after a failed password write took a retry ({subject}): the first attempt \
-                         failed: {first}"
+                        "tree teardown after a failed password write needed the drop's tree kill, made early \
+                         ({subject}): the cleanup's kill failed: {first}"
                     )
                 });
                 None
             }
-            // The retry is the cleanup's last word on the tree: unvouched, it is reported as such.
-            Ok(outcome @ SettleOutcome::Unvouched { kind }) => {
-                Some((format!("; on the retry, {}", kind.unvouched_text()), Ok(outcome)))
-            }
-            Err(again) => Some((format!("; the retry failed too ({again})"), Err(again))),
+            // The early tree kill is the cleanup's last word on the tree: unvouched, it is reported
+            // as such.
+            Ok(outcome @ SettleOutcome::Unvouched { kind }) => Some((
+                format!("; on the drop's tree kill, made early, {}", kind.unvouched_text()),
+                Ok(outcome),
+            )),
+            Err(again) => Some((
+                format!("; the drop's tree kill, made early, failed too ({again})"),
+                Err(again),
+            )),
         };
         if let Some((added, again)) = more {
             tree_note.push_str(&added);
@@ -307,7 +315,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     if hands_back || tree_settled {
         child.kill_on_drop = false;
     }
-    // The drop, armed to try again or not, need not warn of what the cleanup warned of again.
+    // The drop, armed or not, need not warn of what the cleanup warned of again.
     child.reported = warned;
     let unreaped = hands_back.then(|| child.into_unreaped());
     Err(SpawnFailure::started(
@@ -2619,36 +2627,6 @@ pub(crate) mod fault {
 
     use crate::identity::ProcessId;
 
-    thread_local! {
-        #[cfg(target_os = "linux")]
-        static FRONTS_SEEN_RUNNING: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// While the guard lives, a leaf's abandonment on this thread finds every elevation front still
-    /// running, as it finds one its leaf's kill reached but that has not exited yet: in the kernel a
-    /// task leaves its cgroup, which ends the leaf's drain, before its parent can collect it.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn see_fronts_running() -> SeeFrontsRunning {
-        FRONTS_SEEN_RUNNING.with(|f| f.set(true));
-        SeeFrontsRunning(())
-    }
-
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    #[must_use = "fronts are seen as they are again as soon as the guard is dropped"]
-    pub(crate) struct SeeFrontsRunning(());
-
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    impl Drop for SeeFrontsRunning {
-        fn drop(&mut self) {
-            FRONTS_SEEN_RUNNING.with(|f| f.set(false));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fronts_seen_running() -> bool {
-        FRONTS_SEEN_RUNNING.with(Cell::get)
-    }
-
     /// A seam's hook, run with the child's pid.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     type PidHook = Box<dyn FnOnce(u32)>;
@@ -2677,8 +2655,6 @@ pub(crate) mod fault {
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
             const { std::cell::RefCell::new(None) };
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(feature = "tokio")]
         static FAIL_TOKIO_SPAWN: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -2689,14 +2665,6 @@ pub(crate) mod fault {
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PIDFD: std::cell::RefCell<Option<std::os::fd::OwnedFd>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// Fail the NEXT tokio spawn after its fork succeeded, the way tokio's own `build_child` can
-    /// (stdio registration, its pidfd reaper, its signal driver): the child is dropped neither
-    /// killed nor reaped, and the error returns while `Prepared` — with any cgroup leaf — drops.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn set_force_post_fork_failure(on: bool) {
-        FORCE_POST_FORK_FAIL.with(|f| f.set(on));
     }
 
     /// The pid of the child the last forced post-fork failure dropped. It is still this
@@ -2803,32 +2771,6 @@ pub(crate) mod fault {
         let pid = child.id().expect("an unreaped child has its pid");
         std::mem::forget(child);
         pid
-    }
-
-    /// Fails the NEXT tokio spawn on this thread after the handshake concluded, forgetting its child
-    /// as [`fail_tokio_spawn_after_fork`] does. That answer is the seam's own, not production's: a
-    /// test through it checks the leaf and the warnings, never the answer (use
-    /// [`fail_tokio_spawns_after_fork`] for that).
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn post_fork_failure(
-        spawned: Result<::tokio::process::Child, super::SpawnFailure>,
-        leaf: Option<&std::path::Path>,
-    ) -> Result<::tokio::process::Child, super::SpawnFailure> {
-        if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
-            return spawned;
-        }
-        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
-        let child = spawned?;
-        let pid = forget_child(child);
-        // Its pid names this spawn's failure, so a test can tell its log records from any other's.
-        // It models tokio failing after std's spawn succeeded: after `exec`.
-        Err(super::SpawnFailure::started(
-            crate::error::Error::Io(std::io::Error::other(format!(
-                "forced post-fork spawn failure (test seam) for child {pid}"
-            ))),
-            crate::error::ChildFate::Unknown,
-            None,
-        ))
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {
