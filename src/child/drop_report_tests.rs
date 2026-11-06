@@ -190,10 +190,11 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
 }
 
 /// A teardown whose walk left only the root, and whose root someone else had reaped when the
-/// teardown's kill of it came, warns of nothing and marks the tree killed: the root is not running,
-/// whoever ended it.
+/// teardown's kill of it came, warns of nothing (the root is not running, whoever ended it) but does
+/// not vouch for the tree: the walk saw the root running.
 ///
-/// Mutant: the root counts as ended only when this handle's own kill ended it (`Reaped`, `Killed`).
+/// Mutants: the root counts as ended only when this handle's own kill ended it (`Reaped`, `Killed`);
+/// the tree is marked killed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
@@ -216,7 +217,7 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
 
     assert_eq!(torn.fate, crate::error::ChildFate::Gone);
     assert_eq!(warns_since(mark), Vec::<String>::new());
-    assert!(child.tree_killed.is_set(), "the walk left nothing running");
+    assert!(!child.tree_killed.is_set(), "the walk saw the root running");
     drop(writer);
 }
 

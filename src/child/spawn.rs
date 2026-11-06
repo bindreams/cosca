@@ -265,7 +265,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let retry = kill_tree();
         match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
-            Ok(SettleOutcome::Skipped | SettleOutcome::Unvouched) => {}
+            Ok(SettleOutcome::Skipped | SettleOutcome::Unvouched { .. }) => {}
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {

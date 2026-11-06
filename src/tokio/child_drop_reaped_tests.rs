@@ -668,11 +668,12 @@ async fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
-/// A walk that left only the root and a backstop kill of it leave the tree killed, so the drop has
-/// nothing to say. Mutant: the tree is not marked killed.
+/// A walk that saw the root running and left it, whose backstop then killed it, is `Ok` for the
+/// caller but leaves the tree unvouched, so the drop's skip warns that the tree could not be vouched
+/// for, and speaks of no members. Mutant: the tree is marked killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-async fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_warn() {
+async fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
@@ -684,8 +685,11 @@ async fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_does_not_
     let mark = crate::log_capture::mark();
     drop(child);
 
-    // The tree is marked killed: the drop skips the walk from the reaped root's number at `debug`.
-    assert_skipped_at_debug(mark);
+    let warns = drop_warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_eq!(warns[0].0, log::Level::Warn, "{warns:?}");
+    assert!(warns[0].1.contains("could not be vouched for"), "{warns:?}");
+    assert!(!warns[0].1.contains("members"), "{warns:?}");
 }
 
 /// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
