@@ -270,14 +270,49 @@ mod linux {
             view.root
         );
 
-        let skipped = child
+        let kill = child
             .attached
-            .hard_kill_marking_unless_reaped(&view, &killed, &crate::containment::GroupRoot::trusted_for_test())
+            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
+        assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
+        child
+            .attached
+            .settle(&killed, kill, true)
             .expect("a skip is not an error");
 
-        assert!(skipped.is_some(), "the number-named kill must be skipped");
         assert!(!killed.is_set(), "a skipped kill must not mark the tree killed");
         assert_eq!(recorder.killed(), Vec::<i32>::new());
+    }
+
+    /// A `kill_tree` on a root whose handle cannot say whether it is reaped sends nothing by the
+    /// root's number, and kills the root through its pidfd, which names it exactly. The failure says
+    /// the root was killed, so `graceful_shutdown_tree` reaps it before it returns the error.
+    ///
+    /// Mutant: the failure says the root was not killed.
+    #[skuld::test]
+    fn kill_tree_after_a_failed_root_peek_says_it_killed_the_root_through_its_pidfd() {
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+        let recorder = record_kill_group();
+        let (mut child, writer) = session_blocker();
+        let pid = child.id().pid();
+        let sends = Capture::start();
+        let fake = child
+            .proc
+            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+
+        let failure = child
+            .kill_tree_after("kill_tree", None)
+            .expect_err("the number may name another process");
+
+        fake.assert_peeks_exhausted();
+        assert!(failure.root_ended, "{:?}", failure.error);
+        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pidfd)]);
+        assert_eq!(
+            recorder.killed(),
+            Vec::<i32>::new(),
+            "no killpg by an unconfirmed number"
+        );
+        drop(writer);
+        crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
     }
 }
 
