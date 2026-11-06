@@ -123,36 +123,34 @@ pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
 }
 
 /// `TerminateProcess` on `handle`, a live process handle the caller closes afterwards. Never
-/// blocks.
+/// blocks. `granted` is the access the handle holds, which its opener knows (it asked for it, or
+/// read it from the handle once: [`granted_access`]).
 ///
 /// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` both a handle that lacks
 /// `PROCESS_TERMINATE` and a process that has terminated (Microsoft's `TerminateProcess` page), so
-/// the handle's own granted access, read with `NtQueryObject`, decides what a refusal means:
+/// `granted` decides what a refusal means:
 /// - It holds the right: the refusal is the exit, [`Termination::Exited`]. The refusal is already
 ///   given while the process object is not signalled yet (measured on Windows 11 26100), so
 ///   reading the signalled state instead would miss that window.
 /// - It lacks the right: only an [`exit_look`] that finds the process exited proves an exit. The
 ///   exit code is read to prove an exit, never to prove liveness, because 259 cannot be told from a
 ///   live process. Anything else is [`Termination::Failed`] with the refusal.
-///
-/// A handle whose granted access cannot be read is [`Termination::Failed`] with that error.
-pub(crate) fn terminate_held(handle: HANDLE) -> Termination {
+pub(crate) fn terminate_held(handle: HANDLE, granted: PROCESS_ACCESS_RIGHTS) -> Termination {
     let refusal = match terminate_process(handle) {
         Ok(()) => return Termination::Terminated,
         Err(e) if !is_access_denied(&e) => return Termination::Failed(e),
         Err(e) => e,
     };
-    match granted_access(handle) {
-        Err(e) => Termination::Failed(e),
-        Ok(access) if access & PROCESS_TERMINATE.0 != 0 => Termination::Exited,
-        Ok(access) => match exit_look(handle, access & PROCESS_SYNCHRONIZE.0 != 0) {
-            Ok(Look::Exited) => Termination::Exited,
-            Ok(Look::Running) => Termination::Failed(refusal),
-            Err(e) => {
-                log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
-                Termination::Failed(refusal)
-            }
-        },
+    if granted.0 & PROCESS_TERMINATE.0 != 0 {
+        return Termination::Exited;
+    }
+    match exit_look(handle, granted.0 & PROCESS_SYNCHRONIZE.0 != 0) {
+        Ok(Look::Exited) => Termination::Exited,
+        Ok(Look::Running) => Termination::Failed(refusal),
+        Err(e) => {
+            log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
+            Termination::Failed(refusal)
+        }
     }
 }
 
@@ -197,8 +195,9 @@ pub(crate) fn exit_look(handle: HANDLE, has_synchronize: bool) -> windows::core:
     )))
 }
 
-/// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`.
-fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
+/// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`. For a handle whose
+/// opener did not choose its access (`ShellExecuteEx`'s): read it once, where the handle is taken.
+pub(crate) fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
     let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
     // SAFETY: `handle` is live; `info` is the buffer the class describes, and its size is passed.
     let status = unsafe {
@@ -225,7 +224,7 @@ pub(crate) const TERMINATE_EXIT_CODE: u32 = 1;
 
 fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
     #[cfg(test)]
-    if fault::take_exiting_refusal() {
+    if fault::fire_exiting_refusal() {
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
             windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
         )));
@@ -237,20 +236,22 @@ fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
 /// Test seam for the window Windows leaves open while a process exits.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use crate::oneshot_hook::{self, Armed, OneShotHook};
 
     thread_local! {
-        static EXITING: Cell<bool> = const { Cell::new(false) };
+        static EXITING: OneShotHook = const { OneShotHook::new() };
     }
 
     /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
-    /// calling `TerminateProcess`; the process stays alive.
-    pub(crate) fn refuse_next_terminate_as_exiting() {
-        EXITING.with(|e| e.set(true));
+    /// calling `TerminateProcess`; the process stays alive. The guard clears the refusal on drop,
+    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread.
+    pub(crate) fn refuse_next_terminate_as_exiting() -> Armed {
+        oneshot_hook::arm(&EXITING, || {})
     }
 
-    pub(super) fn take_exiting_refusal() -> bool {
-        EXITING.with(|e| e.replace(false))
+    /// Whether an armed refusal was waiting, which this answers.
+    pub(super) fn fire_exiting_refusal() -> bool {
+        oneshot_hook::fire_with(&EXITING, ()).is_some()
     }
 }
 

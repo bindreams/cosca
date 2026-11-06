@@ -104,7 +104,7 @@ pub(crate) fn proc_dir_unreaped(dir: std::os::fd::BorrowedFd<'_>) -> bool {
 
 /// For [`wait_warning`]: whether the process `handle` names has exited (the handle is signalled) by
 /// `until`. Any answer but a timeout, an error included, is `true`, for the wait to find.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "tokio"))]
 pub(crate) fn handle_signaled_by(handle: windows::Win32::Foundation::HANDLE, until: Instant) -> bool {
     use windows::Win32::Foundation::{WAIT_FAILED, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::WaitForSingleObject;

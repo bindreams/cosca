@@ -56,8 +56,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         {
             use crate::elevation::windows::{launch_runas, RunasOutcome};
             match launch_runas(&*cmd)? {
-                RunasOutcome::Launched { proc, id, report, .. } => {
-                    let raw = windows_raw::RawAsyncChild::new(proc);
+                RunasOutcome::Launched {
+                    proc,
+                    granted,
+                    id,
+                    report,
+                    ..
+                } => {
+                    let raw = windows_raw::RawAsyncChild::new(proc, granted);
                     let mut child = Child::from_parts(
                         ProcSource::Raw(raw),
                         id,
