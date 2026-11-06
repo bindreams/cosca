@@ -91,7 +91,7 @@ fn debug_inside_a_blocked_waiter_does_not_block() {
         let child = Arc::clone(&child);
         move || {
             let printer = Arc::clone(&child);
-            let _hook = seams::on_condvar_block(move || {
+            let _hook = crate::wait::block_probe::on_condvar_block(move || {
                 _ = printed_tx.send(format!("{printer:?}"));
             });
             child.wait(None)
@@ -186,7 +186,7 @@ fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
     let signaller = std::thread::spawn({
         let child = Arc::clone(&child);
         move || {
-            let _hook = seams::on_condvar_block(|| panic!("signal blocked on the Condvar"));
+            let _hook = crate::wait::block_probe::on_condvar_block(|| panic!("signal blocked on the Condvar"));
             child.signal(Sig::Kill)
         }
     });
@@ -220,7 +220,7 @@ fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
         let child = Arc::clone(&child);
         move || {
             let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-            let _hook = seams::on_condvar_block_with(move |armed| _ = armed_tx.send(armed));
+            let _hook = crate::wait::block_probe::on_condvar_block_with(move |armed| _ = armed_tx.send(armed));
             let got = child.wait(Some(at + remaining));
             let expired = crate::wait::now() >= at + remaining;
             let holder_still_parked = matches!(child.lock().state, State::W { .. });
@@ -265,10 +265,11 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
         let child = Arc::clone(&child);
         move || {
             let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-            let _first = seams::on_condvar_block(move || {
+            let _first = crate::wait::block_probe::on_condvar_block(move || {
                 _ = blocked_tx.send(());
-                // The second round's hook arms from inside the first, under the lock.
-                let second = seams::on_condvar_block(move || _ = again_tx.send(()));
+                // The second round's hook arms from inside the first, under the lock. Forgotten:
+                // the guard would disarm the hook when this closure returns.
+                let second = crate::wait::block_probe::on_condvar_block(move || _ = again_tx.send(()));
                 std::mem::forget(second);
             });
             crate::wait::block_probe::take();
@@ -317,7 +318,7 @@ fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping
     let waiter = std::thread::spawn({
         let child = Arc::clone(&child);
         move || {
-            let _hook = seams::on_condvar_block(|| panic!("the waiter blocked past its deadline"));
+            let _hook = crate::wait::block_probe::on_condvar_block(|| panic!("the waiter blocked past its deadline"));
             try_wait(&child)
         }
     });
@@ -340,7 +341,7 @@ fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_pas
     let waiter = std::thread::spawn({
         let child = Arc::clone(&child);
         move || {
-            let _hook = seams::on_condvar_block(|| panic!("the waiter blocked past its deadline"));
+            let _hook = crate::wait::block_probe::on_condvar_block(|| panic!("the waiter blocked past its deadline"));
             try_wait(&child)
         }
     });
@@ -405,7 +406,7 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
     let second = std::thread::spawn({
         let child = Arc::clone(&child);
         move || {
-            let _hook = seams::on_condvar_block(move || {
+            let _hook = crate::wait::block_probe::on_condvar_block(move || {
                 _ = blocked_tx.send(());
             });
             let _blocking = crate::wait::block_probe::on_blocking(move || {
