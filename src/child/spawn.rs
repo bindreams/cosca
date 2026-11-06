@@ -2206,9 +2206,12 @@ pub(crate) fn spawn_identity_error(
 /// Read the spawned child's stable identity, then check through `through`, the handle held since
 /// the spawn, that the read named our child.
 ///
-/// - **Linux:** a peek through the pidfd after the read. `Running` and `Exit` keep the read (a
-///   reap is irreversible, so the pid named our child throughout); `Foreign` is `Gone`; a failed
-///   peek is `Unknown`, warned.
+/// - **Linux:** the key is read from the held pidfd, with no second `pidfd_open` of the pid: on
+///   pidfs (6.9+) its inode, else (no inode of its own) the `/proc` `starttime` by pid. Then a peek
+///   through the pidfd. `Running` and `Exit` keep the read (a reap is irreversible, so the pid
+///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, warned. On pidfs
+///   the pidfd, not the pid, named the read, so the peek does not check it: it shows whether
+///   another party reaped the child.
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
@@ -2230,6 +2233,12 @@ pub(crate) fn resolve_identity(
 ) {
     use crate::identity::Resolved;
 
+    #[cfg(target_os = "linux")]
+    let (read, cause) = {
+        let crate::wait::exit_only::Target::PidFd(held) = *through;
+        resolve_identity_unchecked(kernel, pid, held)
+    };
+    #[cfg(not(target_os = "linux"))]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());
@@ -2321,12 +2330,16 @@ impl Drop for Diagnosis {
     }
 }
 
-/// The unchecked half of [`resolve_identity`]: the read by pid alone, which nothing has yet shown
-/// to name our child, and why it was `Unknown` when the read itself knows. Only `resolve_identity`
-/// and tests call it. A test-only fault seam (`fault`) can force the vanished or unreadable branch.
+/// The unchecked half of [`resolve_identity`]: the read, which nothing has yet shown to name our
+/// child, and why it was `Unknown` when the read itself knows. Only `resolve_identity` and tests
+/// call it. A test-only fault seam (`fault`) can force the vanished or unreadable branch.
+///
+/// On Linux the read is of the held pidfd `held`, not a second open of `pid`. Elsewhere it is by
+/// pid.
 pub(crate) fn resolve_identity_unchecked(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,
+    #[cfg(target_os = "linux")] held: std::os::fd::BorrowedFd<'_>,
 ) -> (crate::identity::Resolved<ProcessId>, crate::identity::UnknownCause) {
     #[cfg(test)]
     {
@@ -2342,7 +2355,14 @@ pub(crate) fn resolve_identity_unchecked(
             return (crate::identity::Resolved::Gone, Default::default());
         }
     }
-    ProcessId::of_with(kernel, pid)
+    #[cfg(target_os = "linux")]
+    {
+        ProcessId::of_held_with(kernel, pid, held)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ProcessId::of_with(kernel, pid)
+    }
 }
 
 /// `containment::attach` for the child whose identity `id` the spawn verified, with a test-only
