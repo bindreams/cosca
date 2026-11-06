@@ -654,9 +654,9 @@ fn win32_wait_clamp() -> u32 {
     WIN32_INFINITE - 1
 }
 
-/// Test-only, thread-local record of the timeout each timed block or recheck pause was armed with on
-/// this thread (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or a
-/// [`crate::os_process::drive`] pause, or a `Condvar` block of an `OwnedChild`.
+/// Test-only, thread-local record of the timeout each block or recheck pause was armed with on this
+/// thread (`None` = unbounded): a `poll` round, a Win32 wait, a [`crate::os_process::drive`] pause,
+/// or an `OwnedChild`'s `Condvar` block.
 /// A test proves a deadline wait armed nothing longer than the time remaining, and blocked at all,
 /// from the log.
 #[cfg(test)]
@@ -688,7 +688,7 @@ pub(crate) mod block_probe {
         static ROUND_OWNER: Cell<u64> = const { Cell::new(0) };
     }
 
-    pub(crate) fn record(armed: Option<Duration>) {
+    fn record(armed: Option<Duration>) {
         ARMED.with(|a| a.borrow_mut().push(armed));
     }
 
@@ -801,7 +801,8 @@ pub(crate) mod block_probe {
         Armed(&ON_PAUSE)
     }
 
-    /// Run `hook`, under the lock, just before this thread's next `Condvar::wait` or `wait_timeout`.
+    /// Run `hook`, under the `OwnedChild`'s lock, just before this thread's next block on that
+    /// handle's `Condvar` (no other `Condvar` fires it).
     /// A test's hook sends on a channel it then `recv()`s, so it knows the waiter is inside the
     /// `Condvar` before it releases anything: the wait releases the lock atomically, so the release
     /// cannot overtake it.
