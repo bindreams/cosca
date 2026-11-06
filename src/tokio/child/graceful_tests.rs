@@ -563,7 +563,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
 }
 
 // Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root`; see there for the
-// fixture's rationale (`exited_by_id`, sync or async, does not reap).
+// fixture's rationale (`exited_through_handle`, like the sync wait, does not reap).
 #[cfg(unix)]
 #[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
@@ -596,9 +596,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     // reaping.
     exit_gate.write_all(b"x\n").await.expect("release the root's exit 0");
     drop(exit_gate);
-    crate::tokio::drive::exited_by_id(id, None)
-        .await
-        .expect("the root must exit");
+    child.exited_through_handle(None).await.expect("the root must exit");
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Present,
