@@ -698,7 +698,12 @@ impl ProcSource {
                     let watched = crate::os_process::macos::child::MacChild::new(pid, *unique)?;
                     // The watch was armed on whatever held the pid by now. The spawn's unique id
                     // read after arming proves it was the child: a unique id is never reused.
-                    Ok(crate::os_process::macos::read_for_open(pid)?
+                    let after = crate::os_process::macos::read_for_open(
+                        pid,
+                        "graceful shutdown",
+                        "the graceful signal was sent, but the child's exit cannot be watched",
+                    )?;
+                    Ok(after
                         .filter(|now| now.unique_id == *unique)
                         .map(|_| Box::new(watched) as Box<dyn OsProcess>))
                 }

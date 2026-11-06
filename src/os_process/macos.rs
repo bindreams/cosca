@@ -45,7 +45,7 @@ impl MacProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
     pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
         let pid = id.pid();
-        let read = || read_for_open(pid);
+        let read = || read_for_open(pid, "wait", OPEN_CONSEQUENCE);
         let Some(first) = read()? else {
             return Ok(None);
         };
@@ -76,15 +76,16 @@ impl MacProcess {
 }
 
 /// `pid`'s unique id for an open. `Ok(None)`: it is gone. A refused read is `Unassessable`, with the
-/// errno as its source.
-pub(crate) fn read_for_open(pid: u32) -> Result<Option<UniqInfo>, Error> {
+/// errno as its source; the caller names itself (`caller`, the warning's prefix) and what its refusal
+/// leaves undone (`consequence`), since what was already sent differs by caller.
+pub(crate) fn read_for_open(pid: u32, caller: &str, consequence: &str) -> Result<Option<UniqInfo>, Error> {
     match uniq_info(pid, ReadPurpose::Open) {
         UniqRead::Found(info) => Ok(Some(info)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => {
-            log::warn!("wait: pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}");
+            log::warn!("{caller}: pid {pid} identity could not be read (errno {errno}); {consequence}");
             Err(Error::Unassessable {
-                detail: format!("pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}"),
+                detail: format!("pid {pid} identity could not be read (errno {errno}); {consequence}"),
                 source: Some(std::io::Error::from_raw_os_error(errno)),
             })
         }

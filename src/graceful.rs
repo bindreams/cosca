@@ -111,7 +111,7 @@ pub(crate) fn signal(
         #[cfg(unix)]
         GracefulMechanism::Process => signal_root(crate::signal::Sig::Term),
         #[cfg(windows)]
-        GracefulMechanism::Process => Err(terminate_unsupported()),
+        GracefulMechanism::Process => Err(crate::error::Error::terminate_unsupported()),
         // One arm for both. This process's console list is readable, but absence from it does
         // not imply undeliverable (see `containment::windows::terminate`), and refusing
         // `OtherConsoleGroup` would refuse a child that re-attached itself to our console after
@@ -147,19 +147,6 @@ pub(crate) fn signal(
                      teardown."
                 .into(),
         }),
-    }
-}
-
-/// Windows has no per-process graceful-termination signal: what [`signal`] and
-/// [`os_process::terminate`](crate::os_process::terminate) answer for a lone process there.
-#[cfg(windows)]
-pub(crate) fn terminate_unsupported() -> Error {
-    Error::Unsupported {
-        op: "graceful terminate (SIGTERM-equivalent)".into(),
-        platform: "windows",
-        detail: "Windows has no per-process graceful-termination signal; for a contained \
-                 child use graceful_shutdown_tree (CTRL_BREAK to the group)"
-            .into(),
     }
 }
 

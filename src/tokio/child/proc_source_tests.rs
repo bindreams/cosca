@@ -525,12 +525,17 @@ async fn the_held_handle_look_checks_the_unique_id_after_arming_on_macos() {
     {
         let _refused = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
         let Err(Error::Unassessable {
-            source: Some(source), ..
+            detail,
+            source: Some(source),
         }) = child.proc().held_os_process(pid)
         else {
             panic!("a refused read is Unassessable with its errno");
         };
         assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+        assert!(
+            detail.contains("the graceful signal was sent") && !detail.contains("no signal was sent"),
+            "the look follows a sent SIGTERM: {detail}"
+        );
     }
     assert!(
         child.proc().held_os_process(pid).expect("a matching read").is_some(),
@@ -565,5 +570,9 @@ async fn an_unproven_child_is_sent_no_sigterm_and_cannot_be_looked_at_on_macos()
         matches!(child.proc().held_os_process(pid), Err(Error::Unassessable { .. })),
         "nothing proves the number is still the child's"
     );
+    // Forgotten, the child is out of tokio's reach (a kill by number is refused, a wait is `ECHILD`):
+    // end and reap the blocker by pid.
     drop(writer);
+    crate::test_child::reaped_elsewhere::kill_own_child(pid);
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
 }
