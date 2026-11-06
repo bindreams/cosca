@@ -78,6 +78,9 @@ impl Child {
     ///
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for the sync [`Child::kill`](crate::Child::kill).
+    ///
+    /// **macOS, a child not shown to be ours** (its handle forgotten as unproven) is sent no `SIGTERM`
+    /// and the call is `Ok`: nothing proves the number is still the child's.
     pub fn terminate(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -99,14 +102,7 @@ impl Child {
     /// through the held handle. Non-reaping, so the pid stays pinned. A child with no handle left
     /// to watch has exited.
     async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        crate::tokio::drive::exited_opening(
-            || match self.os.proc.as_ref() {
-                Some(proc) => proc.held_os_process(self.pid()),
-                None => Ok(None),
-            },
-            timeout,
-        )
-        .await
+        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(self.pid()), timeout).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -157,6 +153,9 @@ impl Child {
     /// [`Child::kill`](crate::Child::kill). A root orphaned during the grace is not killed: the
     /// escalation returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying the kill
     /// sent nothing though the `SIGTERM` was sent.
+    ///
+    /// **macOS, a child not shown to be ours** is sent no `SIGTERM` and its exit cannot be watched, so
+    /// the escalation runs at once, with no grace waited.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
         #[cfg(test)]

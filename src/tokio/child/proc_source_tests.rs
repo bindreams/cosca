@@ -16,7 +16,7 @@ use crate::os_process::child::{ExitRecord, KillRefusal};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 #[cfg(target_os = "linux")]
 use crate::signal::Sent;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_child::Console;
 
 /// The second teardown of a refused child, as `OwnedChild` runs it for a caller that leaves the child
@@ -469,4 +469,101 @@ async fn an_async_reap_whose_tracer_is_gone_looks_again_when_the_recheck_timer_f
         "the timer waits the re-check's 1 ms"
     );
     end_stand_in(tracer);
+}
+
+/// `held_os_process` reads a live child as a process whose look says running, and a child tokio has
+/// reaped as nothing left to watch.
+///
+/// Mutant: a reaped tokio child still yields a process; a live child yields `None` (exited).
+#[skuld::test]
+async fn the_held_handle_reads_as_a_running_process_until_tokio_reaps_the_child() {
+    use crate::os_process::Exit;
+
+    let (mut child, _stdin) = crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe());
+    let pid = child.pid();
+
+    let held = child
+        .proc()
+        .held_os_process(pid)
+        .expect("a live child's handle can be read")
+        .expect("a live child has a process to watch");
+    assert!(
+        matches!(held.exited().expect("a look"), Exit::Running(_)),
+        "a live child looks running"
+    );
+    drop(held);
+
+    child.kill_tree().expect("kill the blocker");
+    child.wait().await.expect("reap the blocker");
+    let reaped = child
+        .proc()
+        .held_os_process(pid)
+        .expect("a reaped child's handle can be read");
+    assert!(reaped.is_none(), "a reaped child has nothing left to watch");
+}
+
+/// The look at a child on macOS requires the unique id read at spawn after the watch is armed: a pid
+/// another process holds by then is exited, not watched as the child, and a refused read cannot be
+/// assessed (`Unassessable`, with the errno).
+///
+/// Mutant: the look never reads the unique id; a mismatch is `Some`; a refused read is `None`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn the_held_handle_look_checks_the_unique_id_after_arming_on_macos() {
+    use crate::child::spawn::identity_macos_tests::other_unique_id;
+    use crate::identity::uniq_fault::force_uniq_read_once;
+    use crate::identity::{ReadPurpose, UniqRead};
+
+    let (mut child, _stdin) = crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe());
+    let pid = child.pid();
+
+    {
+        let _other = force_uniq_read_once(ReadPurpose::Open, other_unique_id(pid));
+        let held = child.proc().held_os_process(pid).expect("a mismatch is not an error");
+        assert!(held.is_none(), "a pid another process holds is exited, not watched");
+    }
+    {
+        let _refused = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
+        let Err(Error::Unassessable {
+            source: Some(source), ..
+        }) = child.proc().held_os_process(pid)
+        else {
+            panic!("a refused read is Unassessable with its errno");
+        };
+        assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+    }
+    assert!(
+        child.proc().held_os_process(pid).expect("a matching read").is_some(),
+        "the child's own unique id is watched"
+    );
+
+    child.kill_tree().expect("kill the blocker");
+    child.wait().await.expect("reap the blocker");
+}
+
+/// A macOS child forgotten as not shown to be ours is sent no `SIGTERM` (`Sent::Unverified`) and its
+/// look is `Unassessable`, so a graceful shutdown escalates at once.
+///
+/// Mutant: the unproven child is sent the signal by number, or its look watches the number.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn an_unproven_child_is_sent_no_sigterm_and_cannot_be_looked_at_on_macos() {
+    use crate::signal::{Sent, Sig};
+
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.pid();
+    child
+        .proc_mut()
+        .forget_as("was forgotten by a test", super::Forgotten::Unproven);
+
+    assert_eq!(child.proc().signal(Sig::Term).expect("no error"), Sent::Unverified);
+    assert!(
+        matches!(child.proc().held_os_process(pid), Err(Error::Unassessable { .. })),
+        "nothing proves the number is still the child's"
+    );
+    drop(writer);
 }

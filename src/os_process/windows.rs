@@ -171,17 +171,6 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
     Ok(Some((handle, granted)))
 }
 
-/// Windows has no per-process graceful-termination signal.
-pub(crate) fn terminate_unsupported() -> Error {
-    Error::Unsupported {
-        op: "graceful terminate (SIGTERM-equivalent)".into(),
-        platform: "windows",
-        detail: "Windows has no per-process graceful-termination signal; for a contained \
-                 child use graceful_shutdown_tree (CTRL_BREAK to the group)"
-            .into(),
-    }
-}
-
 impl OsProcess for WindowsProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match sig {

@@ -125,5 +125,5 @@ pub(crate) fn terminate(p: &dyn OsProcess) -> Result<(), Error> {
 /// There is no [`Sig`] to send for it on Windows: `Unsupported`.
 #[cfg(windows)]
 pub(crate) fn terminate(_p: &dyn OsProcess) -> Result<(), Error> {
-    Err(windows::terminate_unsupported())
+    Err(crate::graceful::terminate_unsupported())
 }

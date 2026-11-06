@@ -944,12 +944,10 @@ pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
     (HostKernel, backend::fault::force_unknown(pid))
 }
 
-#[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::UniqInfo;
 /// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::{
-    held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose, UniqRead, LAUNCHD,
+    held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
 };
 
 /// The identity-read forcing seams.

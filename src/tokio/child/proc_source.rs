@@ -668,6 +668,7 @@ impl ProcSource {
         {
             let pidfd = match self {
                 ProcSource::Foreign { fate, .. } if fate.gone() => return Ok(None),
+                ProcSource::Tokio { child, .. } if child.id().is_none() => return Ok(None),
                 ProcSource::Tokio { pidfd, .. } | ProcSource::Foreign { pidfd, .. } => pidfd,
             };
             let held = std::os::fd::AsFd::as_fd(pidfd)
@@ -694,8 +695,12 @@ impl ProcSource {
                     ..
                 } => {
                     let pid = child.id().expect("checked above");
-                    crate::os_process::macos::child::MacChild::new(pid, *unique)
-                        .map(|watched| Some(Box::new(watched) as Box<dyn OsProcess>))
+                    let watched = crate::os_process::macos::child::MacChild::new(pid, *unique)?;
+                    // The watch was armed on whatever held the pid by now. The spawn's unique id
+                    // read after arming proves it was the child: a unique id is never reused.
+                    Ok(crate::os_process::macos::read_for_open(pid)?
+                        .filter(|now| now.unique_id == *unique)
+                        .map(|_| Box::new(watched) as Box<dyn OsProcess>))
                 }
                 ProcSource::Tokio { identity: None, .. } => {
                     debug_assert!(false, "a spawn that left a child with no unique id fails");
