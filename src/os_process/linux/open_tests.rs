@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::process::{getpid, pidfd_open, PidfdFlags};
 
-use super::open_verified_with;
+use super::open_verified_error_with;
 use crate::error::Error;
 use crate::identity::stat_parse::stat_fixture;
 use crate::identity::{Existence, FakeKernel, HostKernel, Key, ProcessId, UNREADABLE_STATUS_REASON};
@@ -104,7 +104,7 @@ fn open_verified_is_gone_for_a_reaped_pgid_leader_when_pidfd_open_says_einval() 
     );
 
     let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(l_id.pid(), Err(Errno::INVAL));
-    let result = open_verified_with(&kernel, l_id);
+    let result = open_verified_error_with(&kernel, l_id);
     assert!(
         matches!(result, Ok(None)),
         "an EINVAL on a reaped group leader whose group lives on must be gone (Ok(None)), not {result:?}"
@@ -123,7 +123,7 @@ fn open_verified_is_gone_for_a_reaped_pgid_leader_whatever_the_proc_view() {
         ("diverged", refused().diverged_view()),
         ("unreadable", refused().unreadable_view()),
     ] {
-        let result = open_verified_with(&kernel, l_id);
+        let result = open_verified_error_with(&kernel, l_id);
         assert!(
             matches!(result, Ok(None)),
             "a reaped leader is gone under a {view} view, got {result:?}"
@@ -142,7 +142,7 @@ fn open_verified_on_a_live_non_leader_tid_is_not_thread_group_leader_whichever_e
 
     for errno in [Errno::INVAL, Errno::NOENT] {
         let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Err(errno));
-        match open_verified_with(&kernel, id) {
+        match open_verified_error_with(&kernel, id) {
             Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
                 assert_eq!(pid, id.pid());
                 assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
@@ -201,7 +201,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(worker.id.pid(), Err(Errno::NOENT))
         .diverged_view();
-    let result = open_verified_with(&kernel, worker.id).map(|fd| fd.is_some());
+    let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
     assert_unassessable_with_cause(result, &["outer pid namespace", "pidfd_open: "], true, &marker, mark);
 }
 
@@ -215,7 +215,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(worker.id.pid(), Err(Errno::INVAL))
         .unreadable_view();
-    let result = open_verified_with(&kernel, worker.id).map(|fd| fd.is_some());
+    let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
     assert_unassessable_with_cause(result, &[UNREADABLE_STATUS_REASON, "pidfd_open: "], true, &marker, mark);
 }
 
@@ -230,7 +230,7 @@ fn open_verified_on_a_dead_non_leader_tid_is_gone() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Err(Errno::NOENT))
         .on_read(&format!("{}/stat", id.pid()), Ok(&stat_fixture("Z", id.key().ticks())));
-    let result = open_verified_with(&kernel, id);
+    let result = open_verified_error_with(&kernel, id);
     assert!(
         matches!(result, Ok(None)),
         "a Present but Dead non-leader tid must be gone (Ok(None)), not {result:?}"
@@ -253,7 +253,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
         .on_pidfd_open(id.pid(), Err(Errno::INVAL))
         .on_read(&stat, Ok(&stat_fixture("S", id.key().ticks())))
         .on_read_after(&stat, 1, Err(libc::EACCES));
-    let result = open_verified_with(&kernel, id);
+    let result = open_verified_error_with(&kernel, id);
     match result {
         Err(Error::Unassessable {
             source: Some(source), ..
@@ -281,7 +281,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
         .same_view()
         .on_pidfd_open(own.pid(), Err(Errno::INVAL))
         .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
-    let result = open_verified_with(&kernel, own);
+    let result = open_verified_error_with(&kernel, own);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["existence query"],
@@ -420,7 +420,7 @@ fn open_verified_current_with_fdinfo(fdinfo: Result<&[u8], i32>) -> Result<Optio
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(own.pid(), Ok(pidfd))
         .on_read(&path, fdinfo);
-    open_verified_with(&kernel, own)
+    open_verified_error_with(&kernel, own)
 }
 
 /// An fdinfo whose `Pid:` line says `pid` (`-1`: the target was reaped).
@@ -485,7 +485,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
     let stated = open_verified_current_with_fdinfo(Ok(&fdinfo_naming(i64::from(std::process::id()))));
     assert!(matches!(stated, Ok(Some(_))), "got {stated:?}");
-    let real = open_verified_with(&HostKernel, crate::identity::ticks_id(std::process::id()));
+    let real = open_verified_error_with(&HostKernel, crate::identity::ticks_id(std::process::id()));
     assert!(
         matches!(real, Ok(Some(_))),
         "the real fdinfo must match too, got {real:?}"
@@ -525,7 +525,7 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
         .on_pidfd_open(own.pid(), Ok(pidfd))
         .on_read(&fdinfo, Ok(&fdinfo_naming(i64::from(own.pid()))))
         .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
-    let result = open_verified_with(&kernel, own);
+    let result = open_verified_error_with(&kernel, own);
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["existence query"],
@@ -546,7 +546,7 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
 fn open_verified_is_gone_when_pidfd_open_says_esrch() {
     let id = fabricated_id();
     let kernel = FakeKernel::new().on_pidfd_open(id.pid(), Err(Errno::SRCH));
-    let result = open_verified_with(&kernel, id);
+    let result = open_verified_error_with(&kernel, id);
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -554,7 +554,7 @@ fn open_verified_is_gone_when_pidfd_open_says_esrch() {
 fn refused_with(errno: Errno) -> Error {
     let id = fabricated_id();
     let kernel = FakeKernel::new().on_pidfd_open(id.pid(), Err(errno));
-    match open_verified_with(&kernel, id) {
+    match open_verified_error_with(&kernel, id) {
         Err(e) => e,
         Ok(_) => panic!("a pidfd_open answering {errno} must fail the open, but it succeeded"),
     }
@@ -562,7 +562,7 @@ fn refused_with(errno: Errno) -> Error {
 
 /// Every refusal is `Unsupported` in the policy's message shape.
 ///
-/// Mutants: `EACCES` (or any other) missing from `refusal_name`; the detail carries a guessed
+/// Mutants: `EACCES` (or any other) missing from `FailedCall::refusal`; the detail carries a guessed
 /// cause; a different `Errno` name.
 #[skuld::test]
 fn a_refused_pidfd_open_is_unsupported_in_the_policys_message_shape() {

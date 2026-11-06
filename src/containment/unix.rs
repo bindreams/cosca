@@ -506,7 +506,7 @@ fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Thr
 
 /// `signal` to the one process `pidfd` names, whose pid is `pid`: a listed member of a group or a
 /// tree. `pidfd` is a pidfd that [`open_verified_with`](crate::os_process::linux::open::open_verified_with)
-/// proved to name that member, so the send reaches it and no process that took its number since.
+/// (or its error form, `open_verified_error_with`) proved to name that member, so the send reaches it and no process that took its number since.
 /// `ESRCH` is a process that exited and was reaped after the proof.
 #[cfg(target_os = "linux")]
 pub(crate) fn pidfd_signal_member(

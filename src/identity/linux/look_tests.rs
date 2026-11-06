@@ -105,6 +105,8 @@ fn a_pid_the_thread_retry_answers_enoent_is_gone() {
 /// The errno of a failed call is the `Unknown`'s cause.
 fn assert_unknown_with(errno: Errno, row: &str, (name, got, cause): (&str, Resolved<ProcessId>, UnknownCause)) {
     assert!(matches!(got, Resolved::Unknown), "{row}, {name}: got {got:?}");
+    let call = cause.call().expect("a failed call is the cause").name();
+    assert!(row.ends_with(call), "{row}, {name}: the call that failed was {call}");
     let err = cause.into_error("pid 4242").expect("the errno is the cause");
     assert!(matches!(err, Error::Unassessable { .. }), "{row}, {name}: {err:?}");
     let source = err.source().expect("the errno is the source");
