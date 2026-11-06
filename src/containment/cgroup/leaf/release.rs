@@ -29,19 +29,11 @@ impl CgroupLeaf {
             Err(e) => e,
         };
         if !self.child_entered() {
-            warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
-            );
+            self.report_left_unkilled(&first, None);
             return;
         }
         if armed || killed {
-            // One write per teardown: a write already made, landed or failed, is its answer.
-            let written = self
-                .kill
-                .answer()
-                .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()));
-            if let Err(e) = written {
+            if let Err(e) = self.kill_unless_written() {
                 warn_leaf_left_behind(
                     &self.leaf_path,
                     format_args!("rmdir failed ({first}) on release; cgroup.kill failed ({e})"),
@@ -57,12 +49,12 @@ impl CgroupLeaf {
             Ok(_) => None,
             Err(e) => Some(e),
         };
-        // A failed read says nothing about the drain: it is reported as what it is.
-        let cause = match &unread {
-            Some(e) => format!("its drain could not be read ({e})"),
-            None => "the tree it killed has not drained".to_owned(),
-        };
         if armed || killed {
+            // A failed read says nothing about the drain: it is reported as what it is.
+            let cause = match &unread {
+                Some(e) => format!("its drain could not be read ({e})"),
+                None => "the tree it killed has not drained".to_owned(),
+            };
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!(
@@ -70,21 +62,8 @@ impl CgroupLeaf {
                      wait_tree().await before dropping to have the leaf removed"
                 ),
             );
-        } else if self.kill.failure().is_some() {
-            warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!(
-                    "rmdir failed ({first}); its cgroup.kill failed, so the tree that opted out of \
-                     Drop's own teardown is still running{}",
-                    unread.as_ref().map_or(String::new(), |_| format!("; {cause}"))
-                ),
-            );
         } else {
-            log::debug!(
-                "cgroup leaf {} is left behind for a tree that opted out of teardown ({first}){}",
-                self.leaf_path.display(),
-                unread.as_ref().map_or(String::new(), |_| format!("; {cause}"))
-            );
+            self.report_left_unkilled(&first, unread.as_ref());
         }
     }
 }

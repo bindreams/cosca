@@ -514,6 +514,15 @@ impl CgroupLeaf {
         self.kill.landed()
     }
 
+    /// The leaf's one `cgroup.kill` write per teardown: the answer of a write already made, landed
+    /// or failed, else the answer of the write [`hard_kill`](Self::hard_kill) makes now. Every
+    /// teardown of the leaf asks here.
+    pub(crate) fn kill_unless_written(&self) -> KillAnswer {
+        self.kill
+            .answer()
+            .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()))
+    }
+
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
     /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
     /// [`crate::wait::remaining`]). Reads the leaf first, and answers from that read if it has
@@ -964,10 +973,7 @@ impl CgroupLeaf {
         // | false   | –     | –      | one rmdir: the child never entered the leaf                                 |
         if !self.child_entered() {
             if !removed_after_drain(&first) {
-                warn_leaf_left_behind(
-                    &self.leaf_path,
-                    format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
-                );
+                self.report_left_unkilled(&first, None);
             }
             return;
         }
@@ -984,7 +990,6 @@ impl CgroupLeaf {
             }
             if self.kill_landed() {
                 self.drain_and_remove(
-                    self.kill.answer(),
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
                     warn,
                 );
@@ -1001,33 +1006,16 @@ impl CgroupLeaf {
                 Ok(crate::containment::TreeDrain::AllMembersExited) => {
                     self.sweep_and_retry_rmdir("after a caller-opted-out tree exited on its own");
                 }
-                // Still populated (or unreadable): the tree was never killed. If the caller's own
-                // kill_tree()/hard_kill() had actually been attempted and failed, that is not the
-                // "opted out and left running" case this leaf's own doc promises — it is a
-                // mechanism failure, reported exactly as loudly as the armed path's own kill
-                // failure is.
-                _ if self.kill.failure().is_some() => {
-                    warn_leaf_left_behind(
-                        &self.leaf_path,
-                        format_args!(
-                            "rmdir failed ({first}); its cgroup.kill failed, so the tree that \
-                             opted out of Drop's own teardown is still running"
-                        ),
-                    );
-                }
-                _ => {
-                    log::debug!(
-                        "cgroup leaf {} is left behind for a tree that opted out of teardown ({first})",
-                        self.leaf_path.display()
-                    );
-                }
+                // Still populated (or unreadable): the tree was never killed.
+                Ok(_) => self.report_left_unkilled(&first, None),
+                Err(e) => self.report_left_unkilled(&first, Some(&e)),
             }
             return;
         }
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(self.kill.answer(), "after its handle's teardown", warn);
+            self.drain_and_remove("after its handle's teardown", warn);
         }
     }
 }
@@ -1140,7 +1128,7 @@ impl CgroupLeaf {
                 self.subtree_with(None)
             })
         });
-        let killed = self.kill_entered();
+        self.kill_entered();
         let tree = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
         // The leaf stays until the child is gone: a child that entered it but whose report the shut
         // beat is not counted entered, and its leaf cannot be removed while it runs.
@@ -1155,7 +1143,7 @@ impl CgroupLeaf {
             };
             Abandoned::of_teardown(tear_down_expecting(&owned, None, kill, past, warn.due()), &mut why)
         };
-        self.remove_abandoned(killed, warn);
+        self.remove_abandoned(warn);
         abandoned
     }
 
@@ -1171,8 +1159,8 @@ impl CgroupLeaf {
             debug_assert!(false, "the leaf answers for a child once");
             return WithoutChild::AlreadyAbandoned;
         };
-        let killed = self.kill_entered();
-        self.remove_abandoned(killed, warn);
+        self.kill_entered();
+        self.remove_abandoned(warn);
         if received.pid.is_some() {
             WithoutChild::Named
         } else {
@@ -1191,41 +1179,46 @@ impl CgroupLeaf {
         Some(received)
     }
 
-    /// Kills through the leaf if the child entered it: `None` if there was none to make, else what
-    /// the one write answered. It is made before anything looks at the child, so a look that asks
-    /// whether the kill landed ([`Subtree`]) reads its answer, and the removal does not kill again.
-    /// After a failed write the removal neither waits for the drain nor sweeps child cgroups: the
-    /// leaf is left behind and reported as "cgroup.kill failed" (see
-    /// [`drain_and_remove`](Self::drain_and_remove)).
-    fn kill_entered(&self) -> Option<KillAnswer> {
-        self.entered.then(|| self.hard_kill().map_err(|e| e.to_string()))
+    /// Kills through the leaf if the child entered it ([`kill_unless_written`](Self::kill_unless_written)).
+    /// It is made before anything looks at the child, so a look that asks whether the kill landed
+    /// ([`Subtree`]) reads its answer, and the removal does not kill again. After a failed write
+    /// the removal neither waits for the drain nor sweeps child cgroups: the leaf is left behind
+    /// and reported as "cgroup.kill failed" (see [`drain_and_remove`](Self::drain_and_remove)).
+    fn kill_entered(&self) {
+        if self.entered {
+            // The answer is in the leaf's record, which the removal reads and reports.
+            if let Err(e) = self.kill_unless_written() {
+                log::debug!("cgroup v2: an abandoned spawn's leaf kill failed ({e})");
+            }
+        }
     }
 
-    /// Removes the abandoned leaf: killed through, if `killed` holds the kill's answer, and
-    /// otherwise holding nothing of the child's.
-    fn remove_abandoned(&mut self, killed: Option<KillAnswer>, warn: &mut dyn TeardownWarn) {
-        match killed {
-            Some(killed) => self.remove_killing_through(killed, "after its spawn was abandoned", warn),
-            None => self.remove_holding_nothing(),
+    /// Removes the abandoned leaf: killed through if its child entered it ([`kill_entered`](Self::kill_entered)
+    /// did so), and otherwise holding nothing of the child's.
+    fn remove_abandoned(&mut self, warn: &mut dyn TeardownWarn) {
+        if self.entered {
+            self.remove_killing_through("after its spawn was abandoned", warn);
+        } else {
+            self.remove_holding_nothing();
         }
     }
 
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
-    /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
-    /// is the answer of the caller's own kill through it; `context` says what removal this
-    /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
-    fn remove_killing_through(&mut self, killed: KillAnswer, context: &str, warn: &mut dyn TeardownWarn) {
+    /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)).
+    /// `context` says what removal this is, for the report of a leaf left behind; `warn`, for the
+    /// wait for the drain.
+    fn remove_killing_through(&mut self, context: &str, warn: &mut dyn TeardownWarn) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
-            Err(_) => self.drain_and_remove(Some(killed), context, warn),
+            Err(_) => self.drain_and_remove(context, warn),
         }
     }
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf, in one write, unless `killed` holds the answer of a write already
-    /// made (the caller's, or the one this leaf's record holds); a failed write is final and
+    /// Kills through the leaf, in one write ([`kill_unless_written`](Self::kill_unless_written));
+    /// a failed write is final and
     /// reported: the removal then neither waits for the drain nor sweeps child cgroups, and the
     /// leaf is left behind, reported as "cgroup.kill failed". After a landed write it waits
     /// however long the drain takes, with `warn`
@@ -1233,8 +1226,8 @@ impl CgroupLeaf {
     /// cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and reported:
     /// after the drain and the sweep, an `EBUSY` means something another party did since
     /// ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never impossible.
-    fn drain_and_remove(&mut self, killed: Option<KillAnswer>, context: &str, warn: &mut dyn TeardownWarn) {
-        if let Err(e) = killed.unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string())) {
+    fn drain_and_remove(&mut self, context: &str, warn: &mut dyn TeardownWarn) {
+        if let Err(e) = self.kill_unless_written() {
             return warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
@@ -1283,6 +1276,42 @@ impl CgroupLeaf {
                 format_args!("rmdir failed ({e}) {context}, after its sweep: {LEFT_BEHIND_CAUSES}"),
             ),
             Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
+        }
+    }
+
+    /// Says what is to be said of a leaf whose `rmdir` failed with `first`, that this teardown did
+    /// not kill through and does not wait for. The one table for [`tear_down`](Self::tear_down)
+    /// and `release_without_waiting`:
+    ///
+    /// | child entered | a kill failed | said                                                  |
+    /// |---------------|---------------|-------------------------------------------------------|
+    /// | no            | –             | warn: nothing of the child's is in it                 |
+    /// | yes           | yes           | warn: the tree that opted out is still running        |
+    /// | yes           | no            | debug: left behind for a tree that opted out          |
+    ///
+    /// `unread` is why the leaf's drain could not be read, if it could not; it is added to the
+    /// last two.
+    fn report_left_unkilled(&self, first: &io::Error, unread: Option<&crate::error::Error>) {
+        if !self.child_entered() {
+            return warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
+            );
+        }
+        let unread = unread.map_or(String::new(), |e| format!("; its drain could not be read ({e})"));
+        if self.kill.failure().is_some() {
+            warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!(
+                    "rmdir failed ({first}); its cgroup.kill failed, so the tree that opted out of \
+                     Drop's own teardown is still running{unread}"
+                ),
+            );
+        } else {
+            log::debug!(
+                "cgroup leaf {} is left behind for a tree that opted out of teardown ({first}){unread}",
+                self.leaf_path.display()
+            );
         }
     }
 
