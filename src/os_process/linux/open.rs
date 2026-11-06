@@ -120,14 +120,14 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
     }
 }
 
-/// A failed pidfd call as the error [`Process::open`](crate::Process::open) returns; see
+/// The error [`Process::open`](crate::Process::open) returns for a failed pidfd call; see
 /// [`io_or_unsupported`].
 pub(crate) fn open_error(call: FailedCall) -> Error {
     io_or_unsupported(OP_NAME, call)
 }
 
-/// `call` as [`Error::Unsupported`] naming `op` if refused, else `Io`. Classification: see
-/// [`Error::Unsupported`].
+/// `call` as [`Error::Unsupported`] naming `op` if the OS refused it (classification: see
+/// [`Error::Unsupported`]), else [`Error::Io`]. The one place this mapping is stated.
 fn io_or_unsupported(op: &str, call: FailedCall) -> Error {
     match call.refusal() {
         Some(name) => pidfd_open_unsupported(op, name),

@@ -474,12 +474,10 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 
 /// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
 /// crate's `open_verified_error_with` ("open a pidfd for this identity, re-verifying, `Ok(None)` if
-/// already gone"). `pidfd_send_signal`
-/// on the returned fd is guaranteed to hit the SAME process `open_verified_error_with` just confirmed,
-/// even if the pid number is reused by something else in between — no gap remains, unlike
-/// `check_or_signal`'s plain-`kill(2)` path.
+/// already gone"). `pidfd_send_signal` on the returned fd is guaranteed to hit the SAME process the
+/// open just confirmed, even if the pid number is reused by something else in between — no gap
+/// remains, unlike `check_or_signal`'s plain-`kill(2)` path.
 ///
-/// **How `open_verified_error_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
 ///   `id.exists()` saying `Gone`) and a ptraced zombie thread.
