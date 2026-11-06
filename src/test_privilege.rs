@@ -83,6 +83,36 @@ pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
     (child, stdin)
 }
 
+/// A plain root `sh` over `count` setuid-root helpers, each blocked on the stdin the test holds
+/// (the returned write end) and past its ready byte. A helper refuses the kill of its caller.
+/// `configure` sets the root's command up further (its containment, say).
+#[cfg(unix)]
+pub(crate) fn root_over_setuid_blockers(
+    count: usize,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, std::io::PipeWriter) {
+    use std::io::Read as _;
+    // A background job's own stdin is `/dev/null`, so each helper reads fd 3.
+    let job = r#""$0" setuid-stdin-block root <&3 3<&- &"#;
+    let script = format!("exec 3<&0; {} wait", vec![job; count].join(" "));
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(["sh", "-c", &script]).arg(setuid::setuid_helper());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::null()).expect("stderr null");
+    configure(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn the root");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = vec![0u8; count];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("every helper reports ready");
+    assert!(ready.iter().all(|byte| *byte == b'+'), "{ready:?}");
+    (child, stdin)
+}
+
 /// Fails unless the caller holds a DAC bypass (see [`holds_dac_bypass`]). Off-switch and consent belong
 /// to the `ROOT` group (`test_groups.rs`).
 pub(crate) fn assert_holds_dac_bypass() {

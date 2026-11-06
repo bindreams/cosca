@@ -3,6 +3,8 @@
 //! test forces the looks it counts on and asserts they were all made.
 
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{setuid, Group};
 use crate::ContainMode;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
@@ -144,6 +146,249 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
             && warns[0].contains(&format!("the elevated child pid {pid}: the wait failed")),
         "{warns:?}"
     );
+}
+
+/// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
+/// kill of the root ends it, but the walk saw the root running, so the tree is not vouched for. The
+/// cleanup says so once, in the error and the warn, and disarms the handle, so its drop does not say
+/// it again. A walk that left a descendant is a failed kill: reported, and the handle stays armed to
+/// try again. Not on macOS, where `TreeWalk` mode is an fd marker.
+///
+/// Mutants: the cleanup reports the walk's error before the root's kill; the handle stays armed over
+/// an unvouched tree (its drop warns again).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    for (left, failed) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+        let (child, writer) = crate::test_child::held_treewalk_blocker_leaving(left);
+        let mark = crate::log_capture::mark();
+        let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
+
+        let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+        assert!(fate.not_running(), "{left:?}: {fate:?}");
+        // A failed kill leaves the handle armed to try again: the look at the tree when it drops is the
+        // armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+        assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
+        let cause = cause.to_string();
+        assert_eq!(
+            cause.contains("its contained tree could not be killed"),
+            failed,
+            "{left:?}: {cause}"
+        );
+        assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
+        let warns = warns_since(mark);
+        let finish_elevated: Vec<_> = warns
+            .iter()
+            .filter(|warn| warn.starts_with("finish_elevated:"))
+            .collect();
+        assert_eq!(finish_elevated.len(), 1, "{left:?}: {warns:?}");
+        // The cleanup's one warn, and no drop's after it.
+        let unvouched = warns
+            .iter()
+            .filter(|warn| warn.contains("could not be vouched for"))
+            .count();
+        assert_eq!(unvouched, usize::from(!failed), "{left:?}: {warns:?}");
+    }
+}
+
+/// A failed spawn's cleanup that hands the root back (its exit was not collected) over a walk that
+/// left only the root: an unvouched tree is not a failed kill, so the cleanup does not retry it, says
+/// once that the tree could not be vouched for, and the handle is disarmed.
+///
+/// Mutants: the cleanup retries over an unvouched tree and reports "the retry failed too"; the warn
+/// is not said, or said again by the drop.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_does_not_retry_an_unvouched_tree_when_it_hands_the_root_back() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let cause = cause.to_string();
+    assert!(cause.contains("could not be vouched for"), "{cause}");
+    assert!(!cause.contains("retry"), "{cause}");
+    assert!(!drop_looks.seen(), "the handle is disarmed");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let unvouched = warns
+        .iter()
+        .filter(|warn| warn.contains("could not be vouched for"))
+        .count();
+    assert_eq!(unvouched, 1, "{warns:?}");
+    assert!(warns.iter().all(|warn| !warn.contains("retry")), "{warns:?}");
+    handed_back.wait();
+}
+
+/// A failed spawn's cleanup whose first tree kill left the root running (its own kill of the root was
+/// refused) and whose root was reaped by someone else before the retry: the retry finds no root to
+/// walk, and the one report says what the first walk found, that it saw the root running, not that
+/// "something" was left. The handle is disarmed (the root is handed back).
+///
+/// Mutants: the kind of the unvouched tree is not the latest fact (the root seen running), so the
+/// retry's text names an earlier kill's leftovers instead; the handle stays armed, so its drop says
+/// it again.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_finds_it_gone() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+    // The first walk killed the root: someone else reaps it before the retry, which finds no root.
+    let pid = child.id().pid();
+    let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        crate::test_child::wait_until_zombie(pid);
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own zombie child.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+
+    let cause = cause.to_string();
+    assert!(
+        cause.contains("its contained tree could not be killed"),
+        "the first failure: {cause}"
+    );
+    let found = "the root an earlier walk found running is gone";
+    assert!(
+        cause.contains("the retry failed too") && cause.contains(found),
+        "the retry's answer: {cause}"
+    );
+    assert!(!cause.contains("left something running"), "{cause}");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let tree: Vec<_> = warns
+        .iter()
+        .filter(|warn| warn.starts_with("finish_elevated:"))
+        .collect();
+    assert_eq!(tree.len(), 1, "{warns:?}");
+    assert!(tree[0].contains(found), "{warns:?}");
+    // The root was reaped above, so there is nothing for the handed-back child to wait for.
+    drop(handed_back);
+}
+
+/// A failed spawn's cleanup whose first tree kill left a member that refuses the kill, whose root
+/// kill ended the root without collecting its exit (so it is handed back and the kill is retried), and
+/// whose retry finds the member gone but its walk leaves the root, whose own end the cleanup saw: the
+/// retry ends unvouched, not failed. The cleanup's one report says what the first attempt left and
+/// that the retry could not vouch for the tree. Needs the `setuid` group: the member is a setuid-root
+/// helper.
+///
+/// Mutant: a retry that ends unvouched is dropped from the report (as a skipped one is).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_the_first_kill(
+    #[fixture(setuid)] _group: &Group,
+) {
+    use crate::containment::treewalk::fault::{force_incomplete_once, LeftBehind};
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_privilege::root_over_setuid_blockers(1, |cmd| {
+        cmd.contain_with(ContainMode::TreeWalk);
+    });
+    let pid = child.id().pid();
+    let member: u32 = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .expect("the root lists its children")
+        .trim()
+        .parse()
+        .expect("the root has the one child");
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+    // The first walk killed the root and was refused by the member. Let the member exit, and wait until
+    // nothing names it, and make the retry's walk leave the root, before the retry.
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        drop(writer);
+        while std::path::Path::new(&format!("/proc/{member}")).exists() {
+            std::thread::yield_now();
+        }
+        force_incomplete_once(LeftBehind::Root);
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), ());
+
+    let cause = cause.to_string();
+    assert!(
+        cause.contains("its contained tree could not be killed"),
+        "the first failure: {cause}"
+    );
+    assert!(
+        cause.contains("; on the retry, ") && cause.contains("could not be vouched for"),
+        "the retry's answer: {cause}"
+    );
+    assert!(!cause.contains("the retry failed too"), "{cause}");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let tree: Vec<_> = warns
+        .iter()
+        .filter(|warn| warn.starts_with("finish_elevated:"))
+        .collect();
+    assert_eq!(tree.len(), 1, "{warns:?}");
+    assert!(
+        tree[0].contains("; on the retry, ") && tree[0].contains("could not be vouched for"),
+        "{warns:?}"
+    );
+    handed_back.wait();
+}
+
+/// A teardown whose walk left only the root, and whose root someone else had reaped when the
+/// teardown's kill of it came, does not vouch for the tree: the walk saw the root running. The
+/// teardown's own warn says so, and the tree is not marked killed.
+///
+/// Mutants: the root counts as ended only when this handle's own kill ended it (`Reaped`, `Killed`);
+/// the tree is marked killed; the teardown is silent.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([refused()])
+            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
+                crate::os_process::child::Foreign::Gone,
+            )])
+    });
+
+    let torn = child.tear_down(
+        crate::containment::dispatch::TeardownCaller::FailedRun,
+        crate::child::owned::teardown::Disposition::Leave,
+    );
+    child.kill_on_drop = false;
+
+    assert_eq!(torn.fate, crate::error::ChildFate::Gone);
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
+    assert!(!warns[0].contains("members"), "{warns:?}");
+    assert!(!child.tree_killed.is_set(), "the walk saw the root running");
+    drop(writer);
 }
 
 /// A failed spawn's cleanup whose root kill is refused, and whose root still runs, hands the root
@@ -648,6 +893,56 @@ fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
         "nothing killed the tree: {cause}"
     );
     handed_back.wait();
+}
+
+/// A tree kill skipped because the root's state is unknown has not killed the tree: a failed spawn's
+/// cleanup leaves the handle armed, so its drop tries again. A killed root does not change that.
+///
+/// Mutant: a skipped kill marks the tree killed, which disarms the handle.
+#[skuld::test]
+fn finish_elevated_leaves_the_handle_armed_after_a_skipped_tree_kill() {
+    crate::log_capture::install();
+    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+    let mark = crate::log_capture::mark();
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+
+    assert!(
+        cause.to_string().contains("its contained tree was not killed"),
+        "nothing killed the tree: {cause}"
+    );
+    // An armed handle's drop looks at the tree again, at `debug` at least; a disarmed one says nothing.
+    let drops = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
+    assert!(!drops.is_empty(), "the handle was disarmed by a kill that did not run");
+}
+
+/// A drop that skipped the tree kill (the root's state is unknown) has not killed the tree, so it
+/// does not mark it.
+///
+/// Mutant: `settle` marks the tree killed for a kill that was skipped.
+#[skuld::test]
+fn a_teardown_that_skipped_the_tree_kill_does_not_mark_the_tree_killed() {
+    crate::log_capture::install();
+    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+
+    let torn = child.tear_down(
+        crate::containment::dispatch::TeardownCaller::FailedRun,
+        crate::child::owned::teardown::Disposition::Leave,
+    );
+
+    assert!(torn.fate.not_running(), "{:?}", torn.fate);
+    assert!(
+        !child.tree_killed.is_set(),
+        "a skipped kill does not mark the tree killed"
+    );
+    drop(writer);
 }
 
 /// A handle that could not say, when the root's number shows it reaped: the doubt is not dropped

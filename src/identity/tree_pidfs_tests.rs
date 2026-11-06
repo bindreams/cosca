@@ -234,9 +234,9 @@ fn a_ticks_id_whose_record_cannot_be_read_is_unassessable() {
     }
 }
 
-/// A parent whose proof after `self`'s read cannot be made is an error naming the parent, not
-/// `self`, whose own read succeeded. Mutant: "the error names `self` whatever left the read
-/// `Unknown`".
+/// A parent whose proof after `self`'s read cannot be made is an error naming the parent, whose
+/// proof failed, and `self`, the read left unanswered. Mutants: "the error names `self` whatever left
+/// the read `Unknown`"; "the error does not say which read was left unanswered".
 #[skuld::test]
 fn a_parent_that_cannot_be_proved_again_is_the_subject_of_the_error() {
     let kernel = ticks_table()
@@ -248,6 +248,7 @@ fn a_parent_that_cannot_be_proved_again_is_the_subject_of_the_error() {
                 detail.contains(&format!("ppid {PARENT} exists but could not be queried")),
                 "{detail}"
             );
+            assert!(detail.contains(&format!("reading pid {SELF}")), "{detail}");
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
@@ -266,6 +267,8 @@ fn a_parent_that_cannot_be_read_is_the_subject_of_the_error() {
                 detail.contains(&format!("ppid {PARENT} exists but could not be queried")),
                 "{detail}"
             );
+            // The read of the parent's number is the one that failed: `self` is not a read left unanswered.
+            assert!(!detail.contains("reading pid"), "{detail}");
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
