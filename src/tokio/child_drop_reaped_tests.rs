@@ -619,6 +619,55 @@ async fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
     drop(stdin);
 }
 
+/// The handle's memory of a member outlives the root's reap (the sync twin is in
+/// `child::drop_reaped_tests`): a `kill_tree` after `wait` answers with the member an earlier one
+/// left, not with the gone root.
+///
+/// Mutant: the held members are retried only when the new kill ran.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, stdin) = crate::test_child::held_treewalk_blocker_leaving_async(LeftBehind::Descendant);
+    let first = child.kill_tree().expect_err("the walk left a member");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
+
+    let second = child
+        .kill_tree()
+        .expect_err("the root is gone, and the member is not shown killed");
+
+    let pid_of = |error: &crate::error::Error| match error {
+        crate::error::Error::MemberNotKilled { pid, .. } => *pid,
+        other => panic!("expected MemberNotKilled, got {other:?}"),
+    };
+    assert_eq!(pid_of(&second), pid_of(&first), "{first:?}, {second:?}");
+    assert!(!child.tree_killed(), "a member was left");
+}
+
+/// The drop after `wait` is the same reader: it still warns of the member a `kill_tree` left, once.
+///
+/// Mutant: the drop's reaped path does not retry the held members.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+async fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
+    use crate::containment::treewalk::fault::LeftBehind;
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, stdin) = crate::test_child::held_treewalk_blocker_leaving_async(LeftBehind::Descendant);
+    child.kill_tree().expect_err("the walk left a member");
+    drop(stdin);
+    crate::test_child::assert_killed("the root", child.wait().await.expect("reap the root"));
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = crate::log_capture::records_since_on_current_thread(mark, "was not killed");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+}
+
 /// A walk that left only the root and a backstop kill of it leave the tree killed, so the drop has
 /// nothing to say. Mutant: the tree is not marked killed.
 #[cfg(not(target_os = "macos"))]

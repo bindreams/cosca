@@ -972,9 +972,14 @@ impl Child {
         }
         let group_result = self.os.attached.hard_kill(&group);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
-        // descendants beyond a retry: return the error with the tree intact.
-        if let TreeKillOutcome::Unwalked(error) = group_result {
-            return Err(error.into());
+        // descendants beyond a retry: return the error with the tree intact. The members an earlier
+        // kill left are still killed again, which settles that answer.
+        if matches!(group_result, TreeKillOutcome::Unwalked(_)) {
+            return self
+                .os
+                .attached
+                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
+                .map_err(SweepFailure::from);
         }
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:

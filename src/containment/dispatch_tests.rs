@@ -536,6 +536,51 @@ fn a_member_whose_identity_was_never_read_is_reported_again_until_a_kill_shows_i
     assert_eq!(named_again.others.iter().map(pid_left).collect::<Vec<_>>(), [8]);
 }
 
+/// Whatever the next kill found, a held member is answered first: a gone root, a walk that could not
+/// be made and a skipped kill each leave it reported, and none marks the tree. Mutant: the held
+/// members are retried only when the new kill ran.
+#[skuld::test]
+fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let unwalked = || {
+        TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
+            detail: "the snapshot failed".into(),
+            source: None,
+        })
+    };
+    let skipped = || TreeKillOutcome::Skipped {
+        action: "walk the process table".into(),
+        holders: Ok(()),
+    };
+    let outcomes: [(&str, &dyn Fn() -> TreeKillOutcome); 3] = [
+        ("NoRoot", &|| TreeKillOutcome::NoRoot),
+        ("Unwalked", &unwalked),
+        ("Skipped", &skipped),
+    ];
+    for (label, outcome) in outcomes {
+        let killed = TreeKilled::default();
+        attached
+            .settle(
+                &killed,
+                TreeKillOutcome::Ran(Err(Unkilled {
+                    members: vec![member_left(7)],
+                    root: None,
+                    resolved: Vec::new(),
+                })),
+                true,
+            )
+            .expect_err("a member was left");
+
+        let again = attached
+            .settle(&killed, outcome(), true)
+            .expect_err("the member is not shown killed");
+
+        assert_eq!(pid_left(&again.first), 7, "{label}: {again}");
+        assert!(!killed.is_set(), "{label}");
+    }
+}
+
 /// A member whose identity was read and whose kill was refused is killed by identity again by the
 /// next kill that runs, and the tree is then settled and marked. Mutants: the retry does not kill it;
 /// it kills it and still answers with the earlier error.

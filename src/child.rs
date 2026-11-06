@@ -513,7 +513,8 @@ impl Child {
     /// kill was refused. A walk that left only the root is `Ok` once the handle backstop killed it.
     /// The backstop still ran. The handle keeps the members the walk left: a later `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again, so the tree is
-    /// not taken for killed while a member is not shown killed.
+    /// not taken for killed while a member is not shown killed. That holds whatever the later walk
+    /// finds, a root that is gone included.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
@@ -651,9 +652,13 @@ impl Child {
         #[cfg(unix)]
         drop(held);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
-        // descendants beyond a retry: return the error with the tree intact.
-        if let TreeKillOutcome::Unwalked(error) = group_result {
-            return Err(error.into());
+        // descendants beyond a retry: return the error with the tree intact. The members an earlier
+        // kill left are still killed again, which settles that answer.
+        if matches!(group_result, TreeKillOutcome::Unwalked(_)) {
+            return self
+                .attached
+                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
+                .map_err(SweepFailure::from);
         }
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:

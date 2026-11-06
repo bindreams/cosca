@@ -911,9 +911,9 @@ impl Attached {
     /// killed in `killed` if the kill ran. Otherwise it is the first member left, and the others as
     /// data: it reports none of them.
     ///
-    /// A `TreeWalk` kill that ran is answered against the members earlier kills left, which `killed`
-    /// holds ([`TreeKilled::with_earlier`]): the first failure stands until the member is shown killed,
-    /// whichever kill reads it.
+    /// A `TreeWalk` kill is answered against the members earlier kills left, which `killed` holds
+    /// ([`TreeKilled::with_earlier`]): the first failure stands until the member is shown killed,
+    /// whichever kill reads it and whatever that kill found, a gone root and a walk not made included.
     ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
@@ -930,7 +930,7 @@ impl Attached {
         }
         let ran = matches!(outcome, TreeKillOutcome::Ran(_));
         let mut result = outcome.into_result();
-        if ran && matches!(self, Attached::TreeWalk(_)) {
+        if matches!(self, Attached::TreeWalk(_)) {
             result = killed.with_earlier(&crate::identity::HostKernel, result);
         }
         if let Err(left) = result {

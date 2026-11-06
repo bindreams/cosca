@@ -613,13 +613,13 @@ pub(crate) enum Left {
 }
 
 impl Left {
-    /// Every member `left` names, in order.
+    /// Every member `left` names, in order. A walk that was not made, or found no root, leaves its
+    /// error as the only member; that names no process, so none is held.
     pub(crate) fn of(left: &Unkilled) -> Vec<Left> {
         left.members
             .iter()
             .filter_map(|member| {
                 let Error::MemberNotKilled { pid, source, .. } = member else {
-                    debug_assert!(false, "a walk leaves members as `MemberNotKilled`: {member:?}");
                     return None;
                 };
                 Some(match left.resolved.iter().find(|id| id.pid() == *pid) {
