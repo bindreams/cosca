@@ -1,17 +1,9 @@
 //! The async `Child`'s backend answers [`RootState`] from its own handle, and tells its own reap
 //! from a reap by someone else.
 
+use crate::log_capture::warns_since;
 use crate::signal::RootState;
 use crate::test_child::Console;
-
-/// Every record at `warn` or above that this thread logged since `mark`.
-pub(super) fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
-}
 
 /// This handle's own reap is `Reaped`, is not a reap by someone else, and nothing around it warns.
 ///
@@ -32,7 +24,7 @@ async fn state_after_own_wait_is_reaped_without_a_warn() {
 
     assert!(matches!(state, RootState::Reaped { own: true }), "{state:?}");
     assert_eq!(forgot, None, "this handle reaped the child itself");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
 /// A `kill` after a completed `wait` is `Ok` and leaves the cached status for the next `wait`.
@@ -53,7 +45,7 @@ async fn tokio_kill_after_a_completed_wait_keeps_the_cached_status() {
     let again = child.wait().await.expect("the cached status survives the kill");
 
     assert_eq!(again, status);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
 #[cfg(target_os = "linux")]
@@ -94,7 +86,7 @@ async fn a_tokio_drop_with_an_unknown_root_warns_once() {
     drop(child);
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
     assert!(
         warns[0].contains("RootState::Unknown")
@@ -131,7 +123,7 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
 
     assert_peeks_exhausted();
     assert_eq!(recorder.killed(), Vec::<i32>::new());
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
     assert!(
         warns[0].contains("RootState::Unknown")
@@ -172,7 +164,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
     assert_peeks_exhausted();
     drop(looks);
     assert!(matches!(forgot.now, Some(RootState::Unknown(_))), "{forgot:?}");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     // The backend is forgotten now: a second forget has nothing to forget, and leaks nothing.
     assert!(child.proc_mut().forget_for(&view(RootView::Reaped)).is_none());
     assert_eq!(
@@ -180,7 +172,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
         None,
         "a forget that never happened leaks nothing"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     let (mut child, _writer) = session_blocker(false);
     let mark = crate::log_capture::mark();
@@ -192,7 +184,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
     assert_peeks_exhausted();
     drop(looks);
     assert!(matches!(forgot.now, Some(RootState::Unknown(_))), "{forgot:?}");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     let (mut child, _writer) = session_blocker(false);
     let mark = crate::log_capture::mark();
@@ -201,7 +193,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
         .forget_for(&view(RootView::Reaped))
         .expect("a root the view shows reaped is forgotten on that evidence");
     assert!(forgot.now.is_none(), "{forgot:?}");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
     let (mut child, _writer) = session_blocker(false);
     assert!(child.proc_mut().forget_for(&view(RootView::Trusted)).is_none());
@@ -229,7 +221,7 @@ async fn a_tokio_drop_whose_kill_fails_on_an_unknown_root_warns_once() {
     drop(child);
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("RootState::Unknown") && warns[0].contains("leaks"),
@@ -255,7 +247,7 @@ async fn an_unknown_seen_only_on_the_second_look_names_its_error() {
     drop(child);
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("second look failure 91"), "{warns:?}");
 }
@@ -277,7 +269,7 @@ async fn a_disarmed_drop_with_an_unknown_root_does_not_claim_a_skipped_kill() {
     drop(child);
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(!warns[0].contains("does not"), "{warns:?}");
 }
@@ -302,7 +294,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
         .expect_err("the spawn fails");
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
         warns[0].starts_with("finish_elevated:")
@@ -335,7 +327,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait
         .expect_err("the spawn fails");
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
         warns[0].starts_with("finish_elevated:")
@@ -365,7 +357,7 @@ async fn finish_elevated_with_a_trusted_root_and_a_foreign_reap_during_the_wait_
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
         .expect_err("the spawn fails");
 
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
         warns[0].starts_with("finish_elevated:")
@@ -398,7 +390,7 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
         .expect_err("the spawn fails");
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
         warns[0].starts_with("finish_elevated:") && warns[0].contains("leaks"),
@@ -425,7 +417,7 @@ async fn a_second_look_that_shows_a_foreign_reap_is_named() {
     drop(child);
 
     assert_peeks_exhausted();
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("reaped by someone else"), "{warns:?}");
 }
@@ -476,7 +468,7 @@ mod macos {
         assert_peeks_exhausted();
 
         assert_eq!(sends.entries(), vec![], "nothing may be sent to a root we do not pin");
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd") && warns[0].contains("leaks"), "{warns:?}");
     }
@@ -528,7 +520,7 @@ mod macos {
 
         assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![]);
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("launchd") && warns[0].contains("elevation front pid") && warns[0].contains("leaks"),
@@ -628,7 +620,7 @@ mod macos {
             crate::error::ChildFate::Gone,
             "a launchd-held zombie, sent nothing, is gone"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd") && warns[0].contains("leaks"), "{warns:?}");
     }

@@ -3,9 +3,10 @@
 //! default runtime is current-thread, so the sends are recorded on this thread.
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
+use crate::log_capture::warns_since;
 use crate::test_child::reaped_elsewhere::{
-    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, kill_own_child, reap_behind, warns_since,
-    MAY_STILL_RUN, REAPED_ELSEWHERE,
+    assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, kill_own_child, reap_behind, MAY_STILL_RUN,
+    REAPED_ELSEWHERE,
 };
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
@@ -152,7 +153,7 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_p
         "the root is killed through its pidfd, and nothing else is sent"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     drop(stdin);
     let status = child.wait().await.expect("reap the root");
@@ -208,7 +209,7 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
         "the root is signalled through its pidfd, and nothing else is sent"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     drop(stdin);
     let status = child.wait().await.expect("reap the root");
@@ -261,7 +262,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
         "the SIGTERM, then the kill, both through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     drop(stdin);
@@ -325,7 +326,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
         "only the SIGTERM, through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     let status = child.wait().await.expect("reap the root");
@@ -361,7 +362,7 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends()
         "no SIGTERM by a reaped root's number"
     );
     assert_one_reaped_elsewhere_warn(mark, pgid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(
         !warns[0].contains("was sent before it"),
@@ -411,7 +412,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
         Vec::<i32>::new(),
         "no killpg by a reaped root's number"
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(warns[0].contains(UNTRUSTED_NUMBER), "{warns:?}");
     #[cfg(target_os = "linux")]
@@ -479,7 +480,7 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
             [(pid, crate::signal::Sig::Kill, crate::send_log::Via::Pidfd)],
             "the root alone is killed, through its pidfd"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
         assert!(
             warns[0].contains(MAY_STILL_RUN),
@@ -565,7 +566,7 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_
     );
     assert_eq!(killed.killed(), Vec::<i32>::new(), "no killpg by the root's number");
     assert_eq!(termed.termed(), Vec::<i32>::new(), "no SIGTERM by the root's number");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(warns[0].contains(MAY_STILL_RUN), "{warns:?}");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
@@ -700,7 +701,7 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -741,7 +742,7 @@ async fn tokio_kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -788,7 +789,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_an
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -870,7 +871,7 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_i
         "the SIGTERM, then the kill"
     );
     assert_one_reaped_elsewhere_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert_holder_dies(stderr).await;
 }

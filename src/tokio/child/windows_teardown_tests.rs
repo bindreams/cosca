@@ -10,6 +10,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::error::ChildFate;
+use crate::log_capture::warns_since;
 
 use super::proc_source::{ProcSource, Waited};
 
@@ -59,14 +60,6 @@ fn observer_handle(pid: u32) -> OwnedHandle {
         .expect("open the child to observe it");
     // SAFETY: a fresh owned handle from OpenProcess.
     unsafe { OwnedHandle::from_raw_handle(handle.0) }
-}
-
-/// The "still waiting" warns logged by this thread since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "still waiting")
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A teardown whose kill was refused because the child's exit is underway (here: it has exited and
@@ -136,7 +129,7 @@ async fn reap_now_of_an_exited_child_with_warnings_on_does_not_warn() {
     let fate = proc.reap_now(pid, None);
 
     assert_eq!(fate, ChildFate::Reaped);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, "still waiting"), Vec::<String>::new());
 }
 
 /// A teardown with warnings on whose child is still running when it looks (the kill is refused as an
@@ -157,7 +150,7 @@ async fn reap_now_of_a_running_child_with_warnings_on_warns_once_naming_it() {
     let fate = proc.reap_now(pid, None);
 
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the warn");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "still waiting");
     assert_eq!(warns.len(), 1, "one warn: {warns:?}");
     assert!(
         warns[0].contains(&format!("child {pid} ")),

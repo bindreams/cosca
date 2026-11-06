@@ -1,17 +1,9 @@
 //! The sync `Child` asks its own handle whether the root is still its child: [`RootState`]. The
 //! drop and the failed-spawn cleanup act on that answer, not on the root's start token alone.
 
+use crate::log_capture::warns_since;
 use crate::signal::RootState;
 use crate::test_child::Console;
-
-/// Every record at `warn` or above that this thread logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
-}
 
 /// This handle's own reap is `Reaped`, and nothing around it warns.
 ///
@@ -35,7 +27,7 @@ fn state_after_own_wait_is_reaped_without_a_warn() {
     drop(child);
 
     assert!(matches!(state, RootState::Reaped { own: true }), "{state:?}");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
 #[cfg(target_os = "linux")]
@@ -130,7 +122,7 @@ mod linux {
             "no killpg by an unconfirmed root's number"
         );
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pidfd)]);
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
         assert!(
             warns[0].contains(&format!("pgid {pid}")),
@@ -169,7 +161,7 @@ mod linux {
         blocker.assert_killed();
         // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
         // disarmed and says nothing more.
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
         assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
         let read = crate::log_capture::records_since_on_current_thread(mark, "could not be read either");
@@ -205,7 +197,7 @@ mod linux {
         fake.assert_peeks_exhausted();
         assert_eq!(recorder.killed(), Vec::<i32>::new());
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
         assert!(
             warns[0].contains("RootState::Unknown") && warns[0].contains("left running"),
@@ -357,7 +349,7 @@ mod macos {
             crate::test_child::is_unreaped_child(pid),
             "the root was waited on: this process does not pin it"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd"), "{warns:?}");
         // The test's own child ended and collected, since the drop left it alone.
@@ -393,7 +385,7 @@ mod macos {
 
         fake.assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![]);
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].contains("launchd") && warns[0].contains("left running"),
@@ -507,7 +499,7 @@ mod macos {
             crate::error::ChildFate::Gone,
             "a launchd-held zombie, sent nothing, is gone"
         );
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd"), "{warns:?}");
     }

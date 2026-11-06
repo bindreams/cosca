@@ -641,10 +641,7 @@ fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
 
 /// The `warn`s on this thread since `mark` that say a child has not reported its id.
 fn waiting_warns(mark: usize) -> usize {
-    crate::log_capture::records_since_on_current_thread(mark, "the spawned child")
-        .into_iter()
-        .filter(|(level, text)| *level == log::Level::Warn && text.contains("has not reported its unique id"))
-        .count()
+    crate::log_capture::warns_since(mark, "has not reported its unique id").len()
 }
 
 /// A wait on `child` (a [`live_child`]) whose checks find it held by `tracer` (another live child),
