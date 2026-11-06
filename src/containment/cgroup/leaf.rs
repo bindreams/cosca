@@ -216,22 +216,17 @@ pub(crate) struct CgroupLeaf {
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
     armed: AtomicBool,
-    /// Whether [`hard_kill`](Self::hard_kill) wrote `cgroup.kill`. A disarmed `Drop` reads it to
-    /// tell a tree the caller killed, whose leaf has not drained yet, from one left running.
-    /// [`terminate`](Self::terminate) does not set it: a SIGTERM can be caught.
-    killed: std::sync::Arc<AtomicBool>,
+    /// What [`hard_kill`](Self::hard_kill)'s `cgroup.kill` writes answered. A teardown of the leaf
+    /// reads it, and writes only if none was made. A disarmed `Drop` reads it to tell a tree the
+    /// caller killed, whose leaf has not drained yet, from one left running, and a kill that failed
+    /// from one never made. [`terminate`](Self::terminate) does not set it: a SIGTERM can be caught.
+    kill: std::sync::Arc<KillRecord>,
     /// The elevation front this leaf's child is, by pid, whose place is recorded in `placed` before
     /// each `rmdir` (see [`watch_front`](Self::watch_front)).
     watched: Option<u32>,
     /// Where the watched front was when the leaf was last about to be removed, shared with the
     /// leaf's [`Subtree`]s.
     placed: super::PlacedAtRemoval,
-    /// Whether a [`hard_kill`](Self::hard_kill) call failed for a real mechanism reason (not
-    /// "leaf already gone", which sets `killed` above instead). A disarmed `Drop` reads it to
-    /// `warn` that the caller's own `kill_tree()` never actually reached this leaf, rather than
-    /// silently folding a genuine failure into the same `debug` note used for a tree the caller
-    /// never asked to kill at all.
-    kill_attempt_failed: AtomicBool,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -400,7 +395,7 @@ impl CgroupLeaf {
             self.cgroup_path.clone(),
             self.dir.swept(),
             self.placed.clone(),
-            std::sync::Arc::clone(&self.killed),
+            std::sync::Arc::clone(&self.kill),
         )
     }
 
@@ -496,7 +491,7 @@ impl CgroupLeaf {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());
-                self.killed.store(true, Ordering::Relaxed);
+                self.kill.record(Ok(()));
                 #[cfg(test)]
                 fault::run_after_kill_write();
                 Ok(())
@@ -506,7 +501,7 @@ impl CgroupLeaf {
                 Ok(())
             }
             Err(e) => {
-                self.kill_attempt_failed.store(true, Ordering::Relaxed);
+                self.kill.record(Err(&e));
                 Err(crate::error::Error::Io(e))
             }
         }
@@ -892,10 +887,9 @@ impl CgroupLeaf {
             cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
-            killed: std::sync::Arc::new(AtomicBool::new(false)),
+            kill: std::sync::Arc::default(),
             watched: None,
             placed: super::PlacedAtRemoval::default(),
-            kill_attempt_failed: AtomicBool::new(false),
         }
     }
 
@@ -972,7 +966,7 @@ impl CgroupLeaf {
             if removed_after_drain(&first) {
                 return;
             }
-            if self.killed.load(Ordering::Relaxed) {
+            if self.kill.landed() {
                 // A stale `killed` flag must not make this wait forever: re-fire the kill before
                 // waiting on its drain. An occupant that migrated in after the first kill was
                 // never targeted, and on a kernel before 6.14 a process that forked while that
@@ -1002,7 +996,7 @@ impl CgroupLeaf {
                 // "opted out and left running" case this leaf's own doc promises — it is a
                 // mechanism failure, reported exactly as loudly as the armed path's own kill
                 // failure is.
-                _ if self.kill_attempt_failed.load(Ordering::Relaxed) => {
+                _ if self.kill.failure().is_some() => {
                     warn_leaf_left_behind(
                         &self.leaf_path,
                         format_args!(
@@ -1021,9 +1015,9 @@ impl CgroupLeaf {
             return;
         }
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
-        // that is already gone left nothing behind.
+        // that is already gone left nothing behind. A write already made and failed is final.
         if !removed_after_drain(&first) {
-            self.drain_and_remove(None, "after its handle's teardown", warn);
+            self.drain_and_remove(self.kill.failure().map(Err), "after its handle's teardown", warn);
         }
     }
 }
@@ -1173,13 +1167,13 @@ impl CgroupLeaf {
     /// After a failed write the removal neither waits for the drain nor sweeps child cgroups: the
     /// leaf is left behind and reported as "cgroup.kill failed" (see
     /// [`drain_and_remove`](Self::drain_and_remove)).
-    fn kill_entered(&self) -> Option<Result<(), crate::error::Error>> {
-        self.entered.then(|| self.hard_kill())
+    fn kill_entered(&self) -> Option<KillAnswer> {
+        self.entered.then(|| self.hard_kill().map_err(|e| e.to_string()))
     }
 
     /// Removes the abandoned leaf: killed through, if `killed` holds the kill's answer, and
     /// otherwise holding nothing of the child's.
-    fn remove_abandoned(&mut self, killed: Option<Result<(), crate::error::Error>>, warn: &mut dyn TeardownWarn) {
+    fn remove_abandoned(&mut self, killed: Option<KillAnswer>, warn: &mut dyn TeardownWarn) {
         match killed {
             Some(killed) => self.remove_killing_through(killed, "after its spawn was abandoned", warn),
             None => self.remove_holding_nothing(),
@@ -1190,12 +1184,7 @@ impl CgroupLeaf {
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)). `killed`
     /// is the answer of the caller's own kill through it; `context` says what removal this
     /// is, for the report of a leaf left behind; `warn`, for the wait for the drain.
-    fn remove_killing_through(
-        &mut self,
-        killed: Result<(), crate::error::Error>,
-        context: &str,
-        warn: &mut dyn TeardownWarn,
-    ) {
+    fn remove_killing_through(&mut self, killed: KillAnswer, context: &str, warn: &mut dyn TeardownWarn) {
         match self.rmdir_leaf() {
             Ok(()) => {}
             Err(e) if removed_after_drain(&e) => {}
@@ -1205,21 +1194,17 @@ impl CgroupLeaf {
 
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
-    /// Kills through the leaf, in one write, unless `killed` holds the answer of the write the
-    /// caller made; a failed write is final and reported: the removal then neither waits for the
-    /// drain nor sweeps child cgroups, and the leaf is left behind, reported as "cgroup.kill
-    /// failed". After a landed write it waits however long the drain takes, with `warn`
+    /// Kills through the leaf, in one write, unless `killed` holds the answer of a write already
+    /// made (the caller's, or the one this leaf's record holds); a failed write is final and
+    /// reported: the removal then neither waits for the drain nor sweeps child cgroups, and the
+    /// leaf is left behind, reported as "cgroup.kill failed". After a landed write it waits
+    /// however long the drain takes, with `warn`
     /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the leaf's child
     /// cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and reported:
     /// after the drain and the sweep, an `EBUSY` means something another party did since
     /// ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never impossible.
-    fn drain_and_remove(
-        &mut self,
-        killed: Option<Result<(), crate::error::Error>>,
-        context: &str,
-        warn: &mut dyn TeardownWarn,
-    ) {
-        if let Err(e) = killed.unwrap_or_else(|| self.hard_kill()) {
+    fn drain_and_remove(&mut self, killed: Option<KillAnswer>, context: &str, warn: &mut dyn TeardownWarn) {
+        if let Err(e) = killed.unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string())) {
             return warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
@@ -1527,10 +1512,9 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
-        killed: std::sync::Arc::new(AtomicBool::new(false)),
+        kill: std::sync::Arc::default(),
         watched: None,
         placed: super::PlacedAtRemoval::default(),
-        kill_attempt_failed: AtomicBool::new(false),
     })
 }
 

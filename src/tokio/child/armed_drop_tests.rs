@@ -243,13 +243,13 @@ async fn tokio_armed_drop_warns_once_when_the_reap_waits_past_1s(#[fixture(trace
     );
 }
 
-/// An armed drop whose tree kill fails, and fails again when fired once more, has nothing to bound
-/// the drain: it neither waits for it nor says it is waiting, even once a later `cgroup.kill` (the
-/// release's own) lands. The leaf is left behind, and a warning names it. The writes fail until the
-/// leaf's first `rmdir`; a drain wait that blocks after it releases the member and records it.
+/// An armed drop whose tree kill fails has nothing to bound the drain: it neither waits for it nor
+/// says it is waiting, and writes no other `cgroup.kill`, though one after the leaf's first `rmdir`
+/// would land. The leaf is left behind, and a warning names it. The writes fail until that `rmdir`; a
+/// drain wait that blocks after it releases the member and records it.
 ///
 /// Mutants: the drain is waited for after a failed kill (the drop says it is still waiting); the
-/// leaf's own drop, whose kill then lands, waits for the drain.
+/// failed kill is written again, by the drop or by the leaf's own drop, and lands.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
@@ -302,6 +302,44 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
         levels.contains(&log::Level::Warn),
         "the leaf left behind is named: {steps:?}"
     );
+}
+
+/// The awaited teardown of a helper that failed after its spawn, whose tree kill fails, gives the
+/// leaf up as the drop does: no second write, no wait for a drain nothing bounds, the leaf left
+/// behind and the failed kill warned once. The root's own kill landed, so it is reaped.
+///
+/// Mutants: the failed kill is written again and lands (the leaf drains and is removed); the drain is
+/// awaited anyway.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn an_awaited_teardown_whose_tree_kill_fails_gives_up_the_leaf_without_waiting() {
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let name = "cosca-awaited-teardown-failed-tree-kill";
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let events = fake.events.clone();
+    // A drain wait would empty the leaf: a teardown that waits fails the assertions instead of hanging.
+    let _release = leaf_fault::set_before_drain_block(move || FakeLeaf::set_populated(&events, false));
+    let _tree_kill_fails = leaf_fault::fail_next_kill_write();
+    let (child, released) = released_blocker();
+    let root = Root::of(&child);
+    let mut child = linux::contained_by(child, leaf);
+    let mark = crate::log_capture::mark();
+    child.tear_down_awaiting().await;
+    leaf_fault::take_rmdir_hook();
+    released.assert_killed();
+
+    assert!(root.reaped(), "the root's own kill landed, so it is reaped");
+    assert_eq!(fake.kill_written(), b"", "the failed kill is not written again");
+    assert!(
+        fake.leaf.exists(),
+        "the leaf the failed kill left running is left behind"
+    );
+    let warns = crate::log_capture::records_since(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
 /// A leaf that has not drained when the drop's warn is due: the drop warns once, naming the root's
@@ -407,10 +445,12 @@ fn a_failed_run_to_completion_helper_awaits_its_teardown() {
 
 /// A helper's teardown dropped while it awaits the reap finishes as the drop would, on the dropping
 /// thread: it reaps the root, emits the drop's report (here, of the tree kill that failed), and
-/// drains and removes the leaf. The teardown really was awaiting the reap when it was dropped.
+/// gives up the leaf the failed kill left running, without a second write or a wait for its drain.
+/// The teardown really was awaiting the reap when it was dropped.
 ///
 /// Mutants: the dropped teardown leaves what it holds to the fields' own drops (no report); the
-/// teardown reaps by blocking, as the drop does (it never reaches the awaited reap).
+/// teardown reaps by blocking, as the drop does (it never reaches the awaited reap); the failed
+/// kill is written again.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
@@ -451,7 +491,13 @@ fn a_dropped_awaited_teardown_finishes_as_the_drop_would() {
         "the dropped teardown must still emit the drop's report"
     );
     assert!(root.reaped(), "the dropped teardown must reap the root");
-    assert!(!fake.leaf.exists(), "the drained leaf is removed");
+    assert_eq!(fake.kill_written(), b"", "the failed kill is not written again");
+    assert!(
+        fake.leaf.exists(),
+        "the leaf the failed kill left running is left behind"
+    );
+    let warns = crate::log_capture::records_since(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
 /// A helper's teardown dropped while it awaits the drain leaves the leaf to a wait on the dropping

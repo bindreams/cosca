@@ -1175,6 +1175,41 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     );
 }
 
+/// An armed `Drop` after a `cgroup.kill` that failed does not write it again: the failure is final,
+/// the leaf is left behind and the failed kill is warned once. The fault fails only the first
+/// write, so a second would be recorded as a kill (and would drain the leaf, so the drop would wait
+/// for it, with nothing to end the wait: `death_watch_` bounds it).
+///
+/// Mutant: the armed `Drop` writes `cgroup.kill` again after a failed write.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::log_capture::install();
+    let name = "cosca-armed-drop-earlier-kill-failed";
+    let fake = FakeLeaf::new(name, true);
+    let (leaf_dir, events) = (fake.leaf.clone(), fake.events.clone());
+    fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf_dir, &events));
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    {
+        let _first_write_fails = fault::fail_next_kill_write();
+        leaf.hard_kill().expect_err("the forced failure");
+    }
+    let mark = crate::log_capture::mark();
+    fault::record_leaf_steps();
+    drop(leaf);
+    let steps = fault::take_leaf_steps();
+    fault::take_rmdir_hook();
+
+    assert_eq!(steps, ["rmdir populated 1"], "no second write, and no wait for a drain");
+    assert_eq!(fake.kill_written(), b"", "nothing wrote cgroup.kill");
+    assert!(fake.leaf.exists(), "the leaf is left behind");
+    let warns = crate::log_capture::records_since(mark, "cgroup.kill failed");
+    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
+}
+
 /// #194 follow-up: in `Drop`'s never-killed branch, a first `rmdir` that fails is not always the
 /// caller's tree left running by request — a leaf can drain on its own (no kill needed) yet still
 /// hold an empty child cgroup a grandchild left behind. `cgroup.events` already reading

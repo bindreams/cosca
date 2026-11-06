@@ -286,12 +286,6 @@ async fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf(#[fixture(cgrou
     assert_tokio_drop_kills_the_leaf(|| Box::new(crate::containment::cgroup::fault::fail_pidfd_info())).await;
 }
 
-/// Async twin of the sync first-write twin.
-#[skuld::test]
-async fn cgroup_a_drop_whose_first_cgroup_kill_fails_kills_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    assert_tokio_drop_kills_the_leaf(|| Box::new(crate::containment::cgroup::fault::fail_next_kill_write())).await;
-}
-
 /// Async twin of the sync post-kill twin.
 #[skuld::test]
 async fn cgroup_a_drop_whose_post_kill_read_fails_kills_the_leaf(#[fixture(cgroup)] _group: &Group) {

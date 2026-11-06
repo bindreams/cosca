@@ -12,10 +12,10 @@
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::parse::{is_at_or_under, parse_v2_relative_path};
+use super::KillRecord;
 use crate::child::owned::teardown::Reach;
 
 /// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
@@ -175,7 +175,7 @@ pub(crate) struct Subtree {
     path: Option<String>,
     swept: super::Swept,
     placed: PlacedAtRemoval,
-    killed: Arc<AtomicBool>,
+    killed: Arc<KillRecord>,
 }
 
 impl Subtree {
@@ -185,7 +185,7 @@ impl Subtree {
         path: Option<String>,
         swept: super::Swept,
         placed: PlacedAtRemoval,
-        killed: Arc<AtomicBool>,
+        killed: Arc<KillRecord>,
     ) -> Subtree {
         Subtree {
             leaf_id,
@@ -292,7 +292,7 @@ impl Subtree {
     /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
     /// only then does the task's exit follow, so only then may it be waited for.
     pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
-        if !self.killed.load(Ordering::Relaxed) {
+        if !self.killed.landed() {
             return Ok(false);
         }
         self.holds(pid, pidfd)

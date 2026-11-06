@@ -98,8 +98,8 @@ bounded number of signals and write `cgroup.kill`, one bounded file write, and n
 process exit or a cgroup drain. On Linux 6.9+ the signals include the signal-0 send through the
 root's pidfd that decides whether a reaped root's process group is killed (principle 4). A leaf it
 leaves undrained stays behind, logged as principle 7 says.
-A leaf whose `cgroup.kill` fails twice, in the tree kill and again before the drain, is given up the
-same way, though the drop still reaps a root its kill reached.
+A leaf whose `cgroup.kill` fails is given up the same way, though the drop still reaps a root its
+kill reached. A failed write is final: no teardown writes `cgroup.kill` again after it.
 Its still-running root is left to tokio's drop of its `Child`: an in-drop `try_wait`
 ([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
 cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4). The orphan

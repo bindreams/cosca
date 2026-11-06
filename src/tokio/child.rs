@@ -49,7 +49,7 @@ const PROC_TAKEN: &str = "the async child's process backend is taken only by Dro
 /// released**: the backend first, then the containment resource.
 ///
 /// [`release_without_waiting`](OsResources::release_without_waiting) and, on Unix,
-/// `release_backend_and_rekill` (the start of both drain releases) are the only places a teardown
+/// `release_backend` (the start of both drain releases) are the only places a teardown
 /// gives them up. Adding a resource-owning field here without releasing it in both would silently
 /// change when it is released.
 #[derive(Debug, Default)]
@@ -98,10 +98,11 @@ impl OsResources {
     /// [`ProcSource::release`]; it holds no unreaped child by now, so tokio's drop queues nothing.
     /// The containment resource then drops in place, as the sync `Drop` drops it: a cgroup leaf
     /// is killed again if it is still populated, drained, swept and removed. The drain shares the
-    /// drop's one `late` warn. `tree_failed`: the drop's own tree kill failed.
+    /// drop's one `late` warn. `tree_failed`: the drop's own tree kill failed, which is final: the
+    /// leaf is given up without waiting.
     #[cfg(unix)]
     fn release_after_drain(self, late: &mut LateWarn, tree_failed: bool) {
-        if let Some(attached) = self.release_backend_and_rekill(tree_failed) {
+        if let Some(attached) = self.release_backend(tree_failed) {
             drop_after_drain(attached, late);
         }
     }
@@ -112,7 +113,7 @@ impl OsResources {
     /// drop does, with the drop's warn for async child `pid` past 1 s from then.
     #[cfg(unix)]
     async fn release_after_drain_awaiting(self, pid: u32, tree_failed: bool) {
-        let Some(attached) = self.release_backend_and_rekill(tree_failed) else {
+        let Some(attached) = self.release_backend(tree_failed) else {
             return;
         };
         let draining = Draining {
@@ -134,11 +135,11 @@ impl OsResources {
         draining.finish();
     }
 
-    /// The first half of both drain releases: the backend goes, and a failed tree kill is fired
-    /// again. Answers the containment resource whose drain the kills bound, or `None` once it has
-    /// been given up without waiting, because neither kill landed and nothing bounds its drain.
+    /// The first half of both drain releases: the backend goes. Answers the containment resource
+    /// whose drain the tree kill bounds, or `None` once it has been given up without waiting,
+    /// because the tree kill failed and nothing bounds its drain.
     #[cfg(unix)]
-    fn release_backend_and_rekill(mut self, tree_failed: bool) -> Option<Attached> {
+    fn release_backend(mut self, tree_failed: bool) -> Option<Attached> {
         #[cfg(test)]
         fault::note_release();
         if let Some(proc) = self.proc.take() {
@@ -146,11 +147,9 @@ impl OsResources {
         }
         let attached = std::mem::take(&mut self.attached);
         #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = &attached {
-            if tree_failed && leaf.hard_kill().is_err() {
-                attached.release_without_waiting();
-                return None;
-            }
+        if tree_failed && matches!(attached, Attached::Cgroup(_)) {
+            attached.release_without_waiting();
+            return None;
         }
         #[cfg(not(target_os = "linux"))]
         let _ = tree_failed;
@@ -1489,9 +1488,8 @@ impl Child {
 ///   written once more) or was armed to. Call [`wait_tree`](Child::wait_tree) first to have the
 ///   leaf removed. Other mechanisms drop in place.
 ///
-/// A leaf whose `cgroup.kill` fails twice, in the tree kill and again before the drain, has nothing
-/// to bound its drain: it is given up the same way, though the drop still reaps a root its kill
-/// reached.
+/// A leaf whose `cgroup.kill` fails has nothing to bound its drain: it is given up the same way,
+/// though the drop still reaps a root its kill reached. The failed write is not made again.
 ///
 /// On Windows the drop terminates the tree and the root and waits for neither: a Job Object is
 /// terminated by the tree kill and its handle closed there (`TerminateJobObject`, then

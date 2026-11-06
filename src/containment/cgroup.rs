@@ -120,6 +120,12 @@ mod watcher;
 pub(crate) use watcher::*;
 
 #[cfg(target_os = "linux")]
+#[path = "cgroup/kill_record.rs"]
+mod kill_record;
+#[cfg(target_os = "linux")]
+pub(crate) use kill_record::*;
+
+#[cfg(target_os = "linux")]
 #[path = "cgroup/reach.rs"]
 mod reach;
 #[cfg(target_os = "linux")]

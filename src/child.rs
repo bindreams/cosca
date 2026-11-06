@@ -420,8 +420,8 @@ impl Child {
     }
 
     /// A drop's end for an elevation front it cannot be sure its cgroup kill reached: its leaf is
-    /// torn down (killed through, with a failed kill retried, drained, removed), and then the front
-    /// is looked at through [`look_at_front`](OwnedChild::look_at_front), which waits for it only if
+    /// torn down (killed through unless a kill was made, whose failure is final; drained; removed),
+    /// and then the front is looked at through [`look_at_front`](OwnedChild::look_at_front), which waits for it only if
     /// its place says the kill reached it. A front is never killed through [`tear_down`](OwnedChild::tear_down):
     /// that would orphan its program. The leaf's subtree is captured while the leaf exists, since
     /// it places the front once the leaf is gone. How the look went is worded by [`word_front`],
@@ -1214,8 +1214,8 @@ impl Child {
                 match not_reached {
                     // The cgroup kill ended it: reap it, sending nothing.
                     None => self.proc.reap_after_tree_kill(disposition),
-                    // Never waited for. The armed leaf still kills what it holds, retrying a kill
-                    // that failed, and the front is looked at once that is done.
+                    // Never waited for. A kill that failed is final: the armed leaf writes no
+                    // other. The front is looked at once the leaf is torn down.
                     Some(why) => self.tear_down_leaf_and_look_at_front(&why, disposition),
                 }
             } else {

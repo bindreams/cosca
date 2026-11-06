@@ -633,6 +633,16 @@ pub(crate) fn assert_bounded_conclusion(
     }
 }
 
+/// A leaf's kill record in which a `cgroup.kill` write has landed (`landed`), or none was made.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_record(landed: bool) -> std::sync::Arc<crate::containment::cgroup::KillRecord> {
+    let record = crate::containment::cgroup::KillRecord::default();
+    if landed {
+        record.record(Ok(()));
+    }
+    std::sync::Arc::new(record)
+}
+
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
 mod test_support_tests;

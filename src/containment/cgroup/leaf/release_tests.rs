@@ -195,6 +195,28 @@ fn an_armed_leaf_whose_kill_write_fails_is_warned_about() {
     assert!(crate::log_capture::records_since(mark, name)[0].contains("cgroup.kill failed"));
 }
 
+/// A `cgroup.kill` that failed is final: the release writes nothing more, leaves the leaf behind and
+/// warns once. The fault fails only the first write, so a second would be recorded as a kill.
+///
+/// Mutant: the release writes `cgroup.kill` again after a failed write.
+#[skuld::test]
+fn an_armed_leaf_whose_earlier_kill_failed_is_not_killed_again_on_release() {
+    let name = "cosca-release-armed-earlier-kill-failed";
+    let (fake, leaf) = entered(name, true);
+    {
+        let _first_write_fails = fault::fail_next_kill_write();
+        leaf.hard_kill().expect_err("the forced failure");
+    }
+    let mark = crate::log_capture::mark();
+    let (steps, levels) = release(leaf, name);
+
+    assert_eq!(steps, ["rmdir populated 1"], "no second write");
+    assert_eq!(fake.kill_written(), b"", "nothing wrote cgroup.kill");
+    assert!(fake.leaf.exists(), "the leaf is left behind");
+    assert_eq!(levels, [log::Level::Warn]);
+    assert!(crate::log_capture::records_since(mark, name)[0].contains("cgroup.kill failed"));
+}
+
 /// A leaf whose `rmdir` is refused as busy and whose `cgroup.events` has no `populated` field, so
 /// the release cannot read the drain.
 fn entered_unreadable(name: &str) -> (FakeLeaf, CgroupLeaf) {

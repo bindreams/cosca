@@ -121,15 +121,15 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// `finish_elevated`.
 ///
 /// A root the cleanup did not show collected ([`TeardownOutcome::uncollected`]) is handed back in
-/// the error (an `Unreaped`) and the handle is disarmed. The drop that would have retried a failed
-/// tree kill does not run for it, so the cleanup retries that kill once first, and the warn and the
-/// error say how the retry went (a skipped kill is not a retry that worked). The handle is also
+/// the error (an `Unreaped`) and the handle is disarmed. The drop, whose tree kill a failed one
+/// leaves to be made, does not run for it, so the cleanup makes that kill itself, early, and the
+/// warn and the error say how it went (a skipped kill is not one that worked). The handle is also
 /// disarmed once the tree is settled: killed, not for the cleanup to kill, or deliberately left
 /// alone (a reaped or unpinned root). A tree that could not be vouched for (a walk saw the root
 /// running, and its end came after) is no failed kill: it is not retried, the cleanup's one report
 /// says so, and the handle is disarmed. A retry that itself ends unvouched is reported the same way,
 /// after the first failure. Only a failed tree kill with a root not handed back leaves
-/// the handle armed, so its drop writes the kill again; that drop does not warn of the event a
+/// the handle armed, so its drop makes its own tree kill; that drop does not warn of the event a
 /// second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
@@ -266,8 +266,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
-    // A handed-back root takes the drop that would have retried a failed tree kill with it: retry
-    // here. The one warn and the error's note say how the retry went.
+    // A handed-back root takes the drop, which makes the tree kill, with it: that kill is made here,
+    // early. The one warn and the error's note say how it went.
     if hands_back && !tree_settled {
         let retry = kill_tree();
         // What the retry adds to the first attempt's report, and the outcome that report is built from.

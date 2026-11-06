@@ -22,7 +22,7 @@ impl CgroupLeaf {
         self.abandoned = true;
 
         let armed = self.armed.load(Ordering::Relaxed);
-        let killed = self.killed.load(Ordering::Relaxed);
+        let killed = self.kill.landed();
         let first = match self.rmdir_leaf() {
             Ok(()) => return,
             Err(e) if removed_after_drain(&e) => return,
@@ -36,7 +36,12 @@ impl CgroupLeaf {
             return;
         }
         if armed || killed {
-            if let Err(e) = self.hard_kill() {
+            // A write already made and failed is final.
+            let written = match self.kill.failure() {
+                Some(why) => Err(why),
+                None => self.hard_kill().map_err(|e| e.to_string()),
+            };
+            if let Err(e) = written {
                 warn_leaf_left_behind(
                     &self.leaf_path,
                     format_args!("rmdir failed ({first}) on release; cgroup.kill failed ({e})"),
@@ -65,7 +70,7 @@ impl CgroupLeaf {
                      wait_tree().await before dropping to have the leaf removed"
                 ),
             );
-        } else if self.kill_attempt_failed.load(Ordering::Relaxed) {
+        } else if self.kill.failure().is_some() {
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!(
