@@ -4,25 +4,16 @@
 use super::*;
 use crate::wait::teardown_warn::{wait_warning, Due};
 
-/// What a teardown's blocking wait is for.
-#[cfg_attr(
-    not(any(test, feature = "tokio")),
-    allow(dead_code, reason = "only an async teardown's warn says what it waited for")
-)]
-pub(crate) enum Waiting<'a> {
-    /// The drain of the leaf at the path.
-    Drain(&'a std::path::Path),
-    /// The exit of a child it killed, by its pid if known.
-    Child(Option<u32>),
-}
-
 /// What a teardown's blocking waits say once they are slow (principles 2 and 3). The caller that
-/// drops or abandons the leaf passes it; the leaf keeps none.
+/// drops or abandons the leaf passes it; the leaf keeps none. [`due`](Self::due) is also the
+/// threshold of the wait for the child a leaf's abandonment kills, which the child's own teardown
+/// warns of.
 pub(crate) trait TeardownWarn {
     /// When a wait starting now warns, or `None` if it does not.
     fn due(&self) -> Option<Due>;
-    /// The one warn of the wait that passed [`due`](Self::due).
-    fn warn(&mut self, waiting: Waiting<'_>);
+    /// The one warn of the wait for the drain of the leaf at `leaf` that passed
+    /// [`due`](Self::due).
+    fn warn(&mut self, leaf: &std::path::Path);
 }
 
 /// No warn: every wait but an async teardown's.
@@ -33,31 +24,28 @@ impl TeardownWarn for NoWarn {
         None
     }
 
-    fn warn(&mut self, _: Waiting<'_>) {}
+    fn warn(&mut self, _: &std::path::Path) {}
 }
 
 /// A failed async spawn's teardown: each wait warns once, this long into it (principle 2).
-#[cfg(any(test, feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub(crate) struct WarnAfter(pub(crate) Option<std::time::Duration>);
 
-#[cfg(any(test, feature = "tokio"))]
+#[cfg(feature = "tokio")]
 impl TeardownWarn for WarnAfter {
     fn due(&self) -> Option<Due> {
         Due::in_(self.0)
     }
 
-    fn warn(&mut self, waiting: Waiting<'_>) {
+    fn warn(&mut self, leaf: &std::path::Path) {
         let Some(after) = self.0 else {
             return;
         };
-        match waiting {
-            Waiting::Drain(path) => log::warn!(
-                "cgroup leaf {} has not drained {after:?} after its kill (a member is still running, or a tracer \
-                 holds it); still waiting for it to drain",
-                path.display()
-            ),
-            Waiting::Child(pid) => crate::child::spawn::warn_still_waiting(pid, after),
-        }
+        log::warn!(
+            "cgroup leaf {} has not drained {after:?} after its kill (a member is still running, or a tracer \
+             holds it); still waiting for it to drain",
+            leaf.display()
+        );
     }
 }
 
@@ -75,7 +63,7 @@ impl CgroupLeaf {
                 warn.due(),
                 |watch, until| watch.drained_by(until),
                 |_| {
-                    warn.warn(Waiting::Drain(path));
+                    warn.warn(path);
                     #[cfg(test)]
                     fault::run_after_drain_warn();
                 },

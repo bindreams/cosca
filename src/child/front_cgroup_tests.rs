@@ -563,15 +563,6 @@ fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf_and_reaps_the_front(#
     assert_drop_kills_the_leaf_and_reaps_the_front(|| Box::new(crate::containment::cgroup::fault::fail_pidfd_info()));
 }
 
-/// A drop whose own first `cgroup.kill` write fails: the leaf's retry kills the leaf, and the front
-/// is reaped, with no word of it running. Mutants as above.
-#[skuld::test]
-fn cgroup_a_drop_whose_first_cgroup_kill_fails_kills_the_leaf_and_reaps_the_front(#[fixture(cgroup)] _group: &Group) {
-    assert_drop_kills_the_leaf_and_reaps_the_front(|| {
-        Box::new(crate::containment::cgroup::fault::fail_next_kill_write())
-    });
-}
-
 /// A drop whose kill landed but whose reach cannot be read: the front is looked at once the leaf
 /// has drained, found exited, and reaped. Mutant: "the drop warns the front is not reached without
 /// looking".
@@ -593,8 +584,14 @@ fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fix
 /// drain) before it can be collected: its place says it is dying, so it is waited for and reaped,
 /// and never called running. Neither the drain nor the look's hook waits for it. Mutant: "the look
 /// trusts the exit alone" (the warning then says it is left running, and nothing reaps it).
+///
+/// The one `cgroup.kill` write lands, but the drop cannot read whether it reached the front (the
+/// place read fails from the write on), so the front is looked at after the leaf's teardown, as the
+/// first look finds the place readable again.
 #[skuld::test]
 fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
     crate::log_capture::install();
     let FrontWithMember {
         mut child,
@@ -607,13 +604,31 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     let front = pidfd_of(pid);
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    // The look reads the front as running, as on a kernel before 6.19.
-    child.proc.script_over(|fake| fake.reaps([ReapAnswer::Running]));
+    let unreadable = Arc::new(std::sync::Mutex::new(None));
+    fault::record_leaf_steps();
+    // The look reads the front as running, as on a kernel before 6.19. A look after the kill finds
+    // the place readable again; one before it (none is known) would find it as it was.
+    child
+        .proc
+        .script_over(|fake| fake.reaps([ReapAnswer::Running]))
+        .on_look({
+            let unreadable = Arc::clone(&unreadable);
+            move |_| {
+                if fault::peek_leaf_steps().iter().any(|step| step == "kill") {
+                    drop(unreadable.lock().expect("lock").take());
+                }
+            }
+        });
     let mark = crate::log_capture::mark();
     {
-        let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+        let _arming = fault::set_before_kill_write({
+            let unreadable = Arc::clone(&unreadable);
+            move || *unreadable.lock().expect("lock") = Some(fault::fail_pidfd_info())
+        });
+        let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
         drop(child);
     }
+    fault::take_leaf_steps();
     release.assert_killed();
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));

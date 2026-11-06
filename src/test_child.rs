@@ -92,7 +92,7 @@ pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } 
 /// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
 /// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
 /// writer instead ([`held_writer_stdin`]) and releases it after the kill.
-#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "tokio")))]
+#[cfg(target_os = "macos")]
 pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]

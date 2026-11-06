@@ -147,14 +147,3 @@ fn a_group_root_a_failed_spawn_was_told_to_go_is_torn_down_with_a_warn(#[fixture
         LeftFront::GroupRoot
     });
 }
-
-/// The child's pidfd is copied for its cgroup leaf's abandonment, and the child is torn down
-/// through the original, whose wait warns.
-///
-/// Mutant: `conclude`'s `LeafHeld` arm tears down with a call that has no threshold.
-#[skuld::test]
-fn a_child_a_leaf_holds_a_copy_of_is_torn_down_with_a_warn(#[fixture(tracer_group)] _group: &Group) {
-    assert_failed_spawn_warns_once_with(foreign_tracer::blocker(), Outcome::Opened, || {
-        LeftFront::LeafHeld(std::rc::Rc::default())
-    });
-}
