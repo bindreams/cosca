@@ -951,9 +951,9 @@ pub(crate) fn assert_attach_cannot_fail(error: &Error) {
 #[cfg(target_os = "macos")]
 fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
     log::warn!(
-        "elevation front pid {} is left running and unreaped, with nothing signalled or waited on by pid: its \
-         attach failed, and a kill would orphan the elevated program",
-        child.id()
+        "{} is left running and unreaped, with nothing signalled or waited on by pid: its attach failed, and a \
+         kill would orphan the elevated program",
+        crate::elevation::front::front_named(Some(child.id()))
     );
     drop(child);
     FrontFate::LeftUnreaped

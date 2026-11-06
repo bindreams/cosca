@@ -440,7 +440,8 @@ impl CgroupLeaf {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(
-                    "cgroup v2: elevation front pid {pid}'s place before its leaf's removal cannot be read ({e})"
+                    "cgroup v2: {}'s place before its leaf's removal cannot be read ({e})",
+                    crate::elevation::front::front_named(Some(pid))
                 );
                 self.placed.clear();
             }
