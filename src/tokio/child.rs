@@ -305,8 +305,7 @@ impl Child {
     pub(super) fn proc_mut(&mut self) -> &mut ProcSource {
         self.os.proc_mut()
     }
-    /// Shared read-only accessor for the two `pins_pid` guards, which hold `&self`.
-    #[cfg(windows)]
+    /// Shared read-only accessor for the callers that hold `&self`.
     pub(super) fn proc(&self) -> &ProcSource {
         self.os.proc.as_ref().expect(PROC_TAKEN)
     }

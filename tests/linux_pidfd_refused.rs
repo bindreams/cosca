@@ -214,22 +214,8 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
 
 /// Run `act` on a child of an async `control-block` fixture, on a current-thread runtime entered on
 /// a thread whose `pidfd_open` is refused with `code`. The runtime is built and the child spawned
-/// before the filter lands. `act` must fail `Unsupported` naming `process open`. The control socket
-/// is released only afterwards, so the returned status is a clean exit unless `act` ended the child.
-#[cfg(target_os = "linux")]
-#[cfg(feature = "tokio")]
-fn assert_async_act_refused<T: std::fmt::Debug + Send>(
-    code: i32,
-    name: &str,
-    contain: bool,
-    act: impl FnOnce(&tokio::runtime::Runtime, &mut cosca::tokio::Child) -> Result<T, Error> + Send,
-) -> std::process::ExitStatus {
-    let (result, status) = async_act_under_refusal(code, contain, act);
-    assert_refused(result, "process open", name);
-    status
-}
-
-/// [`assert_async_act_refused`] without the assertion: the result of `act` and the child's status.
+/// before the filter lands. The control socket is released only afterwards, so the returned status
+/// is a clean exit unless `act` ended the child. Returns the result of `act` and the child's status.
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 fn async_act_under_refusal<T: std::fmt::Debug + Send>(
@@ -258,41 +244,43 @@ fn async_act_under_refusal<T: std::fmt::Debug + Send>(
     })
 }
 
-/// The async `Child::terminate` signals by the child's identity, so a refused `pidfd_open` fails it
-/// with nothing sent: the child exits clean when its socket is released.
+/// The async `Child::terminate` signals through the pidfd the child holds, so a refused
+/// `pidfd_open` changes nothing: the `SIGTERM` is sent. The control socket is released only
+/// afterwards, so a `terminate` that sent nothing ends in a clean exit, not in the `SIGTERM`.
 ///
-/// Mutant: `terminate_by_id` answers `Ok` when its open fails.
+/// Mutant: `terminate` signals by the child's identity (the open then fails `Unsupported`).
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 #[skuld::test]
-fn a_refused_pidfd_open_fails_the_async_terminate_naming_process_open() {
+fn the_async_terminate_needs_no_pidfd_open() {
+    use std::os::unix::process::ExitStatusExt;
+
     for (code, name) in REFUSALS {
-        let status = assert_async_act_refused(code, name, false, |_, child| child.terminate());
-        assert!(
-            status.success(),
-            "{name}: nothing was sent, yet the child ended {status:?}"
-        );
+        let (result, status) = async_act_under_refusal(code, false, |_, child| child.terminate());
+        result.unwrap_or_else(|e| panic!("{name}: terminate needs no pidfd_open: {e}"));
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
 }
 
-/// The async `graceful_shutdown` terminates first, so a refused `pidfd_open` fails it before any
-/// wait and before the escalation: the child is not killed and exits clean when its socket is
-/// released.
+/// The async `graceful_shutdown` sends its `SIGTERM` and watches the exit through the pidfd the
+/// child holds, so a refused `pidfd_open` changes nothing: the child ends of the `SIGTERM` within
+/// the grace, and is not killed.
 ///
-/// Mutant: `terminate_by_id` answers `Ok` when its open fails, so the shutdown goes on to the
-/// escalation and kills the child.
+/// Mutants: the signal or the grace watch opens the child by its identity (the open then fails
+/// `Unsupported`, or the watch ends in the escalation's `SIGKILL`).
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 #[skuld::test]
-fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_before_the_escalation_naming_process_open() {
+fn the_async_graceful_shutdown_needs_no_pidfd_open() {
+    use std::os::unix::process::ExitStatusExt;
+
     for (code, name) in REFUSALS {
-        let status = assert_async_act_refused(code, name, false, |runtime, child| {
+        let (result, status) = async_act_under_refusal(code, false, |runtime, child| {
             runtime.block_on(child.graceful_shutdown(Duration::from_secs(30)))
         });
-        assert!(
-            status.success(),
-            "{name}: nothing was sent, yet the child ended {status:?}"
-        );
+        let shutdown = result.unwrap_or_else(|e| panic!("{name}: graceful_shutdown needs no pidfd_open: {e}"));
+        assert_eq!(shutdown.signal(), Some(libc::SIGTERM), "{name}: {shutdown:?}");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
 }
 

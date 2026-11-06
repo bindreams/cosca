@@ -13,7 +13,7 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqRead};
+use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -45,17 +45,7 @@ impl MacProcess {
     /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
     pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
         let pid = id.pid();
-        let read = || match uniq_info(pid, ReadPurpose::Open) {
-            UniqRead::Found(info) => Ok(Some(info)),
-            UniqRead::Gone => Ok(None),
-            UniqRead::Refused(errno) => {
-                log::warn!("wait: pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}");
-                Err(Error::Unassessable {
-                    detail: format!("pid {pid} identity could not be read (errno {errno}); {OPEN_CONSEQUENCE}"),
-                    source: Some(std::io::Error::from_raw_os_error(errno)),
-                })
-            }
-        };
+        let read = || read_for_open(pid, "wait", OPEN_CONSEQUENCE);
         let Some(first) = read()? else {
             return Ok(None);
         };
@@ -82,6 +72,23 @@ impl MacProcess {
             idversion: AtomicI32::new(second.id_version),
             watch,
         }))
+    }
+}
+
+/// `pid`'s unique id for an open. `Ok(None)`: it is gone. A refused read is `Unassessable`, with the
+/// errno as its source; the caller names itself (`caller`, the warning's prefix) and what its refusal
+/// leaves undone (`consequence`), since what was already sent differs by caller.
+pub(crate) fn read_for_open(pid: u32, caller: &str, consequence: &str) -> Result<Option<UniqInfo>, Error> {
+    match uniq_info(pid, ReadPurpose::Open) {
+        UniqRead::Found(info) => Ok(Some(info)),
+        UniqRead::Gone => Ok(None),
+        UniqRead::Refused(errno) => {
+            log::warn!("{caller}: pid {pid} identity could not be read (errno {errno}); {consequence}");
+            Err(Error::Unassessable {
+                detail: format!("pid {pid} identity could not be read (errno {errno}); {consequence}"),
+                source: Some(std::io::Error::from_raw_os_error(errno)),
+            })
+        }
     }
 }
 

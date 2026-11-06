@@ -436,6 +436,19 @@ impl std::error::Error for IoContext {
 }
 
 impl Error {
+    /// Windows has no per-process graceful-termination signal: what a graceful terminate of a lone
+    /// process answers there.
+    #[cfg(windows)]
+    pub(crate) fn terminate_unsupported() -> Error {
+        Error::Unsupported {
+            op: "graceful terminate (SIGTERM-equivalent)".into(),
+            platform: "windows",
+            detail: "Windows has no per-process graceful-termination signal; for a contained \
+                     child use graceful_shutdown_tree (CTRL_BREAK to the group)"
+                .into(),
+        }
+    }
+
     /// What a failed spawn did with its child, for an error that says the program may have started
     /// ([`Error::MayHaveStarted`]); `None` for any other error, including one that says the program
     /// did not start.
