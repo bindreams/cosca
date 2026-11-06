@@ -53,9 +53,8 @@ pub(crate) trait OsChild: OsProcess {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillRefusal {
-    /// Never: the handle can kill its process, so a refusal of the kill is a contract breach (a
-    /// refusal that only says the process is exiting is not one: the kill answers it as an exit). A
-    /// Windows handle that holds `PROCESS_TERMINATE`.
+    /// Never: the handle can kill its process (a Windows handle holding `PROCESS_TERMINATE`), so a
+    /// refusal is a contract breach.
     Never,
     /// For want of permission alone ([`PermissionDenied`](std::io::ErrorKind::PermissionDenied)): a
     /// Linux pidfd (`EPERM`), a Windows handle that lacks `PROCESS_TERMINATE`.

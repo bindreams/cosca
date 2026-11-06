@@ -711,10 +711,10 @@ impl ProcSource {
                     return Ok(Sent::Gone);
                 };
                 // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
-                // tokio's own child, made by `CreateProcess`: its handle holds every right.
+                // tokio's own child, made by `CreateProcess`.
                 terminate_unreaped(
                     windows::Win32::Foundation::HANDLE(h),
-                    windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
+                    crate::os_process::windows::CREATE_PROCESS_ACCESS,
                 )
             }
             #[cfg(windows)]

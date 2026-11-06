@@ -101,9 +101,8 @@ pub(crate) fn tear_down_failed_spawn(
     say_failed_spawn(child, id, torn, past, disposition, why)
 }
 
-/// The end of every failed spawn's teardown of `child`: says `torn` as the spawn's one warn, through
-/// the one log-then-assert of a handle teardown ([`HandleTeardown::say_as_failed_spawn`]), and hands
-/// `child` back if `disposition` does and `torn` left it uncollected.
+/// Says `torn` as the failed spawn's one warn; hands `child` back per `disposition` if it is
+/// uncollected.
 fn say_failed_spawn(
     child: OwnedChild,
     id: Option<ProcessId>,

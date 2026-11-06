@@ -4,8 +4,7 @@
 //! inheritance. In the library (not `tests/`) because the seam is `pub(crate)`/`#[cfg(test)]` and
 //! only reachable from within the crate. The batch gate's tests are in `spawn/batch_gate_tests.rs`.
 //!
-//! A failed spawn's teardown steps run through `OwnedChild::tear_down` on Linux and Windows; its rows
-//! are in `owned_tests`, `hand_back_tests` and, for Windows, `spawn/windows_raw/teardown_tests.rs`.
+//! Teardown rows live beside `OwnedChild::tear_down` (`owned_tests`), not here.
 
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;

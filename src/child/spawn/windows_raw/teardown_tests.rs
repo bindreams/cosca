@@ -1,6 +1,11 @@
 //! The teardowns of a Windows child over a real `CREATE_SUSPENDED` process, whose calls a
 //! [`FakeProcess`] answers where a test must make the OS refuse, fail or slow down: a failed
 //! spawn's ([`tear_down_failed_spawn`]) and the drop's ([`OwnedChild::tear_down`]).
+//!
+//! A "UAC handle" is a handle a UAC elevation returned, opened without `PROCESS_TERMINATE` (the
+//! access of a higher-integrity child), so its `TerminateProcess` is denied. A row that says "a fake
+//! answers" needs an answer no real handle gives: a `CreateProcess` handle is never refused and
+//! never fails a wait.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
@@ -163,8 +168,8 @@ fn after_a_failed_spawn(
 }
 
 /// A failed spawn's teardown with warnings on, whose child has already exited by the time it looks,
-/// does not warn, under either disposition. The handle is a UAC elevation's and lacks
-/// `PROCESS_TERMINATE`, so only its signalled state shows the exit.
+/// does not warn, under either disposition. The handle is a UAC handle, so only its signalled state
+/// shows the exit.
 ///
 /// Mutant: the look at the child's exit finds it late whatever its handle says.
 #[skuld::test]
@@ -228,10 +233,9 @@ fn a_failed_spawn_teardown_of_a_running_child_with_warnings_on_warns_once_naming
     }
 }
 
-/// A failed spawn's teardown whose `TerminateProcess` is denied on a live child (a UAC elevation's
-/// handle, which lacks `PROCESS_TERMINATE`) asked nothing to exit: it looks once, never waits, answers
-/// `Running { id }` and warns of the refusal once. A UAC handle may be refused for permission, so the
-/// contract holds.
+/// A failed spawn's teardown whose `TerminateProcess` is denied on a live child (a UAC handle) asked
+/// nothing to exit: it looks once, never waits, answers `Running { id }` and warns of the refusal
+/// once. A UAC handle may be refused for permission, so the contract holds.
 ///
 /// Mutants: the failed-kill arm falls through to the wait; it answers without the look; the failed
 /// `TerminateProcess` is warned of where it is made, as well as by the teardown.
@@ -271,8 +275,7 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_is_running_and_does_not_wait(
 
 /// A failed spawn's teardown whose kill fails on a child that has exited collects it from the look
 /// and warns of nothing, under either disposition: the child is collected, so none is handed back.
-/// The handle is one that may be refused for permission (a UAC elevation's without
-/// `PROCESS_TERMINATE`).
+/// The handle may be refused for permission, as a UAC handle's is.
 ///
 /// Mutant: the failed-kill arm answers `Running` without looking, and warns.
 #[skuld::test]
@@ -283,6 +286,7 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
         crate::log_capture::install();
         let mark = crate::log_capture::mark();
         let fake = FakeProcess::new([])
+            .with_pid(owner.pid)
             .with_kill_refusal(KillRefusal::Permission)
             .reaps([ReapAnswer::Reaped(ExitRecord::Status(
                 std::process::ExitStatus::default(),
@@ -296,6 +300,7 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
             "a collected child is handed back by none: {disposition:?}"
         );
         assert_eq!(fake.looks(), 1);
+        // The fake answers `owner`'s pid, so a warn about the child names it.
         let warned = crate::log_capture::records_since_on_current_thread(mark, &owner.pid.to_string())
             .into_iter()
             .filter(|(level, _)| *level <= log::Level::Warn)
@@ -354,9 +359,8 @@ fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_kille
 }
 
 /// A caller that expects a wait on its handle to succeed is told when it did not: a failed wait after
-/// a delivered kill is a breach of the contract, asserted where the warn is logged, after it.
-///
-/// A fake answers the failed wait: a handle from `CreateProcess` fails none.
+/// a delivered kill is a breach of the contract, asserted where the warn is logged, after it. A fake
+/// answers the failed wait.
 ///
 /// Mutant: `warn_teardown` asserts nothing.
 #[cfg(debug_assertions)]
@@ -397,9 +401,7 @@ fn each_windows_handle_kind_states_what_its_kill_may_be_refused_for() {
 }
 
 /// A `CreateProcess` handle holds `PROCESS_TERMINATE`, so its kill is never refused: a refusal for
-/// want of permission breaks the contract too.
-///
-/// A fake answers the refusal: no real `CreateProcess` handle is refused.
+/// want of permission breaks the contract too. A fake answers the refusal.
 ///
 /// Mutant: `for_child` allows a refusal of permission.
 #[cfg(debug_assertions)]
@@ -427,10 +429,8 @@ fn a_kill_of_a_uac_handle_granted_terminate_refused_for_permission_breaks_the_co
     after_a_failed_spawn(child, None, Past::Clean, Disposition::Leave, None);
 }
 
-/// A kill of a handle that may be refused for permission (a UAC handle without `PROCESS_TERMINATE`) is
-/// refused only for that: any other refusal breaks the contract.
-///
-/// A fake answers the refusal: no real handle is refused for another reason.
+/// A kill of a handle that may be refused for permission (a UAC handle) is refused only for that: any
+/// other refusal breaks the contract. A fake answers the refusal.
 ///
 /// Mutant: `warn_teardown` does not read the refusal's kind.
 #[cfg(debug_assertions)]
@@ -487,8 +487,7 @@ fn a_failed_look_does_not_excuse_a_refusal_for_another_reason_than_permission() 
 }
 
 /// A failed spawn that hands its child back, whose `TerminateProcess` is denied on a live child (a UAC
-/// handle that lacks `PROCESS_TERMINATE`), comes back with the child, still running and nothing sent
-/// to it, and says so once.
+/// handle), comes back with the child, still running and nothing sent to it, and says so once.
 ///
 /// Mutants: the child is dropped, or reported reaped; the kill is sent anyway (the child exits 1);
 /// the warn says the child is left.
@@ -555,9 +554,8 @@ fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
     );
 }
 
-/// A handle without `PROCESS_TERMINATE` to a live child (a higher-integrity runas child): the
-/// teardown looks once, never waits, and leaves it running. What it could not do comes back for the
-/// caller's one warn.
+/// A UAC handle to a live child: the teardown looks once, never waits, and leaves it running. What it
+/// could not do comes back for the caller's one warn.
 ///
 /// Mutants: wait for the exit when the kill is refused; a refusal on a handle without the right
 /// reads as the exit; the failed `TerminateProcess` is warned of where it is made, as well as by
@@ -601,8 +599,8 @@ fn a_kill_teardown_never_blocks_on_a_handle_without_terminate() {
     );
 }
 
-/// A handle without `PROCESS_TERMINATE` to a child that has exited: its signalled state is the exit,
-/// so the child is `Reaped` and nothing is left running.
+/// A UAC handle to a child that has exited: its signalled state is the exit, so the child is `Reaped`
+/// and nothing is left running.
 ///
 /// Mutant: the teardown reads the refusal by the handle's rights alone, so it leaves a dead child as
 /// `Running`.

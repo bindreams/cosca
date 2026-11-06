@@ -478,21 +478,45 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
     assert_eq!(warns_since(mark).len(), 1);
 }
 
+/// The test's cleanup of a blocker that a teardown left running, on unwind too: it exits on its
+/// stdin's close, and is the test's to reap.
+struct ReapsBlocker {
+    stdin: Option<std::io::PipeWriter>,
+    pid: u32,
+}
+
+impl ReapsBlocker {
+    fn new(owned: &OwnedChild, stdin: std::io::PipeWriter) -> ReapsBlocker {
+        ReapsBlocker {
+            stdin: Some(stdin),
+            pid: owned.pid().expect("the held child has a pid"),
+        }
+    }
+}
+
+impl Drop for ReapsBlocker {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        crate::child::front_kill_tests::reap(self.pid);
+    }
+}
+
 /// The pidfd states what its kill may be refused for: permission alone (`EPERM`).
 ///
 /// Mutant: `LinuxProcess` allows no refusal, or any.
 #[skuld::test]
 fn a_pidfd_allows_a_refusal_of_permission_alone() {
     let (owned, stdin) = held_blocker(|f| f);
+    let _reaped = ReapsBlocker::new(&owned, stdin);
     assert_eq!(owned.kill_refusal(), KillRefusal::Permission);
-    drop(stdin);
 }
 
 /// A failed spawn's teardown of a pidfd whose kill is refused with `errno`: the fate, which the
 /// refusal leaves `Running`.
 fn after_a_pidfd_kill_refused_with(errno: i32, past: Past) -> ChildFate {
     crate::log_capture::install();
-    let (owned, _stdin) = held_blocker(|f| f.signals([failed_signal(errno)]));
+    let (owned, stdin) = held_blocker(|f| f.signals([failed_signal(errno)]));
+    let _reaped = ReapsBlocker::new(&owned, stdin);
     super::held_teardown::tear_down_failed_spawn(owned, None, past, Disposition::Leave, None, &mut Diagnosis::default())
         .0
 }

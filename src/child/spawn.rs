@@ -686,8 +686,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     }
     // Read the identity while the child is still unreaped, and check the read against what the spawn
     // holds of the child: the pidfd on Linux, and on macOS the unique id the child reported (the
-    // pid alone does not say whom it names once something else has reaped the child). On Windows
-    // nothing is checked: the process handle held since the spawn pins the pid. The attach takes
+    // pid alone does not say whom it names once something else has reaped the child). The attach takes
     // this identity and does not re-read the root's, so a reap and reuse after the check cannot
     // make the containment name a stranger. Nothing here reaps the child, so this is also the
     // identity the adopted `OwnedChild` takes.
@@ -807,7 +806,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
             // neither kills nor reaps). On Linux a front is the exception, and a failed attach has
             // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`). Windows has no front.
+            // dying, and is waited for (`tear_down_held`).
             #[cfg(target_os = "linux")]
             let (error, child_fate, unreaped) = held_teardown::tear_down_held(
                 owned,

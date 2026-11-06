@@ -25,6 +25,10 @@ use crate::wait::exit_only::{self, Reap, Target};
 
 pub(crate) mod cancel;
 
+/// What a handle `CreateProcess` returned holds: every right, `SYNCHRONIZE` and `PROCESS_TERMINATE`
+/// among them. [`WindowsProcess::for_child`] and the tokio spawn's own children state it.
+pub(crate) const CREATE_PROCESS_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ALL_ACCESS;
+
 #[derive(Debug)]
 pub(crate) struct WindowsProcess {
     pid: u32,
@@ -56,7 +60,7 @@ impl WindowsProcess {
         Self {
             pid,
             handle,
-            granted: PROCESS_ALL_ACCESS,
+            granted: CREATE_PROCESS_ACCESS,
         }
     }
 

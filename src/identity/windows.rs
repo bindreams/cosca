@@ -244,8 +244,7 @@ pub(crate) mod fault {
 
     /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
     /// calling `TerminateProcess`; the process stays alive. The guard clears the refusal on drop,
-    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread;
-    /// [`assert_fired`](Armed::assert_fired) asks whether a kill used it.
+    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread.
     pub(crate) fn refuse_next_terminate_as_exiting() -> Armed {
         oneshot_hook::arm(&EXITING, || {})
     }

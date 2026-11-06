@@ -1,16 +1,17 @@
 //! Windows: a failed async spawn's teardown warns once when its wait for the process it terminated
 //! passes its threshold, and keeps waiting until the process is gone (principle 2). No test can make
-//! `TerminateProcess` slow. The std spawn's row (`ProcSource::reap_now`) makes the seam
-//! `fault::set_late_exit` find the one check of the exit late; the wait after it is real and ends at
-//! once. The raw rows (`OwnedChild::tear_down`) refuse the kill as an exit under way and use a zero
-//! threshold, so the child is really running at the first look, and close its stdin once the wait
-//! blocks; they check that the kill reached `TerminateProcess` to be refused. The unoverridden look
-//! is tested against real handles in `windows_teardown_tests` and `proc_tests`.
+//! `TerminateProcess` slow, so each row makes the wait real another way.
 //!
-//! In the std row the process ends only by `TerminateProcess`, or by its stdin closing. The teardown's
-//! thread drops the stdin writer once the kill returned (`teardown_blocker_parts`), so a kill that
-//! sent nothing leaves a process that exits `0`, and the test fails on `assert_killed` instead of
-//! hanging.
+//! - The std row (`ProcSource::reap_now`): `fault::set_late_exit` makes the one check of the exit
+//!   late; the wait after it ends at once. The process ends only by `TerminateProcess` or by its
+//!   stdin closing, which the teardown's thread does once the kill returned
+//!   (`teardown_blocker_parts`): a kill that sent nothing leaves a process that exits `0`, and the
+//!   test fails on `assert_killed` instead of hanging.
+//! - The raw rows (`OwnedChild::tear_down`): the kill is refused as an exit under way and the
+//!   threshold is zero, so the child is running at the first look; stdin closes once the wait
+//!   blocks. They check that the kill reached `TerminateProcess` to be refused.
+//!
+//! The unoverridden look is tested against real handles in `windows_teardown_tests` and `proc_tests`.
 
 use crate::child::spawn::fault;
 use crate::error::ChildFate;

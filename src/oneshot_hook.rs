@@ -68,8 +68,7 @@ pub(crate) struct Armed<A: 'static = (), R: 'static = ()> {
 }
 
 impl<A: 'static, R: 'static> Armed<A, R> {
-    /// Panics unless the hook this guard armed has fired: a test that counts on its fire point being
-    /// reached asserts it.
+    /// Panics unless the hook this guard armed has fired.
     #[track_caller]
     pub(crate) fn assert_fired(&self) {
         assert!(

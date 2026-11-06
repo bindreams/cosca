@@ -152,8 +152,7 @@ pub(crate) struct TeardownOutcome {
 }
 
 /// What is left of a [`TeardownOutcome`] once its clause is said: the fate, whether the child is
-/// uncollected, and the kind of the error its kill was refused with, if it was. The clause is gone,
-/// so nothing can say it twice.
+/// uncollected, and the kind of the error its kill was refused with, if it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Remains {
     pub(crate) fate: ChildFate,
@@ -322,8 +321,6 @@ impl TeardownOutcome {
 /// What already happened to a handle a teardown goes over (a Linux pidfd, a Windows process handle),
 /// which the caller knows and the handle does not. What the handle allows is its constructor's
 /// ([`KillRefusal`]); the two make an [`Expect`].
-///
-/// Only the Linux and Windows spawns tear a child down over a handle and state these.
 #[cfg_attr(
     not(any(target_os = "linux", windows)),
     allow(
@@ -333,9 +330,8 @@ impl TeardownOutcome {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Past {
-    /// Nothing happened to the handle. The handle may be waited on (a pidfd; a Windows handle from
-    /// `CreateProcess` or `ShellExecuteEx`, which has `SYNCHRONIZE`), so a wait on it does not fail:
-    /// a child the teardown left uncollected is one whose kill was refused, and still running.
+    /// Nothing happened to the handle, which can be waited on, so a wait on it does not fail: a child
+    /// left uncollected is one whose kill was refused, and still running.
     Clean,
     /// An earlier look on the handle failed, or may have, so a wait on it may fail too: a child the
     /// teardown left uncollected need not be one whose kill was refused. What the kill may be refused
