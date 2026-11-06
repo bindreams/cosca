@@ -261,7 +261,7 @@ async fn an_echild_after_a_look_that_showed_the_exit_is_a_foreign_reap() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     let proc = child.proc_mut();
     crate::test_child::reaped_elsewhere::kill_own_child(pid);
     let raw = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");

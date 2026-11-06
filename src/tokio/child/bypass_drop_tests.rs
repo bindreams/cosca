@@ -104,7 +104,7 @@ fn exited_unreaped(kill_on_drop: bool) -> (crate::tokio::Child, Witness) {
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
     let child = cmd.spawn().expect("spawn");
-    let witness = Witness::new(child.id().pid());
+    let witness = Witness::new(child.pid());
     drop(writer);
     witness.wait_exited();
     (child, witness)
@@ -364,7 +364,7 @@ async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
-    let witness = Witness::new(child.id().pid());
+    let witness = Witness::new(child.pid());
     drop(writer);
     witness.wait_exited();
     witness
@@ -397,7 +397,7 @@ async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() 
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(true);
     let child = cmd.spawn().expect("spawn");
-    let witness = Witness::new(child.id().pid());
+    let witness = Witness::new(child.pid());
     let _refused = super::fault::force_kill_failure();
     let drops = super::fault::count_backend_drops();
     let unwound = {
@@ -429,7 +429,7 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
     cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("set stdin");
     cmd.kill_on_drop(true);
     let child = cmd.spawn().expect("spawn");
-    let witness = Witness::new(child.id().pid());
+    let witness = Witness::new(child.pid());
     let crate::tokio::child::ProcSource::Tokio { stdin, .. } = child.os.proc.as_ref().expect("backend") else {
         panic!("a fresh child is a tokio backend");
     };

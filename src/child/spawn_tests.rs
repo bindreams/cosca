@@ -685,7 +685,7 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     crate::log_capture::install();
     let (mut cmd, teardown) = teardown_blocker();
     let child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
     let (err, fate, handed_back) = super::finish_elevated(child, failed_write())
@@ -918,7 +918,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
@@ -954,7 +954,7 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
         .expect_err("a failed write fails the spawn")
@@ -994,7 +994,7 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let unsure = child
         .proc
@@ -1232,7 +1232,7 @@ fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
 /// End `child` and reap it behind its handle's back, as an application that owns SIGCHLD would.
 #[cfg(unix)]
 fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
     let mut status = 0;

@@ -184,7 +184,7 @@ async fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders
         let _holders = crate::containment::fdmarker::fault::record_holder_kills();
         let (mut child, writer, descendant) = session_tree().await;
         let sends = Capture::start();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let mark = crate::log_capture::mark();
         let after_terminate: Arc<Mutex<Option<Vec<u32>>>> = Arc::default();
         let hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
@@ -294,7 +294,7 @@ async fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_fa
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     // SAFETY: `pid` is this test's own child.
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
     crate::test_child::wait_until_zombie(pid);
@@ -335,7 +335,7 @@ async fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_rea
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let (slot, set) = hold_forced();
     let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, move || set(orphaned()));

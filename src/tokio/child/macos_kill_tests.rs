@@ -15,7 +15,7 @@ async fn foreign_reaped_blocker() -> crate::tokio::Child {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
 
     // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.

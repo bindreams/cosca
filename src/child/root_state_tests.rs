@@ -101,7 +101,7 @@ mod linux {
         let (mut child, writer) = session_blocker();
         // Released once the drop's root kill returned, so a drop that sent none ends it with 0.
         let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = child
@@ -285,7 +285,7 @@ mod linux {
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         let recorder = record_kill_group();
         let (mut child, writer) = session_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let fake = child
             .proc
@@ -334,7 +334,7 @@ mod macos {
     fn an_orphaned_root_is_neither_signalled_nor_waited_on_and_warns_once() {
         crate::log_capture::install();
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let fake = child
@@ -368,7 +368,7 @@ mod macos {
     fn an_orphaned_root_behind_a_closed_front_gate_warns_once() {
         crate::log_capture::install();
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -405,7 +405,7 @@ mod macos {
     fn an_unknown_root_we_pin_is_still_killed_through_its_handle() {
         crate::log_capture::install();
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let fake = child
             .proc
@@ -444,7 +444,7 @@ mod macos {
         // Control: a root that is a marker holder is swept when the handle says it is reaped, so
         // the assertion below is not vacuous.
         let (mut control, control_writer) = session_blocker();
-        let control_pid = control.id().pid();
+        let control_pid = control.pid();
         let gone = control
             .proc
             .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]));
@@ -454,7 +454,7 @@ mod macos {
         assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
 
         let (mut child, writer) = session_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let fake = child
             .proc

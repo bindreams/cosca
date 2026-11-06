@@ -1148,7 +1148,7 @@ pub async fn spawn_released_tree_async() -> (cosca::tokio::Child, Member, Member
         cmd.env(RELEASED_EXIT_ENV, RELEASED_EXIT_CODE.to_string());
     })
     .await;
-    let root = Member::new(root, child.id().pid());
+    let root = Member::new(root, child.pid());
     let grand = Member::new(grand, grand_pid);
     (child, root, grand)
 }

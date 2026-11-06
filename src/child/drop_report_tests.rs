@@ -82,7 +82,7 @@ fn a_roots_reap_is_said_under_the_name_of_the_caller_that_tore_it_down() {
 
     crate::log_capture::install();
     let (mut child, writer) = bare_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
 
     let torn = child.tear_down(
@@ -110,7 +110,7 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (mut child, writer) = contained_blocker(ContainMode::Session);
-    let pid = child.id().pid();
+    let pid = child.pid();
     // Released once the cleanup's root kill returned, before its reap (the forced failure comes
     // after the reap, which records nothing): the root must be a zombie that died of `SIGKILL`.
     let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
@@ -254,7 +254,7 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
     // The first walk killed the root: someone else reaps it before the early tree kill, which finds no root.
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         crate::test_child::wait_until_zombie(pid);
         let mut status = 0;
@@ -307,7 +307,7 @@ fn finish_elevated_reports_an_early_tree_kill_that_ends_unvouched_after_a_member
     let (mut child, writer) = crate::test_privilege::root_over_setuid_blockers(1, |cmd| {
         cmd.contain_with(ContainMode::TreeWalk);
     });
-    let pid = child.id().pid();
+    let pid = child.pid();
     let member: u32 = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .expect("the root lists its children")
         .trim()
@@ -600,7 +600,7 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_roo
 fn finish_elevated_names_the_root_when_launchd_holds_it_after_a_delivered_kill() {
     crate::log_capture::install();
     let (mut child, writer) = bare_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     child.proc.script_over(|f| {
         f.signals([Ok(crate::signal::Sent::Delivered)])

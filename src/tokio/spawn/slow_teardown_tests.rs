@@ -289,7 +289,7 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
 #[skuld::test]
 async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
     let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     let tracer = foreign_tracer::spawn_helper(pid);
     let (cleaned, reaps) = assert_warns_once_before_blocking(
         Names::Pid,

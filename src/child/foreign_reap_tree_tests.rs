@@ -69,7 +69,7 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
@@ -104,7 +104,7 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
     let recorder = record_kill_group();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
@@ -150,7 +150,7 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
     let termed = record_term_group();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
@@ -199,7 +199,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
     let termed = record_term_group();
     let mut child = term_ignoring_session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mut ready = String::new();
     std::io::BufRead::read_line(
         &mut std::io::BufReader::new(child.stdout().expect("stdout pipe")),
@@ -255,7 +255,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
     crate::log_capture::install();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = std::rc::Rc::new(crate::send_log::Capture::start());
@@ -350,7 +350,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
     let killed = record_kill_group();
     let termed = record_term_group();
     let child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
     let other = child.id().with_other_value();
@@ -407,7 +407,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().with_other_value();
@@ -451,7 +451,7 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_ki
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
@@ -498,7 +498,7 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_co
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     let collected = child.wait().expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
@@ -545,7 +545,7 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -587,7 +587,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -634,7 +634,7 @@ fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_h
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -669,7 +669,7 @@ fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_t
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().with_other_value();
