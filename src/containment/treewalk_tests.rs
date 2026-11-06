@@ -7,7 +7,7 @@
 
 use super::{descendants_with, Resolution, Walk};
 use crate::error::Error;
-use crate::identity::{Key, OrderKey, ProcessId, RawPid, UnknownCause};
+use crate::identity::{Key, OrderKey, ProcessId, RawPid, UnknownCause, Unread};
 #[cfg(unix)]
 use crate::test_groups::setuid;
 use std::collections::HashMap;
@@ -36,8 +36,11 @@ fn resolver(tokens: &HashMap<RawPid, u64>) -> impl Fn(RawPid, ProcessId, Option<
 }
 
 /// What the live resolver returns for a pid whose read was `Unknown`.
-fn unreadable(pid: RawPid) -> Error {
-    crate::identity::unqueryable_read("pid", pid, UnknownCause::default())
+fn unreadable(pid: RawPid) -> Unread {
+    Unread {
+        why: crate::identity::unqueryable_read("pid", pid, UnknownCause::default()),
+        parent_blamed: false,
+    }
 }
 
 /// Collect the member pids into a sorted Vec for order-independent comparison.
@@ -145,28 +148,39 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
         }
     });
     assert_eq!(unassessed(&got), [200]);
-    assert!(matches!(&got.unassessed[0].1, Error::Unassessable { detail, .. } if detail.contains("pid 200")));
+    assert!(matches!(&got.unassessed[0].1.why, Error::Unassessable { detail, .. } if detail.contains("pid 200")));
     assert_eq!(pids(got), [400]);
 }
 
-/// `complete_members` is the first unassessed candidate's error, naming that candidate, and each
-/// other's pid and cause. Mutants: "the others' causes are dropped"; "the first is not named".
+/// `complete_members` is the first unassessed candidate's error, and each other's pid and cause.
+/// The first names its candidate itself when its own read failed, and a note names it when its
+/// parent's proof did, never both. Mutants: "the others' causes are dropped"; "a blamed parent's
+/// candidate is not named"; "an own read's candidate is named twice".
 #[skuld::test]
 fn complete_members_names_every_unassessed_candidate_with_its_cause() {
     let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
-    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
-        Err(Error::Unassessable {
-            detail: format!("cause of {pid}"),
-            source: None,
-        })
-    });
-    let first = got.unassessed[0].0;
-    let error = got.complete_members().expect_err("three candidates were not assessed");
-    let said = error.to_string();
-    assert!(said.contains(&format!("cause of {first}")), "{said}");
-    assert!(said.contains(&format!("reading pid {first}")), "{said}");
-    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        assert!(said.contains(&format!("pid {other} (cause of {other})")), "{said}");
+    for parent_blamed in [false, true] {
+        let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
+            Err(Unread {
+                why: Error::Unassessable {
+                    detail: format!("cause of {pid}"),
+                    source: None,
+                },
+                parent_blamed,
+            })
+        });
+        let first = got.unassessed[0].0;
+        let error = got.complete_members().expect_err("three candidates were not assessed");
+        let said = error.to_string();
+        assert!(said.contains(&format!("cause of {first}")), "{said}");
+        assert_eq!(
+            said.contains(&format!("reading pid {first}")),
+            parent_blamed,
+            "blamed: {parent_blamed}: {said}"
+        );
+        for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
+            assert!(said.contains(&format!("pid {other} (cause of {other})")), "{said}");
+        }
     }
 }
 
@@ -367,8 +381,10 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
     let denied = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(denied.is_running(), "precondition: the subject must be live");
     let mark = crate::log_capture::mark();
-    let Err(Error::Unassessable { detail, .. }) =
-        super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current(), None)
+    let Err(Unread {
+        why: Error::Unassessable { detail, .. },
+        ..
+    }) = super::resolve_or_drop(&crate::identity::HostKernel, denied.pid(), ProcessId::current(), None)
     else {
         panic!("the walk cannot keep what it cannot verify, and an unread pid is not a gone one");
     };

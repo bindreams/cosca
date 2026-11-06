@@ -406,7 +406,7 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_settled(&self.tree_killed, &crate::containment::GroupRoot::none())
+                    .hard_kill_settled("kill", &self.tree_killed, &crate::containment::GroupRoot::none())
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -656,7 +656,7 @@ impl Child {
         if let Some(in_cgroup) = front {
             return match self
                 .attached
-                .settle_for_kill_tree(&self.tree_killed, group_result, false)
+                .settle_for_kill_tree("kill_tree", &self.tree_killed, group_result, false)
             {
                 Ok(()) if in_cgroup => self.cgroup_kill_reached(),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
@@ -1195,9 +1195,9 @@ impl Child {
             })
         } else {
             if cgroup_only {
-                let not_reached = match kill.result() {
-                    Ok(()) => self.cgroup_kill_reached().err().map(|e| e.to_string()),
-                    Err(left) => Some(left.first().to_string()),
+                let not_reached = match kill.incomplete() {
+                    None => self.cgroup_kill_reached().err().map(|e| e.to_string()),
+                    failure => failure,
                 };
                 match not_reached {
                     // The cgroup kill ended it: reap it, sending nothing.
@@ -1209,7 +1209,7 @@ impl Child {
             } else {
                 // The tree kill above may have reached the root: if the root's own kill is refused,
                 // that kill is what ends it.
-                let reach = kill.result().is_ok().then_some(&self.attached as &dyn Reach);
+                let reach = kill.completed().then_some(&self.attached as &dyn Reach);
                 self.proc.tear_down(
                     Some(self.id),
                     Kill {

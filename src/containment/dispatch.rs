@@ -573,6 +573,21 @@ impl std::fmt::Display for Unsettled {
     }
 }
 
+/// How an [`Attached::settle`] that found nothing left came out: the call's own decision, which the
+/// caller reads in place of the handle's mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleOutcome {
+    /// The kill ran and left nothing: the tree is killed, and marked so.
+    Killed,
+    /// The kill was skipped (and the sweep by identity of a macOS fd marker left nothing): it killed
+    /// nothing, and marks nothing.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix drop or cleanup skips a kill by the root's number")
+    )]
+    Skipped,
+}
+
 /// What a tree kill did ([`Attached::hard_kill_for_drop`], [`Attached::hard_kill`]): the one value
 /// [`Attached::settle`] turns into what is left and into the handle's mark.
 #[derive(Debug)]
@@ -609,12 +624,30 @@ impl TreeKillOutcome {
         }
     }
 
-    /// Whether the kill ran and left nothing, the root included: the tree is killed. This is the
-    /// kill's own answer, which a caller reads instead of the handle's mark ([`TreeKilled`]), which
-    /// only [`Attached::settle`] sets.
+    /// Why the kill did not leave the tree killed, or `None` when it did: it ran and left nothing, the
+    /// root included. The first member a kill left, or what a skip left undone. Written once for
+    /// [`completed`](Self::completed), and for the text of a gate that reads it.
+    #[cfg(unix)]
+    pub(crate) fn incomplete(&self) -> Option<String> {
+        match self {
+            TreeKillOutcome::Ran(Ok(())) => None,
+            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Skipped { holders: Err(left), .. } => {
+                Some(left.first().to_string())
+            }
+            TreeKillOutcome::Skipped {
+                action,
+                holders: Ok(()),
+            } => Some(format!("the kill was skipped, and would {action}")),
+        }
+    }
+
+    /// Whether the kill reached the front it was made for: it ran and left nothing, the root
+    /// included, so the tree is killed. The one predicate of every gate that asks, with a cgroup
+    /// front, whether the cgroup kill ended it. A caller reads this, not the handle's mark
+    /// ([`TreeKilled`]), which only [`Attached::settle`] sets and only a later call reads.
     #[cfg(unix)]
     pub(crate) fn completed(&self) -> bool {
-        matches!(self, TreeKillOutcome::Ran(Ok(())))
+        self.incomplete().is_none()
     }
 
     /// What the kill skipped, as an action, when it was skipped.
@@ -687,7 +720,7 @@ impl SweepFailure {
         backstop: Result<(), Error>,
         root_ended: bool,
     ) -> Result<(), SweepFailure> {
-        let walk = attached.settle_for_kill_tree(killed, walk, root_ended);
+        let walk = attached.settle_for_kill_tree("kill_tree", killed, walk, root_ended);
         if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
             // Both-fail: the walk's error is surfaced; subsuming the backstop's is deliberate.
             log::debug!("kill_tree handle backstop also failed ({backstop}); surfacing the walk's error: {walk}");
@@ -816,14 +849,16 @@ impl Attached {
     }
 
     /// [`hard_kill`](Self::hard_kill) for a caller with no root to kill after it, settled and reported
-    /// as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not ended.
+    /// as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not ended. `caller`
+    /// names the call in the warns of the members it left besides the first.
     #[cfg(unix)]
     pub(crate) fn hard_kill_settled(
         &self,
+        caller: &str,
         killed: &TreeKilled,
         root: &crate::containment::GroupRoot<'_>,
     ) -> Result<(), Error> {
-        self.settle_for_kill_tree(killed, self.hard_kill(root), false)
+        self.settle_for_kill_tree(caller, killed, self.hard_kill(root), false)
     }
 
     /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk` refusal to walk: the
@@ -844,6 +879,9 @@ impl Attached {
     /// killed in `killed` if the kill ran; a skipped kill killed nothing and never marks. Otherwise
     /// it is the first member left, and the others as data: it reports none of them.
     ///
+    /// The answer is the call's own decision, which the caller reads instead of `killed`: that mark is
+    /// for a later call (a drop's [`DropView`]).
+    ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
     pub(crate) fn settle(
@@ -851,7 +889,7 @@ impl Attached {
         killed: &TreeKilled,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Result<(), Unsettled> {
+    ) -> Result<SettleOutcome, Unsettled> {
         let (ran, result) = match outcome.into() {
             TreeKillOutcome::Ran(result) => (true, result),
             TreeKillOutcome::Skipped { holders, .. } => (false, holders),
@@ -863,22 +901,25 @@ impl Attached {
             );
             left.unsettled(root_ended)?;
         }
-        if ran {
-            killed.mark();
+        if !ran {
+            return Ok(SettleOutcome::Skipped);
         }
-        Ok(())
+        killed.mark();
+        Ok(SettleOutcome::Killed)
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
-    /// left, and each other is warned of here, once.
+    /// left, and each other is warned of here, once. `caller` names the call in those warns.
     pub(crate) fn settle_for_kill_tree(
         &self,
+        caller: &str,
         killed: &TreeKilled,
         walk: Result<(), Unkilled>,
         root_ended: bool,
     ) -> Result<(), Error> {
         self.settle(killed, walk, root_ended)
-            .map_err(|left| left.report("kill_tree"))
+            .map(drop)
+            .map_err(|left| left.report(caller))
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded

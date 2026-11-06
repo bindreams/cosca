@@ -268,8 +268,9 @@ impl Child {
         self.os.proc.as_mut()?.forget_for(view)
     }
 
-    /// Whether this handle already killed its tree completely.
-    #[cfg(unix)]
+    /// Whether this handle already killed its tree completely: what a later call sees. A call that has
+    /// just run a kill reads the kill's own answer ([`settle_tree`](Self::settle_tree)).
+    #[cfg(all(test, unix))]
     pub(super) fn tree_killed(&self) -> bool {
         self.tree_killed.is_set()
     }
@@ -281,12 +282,12 @@ impl Child {
         &self,
         kill: TreeKillOutcome,
         root_ended: bool,
-    ) -> Result<(), crate::containment::dispatch::Unsettled> {
+    ) -> Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled> {
         self.os.attached.settle(&self.tree_killed, kill, root_ended)
     }
 
-    /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
-    /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
+    /// End a failed spawn's cleanup: `settled` (the tree was killed and its drain watched, and the root
+    /// was killed, is gone, or was deliberately left alone) disarms the drop, whose error reports what the cleanup did and
     /// left. Otherwise the handle stays armed so its drop tries again. `warned` is what the cleanup
     /// already warned of, so the drop, armed or not, does not warn of the same twice.
     #[cfg(unix)]
@@ -829,6 +830,7 @@ impl Child {
                 self.os
                     .attached
                     .hard_kill_settled(
+                        "kill",
                         &self.tree_killed,
                         &crate::containment::GroupRoot::new(self.root_pidfd(), &check),
                     )
@@ -967,7 +969,7 @@ impl Child {
             return match self
                 .os
                 .attached
-                .settle_for_kill_tree(&self.tree_killed, group_result, false)
+                .settle_for_kill_tree("kill_tree", &self.tree_killed, group_result, false)
             {
                 Ok(()) if in_cgroup => cgroup_kill_reached(self.front, &self.os, self.id.pid()),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
@@ -2072,9 +2074,6 @@ fn signal_on_drop(
         _ = tree_killed;
         TreeKillOutcome::from(os.attached.hard_kill(&crate::containment::GroupRoot::none()))
     };
-    // What the cgroup front's gate reads below: the kill's own outcome.
-    #[cfg(unix)]
-    let tree_failure = tree.result().as_ref().err().map(|left| left.first().to_string());
     // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on, once
     // the root is killed ([`Child::report`]).
     signals.tree = Some(tree);
@@ -2095,7 +2094,8 @@ fn signal_on_drop(
     // have its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
     if let Some(front) = cgroup_front {
-        let reached = match tree_failure {
+        // The gate reads the kill's own outcome.
+        let reached = match signals.tree.as_ref().expect("the tree kill ran above").incomplete() {
             None => cgroup_kill_reached(Some(front), os, pid).map_err(|e| e.to_string()),
             Some(failure) => Err(failure),
         };

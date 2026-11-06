@@ -133,3 +133,45 @@ async fn a_drain_watch_that_fails_after_a_landed_kill_is_reported_beside_it() {
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("its drain could not be watched"), "{warns:?}");
 }
+
+/// A drain that could not be watched is not a settled tree: the cleanup leaves the handle armed, so
+/// its drop writes `cgroup.kill` again and waits for the drain again.
+///
+/// Mutant: the cleanup disarms the handle once the kill landed, whether or not its drain was watched.
+#[skuld::test]
+async fn a_drain_watch_that_fails_leaves_the_handle_armed_to_watch_it_again() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+
+    let kill_written_by_the_drop = std::thread::scope(|s| {
+        s.spawn(move || {
+            let teardown = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
+            let (fake, leaf) = linux::fake_leaf("cosca-failed-write-rearmed-drain", true);
+            let child = linux::contained_by(child, leaf);
+            // The first kill lands; then the file the drain watch reads is garbage.
+            let _corrupted = leaf_fault::set_after_kill_write({
+                let (events, kill) = (fake.events.clone(), fake.kill.clone());
+                move || {
+                    std::fs::write(&events, "garbage\n").expect("corrupt cgroup.events");
+                    // Only a later write of `cgroup.kill` shows.
+                    std::fs::write(&kill, b"").expect("clear cgroup.kill");
+                }
+            });
+            let failed =
+                crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+                    .map(drop)
+                    .is_err();
+            assert!(failed, "the failed write fails the spawn");
+            teardown.assert_killed();
+            !fake.kill_written().is_empty()
+        })
+        .join()
+        .expect("the cleanup")
+    });
+
+    assert!(kill_written_by_the_drop, "the armed drop kills the leaf again");
+}

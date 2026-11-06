@@ -405,7 +405,7 @@ fn the_keep_rule_over_optional_keys_drops_a_keyless_read_only_under_a_bound() {
 /// (`y` is kept).
 #[skuld::test]
 fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
-    use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};
+    use super::{unread_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};
     use crate::containment::treewalk::descendants_with;
 
     const ROOT: RawPid = 100;
@@ -421,7 +421,7 @@ fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the
             parent: ParentRead::Is(shown),
             cause: UnknownCause::default(),
         };
-        resolution_of("pid", pid, read.judged(pid, parent.pid(), bound).proved(|| Ok(())))
+        unread_of("pid", pid, read.judged(pid, parent.pid(), bound).proved(|| Ok(())))
     };
 
     let root_bound = order_of(100);

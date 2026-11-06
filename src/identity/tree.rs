@@ -1,6 +1,6 @@
 //! The process tree around a [`ProcessId`](super::ProcessId): its parent and its children.
 
-use super::{keeps, resolution_of, HostKernel, Kernel, ProcessId, ORDER_AFTER_PARENT};
+use super::{keeps, resolution_of, unread_of, HostKernel, Kernel, ProcessId, ORDER_AFTER_PARENT};
 use crate::error::Error;
 
 /// Whether a tree query descends recursively or returns only direct children.
@@ -61,7 +61,9 @@ impl ProcessId {
         }
         // Elsewhere `self` read after the parent must still name it, and it must still hold its pid.
         let read = ProcessId::of_ordered_with(kernel, self.pid(), Some(parent), Some(self.key), None);
-        Ok(resolution_of("pid", self.pid(), read)?.map(|_| parent))
+        // A parent whose proof failed is named by the error: say which read was left unanswered.
+        let again = unread_of("pid", self.pid(), read).map_err(|unread| unread.naming(self.pid()))?;
+        Ok(again.map(|_| parent))
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the

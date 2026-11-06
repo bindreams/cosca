@@ -163,7 +163,11 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_settled(&self.tree_killed, &crate::containment::GroupRoot::none())
+                    .hard_kill_settled(
+                        "graceful_shutdown",
+                        &self.tree_killed,
+                        &crate::containment::GroupRoot::none(),
+                    )
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
                 self.cgroup_kill_reached()?;
             }

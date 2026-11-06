@@ -11,7 +11,7 @@ use rustix::io::Errno;
 use rustix::process::Pid;
 
 use crate::error::Error;
-use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId};
+use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId, Unread};
 use crate::Recursive;
 
 const ROOT: u32 = 4242;
@@ -242,8 +242,18 @@ fn a_child_whose_parent_cannot_be_proved_again_is_unassessed_and_a_gone_child_is
             .expect("the root is live")
     };
     let found = walk(&unproved(), Recursive::Yes);
-    let [(pid, Error::Unassessable { detail, .. })] = &found.unassessed[..] else {
-        panic!("expected one Unassessable entry, got {:?}", found.unassessed);
+    let [(
+        pid,
+        Unread {
+            why: Error::Unassessable { detail, .. },
+            parent_blamed: true,
+        },
+    )] = &found.unassessed[..]
+    else {
+        panic!(
+            "expected one Unassessable entry blaming the parent, got {:?}",
+            found.unassessed
+        );
     };
     assert_eq!(*pid, CHILD);
     assert!(
@@ -279,7 +289,14 @@ fn a_child_whose_parent_cannot_be_proved_is_reported_by_an_error_naming_both() {
         let walked = super::walk_from(&kernel(), root(), &EDGES, depth)
             .expect("the root reads")
             .expect("the root is live");
-        let [(_, Error::Unassessable { detail, .. })] = &walked.unassessed[..] else {
+        let [(
+            _,
+            Unread {
+                why: Error::Unassessable { detail, .. },
+                ..
+            },
+        )] = &walked.unassessed[..]
+        else {
             panic!(
                 "{depth:?}: expected one Unassessable entry, got {:?}",
                 walked.unassessed

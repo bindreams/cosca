@@ -873,7 +873,7 @@ fn leave_unverified_front(
 /// have started. The waits for the root and for the tree's drain each warn once past 1 s.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
-    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::dispatch::{SettleOutcome, TreeKillOutcome};
 
     let Err(write_err) = written else {
         return Ok(child);
@@ -901,10 +901,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         }
         kill
     });
-    let tree_failure = match tree.as_ref().map(TreeKillOutcome::result) {
-        Some(Err(left)) => Some(left.first().to_string()),
-        _ => None,
-    };
+    let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
     // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
     // deliberately not signalled (an unpinned root, a live front). A refused kill leaves it to the
     // handle's drop to try again.
@@ -986,11 +983,31 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     // The tree is reported after the root's kill: a walk that left only the root is settled by it.
     let tree = tree.map(|walk| child.settle_tree(walk, fate.ended_by_the_kill()));
-    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
-    // deliberately left alone because the root is reaped or unpinned.
-    let tree_settled = tree.is_none() || child.tree_killed() || (skipped.is_some() && view.leaves_root_alone());
-    let (mut tree_note, tree_warn) =
-        crate::child::spawn::report_tree_teardown(tree, drain_failure.as_ref(), &child.teardown_subject());
+    // The tree is settled when it was killed completely and its drain was watched, was not for the
+    // cleanup to kill, or was deliberately left alone because the root is reaped or unpinned. A drain
+    // that could not be watched leaves the handle armed: its drop waits for it again.
+    let tree_settled = tree
+        .as_ref()
+        .is_none_or(|settled| matches!(settled, Ok(SettleOutcome::Killed)) && drain_failure.is_none())
+        || (skipped.is_some() && view.leaves_root_alone());
+    let subject = child.teardown_subject();
+    let (mut tree_note, mut tree_warn) = crate::child::spawn::report_tree_teardown(tree, &subject);
+    if let Some(drain) = &drain_failure {
+        tree_note.push_str(&format!(
+            "; its contained tree was killed, but its drain could not be watched ({subject}: {drain}); the handle \
+             stays armed to watch it again"
+        ));
+        let said = format!("the kill succeeded, but its drain could not be watched ({drain})");
+        match tree_warn.as_mut() {
+            Some(warn) => warn.push_str(&format!("; {said}")),
+            None => {
+                tree_warn = Some(format!(
+                    "{} ({subject}): {said}",
+                    crate::child::spawn::TREE_TEARDOWN_WARN
+                ));
+            }
+        }
+    }
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }

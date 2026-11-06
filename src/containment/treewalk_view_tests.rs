@@ -10,7 +10,7 @@ use crate::child::front_cgroup_tests::pidfd_of;
 use crate::containment::dispatch::Unkilled;
 use crate::error::Error;
 use crate::identity::{
-    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
+    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, Unread, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::{
     live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
@@ -260,7 +260,10 @@ fn a_pid_the_kernel_cannot_read_is_an_error_the_walk_does_not_warn_of() {
     let (child, id) = live_member();
     let (kernel, _guard) = unreadable(id.pid());
     let mark = crate::log_capture::mark();
-    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None)
+    let Err(Unread {
+        why: Error::Unassessable { detail, .. },
+        ..
+    }) = super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None)
     else {
         panic!("an unreadable pid is Unassessable");
     };
@@ -289,7 +292,11 @@ fn the_error_for_a_dropped_pid_names_the_cause_of_its_own_read_under_a_held_pare
             .on_pidfs_ino(me.pid(), Ok(Some(9))),
         0,
     );
-    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), parent, None) else {
+    let Err(Unread {
+        why: Error::Unassessable { detail, .. },
+        parent_blamed: false,
+    }) = super::resolve_or_drop(&kernel, id.pid(), parent, None)
+    else {
         panic!("an unreadable pid is Unassessable");
     };
     assert!(
@@ -310,8 +317,12 @@ fn the_error_for_a_dropped_pid_names_the_cause_of_its_parents_proof() {
     let me = ProcessId::current();
     let parent = ticks_id(me.pid());
     let kernel = View::Unreadable.fail(FakeKernel::over(&HostKernel), 0);
-    let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), parent, None) else {
-        panic!("an unreadable parent proof is Unassessable");
+    let Err(Unread {
+        why: Error::Unassessable { detail, .. },
+        parent_blamed: true,
+    }) = super::resolve_or_drop(&kernel, id.pid(), parent, None)
+    else {
+        panic!("an unreadable parent proof is Unassessable, blaming the parent");
     };
     assert!(
         detail.contains(&format!("ppid {} identity could not be read", me.pid())),
