@@ -159,18 +159,18 @@ fn finish_elevated_settles_a_walk_that_left_only_the_root_by_its_own_kill_of_the
     crate::log_capture::install();
     for (left, reported) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
         let (child, writer) = crate::test_child::held_treewalk_blocker_leaving(left);
-        let teardowns = crate::child::owned::seams::record_root_teardowns();
         let mark = crate::log_capture::mark();
 
         let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
         let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
-        // A settled tree disarms the handle; an unsettled one leaves it to try again when it drops.
+        // A settled tree disarms the handle; an unsettled one is looked at again when it drops.
+        let drops = crate::log_capture::records_since_on_current_thread(mark, "Child::drop:");
         assert_eq!(
-            teardowns.count(),
-            u32::from(reported),
-            "{left:?}: the handle is armed iff reported"
+            !drops.is_empty(),
+            reported,
+            "{left:?}: the handle is armed iff reported: {drops:?}"
         );
         let cause = cause.to_string();
         assert_eq!(
