@@ -28,7 +28,7 @@ pub async fn accept_or_die_async_also(
     // As in the sync path: a target that has already exited is dead, decided before any wait so
     // that no reactor-readiness ordering between the accept arm and the exit arm can matter.
     #[cfg(unix)]
-    let exited = super::has_exited_unreaped(child.id());
+    let exited = super::has_exited_unreaped(child.id().expect("the spawn read the control target's identity"));
     #[cfg(windows)]
     let exited = child
         .try_wait()
@@ -38,7 +38,8 @@ pub async fn accept_or_die_async_also(
         died_before_connecting(target_pid);
     }
     #[cfg(unix)]
-    let target = cosca::tokio::Process::open(child.id()).expect("open the control target");
+    let target = cosca::tokio::Process::open(child.id().expect("the spawn read the control target's identity"))
+        .expect("open the control target");
     #[cfg(unix)]
     let target_exit = async {
         match &target {

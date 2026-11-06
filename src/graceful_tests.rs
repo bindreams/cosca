@@ -105,12 +105,8 @@ fn signal_refuses_a_child_with_no_mechanism() {
 #[skuld::test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
     let (child, stdin) = crate::test_child::windows_blocker_on_console();
-    let other = super::signal(
-        GracefulMechanism::OtherConsoleGroup,
-        child.id().pid(),
-        root_is_not_signalled,
-    );
-    let group = super::signal(GracefulMechanism::ConsoleGroup, child.id().pid(), root_is_not_signalled);
+    let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.pid(), root_is_not_signalled);
+    let group = super::signal(GracefulMechanism::ConsoleGroup, child.pid(), root_is_not_signalled);
     assert!(
         other.is_ok(),
         "OtherConsoleGroup must be attempted, not refused: {other:?}"
@@ -139,7 +135,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 fn signal_refuses_a_child_cosca_did_not_create() {
     let (child, stdin) = crate::test_child::windows_blocker_on_console();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;
-    let err = super::signal(mechanism, child.id().pid(), root_is_not_signalled)
+    let err = super::signal(mechanism, child.pid(), root_is_not_signalled)
         .expect_err("a child cosca did not create must not be signalled");
     let crate::error::Error::Unsupported { detail, .. } = &err else {
         panic!("expected Unsupported, got {err:?}");

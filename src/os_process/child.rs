@@ -36,6 +36,13 @@ pub(crate) trait OsChild: OsProcess {
     /// time.
     fn peek(&self) -> Result<PeekOutcome, Error>;
 
+    /// Whether the process has exited though [`OsProcess::exited`] has not said so: a zombie that
+    /// only its tracer sees, on a platform where the OS withholds the exit from a parent that does
+    /// not trace (macOS). The default is no such case.
+    fn exited_unannounced(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// The waiter's look: prepare what it will wait on, then consume the exit record if there is
     /// one (never a stop). [`TryReapOutcome::Running`] carries the wait, which the caller waits on
     /// before it calls again. Only the one waiter that holds the reap calls it.

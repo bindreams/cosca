@@ -392,7 +392,7 @@ use crate::test_groups::setuid;
 #[skuld::test]
 fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
     let (child, writer) = held_blocker(true);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     // Released after the kill: a kill that sent nothing exits 0.
     let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
@@ -412,7 +412,7 @@ fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
 #[skuld::test]
 fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     let (child, writer) = held_blocker(false);
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
     assert_eq!(
         error.fate(),
@@ -480,7 +480,7 @@ fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
 ) {
     crate::log_capture::install();
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let id = child.id();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let mark = crate::log_capture::mark();
 
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);

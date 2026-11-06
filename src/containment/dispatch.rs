@@ -79,19 +79,13 @@ impl Prepared {
     /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
     /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
     /// tree either way.
-    pub(crate) fn settle_verdict(
-        &mut self,
-        #[cfg(target_os = "linux")] child: ChildHandle<'_>,
-        #[cfg(not(target_os = "linux"))] pid: u32,
-    ) {
+    pub(crate) fn settle_verdict(&mut self, #[cfg(target_os = "linux")] child: ChildHandle<'_>) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
             if let Err(e) = leaf.take_placement(child) {
                 log::debug!("cgroup v2: a failed spawn's child is not placed in its leaf: {e}");
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = pid;
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group
@@ -347,19 +341,21 @@ impl DropView {
     /// Read the state a drop or a failed-spawn cleanup decides on: the root's number first, then
     /// the handle's own answer ([`RootState`](crate::signal::RootState)). The handle is exact
     /// where the number is not: a foreign reap followed by a same-tick reuse still reads as this
-    /// root by its start token.
+    /// root by its start token. A root with no identity (`id` is `None`) has nothing the number can
+    /// be compared with, so only a number that names no process shows it reaped, and the handle
+    /// decides alone otherwise.
     ///
     /// Reading emits no `warn`: the caller reports once, with a
     /// [`DropReport`](crate::child::drop_report::DropReport). `caller` names itself in log lines.
     pub(crate) fn read(
         caller: TeardownCaller,
-        id: crate::identity::ProcessId,
+        root_pid: u32,
+        id: Option<crate::identity::ProcessId>,
         root: impl FnOnce() -> crate::signal::RootState,
         tree_killed: &TreeKilled,
     ) -> DropView {
         use crate::signal::RootState;
         let label = caller.label();
-        let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
         let state = root();
         let handle_reaped = matches!(state, RootState::Reaped { .. });
@@ -1950,14 +1946,22 @@ pub(crate) fn prepare(
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
 /// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
 /// cooperative-signal mechanism is read off it first.
+///
+/// `id` is the identity the spawn read of the root, or the error of the read that failed. A
+/// mechanism that names the tree by the root's identity (a tree walk, the macOS fd marker) fails the
+/// attach with that error; one that attaches by pid or handle (a cgroup, a process group, a Job
+/// Object) does not need it.
 pub(crate) fn attach(
-    id: crate::identity::ProcessId,
+    #[cfg(unix)] pid: u32,
+    id: Result<crate::identity::ProcessId, Error>,
     #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
 ) -> Result<Attachment, Error> {
     let graceful = prepared.graceful_mechanism();
     let (containment, attached) = attach_tree(
+        #[cfg(unix)]
+        pid,
         id,
         #[cfg(target_os = "linux")]
         child,
@@ -1974,13 +1978,12 @@ pub(crate) fn attach(
 
 /// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.
 fn attach_tree(
-    id: crate::identity::ProcessId,
+    #[cfg(unix)] pid: u32,
+    id: Result<crate::identity::ProcessId, Error>,
     #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
 ) -> Result<(Containment, Attached), Error> {
-    #[cfg(unix)]
-    let pid = id.pid();
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
@@ -1990,7 +1993,7 @@ fn attach_tree(
                 // TreeWalk root: no kernel container / process group; teardown is
                 // by identity: the one the spawn verified against the child's handle.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
                 }
 
                 let raw_pid = pid;
@@ -2063,12 +2066,12 @@ fn attach_tree(
                     };
                     return Ok((
                         Containment::FdMarker,
-                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, id, pgid)),
+                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, id?, pgid)),
                     ));
                 }
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
                 }
                 let raw_pid = pid;
                 debug_assert!(
@@ -2109,7 +2112,7 @@ fn attach_tree(
             // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
             // identity teardown, with CTRL_BREAK to the group as cooperative term.
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
+                return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
             }
             // A frozen root is assigned its job and left suspended. It gets no `TreeWalk` fallback:
             // a frozen root without a job would have nothing to kill it if its owner died.
@@ -2126,7 +2129,7 @@ fn attach_tree(
                     // mechanism rather than silently yielding no containment. The
                     // root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags),
                     // so `terminate`'s CTRL_BREAK still reaches the group.
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
                 }
                 Err(e) => return Err(Error::Containment { detail: e.to_string() }),
             }

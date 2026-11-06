@@ -53,8 +53,9 @@ impl Command {
 }
 
 impl SuspendedChild {
-    /// The child's identity. It names the same process after [`resume`](Self::resume).
-    pub fn id(&self) -> ProcessId {
+    /// The child's identity, or `None` when the OS refused to report it; see [`Child::id`]. It names
+    /// the same process after [`resume`](Self::resume).
+    pub fn id(&self) -> Option<ProcessId> {
         self.child.id()
     }
 

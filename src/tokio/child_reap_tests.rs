@@ -7,23 +7,25 @@ use crate::test_groups::{tracer_group, Group};
 /// `child` as a backend, as the spawn builds it: Linux holds a pidfd the test opens itself (a raw
 /// tokio child has none), macOS the child's unique id.
 pub(in crate::tokio::child) fn proc_source(child: ::tokio::process::Child) -> ProcSource {
+    let pid = child.id().expect("tokio owns an un-reaped child");
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
-        let pid = child.id().expect("tokio owns an un-reaped child");
         let pidfd = pidfd_open(Pid::from_raw(pid as i32).expect("pid"), PidfdFlags::empty()).expect("pidfd_open");
-        ProcSource::new(child, pidfd)
+        ProcSource::new(child, pid, pidfd)
     }
     #[cfg(target_os = "macos")]
     {
-        let pid = child.id().expect("tokio owns an un-reaped child");
         ProcSource::new(
             child,
+            pid,
             crate::signal::read_identity(pid).expect("the identity is readable"),
         )
     }
     #[cfg(windows)]
-    ProcSource::new(child)
+    {
+        ProcSource::new(child, pid)
+    }
 }
 
 /// Blocks until `pid` has exited, without consuming its exit record.
@@ -599,7 +601,7 @@ fn exited_unreaped_with(identity: impl FnOnce(u64) -> Option<u64>) -> (ProcSourc
     let real = crate::signal::read_identity(pid)
         .expect("readable")
         .expect("a zombie still has a unique id");
-    (ProcSource::new(child, identity(real)), pid)
+    (ProcSource::new(child, pid, identity(real)), pid)
 }
 
 /// The pid names an exited child of this process, so a bare `waitid` would answer at once: only
@@ -809,7 +811,7 @@ async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back(
     let unique = crate::signal::read_identity(pid).expect("readable");
     let mut helper = tracer::start(Mode::Auto).attach_tokio(&child);
     assert_eq!(helper.recv(), Report::Attached);
-    let mut proc = ProcSource::new(child, unique);
+    let mut proc = ProcSource::new(child, pid, unique);
 
     let waited = std::thread::scope(|s| {
         let waiter = s.spawn(|| proc.wait_and_reap(pid));

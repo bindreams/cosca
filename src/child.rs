@@ -131,8 +131,8 @@ pub struct Child {
     /// Empty only inside [`tear_down_or_hand_back`](Child::tear_down_or_hand_back), which consumes
     /// the child.
     proc: ChildSlot,
-    /// Stable identity resolved immediately after spawn.
-    id: ProcessId,
+    /// See [`Child::id`].
+    id: Option<ProcessId>,
     pipes: BTreeMap<Fd, ParentEnd>,
     kill_on_drop: bool,
     containment: Containment,
@@ -154,14 +154,14 @@ pub struct Child {
 impl Child {
     pub(crate) fn from_parts(
         proc: OwnedChild,
-        id: ProcessId,
+        id: Option<ProcessId>,
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
     ) -> Child {
-        debug_assert_eq!(
-            proc.pid(),
-            Some(id.pid()),
+        debug_assert!(proc.pid().is_some(), "a child's process has the pid its spawn learned");
+        debug_assert!(
+            id.is_none_or(|id| proc.pid() == Some(id.pid())),
             "a child's process and identity name one pid"
         );
         Child {
@@ -244,25 +244,36 @@ impl Child {
         crate::containment::require_drainable(self.containment, &self.attached)
     }
 
-    /// This child's stable identity (see [`crate::identity::ProcessId`]).
-    pub fn id(&self) -> ProcessId {
+    /// This child's stable identity (see [`crate::identity::ProcessId`]), or `None` when the OS
+    /// refused to report it at spawn (below Linux 6.9 with no usable `/proc`, or a refused query on
+    /// another OS). Such a child is otherwise a child like any other: [`pid`](Self::pid), `wait`,
+    /// `kill` and the drop go through its handle. A containment that names its tree by the root's
+    /// identity (a tree walk, the macOS fd marker) cannot be had without one, and the spawn fails.
+    pub fn id(&self) -> Option<ProcessId> {
         self.id
     }
 
     /// The pid the child had at spawn. A number only: it does not say the process still holds it
     /// (an identity is [`id`](Self::id)).
+    ///
+    /// The handle's pid is an `Option` because a handle exists pid-less before the spawn handshake;
+    /// a `Child` always has one, asserted in `from_parts`.
     pub fn pid(&self) -> u32 {
         self.proc
             .pid()
             .expect("a Child's process has the pid its spawn learned")
     }
 
-    /// Whether the child is still running — re-checked via its stable identity, so a
-    /// recycled pid never reads as alive. [`crate::identity::Liveness::Unknown`] when the OS
-    /// refuses the query: an unelevated parent cannot open a UAC-elevated child by pid, and
-    /// the honest answer there is not "dead".
+    /// Whether the child is still running, read through the child's own handle, with or without an
+    /// [`id`](Self::id): a recycled pid never reads as alive. An exited child that has not been
+    /// reaped is dead. [`crate::identity::Liveness::Unknown`] when the OS refuses the query: the
+    /// handle of a UAC-elevated child may not be readable by an unelevated parent, and the honest
+    /// answer there is not "dead".
     pub fn is_alive(&self) -> crate::identity::Liveness {
-        self.id.is_alive()
+        self.proc.liveness().unwrap_or_else(|e| {
+            log::debug!("child {}: its liveness could not be read ({e})", self.pid());
+            crate::identity::Liveness::Unknown
+        })
     }
 
     /// Block until the child exits, returning its status.
@@ -465,7 +476,7 @@ impl Child {
         };
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
-        let look = self.proc.look_at_front(Some(self.id), reach, None);
+        let look = self.proc.look_at_front(self.id, reach, None);
         word_front(self.pid(), why, disposition, look)
     }
 
@@ -999,10 +1010,11 @@ impl Child {
 /// Whether the root has been reaped, from its inputs: this handle's own reap, or the root's number
 /// reading `Gone` or as another process.
 #[cfg(unix)]
-pub(crate) fn root_reaped(own_reap: bool, id: ProcessId, now: crate::identity::Resolved<ProcessId>) -> bool {
+pub(crate) fn root_reaped(own_reap: bool, id: Option<ProcessId>, now: crate::identity::Resolved<ProcessId>) -> bool {
     own_reap
         || match now {
-            crate::identity::Resolved::Found(now) => now != id,
+            // With no identity to compare, a number that names a process says nothing: the handle decides.
+            crate::identity::Resolved::Found(now) => id.is_some_and(|id| now != id),
             crate::identity::Resolved::Gone => true,
             crate::identity::Resolved::Unknown => false,
         }
@@ -1109,7 +1121,7 @@ impl Child {
             let fate = if self.proc.is_reaped() {
                 ChildFate::Reaped
             } else {
-                ChildFate::Running { id: Some(self.id) }
+                ChildFate::Running { id: self.id }
             };
             return (fate, None);
         }
@@ -1122,7 +1134,7 @@ impl Child {
     fn into_unreaped(mut self) -> Unreaped {
         debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
         let root = self.proc.take().expect("a child handed back still holds its root");
-        Unreaped::new(root, Some(self.id))
+        Unreaped::new(root, self.id)
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
@@ -1142,7 +1154,7 @@ impl Child {
             let mut left = Vec::new();
             let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
             let torn = self.proc.tear_down(
-                Some(self.id),
+                self.id,
                 Kill {
                     disposition,
                     tree: None,
@@ -1182,7 +1194,8 @@ impl Child {
         // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
         // gate comes first, so the look at the root is right before the kill it decides.
         let gate = self.kill_gate();
-        let view = crate::containment::DropView::read(caller, self.id, || self.proc.state(), &self.tree_killed);
+        let view =
+            crate::containment::DropView::read(caller, self.pid(), self.id, || self.proc.state(), &self.tree_killed);
         let mut report = DropReport::new(&view);
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
@@ -1238,7 +1251,7 @@ impl Child {
                 // that kill is what ends it.
                 let reach = kill.completed().then_some(&self.attached as &dyn Reach);
                 self.proc.tear_down(
-                    Some(self.id),
+                    self.id,
                     Kill {
                         disposition,
                         tree: reach,
