@@ -564,10 +564,7 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
 fn a_descendant_that_cannot_be_read_is_reported_once() {
     crate::log_capture::install();
     let warns_naming = |mark, descendant: ProcessId| -> Vec<String> {
-        crate::log_capture::warns_since_on_current_thread(mark, &format!("pid {}", descendant.pid()))
-            .into_iter()
-            .map(|(_, said)| said)
-            .collect()
+        crate::log_capture::warns_since(mark, &format!("pid {}", descendant.pid()))
     };
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
@@ -621,7 +618,7 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     let left = super::hard_kill(&kernel, root)
         .into_result()
         .expect_err("two members were left");
-    let warned = crate::log_capture::warns_since_on_current_thread(mark, "treewalk:");
+    let warned = crate::log_capture::warns_since(mark, "treewalk:");
     let pids: Vec<u32> = left
         .members
         .iter()
@@ -632,7 +629,7 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
         .collect();
     assert_eq!(pids, [descendant.pid(), second], "{left:?}");
     assert!(left.root.is_none(), "{left:?}");
-    assert_eq!(warned, [], "the caller reports");
+    assert_eq!(warned, Vec::<String>::new(), "the caller reports");
     release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
 }
 

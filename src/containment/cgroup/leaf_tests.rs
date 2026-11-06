@@ -2811,7 +2811,7 @@ fn an_abandoned_fronts_failed_leaf_kill_is_in_the_warn_of_its_teardown() {
         crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
     );
     assert!(!leaf_path.exists(), "the leaf is removed");
-    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "one warn: {warns:?}");
     assert!(
         warns[0].contains("cgroup.kill failed"),

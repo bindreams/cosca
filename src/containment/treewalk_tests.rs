@@ -710,11 +710,11 @@ fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once
     let crate::error::Error::MemberNotKilled { pid: first, .. } = err else {
         panic!("expected MemberNotKilled, got {err:?}");
     };
-    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was not killed");
+    let warned = crate::log_capture::warns_since(mark, "was not killed");
     assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].1.starts_with("Process::kill_tree: pid "), "{warned:?}");
+    assert!(warned[0].starts_with("Process::kill_tree: pid "), "{warned:?}");
     assert!(
-        !warned[0].1.contains(&format!("pid {first} ")),
+        !warned[0].contains(&format!("pid {first} ")),
         "the warn names the other member, not the first: {warned:?}"
     );
     drop(stdin);
@@ -735,10 +735,10 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     super::terminate(&crate::identity::HostKernel, child.id()).expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
-    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was sent no SIGTERM");
+    let warned = crate::log_capture::warns_since(mark, "was sent no SIGTERM");
     assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].1.starts_with("treewalk: pid "), "{warned:?}");
-    assert!(warned[0].1.contains(&os.to_string()), "{warned:?}");
+    assert!(warned[0].starts_with("treewalk: pid "), "{warned:?}");
+    assert!(warned[0].contains(&os.to_string()), "{warned:?}");
     drop(stdin);
     child.wait().expect("reap the root");
 }

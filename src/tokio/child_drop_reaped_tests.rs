@@ -503,7 +503,7 @@ async fn a_drop_whose_walk_leaves_a_descendant_warns_once_and_kills_the_root() {
     let records = crate::log_capture::records_since_on_current_thread(mark, "was not killed");
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn);
-    let drop_records = crate::log_capture::warns_since_on_current_thread(mark, "Child::drop");
+    let drop_records = crate::log_capture::warns_since(mark, "Child::drop");
     assert_eq!(drop_records.len(), 1, "one report of the event: {drop_records:?}");
 }
 
@@ -541,9 +541,9 @@ async fn kill_tree_and_drop_after_a_walk_that_left_a_descendant_and_the_root_nam
     drop(child);
 
     assert_the_drop_killed(&teardown, &sends, root);
-    let warns = crate::log_capture::warns_since_on_current_thread(mark, "");
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "one report of the event: {warns:?}");
-    let text = &warns[0].1;
+    let text = &warns[0];
     assert!(
         text.contains(&format!("pid {} was not killed", root.wrapping_add(1))),
         "{text}"
@@ -568,10 +568,10 @@ async fn a_drop_whose_walk_leaves_only_the_root_warns_it_could_not_vouch_for_the
     drop(child);
 
     assert_the_drop_killed(&teardown, &sends, pid);
-    let warns = crate::log_capture::warns_since_on_current_thread(mark, "Child::drop");
+    let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("could not be vouched for"), "{warns:?}");
-    assert!(!warns[0].1.contains("members"), "{warns:?}");
+    assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
+    assert!(!warns[0].contains("members"), "{warns:?}");
 }
 
 /// The handle remembers a member a walk left (the sync twin is in `child::drop_reaped_tests`): a

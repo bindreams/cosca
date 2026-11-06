@@ -2,6 +2,7 @@
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::error::Error;
+use crate::log_capture::warns_since;
 use crate::test_child::Console;
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::seams::force_peeks;
@@ -54,7 +55,7 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
         "a failed peek is Unassessable, not a vanish: {err:?}"
     );
     // The teardown has nothing to warn of, so the diagnosis is logged on its own: one warn.
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("could not be checked against its handle (forced identity-check failure 3b7e)"),
@@ -72,15 +73,6 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
         Some(libc::SIGKILL),
         "the teardown must have killed the child through its pidfd"
     );
-}
-
-/// The `warn`-or-worse records logged since `mark` on this thread.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A failed identity check and the teardown it leads to are one event, so they share one `warn`.
@@ -115,7 +107,7 @@ fn a_failed_identity_peek_and_a_refused_kill_share_one_warn(#[fixture(setuid)] _
     let (err, _fate, handed_back) =
         crate::test_child::expect_handed_back(outcome.expect_err("a failed identity peek fails the spawn"), writer);
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("could not be checked against its handle (forced identity-check failure 6c1d)")

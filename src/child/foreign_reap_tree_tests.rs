@@ -4,11 +4,12 @@
 //! reaches no process.
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
+use crate::log_capture::warns_since;
 #[cfg(target_os = "linux")]
 use crate::test_child::reaped_elsewhere::ROOT_KILLED_BY_PIDFD;
 use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, kill_own_child,
-    session_sleep, warns_since,
+    session_sleep,
 };
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
@@ -127,7 +128,7 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_pidfd_alone()
         "the root is killed through its pidfd, and nothing else is sent"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     drop(stdin);
     let status = child.wait().expect("reap the root");
@@ -173,7 +174,7 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
         "the root is signalled through its pidfd, and nothing else is sent"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     drop(stdin);
     let status = child.wait().expect("reap the root");
@@ -227,7 +228,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
         "the SIGTERM, then the kill, both through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     drop(stdin);
@@ -286,7 +287,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
         "only the SIGTERM, through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert!(warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
     assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
     let status = child.wait().expect("reap the root");
@@ -324,7 +325,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
         "no SIGTERM by a reaped root's number"
     );
     assert_one_reaped_elsewhere_warn(mark, pgid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(
         !warns[0].contains("was sent before it"),
@@ -376,7 +377,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
         Vec::<i32>::new(),
         "no killpg by a reaped root's number"
     );
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     assert!(warns[0].contains(UNTRUSTED_NUMBER), "{warns:?}");
     #[cfg(target_os = "linux")]
@@ -428,7 +429,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -472,7 +473,7 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_ki
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -523,7 +524,7 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_co
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark),
+        warns_since(mark, ""),
         Vec::<String>::new(),
         "the tree was killed: the drop does not warn"
     );
@@ -613,7 +614,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
         "the SIGTERM, then the kill"
     );
     assert_one_reaped_elsewhere_warn(mark, pid);
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "exactly one warn: {warns:?}");
     holder.assert_dies();
 }

@@ -540,7 +540,7 @@ async fn a_front_reaped_elsewhere_before_its_identity_read_is_gone() {
         .expect_err("a front reaped before its identity read fails the spawn")
         .expect_may_have_started_with();
     assert_eq!(fate, ChildFate::Gone, "{err}");
-    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("leaks"), "the warn carries the forget: {warns:?}");
 }

@@ -667,7 +667,7 @@ async fn cgroup_a_post_fork_tokio_failure_ends_its_child_in_or_out_of_its_leaf(#
 
         let case = format!("placed: {placed}");
         assert_eq!(
-            crate::test_child::reaped_elsewhere::warns_since(mark),
+            crate::log_capture::warns_since(mark, ""),
             Vec::<String>::new(),
             "{case}: nothing is warned about"
         );
@@ -720,7 +720,7 @@ async fn cgroup_a_post_fork_tokio_failure_of_a_child_that_refuses_its_kill_leave
     let (_, fate) = expect_may_have_started_with(err.expect("the forced failure fails the spawn"));
 
     assert_eq!(fate, ChildFate::Running { id: None });
-    let warns = crate::test_child::reaped_elsewhere::warns_since(mark);
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains(&format!("process group {pid}"))

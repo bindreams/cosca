@@ -25,8 +25,9 @@ mod pidfd_shutdown {
     use crate::containment::{Attached, TreeKilled};
     use crate::elevation::front::Gate;
     use crate::error::Error;
+    use crate::log_capture::warns_since;
     use crate::signal::Sent;
-    use crate::test_child::reaped_elsewhere::{warns_since, ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
+    use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
 
     const WHY: &str = "the root's own handle could not say";
 
@@ -68,7 +69,7 @@ mod pidfd_shutdown {
             term
         }) {
             Ok(shutdown) => shutdown,
-            Err(e) => return (e, sent.into_inner(), warns_since(mark)),
+            Err(e) => return (e, sent.into_inner(), warns_since(mark, "")),
         };
         // A grace the row does not answer reads as an exit, so a wrongly waited one shows in `sent`.
         let waited = shutdown.needs_grace().then(|| {
@@ -85,7 +86,7 @@ mod pidfd_shutdown {
                 kill
             },
         );
-        (err, sent.into_inner(), warns_since(mark))
+        (err, sent.into_inner(), warns_since(mark, ""))
     }
 
     /// Mutant: `start` ignores a closed gate.
