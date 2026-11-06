@@ -115,3 +115,31 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
     );
 }
+
+/// `Child::kill`'s refusal is the OS's own: the error carries the raw errno (`EPERM`, or Windows'
+/// `ERROR_ACCESS_DENIED`), not a message about it.
+///
+/// Mutant: the error is wrapped in a new `io::Error`, or its payload is stringified.
+#[skuld::test]
+fn child_kill_error_keeps_the_raw_errno() {
+    use crate::os_process::child::PeekOutcome;
+    use crate::os_process::fake::FakeProcess;
+
+    #[cfg(unix)]
+    const REFUSED: i32 = libc::EPERM;
+    #[cfg(windows)]
+    const REFUSED: i32 = 5;
+    // macOS reads the root's state first; nothing else peeks.
+    let fake = FakeProcess::new([])
+        .peeks([Ok(PeekOutcome::Running)])
+        .signals([Err(std::io::Error::from_raw_os_error(REFUSED))]);
+    let child = crate::test_child::over_fake::child_over(&fake);
+
+    let err = child.kill().expect_err("the scripted signal is refused");
+
+    assert!(
+        matches!(&err, crate::error::Error::Io(e) if e.raw_os_error() == Some(REFUSED)),
+        "{err:?}"
+    );
+    assert_eq!(fake.signal_calls(), [crate::signal::Sig::Kill]);
+}

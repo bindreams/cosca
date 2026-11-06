@@ -48,7 +48,8 @@ impl WindowsProcess {
     }
 
     /// The child `pid` that a spawn created, by the handle the spawn returned. That handle carries
-    /// every access, `SYNCHRONIZE` and `PROCESS_TERMINATE` included.
+    /// `SYNCHRONIZE`; it carries `PROCESS_TERMINATE` too unless the spawn was a UAC elevation,
+    /// whose handle may lack it (a kill then fails with the Win32 error).
     pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
         Self {
             pid,
@@ -146,8 +147,9 @@ impl OsProcess for WindowsProcess {
             Sig::Kill => match windows_terminate_held(self.raw()) {
                 Termination::Terminated => Ok(Sent::Delivered),
                 Termination::Exited => Ok(Sent::Gone),
+                // The caller that goes on to report the refusal warns of it: a refusal warns once.
                 Termination::Failed(e) => {
-                    log::warn!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
+                    log::debug!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
                     Err(Error::Io(win32_io_error(e)))
                 }
             },
