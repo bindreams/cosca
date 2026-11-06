@@ -43,8 +43,9 @@ impl Process {
     /// - [`Error::Unsupported`]: the OS lacks the mechanism (on Linux, a refused `pidfd_open`).
     /// - [`Error::NotThreadGroupLeader`]: on Linux, `id` names a live thread that is not its
     ///   process's leader.
-    /// - [`Error::Io`]: the open failed otherwise (a `pidfd_open` error on Linux; a kqueue that
-    ///   cannot be created or armed on macOS).
+    /// - [`Error::Io`]: the open failed otherwise (on Linux a failed pidfd call: `pidfd_open`, the
+    ///   pidfd's inode read, or its `poll`, prefixed with the call's name; a kqueue that cannot be
+    ///   created or armed on macOS).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
         Self::open_with(&crate::identity::HostKernel, id)
     }
@@ -70,8 +71,8 @@ impl Process {
                 // A pidfd call that failed is the open's own failure: a refusal is `Unsupported`
                 // naming the open, as for `open`.
                 #[cfg(target_os = "linux")]
-                if let Some(errno) = cause.errno() {
-                    return Err(crate::os_process::linux::open::open_error(errno));
+                if let Some(call) = cause.call() {
+                    return Err(crate::os_process::linux::open::open_error(call));
                 }
                 Err(crate::identity::unqueryable(&format!("pid {pid}"), cause))
             }
