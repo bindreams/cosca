@@ -63,29 +63,46 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
 
 /// A tree walk cannot do without the identity, so a failed peek fails the spawn and the child is
 /// torn down. The failed check and that teardown are one event: the diagnosis is folded into the
-/// teardown's warn (or logged once on its own), never twice.
+/// teardown's warn (or logged once on its own), never twice. The teardown has a warn of its own to
+/// fold the check into: the application reaps the killed child behind the spawn's back, so the
+/// teardown's reap finds `ECHILD`.
 ///
-/// Mutants: the failure arm tears down with a fresh diagnosis, which drops the failed check from the
-/// warn; the check warns at the call as well as at the teardown (two warns); the child is not reaped.
+/// Mutants: the failure arm tears down with a fresh diagnosis, which leaves the failed check to be
+/// logged apart from the teardown's warn (two warns); the check warns at the call as well as at the
+/// teardown (two warns); the child is not reaped.
 #[skuld::test]
 fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     crate::log_capture::install();
-    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::TreeWalk);
+    let pid = Rc::new(Cell::new(0));
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let armed = Rc::clone(&armed);
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
         move || {
+            pid.set(fault::spawn_pid());
             *armed.borrow_mut() = Some(Box::new(force_peeks([Err(std::io::Error::other(
                 "forced identity-check failure 8e2f",
             ))])));
         }
+    });
+    // The hook reaps the zombie the teardown's kill made. The writer is released after the kill, so a
+    // kill that sent nothing fails the SIGKILL assertion.
+    let _foreign_reap = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterDropKill, move || {
+        let pid = pid.get();
+        assert_ne!(pid, 0, "the spawn noted the child's pid");
+        drop(writer);
+        crate::test_child::assert_zombie_sigkilled("the child", pid);
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own zombie child; this plays the application that reaps it.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
     });
     let mark = crate::log_capture::mark();
 
@@ -102,14 +119,14 @@ fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() 
     );
     assert_eq!(
         fate,
-        crate::error::ChildFate::Reaped,
-        "the pidfd pins the child, so it is reaped"
+        crate::error::ChildFate::Killed,
+        "the kill was delivered and someone else collected the exit"
     );
-    teardown.assert_killed();
     let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 8e2f)"),
-        "the one warn names the failed check: {warns:?}"
+        warns[0].contains("could not be checked against its handle (forced identity-check failure 8e2f)")
+            && warns[0].contains("reaped by someone else"),
+        "the one warn names the failed check and the teardown's own: {warns:?}"
     );
 }
