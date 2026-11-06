@@ -15,12 +15,8 @@
 
 use crate::child::spawn::fault;
 use crate::error::ChildFate;
+use crate::log_capture::warns_since;
 use crate::test_child::Console;
-
-/// The "still waiting" warns logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since(mark, "still waiting")
-}
 
 /// A command for the `more.com` blocker of `teardown_blocker_parts`, and the guard that releases it
 /// after the teardown's kill.
@@ -53,7 +49,7 @@ fn teardown_with_a_late_exit(mut cmd: crate::tokio::Command, force: fn(bool)) ->
     let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         spawned.expect_err("the forced failure fails the spawn"),
     );
-    (fate, warns_since(mark))
+    (fate, warns_since(mark, "still waiting"))
 }
 
 /// The teardown of a spawn through tokio (`ProcSource::reap_now`).
@@ -92,7 +88,7 @@ fn raw_teardown_with_an_exit_under_way(force: fn(bool)) -> (ChildFate, Vec<Strin
     );
     // The refusal stands in for the kill's `TerminateProcess`, so the teardown did send its kill.
     refusal.assert_fired();
-    (fate, warns_since(mark))
+    (fate, warns_since(mark, "still waiting"))
 }
 
 /// The teardown of a spawn through the raw backend (`raw_spawn_teardown`).
