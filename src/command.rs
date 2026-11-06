@@ -528,7 +528,8 @@ impl Command {
     /// and so does the drop, which waits for that child's whole life and warns once past 1 s.
     /// The same holds for a process that migrated into the leaf after a landed kill. Neither raises
     /// an event cosca could re-kill on: `populated` does not change, and a fork writes no file.
-    /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown.
+    /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown; see
+    /// principle 3 in `docs/principles.md` for the one place that writes again.
     ///
     /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
     /// [`Child`](crate::Child) does so as sync Rust normally does. The async

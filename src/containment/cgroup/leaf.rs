@@ -508,8 +508,8 @@ impl CgroupLeaf {
     }
 
     /// Whether a `cgroup.kill` write on this leaf landed, by any handle's teardown. A failed write
-    /// after it does not undo it: the landed kill still bounds the leaf's drain.
-    #[cfg(feature = "tokio")]
+    /// after it does not undo it: the landed kill still bounds the leaf's drain. Every reader of
+    /// the leaf's record asks here.
     pub(crate) fn kill_landed(&self) -> bool {
         self.kill.landed()
     }
@@ -979,7 +979,7 @@ impl CgroupLeaf {
             if removed_after_drain(&first) {
                 return;
             }
-            if self.kill.landed() {
+            if self.kill_landed() {
                 self.drain_and_remove(
                     self.kill.answer(),
                     "after an explicit kill through a handle that opted out of Drop's own teardown",

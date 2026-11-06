@@ -124,7 +124,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 /// the error (an `Unreaped`) and the handle is disarmed, so its drop, which would make a tree kill
 /// the cleanup's failed one left undone, does not run. After a failed tree kill the cleanup makes
 /// that drop's tree kill itself, early, and the warn and the error say how it went (a skipped kill
-/// is not one that worked). The handle is also disarmed once the tree is settled: killed, not for
+/// is not one that worked). This is the one place a second `cgroup.kill` write is made within one
+/// call, after its own failed one, because that drop will not run (principle 3 in
+/// `docs/principles.md`). The handle is also disarmed once the tree is settled: killed, not for
 /// the cleanup to kill, or deliberately left alone (a reaped or unpinned root). A tree that could
 /// not be vouched for (a walk saw the root running, and its end came after) is no failed kill: no
 /// tree kill is made early for it, the cleanup's one report says so, and the handle is disarmed. An

@@ -1488,8 +1488,11 @@ impl Child {
 ///   [`wait_tree`](Child::wait_tree) first to have the leaf removed. Other mechanisms drop in
 ///   place.
 ///
-/// A leaf whose `cgroup.kill` fails has nothing to bound its drain: it is given up the same way,
-/// though the drop still reaps a root its kill reached. The failed write is not made again.
+/// A leaf whose `cgroup.kill` fails, and on which no earlier kill landed, has nothing to bound its
+/// drain: it is given up the same way, though the drop still reaps a root its kill reached. The
+/// failed write is not made again. A leaf an earlier kill did land on (a `kill_tree()`, say) is
+/// still waited for: that kill bounds the drain, for the life of any process left in the leaf
+/// (one that escaped the kill, or migrated in), and the drop warns once past 1 s.
 ///
 /// On Windows the drop terminates the tree and the root and waits for neither: a Job Object is
 /// terminated by the tree kill and its handle closed there (`TerminateJobObject`, then

@@ -22,7 +22,7 @@ impl CgroupLeaf {
         self.abandoned = true;
 
         let armed = self.armed.load(Ordering::Relaxed);
-        let killed = self.kill.landed();
+        let killed = self.kill_landed();
         let first = match self.rmdir_leaf() {
             Ok(()) => return,
             Err(e) if removed_after_drain(&e) => return,
