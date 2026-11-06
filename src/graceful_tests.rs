@@ -64,14 +64,10 @@ fn root_is_not_signalled(sig: crate::signal::Sig) -> Result<(), crate::error::Er
 #[skuld::test]
 fn signal_hands_the_process_mechanism_to_the_roots_closure_as_a_term() {
     let mut sent = Vec::new();
-    super::signal(
-        GracefulMechanism::Process,
-        crate::identity::ProcessId::from_parts_for_test(0x7fff_fffe, crate::identity::Key::for_test(1)),
-        |sig| {
-            sent.push(sig);
-            Ok(())
-        },
-    )
+    super::signal(GracefulMechanism::Process, 0x7fff_fffe, |sig| {
+        sent.push(sig);
+        Ok(())
+    })
     .expect("the closure's answer is the call's");
     assert_eq!(sent, [crate::signal::Sig::Term]);
 }
@@ -81,12 +77,8 @@ fn signal_hands_the_process_mechanism_to_the_roots_closure_as_a_term() {
 #[cfg(windows)]
 #[skuld::test]
 fn signal_refuses_the_process_mechanism_without_signalling_the_root() {
-    let err = super::signal(
-        GracefulMechanism::Process,
-        crate::identity::ProcessId::current(),
-        root_is_not_signalled,
-    )
-    .expect_err("Windows has no per-process graceful signal");
+    let err = super::signal(GracefulMechanism::Process, std::process::id(), root_is_not_signalled)
+        .expect_err("Windows has no per-process graceful signal");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
 }
 
@@ -94,8 +86,8 @@ fn signal_refuses_the_process_mechanism_without_signalling_the_root() {
 // wildcard arm that fell through to the console call would return something else entirely.
 #[skuld::test]
 fn signal_refuses_a_child_with_no_mechanism() {
-    let id = crate::identity::ProcessId::current();
-    let err = super::signal(GracefulMechanism::None, id, root_is_not_signalled).expect_err("no group to address");
+    let err = super::signal(GracefulMechanism::None, std::process::id(), root_is_not_signalled)
+        .expect_err("no group to address");
     let crate::error::Error::Unsupported { detail, .. } = &err else {
         panic!("expected Unsupported, got {err:?}");
     };
@@ -107,14 +99,18 @@ fn signal_refuses_a_child_with_no_mechanism() {
 // attempted rather than refused. No spawn through the public containment API can carry this
 // mechanism (the flag words emitted never produce it), so the dispatcher is the only place the
 // routing can be pinned at all. `Ok` is what separates the two worlds: the `Unsupported` arms
-// refuse, and `os_process::terminate_by_id` — the only other path out of `signal` — is itself `Unsupported`
-// on Windows.
+// refuse, and the `Process` arm — the only other path out of `signal` — is itself `Unsupported` on
+// Windows.
 #[cfg(windows)]
 #[skuld::test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
     let (child, stdin) = crate::test_child::windows_blocker_on_console();
-    let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id(), root_is_not_signalled);
-    let group = super::signal(GracefulMechanism::ConsoleGroup, child.id(), root_is_not_signalled);
+    let other = super::signal(
+        GracefulMechanism::OtherConsoleGroup,
+        child.id().pid(),
+        root_is_not_signalled,
+    );
+    let group = super::signal(GracefulMechanism::ConsoleGroup, child.id().pid(), root_is_not_signalled);
     assert!(
         other.is_ok(),
         "OtherConsoleGroup must be attempted, not refused: {other:?}"
@@ -143,7 +139,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 fn signal_refuses_a_child_cosca_did_not_create() {
     let (child, stdin) = crate::test_child::windows_blocker_on_console();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;
-    let err = super::signal(mechanism, child.id(), root_is_not_signalled)
+    let err = super::signal(mechanism, child.id().pid(), root_is_not_signalled)
         .expect_err("a child cosca did not create must not be signalled");
     let crate::error::Error::Unsupported { detail, .. } = &err else {
         panic!("expected Unsupported, got {err:?}");

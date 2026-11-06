@@ -75,7 +75,7 @@ impl Child {
             }
             self.refuse_unpinned("terminate", None)?;
         }
-        crate::graceful::signal(self.graceful, self.id, |sig| self.proc.signal(sig).map(drop))
+        crate::graceful::signal(self.graceful, self.id.pid(), |sig| self.proc.signal(sig).map(drop))
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
