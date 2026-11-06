@@ -16,19 +16,25 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Threading::{WaitForSingleObject, PROCESS_ACCESS_RIGHTS};
 
+use crate::child::owned::teardown::{Disposition, Past};
+use crate::child::owned::OwnedChild;
+use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
-    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, ParentStd, SpawnFailure,
+    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, Diagnosis, ParentStd,
+    SpawnFailure,
 };
 use crate::command::Command;
-use crate::error::{win32_io_error, Error};
+use crate::error::{win32_io_error, ChildFate, Error};
 use crate::identity::{windows_terminate_held, Termination};
 use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel};
+use crate::os_process::windows::{WindowsProcess, CREATE_PROCESS_ACCESS};
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
 use crate::tokio::stdio::OwnedStd;
+use crate::wait::teardown_warn::Due;
 
 use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
@@ -40,6 +46,8 @@ use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 #[derive(Debug)]
 pub(crate) struct RawAsyncChild {
     proc: Arc<OwnedHandle>,
+    /// The access `proc` was granted: it decides what a refused kill means.
+    granted: PROCESS_ACCESS_RIGHTS,
     /// Memoized once the child has exited, so a second `wait`/`try_wait` is immediate and cannot
     /// re-read a status off a (post-close) recycled handle.
     exited: Option<ExitStatus>,
@@ -48,9 +56,11 @@ pub(crate) struct RawAsyncChild {
 }
 
 impl RawAsyncChild {
-    pub(crate) fn new(proc: OwnedHandle) -> RawAsyncChild {
+    /// The child whose process handle is `proc`, which holds `granted`.
+    pub(crate) fn new(proc: OwnedHandle, granted: PROCESS_ACCESS_RIGHTS) -> RawAsyncChild {
         RawAsyncChild {
             proc: Arc::new(proc),
+            granted,
             exited: None,
             #[cfg(test)]
             observer: None,
@@ -152,7 +162,7 @@ impl RawAsyncChild {
     pub(crate) fn start_kill(&self) -> Result<(), Error> {
         // Signal-only, never block. A handle without `PROCESS_TERMINATE` (a runas child we cannot
         // terminate) surfaces as `Io`.
-        match windows_terminate_held(self.handle()) {
+        match windows_terminate_held(self.handle(), self.granted) {
             Termination::Terminated | Termination::Exited => Ok(()),
             Termination::Failed(e) => Err(Error::Io(win32_io_error(e))),
         }
@@ -315,7 +325,7 @@ pub(crate) fn spawn_raw(
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, None, crate::tokio::child::slow_teardown_after());
+            let fate = raw_spawn_teardown(proc, pid, None);
             return Err(SpawnFailure::started(
                 crate::child::spawn::spawn_identity_error(other, cause),
                 fate,
@@ -326,19 +336,36 @@ pub(crate) fn spawn_raw(
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id), crate::tokio::child::slow_teardown_after());
+            let fate = raw_spawn_teardown(proc, pid, Some(id));
             return Err(SpawnFailure::started(e, fate, None));
         }
     };
 
     Ok(Child::from_parts(
-        ProcSource::Raw(RawAsyncChild::new(proc)),
+        ProcSource::Raw(RawAsyncChild::new(proc, CREATE_PROCESS_ACCESS)),
         id,
         kill_on_drop,
         attachment,
         fd_pipes,
         owned_std,
     ))
+}
+
+/// Kills and reaps a just-spawned child whose attach or identity read failed, so a failed spawn
+/// never leaks a running process, and answers its fate. The wait for the killed child blocks this
+/// thread, and warns once it passes [`slow_teardown_after`](crate::tokio::child::slow_teardown_after).
+/// A child whose kill was refused is left running, warned of.
+fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::ProcessId>) -> ChildFate {
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
+    let (fate, _) = tear_down_failed_spawn(
+        owned,
+        id,
+        Past::Clean,
+        Disposition::Leave,
+        Due::in_(crate::tokio::child::slow_teardown_after()),
+        &mut Diagnosis::default(),
+    );
+    fate
 }
 
 /// The raw backend's resolved stdio ends: the child's handle ends (0/1/2 + fd >= 3) keyed by slot,

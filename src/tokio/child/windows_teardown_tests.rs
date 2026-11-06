@@ -152,7 +152,7 @@ async fn reap_now_of_a_running_child_with_warnings_on_warns_once_naming_it() {
     let (child, pid, _blocker) = blocker_child();
     let proc = ProcSource::new(child);
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
-    crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
 
     let fate = proc.reap_now(pid, None);
 

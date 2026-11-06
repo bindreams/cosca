@@ -304,7 +304,7 @@ fn each_fate_has_its_own_message() {
 /// A child still running is `Running` with the identity the caller knows, and none when it knows none.
 ///
 /// Mutant: a failed look is `Running`, `ECHILD` is `Unknown`, or the identity is dropped or invented.
-#[cfg(all(unix, any(feature = "tokio", not(any(target_os = "macos", target_os = "linux")))))]
+#[cfg(all(unix, feature = "tokio"))]
 #[skuld::test]
 fn a_look_at_an_unkilled_child_tells_reaped_running_gone_and_unknown_apart() {
     use std::os::unix::process::ExitStatusExt as _;
