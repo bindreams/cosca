@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Expect, Left, PidfdTeardown};
+use crate::child::owned::teardown::{HandleTeardown, Left, Past};
 #[cfg(target_os = "linux")]
 use crate::child::spawn::held_teardown::tear_down_pidfd;
 #[cfg(target_os = "linux")]
@@ -1059,7 +1059,7 @@ impl Abandoned {
     /// `torn` says. A child the teardown collected is `Ended`, and the teardown's clause is said as
     /// a failed spawn's. One it left uncollected is [`Uncollected`](Abandoned::Uncollected), with the
     /// clause as the one warn the caller logs, and the teardown's verdict.
-    fn after_pidless_teardown(torn: PidfdTeardown) -> Abandoned {
+    fn after_pidless_teardown(torn: HandleTeardown) -> Abandoned {
         match torn.uncollected() {
             Ok(left) => Abandoned::Uncollected(left),
             Err(collected) => {
@@ -1108,7 +1108,7 @@ impl CgroupLeaf {
     pub(crate) fn abandon_before_verdict(
         &mut self,
         front: bool,
-        handshake: Option<(OwnedFd, Expect)>,
+        handshake: Option<(OwnedFd, Past)>,
         warn: &mut dyn TeardownWarn,
     ) -> Abandoned {
         let Some(channel) = self.report.take() else {
@@ -1119,24 +1119,24 @@ impl CgroupLeaf {
         let mut received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
         // The handshake's pidfd names the child where its intent named it by no handle, and the
-        // handshake says what it expects of a teardown through it.
+        // handshake says what became of it before.
         let mut handed = None;
         if received.pidfd.is_none() && received.proc_dir.is_none() {
-            if let Some((pidfd, expect)) = handshake {
+            if let Some((pidfd, past)) = handshake {
                 received.pidfd = Some(pidfd);
-                handed = Some(expect);
+                handed = Some(past);
             }
         }
         // A child that never named itself is no front, and a pidfd alone can reap it. Whether it
-        // ran the program is the handshake's to say, with its pidfd's `Expect`; the child's own
+        // ran the program is the handshake's to say, with its pidfd's `Past`; the child's own
         // intent pidfd (`handed` is `None`) establishes neither that nor that no look failed:
-        // anything stands.
+        // a wait on it may fail.
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
                 // No pid, no identity, no tree kill: killed through the pidfd, and left if refused.
-                let expect = handed.unwrap_or(Expect::Anything);
-                let torn = tear_down_pidfd(None, pidfd, None, expect, warn.due());
+                let past = handed.unwrap_or(Past::WaitMayFail);
+                let torn = tear_down_pidfd(None, pidfd, None, past, warn.due());
                 return Abandoned::after_pidless_teardown(torn);
             }
         }

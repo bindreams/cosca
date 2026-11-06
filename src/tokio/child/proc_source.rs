@@ -6,9 +6,9 @@ use std::process::ExitStatus;
 
 #[cfg(unix)]
 use crate::child::drop_report::Forgot;
-use crate::child::owned::teardown::PidfdTeardown;
+use crate::child::owned::teardown::HandleTeardown;
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, Expect};
+use crate::child::owned::teardown::{Disposition, Past};
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
@@ -235,14 +235,14 @@ fn foreign_why(state: &RootState) -> String {
 }
 
 /// What the second teardown of a child whose first kill was refused did, as its
-/// [`PidfdTeardown`]'s outcome says, plus what forgetting tokio's handle for it leaked, for the
+/// [`HandleTeardown`]'s outcome says, plus what forgetting tokio's handle for it leaked, for the
 /// caller's one warn. Only Linux tears a refused kill's child down again through its pidfd.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(dead_code, reason = "only Linux tears a child down again through its pidfd")
 )]
 struct TornDown {
-    torn: PidfdTeardown,
+    torn: HandleTeardown,
     /// What the forget leaked; `None` if the backend was forgotten before, so nothing more leaked
     /// (and its warn says so).
     leak: Option<&'static str>,
@@ -711,7 +711,11 @@ impl ProcSource {
                     return Ok(Sent::Gone);
                 };
                 // SAFETY of the handle: tokio owns it live while `raw_handle` is `Some`.
-                terminate_unreaped(windows::Win32::Foundation::HANDLE(h))
+                // tokio's own child, made by `CreateProcess`.
+                terminate_unreaped(
+                    windows::Win32::Foundation::HANDLE(h),
+                    crate::os_process::windows::CREATE_PROCESS_ACCESS,
+                )
             }
             #[cfg(windows)]
             ProcSource::Raw(r) => {
@@ -1514,10 +1518,10 @@ impl ProcSource {
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
-    /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
+    /// seam's "leave it alive" form, which replaces the kill so the child is really left alone.
     fn teardown_kill(&self) -> Result<Sent, Error> {
         #[cfg(test)]
-        if let Some((marker, kind, _)) = crate::child::spawn::fault::take_force_kill_failure() {
+        if let Some((marker, kind)) = crate::child::spawn::fault::take_force_kill_failure() {
             return Err(Error::Io(std::io::Error::new(kind, marker)));
         }
         self.signal(Sig::Kill)
@@ -1538,13 +1542,13 @@ impl ProcSource {
     /// already.
     #[cfg(target_os = "linux")]
     fn tear_down_forgotten(mut self, pid: u32, id: Option<ProcessId>, forgot: Option<Forgetting>) -> TornDown {
-        let (expect, leak, why) = match forgot {
-            Some(forgot) => (Expect::Anything, Some(forgot.leak), Some(forgot.why)),
+        let (past, leak, why) = match forgot {
+            Some(forgot) => (Past::WaitMayFail, Some(forgot.leak), Some(forgot.why)),
             None => match self.forget_quietly(Forgotten::Unproven) {
-                Some((_, leak)) => (Expect::Waited, Some(leak), None),
+                Some((_, leak)) => (Past::Clean, Some(leak), None),
                 // Forgotten before ([`reap_now`](ProcSource::reap_now) takes any backend): whatever
                 // look did it says nothing of a wait on the pidfd, and nothing more leaks.
-                None => (Expect::Anything, None, None),
+                None => (Past::WaitMayFail, None, None),
             },
         };
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
@@ -1552,7 +1556,7 @@ impl ProcSource {
             Some(pid),
             self.take_forgotten_pidfd(),
             id,
-            expect,
+            past,
             Due::in_(super::slow_teardown_after()),
         );
         TornDown { torn, leak, why }
@@ -1626,7 +1630,7 @@ impl ProcSource {
     /// `why`: what the spawn's identity check found, if that is why the child is torn down; the
     /// forget owes it a warn, so the teardown's one warn carries it and the forget's leak, and says
     /// what became of the child, whatever the teardown's own level. A failed check is a failed look
-    /// on the pidfd, so no wait on it is expected to succeed ([`Expect::Anything`]).
+    /// on the pidfd, so a wait on it may fail ([`Past::WaitMayFail`]).
     #[cfg(target_os = "linux")]
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32, id: Option<ProcessId>, why: &mut Diagnosis) -> ChildFate {
         crate::bounded::assert_may_block("teardown_through_pidfd");
@@ -1635,7 +1639,7 @@ impl ProcSource {
             Some(pid),
             self.take_forgotten_pidfd(),
             id,
-            Expect::Anything,
+            Past::WaitMayFail,
             Due::in_(super::slow_teardown_after()),
         )
         .say_as_failed_spawn(why)
@@ -1889,12 +1893,16 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
 }
 
 /// Windows: hard-kill the not-yet-reaped child whose live process handle is `h`, through
-/// [`windows_terminate_held`](crate::identity::windows_terminate_held). Never blocks.
+/// [`windows_terminate_held`](crate::identity::windows_terminate_held), `granted` the access it holds.
+/// Never blocks.
 #[cfg(windows)]
-pub(super) fn terminate_unreaped(h: windows::Win32::Foundation::HANDLE) -> Result<Sent, Error> {
+pub(super) fn terminate_unreaped(
+    h: windows::Win32::Foundation::HANDLE,
+    granted: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+) -> Result<Sent, Error> {
     use crate::identity::{windows_terminate_held, Termination};
     // `h` is a live process handle the caller owns.
-    match windows_terminate_held(h) {
+    match windows_terminate_held(h, granted) {
         Termination::Terminated | Termination::Exited => Ok(Sent::Delivered),
         Termination::Failed(e) => Err(Error::Io(crate::error::win32_io_error(e))),
     }
