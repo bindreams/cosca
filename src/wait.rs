@@ -534,6 +534,10 @@ pub(crate) fn wait_until(
 /// until `until`. A failed poll of the pidfd is logged and treated the same way: the peeks decide,
 /// and a child still running at `until` answers `false`.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(any(test, feature = "tokio")),
+    allow(dead_code, reason = "only an async spawn's teardown looks at a killed child's exit")
+)]
 pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: Instant) -> bool {
     use crate::os_process::drive::{run, RunOutcome};
 
@@ -551,6 +555,10 @@ pub(crate) fn pidfd_exit_visible_by(pidfd: std::os::fd::BorrowedFd<'_>, until: I
 /// A child's pidfd, as a [`Waitable`](crate::os_process::drive::Waitable): done once a peek shows
 /// the exit.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(any(test, feature = "tokio")),
+    allow(dead_code, reason = "only an async spawn's teardown looks at a killed child's exit")
+)]
 struct PidfdExit<'a> {
     pidfd: std::os::fd::BorrowedFd<'a>,
     /// A poll of `pidfd` has failed: the look no longer asks for a block.
@@ -558,6 +566,10 @@ struct PidfdExit<'a> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(any(test, feature = "tokio")),
+    allow(dead_code, reason = "only an async spawn's teardown looks at a killed child's exit")
+)]
 impl<'a> PidfdExit<'a> {
     fn new(pidfd: std::os::fd::BorrowedFd<'a>) -> Self {
         Self {
