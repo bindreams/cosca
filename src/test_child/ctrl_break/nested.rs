@@ -27,7 +27,7 @@ fn fixture_nested_terminate_reporter() {
     let _warns = crate::log_capture::warn_watch();
 
     let (child, mut sock, _) = spawn_member(Handler::Ack, None, crate::ContainMode::Strongest, |_| {});
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_eq!(
         child.containment(),
         Containment::Delegated,

@@ -164,7 +164,7 @@ mod linux {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
         let (child, _writer) = session_blocker(true);
-        let pid = child.id().pid();
+        let pid = child.pid();
         let mark = crate::log_capture::mark();
         let _looks = force_peeks([failed_peek("forced"), running()]);
         let _kill = crate::tokio::child::fault::force_kill_failure();
@@ -264,7 +264,7 @@ mod linux {
         let (child, _writer) = crate::test_child::held_treewalk_blocker_async();
         let view = crate::containment::DropView {
             caller: TeardownCaller::FinishElevated,
-            root_pid: child.id().pid(),
+            root_pid: child.pid(),
             root: RootView::Unknown(std::io::Error::other("forced")),
             tree_killed: false,
         };
@@ -288,7 +288,7 @@ mod linux {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
         let (child, writer) = session_blocker(true);
-        let pid = child.id().pid();
+        let pid = child.pid();
         let mark = crate::log_capture::mark();
         let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
             crate::tokio::child::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
@@ -318,7 +318,7 @@ mod linux {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
         let (mut child, _writer) = session_blocker(true);
-        let pid = child.id().pid();
+        let pid = child.pid();
         child.proc_mut().signal(Sig::Kill).expect("kill the blocker");
         let mark = crate::log_capture::mark();
         let _errno = force_visible_errno_once(libc::EIO);
@@ -435,7 +435,7 @@ mod linux {
         crate::log_capture::install();
         let _recorder = crate::containment::unix::fault::record_kill_group();
         let (mut child, writer) = session_blocker(false);
-        let pid = child.id().pid();
+        let pid = child.pid();
         let proc = child.os.proc.take().expect("the backend");
         let mark = crate::log_capture::mark();
         let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
@@ -475,7 +475,7 @@ mod macos {
         cmd.contain_with(crate::ContainMode::TreeWalk);
         cmd.kill_on_drop(false);
         let mut child = cmd.spawn().expect("spawn");
-        let pid = child.id().pid();
+        let pid = child.pid();
         let proc = child.os.proc.take().expect("the backend");
         let mark = crate::log_capture::mark();
         let _orphaned = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned)));

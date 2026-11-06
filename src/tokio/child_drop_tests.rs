@@ -79,7 +79,7 @@ pub(crate) fn released_blocker() -> (Child, TerminatedBlocker) {
         OpenProcess(
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
             false,
-            child.id().pid(),
+            child.pid(),
         )
     }
     .expect("open the root");
@@ -154,7 +154,7 @@ pub(crate) mod linux {
 
     impl Pidfd {
         pub(crate) fn of(child: &Child) -> Pidfd {
-            let pid = rustix::process::Pid::from_raw(child.id().pid() as i32).expect("a positive pid");
+            let pid = rustix::process::Pid::from_raw(child.pid() as i32).expect("a positive pid");
             Pidfd(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open"))
         }
 
@@ -307,7 +307,7 @@ async fn a_kill_on_drop_drop_of_a_live_blocker_returns() {
 /// `child`, contained by a process group led by its own pid, as a `ProcessGroup` spawn leaves it.
 #[cfg(unix)]
 fn in_its_own_group(mut child: Child) -> Child {
-    child.os.attached = crate::containment::Attached::ProcessGroup(child.id().pid() as i32);
+    child.os.attached = crate::containment::Attached::ProcessGroup(child.pid() as i32);
     child
 }
 
@@ -318,7 +318,7 @@ async fn a_drop_of_a_live_group_root_kills_its_group() {
     crate::tokio::test_runtime::assert_current_thread();
     let (child, teardown) = released_blocker();
     let child = in_its_own_group(child);
-    let pgid = child.id().pid() as i32;
+    let pgid = child.pid() as i32;
     let killed = crate::containment::unix::fault::record_kill_group();
     drop(child);
     assert_eq!(killed.killed(), [pgid]);
@@ -646,7 +646,7 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
     let (child, stdin) = blocker();
     let mut child = linux::contained_by(child, leaf);
     let root = linux::Pidfd::of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     // `kill_tree`'s backstop kill fails, so the root survives it: the tree kill alone does not
     // signal the root.
@@ -699,7 +699,7 @@ async fn unreaped_root_could_not_be_terminated_on_drop_is_logged() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (child, stdin) = blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _armed = fault::force_kill_failure();
     let mark = crate::log_capture::mark();
     drop(child);
@@ -738,7 +738,7 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
     // in Drop runs on the dropping thread, so no probe is needed to observe it.
     let mut child = cmd.spawn().expect("spawn");
     let teardown = release_between_kill_and_wait(child.stdin().expect("piped stdin"));
-    let pid = child.id().pid();
+    let pid = child.pid();
     let sends = crate::send_log::Capture::start();
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from

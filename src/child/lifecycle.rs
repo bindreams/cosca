@@ -305,7 +305,7 @@ impl Child {
     /// a deadline that passed with the root still running.
     pub(super) fn wait_root(&self, deadline: Option<Instant>, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
         match deadline {
-            Some(deadline) => status_of_outcome(Some(self.id.pid()), self.proc.wait(Some(deadline))?, orphaned),
+            Some(deadline) => status_of_outcome(Some(self.pid()), self.proc.wait(Some(deadline))?, orphaned),
             None => wait_for_status(&self.proc, orphaned).map(Some),
         }
     }

@@ -501,7 +501,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     // here and not when the grace runs out.
     #[cfg(windows)]
     let check = {
-        let pid = child.id().pid();
+        let pid = child.pid();
         term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
             crate::test_child::ctrl_break::assert_break_sent_to(pid)
         })
@@ -802,7 +802,7 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
     let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
         cmd.contain();
     });
-    let id = child.id();
+    let pid = child.pid();
     child.kill().expect("kill");
     // Released only after the kill, so a no-op kill fails `assert_killed`.
     drop(stdin);
@@ -823,10 +823,7 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
         .await
         .expect("a drained tree supersedes the held refusal");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
-        ),
+        crate::log_capture::contains_since(mark, &format!("graceful_shutdown_tree({pid}): terminate_tree refused")),
         "graceful_shutdown_tree must inherit the refusal from its cooperative half"
     );
 }
@@ -851,7 +848,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
         crate::Containment::TreeWalk,
         "the subject must be the mechanism that has no drain edge to watch"
     );
-    let id = child.id();
+    let pid = child.pid();
     child.kill().expect("kill");
     // Released only after the kill, so a no-op kill fails `assert_killed`.
     drop(stdin);
@@ -883,10 +880,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
     // green run, and this test would then be measuring a path it never entered.
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
-        ),
+        crate::log_capture::contains_since(mark, &format!("graceful_shutdown_tree({pid}): terminate_tree refused")),
         "the refusal must have reached the hold-and-continue arm"
     );
     assert!(

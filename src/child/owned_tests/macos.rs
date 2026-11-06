@@ -559,7 +559,7 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let mut child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();

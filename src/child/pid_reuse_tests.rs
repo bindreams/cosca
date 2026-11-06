@@ -19,7 +19,7 @@ fn spawn_blocker() -> (crate::Child, std::io::PipeWriter) {
 fn kill_after_foreign_reap_and_reuse_body() {
     let (child, writer) = spawn_blocker();
     drop(writer);
-    let reuser = reap_behind_and_reuse(child.id().pid());
+    let reuser = reap_behind_and_reuse(child.pid());
     child.kill().expect("a kill of a foreign-reaped child answers Ok");
     assert_eq!(
         sigusr1_and_wait(reuser),
@@ -38,7 +38,7 @@ in_fresh_pid_ns!(
 fn drop_kill_after_foreign_reap_and_reuse_body() {
     let (child, writer) = spawn_blocker();
     drop(writer);
-    let reuser = reap_behind_and_reuse(child.id().pid());
+    let reuser = reap_behind_and_reuse(child.pid());
     drop(child);
     assert_eq!(
         sigusr1_and_wait(reuser),
@@ -89,11 +89,7 @@ fn treewalk_root_is_the_verified_identity_body() {
         Err(e) => panic!("a reap after the verified identity read must not fail the spawn: {e:?}"),
     };
     let stranger = stranger.borrow_mut().take().expect("the hook must have run");
-    assert_eq!(
-        stranger.id(),
-        child.id().pid(),
-        "the stranger must hold the child's pid"
-    );
+    assert_eq!(stranger.id(), child.pid(), "the stranger must hold the child's pid");
     assert_eq!(
         child.test_treewalk_root(),
         Some(child.id()),
@@ -141,7 +137,7 @@ fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
     let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), same_tick));
@@ -190,7 +186,7 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
     let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));
@@ -233,7 +229,7 @@ fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let reuser_read = reuser_id(child.id(), same_tick);
     drop(writer);
     child.wait().expect("this handle reaps the root");
@@ -298,7 +294,7 @@ fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
     let killed = crate::containment::unix::fault::record_kill_group();
     let termed = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let reuser_read = reuser_id(child.id(), false);
     drop(writer);
     let status = child.wait().expect("this handle reaps the root");
@@ -347,7 +343,7 @@ fn terminate_tree_after_own_wait_and_reuse_body() {
     crate::log_capture::install();
     let termed = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     let reuser_read = reuser_id(child.id(), false);
     drop(writer);
     child.wait().expect("this handle reaps the root");
@@ -395,7 +391,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
     let killed = crate::containment::unix::fault::record_kill_group();
     let termed = crate::containment::unix::fault::record_term_group();
     let (child, writer) = spawn_group_blocker();
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
     let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));

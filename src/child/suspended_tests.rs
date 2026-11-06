@@ -80,7 +80,7 @@ mod on_windows {
         frozen: &crate::child::SuspendedChild,
         writer: std::io::PipeWriter,
     ) -> crate::child::spawn::fault::TeardownBlocker {
-        let thread = InitialThread::of(frozen.id().pid());
+        let thread = InitialThread::of(frozen.pid());
         crate::child::spawn::fault::release_at_drop_kill((writer, ResumeOnDrop(thread)))
     }
 
@@ -148,7 +148,7 @@ mod on_windows {
     fn frozen_child_has_executed_no_instruction_before_resume() {
         for raw in BACKENDS {
             let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            let thread = InitialThread::of(frozen.id().pid());
+            let thread = InitialThread::of(frozen.pid());
             assert_eq!(thread.suspend_count(), 1, "raw={raw}: frozen until resumed");
 
             let child = frozen.resume().expect("resume");
@@ -169,7 +169,7 @@ mod on_windows {
                     cmd.contain();
                 }
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
-                let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.id().pid());
+                let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.pid());
 
                 let child = frozen.resume().unwrap_or_else(|e| {
                     panic!("raw={raw} contain={contain}: a running second thread failed the resume: {e:?}")
@@ -286,7 +286,7 @@ mod on_windows {
                     .resume()
                     .expect("resume");
                 assert_eq!(child.kill_on_drop, kill_on_drop, "{shape}");
-                let remote = Remote::open(child.id().pid());
+                let remote = Remote::open(child.pid());
 
                 drop(child);
 
@@ -353,7 +353,7 @@ mod on_windows {
                 let frozen = cmd.spawn_suspended().expect("spawn suspended");
                 // Released and resumed after the drop's kill.
                 let teardown = release_at_teardown_kill(&frozen, writer);
-                let remote = Remote::open(frozen.id().pid());
+                let remote = Remote::open(frozen.pid());
                 let teardowns = crate::child::owned::seams::record_root_teardowns();
 
                 drop(frozen);
@@ -375,7 +375,7 @@ mod on_windows {
             let frozen = cmd.spawn_suspended().expect("spawn suspended");
             // Released and resumed after the drop's kill.
             let teardown = release_at_teardown_kill(&frozen, writer);
-            let remote = Remote::open(frozen.id().pid());
+            let remote = Remote::open(frozen.pid());
 
             drop(frozen);
 
@@ -443,7 +443,7 @@ mod on_windows {
         let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
         // Opened while `frozen` holds the process, so the pid cannot name anything else.
         // SAFETY: plain Win32 calls; the handle is closed below.
-        let victim: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, frozen.id().pid()) }
+        let victim: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, frozen.pid()) }
             .expect("open the frozen child");
         // SAFETY: `victim` is live.
         unsafe {
@@ -517,7 +517,7 @@ mod on_windows {
         let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
 
         assert_eq!(
-            InitialThread::of(child.id().pid()).suspend_count(),
+            InitialThread::of(child.pid()).suspend_count(),
             0,
             "the spawn after a frozen one must run"
         );

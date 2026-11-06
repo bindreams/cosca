@@ -650,7 +650,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let cat = cat_pid(&line);
     let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
-    let root = child.id().pid();
+    let root = child.pid();
     if reap.reaped() {
         kill_own_child(root);
         if reap.own() {
@@ -786,7 +786,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let cat = cat_pid(&line);
     let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
-    let root = child.id().pid();
+    let root = child.pid();
     if reap.reaped() {
         kill_own_child(root);
         if reap.own() {
