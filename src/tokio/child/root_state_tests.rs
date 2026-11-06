@@ -79,7 +79,7 @@ async fn a_tokio_drop_with_an_unknown_root_warns_once() {
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, _writer) = session_blocker(true);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let _failed = force_peeks([failed_peek("forced"), failed_peek("forced")]);
 
@@ -316,7 +316,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = session_blocker(true);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let _failed = force_peeks([failed_peek("forced")]);
     let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
@@ -348,7 +348,7 @@ async fn finish_elevated_with_a_trusted_root_and_a_foreign_reap_during_the_wait_
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = session_blocker(true);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mark = crate::log_capture::mark();
     let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         super::child_reap_tests::release_then_reap_behind_the_owner(pid, writer);
@@ -380,7 +380,7 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
     let _recorder = crate::containment::unix::fault::record_kill_group();
     let (child, writer) = session_blocker(true);
     drop(writer);
-    super::child_reap_tests::reap_behind_the_owner(child.id().pid());
+    super::child_reap_tests::reap_behind_the_owner(child.pid());
     let mark = crate::log_capture::mark();
     // The number still reads as the root, as after a same-tick reuse.
     let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(child.id()));
@@ -447,7 +447,7 @@ mod macos {
     async fn an_orphaned_root_is_not_signalled_and_warns_once() {
         crate::log_capture::install();
         let (child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
@@ -503,7 +503,7 @@ mod macos {
     async fn an_orphaned_root_behind_a_closed_front_gate_warns_once() {
         crate::log_capture::install();
         let (mut child, writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -540,7 +540,7 @@ mod macos {
     async fn an_unknown_root_we_pin_is_still_killed_through_its_handle() {
         crate::log_capture::install();
         let (child, _writer) = walked_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let _failed = force_peeks([Err(std::io::Error::other("forced peek failure"))]);
 
@@ -570,14 +570,14 @@ mod macos {
         // Control: a root that is a marker holder is swept when the handle says it is reaped, so
         // the assertion below is not vacuous.
         let (control, _control_writer) = session_blocker();
-        let control_pid = control.id().pid();
+        let control_pid = control.pid();
         let gone = force_peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
         drop(control);
         drop(gone);
         assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
 
         let (child, _writer) = session_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let sends = Capture::start();
         let orphaned = || Ok(PeekOutcome::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);

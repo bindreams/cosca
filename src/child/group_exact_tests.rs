@@ -64,7 +64,7 @@ impl EndedAtTheSigterm {
 #[skuld::test]
 fn kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     let (child, member) = root_with_a_member();
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     let capture = Capture::start();
@@ -100,7 +100,7 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
 #[skuld::test]
 fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
     let (child, member) = root_with_a_member();
-    kill_own_child(child.id().pid());
+    kill_own_child(child.pid());
     child.wait().expect("this handle reaps the root");
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let capture = Capture::start();
@@ -179,7 +179,7 @@ impl EmptiedGroup {
         stdout.read_exact(&mut started).expect("read `started`");
         assert_eq!(&started, b"started\n");
         let (stdin, stderr) = (root.stdin().expect("stdin pipe"), root.stderr().expect("stderr pipe"));
-        let pid = root.id().pid();
+        let pid = root.pid();
         kill_own_child(pid);
         reap_behind(pid);
         let mut other = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the other group's leader");
@@ -316,7 +316,7 @@ pub(crate) fn assert_down_without_status(result: Result<std::process::ExitStatus
 #[skuld::test]
 fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_signal)] _group: &Group) {
     let (child, member) = root_with_a_member();
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     let capture = Capture::start();
@@ -356,7 +356,7 @@ fn graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
 ) {
     crate::log_capture::install();
     let (child, member) = root_with_a_member();
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     let mark = crate::log_capture::mark();

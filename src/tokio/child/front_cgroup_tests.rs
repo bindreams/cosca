@@ -122,7 +122,7 @@ async fn cgroup_drop_of_a_front_kills_it_through_the_cgroup(#[fixture(cgroup)] _
     let _leaf_cleanup = clean_up_leaf_of(&child);
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
+    release.observe(child.pid());
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(roots.kills(), 0, "the drop sends the front no kill of its own");
@@ -153,7 +153,7 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
         panic!("expected a cgroup leaf, got {:?}", child.os.attached);
     };
     let leaf = leaf.path().to_path_buf();
-    let pidfd = pidfd_of(child.id().pid());
+    let pidfd = pidfd_of(child.pid());
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
@@ -242,7 +242,7 @@ async fn assert_tokio_drop_kills_the_leaf(fault: impl FnOnce() -> Box<dyn std::a
         stdout,
     } = spawn_front_with_member().await;
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
@@ -307,7 +307,7 @@ async fn cgroup_drop_of_a_front_outside_its_leaf_kills_the_rest_of_it(#[fixture(
         stdout,
     } = spawn_front_with_member().await;
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let pidfd = pidfd_of(pid);
     move_out_of_its_leaf(pid);
     // The member is released as the kill returns (see [`KillRelease`]), the front at the wait a drop
@@ -335,7 +335,7 @@ async fn cgroup_kill_of_a_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _g
     let (mut child, stdin) = spawn_nobody_front().await;
     let _leaf_cleanup = clean_up_leaf_of(&child);
     {
-        let _refusing = WithoutKillCap::refusing(child.id().pid());
+        let _refusing = WithoutKillCap::refusing(child.pid());
         child.kill().expect("the cgroup kill ends the front");
         child.kill_tree().expect("the cgroup kill ends the front");
     }
@@ -352,10 +352,10 @@ async fn cgroup_drop_of_a_front_that_refuses_signals_kills_it(#[fixture(cgroup)]
     let (child, stdin) = spawn_nobody_front().await;
     let _leaf_cleanup = clean_up_leaf_of(&child);
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
+    release.observe(child.pid());
     let mark = crate::log_capture::mark();
     {
-        let _refusing = WithoutKillCap::refusing(child.id().pid());
+        let _refusing = WithoutKillCap::refusing(child.pid());
         drop(child);
     }
     assert_eq!(roots.kills(), 0, "the drop sends the front no kill of its own");
@@ -371,8 +371,8 @@ async fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(
     let _leaf_cleanup = clean_up_leaf_of(&child);
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
-    let _refusing = WithoutKillCap::refusing(child.id().pid());
+    release.observe(child.pid());
+    let _refusing = WithoutKillCap::refusing(child.pid());
     crate::containment::cgroup::fault::record_leaf_steps();
     let err = crate::tokio::spawn::finish_elevated(
         child,
@@ -401,7 +401,7 @@ async fn cgroup_a_front_that_left_its_leaf_is_unkillable_and_sent_nothing(#[fixt
     let roots = drop_fault::record();
     let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let pidfd = pidfd_of(pid);
     move_out_of_its_leaf(pid);
     assert_unkillable_front(child.kill(), pid);
@@ -417,7 +417,7 @@ async fn cgroup_a_front_that_left_its_leaf_is_unkillable_and_sent_nothing(#[fixt
 async fn cgroup_kill_of_an_exited_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _group: &Group) {
     let (mut child, stdin) = spawn_nobody_front().await;
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     {
@@ -437,7 +437,7 @@ async fn cgroup_a_front_moved_out_during_its_kill_is_unkillable(#[fixture(cgroup
     for kill in kills {
         let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
         let _leaf_cleanup = clean_up_leaf_of(&child);
-        let pid = child.id().pid();
+        let pid = child.pid();
         let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
         assert_refused_by(kill(&mut child), "left the cgroup before its kill");
         assert_ends_unsignalled(&mut child, stdin).await;
@@ -467,7 +467,7 @@ async fn cgroup_drop_of_a_front_moved_out_during_its_kill_warns(#[fixture(cgroup
     let roots = drop_fault::record();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let pidfd = pidfd_of(pid);
     let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
     // The front's stdin is closed only where the drop waits (for the leaf's drain, or for the front),
@@ -492,7 +492,7 @@ async fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _g
     let (child, stdin) = spawn_as(cmd, SUDO);
     let _leaf_cleanup = clean_up_leaf_of(&child);
     let release = release_after_cgroup_kill(stdin);
-    release.observe(child.id().pid());
+    release.observe(child.pid());
     let gates = crate::elevation::front::seams::count_kill_gates();
     let err = crate::tokio::spawn::finish_elevated(
         child,
@@ -592,7 +592,7 @@ async fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(
 async fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup)] _group: &Group) {
     let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let _leaf_cleanup = clean_up_leaf_of(&child);
-    crate::child::front_cgroup_tests::move_under_its_leaf(child.id().pid());
+    crate::child::front_cgroup_tests::move_under_its_leaf(child.pid());
     {
         let _hidden = crate::containment::cgroup::fault::hide_proc();
         child.kill().expect("the leaf's kill reaches a front nested under it");

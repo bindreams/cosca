@@ -232,7 +232,7 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
     for (errno, name) in REFUSALS {
         let (child, control) = common::spawn_control("control-block", &["R"], true);
         // `setsid` makes the child its own group leader.
-        let pgid = child.id().pid();
+        let pgid = child.pid();
         let results = with_openat2_refused(errno, || {
             [
                 ("kill_tree", child.kill_tree()),

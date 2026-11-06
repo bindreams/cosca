@@ -46,7 +46,7 @@ fn spawn_blocker_with(kill_on_drop: bool) -> (crate::tokio::Child, std::io::Pipe
 fn tokio_child_holds_its_handshake_pidfd() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
             panic!("a fresh child is a tokio backend");
         };
@@ -66,7 +66,7 @@ fn tokio_child_holds_its_handshake_pidfd() {
 /// Ends the child, reaps it behind tokio's back and reuses its pid.
 fn foreign_reaped_and_reused(child: &crate::tokio::Child, writer: std::io::PipeWriter) -> std::process::Child {
     drop(writer);
-    reap_behind_and_reuse(child.id().pid())
+    reap_behind_and_reuse(child.pid())
 }
 
 /// Every read of `child`'s number now finds `child`'s own identity, as a reuser in the same clock
@@ -130,7 +130,7 @@ in_fresh_pid_ns!(
 fn send_log_failed_attempt_body() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(writer);
         let pidfd = pidfd_open(Pid::from_raw(pid as i32).expect("pid"), PidfdFlags::empty()).expect("pidfd_open");
         wait_pollin(pidfd.as_fd());
@@ -169,7 +169,7 @@ fn is_open(fd: std::os::fd::RawFd) -> bool {
 fn drop_after_a_foreign_reap_closes_cosca_pidfd_body() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
             panic!("a fresh child is a tokio backend");
         };
@@ -219,7 +219,7 @@ fn elevation_detail(err: crate::error::Error) -> String {
 fn finish_elevated_after_a_foreign_reap_does_not_claim_a_termination() {
     runtime().block_on(async {
         let (child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(writer);
         crate::test_child::wait_until_zombie(pid);
         let mut status = 0;
@@ -316,7 +316,7 @@ fn finish_elevated_after_a_delivered_kill_and_a_foreign_reap_and_reuse_waits_for
 
     runtime().block_on(async {
         let (child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let stranger = Rc::new(RefCell::new(None));
         let _hook = crate::child::spawn::fault::set_between_kill_and_wait({
             let stranger = Rc::clone(&stranger);
@@ -416,7 +416,7 @@ fn armed_drop_after_foreign_reap_and_reuse_signals_nothing_body() {
 
     runtime().block_on(async {
         let (child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let root = child.id();
         type Reused = Option<(std::process::Child, Box<dyn std::any::Any>)>;
         let reused: Rc<RefCell<Reused>> = Rc::default();
@@ -468,7 +468,7 @@ fn awaited_teardown_after_foreign_reap_and_reuse_takes_nothing_body() {
 
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         type Reused = Option<std::process::Child>;
         let reused: Rc<RefCell<Reused>> = Rc::default();
         let hand = Rc::clone(&reused);
@@ -525,7 +525,7 @@ async fn traced_then_reaped_elsewhere_on_park() -> (
     use crate::test_support::foreign_tracer::{self, REAP};
 
     let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mut tracer = foreign_tracer::spawn_helper(pid);
     let reused: std::rc::Rc<std::cell::RefCell<Option<std::process::Child>>> = std::rc::Rc::default();
     let hand = std::rc::Rc::clone(&reused);
@@ -662,7 +662,7 @@ fn first_look_sees_it_running() -> impl Sized {
 fn armed_drop_whose_first_look_missed_the_reap_body() {
     runtime().block_on(async {
         let (child, writer) = spawn_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let reuser = foreign_reaped_and_reused(&child, writer);
         let _read = read_as_root(&child);
         let root = super::drop_fault::record();
@@ -867,7 +867,7 @@ in_fresh_pid_ns!(
 fn wait_parked_then_foreign_reap_and_reuse_body() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
-        let id = child.id();
+        let pid = child.pid();
         let mut waiting = std::pin::pin!(child.wait());
         let parked = std::future::poll_fn(|cx| {
             std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
@@ -875,7 +875,7 @@ fn wait_parked_then_foreign_reap_and_reuse_body() {
         .await;
         assert!(parked, "wait must be parked on a live child");
         drop(writer);
-        let mut reuser = reap_behind_and_reuse(id.pid());
+        let mut reuser = reap_behind_and_reuse(pid);
         assert_eq!(
             sigusr1_and_peek(&reuser),
             Some(libc::SIGUSR1),
@@ -1049,11 +1049,7 @@ fn treewalk_root_is_the_verified_identity_body() {
             Err(e) => panic!("a reap after the verified identity read must not fail the spawn: {e:?}"),
         };
         let stranger = stranger.borrow_mut().take().expect("the hook must have run");
-        assert_eq!(
-            stranger.id(),
-            child.id().pid(),
-            "the stranger must hold the child's pid"
-        );
+        assert_eq!(stranger.id(), child.pid(), "the stranger must hold the child's pid");
         assert_eq!(
             child.test_treewalk_root(),
             Some(child.id()),
@@ -1188,7 +1184,7 @@ fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (mut child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
         let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), same_tick));
@@ -1238,7 +1234,7 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_term_group();
         let (child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
         let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));
@@ -1279,7 +1275,7 @@ fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
         crate::log_capture::install();
         let recorder = crate::containment::unix::fault::record_kill_group();
         let (mut child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let reuser_read = reuser_id(child.id(), same_tick);
         drop(writer);
         child.wait().await.expect("this handle reaps the root");
@@ -1341,7 +1337,7 @@ fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
         let killed = crate::containment::unix::fault::record_kill_group();
         let termed = crate::containment::unix::fault::record_term_group();
         let (mut child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let reuser_read = reuser_id(child.id(), false);
         drop(writer);
         let status = child.wait().await.expect("this handle reaps the root");
@@ -1390,7 +1386,7 @@ fn terminate_tree_after_own_wait_and_reuse_body() {
         crate::log_capture::install();
         let termed = crate::containment::unix::fault::record_term_group();
         let (mut child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let reuser_read = reuser_id(child.id(), false);
         drop(writer);
         child.wait().await.expect("this handle reaps the root");
@@ -1435,7 +1431,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
         let killed = crate::containment::unix::fault::record_kill_group();
         let termed = crate::containment::unix::fault::record_term_group();
         let (mut child, writer) = spawn_group_blocker();
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(writer);
         let reuser = reap_behind_and_reuse(pid);
         let _read = crate::child::fault::force_root_reads(reuser_id(child.id(), false));

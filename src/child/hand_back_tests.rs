@@ -100,7 +100,7 @@ fn a_child_that_opted_out_is_not_handed_back() {
 fn a_refused_kill_of_a_child_that_has_exited_hands_nothing_back() {
     let (mut child, stdin) = held_uncontained_blocker(true);
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     refuse_the_kill(&mut child);
 
     let (fate, handed_back) = tear_down_holding(child, (), Disposition::HandBack);
@@ -364,7 +364,7 @@ fn an_elevation_front_reaped_elsewhere_is_not_handed_back() {
 fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
     let (child, stdin) = a_running_front();
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let mark = crate::log_capture::mark();
 
     let (fate, handed_back) = tear_down_holding(child, (), Disposition::HandBack);
@@ -414,7 +414,7 @@ mod in_a_cgroup {
     #[skuld::test]
     fn a_handed_back_child_does_not_hold_up_its_leaf(#[fixture(cgroup)] _group: &Group) {
         let (mut child, stdin) = blocker_in_a_leaf();
-        let pid = child.id().pid();
+        let pid = child.pid();
         let leaf = cgroup_dir_of(pid);
         move_out_of_its_leaf(pid);
         refuse_the_kill(&mut child);
@@ -566,7 +566,7 @@ mod in_a_cgroup {
     fn a_handed_back_child_whose_leaf_cannot_kill_returns_and_logs_the_leaf(#[fixture(cgroup)] _group: &Group) {
         crate::log_capture::install();
         let (mut child, stdin) = blocker_in_a_leaf();
-        let leaf = cgroup_dir_of(child.id().pid());
+        let leaf = cgroup_dir_of(child.pid());
         refuse_the_kill(&mut child);
         let mark = crate::log_capture::mark();
 

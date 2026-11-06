@@ -32,7 +32,7 @@ fn tracee_receiving(kind: Tracee, signals: &[i32]) -> (crate::Child, std::io::Pi
     let (mut child, ready) = super::spawn_tracee(kind);
     for &signal in signals {
         let caught = kind == Tracee::CatchSigterm && signal == libc::SIGTERM;
-        assert_receives(child.id().pid(), &ready, signal, caught);
+        assert_receives(child.pid(), &ready, signal, caught);
     }
     let stdin = child.stdin().expect("the tracee's stdin is piped");
     (child, stdin)
@@ -239,7 +239,7 @@ fn assert_sigkilled(tracee: crate::Child) {
         0,
         "assert_sigkilled before the tracer helper was reaped"
     );
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let info = await_change(pid);
     if let Some(signal) = stopped_by(&info, proc_state(pid)) {
         tracee.kill().expect("kill the stopped tracee");
@@ -321,7 +321,7 @@ fn panic_of(f: impl FnOnce()) -> String {
 #[skuld::test]
 fn feasibility_facts(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
     assert_eq!(sys::pbi_status(pid), Ok(libc::SSTOP), "the held tracee's status");
@@ -353,7 +353,7 @@ fn feasibility_facts(#[fixture(tracer_group)] _group: &Group) {
 fn check_receives(kind: Tracee, signal: i32, caught: bool) -> Result<(), String> {
     let (mut tracee, ready) = super::spawn_tracee(kind);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let checked = std::panic::catch_unwind(|| assert_receives(pid, &ready, signal, caught));
     drop(stdin);
     assert_exited_cleanly(tracee);
@@ -396,7 +396,7 @@ fn a_blocked_signal_fails_the_precondition(#[fixture(tracer_group)] _group: &Gro
 fn a_blocked_tracee_blocks_the_signal_on_every_thread(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, ready) = super::spawn_tracee(Tracee::BlockSigtstp);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     // So XNU would not discard the stop the mutant takes.
     assert_job_control_reaches(pid, &ready, libc::SIGTSTP);
     let message = panic_of(|| assert_receives(pid, &ready, libc::SIGTSTP, false));
@@ -461,7 +461,7 @@ fn an_orphaned_group_does_not_matter_for_other_signals(#[fixture(tracer_group)] 
 #[skuld::test]
 fn a_client_helper_reports_only_the_protocol(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start(Mode::Auto).attach(&mut tracee);
     assert_eq!(th.recv(), Report::Attached);
     drop(stdin);
@@ -594,7 +594,7 @@ fn s1_an_attach_error_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s1h_a_signal_byte_goes_to_release(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
     th.signal();
@@ -612,7 +612,7 @@ fn s1h_a_signal_byte_goes_to_release(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn a_stop_record_of_an_exiting_tracee_is_its_kill(#[fixture(tracer_group)] _group: &Group) {
     let (tracee, _stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     send(pid, libc::SIGKILL);
     sys::peek(pid, libc::WEXITED).expect("waitid the killed tracee");
     let _stale = ForcedStop::arm(libc::SIGKILL);
@@ -624,7 +624,7 @@ fn a_stop_record_of_an_exiting_tracee_is_its_kill(#[fixture(tracer_group)] _grou
 #[skuld::test]
 fn a_stopped_tracee_reads_as_stopped(#[fixture(tracer_group)] _group: &Group) {
     let (tracee, _stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     send(pid, libc::SIGSTOP);
     let info = await_change(pid);
     assert_eq!(
@@ -812,7 +812,7 @@ fn await_settled(pid: u32) {
 #[skuld::test]
 fn a_stop_with_a_never_started_thread_settles(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_with(Tracee::UnstartedThread);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h"]);
     await_settled(pid);
@@ -849,7 +849,7 @@ fn from_held<'a>(tracee: &'a mut crate::Child, force: &str) -> TracerHelper<'a> 
 #[skuld::test]
 fn s2_ebusy_backs_off_then_retries(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = from_held(&mut tracee, "S1:hold,S2:EBUSY");
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
     drop(stdin);
@@ -873,7 +873,7 @@ fn s2_a_settling_stop_backs_off(#[fixture(tracer_group)] _group: &Group) {
 
 fn s2_backs_off_before_the_release(force: &str) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = from_held(&mut tracee, force);
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
     drop(stdin);
@@ -910,7 +910,7 @@ fn s2_passes_a_stopping_signal_through(#[fixture(tracer_group)] _group: &Group) 
 #[skuld::test]
 fn s2_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S2stop:SIGTSTP").attach(&mut tracee);
     expect(&mut th, &HELD);
     send(pid, libc::SIGSTOP);
@@ -986,7 +986,7 @@ fn s2b_eof_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s2b_a_lone_sigchld_reads_as_the_timeout(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = from_held(&mut tracee, "S1:hold,S2:EBUSY,S2b:SIGCHLD");
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
     drop(stdin);
@@ -1004,7 +1004,7 @@ fn s2b_a_lone_sigchld_reads_as_the_timeout(#[fixture(tracer_group)] _group: &Gro
 #[skuld::test]
 fn s3_auto_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1018,7 +1018,7 @@ fn s3_auto_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s3_auto_note_exit_wins_over_a_signal_byte_in_the_same_batch(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S3:NOTE_EXIT+SIGNAL").attach(&mut tracee);
     expect(
         &mut th,
@@ -1036,7 +1036,7 @@ fn s3_auto_note_exit_wins_over_a_signal_byte_in_the_same_batch(#[fixture(tracer_
 #[skuld::test]
 fn s3_auto_a_signal_byte_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     th.signal();
@@ -1050,7 +1050,7 @@ fn s3_auto_a_signal_byte_goes_to_detach(#[fixture(tracer_group)] _group: &Group)
 #[skuld::test]
 fn s3_auto_eof_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(th.session.signal_tx.take());
@@ -1064,7 +1064,7 @@ fn s3_auto_eof_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s5_eintr_retries(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S5:EINTR").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1078,7 +1078,7 @@ fn s5_eintr_retries(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s5_another_errno_fails(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S5:ECHILD").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1093,7 +1093,7 @@ fn s5_another_errno_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s5_a_stop_is_not_a_reap(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S3:NOTE_EXIT").attach(&mut tracee);
     expect(
         &mut th,
@@ -1115,7 +1115,7 @@ const EXITED: [&str; 4] = ["blocking S3 exit", "exited", "S3x", "blocking S3x eo
 #[skuld::test]
 fn s3_hold_note_exit_reports_exited_then_a_signal_byte_reaps(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1132,7 +1132,7 @@ fn s3_hold_note_exit_reports_exited_then_a_signal_byte_reaps(#[fixture(tracer_gr
 #[skuld::test]
 fn s3x_eof_reaps(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1147,7 +1147,7 @@ fn s3x_eof_reaps(#[fixture(tracer_group)] _group: &Group) {
 /// S3x's event arrives as an injected batch.
 fn s3x_injected_release(event: &str) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, &format!("S3x:{event}")).attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1174,7 +1174,7 @@ fn s3x_an_injected_eof_reaps(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s3x_note_exit_fails(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "S3x:NOTE_EXIT").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1192,7 +1192,7 @@ fn s3x_note_exit_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s3x_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "S3x:SIGCHLD,S3x:NOTE_EXIT").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1211,7 +1211,7 @@ fn s3x_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s3_hold_a_zombie_wait_that_finds_no_exit_fails(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "S3:NOTE_EXIT").attach(&mut tracee);
     expect(
         &mut th,
@@ -1228,7 +1228,7 @@ fn s3_hold_a_zombie_wait_that_finds_no_exit_fails(#[fixture(tracer_group)] _grou
 #[skuld::test]
 fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     th.signal();
@@ -1242,7 +1242,7 @@ fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach(#[fixture(tracer_group
 #[skuld::test]
 fn s3_hold_eof_without_note_exit_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(th.session.signal_tx.take());
@@ -1255,7 +1255,7 @@ fn s3_hold_eof_without_note_exit_goes_to_detach(#[fixture(tracer_group)] _group:
 /// The injected batch is taken on S3's entry; S3 then waits for the real zombie.
 fn s3_hold_batch_passes_s3x(event: &str) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let force = format!("S3:NOTE_EXIT+{event}");
     let mut th = super::start_forced(Mode::Hold, &force).attach(&mut tracee);
     expect(
@@ -1295,7 +1295,7 @@ fn at_s4<'a>(tracee: &'a mut crate::Child, force: &str) -> TracerHelper<'a> {
 #[skuld::test]
 fn s4_ebusy_backs_off_then_retries(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, "S4:EBUSY,S4sigstop:1");
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
     assert_is_our_child(pid);
@@ -1331,7 +1331,7 @@ fn s4_backs_off_before_the_detach(stop: &str) {
 #[skuld::test]
 fn s4b_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, "S4:EBUSY,S4b:NOTE_EXIT");
     expect(&mut th, &["S4", "S4b", "S5", "blocking S5 exit"]);
     drop(stdin);
@@ -1343,7 +1343,7 @@ fn s4b_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
 
 fn s4b_ignores(event: &str) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, &format!("S4:EBUSY,S4sigstop:1,S4b:{event}"));
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
     assert_is_our_child(pid);
@@ -1372,7 +1372,7 @@ fn s4b_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
 /// Reaches S6 with S4's injections, then lets the tracee really exit: S6's `NOTE_EXIT` row.
 fn s4_goes_to_s6(force: &str) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, force);
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
     drop(stdin);
@@ -1405,7 +1405,7 @@ fn s4_a_pass_through_on_an_exiting_tracee_goes_to_exiting(#[fixture(tracer_group
 #[skuld::test]
 fn s4_esrch_after_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, "seed:NOTE_EXIT,S4:ESRCH");
     expect(&mut th, &["S4", "S5", "blocking S5 exit"]);
     drop(stdin);
@@ -1456,7 +1456,7 @@ fn s4_a_failed_pass_through_fails(#[fixture(tracer_group)] _group: &Group) {
 
 fn s6_ignores(eof: bool) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = at_s4(&mut tracee, "S4:ESRCH");
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
     if eof {
@@ -1514,7 +1514,7 @@ fn assert_job_stopped(pid: u32, signal: i32) {
 /// Holds the tracee at S1hs, posts it `signal` (a traced, stopped tracee only posts it;
 /// measured on CI), and releases it: its first act on resuming is a traced stop for `signal`.
 fn released_with_pending<'a>(tracee: &'a mut crate::Child, force: &str, signal: i32) -> TracerHelper<'a> {
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, force).attach(tracee);
     expect(&mut th, &HELD);
     send(pid, signal);
@@ -1527,7 +1527,7 @@ fn released_with_pending<'a>(tracee: &'a mut crate::Child, force: &str, signal: 
 #[skuld::test]
 fn s3_passes_a_stopping_signal_through(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold", libc::SIGTERM);
     expect(&mut th, &["blocking S3 eof", "S3s", "blocking S3 eof"]);
     // A tracee released without the signal then exits on its own instead.
@@ -1542,7 +1542,7 @@ fn s3_passes_a_stopping_signal_through(#[fixture(tracer_group)] _group: &Group) 
 #[skuld::test]
 fn s3_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     send(pid, libc::SIGTSTP);
@@ -1559,7 +1559,7 @@ fn s3_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group
 #[skuld::test]
 fn s3_keeps_only_the_first_stop_signal(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGTTIN]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     send(pid, libc::SIGTSTP);
@@ -1578,7 +1578,7 @@ fn s3_keeps_only_the_first_stop_signal(#[fixture(tracer_group)] _group: &Group) 
 #[skuld::test]
 fn s3_a_sigcont_drops_a_kept_stop_signal(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGCONT]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     send(pid, libc::SIGTSTP);
@@ -1605,7 +1605,7 @@ fn s3_a_sigcont_drops_a_kept_stop_signal(#[fixture(tracer_group)] _group: &Group
 #[skuld::test]
 fn s4_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     // S3's injected byte takes it to S4 before the SIGTSTP stop is handled there, and S4 sends no
     // SIGSTOP until the test does, after S4k: SIGSTOP (17) would otherwise beat SIGTSTP (18).
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL,S4sigstop:0", libc::SIGTSTP);
@@ -1622,7 +1622,7 @@ fn s4_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group
 #[skuld::test]
 fn s4_a_failed_resend_fails(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S4r:EPERM").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     send(pid, libc::SIGTSTP);
@@ -1637,7 +1637,7 @@ fn s4_a_failed_resend_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s3_a_sigchld_without_a_stop_changes_nothing(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S3:SIGCHLD").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1651,7 +1651,7 @@ fn s3_a_sigchld_without_a_stop_changes_nothing(#[fixture(tracer_group)] _group: 
 #[skuld::test]
 fn s3_a_pass_through_on_an_exiting_tracee_waits_for_note_exit(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S3:SIGCHLD,S3stop:SIGTERM,S3cont:ESRCH").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1706,7 +1706,7 @@ fn s3_a_failed_pass_through_fails(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn s4_passes_a_stopping_signal_through_before_detaching(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]);
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL", libc::SIGTERM);
     expect(
         &mut th,
@@ -1776,7 +1776,7 @@ fn a_failed_s3_pass_through_trace_write_ends_the_run(#[fixture(tracer_group)] _g
 #[skuld::test]
 fn a_failed_exited_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Hold, "gone:exited").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1790,7 +1790,7 @@ fn a_failed_exited_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn a_failed_blocking_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "gone:blocking S5 exit").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1804,7 +1804,7 @@ fn a_failed_blocking_write_ends_the_run(#[fixture(tracer_group)] _group: &Group)
 #[skuld::test]
 fn a_failed_reaped_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "gone:reaped").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);
@@ -1840,7 +1840,7 @@ fn a_failed_error_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
 #[skuld::test]
 fn done_ignores_a_signal_byte_and_holds(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, stdin) = tracee();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut th = super::start_forced(Mode::Auto, "S5:ECHILD").attach(&mut tracee);
     expect(&mut th, &TO_S3);
     drop(stdin);

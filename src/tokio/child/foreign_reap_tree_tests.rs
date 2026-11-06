@@ -33,7 +33,7 @@ fn session_cat() -> crate::tokio::Command {
 /// A [`session_sleep`] child, killed and reaped behind its back, and its group's id.
 fn foreign_reaped_group_root() -> (crate::tokio::Child, u32) {
     let child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     (child, pid)
@@ -97,7 +97,7 @@ async fn tokio_kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     child.wait().await.expect("this handle reaps the root");
     let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
@@ -130,7 +130,7 @@ async fn tokio_kill_tree_of_a_root_its_handle_cannot_read_kills_it_through_its_p
     let recorder = record_kill_group();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
@@ -186,7 +186,7 @@ async fn tokio_terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_
     let termed = record_term_group();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = crate::send_log::Capture::start();
@@ -232,7 +232,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates
     let termed = record_term_group();
     let mut child = term_ignoring_session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
     let mut ready = String::new();
     ::tokio::io::AsyncBufReadExt::read_line(
         &mut ::tokio::io::BufReader::new(child.stdout().expect("stdout pipe")),
@@ -289,7 +289,7 @@ async fn tokio_graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_
     crate::log_capture::install();
     let mut child = session_cat().spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     let sends = std::rc::Rc::new(crate::send_log::Capture::start());
@@ -384,7 +384,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_no
     let killed = record_kill_group();
     let termed = record_term_group();
     let mut child = session_sleep().spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     kill_own_child(pid);
     child.wait().await.expect("this handle reaps the root");
     let other = child.id().with_other_value();
@@ -450,7 +450,7 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child
         .proc_mut()
         .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
@@ -531,7 +531,7 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_the_
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child
         .proc_mut()
         .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
@@ -595,7 +595,7 @@ async fn tokio_graceful_shutdown_tree_of_a_backend_forgotten_unproven_shuts_its_
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
-    let pid = child.id().pid();
+    let pid = child.pid();
     child
         .proc_mut()
         .forget_as("was forgotten by a test", super::proc_source::Forgotten::Unproven);
@@ -648,7 +648,7 @@ async fn escaped_holder_tree(
         .await
         .expect("read the holder's pid");
     let holder: u32 = line.trim().parse().expect("the holder's pid");
-    crate::test_child::reaped_elsewhere::assert_left_the_group(holder, child.id().pid());
+    crate::test_child::reaped_elsewhere::assert_left_the_group(holder, child.pid());
     let stdin = child.stdin().expect("stdin pipe");
     let stderr = child.stderr().expect("stderr pipe");
     (child, holder, stdin, stderr)
@@ -679,7 +679,7 @@ async fn tokio_kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_g
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
     let other = child.id().with_other_value();
@@ -720,7 +720,7 @@ async fn tokio_kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
@@ -762,7 +762,7 @@ async fn tokio_graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_an
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, true).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     let collected = child.wait().await.expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
@@ -806,7 +806,7 @@ async fn tokio_kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, false).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -843,7 +843,7 @@ async fn tokio_graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_i
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::Session, true).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -887,7 +887,7 @@ async fn tokio_kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::TreeWalk, false).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     reap_behind(pid);
 
@@ -919,7 +919,7 @@ async fn tokio_kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (mut child, holder, _stdin, stderr) = escaped_holder_tree(crate::ContainMode::TreeWalk, false).await;
-    let pid = child.id().pid();
+    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().await.expect("this handle reaps the root");
     let other = child.id().with_other_value();

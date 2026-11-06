@@ -72,7 +72,7 @@ pub(crate) fn assert_ends_unsignalled(child: &crate::Child, stdin: PipeWriter) {
 #[skuld::test]
 fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    assert_unkillable_front(child.kill(), child.id().pid());
+    assert_unkillable_front(child.kill(), child.pid());
     assert_ends_unsignalled(&child, stdin);
 }
 
@@ -82,7 +82,7 @@ fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
 fn kill_of_an_exited_front_is_ok() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     child.kill().expect("an exited front is killed like any child");
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
@@ -94,7 +94,7 @@ fn kill_of_an_exited_front_is_ok() {
 fn kill_of_an_exited_front_returns_any_other_failure() {
     let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     child.proc.script_over(|f| f.signals([failed_signal(libc::EINVAL)]));
     match child.kill() {
         Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{io}"),
@@ -111,7 +111,7 @@ fn kill_tree_of_an_exited_front_is_ok() {
     cmd.contain_with(ContainMode::Session);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f);
     child
         .kill_tree()
@@ -125,7 +125,7 @@ fn kill_tree_of_an_exited_front_is_ok() {
 fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     crate::log_capture::install();
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     let mark = crate::log_capture::mark();
@@ -155,7 +155,7 @@ fn kill_reads_the_front_its_spawn_found_not_its_report() {
 #[skuld::test]
 fn kill_of_a_live_doas_front_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Doas));
-    assert_refused_by(child.kill(), &format!("pid {} is what doas left", child.id().pid()));
+    assert_refused_by(child.kill(), &format!("pid {} is what doas left", child.pid()));
     assert_ends_unsignalled(&child, stdin);
 }
 
@@ -171,7 +171,7 @@ pub(crate) fn uncontained_cats() -> [Command; 2] {
 fn kill_of_a_live_front_without_a_group_sends_nothing() {
     for cmd in uncontained_cats() {
         let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-        assert_unkillable_front(child.kill(), child.id().pid());
+        assert_unkillable_front(child.kill(), child.pid());
         assert_ends_unsignalled(&child, stdin);
     }
 }
@@ -182,7 +182,7 @@ fn drop_of_a_live_front_without_a_group_sends_nothing() {
     for cmd in uncontained_cats() {
         let teardowns = record_root_teardowns();
         let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-        let pid = child.id().pid();
+        let pid = child.pid();
         drop(child);
         assert_eq!(teardowns.count(), 0, "the drop must not kill or reap a live front");
         drop(stdin);
@@ -265,7 +265,7 @@ fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
             .expect("stdout pipe")
             .read_exact(&mut ready)
             .expect("read `ready`");
-        let pid = child.id().pid();
+        let pid = child.pid();
         let fake = child.proc.script_over(|f| f);
         let sent = fake.clone();
         let _hook = at(HookPoint::BeforeEscalation, move || {
@@ -297,7 +297,7 @@ fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exited() {
     let mut cmd = cat();
     cmd.kill_on_drop(false);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     assert!(reap(pid).is_some(), "the test reaps the front itself");
@@ -328,7 +328,7 @@ fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() 
     cmd.contain_with(ContainMode::Session);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     assert_ne!(child.containment(), Containment::CgroupV2);
-    assert_unkillable_front(child.kill_tree(), child.id().pid());
+    assert_unkillable_front(child.kill_tree(), child.pid());
     assert_ends_unsignalled(&child, stdin);
 }
 
@@ -347,7 +347,7 @@ fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
         .read_exact(&mut ready)
         .expect("read `ready`");
     assert_eq!(&ready, b"ready\n");
-    assert_unkillable_front(child.graceful_shutdown(Duration::ZERO), child.id().pid());
+    assert_unkillable_front(child.graceful_shutdown(Duration::ZERO), child.pid());
     assert_ends_unsignalled(&child, stdin);
 }
 
@@ -359,7 +359,7 @@ fn drop_of_a_live_front_leaves_it_running_unreaped_and_warns() {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
 
     let mark = crate::log_capture::mark();
     drop(child);
@@ -478,7 +478,7 @@ fn a_failed_password_write_hands_back_a_live_front_and_names_it() {
 #[skuld::test]
 fn a_live_front_reaped_elsewhere_after_the_refused_kill_is_gone() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
-    let pid = child.id().pid();
+    let pid = child.pid();
     let _foreign_reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
         drop(stdin);
         crate::test_child::wait_until_zombie(pid);
@@ -502,7 +502,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     cmd.kill_on_drop(false);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     let gates = crate::elevation::front::seams::count_kill_gates();
     let (err, fate) = crate::child::spawn::finish_elevated(
@@ -537,7 +537,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     cmd.kill_on_drop(false);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
     let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
@@ -570,7 +570,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
 #[skuld::test]
 fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_refused_by(child.terminate(), &format!("pid {pid} is osascript"));
     assert_ends_unsignalled(&child, stdin);
 }
@@ -580,7 +580,7 @@ fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
 #[skuld::test]
 fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert_refused_by(
         child.graceful_shutdown(Duration::ZERO),
         &format!("pid {pid} is osascript"),
