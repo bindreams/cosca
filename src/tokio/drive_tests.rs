@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use super::{absolute, drive};
 use crate::error::Error;
-use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
 use crate::wait::fault;
 
@@ -407,15 +406,21 @@ mod windows {
     }
 }
 
-/// Mutant: `exited_by_id` takes the seam only after `open`, so a gone id never reaches it.
+/// Mutant: `exited_opening` takes the seam only after `open`, so a gone process never reaches it.
 #[skuld::test]
-async fn exited_by_id_returns_a_forced_watch_error_for_a_gone_id() {
+async fn exited_opening_returns_a_forced_watch_error_for_a_gone_process() {
     crate::tokio::test_runtime::assert_current_thread();
-    let current = ProcessId::current();
-    let gone = current.with_other_value();
     fault::set_force_watch_error(true);
-    assert!(super::exited_by_id(gone, None).await.is_err());
+    let opened = || panic!("the seam comes before the open");
+    assert!(super::exited_opening(opened, None).await.is_err());
     assert!(!fault::armed(), "the seam is consumed");
+}
+
+/// Mutant: `exited_opening` waits on, or errs for, a process that is gone.
+#[skuld::test]
+async fn exited_opening_resolves_at_once_for_a_gone_process() {
+    crate::tokio::test_runtime::assert_current_thread();
+    assert!(super::exited_opening(|| Ok(None), None).await.unwrap());
 }
 
 /// Mutant: `exited_held` skips the seam, or looks at a process the seam should have refused.

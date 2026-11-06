@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::identity::ProcessId;
 use crate::os_process::drive::exited_held;
-use crate::os_process::{kill, open, terminate, terminate_by_id, Exit};
+use crate::os_process::{kill, open, terminate, Exit};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie};
 use crate::test_groups::{tracer_group, Group};
@@ -89,12 +89,13 @@ fn the_wait_is_on_the_pidfd_of_the_process() {
     child.wait().unwrap();
 }
 
-/// Mutant: `terminate_by_id` sends `SIGKILL`.
+/// Mutant: `terminate` sends `SIGKILL`.
 #[skuld::test]
-fn terminate_by_id_sends_sigterm_and_the_blocker_exits() {
+fn terminate_sends_sigterm_and_the_blocker_exits() {
     use std::os::unix::process::ExitStatusExt;
     let (child, _stdin, id) = blocker();
-    terminate_by_id(id).unwrap();
+    let p = open(id).unwrap().expect("a live process opens");
+    terminate(&*p).unwrap();
     assert_eq!(
         child.wait().unwrap().signal(),
         Some(rustix::process::Signal::TERM.as_raw())
@@ -123,18 +124,6 @@ fn kill_and_terminate_of_a_held_process_that_is_gone_are_ok() {
     child.wait().unwrap();
     kill(&*p).unwrap();
     terminate(&*p).unwrap();
-}
-
-#[skuld::test]
-fn terminate_by_id_on_a_gone_process_is_ok() {
-    let (child, _stdin, id) = blocker();
-    let other = id.with_other_value();
-    terminate_by_id(other).unwrap();
-    let p = open(id).unwrap().expect("the blocker is alive");
-    assert!(!exited_held(&*p, Some(Duration::ZERO)).unwrap());
-    child.kill().unwrap();
-    child.wait().unwrap();
-    terminate_by_id(id).unwrap();
 }
 
 /// `Process::kill` promises the raw errno of a refused kill. Mutant: `signal` wraps the errno in
