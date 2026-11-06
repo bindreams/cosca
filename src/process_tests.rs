@@ -73,6 +73,40 @@ fn open_pid_with_opens_through_its_kernel() {
     crate::test_child::release_unsignalled(child);
 }
 
+/// A pidfd call that failed while reading the pid's identity is the open's own failure, as for
+/// `open`: a refused `pidfd_open` is `Unsupported`, a failed inode read `Io` naming `pidfs_ino` with
+/// the raw errno. Mutant: "the identity read's failed call is `Unassessable`".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn open_pid_of_a_pid_whose_pidfd_call_failed_is_the_opens_error() {
+    use rustix::io::Errno;
+
+    use crate::identity::FakeKernel;
+
+    const PID: u32 = 4242;
+    let refused = FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM));
+    assert!(
+        matches!(Process::open_pid_with(&refused, PID), Err(Error::Unsupported { .. })),
+        "a refused pidfd_open"
+    );
+
+    let (stand_in, _writer) = std::io::pipe().expect("a pipe");
+    let unreadable = FakeKernel::new()
+        .on_pidfd_open(PID, Ok(stand_in.into()))
+        .on_pidfs_ino(PID, Err(Errno::BADF));
+    let result = Process::open_pid_with(&unreadable, PID);
+    let Err(Error::Io(e)) = &result else {
+        panic!("a failed inode read: expected Io, got {result:?}");
+    };
+    assert!(e.to_string().starts_with("pidfs_ino: "), "{e}");
+    let raw = e
+        .get_ref()
+        .and_then(std::error::Error::source)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error);
+    assert_eq!(raw, Some(Errno::BADF.raw_os_error()));
+}
+
 #[cfg(windows)]
 #[skuld::test]
 fn open_pid_of_an_access_denied_process_is_unassessable() {
