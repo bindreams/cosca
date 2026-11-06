@@ -681,7 +681,8 @@ async fn cgroup_a_post_fork_tokio_failure_ends_its_child_in_or_out_of_its_leaf(#
 /// one warn, for the child, which the teardown could not terminate and left running, and for its
 /// group, which refused too. Nothing reaps it behind the caller's back: the test does.
 ///
-/// CI only (the `cgroup` and `setuid` groups).
+/// CI only (the `cgroup` and `setuid` groups): the unprivileged cgroup step, since the setuid helper
+/// refuses a kill only from a caller that is not root.
 ///
 /// Mutants: a refused kill reports the child reaped; the child's refusal is not warned of; the
 /// group's refusal is warned of beside the child's.
