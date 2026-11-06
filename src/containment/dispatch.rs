@@ -989,6 +989,13 @@ impl Attached {
         Ok(false)
     }
 
+    /// Whether this is a cgroup leaf with a landed `cgroup.kill` write, which bounds its drain.
+    /// `false` for every other mechanism.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    pub(crate) fn cgroup_kill_landed(&self) -> bool {
+        matches!(self, Attached::Cgroup(leaf) if leaf.kill_landed())
+    }
+
     /// Whether `pid` (which `pidfd` names, when there is one) is in a cgroup's leaf or a cgroup
     /// under it (see `CgroupLeaf::names`). `false` for every other mechanism.
     #[cfg(unix)]

@@ -304,6 +304,44 @@ async fn tokio_armed_drop_whose_tree_kill_fails_does_not_wait_for_the_drain() {
     );
 }
 
+/// A drop whose own tree kill fails after the handle's `kill_tree()` landed still has a kill that
+/// bounds the leaf's drain: it waits for the drain and removes the leaf, as the sync `Drop` does,
+/// and warns of the failed write.
+///
+/// Mutant: the failed write alone decides to give the leaf up (the leaf is left behind, undrained).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn tokio_armed_drop_whose_tree_kill_fails_after_a_landed_kill_waits_for_the_drain() {
+    use super::child_drop_tests::linux;
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let name = "cosca-armed-drop-failed-write-after-landed-kill";
+    let (fake, leaf) = linux::fake_leaf(name, true);
+    let events = fake.events.clone();
+    // The member leaves only once the drain wait blocks: a drop that gives the leaf up leaves it.
+    let _release = leaf_fault::set_before_drain_block(move || FakeLeaf::set_populated(&events, false));
+    let (child, teardown) = released_blocker();
+    let mut child = linux::contained_by(child, leaf);
+    child.kill_tree().expect("the first kill lands");
+    assert_eq!(fake.kill_written(), b"1", "the handle's kill landed");
+    let _drop_kill_fails = leaf_fault::fail_next_kill_write();
+    let mark = crate::log_capture::mark();
+    let (steps, _) = linux::dropped(child, name);
+
+    teardown.assert_killed();
+    assert!(
+        !fake.leaf.exists(),
+        "the landed kill bounds the drain, so the leaf is removed: {steps:?}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "contained-tree teardown did not fully succeed"),
+        [log::Level::Warn],
+        "the drop's failed write is still warned of"
+    );
+}
+
 /// The awaited teardown of a helper that failed after its spawn, whose tree kill fails, gives the
 /// leaf up as the drop does: no second write, no wait for a drain nothing bounds, the leaf left
 /// behind and the failed kill warned once. The root's own kill landed, so it is reaped.

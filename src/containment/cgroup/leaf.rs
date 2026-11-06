@@ -507,6 +507,13 @@ impl CgroupLeaf {
         }
     }
 
+    /// Whether a `cgroup.kill` write on this leaf landed, by any handle's teardown. A failed write
+    /// after it does not undo it: the landed kill still bounds the leaf's drain.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn kill_landed(&self) -> bool {
+        self.kill.landed()
+    }
+
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
     /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
     /// [`crate::wait::remaining`]). Reads the leaf first, and answers from that read if it has
@@ -936,10 +943,11 @@ impl CgroupLeaf {
         // if the child entered it: a final report other than `Placed` proves nothing of the
         // child's is there. A leaf that outlives the removal is reported.
         //
-        // The kill is not written again after one landed. An occupant that migrated in after it
-        // came from a party that already controls the subtree (see `LeafDir::rmdir`), and the
-        // fork race of kernels before 6.14 (`cgroup: fix race between fork and cgroup.kill`) is
-        // the documented assumption of `Command::kill_on_drop`.
+        // The kill is not written again after one landed. A leaf that repopulates after it (a
+        // fork-race escapee on a kernel without `b69bb476dee9`, or a process that migrated in)
+        // makes the drain wait for that process to exit, warned past 1 s. A migrant came from a
+        // party that already controls the subtree (see `LeafDir::rmdir`), and the fork race is the
+        // documented assumption of `Command::kill_on_drop`.
         let Err(first) = self.rmdir_leaf() else {
             return;
         };

@@ -99,7 +99,7 @@ impl OsResources {
     /// The containment resource then drops in place, as the sync `Drop` drops it: a cgroup leaf
     /// is killed unless a write was made, drained, swept and removed. The drain shares the
     /// drop's one `late` warn. `tree_failed`: the drop's own tree kill failed, which is final: the
-    /// leaf is given up without waiting.
+    /// leaf is given up without waiting, unless an earlier kill on it landed.
     #[cfg(unix)]
     fn release_after_drain(self, late: &mut LateWarn, tree_failed: bool) {
         if let Some(attached) = self.release_backend(tree_failed) {
@@ -136,8 +136,9 @@ impl OsResources {
     }
 
     /// The first half of both drain releases: the backend goes. Answers the containment resource
-    /// whose drain the tree kill bounds, or `None` once it has been given up without waiting,
-    /// because the tree kill failed and nothing bounds its drain.
+    /// whose drain a kill bounds, or `None` once it has been given up without waiting, because the
+    /// drop's tree kill failed and no kill on the leaf landed (the leaf's record decides: a
+    /// `kill_tree()` that landed earlier still bounds the drain).
     #[cfg(unix)]
     fn release_backend(mut self, tree_failed: bool) -> Option<Attached> {
         #[cfg(test)]
@@ -147,7 +148,7 @@ impl OsResources {
         }
         let attached = std::mem::take(&mut self.attached);
         #[cfg(target_os = "linux")]
-        if tree_failed && matches!(attached, Attached::Cgroup(_)) {
+        if tree_failed && matches!(attached, Attached::Cgroup(_)) && !attached.cgroup_kill_landed() {
             attached.release_without_waiting();
             return None;
         }
@@ -1463,7 +1464,7 @@ impl Child {
 /// **blocks until the root is reaped and the tree has drained**: the root's exit seen through its own
 /// handle (on Linux its pidfd, on macOS its pid checked against its unique id), then collected
 /// through tokio's `try_wait`, by pid; and a `Cgroup` leaf as the sync [`Child`](crate::Child)'s
-/// drop does it (killed again if still populated, drained, its empty
+/// drop does it (`cgroup.kill` written once unless a write was already made, drained, its empty
 /// child cgroups removed, then removed). The wait runs on the dropping thread, which may be a tokio
 /// worker, on any runtime: a destructor cannot be awaited. The kills bound it, except for a process
 /// stuck in uninterruptible I/O (D state) or a root whose zombie a foreign tracer holds until it lets
