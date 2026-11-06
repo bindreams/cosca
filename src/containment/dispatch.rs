@@ -464,7 +464,7 @@ pub(crate) struct TreeKilled {
 /// The kind of an `Unvouched` state is the latest fact: a walk that saw the root running names
 /// [`RootSeenRunning`](UnvouchedKind::RootSeenRunning), whether or not the root had ended; held members
 /// that all dropped out, [`HeldMembersGone`](UnvouchedKind::HeldMembersGone); something else left with
-/// no identity, [`Earlier`](UnvouchedKind::Earlier). A settlement with no new fact keeps the stored kind.
+/// no identity, [`Earlier`](UnvouchedKind::Earlier), from any previous state. A settlement with no new fact keeps the stored kind.
 #[derive(Debug, Default)]
 enum TreeState {
     /// Nothing has settled the tree: no kill left anything running, and no walk left nothing.
@@ -502,13 +502,15 @@ fn next(
     if !left_now.is_empty() {
         return TreeState::Left(left_now);
     }
-    // The kind the facts name, for a state they leave unvouched.
+    // The kind the facts name, for a state they leave unvouched. Something running with no identity
+    // and no root seen is `Earlier` from any state; with nothing running, the only way to be
+    // unvouched is `Left` whose held members all dropped out.
     let named = if root_seen_running {
         UnvouchedKind::RootSeenRunning
-    } else if matches!(prev, TreeState::Left(_)) {
-        UnvouchedKind::HeldMembersGone
-    } else {
+    } else if running {
         UnvouchedKind::Earlier
+    } else {
+        UnvouchedKind::HeldMembersGone
     };
     match prev {
         _ if walked && !running => TreeState::Killed,
@@ -688,8 +690,7 @@ impl UnvouchedKind {
                 "the members an earlier kill left are gone now, but no later walk has checked what they forked"
             }
             UnvouchedKind::RootSeenRunning => {
-                "the walk found the root running and the root had ended by then, but what the root forked \
-                 meanwhile was never looked for"
+                "the walk found the root running, and what the root forked meanwhile was never looked for"
             }
             UnvouchedKind::Earlier => {
                 "an earlier kill left something running that no later walk has checked for what it forked"
@@ -1094,10 +1095,18 @@ impl Attached {
         let after = next(&state, ran, left_now, running, root_seen_running);
         if gone_root && result.is_ok() && !was_killed {
             // What an earlier walk left is gone or unknown, but nothing walked the tree for what it forked.
-            let TreeState::Unvouched(kind) = after else {
-                unreachable!("a gone root over held or unvouched members leaves the tree unvouched");
+            let error = match after {
+                TreeState::Unvouched(kind) => TreeKillOutcome::no_root_after_kills_error(kind),
+                TreeState::Never | TreeState::Killed | TreeState::Left(_) => {
+                    debug_assert!(
+                        false,
+                        "a gone root over held or unvouched members leaves the tree unvouched"
+                    );
+                    // Release: the gone-root answer of a tree no kill left unvouched.
+                    TreeKillOutcome::no_root_error()
+                }
             };
-            result = Err(Unkilled::from(TreeKillOutcome::no_root_after_kills_error(kind)));
+            result = Err(Unkilled::from(error));
         }
         let unsettled = match result {
             Ok(()) => Ok(()),

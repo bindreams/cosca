@@ -571,14 +571,14 @@ fn next_is_the_one_transition_of_state_and_facts() {
         ("walk, nothing left", true, vec![], false, false,
             [killed(), killed(), killed(), killed(), killed(), killed()]),
         ("walk, something running with no identity", true, vec![], true, false,
-            [earlier(), earlier(), held(), earlier(), earlier(), earlier()]),
+            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
         ("walk, the root seen running", true, vec![], true, true,
             [root(), root(), root(), root(), root(), root()]),
         ("no walk, nothing left (skipped kill, gone root, walk not made)", false, vec![], false, false,
             [Standing::Never, killed(), held(), held(), root(), earlier()]),
         ("no walk, something running with no identity", false, vec![], true, false,
-            [earlier(), earlier(), held(), earlier(), earlier(), earlier()]),
-        ("walk, member 8 left", true, vec![unread(8)], true, false,
+            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
+        ("walk, member 8 left",true, vec![unread(8)], true, false,
             [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
         ("walk, member 8 left and the root seen running", true, vec![unread(8)], true, true,
             [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
@@ -1279,6 +1279,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .settle_for_drop(&root_running, skipped(), true)
         .expect("an unvouched tree is warned of");
     assert!(warn.contains("found the root running"), "{warn}");
+    assert!(!warn.contains("had ended"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
 
     // A walk that left only the root, then a `kill_tree` that answered `Ok`: the drop says what that
@@ -1291,7 +1292,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
             .expect("an unvouched tree is warned of");
         assert!(warn.contains("could not be vouched for"), "{warn}");
         assert!(warn.contains("found the root running"), "{warn}");
-        assert!(warn.contains("the root had ended by then"), "{warn}");
+        assert!(warn.contains("never looked for"), "{warn}");
+        assert!(!warn.contains("had ended"), "{warn}");
         assert!(!warn.contains("members"), "{warn}");
         assert!(!warn.contains("skipped the kill"), "{warn}");
         assert!(!warn.contains("earlier kill"), "{warn}");
@@ -1312,7 +1314,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .expect("a walk that left the root is warned of");
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("found the root running"), "{warn}");
-    assert!(warn.contains("the root had ended by then"), "{warn}");
+    assert!(warn.contains("never looked for"), "{warn}");
+    assert!(!warn.contains("had ended"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
     assert!(!warn.contains("skipped the kill"), "{warn}");
 

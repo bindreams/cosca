@@ -743,30 +743,10 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     child.wait().expect("reap the root");
 }
 
-/// A plain root `sh` over `count` setuid-root helpers, each blocked on the stdin the test holds
-/// (the returned write end) and past its ready byte. A helper refuses the kill of its caller.
+/// [`crate::test_privilege::root_over_setuid_blockers`], uncontained.
 #[cfg(unix)]
 fn root_over_setuid_blockers(count: usize) -> (crate::Child, std::io::PipeWriter) {
-    use std::io::Read as _;
-    // A background job's own stdin is `/dev/null`, so each helper reads fd 3.
-    let job = r#""$0" setuid-stdin-block root <&3 3<&- &"#;
-    let script = format!("exec 3<&0; {} wait", vec![job; count].join(" "));
-    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
-    cmd.args(["sh", "-c", &script])
-        .arg(crate::test_privilege::setuid::setuid_helper());
-    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
-    cmd.stderr(crate::Stdio::null()).expect("stderr null");
-    let mut child = cmd.spawn().expect("spawn the root");
-    let stdin = child.stdin().expect("piped stdin");
-    let mut ready = vec![0u8; count];
-    child
-        .stdout()
-        .expect("piped stdout")
-        .read_exact(&mut ready)
-        .expect("every helper reports ready");
-    assert!(ready.iter().all(|byte| *byte == b'+'), "{ready:?}");
-    (child, stdin)
+    crate::test_privilege::root_over_setuid_blockers(count, |_| {})
 }
 
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale

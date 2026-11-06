@@ -3,6 +3,8 @@
 //! test forces the looks it counts on and asserts they were all made.
 
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{setuid, Group};
 use crate::ContainMode;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
@@ -285,6 +287,73 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_retry_find
     assert!(tree[0].contains(found), "{warns:?}");
     // The root was reaped above, so there is nothing for the handed-back child to wait for.
     drop(handed_back);
+}
+
+/// A failed spawn's cleanup whose first tree kill left a member that refuses the kill, whose root
+/// kill ended the root without collecting its exit (so it is handed back and the kill is retried), and
+/// whose retry finds the member gone but its walk leaves the root, whose own end the cleanup saw: the
+/// retry ends unvouched, not failed. The cleanup's one report says what the first attempt left and
+/// that the retry could not vouch for the tree. Needs the `setuid` group: the member is a setuid-root
+/// helper.
+///
+/// Mutant: a retry that ends unvouched is dropped from the report (as a skipped one is).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn finish_elevated_reports_a_retry_that_ends_unvouched_after_a_member_refused_the_first_kill(
+    #[fixture(setuid)] _group: &Group,
+) {
+    use crate::containment::treewalk::fault::{force_incomplete_once, LeftBehind};
+    crate::log_capture::install();
+    let (mut child, writer) = crate::test_privilege::root_over_setuid_blockers(1, |cmd| {
+        cmd.contain_with(ContainMode::TreeWalk);
+    });
+    let pid = child.id().pid();
+    let member: u32 = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .expect("the root lists its children")
+        .trim()
+        .parse()
+        .expect("the root has the one child");
+    let teardowns = crate::child::owned::seams::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    child.proc.script_over(|f| {
+        f.signals([Ok(crate::signal::Sent::Delivered)])
+            .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
+    });
+    // The first walk killed the root and was refused by the member. Let the member exit, and wait until
+    // nothing names it, and make the retry's walk leave the root, before the retry.
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        drop(writer);
+        while std::path::Path::new(&format!("/proc/{member}")).exists() {
+            std::thread::yield_now();
+        }
+        force_incomplete_once(LeftBehind::Root);
+    });
+
+    let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), ());
+
+    let cause = cause.to_string();
+    assert!(
+        cause.contains("its contained tree could not be killed"),
+        "the first failure: {cause}"
+    );
+    assert!(
+        cause.contains("; on the retry, ") && cause.contains("could not be vouched for"),
+        "the retry's answer: {cause}"
+    );
+    assert!(!cause.contains("the retry failed too"), "{cause}");
+    assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
+    let warns = warns_since(mark);
+    let tree: Vec<_> = warns
+        .iter()
+        .filter(|warn| warn.starts_with("finish_elevated:"))
+        .collect();
+    assert_eq!(tree.len(), 1, "{warns:?}");
+    assert!(
+        tree[0].contains("; on the retry, ") && tree[0].contains("could not be vouched for"),
+        "{warns:?}"
+    );
+    handed_back.wait();
 }
 
 /// A teardown whose walk left only the root, and whose root someone else had reaped when the
