@@ -41,12 +41,13 @@ past 1 s, as the drop's does, each naming what it waits for:
   [`reap_unreported`](../src/tokio/child/proc_source.rs));
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
-  leaf's abandonment: `end_child` for a child that named itself, and the pidfd teardown of one that
-  never did (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  leaf's abandonment, which tears the child down through the pidfd the handshake left it
+  (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
-  exists and in the leaf's abandonment (`end_front` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  exists and in the leaf's abandonment (`abandon_before_verdict` in
+  [`leaf.rs`](../src/containment/cgroup/leaf.rs));
 - on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
-  cleanup, and in the leaf's abandonment (`abandon_before_verdict` and `abandon_front` in
+  cleanup, and in the leaf's abandonment (`abandon_before_verdict` in
   [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
 
 Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and
@@ -97,10 +98,15 @@ bounded number of signals and write `cgroup.kill`, one bounded file write, and n
 process exit or a cgroup drain. On Linux 6.9+ the signals include the signal-0 send through the
 root's pidfd that decides whether a reaped root's process group is killed (principle 4). A leaf it
 leaves undrained stays behind, logged as principle 7 says.
-A leaf whose `cgroup.kill` fails twice, in the tree kill and again before the drain, is given up the
-same way, though the drop still reaps a root its kill reached.
-Its still-running root is left to tokio's drop of its `Child`: an in-drop `try_wait`
-([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
+A leaf whose `cgroup.kill` fails, and on which no earlier kill landed, is given up the same way,
+though the drop still reaps a root its kill reached. A teardown writes `cgroup.kill` once, and a
+failed write is final for it. The one place that writes again within a call is `finish_elevated`,
+when its first tree kill did not settle the tree (it failed or was skipped): it makes the drop's
+tree kill itself, early, because it hands the root back and disarms the handle, so the drop that
+would have made that kill never runs. Everywhere else a second write is a different teardown's (a
+`kill_tree()`, then the drop). A leaf the async drop gives up leaves its still-running root to
+tokio's drop of its `Child`: an in-drop `try_wait` ([tokio reap.rs], [tokio pidfd_reaper.rs]),
+then tokio's orphan queue. Both are tokio's state, not
 cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4). The orphan
 queue is best-effort: it drains only while some tokio runtime parks ([tokio runtime/process.rs]),
 and until then the root stays a zombie.
@@ -138,8 +144,7 @@ Windows, only while a handle to the process is open. Signal and wait through a h
 process:
 
 - on Linux, a `pidfd` opened while the child is provably ours, or the child's own pidfd from before
-  `exec`. A failed spawn's warn opens one by number for a child that sent only its `/proc`
-  directory, and keeps it only if that directory shows the child unreaped after the open;
+  `exec`;
 - a cgroup, since `cgroup.kill` names no PID;
 - on macOS, the audit token of a `Process` opened from a `ProcessId` and of a spawned child: the pid
   with its `p_idversion`, which `proc_signal_with_audittoken` checks in the kernel. A process that
