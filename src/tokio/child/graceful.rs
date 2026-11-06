@@ -168,7 +168,7 @@ impl Child {
             {
                 self.refuse_unpinned("kill", Some("the SIGTERM"))?;
                 let gate = self.kill_gate();
-                self.kill_sent_gated(gate)?;
+                self.kill_sent_gated("graceful_shutdown", gate)?;
             }
             #[cfg(not(unix))]
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
@@ -434,8 +434,8 @@ impl Child {
             );
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
-        // a LIVE root (waiting unswept would hang), but once the root's exit was observed, the
-        // reap runs first so no zombie is stranded.
+        // a LIVE root (waiting unswept would hang), but once the root is dead (its exit was observed,
+        // or the sweep's backstop killed it), the reap runs first.
         if !drained {
             // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
             // not merely that it would have no-op'd: forcing this call to fail and then
@@ -443,16 +443,16 @@ impl Child {
             // never entered at all.
             #[cfg(test)]
             let sweep_result = if fault::take_force_kill_tree_error() {
-                Err(fault::forced_kill_tree_error())
+                Err(fault::forced_kill_tree_error().into())
             } else {
-                self.kill_tree_after(earlier)
+                self.kill_tree_after("graceful_shutdown_tree", earlier)
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after(earlier);
+            let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if root_exited && !self.root_is_unpinned() {
-                    // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
+                if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {
+                    // Best-effort reap so a dead root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
                     // and a silent one here would obscure a second, independent failure mode.
@@ -463,7 +463,7 @@ impl Child {
                         );
                     }
                 }
-                return Err(sweep);
+                return Err(sweep.error);
             }
         }
         #[cfg(test)]

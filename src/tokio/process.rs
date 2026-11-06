@@ -89,7 +89,8 @@ impl Process {
     }
 
     /// Best-effort hard identity-walk sweep of the tree (all platforms; the `TreeWalk`
-    /// contract — see [`Process::kill_tree`](crate::Process::kill_tree)).
+    /// contract — see [`Process::kill_tree`](crate::Process::kill_tree), which says what a member it
+    /// leaves running is).
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.inner.kill_tree()
     }

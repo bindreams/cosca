@@ -847,10 +847,19 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
     crate::log_capture::install();
-    let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
+    let failed = || {
+        Some(Err(crate::containment::dispatch::Unsettled {
+            first: Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR)),
+            others: Vec::new(),
+        }))
+    };
     for (name, tree, reported) in [
         ("cosca-report-failed", failed(), true),
-        ("cosca-report-worked", Some(Ok(())), false),
+        (
+            "cosca-report-worked",
+            Some(Ok(crate::containment::dispatch::SettleOutcome::Killed)),
+            false,
+        ),
         ("cosca-report-not-tried", None, false),
     ] {
         let mark = crate::log_capture::mark();
@@ -1195,7 +1204,7 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 /// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
 /// group number may name another group by now, and the error says the tree kill was skipped.
 ///
-/// Mutant: `finish_elevated` runs `hard_kill_marking` before it learns the root was reaped.
+/// Mutant: `finish_elevated` runs `hard_kill` before it learns the root was reaped.
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
@@ -1231,6 +1240,39 @@ fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
     // SAFETY: `pid` is this test's own zombie child.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
     assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+}
+
+/// Both `finish_elevated`s ask the one predicate whether a tree kill is left to try: none was made,
+/// the tree was killed, or it cannot be vouched for, and there is not; a kill that left members, or
+/// was skipped and killed nothing, and there is.
+///
+/// Mutants: an unvouched tree is retried; a skipped kill counts as settled.
+#[cfg(unix)]
+#[skuld::test]
+fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the_tree() {
+    use crate::containment::dispatch::{SettleOutcome, Unsettled, UnvouchedKind};
+    let unsettled = || Unsettled {
+        first: Error::Containment {
+            detail: "refused".into(),
+        },
+        others: Vec::new(),
+    };
+    let table = [
+        ("none made", None, false),
+        ("killed", Some(Ok(SettleOutcome::Killed)), false),
+        (
+            "unvouched",
+            Some(Ok(SettleOutcome::Unvouched {
+                kind: UnvouchedKind::RootSeenRunning,
+            })),
+            false,
+        ),
+        ("skipped", Some(Ok(SettleOutcome::Skipped)), true),
+        ("left members", Some(Err(unsettled())), true),
+    ];
+    for (label, tree, want) in table {
+        assert_eq!(super::tree_needs_another_kill(&tree), want, "{label}");
+    }
 }
 
 /// The `detail` of the error `finish_elevated` returns for `child` after a failed password write.

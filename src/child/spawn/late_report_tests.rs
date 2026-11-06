@@ -14,6 +14,7 @@ use super::identity_macos_tests::{
     std_blocker_with_unique, sync_blocker,
 };
 use super::unique_report;
+use super::{LateTree, Reach};
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::os_process::child::PeekOutcome;
@@ -515,24 +516,75 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
     );
 }
 
-/// A walk that left a member it could not kill is not a complete kill, though it returns `Ok`: the
-/// warn says so, even when a later walk is complete.
+/// A walk that left a member it could not kill is an error naming it: the warn says so, even when a
+/// later walk is complete.
 ///
-/// Mutant: the sweep reads only the walk's `Ok`, not whether it was complete.
+/// Mutant: a later walk's `Ok` overwrites the error of the first.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
-    let (pid, fate, _, mark) = late_tree_walk(crate::containment::treewalk::fault::force_incomplete_once);
+    let (pid, fate, _, mark) = late_tree_walk(|| {
+        crate::containment::treewalk::fault::force_incomplete_once(
+            crate::containment::treewalk::fault::LeftBehind::Descendant,
+        );
+    });
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
         pid,
         mark,
-        &[
-            SAID_REAPED,
-            "its tree may not be fully killed",
-            "a member could not be killed",
-        ],
+        &[SAID_REAPED, "its tree may not be fully killed", "was not killed"],
         &[],
     );
+}
+
+/// A walk that left only the root is settled by the root's kill, which follows it: the warn says
+/// nothing of the tree.
+///
+/// Mutant: the walk's result is judged before the root's kill.
+#[skuld::test]
+fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() {
+    let (pid, fate, _, mark) = late_tree_walk(|| {
+        crate::containment::treewalk::fault::force_incomplete_once(
+            crate::containment::treewalk::fault::LeftBehind::Root,
+        );
+    });
+    assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
+    assert_one_warn(
+        pid,
+        mark,
+        &[SAID_REAPED],
+        &["tree was not", "fully killed", "was not killed"],
+    );
+}
+
+/// A walk that left only the root is settled by the root's kill only when that kill ended the root.
+/// A root whose kill was refused or could not be verified is still running, so the note names it.
+///
+/// Mutant: `failure_note` treats the root as ended whatever its kill did.
+#[skuld::test]
+fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
+    use crate::containment::dispatch::Unkilled;
+    let root_left = || LateTree {
+        reach: Reach::None,
+        pid: 4242,
+        unique: 1,
+        id: None,
+        sweeps: vec![Err(Unkilled {
+            members: Vec::new(),
+            root: Some(crate::error::Error::MemberNotKilled {
+                pid: 4242,
+                source: Box::new(crate::error::Error::Containment {
+                    detail: "refused".into(),
+                }),
+                note: None,
+            }),
+            resolved: Vec::new(),
+        })],
+        notes: Vec::new(),
+    };
+
+    assert_eq!(root_left().failure_note(true), None, "the root's kill ended it");
+    let named = root_left().failure_note(false).expect("the root is still running");
+    assert!(named.contains("pid 4242 was not killed"), "{named}");
 }
 
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with

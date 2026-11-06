@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
-    assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, group_blocker, orphan,
-    session_tree, walked_blocker, warns_since, Untrusted, BOTH,
+    assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused,
+    group_blocker, orphan, session_tree, walked_blocker, warns_since, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::os_process::child::{Foreign, PeekOutcome};
@@ -226,9 +226,10 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         });
         let _fake = state.script(&mut child);
 
-        child
+        let err = child
             .graceful_shutdown_tree(Duration::ZERO)
-            .expect("the tree is swept and the root reaped");
+            .expect_err("the sweep reached the holders only, and skipped the rest of the tree");
+        assert_holders_only(&err, "graceful_shutdown_tree", state);
 
         drop(hook);
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
