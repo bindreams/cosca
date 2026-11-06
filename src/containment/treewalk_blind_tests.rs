@@ -126,25 +126,23 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
 }
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own. Mutant: "walk without an anchor". A stale identity cannot be opened, so only the
-/// identity-level walks run.
+/// its own, and are never signalled. `terminate` is `Ok`; `hard_kill` killed nothing, and is
+/// `Unassessable`. Mutants: "walk without an anchor"; "a kill that found no root is `Ok`". A stale
+/// identity cannot be opened, so only the identity-level walks run.
 #[skuld::test]
-fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
-    type IdWalk = fn(ProcessId) -> Result<(), Error>;
-    let walks: [(&str, IdWalk); 2] = [
-        ("hard_kill", |id| {
-            super::hard_kill(&crate::identity::HostKernel, id)
-                .into_result()
-                .map_err(crate::containment::dispatch::Unkilled::into_error)
-        }),
-        ("terminate", |id| super::terminate(&crate::identity::HostKernel, id)),
-    ];
+fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unassessable() {
     let me = ProcessId::current();
     let stale = me.with_other_value();
-    for (name, walk) in walks {
-        let (child, _) = live_member();
-        let result = walk(stale);
-        assert!(result.is_ok(), "{name}: {result:?}");
-        release(child);
-    }
+
+    let (child, _) = live_member();
+    let result = super::hard_kill(&crate::identity::HostKernel, stale)
+        .into_result()
+        .map_err(crate::containment::dispatch::Unkilled::into_error);
+    assert_unassessable_naming(result, "no walk ran");
+    release(child);
+
+    let (child, _) = live_member();
+    let result = super::terminate(&crate::identity::HostKernel, stale);
+    assert!(result.is_ok(), "terminate: {result:?}");
+    release(child);
 }
