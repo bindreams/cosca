@@ -1679,6 +1679,7 @@ impl Child {
                 }
             }
         }
+        signals.name_refused_kill(self.id, &os);
         let signalled = Signalled {
             os,
             signals,
@@ -2007,6 +2008,11 @@ struct DropSignals {
     tree: Option<TreeKillOutcome>,
     /// What the root kill could not do.
     left: Vec<String>,
+    /// The root kill was refused and the child was not shown reaped: [`name_refused_kill`] words it
+    /// once the drop knows what became of tokio's `Child`.
+    ///
+    /// [`name_refused_kill`]: DropSignals::name_refused_kill
+    refused_kill: bool,
     /// What the armed drop waits for once it has signalled.
     #[cfg(unix)]
     settle: Settle,
@@ -2038,7 +2044,33 @@ impl DropSignals {
             forgot: None,
             tree: None,
             left: Vec::new(),
+            refused_kill: false,
         }
+    }
+
+    /// Words a refused root kill from what the drop did with tokio's `Child`, so it is called once
+    /// the forget is over. Forgotten and not shown gone: nothing reaps the child. Forgotten as
+    /// reaped elsewhere: it is gone. Released to tokio (never forgotten): tokio's orphan queue reaps
+    /// it once it exits.
+    fn name_refused_kill(&mut self, id: ProcessId, os: &OsResources) {
+        use crate::child::owned::teardown::LEAVING_RUNNING;
+        if !self.refused_kill {
+            return;
+        }
+        #[cfg(unix)]
+        let tail = match os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(id))) {
+            Some(crate::error::ChildFate::Gone) => "; it is already gone",
+            Some(_) => LEAVING_RUNNING,
+            None => "; leaving it running",
+        };
+        #[cfg(not(unix))]
+        let tail = {
+            _ = (os, id);
+            LEAVING_RUNNING
+        };
+        let pid = id.pid();
+        self.left
+            .push(format!("async child {pid} could not be terminated on drop{tail}"));
     }
 }
 
@@ -2054,6 +2086,7 @@ fn signal_on_drop(
     use crate::error::ChildFate;
     #[allow(unused_mut, reason = "only the Unix signals collect anything")]
     let mut signals = DropSignals::new(ChildFate::Unknown);
+    #[cfg(unix)]
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
@@ -2209,20 +2242,9 @@ fn signal_on_drop(
             return signals;
         }
         let looked = proc.try_wait();
-        if !matches!(looked, Ok(Some(_))) {
-            // A running child is still held by tokio's `Child`, which the release drops
-            // (`ProcSource::release`): its orphan queue reaps it once it exits. A look that failed
-            // is a root not shown to be ours: the drop forgets tokio's `Child` next (`forget_for`),
-            // and nothing reaps it.
-            let left = if looked.is_ok() {
-                "; leaving it running"
-            } else {
-                crate::child::owned::teardown::LEAVING_RUNNING
-            };
-            signals
-                .left
-                .push(format!("async child {pid} could not be terminated on drop{left}"));
-        }
+        // Worded by the drop (`DropSignals::name_refused_kill`), once the forget of tokio's `Child`
+        // that may follow is over.
+        signals.refused_kill = !matches!(looked, Ok(Some(_)));
         signals.fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id));
         return signals;
     }

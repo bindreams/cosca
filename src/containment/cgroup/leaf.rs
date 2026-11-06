@@ -1170,6 +1170,9 @@ impl CgroupLeaf {
     /// Kills through the leaf if the child entered it: `None` if there was none to make, else what
     /// the one write answered. It is made before anything looks at the child, so a look that asks
     /// whether the kill landed ([`Subtree`]) reads its answer, and the removal does not kill again.
+    /// After a failed write the removal neither waits for the drain nor sweeps child cgroups: the
+    /// leaf is left behind and reported as "cgroup.kill failed" (see
+    /// [`drain_and_remove`](Self::drain_and_remove)).
     fn kill_entered(&self) -> Option<Result<(), crate::error::Error>> {
         self.entered.then(|| self.hard_kill())
     }
@@ -1203,8 +1206,10 @@ impl CgroupLeaf {
     /// [`remove_killing_through`](Self::remove_killing_through) after an `rmdir` that failed.
     ///
     /// Kills through the leaf, in one write, unless `killed` holds the answer of the write the
-    /// caller made; a failed write is final and reported. Waits however long the drain takes, with
-    /// `warn` ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the leaf's child
+    /// caller made; a failed write is final and reported: the removal then neither waits for the
+    /// drain nor sweeps child cgroups, and the leaf is left behind, reported as "cgroup.kill
+    /// failed". After a landed write it waits however long the drain takes, with `warn`
+    /// ([`wait_drained_then_warn`](Self::wait_drained_then_warn)), removes the leaf's child
     /// cgroups, and makes one more `rmdir`. Any failure of that `rmdir` is final and reported:
     /// after the drain and the sweep, an `EBUSY` means something another party did since
     /// ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never impossible.
