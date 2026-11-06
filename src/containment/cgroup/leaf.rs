@@ -1079,9 +1079,10 @@ impl CgroupLeaf {
     ///
     /// A child that exec'd outside the leaf is killed as the process group it leads first
     /// ([`kill_group_outside_leaf`]). Then, whatever the child, the leaf is killed through if the
-    /// child entered it and removed; only then is the child torn down: a kill its pidfd refuses is
-    /// reaped if the leaf's kill reached it. The leaf's subtree is read before the removal, which
-    /// it outlives; one that cannot be read leaves open whether the leaf's kill reached the child.
+    /// child entered it, the child is torn down (a kill its pidfd refuses is reaped if the leaf's
+    /// kill reached it), and only then is the leaf removed: a child that entered but whose report
+    /// the shut beat is still in the leaf until it is gone. A leaf whose id cannot be read places
+    /// the child through `/proc`.
     ///
     /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
     /// its own, which would orphan its elevated program: it is looked at instead, and waited for
@@ -1112,27 +1113,31 @@ impl CgroupLeaf {
                 why.add(refused);
             }
         }
-        let subtree = self.subtree();
-        if let Err(e) = &subtree {
-            log::debug!("cgroup v2: an abandoned spawn's leaf subtree cannot be read ({e})");
-        }
+        // A kill through the leaf can reach something only if the child entered it. An id that
+        // cannot be read leaves the subtree to place a task through `/proc`.
+        let subtree = self.entered.then(|| {
+            self.subtree().unwrap_or_else(|e| {
+                log::debug!("cgroup v2: an abandoned spawn's leaf subtree cannot be read ({e}); placing by /proc");
+                self.subtree_with(None)
+            })
+        });
         let killed = self.kill_entered();
-        self.remove_abandoned(killed, warn);
-        if front_pid.is_some() {
-            // Any kill through the leaf, this one or the removal's own, ends what it held.
-            let reach = match &subtree {
-                Ok(subtree) => Ok(Some(subtree as &dyn Reach)),
-                Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
-            };
-            let (fate, torn) = look_at_failed_spawn_front(&owned, None, reach, Disposition::Leave, warn.due());
+        let tree = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
+        // The leaf stays until the child is gone: a child that entered it but whose report the shut
+        // beat is not counted entered, and its leaf cannot be removed while it runs.
+        let abandoned = if front_pid.is_some() {
+            let (fate, torn) = look_at_failed_spawn_front(&owned, None, Ok(tree), Disposition::Leave, warn.due());
             HandleTeardown::new(torn, Expect::of(&owned, past)).say_as_failed_spawn(&mut why);
-            return Abandoned::Front(fate);
-        }
-        let kill = Kill {
-            disposition: Disposition::Leave,
-            tree: subtree.as_ref().ok().map(|subtree| subtree as &dyn Reach),
+            Abandoned::Front(fate)
+        } else {
+            let kill = Kill {
+                disposition: Disposition::Leave,
+                tree,
+            };
+            Abandoned::of_teardown(tear_down_expecting(&owned, None, kill, past, warn.due()), &mut why)
         };
-        Abandoned::of_teardown(tear_down_expecting(&owned, None, kill, past, warn.due()), &mut why)
+        self.remove_abandoned(killed, warn);
+        abandoned
     }
 
     /// End the exchange of a spawn that has no child to give the leaf (see

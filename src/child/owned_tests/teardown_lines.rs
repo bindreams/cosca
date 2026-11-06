@@ -13,6 +13,7 @@
 use std::io;
 
 use super::teardown::{child_with_an_unreadable_exit, exit, fake, id};
+pub(crate) use crate::child::owned::teardown::LEAVING_RUNNING;
 use crate::child::owned::teardown::{Disposition, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::Error;
@@ -29,14 +30,6 @@ pub(crate) const LEFT: &str = if cfg!(unix) {
     "; left unreaped"
 } else {
     "; nothing waits for it"
-};
-
-/// What a caller that leaves a child still running after its refused kill says of it: no one
-/// reaps it afterwards, where a zombie exists to be left.
-pub(crate) const LEAVING_RUNNING: &str = if cfg!(unix) {
-    "; leaving it running and unreaped"
-} else {
-    "; leaving it running"
 };
 
 /// Where a child goes that a caller hands back.

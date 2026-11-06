@@ -78,7 +78,7 @@ const LEFT: &str = if cfg!(unix) {
 
 /// What a caller that leaves a child running after its kill was refused says of it. Nothing reaps it
 /// afterwards, so on Unix it is a zombie once it exits; Windows has none.
-const LEAVING_RUNNING: &str = if cfg!(unix) {
+pub(crate) const LEAVING_RUNNING: &str = if cfg!(unix) {
     "; leaving it running and unreaped"
 } else {
     "; leaving it running"

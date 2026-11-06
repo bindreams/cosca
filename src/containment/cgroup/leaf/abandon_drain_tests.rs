@@ -91,7 +91,7 @@ fn an_abandoned_childs_leaf_drained_slowly_warns_once() {
 /// An elevation front that entered its leaf: the leaf is killed through and drained before the
 /// front is waited for.
 ///
-/// Mutant: `abandon_front` hands `remove_killing_through` a `NoWarn`.
+/// Mutant: `abandon_before_verdict` hands `remove_killing_through` a `NoWarn`.
 #[skuld::test]
 fn an_abandoned_fronts_leaf_drained_slowly_warns_once() {
     let (at_release, levels) = drain_warns_at_release("cosca-abandoned-front-slow-drain", &["true"], true);

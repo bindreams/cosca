@@ -2597,6 +2597,69 @@ fn a_pidless_intent_with_a_pidfd_is_killed_and_reaped_through_it() {
     assert!(reaped(&pidfd), "the child must be reaped through the handshake's pidfd");
 }
 
+/// A child that wrote `cgroup.procs` but whose report the abandonment's read beat (so the leaf
+/// does not count it entered) is still in the leaf, and a running member blocks the leaf's `rmdir`
+/// as cgroupfs does. The leaf is removed only once the child is torn down, with no warn that it
+/// was left behind. Runs on a plain directory whose `rmdir` hook answers as cgroupfs does.
+///
+/// Mutant: the leaf is removed before the child is torn down.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_abandoned_child_that_entered_unreported_is_gone_before_its_leaf_is_removed() {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-unreported");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut child =
+        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
+            .expect("spawn a blocker");
+    let _stdin = child.stdin.take().expect("piped stdin");
+    let pid = child.id();
+    let pidfd = pidfd_of(pid);
+    // The intent arrived; the report did not.
+    // SAFETY: the leaf's channel is open.
+    unsafe {
+        leaf.placement_slot()
+            .send(crate::containment::cgroup::TAG_INTENT, pid as i32)
+            .expect("send the intent");
+    }
+    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
+    drop(child);
+    let member = pidfd.try_clone().expect("duplicate the pidfd");
+    crate::containment::cgroup::fault::set_rmdir_hook(move |path| {
+        let running = matches!(
+            waitid(
+                WaitId::PidFd(member.as_fd()),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ),
+            Ok(None)
+        );
+        if running {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        std::fs::remove_dir(path)
+    });
+
+    let mark = crate::log_capture::mark();
+    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
+    crate::containment::cgroup::fault::take_rmdir_hook();
+
+    assert_eq!(
+        abandoned,
+        crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)
+    );
+    let left = leaf_path.exists();
+    if left {
+        std::fs::remove_dir(&leaf_path).expect("remove the leaf the abandonment left");
+    }
+    assert!(!left, "the leaf must be removed");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "was not removed");
+    assert!(warns.is_empty(), "no leaf is left behind: {warns:?}");
+}
+
 /// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,
 /// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
 /// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.
