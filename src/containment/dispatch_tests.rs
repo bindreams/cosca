@@ -581,6 +581,85 @@ fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
     }
 }
 
+/// A tree this handle already killed does not excuse a gone root from answering the member a later
+/// kill left: the mark shortcut applies only when nothing is held. Mutant: `NoRoot` with the mark set
+/// returns `Killed` before the held members are read.
+#[skuld::test]
+fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
+    use super::{Attached, SettleOutcome, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    attached
+        .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a complete kill");
+    assert!(killed.is_set());
+    attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(7)],
+                root: None,
+                resolved: Vec::new(),
+            })),
+            true,
+        )
+        .expect_err("a later kill left a member");
+
+    let again = attached
+        .settle(&killed, TreeKillOutcome::NoRoot, true)
+        .expect_err("the member is not shown killed");
+    assert_eq!(pid_left(&again.first), 7, "{again}");
+
+    let nothing_held = TreeKilled::default();
+    attached
+        .settle(&nothing_held, TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a complete kill");
+    assert!(matches!(
+        attached.settle(&nothing_held, TreeKillOutcome::NoRoot, true),
+        Ok(SettleOutcome::Killed)
+    ));
+}
+
+/// The early return of both `kill_tree`s: a walk not made is answered here, over a held member, with
+/// the tree unmarked; every other walk is handed back untouched for the backstop.
+#[skuld::test]
+fn only_a_walk_not_made_is_answered_before_the_backstop() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let killed = TreeKilled::default();
+    attached
+        .settle(
+            &killed,
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(7)],
+                root: None,
+                resolved: Vec::new(),
+            })),
+            true,
+        )
+        .expect_err("a member was left");
+
+    let handed_back = attached.unless_unwalked("kill_tree", &killed, TreeKillOutcome::Ran(Ok(())));
+    assert!(
+        matches!(handed_back, Ok(TreeKillOutcome::Ran(Ok(())))),
+        "a walk made is the backstop's to settle"
+    );
+
+    let Err(failure) = attached.unless_unwalked(
+        "kill_tree",
+        &killed,
+        TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
+            detail: "the snapshot failed".into(),
+            source: None,
+        }),
+    ) else {
+        panic!("a walk not made is an error");
+    };
+    assert_eq!(pid_left(&failure.error), 7, "{:?}", failure.error);
+    assert!(!failure.root_ended);
+    assert!(!killed.is_set());
+}
+
 /// A member whose identity was read and whose kill was refused is killed by identity again by the
 /// next kill that runs, and the tree is then settled and marked. Mutants: the retry does not kill it;
 /// it kills it and still answers with the earlier error.

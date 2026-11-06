@@ -7,7 +7,7 @@ use crate::child::owned::teardown::{Disposition, Kill, Remains};
 #[cfg(unix)]
 use crate::child::owned::teardown::{FrontLook, TeardownOutcome};
 use crate::command::Command;
-use crate::containment::dispatch::{SweepFailure, TeardownCaller, TreeKillOutcome};
+use crate::containment::dispatch::{SweepFailure, TeardownCaller};
 use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -651,15 +651,7 @@ impl Child {
         let group_result = self.attached.hard_kill(&group);
         #[cfg(unix)]
         drop(held);
-        // A TreeWalk that could not walk killed nothing, and the root's death would strand the
-        // descendants beyond a retry: return the error with the tree intact. The members an earlier
-        // kill left are still killed again, which settles that answer.
-        if matches!(group_result, TreeKillOutcome::Unwalked(_)) {
-            return self
-                .attached
-                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
-                .map_err(SweepFailure::from);
-        }
+        let group_result = self.attached.unless_unwalked(op, &self.tree_killed, group_result)?;
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.

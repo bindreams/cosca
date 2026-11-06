@@ -463,6 +463,15 @@ impl TreeKilled {
         self.marked.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether an earlier kill left a member that a later kill must still answer.
+    fn holds_members(&self) -> bool {
+        !self
+            .left
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// `walked`, the answer of a `TreeWalk` kill that ran, with the members earlier kills left
     /// ([`treewalk::with_earlier`](crate::containment::treewalk::with_earlier)); what it leaves is
     /// held for the next kill.
@@ -924,8 +933,9 @@ impl Attached {
         root_ended: bool,
     ) -> Result<SettleOutcome, Unsettled> {
         let outcome = outcome.into();
-        if matches!(outcome, TreeKillOutcome::NoRoot) && killed.is_set() {
-            // This handle already killed the tree: the root's end leaves nothing for a walk to reach.
+        if matches!(outcome, TreeKillOutcome::NoRoot) && killed.is_set() && !killed.holds_members() {
+            // This handle already killed the tree and no kill since left a member: the root's end
+            // leaves nothing for a walk to reach.
             return Ok(SettleOutcome::Killed);
         }
         let ran = matches!(outcome, TreeKillOutcome::Ran(_));
@@ -959,6 +969,26 @@ impl Attached {
         self.settle(killed, walk, root_ended)
             .map(drop)
             .map_err(|left| left.report(caller))
+    }
+
+    /// `walk` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not walk
+    /// killed nothing, and the root's death would strand the descendants beyond a retry, so it is
+    /// settled here and returned as the error with the tree intact. The members an earlier kill left
+    /// are still killed again, which settles that answer. Any other `walk` is handed back.
+    pub(crate) fn unless_unwalked(
+        &self,
+        caller: &str,
+        killed: &TreeKilled,
+        walk: TreeKillOutcome,
+    ) -> Result<TreeKillOutcome, SweepFailure> {
+        if !matches!(walk, TreeKillOutcome::Unwalked(_)) {
+            return Ok(walk);
+        }
+        match self.settle_for_kill_tree(caller, killed, walk, false) {
+            Err(error) => Err(SweepFailure::from(error)),
+            // The walk's error is a member left, and the root is not ended.
+            Ok(()) => unreachable!("a walk not made leaves its error"),
+        }
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded

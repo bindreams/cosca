@@ -613,13 +613,23 @@ pub(crate) enum Left {
 }
 
 impl Left {
-    /// Every member `left` names, in order. A walk that was not made, or found no root, leaves its
-    /// error as the only member; that names no process, so none is held.
+    /// Every member `left` names, in order. A walk that was not made, or found no root, adds its
+    /// error as the last member, an [`Error::Unassessable`] or [`Error::Unsupported`] with no root
+    /// beside it; that names no process, so none is held. Every other member is a
+    /// [`Error::MemberNotKilled`].
     pub(crate) fn of(left: &Unkilled) -> Vec<Left> {
+        let last = left.members.len().saturating_sub(1);
         left.members
             .iter()
-            .filter_map(|member| {
+            .enumerate()
+            .filter_map(|(at, member)| {
                 let Error::MemberNotKilled { pid, source, .. } = member else {
+                    debug_assert!(
+                        at == last
+                            && left.root.is_none()
+                            && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
+                        "only the error of a walk not made is not a `MemberNotKilled`, and it is last: {left:?}"
+                    );
                     return None;
                 };
                 Some(match left.resolved.iter().find(|id| id.pid() == *pid) {
