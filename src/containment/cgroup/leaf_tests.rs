@@ -2736,7 +2736,7 @@ fn a_gone_leafs_kill_is_the_teardowns_one_write() {
     let _next_write_fails = fault::fail_next_kill_write();
 
     let mark = crate::log_capture::mark();
-    leaf.drain_and_remove("in a test", &mut crate::containment::cgroup::NoWarn);
+    leaf.drain_and_remove("in a test", &mut crate::containment::cgroup::NoWarn, false);
 
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
     assert!(warns.is_empty(), "the removal wrote again: {warns:?}");
@@ -2774,6 +2774,59 @@ fn an_abandoned_spawns_failed_leaf_kill_is_warned_when_the_removal_succeeds() {
     assert!(!leaf_path.exists(), "the leaf is removed");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
+}
+
+/// The warns on the calling thread since `mark`.
+#[cfg(target_os = "linux")]
+fn warns_since(mark: usize) -> Vec<String> {
+    crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .map(|(_, text)| text)
+        .collect()
+}
+
+/// An abandoned elevation front's teardown warns (the leaf's failed kill did not reach it), and
+/// that one warn carries the failed kill, which is known when the kill is made. The `rmdir`
+/// succeeds.
+///
+/// Mutant: the failed kill is added after the teardown has warned, and is warned a second time.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_abandoned_fronts_failed_leaf_kill_is_in_the_warn_of_its_teardown() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-abandoned-front-kill-failed-removed");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
+    let mut child = spawn_placing(
+        &leaf,
+        &["/bin/cat"],
+        false,
+        std::process::Stdio::piped(),
+        std::process::Stdio::null(),
+    );
+    let _stdin = child.stdin.take().expect("piped stdin");
+    let pidfd = pidfd_of(child.id());
+    let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+
+    let mark = crate::log_capture::mark();
+    let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
+
+    // The leaf's kill reached nothing, so the front still runs.
+    child.kill().expect("kill the front");
+    child.wait().expect("reap the front");
+    assert_eq!(
+        abandoned,
+        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
+    );
+    assert!(!leaf_path.exists(), "the leaf is removed");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "one warn: {warns:?}");
+    assert!(
+        warns[0].contains("cgroup.kill failed"),
+        "it carries the failed kill: {warns:?}"
+    );
 }
 
 /// As above, on a real leaf: an abandoned elevation front whose `cgroup.kill` write fails is not

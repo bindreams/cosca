@@ -4,7 +4,7 @@ use std::io;
 use std::sync::Mutex;
 
 /// What one `cgroup.kill` write answered, for a removal that is told it and writes no more: `Ok`
-/// landed, `Err` carries why it failed.
+/// landed or found the leaf gone, `Err` carries why it failed.
 pub(crate) type KillAnswer = Result<(), String>;
 
 #[derive(Debug, Default)]
@@ -30,7 +30,7 @@ impl KillRecord {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records the answer of a write.
+    /// Records the answer of a write: `Ok` if it landed or found the leaf gone.
     pub(crate) fn record(&self, written: Result<(), &io::Error>) {
         let mut record = self.written();
         match (written, &*record) {
@@ -40,7 +40,7 @@ impl KillRecord {
         }
     }
 
-    /// Whether a write landed.
+    /// Whether a write landed or found the leaf gone.
     pub(crate) fn landed(&self) -> bool {
         matches!(*self.written(), Written::Landed)
     }

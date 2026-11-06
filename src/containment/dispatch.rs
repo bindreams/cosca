@@ -1004,7 +1004,8 @@ impl Attached {
         Ok(false)
     }
 
-    /// Whether this is a cgroup leaf with a landed `cgroup.kill` write, which bounds its drain.
+    /// Whether this is a cgroup leaf with a `cgroup.kill` write that landed or found the leaf gone,
+    /// which bounds its drain.
     /// `false` for every other mechanism.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) fn cgroup_kill_landed(&self) -> bool {

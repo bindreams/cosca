@@ -487,11 +487,11 @@ impl CgroupLeaf {
         };
         #[cfg(not(test))]
         let written = self.dir.write("cgroup.kill", KILL_PAYLOAD);
+        let gone = written.as_ref().err().is_some_and(removed_after_drain);
         // Every answer is recorded here, a gone leaf's included: it is the teardown's one write.
         self.kill.record(match &written {
-            Ok(()) => Ok(()),
-            Err(e) if removed_after_drain(e) => Ok(()),
-            Err(e) => Err(e),
+            Err(e) if !gone => Err(e),
+            _ => Ok(()),
         });
         match written {
             Ok(()) => {
@@ -501,7 +501,7 @@ impl CgroupLeaf {
                 fault::run_after_kill_write();
                 Ok(())
             }
-            Err(e) if removed_after_drain(&e) => {
+            Err(_) if gone => {
                 log::debug!("cgroup.kill: leaf {} is already gone", path.display());
                 Ok(())
             }
@@ -509,9 +509,9 @@ impl CgroupLeaf {
         }
     }
 
-    /// Whether a `cgroup.kill` write on this leaf landed, by any handle's teardown. A failed write
-    /// after it does not undo it: the landed kill still bounds the leaf's drain. Every reader that
-    /// asks whether a kill landed asks here.
+    /// Whether a `cgroup.kill` write on this leaf landed, or found the leaf gone, by any handle's
+    /// teardown. A failed write after it does not undo it: the landed kill still bounds the leaf's
+    /// drain. Every reader that asks whether a kill landed asks here.
     pub(crate) fn kill_landed(&self) -> bool {
         self.kill.landed()
     }
@@ -1002,6 +1002,7 @@ impl CgroupLeaf {
                 self.drain_and_remove(
                     "after an explicit kill through a handle that opted out of Drop's own teardown",
                     warn,
+                    false,
                 );
                 return;
             }
@@ -1025,7 +1026,7 @@ impl CgroupLeaf {
         // Armed: kill through the leaf, wait for it to drain, and only then remove it. A leaf
         // that is already gone left nothing behind.
         if !removed_after_drain(&first) {
-            self.drain_and_remove("after its handle's teardown", warn);
+            self.drain_and_remove("after its handle's teardown", warn, false);
         }
     }
 }
@@ -1145,7 +1146,7 @@ impl CgroupLeaf {
                 self.subtree_with(None)
             })
         });
-        self.kill_entered();
+        self.kill_entered(&mut why);
         let tree = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
         // The leaf stays until the child is gone: a child that entered it but whose report the shut
         // beat is not counted entered, and its leaf cannot be removed while it runs.
@@ -1160,7 +1161,7 @@ impl CgroupLeaf {
             };
             Abandoned::of_teardown(tear_down_expecting(&owned, None, kill, past, warn.due()), &mut why)
         };
-        self.remove_abandoned(warn, &mut why);
+        self.remove_abandoned(warn);
         abandoned
     }
 
@@ -1180,8 +1181,8 @@ impl CgroupLeaf {
         };
         // What the abandonment finds wrong on the way, warned once when it ends.
         let mut why = crate::child::spawn::Diagnosis::default();
-        self.kill_entered();
-        self.remove_abandoned(warn, &mut why);
+        self.kill_entered(&mut why);
+        self.remove_abandoned(warn);
         if received.pid.is_some() {
             WithoutChild::Named
         } else {
@@ -1202,26 +1203,16 @@ impl CgroupLeaf {
 
     /// Kills through the leaf if the child entered it ([`kill_unless_written`](Self::kill_unless_written)).
     /// It is made before anything looks at the child, so a look that asks whether the kill landed
-    /// ([`Subtree`]) reads its answer, and the removal does not kill again. The answer is in the
-    /// leaf's record, which [`remove_abandoned`](Self::remove_abandoned) reports. After a failed
-    /// write the removal neither waits for the drain nor sweeps child cgroups: the leaf is left
-    /// behind and reported as "cgroup.kill failed" (see [`drain_and_remove`](Self::drain_and_remove)).
-    fn kill_entered(&self) {
-        if self.entered {
-            self.kill_unless_written().unwrap_or_default();
-        }
-    }
-
-    /// Removes the abandoned leaf: killed through if its child entered it ([`kill_entered`](Self::kill_entered)
-    /// did so), and otherwise holding nothing of the child's. A failed leaf kill is warned once: by
-    /// the removal's report if the removal reports it, else by `why`, the abandonment's one warn.
-    fn remove_abandoned(&mut self, warn: &mut dyn TeardownWarn, why: &mut crate::child::spawn::Diagnosis) {
+    /// ([`Subtree`]) reads its answer, and the removal does not kill again. A failed write is owed
+    /// to `why` here, where it is known, so whichever warn of the abandonment folds `why` carries
+    /// it, and the removal does not report it ([`remove_abandoned`](Self::remove_abandoned)). After
+    /// a failed write the removal neither waits for the drain nor sweeps child cgroups: the leaf is
+    /// left behind (see [`drain_and_remove`](Self::drain_and_remove)).
+    fn kill_entered(&self, why: &mut crate::child::spawn::Diagnosis) {
         if !self.entered {
-            self.remove_holding_nothing();
             return;
         }
-        let reported = self.remove_killing_through("after its spawn was abandoned", warn);
-        if let (false, Some(e)) = (reported, self.kill.failure()) {
+        if let Err(e) = self.kill_unless_written() {
             why.add(format_args!(
                 "cgroup leaf {}: cgroup.kill failed ({e})",
                 self.leaf_path.display()
@@ -1229,15 +1220,26 @@ impl CgroupLeaf {
         }
     }
 
+    /// Removes the abandoned leaf: killed through if its child entered it ([`kill_entered`](Self::kill_entered)
+    /// did so, and owes its failure to the abandonment's one warn), and otherwise holding nothing
+    /// of the child's.
+    fn remove_abandoned(&mut self, warn: &mut dyn TeardownWarn) {
+        if self.entered {
+            self.remove_killing_through("after its spawn was abandoned", warn, true);
+        } else {
+            self.remove_holding_nothing();
+        }
+    }
+
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
     /// then removed once, a failure reported (see [`drain_and_remove`](Self::drain_and_remove)).
     /// `context` says what removal this is, for the report of a leaf left behind; `warn`, for the
-    /// wait for the drain. Whether the removal reported a failed `cgroup.kill`.
-    fn remove_killing_through(&mut self, context: &str, warn: &mut dyn TeardownWarn) -> bool {
+    /// wait for the drain; `kill_owed`, whether a failed `cgroup.kill` is reported by the caller.
+    fn remove_killing_through(&mut self, context: &str, warn: &mut dyn TeardownWarn, kill_owed: bool) {
         match self.rmdir_leaf() {
-            Ok(()) => false,
-            Err(e) if removed_after_drain(&e) => false,
-            Err(_) => self.drain_and_remove(context, warn),
+            Ok(()) => {}
+            Err(e) if removed_after_drain(&e) => {}
+            Err(_) => self.drain_and_remove(context, warn, kill_owed),
         }
     }
 
@@ -1253,29 +1255,31 @@ impl CgroupLeaf {
     /// after the drain and the sweep, an `EBUSY` means something another party did since
     /// ([`LEFT_BEHIND_CAUSES`]), which another attempt would only make rarer, never impossible.
     ///
-    /// Answers whether it reported a failed `cgroup.kill`, which the caller then does not report
-    /// again.
-    fn drain_and_remove(&mut self, context: &str, warn: &mut dyn TeardownWarn) -> bool {
+    /// `kill_owed` says the caller reports a failed `cgroup.kill` itself (the abandonment's one
+    /// warn), so the report of the leaf left behind does not repeat why.
+    fn drain_and_remove(&mut self, context: &str, warn: &mut dyn TeardownWarn, kill_owed: bool) {
         if let Err(e) = self.kill_unless_written() {
-            warn_leaf_left_behind(
-                &self.leaf_path,
-                format_args!("rmdir failed {context}; cgroup.kill failed ({e})"),
-            );
-            return true;
+            let failed = if kill_owed {
+                "the kill through it failed, as reported with the abandonment".to_string()
+            } else {
+                format!("cgroup.kill failed ({e})")
+            };
+            warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed {context}; {failed}"));
+            return;
         }
         if let Err(e) = self.wait_drained_then_warn(warn) {
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
             );
-            return false;
+            return;
         }
         if let Err(e) = self.dir.remove_children() {
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
             );
-            return false;
+            return;
         }
         match self.rmdir_leaf() {
             Ok(()) => {}
@@ -1286,7 +1290,6 @@ impl CgroupLeaf {
             ),
             Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
         }
-        false
     }
 
     /// Remove a leaf [`drain_now`](Self::drain_now) already found at `populated 0` on its own —
