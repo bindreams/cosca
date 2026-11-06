@@ -207,6 +207,77 @@ mod linux {
         );
     }
 
+    /// A failed spawn's cleanup on a `TreeWalk` child whose walk left only the root: the cleanup's own
+    /// kill of the root ends it, but the walk saw the root running, so the tree is not vouched for. The
+    /// cleanup says so once, in the error and the warn, and disarms the handle, so its drop does not
+    /// say it again. A walk that left a descendant is a failed kill: reported, and the handle stays
+    /// armed to try again.
+    ///
+    /// Mutants: the cleanup reports the walk's error before the root's kill; the handle stays armed
+    /// over an unvouched tree (its drop warns again).
+    #[skuld::test]
+    async fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
+        use crate::containment::treewalk::fault::LeftBehind;
+        crate::log_capture::install();
+        for (left, failed) in [(LeftBehind::Root, false), (LeftBehind::Descendant, true)] {
+            let (child, _writer) = crate::test_child::held_treewalk_blocker_leaving_async(left);
+            let mark = crate::log_capture::mark();
+            let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
+
+            let failure =
+                crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+                    .expect_err("the spawn fails");
+            let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), ());
+
+            assert!(fate.not_running(), "{left:?}: {fate:?}");
+            // A failed kill leaves the handle armed to try again: the look at the tree when it drops
+            // is the armed drop's first act, whatever it then logs. An unvouched tree is not retried.
+            assert_eq!(drop_looks.seen(), failed, "{left:?}: armed only over a failed kill");
+            let cause = cause.to_string();
+            assert_eq!(
+                cause.contains("its contained tree could not be killed"),
+                failed,
+                "{left:?}: {cause}"
+            );
+            assert_eq!(cause.contains("could not be vouched for"), !failed, "{left:?}: {cause}");
+            let warns = warns_since(mark);
+            let cleanup = warns.iter().filter(|warn| warn.starts_with("finish_elevated:")).count();
+            assert_eq!(cleanup, 1, "{left:?}: {warns:?}");
+            // The cleanup's one warn, and no drop's after it.
+            let unvouched = warns
+                .iter()
+                .filter(|warn| warn.contains("could not be vouched for"))
+                .count();
+            assert_eq!(unvouched, usize::from(!failed), "{left:?}: {warns:?}");
+        }
+    }
+
+    /// A tree kill skipped because the root's state is unknown has not killed the tree: the cleanup's
+    /// settle does not mark it, so the failed spawn's handle stays armed.
+    ///
+    /// Mutant: a skipped kill marks the tree killed.
+    #[skuld::test]
+    async fn a_skipped_tree_kill_does_not_mark_the_tree_killed() {
+        use crate::containment::dispatch::{RootView, TeardownCaller};
+        crate::log_capture::install();
+        let (child, _writer) = crate::test_child::held_treewalk_blocker_async();
+        let view = crate::containment::DropView {
+            caller: TeardownCaller::FinishElevated,
+            root_pid: child.id().pid(),
+            root: RootView::Unknown(std::io::Error::other("forced")),
+            tree_killed: false,
+        };
+
+        let kill = child.kill_tree_members_unless_reaped(&view);
+
+        assert!(
+            kill.skipped().is_some(),
+            "the walk from the root's number is skipped: {kill:?}"
+        );
+        child.settle_tree(kill, true).expect("a skip leaves nothing to report");
+        assert!(!child.tree_killed(), "a skipped kill does not mark the tree killed");
+    }
+
     /// The wait's failure is named in the one warn: the cause of a foreign wait result is carried, not
     /// only logged at `debug`.
     ///

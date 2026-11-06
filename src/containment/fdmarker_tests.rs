@@ -1225,8 +1225,12 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     let skipped = |marker| {
         let kill = crate::containment::Attached::FdMarker(marker)
             .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
-        kill.result.expect("the holders-only sweep");
-        kill.skipped.expect("the reaped root's kill by its number is skipped")
+        let skipped = kill
+            .skipped()
+            .expect("the reaped root's kill by its number is skipped")
+            .to_owned();
+        kill.into_result().expect("the holders-only sweep");
+        skipped
     };
 
     let root = crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1));
@@ -1241,4 +1245,36 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
         grouped.contains("pgid 4243") && grouped.contains("root pid 4242"),
         "{grouped:?}"
     );
+}
+
+/// A sweep's kill of a member that refuses it (a setuid-root root refuses its caller's `SIGKILL`) warns
+/// of the refusal once, though the member is both found by the walk and a holder of the marker.
+///
+/// Mutants: the sweep does not warn of it; it warns once for each channel that finds the member.
+#[skuld::test]
+fn a_sweep_warns_once_of_a_member_that_refuses_the_kill(#[fixture(setuid)] _group: &crate::test_groups::Group) {
+    use std::io::Read as _;
+    crate::log_capture::install();
+    let mut cmd = crate::test_privilege::setuid_blocker_command();
+    cmd.contain();
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::null()).expect("stderr null");
+    let mut child = cmd.spawn().expect("spawn the setuid helper");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("the helper reports ready");
+    assert_eq!(ready, *b"+");
+    let mark = crate::log_capture::mark();
+
+    child.kill_tree().expect_err("the root refuses the kill");
+
+    let warned = crate::log_capture::warns_since_on_current_thread(mark, "was sent no SIGKILL");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    drop(stdin);
+    assert!(child.wait().expect("the helper exits on EOF").success());
 }
