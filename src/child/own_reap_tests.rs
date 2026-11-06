@@ -35,7 +35,7 @@ fn zombie_group_root() -> Arc<crate::Child> {
     cmd.suppress_fd_marker();
     let child = cmd.spawn().expect("spawn");
     drop(writer);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     Arc::new(child)
 }
 
@@ -73,7 +73,7 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
 /// the look, before the sends.
 fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), on_send: impl FnOnce(Box<dyn FnMut(i32)>)) {
     let child = zombie_group_root();
-    let pgid = child.id().pid() as i32;
+    let pgid = child.pid() as i32;
     // Each send to the group, and whether this thread held the handle's lock at it.
     let sends: Rc<RefCell<Vec<(i32, bool)>>> = Rc::default();
     on_send(Box::new({

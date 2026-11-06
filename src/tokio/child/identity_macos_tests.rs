@@ -249,7 +249,7 @@ async fn macos_tokio_spawn_adopts_the_live_childs_own_unique_id() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut cmd, writer) = tokio_blocker();
     let mut child = cmd.spawn().expect("spawn");
-    let UniqRead::Found(info) = uniq_info(child.id().pid(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = uniq_info(child.pid(), ReadPurpose::Kill) else {
         panic!("the live child has a unique id")
     };
     let ProcSource::Tokio { identity, .. } = child.proc_mut() else {

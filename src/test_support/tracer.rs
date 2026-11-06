@@ -459,7 +459,7 @@ impl Pending {
     }
 
     fn attach_pid(self, tracee: &crate::Child) -> TracerHelper<'_> {
-        self.attach_pid_number(tracee.id().pid())
+        self.attach_pid_number(tracee.pid())
     }
 
     fn attach_pid_number<'a>(mut self, pid: u32) -> TracerHelper<'a> {

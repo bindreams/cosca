@@ -319,7 +319,7 @@ pub async fn report_grandchild_async(report: ::tokio::net::TcpListener, root: &m
     use ::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     LAST_ASYNC_ROOT.with(|c| c.set(Some(root.id())));
-    let root_pid = root.id().pid();
+    let root_pid = root.pid();
     let std_stream = super::accept::accept_or_die_async(&report, root).await;
     drop(report);
     std_stream

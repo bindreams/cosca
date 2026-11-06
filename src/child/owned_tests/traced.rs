@@ -19,7 +19,7 @@ use crate::wait::macos::{await_reapable, Waited};
 fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let unique = match uniq_info(pid, ReadPurpose::Adopt) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the tracee's unique id: {other:?}"),
@@ -136,7 +136,7 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
 fn tracee_with_unique() -> (crate::Child, std::io::PipeWriter, u64) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let unique = match uniq_info(tracee.id().pid(), ReadPurpose::Adopt) {
+    let unique = match uniq_info(tracee.pid(), ReadPurpose::Adopt) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the tracee's unique id: {other:?}"),
     };
@@ -154,7 +154,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
     use std::rc::Rc;
 
     let (tracee, stdin, unique) = tracee_with_unique();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let (owned, mac) = super::macos::watch(pid, unique);
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
     let helper = Rc::new(RefCell::new(None));
@@ -198,7 +198,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     use std::rc::Rc;
 
     let (tracee, stdin, unique) = tracee_with_unique();
-    let pid = tracee.id().pid();
+    let pid = tracee.pid();
     let mut inner = tracer::start(Mode::Auto).attach_unheld(pid);
     assert_eq!(inner.recv(), Report::Attached);
     let mut outer = tracer::start(Mode::Auto).attach_unheld(inner.helper_pid());

@@ -46,7 +46,7 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(cosca::Process::open_pid(child.id().pid()), "process open", name);
+                    assert_refused(cosca::Process::open_pid(child.pid()), "process open", name);
                     assert_refused(cosca::Process::open(child.id()), "process open", name);
                     assert_refused(cosca::Process::current(), "process open", name);
                 })
@@ -126,9 +126,7 @@ fn a_child_shuts_down_and_kills_through_its_own_handle_under_a_refused_pidfd_ope
 fn a_held_process_needs_no_second_pidfd_open() {
     for (code, _) in REFUSALS {
         let (child, control) = common::spawn_blocker();
-        let process = cosca::Process::open_pid(child.id().pid())
-            .expect("open")
-            .expect("running");
+        let process = cosca::Process::open_pid(child.pid()).expect("open").expect("running");
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -203,7 +201,7 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(cosca::tokio::Process::open_pid(child.id().pid()), "process open", name);
+                    assert_refused(cosca::tokio::Process::open_pid(child.pid()), "process open", name);
                     assert_refused(cosca::tokio::Process::open(child.id()), "process open", name);
                     assert_refused(cosca::tokio::Process::current(), "process open", name);
                 })

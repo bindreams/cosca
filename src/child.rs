@@ -159,6 +159,11 @@ impl Child {
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
     ) -> Child {
+        debug_assert_eq!(
+            proc.pid(),
+            Some(id.pid()),
+            "a child's process and identity name one pid"
+        );
         Child {
             proc: ChildSlot::new(proc),
             id,
@@ -242,6 +247,14 @@ impl Child {
     /// This child's stable identity (see [`crate::identity::ProcessId`]).
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// The pid the child had at spawn. A number only: it does not say the process still holds it
+    /// (an identity is [`id`](Self::id)).
+    pub fn pid(&self) -> u32 {
+        self.proc
+            .pid()
+            .expect("a Child's process has the pid its spawn learned")
     }
 
     /// Whether the child is still running — re-checked via its stable identity, so a
@@ -352,7 +365,7 @@ impl Child {
     /// Whether the root is running, read without reaping it, for the elevation front's gates.
     #[cfg(unix)]
     fn root_running(&self) -> std::io::Result<bool> {
-        let peeked = self.proc.hold(self.id.pid()).peek().map_err(Error::into_io)?;
+        let peeked = self.proc.hold(self.pid()).peek().map_err(Error::into_io)?;
         Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
@@ -372,7 +385,7 @@ impl Child {
     /// `earlier` names what the same operation sent before. See [`crate::signal::refuse_unpinned`].
     #[cfg(unix)]
     pub(crate) fn refuse_unpinned(&self, op: &str, earlier: Option<&str>) -> Result<(), Error> {
-        crate::signal::refuse_unpinned(self.id.pid(), op, earlier, || self.proc.state())
+        crate::signal::refuse_unpinned(self.pid(), op, earlier, || self.proc.state())
     }
 
     /// Whether launchd holds the root's zombie now (macOS; `false` elsewhere, where the state is
@@ -395,7 +408,7 @@ impl Child {
             Gate::Exited => {
                 return match self.kill_root() {
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                        log::debug!("the kill of exited front pid {} was refused ({e})", self.pid());
                         Ok(crate::signal::Sent::Delivered)
                     }
                     other => other.map_err(Error::Io),
@@ -407,7 +420,7 @@ impl Child {
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
                     .hard_kill_settled("kill", &self.tree_killed, &crate::containment::GroupRoot::none())
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
             }
@@ -453,13 +466,13 @@ impl Child {
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
         let look = self.proc.look_at_front(Some(self.id), reach, None);
-        word_front(self.id.pid(), why, disposition, look)
+        word_front(self.pid(), why, disposition, look)
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn kill_gate(&self) -> crate::elevation::front::Gate {
-        let pid = self.id.pid();
+        let pid = self.pid();
         crate::elevation::front::kill_gate(
             self.front,
             pid,
@@ -472,7 +485,7 @@ impl Child {
     /// [`crate::elevation::front::cgroup_kill_reached`]).
     #[cfg(unix)]
     fn cgroup_kill_reached(&self) -> Result<(), Error> {
-        let pid = self.id.pid();
+        let pid = self.pid();
         crate::elevation::front::cgroup_kill_reached(
             self.front,
             pid,
@@ -484,7 +497,7 @@ impl Child {
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.front, self.id.pid(), || self.root_running())
+        crate::elevation::front::terminate_gate(self.front, self.pid(), || self.root_running())
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -622,7 +635,7 @@ impl Child {
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
         // name another process. This handle's reaps are held off from the look to the sweep's end.
         #[cfg(unix)]
-        let held = self.proc.hold(self.id.pid());
+        let held = self.proc.hold(self.pid());
         #[cfg(unix)]
         let group = held.group();
         #[cfg(not(unix))]
@@ -668,7 +681,7 @@ impl Child {
                 Ok(()) if in_cgroup => self.cgroup_kill_reached(),
                 Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
                     self.front,
-                    self.id.pid(),
+                    self.pid(),
                     left,
                 )),
                 other => other,
@@ -683,7 +696,7 @@ impl Child {
         let (backstop, root_ended) = if self.root_is_unpinned() {
             log::debug!(
                 "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
-                self.id.pid()
+                self.pid()
             );
             (Ok(()), true)
         } else {
@@ -782,7 +795,7 @@ impl Child {
         // One look at the root decides, as for `kill_tree`, and this handle's reaps are held off
         // until the signal is sent.
         #[cfg(unix)]
-        let held = self.proc.hold(self.id.pid());
+        let held = self.proc.hold(self.pid());
         #[cfg(unix)]
         let group = held.group();
         #[cfg(not(unix))]
@@ -800,7 +813,7 @@ impl Child {
     /// The group's termination signal, with no look at the root's state but `group`'s own check
     /// before each send by the root's number.
     fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
-        self.attached.terminate(self.id.pid(), group)
+        self.attached.terminate(self.pid(), group)
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).
@@ -813,7 +826,7 @@ impl Child {
     ) -> TreeCall<'a> {
         TreeCall {
             attached: &self.attached,
-            pid: self.id.pid(),
+            pid: self.pid(),
             signal,
             op,
             earlier,
@@ -901,7 +914,7 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        self.test_job_handle_contains(self.id.pid())
+        self.test_job_handle_contains(self.pid())
     }
 
     /// Test-only: [`test_job_handle_contains_self`](Self::test_job_handle_contains_self) for any
@@ -1184,7 +1197,7 @@ impl Child {
         };
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
-        let held = self.proc.hold(self.id.pid());
+        let held = self.proc.hold(self.pid());
         let kill = self.attached.hard_kill_for_drop(&view, &held.group());
         drop(held);
         report.skipped = kill.left_undone(&view);

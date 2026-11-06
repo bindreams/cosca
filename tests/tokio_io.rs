@@ -261,7 +261,7 @@ async fn async_run_line_round_trips() {
 /// The cgroup leaf a contained tree was placed in, if it got one. Read while the root is alive.
 #[cfg(target_os = "linux")]
 fn cgroup_leaf_of(child: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
-    (child.containment() == cosca::Containment::CgroupV2).then(|| common::cgroup::cgroup_of(child.id().pid()))
+    (child.containment() == cosca::Containment::CgroupV2).then(|| common::cgroup::cgroup_of(child.pid()))
 }
 
 #[cfg(feature = "tokio")]
@@ -1146,7 +1146,7 @@ fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca
 #[skuld::test]
 async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_first() {
     let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
     assert_died_before_connecting(&message, pid);
 }
@@ -1157,7 +1157,7 @@ async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_firs
 #[skuld::test]
 async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     #[cfg(unix)]
     let status = common::zombie_exit_status(pid);
     #[cfg(windows)]

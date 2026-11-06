@@ -18,7 +18,7 @@ pub(crate) fn zombie_group_root() -> crate::Child {
     cmd.suppress_fd_marker();
     let child = cmd.spawn().expect("spawn");
     drop(writer);
-    crate::test_child::wait_until_zombie(child.id().pid());
+    crate::test_child::wait_until_zombie(child.pid());
     child
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn assert_reaped_elsewhere(err: &crate::error::Error) {
 #[skuld::test]
 fn kill_tree_checks_the_root_again_before_a_send_by_number() {
     let child = zombie_group_root();
-    let (steps, result) = reaped_after_the_look(child.id().pid(), || child.kill_tree());
+    let (steps, result) = reaped_after_the_look(child.pid(), || child.kill_tree());
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }
@@ -76,7 +76,7 @@ fn kill_tree_checks_the_root_again_before_a_send_by_number() {
 #[skuld::test]
 fn terminate_tree_checks_the_root_again_before_a_send_by_number() {
     let child = zombie_group_root();
-    let (steps, result) = reaped_after_the_look(child.id().pid(), || child.terminate_tree());
+    let (steps, result) = reaped_after_the_look(child.pid(), || child.terminate_tree());
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }
@@ -85,9 +85,8 @@ fn terminate_tree_checks_the_root_again_before_a_send_by_number() {
 #[skuld::test]
 fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
     let child = zombie_group_root();
-    let (steps, result) = reaped_after_the_look(child.id().pid(), || {
-        child.graceful_shutdown_tree(std::time::Duration::ZERO)
-    });
+    let (steps, result) =
+        reaped_after_the_look(child.pid(), || child.graceful_shutdown_tree(std::time::Duration::ZERO));
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }
@@ -95,14 +94,14 @@ fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
 #[skuld::test]
 fn a_drop_checks_the_root_again_before_a_send_by_number() {
     let child = zombie_group_root();
-    let (steps, ()) = reaped_after_the_look(child.id().pid(), || drop(child));
+    let (steps, ()) = reaped_after_the_look(child.pid(), || drop(child));
     assert_nothing_by_number(&steps);
 }
 
 #[skuld::test]
 fn finish_elevated_checks_the_root_again_before_a_send_by_number() {
     let child = zombie_group_root();
-    let (steps, failed) = reaped_after_the_look(child.id().pid(), || {
+    let (steps, failed) = reaped_after_the_look(child.pid(), || {
         crate::child::spawn::finish_elevated(
             child,
             Err(crate::error::Error::Io(std::io::Error::other("no password"))),

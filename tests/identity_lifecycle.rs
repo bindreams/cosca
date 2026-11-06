@@ -188,13 +188,13 @@ fn identity_resolves_an_exited_unreaped_child() {
 fn identity_survives_the_alive_to_zombie_transition() {
     // The socket stays open until the kill is sent: dropping our end earlier would unblock the child.
     let (child, sock) = common::spawn_blocker();
-    let id = ProcessId::of(child.id().pid()).found().expect("live child resolves");
+    let id = ProcessId::of(child.pid()).found().expect("live child resolves");
     assert_eq!(id.exists(), cosca::identity::Existence::Present, "live child exists");
     assert_eq!(id.is_alive(), cosca::identity::Liveness::Alive, "live child is alive");
     child.kill().expect("kill");
     // Released after the kill: a kill that sent nothing exits 0.
     drop(sock);
-    common::assert_killed("the killed child", common::zombie_exit_status(child.id().pid()));
+    common::assert_killed("the killed child", common::zombie_exit_status(child.pid()));
     assert_eq!(
         id.exists(),
         cosca::identity::Existence::Present,

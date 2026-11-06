@@ -11,7 +11,7 @@ use crate::test_child::reaped_elsewhere::{reap_behind, reap_behind_status};
 async fn holds_the_pidfd_after_forgetting_a_live_root_as(fate: Forgotten) -> bool {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = super::root_state_tests::session_blocker(false);
-    let pid = child.id().pid();
+    let pid = child.pid();
     assert!(child.root_pidfd().is_some(), "a spawned handle holds its root's pidfd");
     child.proc_mut().forget_as("was forgotten by a test", fate);
     let held = child.root_pidfd().is_some();
@@ -48,7 +48,7 @@ fn reaped_elsewhere_root() -> (crate::tokio::Child, RawFd) {
     child.kill().expect("kill the root");
     // Released after the kill, so a kill that sent nothing fails the assertion on how the root ended.
     drop(writer);
-    crate::test_child::assert_killed("the root", reap_behind_status(child.id().pid()));
+    crate::test_child::assert_killed("the root", reap_behind_status(child.pid()));
     (child, fd)
 }
 

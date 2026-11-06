@@ -25,12 +25,12 @@ enum Teardown {
 
 /// Kills `child`'s root alone, by the test's own `SIGKILL`, and has `reap` reap it.
 fn reap_root(child: &crate::Child, reap: Reap) {
-    kill_own_child(child.id().pid());
+    kill_own_child(child.pid());
     match reap {
         Reap::Own => {
             child.wait().expect("this handle reaps the root");
         }
-        Reap::Foreign => reap_behind(child.id().pid()),
+        Reap::Foreign => reap_behind(child.pid()),
     }
 }
 
