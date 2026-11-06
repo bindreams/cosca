@@ -30,7 +30,8 @@ fn scripted(script: &[PpidRead]) -> (impl FnMut() -> PpidRead + '_, impl Fn() ->
 /// Mutant: "`Forking` is `Unknown`" (a busy host's transient window fails every walk).
 #[skuld::test]
 fn a_fork_in_progress_is_reread_until_it_resolves() {
-    let (read, count) = scripted(&[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(7, key())]);
+    let script = [PpidRead::Forking, PpidRead::Forking, PpidRead::Found(7, key())];
+    let (read, count) = scripted(&script);
     let mut pauses = Vec::new();
     assert_eq!(resolve_ppid(read, |a| pauses.push(a)), Resolved::Found((7, key())));
     assert_eq!(count(), 3);
