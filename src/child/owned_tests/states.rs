@@ -582,7 +582,7 @@ fn a_holders_recheck_pause_leaves_the_handle_unlocked() {
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let (peeked_tx, peeked_rx) = std::sync::mpsc::channel();
-    let _hook = seams::on_condvar_block({
+    let _hook = crate::wait::block_probe::on_pause({
         let child = Arc::clone(&child);
         move || _ = peeked_tx.send(child.peek())
     });

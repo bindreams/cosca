@@ -24,8 +24,7 @@ pub(crate) fn park_gate() -> (ParkGate, Receiver<()>, Sender<()>) {
     )
 }
 
-/// A hook run just before a `Condvar` block, given the block's timeout (`None`: none), and before
-/// the holder's recheck pause, with `None` and the lock released.
+/// A hook run just before a `Condvar` block, given the block's timeout (`None`: none).
 type BlockHook = Box<dyn FnOnce(Option<std::time::Duration>)>;
 
 thread_local! {
@@ -105,8 +104,7 @@ pub(super) fn panic_after_relock_if_armed() {
     }
 }
 
-/// Run `hook` just before this thread's next `Condvar::wait` or `wait_timeout` (under the lock), or
-/// its next holder recheck pause (with no lock).
+/// Run `hook`, under the lock, just before this thread's next `Condvar::wait` or `wait_timeout`.
 /// A test's hook sends on a channel it then `recv()`s, so it knows the waiter is inside the
 /// `Condvar` before it releases anything: the wait releases the lock atomically, so the release
 /// cannot overtake it.

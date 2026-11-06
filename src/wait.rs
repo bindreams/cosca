@@ -654,8 +654,9 @@ fn win32_wait_clamp() -> u32 {
     WIN32_INFINITE - 1
 }
 
-/// Test-only, thread-local record of the timeout each timed block was armed with on this thread
-/// (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, or a Win32 wait.
+/// Test-only, thread-local record of the timeout each timed block or recheck pause was armed with on
+/// this thread (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round, a Win32 wait, or a
+/// [`crate::os_process::drive`] pause.
 /// A test proves a deadline wait armed nothing longer than the time remaining, and blocked at all,
 /// from the log.
 #[cfg(test)]
@@ -669,9 +670,13 @@ pub(crate) mod block_probe {
     #[cfg(target_os = "macos")]
     type RoundHook = Box<dyn FnMut(u32)>;
 
+    /// A one-shot hook slot: [`on_blocking`]'s or [`on_pause`]'s.
+    type Slot = RefCell<Option<Box<dyn FnOnce()>>>;
+
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
-        static ON_BLOCKING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static ON_BLOCKING: Slot = const { RefCell::new(None) };
+        static ON_PAUSE: Slot = const { RefCell::new(None) };
         #[cfg(target_os = "macos")]
         static ROUND: Cell<u32> = const { Cell::new(0) };
         #[cfg(target_os = "macos")]
@@ -694,6 +699,15 @@ pub(crate) mod block_probe {
         }
         #[cfg(target_os = "macos")]
         fire_round();
+    }
+
+    /// [`record`], for a thread about to sleep out a recheck pause of `d`, and run the hook
+    /// [`on_pause`] armed. A pause is not a block: it fires no round.
+    pub(crate) fn record_pause(d: Duration) {
+        record(Some(d));
+        if let Some(hook) = ON_PAUSE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -749,13 +763,13 @@ pub(crate) mod block_probe {
         })
     }
 
-    /// Disarms an unfired [`on_blocking`] hook on drop.
+    /// Disarms an unfired [`on_blocking`] or [`on_pause`] hook on drop.
     #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
-    pub(crate) struct Armed(());
+    pub(crate) struct Armed(&'static std::thread::LocalKey<Slot>);
 
     impl Drop for Armed {
         fn drop(&mut self) {
-            ON_BLOCKING.with(|h| *h.borrow_mut() = None);
+            self.0.with(|h| *h.borrow_mut() = None);
         }
     }
 
@@ -763,7 +777,14 @@ pub(crate) mod block_probe {
     /// thread has released every lock it took for the wait it is about to make.
     pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
         ON_BLOCKING.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        Armed(())
+        Armed(&ON_BLOCKING)
+    }
+
+    /// Run `hook` on this thread just before its next recheck pause sleeps: the thread has
+    /// released every lock it took for the look.
+    pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
+        ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Armed(&ON_PAUSE)
     }
 
     /// Every timeout armed on this thread since the last call, in order.

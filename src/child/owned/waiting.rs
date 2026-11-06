@@ -128,8 +128,6 @@ impl<'c> Waitable for Holder<'c> {
             }
             TryReapOutcome::Recheck => {
                 self.guard().unlock();
-                #[cfg(test)]
-                super::seams::before_condvar_block(None);
                 Ok(Step::Recheck)
             }
             TryReapOutcome::Running(wait_for) => {

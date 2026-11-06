@@ -99,7 +99,7 @@ pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<R
 
 /// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the step already cut to
 /// the time remaining, and returns once it has passed.
-pub(crate) fn run_with<W: Waitable>(
+fn run_with<W: Waitable>(
     w: &mut W,
     deadline: Option<Instant>,
     mut pause: impl FnMut(Duration),
@@ -134,7 +134,7 @@ pub(crate) fn run_with<W: Waitable>(
 /// must reach during the pause holds no lock across it.
 fn pause(d: Duration) {
     #[cfg(test)]
-    crate::wait::block_probe::record(Some(d));
+    crate::wait::block_probe::record_pause(d);
     #[cfg(test)]
     let started = Instant::now();
     std::thread::sleep(d);
