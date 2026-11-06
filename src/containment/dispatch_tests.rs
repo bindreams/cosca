@@ -1210,8 +1210,8 @@ fn a_gone_root_over_a_member_that_exited_on_its_own_says_it_is_gone_each_time() 
 
 /// A drop that skips the kill over a tree it cannot vouch for warns of it, in words true of what
 /// `settle` found: members an earlier kill left that are gone now (a held member that exited or was
-/// killed by the settlement), or, when the cause is no longer known (an earlier kill left the root,
-/// members never identified, or members since gone), only that something was left running and no walk
+/// killed by the settlement), or, when the cause is no longer known (members never identified, or
+/// members since gone), only that something was left running and no walk
 /// has checked what it forked. A tree that was killed, or never settled (a skipped kill has its own
 /// warn), says nothing here.
 ///

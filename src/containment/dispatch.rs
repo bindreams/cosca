@@ -683,7 +683,7 @@ pub(crate) enum UnvouchedKind {
     /// `Ok`. What the root forked meanwhile was never looked for.
     RootSeenRunning,
     /// A kill, this settlement's own or an earlier one, left something running that it could not name
-    /// (the root, members the handle holds no identity for, or members since gone), and the settlement
+    /// (members the handle holds no identity for, or members since gone), and the settlement
     /// no longer knows which.
     Earlier,
 }
