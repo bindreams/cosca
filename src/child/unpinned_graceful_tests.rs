@@ -203,10 +203,11 @@ fn graceful_shutdown_tree_of_an_untrusted_root_with_no_identity_channel_ends_up_
 /// An fd marker still has its holders: they get the `SIGTERM` by identity, and no `killpg`. A hook
 /// right after the terminate reads who was signalled, before the sweep: the descendant, and the
 /// root only when it is `Unknown`, not `Unpinned`. The grace is zero, so the sweep follows at
-/// once.
+/// once. The root reads the same to the sweep, which kills the holders and is `Unassessable`
+/// all the same, as it skipped the rest of the tree.
 ///
 /// Mutants: the terminate fires `killpg`; it signals the `Unpinned` root; it spares the `Unknown`
-/// root; it signals no holder.
+/// root; it signals no holder; the sweep does not look at the root; the sweep's answer is `Ok`.
 #[skuld::test]
 fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only() {
     crate::log_capture::install();
@@ -225,11 +226,13 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
                     Some(crate::containment::fdmarker::fault::holder_kills_so_far())
             }
         });
-        let _fake = state.script(&mut child);
+        // The terminate's look and the sweep's.
+        let fake = child.proc.script_over(|f| f.peeks([state.result(), state.result()]));
 
         let err = child
             .graceful_shutdown_tree(Duration::ZERO)
             .expect_err("the sweep reached the holders only, and skipped the rest of the tree");
+        fake.assert_peeks_exhausted();
         assert_holders_only(&err, "graceful_shutdown_tree", state);
 
         drop(hook);
@@ -311,7 +314,7 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
         .expect_err("a root this process does not pin is not swept");
 
     fake.assert_peeks_exhausted();
-    assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
+    assert_tree_refused(&err, "graceful_shutdown_tree", Untrusted::Unpinned);
     assert!(
         matches!(&err, Error::Unassessable { detail, .. } if detail.contains("though the SIGTERM was sent before it")),
         "{err:?}"
@@ -355,7 +358,7 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
         .expect_err("a root this process does not pin is not swept");
 
     fake.assert_peeks_exhausted();
-    assert_tree_refused(&err, "kill_tree", Untrusted::Unpinned);
+    assert_tree_refused(&err, "graceful_shutdown_tree", Untrusted::Unpinned);
     assert!(
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"

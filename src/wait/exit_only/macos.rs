@@ -214,8 +214,9 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
             log::debug!("second reap of pid {pid}: already reaped elsewhere");
             return;
         }
+        // The first consume was this handle's, so an untraced child is gone, not reaped by another.
         Err(e) if is_echild(&e) => {
-            log::debug!("second reap of pid {pid}: already reaped elsewhere");
+            log::debug!("second reap of pid {pid}: nothing left to consume");
             return;
         }
         Err(e) => {
