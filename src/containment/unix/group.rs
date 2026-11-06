@@ -359,7 +359,7 @@ fn classify_member(
 /// in THAT gap (not the earlier, listing-to-here gap the re-verify closes) is still possible.
 /// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
 /// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), through
-/// `open_verified_with` — the fd itself pins the identity at the kernel level, so a pid reused
+/// `open_verified_error_with` — the fd itself pins the identity at the kernel level, so a pid reused
 /// after `pidfd_open` cannot be hit even in principle, and `treewalk::kill_by_identity` signals
 /// the same way. Only macOS has the window: it has no pidfd equivalent, so `kill(2)` here and in
 /// `treewalk::kill_by_identity` (re-verify, then `kill(2)`) can reach a pid recycled in that gap,
@@ -473,13 +473,13 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 }
 
 /// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
-/// crate's `open_verified_with` ("open a pidfd for this identity, re-verifying, `Ok(None)` if
+/// crate's `open_verified_error_with` ("open a pidfd for this identity, re-verifying, `Ok(None)` if
 /// already gone"). `pidfd_send_signal`
-/// on the returned fd is guaranteed to hit the SAME process `open_verified_with` just confirmed,
+/// on the returned fd is guaranteed to hit the SAME process `open_verified_error_with` just confirmed,
 /// even if the pid number is reused by something else in between — no gap remains, unlike
 /// `check_or_signal`'s plain-`kill(2)` path.
 ///
-/// **How `open_verified_with`'s answers map here.**
+/// **How `open_verified_error_with`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
 ///   `id.exists()` saying `Gone`) and a ptraced zombie thread.
@@ -522,7 +522,7 @@ fn check_or_signal_linux_sigkill(
     root: &GroupRoot<'_>,
 ) -> Reached {
     use std::os::fd::AsFd as _;
-    match crate::os_process::linux::open::open_verified_with(kernel, id) {
+    match crate::os_process::linux::open::open_verified_error_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
@@ -556,7 +556,10 @@ fn check_or_signal_linux_sigkill(
         // `Error::Unassessable`, or a variant added later: a statement about the PID itself, which
         // no kill(2) fallback resolves. Conservative, not a guess.
         Err(e) => {
-            log::warn!("containment::unix::group: open_verified_with for pid {}: {e}", id.pid());
+            log::warn!(
+                "containment::unix::group: open_verified_error_with for pid {}: {e}",
+                id.pid()
+            );
             Reached::Unknown
         }
     }
