@@ -17,6 +17,7 @@ use std::time::Duration;
 use super::fixtures::{status, try_wait, Blocker};
 use crate::child::owned::{seams, ChildWaitOutcome};
 use crate::error::Error;
+use crate::identity::Liveness;
 use crate::test_child::reaped_elsewhere::kill_own_child;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::foreign_tracer::{self, EXIT, REAP, STOP};
@@ -71,6 +72,40 @@ fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit(#[fixture(tracer_group)] 
 #[skuld::test]
 fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back(#[fixture(tracer_group)] _group: &Group) {
     hand_back(REAP, Wait::Deadline, false);
+}
+
+/// A zombie a foreign tracer holds has exited, so the child reads `Dead` from the pidfd's edge,
+/// though the parent's peek finds no record to show for it.
+///
+/// Mutant: liveness answered from the peek, which reads the held zombie as `Running`.
+#[skuld::test]
+fn a_zombie_held_by_a_foreign_tracer_is_dead(#[fixture(tracer_group)] _group: &Group) {
+    let b = Blocker::spawn_with(foreign_tracer::allow_any_tracer);
+    let mut tracer = foreign_tracer::spawn_helper(b.pid);
+    assert_eq!(
+        b.owned.liveness().expect("liveness"),
+        Liveness::Alive,
+        "a running child"
+    );
+
+    kill_own_child(b.pid);
+    let pidfd = b.owned.os_handle();
+    let mut fds = [rustix::event::PollFd::new(&pidfd, rustix::event::PollFlags::IN)];
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
+    assert!(
+        matches!(try_wait(&b.owned), Ok(ChildWaitOutcome::DeadlinePassed)),
+        "the tracer still holds it"
+    );
+    assert_eq!(b.owned.liveness().expect("liveness"), Liveness::Dead);
+
+    tracer.send(REAP);
+    tracer.expect("reaped");
+    assert_eq!(
+        b.owned.liveness().expect("liveness"),
+        Liveness::Dead,
+        "and once handed back"
+    );
+    tracer.finish();
 }
 
 fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {

@@ -184,11 +184,11 @@ mod on_windows {
     fn id_recorded_while_frozen_equals_the_resumed_childs_id() {
         for raw in BACKENDS {
             let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
-            let recorded = frozen.id();
+            let recorded = frozen.id().expect(crate::test_child::IDENTITY_READ);
 
             let child = frozen.resume().expect("resume");
 
-            assert_eq!(child.id(), recorded, "raw={raw}");
+            assert_eq!(child.id(), Some(recorded), "raw={raw}");
             end(child);
         }
     }
@@ -390,7 +390,7 @@ mod on_windows {
     fn a_failed_thread_resume_kills_the_child_and_reports_its_fate() {
         let (mut cmd, writer) = held_blocker(false);
         let frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let id = frozen.id();
+        let id = frozen.id().expect(crate::test_child::IDENTITY_READ);
         let teardown = release_at_teardown_kill(&frozen, writer);
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
@@ -411,7 +411,7 @@ mod on_windows {
         crate::log_capture::install();
         let (mut cmd, writer) = held_blocker(false);
         let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let id = frozen.id();
+        let id = frozen.id().expect(crate::test_child::IDENTITY_READ);
         let remote = Remote::open(id.pid());
         let release = (writer, ResumeOnDrop(InitialThread::of(id.pid())));
         frozen
@@ -470,7 +470,7 @@ mod on_windows {
     fn resume_when_the_initial_thread_was_suspended_twice_kills_the_child_instead_of_returning_ok() {
         let (mut cmd, writer) = held_blocker(false);
         let frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let id = frozen.id();
+        let id = frozen.id().expect(crate::test_child::IDENTITY_READ);
         let teardown = release_at_teardown_kill(&frozen, writer);
         InitialThread::of(id.pid()).suspend_once();
 

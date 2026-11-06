@@ -72,7 +72,7 @@ fn exited_unreaped_with(identity: impl FnOnce(u64) -> Option<u64>) -> (super::pr
     let real = crate::signal::read_identity(pid)
         .expect("readable")
         .expect("a zombie still has a unique id");
-    (super::proc_source::ProcSource::new(child, identity(real)), pid)
+    (super::proc_source::ProcSource::new(child, pid, identity(real)), pid)
 }
 
 /// Mutant: `state` answers anything but `Unreaped` for the child's own unreaped zombie.
@@ -142,7 +142,7 @@ fn running_backend_with(held: impl FnOnce(u64) -> u64) -> (super::proc_source::P
     let real = crate::signal::read_identity(pid)
         .expect("readable")
         .expect("a running child has a unique id");
-    (super::proc_source::ProcSource::new(child, Some(held(real))), pid)
+    (super::proc_source::ProcSource::new(child, pid, Some(held(real))), pid)
 }
 
 /// A child still running whose unique id cannot be read (a MACF denial) cannot be shown to be ours:
@@ -245,7 +245,7 @@ async fn macos_dropping_a_backend_implicitly_forgets_a_child_with_no_unique_id()
     )
     .expect("spawn");
     let pid = child.id().expect("tokio owns an un-reaped child");
-    let proc = super::proc_source::ProcSource::new(child, None);
+    let proc = super::proc_source::ProcSource::new(child, pid, None);
     let backend_drops = super::fault::count_backend_drops();
 
     drop(proc);

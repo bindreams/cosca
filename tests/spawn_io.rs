@@ -52,7 +52,7 @@ fn spawned_child_has_live_identity() {
     let child = cmd.spawn().expect("spawn");
     // id() is stable across two calls, and pid() is its number.
     assert_eq!(child.id(), child.id());
-    assert_eq!(child.pid(), child.id().pid());
+    assert_eq!(Some(child.pid()), child.id().map(|id| id.pid()));
     let _ = child.wait();
 }
 
@@ -731,7 +731,7 @@ fn detach_leaves_the_child_running() {
     cmd.stdout(Stdio::null()).unwrap();
     cmd.stderr(Stdio::null()).unwrap();
     let mut child = cmd.spawn().expect("spawn");
-    let id = child.id();
+    let id = child.id().expect("the spawn read the child's identity");
     // Take the stdin writer BEFORE detaching, so we can end the orphan cleanly
     // (EOF) afterward without needing a wait handle (kill-by-foreign-id is Plan 6).
     let writer = child.stdin().expect("stdin pipe writer");

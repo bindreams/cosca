@@ -102,7 +102,7 @@ impl Child {
     /// through the held handle. Non-reaping, so the pid stays pinned. A child with no handle left
     /// to watch has exited.
     async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(self.pid()), timeout).await
+        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(), timeout).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -156,8 +156,7 @@ impl Child {
     ///
     /// **macOS, a child not shown to be ours** (its handle forgotten as unproven) is sent nothing,
     /// neither the `SIGTERM` nor the kill, and the call returns `Err(`[`Error::Io`](crate::error::Error::Io)`(ECHILD))`
-    /// at once, with no grace waited: nothing proves the number is still the child's, so there is
-    /// nothing of ours to wait for.
+    /// at once, with no grace waited: nothing proves the number is still the child's.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
         #[cfg(test)]
