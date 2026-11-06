@@ -130,11 +130,7 @@ async fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardow
     }
     // Nothing was left behind. A foreign reap still warns of forgetting tokio's `Child`, and of
     // nothing else.
-    let warns: Vec<String> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     match reap {
         // A reap the handle saw forgot tokio's `Child`, and warned of it, before the teardown.
         Reap::Foreign => assert!(

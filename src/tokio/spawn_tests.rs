@@ -75,10 +75,7 @@ async fn macos_identity_failure_of_a_group_root_warns_that_its_members_may_be_le
     };
     teardown.assert_killed();
     let note = format!("members of the process group of pid {} may be left running", id.pid());
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &note)
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, &note);
     assert_eq!(
         warns.len(),
         1,
@@ -266,14 +263,11 @@ async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped
     };
     let (_, fate) = expect_may_have_started_with(err.expect("the forced attach failure fails the spawn"));
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("could not be terminated"), "{warns:?}");
-    assert!(warns[0].1.contains("leaving it running"), "{warns:?}");
-    assert!(!warns[0].1.contains("torn down"), "{warns:?}");
+    assert!(warns[0].contains("could not be terminated"), "{warns:?}");
+    assert!(warns[0].contains("leaving it running"), "{warns:?}");
+    assert!(!warns[0].contains("torn down"), "{warns:?}");
     // The helper exits once its stdin closes; the test reaps it.
     drop(writer);
     let status = reap(id.pid()).expect("the child is still unreaped");
@@ -351,12 +345,9 @@ async fn an_identity_unknown_child_whose_kill_is_refused_stays_running_and_is_sa
     };
     let (_, fate) = expect_may_have_started_with(err.expect("the forced unknown identity fails the spawn"));
     assert_eq!(fate, ChildFate::Running { id: None });
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    let warn = &warns[0].1;
+    let warn = &warns[0];
     assert!(warn.starts_with("teardown after a failed spawn: "), "{warns:?}");
     assert!(warn.contains("cannot be shown to be ours"), "{warns:?}");
     assert!(warn.contains("could not be terminated"), "{warns:?}");

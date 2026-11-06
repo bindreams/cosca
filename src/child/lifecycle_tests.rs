@@ -331,10 +331,7 @@ fn child_of_an_orphaned_zombie(waits: usize) -> crate::Child {
 
 /// The `warn`s this thread logged since `mark` that say a zombie is not ours to reap.
 fn orphan_warns_since(mark: usize) -> usize {
-    crate::log_capture::records_since_on_current_thread(mark, "not ours to reap")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .count()
+    crate::log_capture::warns_since(mark, "not ours to reap").len()
 }
 
 /// The error every wait on a child someone else reaped answers.

@@ -131,10 +131,7 @@ fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     let mark = crate::log_capture::mark();
     drop(child);
     // The reap is said at `debug`, as "reaped it": only a warn is a complaint.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert!(warns.is_empty(), "{warns:?}");
     assert_eq!(reap(pid), None, "the drop reaps an exited front");
 }

@@ -500,13 +500,13 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
             let result = walk(&kernel, root);
             // A refused kill leaves the descendant running, so `hard_kill` names it; `terminate` is
             // best effort. A descendant shown as another process is gone, not left behind.
-            let warned: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "treewalk:")
+            let warned: Vec<_> = crate::log_capture::warns_since(mark, "treewalk:")
                 .into_iter()
-                .filter(|(level, said)| *level == log::Level::Warn && said.contains(&descendant.pid().to_string()))
+                .filter(|said| said.contains(&descendant.pid().to_string()))
                 .collect();
             if name == "hard_kill" && !shows_a_new_owner {
                 assert_not_killed(result, descendant.pid(), &[]);
-                assert_eq!(warned, [], "the error is the report");
+                assert_eq!(warned, Vec::<String>::new(), "the error is the report");
             } else {
                 assert!(result.is_ok(), "{name}, new owner {shows_a_new_owner}: {result:?}");
                 assert_eq!(
