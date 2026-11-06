@@ -9,9 +9,10 @@ use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{group_blocker, session_tree, walked_blocker};
 use crate::child::unpinned_public_tests::{
     assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused, orphaned,
-    warns_since, Untrusted, BOTH,
+    Untrusted, BOTH,
 };
 use crate::error::Error;
+use crate::log_capture::warns_since;
 use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::send_log::Capture;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
@@ -48,7 +49,7 @@ async fn graceful_shutdown_of_an_orphaned_root_sends_nothing() {
     assert_peeks_exhausted();
     assert_refused(&err, "terminate");
     assert_nothing_sent(&sends);
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(looks);
 
     child
@@ -89,7 +90,7 @@ async fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace
         vec![],
         "the escalation must send nothing to a root we do not pin"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(hook);
     drop(slot);
 
@@ -122,7 +123,7 @@ async fn graceful_shutdown_watch_stays_quiet_for_an_orphaned_root() {
     assert_peeks_exhausted();
     assert_refused(&err, "kill");
     assert_eq!(sends.entries(), vec![], "nothing by pid");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
@@ -154,7 +155,7 @@ async fn graceful_shutdown_tree_of_an_untrusted_root_with_no_identity_channel_en
             assert_tree_refused(&err, "graceful_shutdown_tree", state);
             assert_nothing_sent(&sends);
             assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}, group: {group}");
-            assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}, group: {group}");
+            assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}, group: {group}");
             drop(hook);
             drop(looks);
 
@@ -220,7 +221,7 @@ async fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders
         };
         assert_eq!(signalled, want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
-        assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
         drop(writer);
     }
 }
@@ -282,7 +283,7 @@ async fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace()
         "{:?}",
         sends.by_identity()
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(slot);
     drop(writer);
 }
@@ -324,7 +325,7 @@ async fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_fa
             .any(|(_, text)| text.contains("best-effort reap")),
         "the zombie launchd holds was waited on"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
 
@@ -353,7 +354,7 @@ async fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_rea
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"
     );
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(slot);
     drop(writer);
 }

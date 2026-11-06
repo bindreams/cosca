@@ -122,13 +122,10 @@ fn member_output(to_member: std::io::PipeWriter, mut from_member: std::io::PipeR
 /// The one `warn` of an event whose group kill was not sent because the kernel refused the flag and
 /// the child was reaped: it names the group.
 fn assert_one_warn_for_the_unsent_group_kill(mark: usize, pid: u32) {
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].1.contains(&format!("process group {pid}")),
+        warns[0].contains(&format!("process group {pid}")),
         "it names the group: {warns:?}"
     );
 }
@@ -247,10 +244,7 @@ fn a_reaped_childs_group_gets_no_kill_by_number() {
         not_sent.is_some_and(|text| text.contains(&format!("process group {pid}"))),
         "it names the group"
     );
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect::<Vec<_>>();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert!(warns.is_empty(), "the group kill logs no warn of its own: {warns:?}");
     let steps = capture.group_steps();
     assert!(

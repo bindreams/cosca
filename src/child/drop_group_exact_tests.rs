@@ -93,11 +93,8 @@ fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardown: Tea
     if let Some(detail) = detail {
         assert!(!detail.contains("tree was not killed"), "{detail}");
     }
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
-    assert_eq!(warns, [], "nothing was left behind");
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns, Vec::<String>::new(), "nothing was left behind");
 }
 
 #[skuld::test]
@@ -237,9 +234,6 @@ fn a_drop_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
         !steps.iter().any(|step| matches!(step, GroupStep::Member(..))),
         "nothing was resent: {steps:?}"
     );
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level == log::Level::Warn)
-        .collect();
-    assert_eq!(warns, [], "the tree is gone");
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns, Vec::<String>::new(), "the tree is gone");
 }

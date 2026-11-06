@@ -6,6 +6,7 @@ use crate::child::owned::teardown::Disposition;
 use crate::child::Child;
 use crate::error::ChildFate;
 use crate::identity::Liveness;
+use crate::log_capture::warns_since;
 use crate::os_process::fake::FakeProcess;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
@@ -16,15 +17,6 @@ fn refuse_the_kill(child: &mut Child) -> FakeProcess {
     child
         .proc
         .script_over(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]))
-}
-
-/// Every record at `warn` or above that this thread logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
-    crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .map(|(_, text)| text)
-        .collect()
 }
 
 /// A child whose kill is refused and which still runs comes back as an `Unreaped` that names it,
@@ -45,7 +37,7 @@ fn a_refused_kill_hands_the_child_back_and_says_so() {
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
     assert_eq!(handed_back.unreaped().id(), Some(id));
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with("teardown after a failed run: ")
@@ -73,7 +65,7 @@ fn a_refused_kill_is_left_when_the_caller_leaves_it() {
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("leaving it running"),
@@ -270,7 +262,7 @@ fn assert_front_handed_back(
     assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
     assert_eq!(handed_back.unreaped().id(), Some(id));
     assert_eq!(id.is_alive(), Liveness::Alive, "a front is sent nothing");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with(&format!(
@@ -310,7 +302,7 @@ fn an_elevation_front_is_left_when_the_caller_leaves_it() {
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
-    let warns = warns_since(mark);
+    let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("is left running and unreaped"),
@@ -379,7 +371,7 @@ fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(handed_back.is_none(), "the teardown handed the child back");
-    assert_eq!(warns_since(mark), Vec::<String>::new());
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
 // In a cgroup (the `cgroup` group) =====
@@ -494,7 +486,7 @@ mod in_a_cgroup {
 
         assert_eq!(fate, ChildFate::Running { id: Some(id) });
         assert_eq!(handed_back.unreaped().id(), Some(id));
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
             warns[0].starts_with(&format!(
@@ -546,7 +538,7 @@ mod in_a_cgroup {
         assert_eq!(fate, ChildFate::Reaped);
         assert!(handed_back.is_none(), "the teardown handed the child back");
         assert_eq!(id.exists(), Existence::Gone, "the root was reaped, not left a zombie");
-        assert_eq!(warns_since(mark), Vec::<String>::new());
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     }
 
     /// The same child dropped: its refused kill is not "leaving it running", and the root is reaped,
@@ -562,7 +554,7 @@ mod in_a_cgroup {
         drop(child);
 
         assert_eq!(id.exists(), Existence::Gone, "the root was reaped, not left a zombie");
-        assert_eq!(warns_since(mark), Vec::<String>::new());
+        assert_eq!(warns_since(mark, ""), Vec::<String>::new());
         drop(stdin);
     }
 
@@ -585,7 +577,7 @@ mod in_a_cgroup {
 
         assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
         handed_back.unreaped();
-        let warns = warns_since(mark);
+        let warns = warns_since(mark, "");
         assert!(
             warns.iter().any(|w| w.contains(&leaf) && w.contains("was not removed")),
             "the leaf left behind is named: {warns:?}"

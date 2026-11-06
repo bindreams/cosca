@@ -207,17 +207,14 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>, torn_
         "the warning must say why the forgotten child was forgotten, straight after the refused kill"
     );
     // The refused kill and the forget are one event: one warn, which carries the leak.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("leaks"), "{warns:?}");
+    assert!(warns[0].contains("leaks"), "{warns:?}");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
     let witness = slot.borrow_mut().take().expect("the hook ran");
     if torn_down {
         assert!(
-            warns[0].1.contains("teardown of child"),
+            warns[0].contains("teardown of child"),
             "the warn carries the second teardown's clause: {warns:?}"
         );
         assert_eq!(
@@ -234,7 +231,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>, torn_
     }
     // A child shown gone gets no second teardown: no clause of one in the warn, and no reap recorded.
     assert!(
-        !warns[0].1.contains("teardown of child"),
+        !warns[0].contains("teardown of child"),
         "the warn carries no second teardown's clause: {warns:?}"
     );
     assert!(
@@ -519,34 +516,27 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     );
     // The failed check and the forget its teardown ends in are one event: one warn, which names the
     // error and carries the leak.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0]
-            .1
-            .contains("could not be checked against its handle (forced identity-check failure 91c4)")
-            && warns[0].1.contains("leaks"),
+        warns[0].contains("could not be checked against its handle (forced identity-check failure 91c4)")
+            && warns[0].contains("leaks"),
         "the failed peek is warned once, naming its own error and the leak: {warns:?}"
     );
     // The forget's note says what is known before the teardown (the child cannot be shown ours); the
     // teardown's clause, whatever its level alone, says it was killed and reaped, in the same warn,
     // which the failed spawn's name leads.
     assert!(
-        warns[0]
-            .1
-            .contains("cannot be shown to be ours; forgetting tokio's handle for it leaks"),
+        warns[0].contains("cannot be shown to be ours; forgetting tokio's handle for it leaks"),
         "the warn says why the child was forgotten: {warns:?}"
     );
     assert!(
-        warns[0].1.starts_with("teardown after a failed spawn: ") && warns[0].1.contains(": reaped it after the kill"),
+        warns[0].starts_with("teardown after a failed spawn: ") && warns[0].contains(": reaped it after the kill"),
         "the one warn is the failed spawn's and says the child was killed and reaped: {warns:?}"
     );
     // The child was killed and reaped through its pidfd, not reaped by someone else.
     assert!(
-        !warns[0].1.contains("reaped by someone else"),
+        !warns[0].contains("reaped by someone else"),
         "the warn does not call the child foreign: {warns:?}"
     );
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
@@ -618,12 +608,9 @@ async fn reap_now_after_a_refused_kill_on_a_live_child_reaps_through_the_pidfd()
         "the warn must say the kill was refused, then what became of the forget"
     );
     // The refused kill and the forget are one event: one warn, which carries the leak.
-    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
-        .into_iter()
-        .filter(|(level, _)| *level <= log::Level::Warn)
-        .collect();
+    let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("leaks"), "{warns:?}");
+    assert!(warns[0].contains("leaks"), "{warns:?}");
     assert!(
         !crate::log_capture::contains_since(mark, "was reaped by someone else"),
         "the child was not reaped by someone else"
