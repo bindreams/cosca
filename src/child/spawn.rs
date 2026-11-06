@@ -265,7 +265,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let retry = kill_tree();
         match child.attached.settle(&child.tree_killed, retry, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
-            Ok(SettleOutcome::Skipped) => {}
+            Ok(SettleOutcome::Skipped | SettleOutcome::Unvouched) => {}
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 report.tree = tree_failure.as_ref().map(|first| {
@@ -404,7 +404,7 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// `Attached::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
-/// tree was killed. `Some(Ok(Skipped))`: a kill that killed nothing; its skip note says so (the
+/// tree was killed. `Some(Ok(Skipped | Unvouched))`: a kill that killed nothing; its skip note says so (the
 /// caller's). None of these is reported here.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(

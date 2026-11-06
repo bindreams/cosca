@@ -493,8 +493,13 @@ enum Standing {
 
 /// The state of `killed`.
 fn standing(killed: &super::TreeKilled) -> Standing {
+    standing_of(&killed.lock())
+}
+
+/// `state`, as a `Standing`.
+fn standing_of(state: &super::TreeState) -> Standing {
     use crate::containment::treewalk::Left;
-    match &*killed.lock() {
+    match state {
         super::TreeState::Never => Standing::Never,
         super::TreeState::Killed => Standing::Killed,
         super::TreeState::Unvouched => Standing::Unvouched,
@@ -508,6 +513,55 @@ fn standing(killed: &super::TreeKilled) -> Standing {
                     })
                     .collect(),
             )
+        }
+    }
+}
+
+/// `next` over every state and every combination of facts that can occur: a walk or not, members left
+/// with identities or none, something left running or not. A member left with an identity is
+/// something left running.
+///
+/// Mutants: a fact that walked nothing vouches; a member seen running leaves a state as it was;
+/// `Never` is vouched or un-vouched by a member it never saw walked; a held `Left` outlives
+/// its members.
+#[skuld::test]
+fn next_is_the_one_transition_of_state_and_facts() {
+    use super::TreeState;
+    use crate::containment::treewalk::Left;
+    let unread = |pid| Left::Unread {
+        pid,
+        said: "its identity could not be read".into(),
+    };
+    let prev_names = ["Never", "Killed", "Left(7)", "Unvouched"];
+    let prev_at = |at: usize| match at {
+        0 => TreeState::Never,
+        1 => TreeState::Killed,
+        2 => TreeState::Left(vec![unread(7)]),
+        _ => TreeState::Unvouched,
+    };
+    // (label, walked, left_now, running, next from [Never, Killed, Left(7), Unvouched])
+    type Row = (&'static str, bool, Vec<Left>, bool, [Standing; 4]);
+    let left_8 = || Standing::Left(vec![8]);
+    #[rustfmt::skip]
+    let facts: Vec<Row> = vec![
+        ("walk, nothing left", true, vec![], false,
+            [Standing::Killed, Standing::Killed, Standing::Killed, Standing::Killed]),
+        ("walk, something running with no identity", true, vec![], true,
+            [Standing::Never, Standing::Unvouched, Standing::Unvouched, Standing::Unvouched]),
+        ("no walk, nothing left", false, vec![], false,
+            [Standing::Never, Standing::Killed, Standing::Unvouched, Standing::Unvouched]),
+        ("no walk, something running with no identity", false, vec![], true,
+            [Standing::Never, Standing::Unvouched, Standing::Unvouched, Standing::Unvouched]),
+        ("walk, member 8 left", true, vec![unread(8)], true,
+            [left_8(), left_8(), left_8(), left_8()]),
+        ("no walk, member 8 left", false, vec![unread(8)], true,
+            [left_8(), left_8(), left_8(), left_8()]),
+    ];
+    for (label, walked, left_now, running, wants) in facts {
+        for (at, want) in wants.into_iter().enumerate() {
+            let got = super::next(&prev_at(at), walked, left_now.clone(), running);
+
+            assert_eq!(standing_of(&got), want, "{} x {label}", prev_names[at]);
         }
     }
 }
@@ -678,7 +732,7 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
 /// never settled.
 #[skuld::test]
 fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
-    use super::SettleOutcome::{Killed, Skipped};
+    use super::SettleOutcome::{Killed, Unvouched};
     check_table(
         "left, killable",
         |_| {
@@ -687,7 +741,7 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
                 (Err(vec!["pid 8".to_owned()]), Standing::Left(vec![8])),
                 (Err(gone()), Standing::Unvouched),
                 (Err(gone()), Standing::Unvouched),
-                (Ok(Skipped), Standing::Unvouched),
+                (Ok(Unvouched), Standing::Unvouched),
             ]
         },
         || {
@@ -728,7 +782,7 @@ fn unvouched_tree() -> (super::TreeKilled, Box<dyn FnOnce()>) {
 /// settled; a walk that left nothing does not settle it as killed.
 #[skuld::test]
 fn settle_answers_each_outcome_over_an_unvouched_tree() {
-    use super::SettleOutcome::{Killed, Skipped};
+    use super::SettleOutcome::{Killed, Unvouched};
     check_table(
         "unvouched",
         |_| {
@@ -737,7 +791,7 @@ fn settle_answers_each_outcome_over_an_unvouched_tree() {
                 (Err(vec!["pid 8".to_owned()]), Standing::Left(vec![8])),
                 (Err(gone()), Standing::Unvouched),
                 (Err(gone()), Standing::Unvouched),
-                (Ok(Skipped), Standing::Unvouched),
+                (Ok(Unvouched), Standing::Unvouched),
             ]
         },
         || {
@@ -768,10 +822,11 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_refuses_the_kill(
 }
 
 /// A handle that is not a `TreeWalk` holds no members, so a kill that runs and leaves a member after
-/// it settled the tree killed moves the tree back to never settled: the drop that follows must warn
-/// of the member the call just reported. Mutant: the tree stays killed.
+/// it settled the tree killed leaves the tree unvouched (a kill happened, and the member seen running
+/// may have forked); over a tree never settled it stays never settled. Mutants: the tree stays killed;
+/// it goes to never settled, after which a gone root would say nothing was killed.
 #[skuld::test]
-fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_walk_unsettles_it() {
+fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_walk_unvouches_it() {
     use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
     let attached = Attached::None;
     let killed = TreeKilled::default();
@@ -793,27 +848,32 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
         .expect_err("a member was left");
 
     assert_eq!(pid_left(&left.first), 8);
-    assert_eq!(standing(&killed), Standing::Never);
+    assert_eq!(standing(&killed), Standing::Unvouched);
 
     // The same for a skipped kill whose sweep of the holders left a member.
     attached
         .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
         .expect("a complete kill");
+    assert_eq!(standing(&killed), Standing::Killed);
+    let skipped_with_a_member = || TreeKillOutcome::Skipped {
+        action: "walk".into(),
+        holders: Err(Unkilled {
+            members: vec![member_left(9)],
+            root: None,
+            resolved: Vec::new(),
+        }),
+    };
     attached
-        .settle(
-            &killed,
-            TreeKillOutcome::Skipped {
-                action: "walk".into(),
-                holders: Err(Unkilled {
-                    members: vec![member_left(9)],
-                    root: None,
-                    resolved: Vec::new(),
-                }),
-            },
-            true,
-        )
+        .settle(&killed, skipped_with_a_member(), true)
         .expect_err("a member was left");
-    assert_eq!(standing(&killed), Standing::Never);
+    assert_eq!(standing(&killed), Standing::Unvouched);
+
+    // Over a tree never settled, the member leaves it so.
+    let never = TreeKilled::default();
+    attached
+        .settle(&never, skipped_with_a_member(), true)
+        .expect_err("a member was left");
+    assert_eq!(standing(&never), Standing::Never);
 }
 
 // What a `TreeWalk` handle remembers of the members a kill left =====
@@ -1113,7 +1173,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_it() {
         .expect("an unvouched tree is warned of");
     after();
     assert!(warn.contains("could not be vouched for"), "{warn}");
-    assert!(warn.contains("are gone"), "{warn}");
+    assert!(warn.contains("skipped the kill"), "{warn}");
 
     let killed = TreeKilled::default();
     attached
@@ -1145,6 +1205,48 @@ fn a_walk_that_left_only_the_root_after_its_backstop_was_refused_leaves_the_tree
 
     assert_eq!(pid_left(&left.first), 1);
     assert_eq!(standing(&killed), Standing::Never);
+}
+
+/// The same walk over a tree that was vouched for (or left unvouched) un-vouches it: a kill happened,
+/// and the root seen running may have forked. A gone root afterwards says the tree could not be
+/// walked, not that nothing was killed. Mutants: the state goes to never settled, after which a gone
+/// root says nothing was killed; the state stays killed.
+#[skuld::test]
+fn a_walk_that_left_only_the_root_unvouches_a_killed_or_unvouched_tree() {
+    use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
+    let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
+    let root_left = || {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: Vec::new(),
+            root: Some(member_left(1)),
+            resolved: Vec::new(),
+        }))
+    };
+    for start in ["killed", "unvouched"] {
+        let killed = TreeKilled::default();
+        attached
+            .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+            .expect("a complete kill");
+        if start == "unvouched" {
+            attached
+                .settle(&killed, root_left(), false)
+                .expect_err("the root is left");
+        }
+
+        attached
+            .settle(&killed, root_left(), false)
+            .expect_err("the root is left");
+        assert_eq!(standing(&killed), Standing::Unvouched, "{start}");
+
+        let gone = attached
+            .settle(&killed, TreeKillOutcome::NoRoot, true)
+            .expect_err("a gone root walked nothing");
+        assert!(
+            !gone.first.to_string().contains("nothing was killed"),
+            "{start}: {gone}"
+        );
+        assert_eq!(standing(&killed), Standing::Unvouched, "{start}");
+    }
 }
 
 /// A member whose identity was read and that has exited since stops failing the call: nothing is
