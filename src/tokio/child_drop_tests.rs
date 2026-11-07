@@ -500,7 +500,7 @@ async fn an_async_drops_signals_and_bounded_release_run_inside_a_bounded_section
         };
         let mut child = linux::contained_by(child, leaf);
         if detach {
-            child.detach();
+            child.detach().expect("detach");
         }
         drop(child);
         leaf_fault::take_rmdir_hook();
@@ -600,7 +600,7 @@ async fn a_teardown_that_ran_no_tree_kill_does_not_mark_the_tree_killed() {
     let (_fake, leaf) = linux::fake_leaf(name, true);
     let (child, stdin) = blocker();
     let mut child = linux::contained_by(child, leaf);
-    child.detach();
+    child.detach().expect("detach");
     child.tear_down_now(crate::containment::dispatch::TeardownCaller::Drop);
     crate::containment::cgroup::fault::take_rmdir_hook();
     assert!(!child.tree_killed(), "no tree kill ran, so none is marked");
@@ -619,7 +619,7 @@ async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
     let (fake, leaf) = linux::fake_leaf(name, true);
     let (child, stdin) = blocker();
     let mut child = linux::contained_by(child, leaf);
-    child.detach();
+    child.detach().expect("detach");
     let root = linux::Pidfd::of(&child);
     let (steps, levels) = linux::dropped(child, name);
 

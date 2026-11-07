@@ -902,7 +902,7 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         let mut cmd = opted_out_blocker(stdin);
         let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
         if commit {
-            child.commit_kill_on_drop();
+            child = child.commit_kill_on_drop().expect("commit");
         }
         child.kill().expect("end the stand-in root");
         // Released only after the kill, so a child that exits 0 was not killed.
@@ -940,7 +940,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Disarm the leaf, so the failure path's own kill is the only armed one.
-    child.detach();
+    child.detach().expect("detach");
 
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
@@ -1052,7 +1052,7 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Disarm the leaf, so the failure path's own kill is the only armed one.
-    child.detach();
+    child.detach().expect("detach");
 
     // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
     // directory fails EISDIR.

@@ -15,9 +15,7 @@ use super::child::{Child, ProcSource};
 use crate::signal::Sent;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
-    let child = spawn_uncommitted(cmd)?;
-    child.commit_kill_on_drop();
-    Ok(child)
+    spawn_uncommitted(cmd)?.commit_kill_on_drop()
 }
 
 /// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down

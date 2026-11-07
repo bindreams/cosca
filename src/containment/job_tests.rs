@@ -49,7 +49,7 @@ fn disarm_clears_kill_on_job_close() {
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
     let handle = job.0.as_handle().expect("freshly assigned job handle must be live");
 
-    job.disarm();
+    job.disarm().expect("disarm");
 
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     let mut returned = 0u32;
@@ -177,7 +177,7 @@ fn disarm_and_kill_tree_from_two_threads_complete() {
         let job = std::sync::Arc::new(Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job"));
 
         let a = std::sync::Arc::clone(&job);
-        let t = std::thread::spawn(move || a.disarm());
+        let t = std::thread::spawn(move || a.disarm().expect("disarm"));
         job.kill_tree().expect("kill_tree");
         t.join().expect("the disarming thread must not panic");
 
@@ -199,7 +199,7 @@ fn disarm_after_kill_tree_does_nothing() {
 
     job.kill_tree().expect("kill_tree");
     let consumed = format!("{job:?}");
-    job.disarm(); // must be a no-op, not a write through a dangling value
+    job.disarm().expect("a consumed job has nothing to refuse"); // a no-op, not a write through a dangling value
     assert_eq!(
         consumed,
         format!("{job:?}"),
@@ -207,6 +207,28 @@ fn disarm_after_kill_tree_does_nothing() {
     );
 
     _ = child.wait();
+}
+
+/// A `disarm` the OS refuses is the caller's error: the public `Job::disarm` returns it as
+/// `Error::Io`, with the Win32 code.
+///
+/// Mutant: `Job::disarm` drops the error.
+#[skuld::test]
+fn a_refused_disarm_is_returned_as_an_io_error() {
+    let job = Job(crate::containment::windows::JobHandle::create_without_set_access_for_test());
+
+    let err = job
+        .disarm()
+        .expect_err("the OS refuses SetInformationJobObject on this handle");
+
+    let crate::error::Error::Io(io) = err else {
+        panic!("expected Io, got {err:?}");
+    };
+    assert_eq!(
+        io.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),
+        "{io:?}"
+    );
 }
 
 /// A zero timeout on a live tree reports `MembersRemain` rather than blocking or guessing.

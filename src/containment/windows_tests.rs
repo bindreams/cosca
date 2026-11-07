@@ -1352,3 +1352,37 @@ fn thread_snapshot_failure_carries_the_win32_code() {
     let err = super::thread_snapshot(Err(failed)).expect_err("the snapshot failed");
     assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32), "{err:?}");
 }
+
+/// A `disarm` the OS refuses is returned, with the plain Win32 code, and the flag stays set.
+///
+/// Mutants: `disarm` logs the failure and returns `Ok`; it converts with `.into()`, so the code is
+/// `0x80070005`.
+#[skuld::test]
+fn a_refused_disarm_is_returned_with_the_win32_code() {
+    use super::JobHandle;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let job = JobHandle::create_without_set_access_for_test();
+
+    let err = job
+        .disarm()
+        .expect_err("the OS refuses SetInformationJobObject on this handle");
+
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{err:?}");
+}
+
+/// A `disarm` on a handle that allows it is `Ok`.
+#[skuld::test]
+fn disarm_of_an_empty_job_is_ok() {
+    super::JobHandle::create_empty_for_test()
+        .disarm()
+        .expect("a job made by the crate can be disarmed");
+}
+
+/// A `disarm` after the handle was consumed is `Ok` and does nothing: there is nothing to refuse.
+#[skuld::test]
+fn disarm_of_a_consumed_job_is_ok() {
+    let job = super::JobHandle::create_empty_for_test();
+    job.hard_kill().expect("hard_kill on a live job");
+    job.disarm().expect("a consumed handle has nothing to disarm");
+}

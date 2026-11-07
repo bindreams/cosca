@@ -484,7 +484,7 @@ pub(crate) fn held_treewalk_blocker_leaving_async(
 }
 
 #[cfg(feature = "tokio")]
-fn held_blocker_async(
+pub(crate) fn held_blocker_async(
     stdout: crate::Stdio,
     console: Console,
     contain: impl FnOnce(&mut crate::tokio::Command),

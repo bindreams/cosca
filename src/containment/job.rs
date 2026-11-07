@@ -84,11 +84,14 @@ impl Job {
     ///
     /// This is the "session ended normally, leave background processes alone" teardown path —
     /// the opposite of [`kill_tree`](Job::kill_tree)'s "peer disconnected, reap everything".
-    /// Best-effort: a failure here is logged (`log::warn!`) rather than returned, since the
-    /// backstop for a caller that never sees the log is [`kill_tree`](Job::kill_tree), which
-    /// needs no special disarmed state to work.
-    pub fn disarm(&self) {
-        self.0.disarm();
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] with the Win32 code when the OS refuses to clear the flag. The job is then
+    /// still armed: dropping this `Job` kills the tree, as it did before the call. A job already
+    /// consumed by [`kill_tree`](Job::kill_tree) has nothing to clear, and is `Ok`.
+    pub fn disarm(&self) -> Result<(), Error> {
+        self.0.disarm().map_err(Error::Io)
     }
 
     /// Block until every member of the tree has exited, or forever if none ever does.

@@ -167,12 +167,22 @@ pub(crate) fn after_the_spawn(
     unreaped: Option<Unreaped>,
     behind_wrapper: bool,
 ) -> Error {
+    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_wrapper))
+}
+
+/// [`after_the_spawn`], as the [`SpawnFailure`] a spawn returns.
+pub(crate) fn failed_after_the_spawn(
+    cause: Error,
+    fate: ChildFate,
+    unreaped: Option<Unreaped>,
+    behind_wrapper: bool,
+) -> SpawnFailure {
     let failure = SpawnFailure::started(cause, fate, unreaped);
-    Error::from(if behind_wrapper {
+    if behind_wrapper {
         failure.behind_wrapper()
     } else {
         failure
-    })
+    }
 }
 
 // Only the Unix tests take a `SpawnFailure` apart; the rest read the public `Error`.

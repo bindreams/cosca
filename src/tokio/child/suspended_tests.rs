@@ -563,6 +563,36 @@ mod on_windows {
         release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
     }
 
+    /// `resume` of a `kill_on_drop(false)` child whose job refuses the disarm fails with the
+    /// refusal as its cause, and the child is dead: killed, not released (its stdin is held).
+    ///
+    /// Mutant: `resume` ignores the commit's failure and returns the child.
+    #[skuld::test]
+    async fn resume_whose_disarm_is_refused_fails_and_kills_the_child() {
+        crate::tokio::test_runtime::assert_current_thread();
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
+        frozen.child.os.attached = crate::containment::Attached::JobObject(
+            crate::containment::windows::JobHandle::create_without_set_access_for_test(),
+        );
+        frozen.wanted_kill_on_drop = false;
+        let remote = Remote::open(frozen.pid());
+
+        let err = frozen.resume().expect_err("the disarm was refused");
+
+        let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
+        let Error::Io(io) = &cause else {
+            panic!("expected Io, got {cause:?}");
+        };
+        assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{io:?}");
+        assert_eq!(fate, ChildFate::Killed);
+        assert!(handed_back.is_none(), "an async spawn hands no child back");
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "the teardown must kill the child");
+        drop(writer);
+    }
+
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.

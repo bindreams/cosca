@@ -335,7 +335,7 @@ fn resumed_then_detached_child_is_alive(backend: &str, shape: &str) {
     // While the `Child` pins the pid: the handle that ends the child once the test is done.
     let cleanup = Watch::open_terminable(pid);
 
-    child.detach();
+    child.detach().expect("detach");
 
     common::assert_echoes(&mut sock, &format!("the detached {backend}/{shape} child"));
     cleanup.terminate_and_wait();
@@ -377,7 +377,7 @@ async fn async_resumed_then_detached_child_is_alive(backend: &str, shape: &str) 
     // While the `Child` pins the pid: the handle that ends the child once the test is done.
     let cleanup = Watch::open_terminable(pid);
 
-    child.detach();
+    child.detach().expect("detach");
     drop(child);
 
     common::assert_echoes(&mut sock, &format!("the detached async {backend}/{shape} child"));

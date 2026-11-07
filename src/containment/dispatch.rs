@@ -1258,9 +1258,17 @@ impl Attached {
     /// Not in `Drop` either: a supervisor that exits without running destructors still has its
     /// Job Object handle closed by the OS, and with `KILL_ON_JOB_CLOSE` still set that close is
     /// the kill. `detach()` disarms eagerly for the same reason.
-    pub(crate) fn honor_kill_on_drop(&self, kill_on_drop: bool) {
-        if !kill_on_drop {
-            self.disarm();
+    ///
+    /// # Errors
+    ///
+    /// The refusal of the disarm (Windows: `SetInformationJobObject`), when the handle opted out
+    /// of `kill_on_drop`: the resource is then still armed, and the caller must not hand the child
+    /// over as one cosca no longer kills.
+    pub(crate) fn honor_kill_on_drop(&self, kill_on_drop: bool) -> std::io::Result<()> {
+        if kill_on_drop {
+            Ok(())
+        } else {
+            self.disarm()
         }
     }
 
@@ -1269,7 +1277,10 @@ impl Attached {
     /// leaf, stops `Drop` firing `cgroup.kill`. No-op only for mechanisms whose resource-drop
     /// genuinely does not kill (pgroup/treewalk/fd marker/none), which `Child::drop`'s
     /// `kill_on_drop` opt-out already covers.
-    pub(crate) fn disarm(&self) {
+    ///
+    /// Only a Job Object's disarm can fail (the OS refuses `SetInformationJobObject`); the
+    /// resource is then still armed.
+    pub(crate) fn disarm(&self) -> std::io::Result<()> {
         match self {
             Attached::None | Attached::Delegated => {}
             #[cfg(unix)]
@@ -1277,12 +1288,13 @@ impl Attached {
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.disarm(), // CgroupLeaf::drop kills an occupied leaf
             #[cfg(windows)]
-            Attached::JobObject(job) => job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
+            Attached::JobObject(job) => return job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
             // dropping the read end does not kill; detach opts out via kill_on_drop
             #[cfg(target_os = "macos")]
             Attached::FdMarker(_) => {}
             Attached::TreeWalk(_) => {} // no kernel resource whose drop kills; detach opts out via kill_on_drop
         }
+        Ok(())
     }
 
     /// Whether this mechanism signals a process group named by the root's pid: `ProcessGroup`, and
