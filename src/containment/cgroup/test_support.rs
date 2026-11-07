@@ -114,6 +114,7 @@ fn fork_running_held(held: Held<'_>, keep: Option<&[std::os::fd::RawFd]>, body: 
                     let kod = KillOnDrop {
                         pid,
                         pidfd: Some(pidfd),
+                        closes_fds: keep.is_some(),
                     };
                     // Run only once `kod` exists, and only then release the lock: a seam that
                     // panics still unwinds through `kod`'s `Drop`, which kills and reaps the child.
@@ -182,8 +183,8 @@ pub(crate) const CLOSE_RANGE_FAILED_EXIT: i32 = 114;
 
 /// What a reaped [`fork_running`] child that exited with [`CLOSE_RANGE_FAILED_EXIT`] means.
 #[cfg(target_os = "linux")]
-const CLOSE_RANGE_FAILED_MESSAGE: &str =
-    "the forked child could not close its descriptors: close_range needs Linux 5.9";
+const CLOSE_RANGE_FAILED_MESSAGE: &str = "the forked child exited 114: if it came from fork_running, its close_range \
+                                          failed (it needs Linux 5.9, and a seccomp profile that allows it)";
 
 /// Closes every descriptor but those in `keep` (sorted ascending, duplicate-free), one
 /// `close_range(2)` per gap. `false` if a call failed. Async-signal-safe: for a child just forked
@@ -222,6 +223,8 @@ pub(crate) fn close_range_except(keep: &[std::os::fd::RawFd]) -> bool {
 pub(crate) struct KillOnDrop {
     pid: u32,
     pidfd: Option<std::os::fd::OwnedFd>,
+    /// The child runs `close_range` first ([`fork_running`]), so its exit 114 means that failed.
+    closes_fds: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -234,6 +237,7 @@ impl KillOnDrop {
         KillOnDrop {
             pid: child.id(),
             pidfd: Some(pidfd_of(child.id())),
+            closes_fds: false,
         }
     }
 
@@ -295,8 +299,9 @@ impl Drop for KillOnDrop {
             } else {
                 debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
             }
-        } else if reaped
-            .is_ok_and(|status| status.is_some_and(|status| status.exit_status() == Some(CLOSE_RANGE_FAILED_EXIT)))
+        } else if self.closes_fds
+            && reaped
+                .is_ok_and(|status| status.is_some_and(|status| status.exit_status() == Some(CLOSE_RANGE_FAILED_EXIT)))
         {
             if panicking {
                 _ = writeln!(std::io::stderr(), "KillOnDrop: {CLOSE_RANGE_FAILED_MESSAGE}");
