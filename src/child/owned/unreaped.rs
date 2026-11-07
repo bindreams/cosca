@@ -139,7 +139,7 @@ fn reaped_it(status: ExitStatus) -> String {
 ///
 /// - The level is `warn`, except a child someone else reaped, which is `debug` (principle 7), and
 ///   a refused kill, which is at least `warn` whatever the look found.
-/// - The kill is said whenever one was sent, a refusal with its error.
+/// - The kill is said whenever one was attempted, a refusal with its error.
 /// - A child the look did not collect says where it goes: given up, so nothing waits for it
 ///   ([`LEFT`], [`LEAVING_RUNNING`]). A kill that found nothing to signal never calls the child
 ///   running: it says what is known, that the look saw no exit yet.
@@ -163,7 +163,7 @@ pub(crate) fn let_go_line(
         None => {
             let running = match kill {
                 Some(Ok(Sent::Delivered)) => format!("{subject}; it had not exited yet{LEFT}"),
-                Some(Ok(Sent::Gone)) => format!("{subject}; the look saw no exit yet{LEFT}"),
+                Some(Ok(Sent::Gone)) => format!("{subject}; the look saw no exit yet; gave it up"),
                 _ => format!("{subject}{LEAVING_RUNNING}"),
             };
             let said = look.wording(&subject, Some(&running), Some(Disposition::Leave));

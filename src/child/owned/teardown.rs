@@ -86,7 +86,7 @@ pub(crate) const LEAVING_RUNNING: &str = if cfg!(unix) {
 
 /// What every line about a refused kill says of the child, after its subject: it "could not be
 /// terminated", with the error.
-pub(crate) fn kill_refused(refused: &Error) -> String {
+pub(crate) fn kill_refused(refused: &dyn std::fmt::Display) -> String {
     format!("could not be terminated ({refused})")
 }
 
