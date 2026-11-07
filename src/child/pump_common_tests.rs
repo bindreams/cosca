@@ -237,13 +237,18 @@ fn a_stdin_that_cannot_be_made_ready_fails_the_stdin_stream() {
 }
 
 /// An end whose reads fail, for the stdout of a pump, and the stdin end the child keeps: Unix, a
-/// directory (`read` is `EISDIR`); Windows, the child's own stdin writer, which `ReadFile` refuses
+/// loopback connection whose peer closed with `SO_LINGER` 0, a reset that `poll` reports readable
+/// and `read` fails as `ECONNRESET`; Windows, the child's own stdin writer, which `ReadFile` refuses
 /// as access denied.
 fn unreadable(stdin: Option<PipeWriter>) -> (Option<PipeWriter>, PipeReader) {
     #[cfg(unix)]
     {
-        let dir = std::fs::File::open(std::env::temp_dir()).expect("open a directory");
-        (stdin, PipeReader::from(std::os::fd::OwnedFd::from(dir)))
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let end = std::net::TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (peer, _) = listener.accept().expect("accept");
+        rustix::net::sockopt::set_socket_linger(&peer, Some(std::time::Duration::ZERO)).expect("linger");
+        drop(peer);
+        (stdin, PipeReader::from(std::os::fd::OwnedFd::from(end)))
     }
     #[cfg(windows)]
     {
