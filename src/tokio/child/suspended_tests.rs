@@ -301,9 +301,9 @@ mod on_windows {
                 .resume()
                 .expect("resume");
 
-            assert_eq!(child.kill_on_drop, kill_on_drop);
-            let Attached::JobObject(job) = &child.os.attached else {
-                panic!("expected a job, got {:?}", child.os.attached);
+            assert_eq!(child.inner.kill_on_drop, kill_on_drop);
+            let Attached::JobObject(job) = &child.inner.attached else {
+                panic!("expected a job, got {:?}", child.inner.attached);
             };
             let kills_on_close =
                 limit_flags(job).0 & windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0;
@@ -394,7 +394,7 @@ mod on_windows {
                 .expect("spawn suspended")
                 .resume()
                 .expect("resume");
-            assert_eq!(child.kill_on_drop, kill_on_drop);
+            assert_eq!(child.inner.kill_on_drop, kill_on_drop);
 
             if kill_on_drop {
                 drop_and_expect_it_killed(child, writer, "uncontained");
@@ -416,7 +416,7 @@ mod on_windows {
                     .expect("spawn suspended")
                     .resume()
                     .expect("resume");
-                assert_eq!(child.kill_on_drop, kill_on_drop, "{mode:?}");
+                assert_eq!(child.inner.kill_on_drop, kill_on_drop, "{mode:?}");
 
                 if kill_on_drop {
                     drop_and_expect_it_killed(child, writer, &format!("{mode:?}"));
@@ -573,7 +573,7 @@ mod on_windows {
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
         let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
-        frozen.child.os.attached = crate::containment::Attached::JobObject(
+        frozen.child.inner.attached = crate::containment::Attached::JobObject(
             crate::containment::windows::JobHandle::create_without_set_access_for_test(),
         );
         frozen.wanted_kill_on_drop = false;
@@ -586,8 +586,11 @@ mod on_windows {
             panic!("expected Io, got {cause:?}");
         };
         assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{io:?}");
-        assert_eq!(fate, ChildFate::Killed);
-        assert!(handed_back.is_none(), "an async spawn hands no child back");
+        assert_eq!(fate, ChildFate::Reaped);
+        assert!(
+            handed_back.is_none(),
+            "the teardown ended the child, so none is handed back"
+        );
         remote.wait_for_death();
         assert_eq!(remote.exit_code(), 1, "the teardown must kill the child");
         drop(writer);

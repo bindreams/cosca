@@ -22,9 +22,10 @@
 //! The teardown has one wait, for the root's exit after a kill that reached it. The first half
 //! ([`begin_tear_down`](OwnedChild::begin_tear_down), [`begin_look_at_front`](OwnedChild::begin_look_at_front))
 //! never blocks, and answers [`BeginOutcome::Done`] or the pending [`TeardownWait`], which a driver
-//! makes: [`settle`](TeardownWait::settle) blocks. The wait carries what the first half decided (the
-//! child, its identity, its wording), so the second half takes only the child, and asserts it is the
-//! one the first half was made on. [`OwnedChild::tear_down`] is `begin_tear_down` then `settle`.
+//! makes: [`settle`](TeardownWait::settle) blocks, and `settle_async` awaits. The wait carries what
+//! the first half decided (the child, its identity, its wording), so the second half takes only the
+//! child, and asserts it is the one the first half was made on. [`OwnedChild::tear_down`] is
+//! `begin_tear_down` then `settle`.
 //!
 //! # Look
 //!
@@ -258,12 +259,16 @@ impl TeardownOutcome {
         )
     }
 
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the async child reads the fate of a second teardown")
-    )]
+    /// What became of the child.
+    #[cfg(test)]
     pub(crate) fn fate(&self) -> ChildFate {
         self.fate
+    }
+
+    /// What the teardown said of the child, if it said anything.
+    #[cfg(test)]
+    pub(crate) fn said(&self) -> Option<&Wording> {
+        self.said.as_ref()
     }
 
     /// Whether the teardown left the child uncollected.
@@ -287,30 +292,6 @@ impl TeardownOutcome {
     )]
     pub(crate) fn refused_look(&self) -> Option<&Settlement> {
         self.refused_look.as_deref()
-    }
-
-    /// What the teardown said of the child, if it said anything.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(
-            dead_code,
-            reason = "only the async child words a second teardown's clause into its own"
-        )
-    )]
-    pub(crate) fn said(&self) -> Option<&Wording> {
-        self.said.as_ref()
-    }
-
-    /// Takes the warn of an outcome that left the child uncollected; any other is given back.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux spawn hands an uncollected child on")
-    )]
-    pub(crate) fn into_uncollected(self) -> Result<String, TeardownOutcome> {
-        match self.said {
-            Some(Wording::Uncollected(warn)) => Ok(warn),
-            said => Err(TeardownOutcome { said, ..self }),
-        }
     }
 
     /// Takes the clause for a caller with one warn: a clause at warn comes back to fold into that
@@ -429,25 +410,6 @@ impl HandleTeardown {
         HandleTeardown { outcome, expect }
     }
 
-    /// The teardown as an abandonment hands it on, if it left its child uncollected: its warn, for
-    /// the place that logs it. Any other teardown is given back.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux spawn hands a pidfd teardown's abandonment on")
-    )]
-    pub(crate) fn uncollected(self) -> Result<Left, HandleTeardown> {
-        let expect = self.expect;
-        let remains = self.outcome.remains();
-        self.outcome
-            .into_uncollected()
-            .map(|clause| Left {
-                clause,
-                remains,
-                expect,
-            })
-            .map_err(|outcome| HandleTeardown { outcome, expect })
-    }
-
     /// Says the teardown as a failed spawn's
     /// ([`failed_spawn_line`](TeardownOutcome::failed_spawn_line)): its warn, if it has one, is
     /// logged through [`warn_teardown`], which asserts the teardown's contract with its caller.
@@ -456,48 +418,6 @@ impl HandleTeardown {
         let (line, remains) = self.outcome.failed_spawn_line(why);
         warn_teardown(line.as_deref(), &remains, self.expect);
         remains
-    }
-
-    /// Logs `line` through [`warn_teardown`], as this teardown came out, for a caller that
-    /// folded the clause into its line itself.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(
-            dead_code,
-            reason = "only the async child folds a second teardown's clause into its own line"
-        )
-    )]
-    pub(crate) fn warn(&self, line: Option<&str>) {
-        warn_teardown(line, &self.outcome.remains(), self.expect);
-    }
-}
-
-/// A handle teardown that left its child uncollected, as an abandonment hands it on to the place that
-/// logs it: the clause for the caller's one warn, and what [`warn_teardown`] reads of the
-/// teardown.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Left {
-    pub(crate) clause: String,
-    pub(crate) remains: Remains,
-    pub(crate) expect: Expect,
-}
-
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux spawn tears a child down through a pidfd")
-)]
-impl Left {
-    /// Logs `line` through [`warn_teardown`]: the teardown left the child uncollected.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the tokio spawn logs the warn of an abandoned child")
-    )]
-    pub(crate) fn warn(&self, line: &str) {
-        warn_teardown(Some(line), &self.remains, self.expect);
     }
 }
 
@@ -556,8 +476,15 @@ impl OwnedChild {
     /// bounded wait: a child that is visible as exited but cannot be reaped yet (a zombie a tracer
     /// holds) is still waited for when the threshold passes, and warned of.
     ///
-    /// Returns the child's fate, and what to say of how it went ([`TeardownOutcome::said`]). It
+    /// Returns the child's fate, and what to say of how it went (the outcome's clause). It
     /// logs nothing but that slow-teardown warn.
+    #[cfg_attr(
+        not(any(target_os = "linux", windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux and Windows spawns tear a child down through this wrapper"
+        )
+    )]
     pub(crate) fn tear_down(
         &self,
         id: Option<ProcessId>,
@@ -619,27 +546,14 @@ impl OwnedChild {
         }
     }
 
-    /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
-    /// A failed reap comes back in [`TeardownOutcome::said`], as for [`tear_down`](Self::tear_down).
-    /// `subject` is what the clause calls the child: [`teardown_subject`](Self::teardown_subject)
-    /// for a plain child, and the elevation front's name for a front. `warn_after` is as for
-    /// `tear_down`.
+    /// The wait of a child a tree kill has just ended, which is sent nothing: the kill bounds the
+    /// wait, so it is always pending. `subject` is what the clause calls the child:
+    /// [`teardown_subject`](Self::teardown_subject) for a plain child, and the elevation front's
+    /// name for a front. `warn_after` is as for [`tear_down`](Self::tear_down).
     #[cfg_attr(
         not(unix),
         allow(dead_code, reason = "only a Unix teardown reaps a front a tree kill ended")
     )]
-    pub(crate) fn reap_after_tree_kill(
-        &self,
-        subject: &str,
-        disposition: Disposition,
-        warn_after: Option<Duration>,
-    ) -> TeardownOutcome {
-        self.begin_reap_after_tree_kill(None, subject.to_owned(), disposition, warn_after)
-            .settle(self)
-    }
-
-    /// The first half of [`reap_after_tree_kill`](Self::reap_after_tree_kill): the wait the tree's
-    /// kill bounds, which is always pending.
     pub(crate) fn begin_reap_after_tree_kill(
         &self,
         id: Option<ProcessId>,
@@ -650,6 +564,19 @@ impl OwnedChild {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
         TeardownWait::new(self, warn_after, true, id, subject, disposition)
+    }
+
+    /// [`begin_reap_after_tree_kill`](Self::begin_reap_after_tree_kill) settled, for the rows that
+    /// state the teardown's outcome.
+    #[cfg(test)]
+    pub(crate) fn reap_after_tree_kill(
+        &self,
+        subject: &str,
+        disposition: Disposition,
+        warn_after: Option<Duration>,
+    ) -> TeardownOutcome {
+        self.begin_reap_after_tree_kill(None, subject.to_owned(), disposition, warn_after)
+            .settle(self)
     }
 
     /// What the clause of a root teardown calls a plain child.
@@ -687,8 +614,8 @@ impl OwnedChild {
     /// `Err`: the subtree that kill went through could not be read, so whether it reached the front
     /// is not known. `id` and `warn_after` are as for [`tear_down`](Self::tear_down).
     #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "no Windows teardown looks at a front through this yet")
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux spawn looks at a front through this wrapper")
     )]
     pub(crate) fn look_at_front(
         &self,
@@ -760,8 +687,12 @@ pub(crate) enum BeginOutcome<D, W> {
 /// The wait a teardown's first half left, whichever child and kill it was made on.
 #[derive(Debug)]
 struct Pending {
-    /// The child the first half was made on.
+    /// The child the first half was made on: its pid, for what a test records.
+    #[cfg(test)]
     pid: Option<u32>,
+    /// The child's handle ([`OwnedChild::handle_id`]), which a wait carried across an await is
+    /// checked against: a pid may be absent or shared.
+    handle: usize,
     /// How long into the wait it warns that it is slow (`None`: it does not).
     warn_after: Option<Duration>,
     /// Whether a kill reached the child, as [`Settlement::new`] has it.
@@ -771,7 +702,9 @@ struct Pending {
 impl Pending {
     fn new(child: &OwnedChild, warn_after: Option<Duration>, reached: bool) -> Pending {
         Pending {
+            #[cfg(test)]
             pid: child.pid(),
+            handle: child.handle_id(),
             warn_after,
             reached,
         }
@@ -780,8 +713,24 @@ impl Pending {
     /// Blocks until `child` has exited and been reaped, and says how that ended. The threshold
     /// starts when the wait does (see [`wait_to_exit`]).
     fn settle(&self, child: &OwnedChild) -> Settlement {
-        debug_assert_eq!(self.pid, child.pid(), "a wait is settled on the child it began on");
+        debug_assert_eq!(
+            self.handle,
+            child.handle_id(),
+            "a wait is settled on the child it began on"
+        );
         Settlement::new(wait_to_exit(child, Due::in_(self.warn_after)), self.reached)
+    }
+
+    /// [`settle`](Self::settle) awaited, through [`OwnedChild::wait_async`], with no warn: the
+    /// threshold is about a blocked thread.
+    #[cfg(feature = "tokio")]
+    async fn settle_async(&self, child: &mut OwnedChild) -> Settlement {
+        debug_assert_eq!(
+            self.handle,
+            child.handle_id(),
+            "a wait is settled on the child it began on"
+        );
+        Settlement::new(child.wait_async().await, self.reached)
     }
 }
 
@@ -823,6 +772,14 @@ impl TeardownWait {
         self.outcome(&settlement)
     }
 
+    /// [`settle`](Self::settle) awaited, with no warn. By reference: a caller whose future is dropped
+    /// mid-wait still holds the wait, and settles it blocking, as the drop would.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn settle_async(&self, child: &mut OwnedChild) -> TeardownOutcome {
+        let settlement = self.pending.settle_async(child).await;
+        self.outcome(&settlement)
+    }
+
     /// What the root teardown's `settlement` says of the child: its fate and its clause, led by
     /// the subject.
     fn outcome(&self, settlement: &Settlement) -> TeardownOutcome {
@@ -850,5 +807,11 @@ impl FrontWait {
     /// says how the look ended. With a threshold, warns once past it.
     pub(crate) fn settle(self, child: &OwnedChild) -> FrontLook {
         FrontLook::ended(self.pending.settle(child), self.id)
+    }
+
+    /// [`settle`](Self::settle) awaited, with no warn, by reference as [`TeardownWait::settle_async`].
+    #[cfg(all(feature = "tokio", unix))]
+    pub(crate) async fn settle_async(&self, child: &mut OwnedChild) -> FrontLook {
+        FrontLook::ended(self.pending.settle_async(child).await, self.id)
     }
 }

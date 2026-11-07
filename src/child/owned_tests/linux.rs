@@ -1,6 +1,4 @@
-//! Linux-only `OwnedChild` test: the adopted pidfd never sits in a stdio slot. The `exit_only`
-//! Linux backend's own tests (blocking-wait contract breaches) are in
-//! `wait::exit_only::linux_tests`.
+//! Linux-only `OwnedChild` test: the adopted pidfd never sits in a stdio slot.
 
 use super::fixtures::{identity_of, spawn_std_blocker};
 use crate::child::owned::OwnedChild;

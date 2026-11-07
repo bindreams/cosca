@@ -799,6 +799,23 @@ fn a_wait_left_by_a_delivered_kill_warns_past_the_threshold_it_was_begun_with() 
     assert_eq!(warns, 1);
 }
 
+/// A wait carried across an await is settled on the child it began on, and the child's handle says
+/// so: a pid cannot, for children that have none.
+///
+/// Mutant: the check compares the children's pids, which agree when neither has one.
+#[skuld::test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "a wait is settled on the child it began on")
+)]
+fn a_wait_settled_on_another_child_is_a_breach_even_for_children_without_a_pid() {
+    let pidless = || OwnedChild::new(Box::new(FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())])));
+    let (began_on, other) = (pidless(), pidless());
+    let wait = began_on.begin_reap_after_tree_kill(None, "the child".to_owned(), Disposition::Leave, None);
+
+    _ = wait.settle(&other);
+}
+
 /// The wait a refused kill leaves when a kill sent through the containment reached the child warns
 /// past the threshold the teardown was given.
 ///

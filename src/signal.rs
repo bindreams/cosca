@@ -4,9 +4,6 @@
 #[cfg(unix)]
 use std::io;
 
-#[cfg(target_os = "linux")]
-use crate::error::io_context;
-
 /// A signal cosca sends to an owned process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sig {
@@ -46,11 +43,8 @@ pub(crate) enum Sent {
     /// Nothing was delivered because there was nothing to verify the pid against (macOS: no unique
     /// id is held). The child may be running. Not an error; logged at `debug`.
     #[cfg_attr(
-        not(any(target_os = "macos", all(unix, feature = "tokio"))),
-        allow(
-            dead_code,
-            reason = "only macOS's audit-token send and tokio's forgotten backend cannot verify a process"
-        )
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS's audit-token send cannot verify a process")
     )]
     Unverified,
 }
@@ -172,24 +166,10 @@ impl RootState {
     }
 }
 
-/// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit.
-/// `None` is a child that was already gone when its handle was made.
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only consumer is the tokio spawn's unexecuted-child wait")
-)]
-pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, sig: Sig) -> io::Result<Sent> {
-    let Some(pidfd) = pidfd else {
-        log::debug!("child {pid} has no pidfd (it was gone when adopted); {sig:?} not sent");
-        return Ok(Sent::Gone);
-    };
-    send_pidfd(pidfd, Some(pid), sig).map_err(|e| io_context("pidfd_send_signal", e.into()))
-}
-
-/// [`via_pidfd`] for a pidfd that is present, with the bare errno of a refused send, for a caller
-/// that promises its own caller the raw errno. `pid` only names the child in messages and in the
-/// test send log (where `None` is 0); the send goes by `pidfd`.
+/// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit, with
+/// the bare errno of a refused send, for a caller that promises its own caller the raw errno. `pid`
+/// only names the child in messages and in the test send log (where `None` is 0); the send goes by
+/// `pidfd`.
 #[cfg(target_os = "linux")]
 pub(crate) fn send_pidfd(
     pidfd: std::os::fd::BorrowedFd<'_>,

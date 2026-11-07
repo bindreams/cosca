@@ -12,7 +12,6 @@ use crate::child::owned::owned_tests::teardown::{
 };
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
-use crate::child::owned::unreaped::DropKind;
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
@@ -627,11 +626,7 @@ fn the_unreaped_a_failed_spawn_hands_back_for_a_front_does_what_its_policy_says_
     let record = ExitRecord::Status(std::process::ExitStatus::default());
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Reaped(record)]));
     let _blocker = ReapsBlocker::new(&owned, stdin);
-    let policy = SpawnPolicy {
-        teardown_warn_after: None,
-        unreaped_drop: DropKind::LetGo,
-    };
-    let (_, _, handed_back) = tear_down_front_under(owned, None, policy);
+    let (_, _, handed_back) = tear_down_front_under(owned, None, SpawnPolicy::LET_GO);
     let handed_back = handed_back.expect("a front left running is handed back");
     let mark = crate::log_capture::mark();
 

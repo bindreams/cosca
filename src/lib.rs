@@ -154,8 +154,6 @@ mod os_process;
 #[cfg(unix)]
 mod above_stdio;
 
-#[cfg(feature = "tokio")]
-mod bounded;
 #[cfg(all(test, unix))]
 mod send_log;
 mod signal;

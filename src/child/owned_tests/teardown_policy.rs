@@ -38,7 +38,6 @@ mod failed_spawn {
     use super::slow_to_be_reaped;
     use crate::child::owned::owned_tests::teardown::{fire_on_block, held_owned_blocker, slow_warns_during};
     use crate::child::owned::teardown::{Disposition, Past};
-    use crate::child::owned::unreaped::DropKind;
     use crate::child::spawn::held_teardown::tear_down_failed_spawn;
     use crate::child::spawn::policy::SpawnPolicy;
     use crate::child::spawn::Diagnosis;
@@ -96,10 +95,7 @@ mod failed_spawn {
             None,
             Past::WaitMayFail,
             Disposition::HandBack,
-            SpawnPolicy {
-                teardown_warn_after: None,
-                unreaped_drop: DropKind::LetGo,
-            },
+            SpawnPolicy::LET_GO,
             &mut Diagnosis::default(),
         );
         let handed_back = handed_back.expect("a child whose wait failed is handed back");

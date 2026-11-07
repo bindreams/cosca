@@ -82,27 +82,13 @@ impl Child {
     /// **macOS, a child not shown to be ours** (its handle forgotten as unproven) is sent no `SIGTERM`
     /// and the call is `Ok`: nothing proves the number is still the child's.
     pub fn terminate(&self) -> Result<(), Error> {
-        #[cfg(unix)]
-        {
-            // A front's refusal outranks a root launchd holds, as for `kill`.
-            if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
-                return Err(unkillable);
-            }
-            self.refuse_unpinned("terminate", None)?;
-        }
-        let mechanism = self.graceful_mechanism();
-        #[cfg(windows)]
-        if mechanism.addresses_a_bare_pid() && !self.proc().pins_pid() {
-            return Err(self.unpinned_pid_refusal("terminate"));
-        }
-        crate::graceful::signal(mechanism, self.pid(), |sig| self.proc().signal(sig).map(drop))
+        self.inner.terminate()
     }
 
     /// Whether the child has exited by the time `timeout` is over (`None`: until it does), looked at
-    /// through the held handle. Non-reaping, so the pid stays pinned. A child with no handle left
-    /// to watch has exited.
+    /// through the held handle. Non-reaping, so the pid stays pinned.
     async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        crate::tokio::drive::exited_opening(|| self.proc().held_os_process(), timeout).await
+        crate::tokio::drive::exited_held(self.inner.proc.os_process(), timeout).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -183,9 +169,9 @@ impl Child {
             // does not read the state again.
             #[cfg(unix)]
             {
-                self.refuse_unpinned("kill", Some("the SIGTERM"))?;
-                let gate = self.kill_gate();
-                self.kill_sent_gated("graceful_shutdown", gate)?;
+                self.inner.refuse_unpinned("kill", Some("the SIGTERM"))?;
+                let gate = self.inner.kill_gate();
+                self.inner.kill_sent_gated(gate)?;
             }
             #[cfg(not(unix))]
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
@@ -334,63 +320,65 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
     /// is not this process's to reap.
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.require_contained()?;
+        self.inner.require_contained()?;
 
         // One look at the root decides the cooperative signal (see `terminate_tree`), and what the
         // sweep may say was sent before it.
-        #[cfg(not(unix))]
-        let earlier = Some("the SIGTERM");
         #[cfg(unix)]
-        let check = || self.group_number_holds();
-        #[cfg(unix)]
-        let group = crate::containment::GroupRoot::new(self.root_pidfd(), &check);
-        #[cfg(not(unix))]
-        let group = crate::containment::GroupRoot::none();
-        #[cfg(unix)]
-        let (decided, earlier) = {
-            let call = self.tree_call(
-                crate::containment::dispatch::TreeSignal::Term,
-                "graceful_shutdown_tree",
-                None,
-            );
-            match call.graceful(|| self.root_state(), &group) {
+        let call = self.inner.tree_call(
+            crate::containment::dispatch::TreeSignal::Term,
+            "graceful_shutdown_tree",
+            None,
+        );
+        // This handle's reaps are held off from the look until the `SIGTERM` is sent, as in the sync
+        // twin. The hold is a std lock: nothing in this block awaits, and the paths that send nothing
+        // by the root's number leave it before they wait the grace.
+        let (term_result, earlier) = {
+            #[cfg(unix)]
+            let held = self.inner.proc.hold(self.pid());
+            #[cfg(unix)]
+            let group = held.group();
+            #[cfg(not(unix))]
+            let group = crate::containment::GroupRoot::none();
+            #[cfg(unix)]
+            let (decided, earlier) = match call.graceful(|| held.state(), &group) {
                 crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
                 crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
                 crate::child::Graceful::End(e) => return Err(e),
                 #[cfg(target_os = "linux")]
                 crate::child::Graceful::RootThroughPidfd(why) => {
-                    return Err(self.shut_down_root_through_pidfd(&call, grace, &why).await)
+                    drop(held);
+                    return Err(self.shut_down_root_through_pidfd(&call, grace, &why).await);
                 }
                 #[cfg(target_os = "macos")]
                 crate::child::Graceful::HoldersOnly(why) => {
-                    return Err(self.shut_down_holders_only(&call, grace, &why).await)
+                    drop(held);
+                    return Err(self.shut_down_holders_only(&call, grace, &why).await);
                 }
-            }
-        };
-        let term_signal = || {
-            #[cfg(unix)]
-            if let Some(result) = decided {
-                return result;
-            }
-            self.terminate_tree_unchecked(&group)
-        };
+            };
+            #[cfg(not(unix))]
+            let earlier = Some("the SIGTERM");
+            let term_signal = || {
+                #[cfg(unix)]
+                if let Some(result) = decided {
+                    return result;
+                }
+                self.inner.terminate_tree_unchecked(&group)
+            };
 
-        #[cfg(test)]
-        let term_result = match fault::take_force_terminate() {
-            fault::Forced::None => term_signal(),
-            kind => Err(fault::forced_terminate_error(kind)),
+            #[cfg(test)]
+            let term_result = match fault::take_force_terminate() {
+                fault::Forced::None => term_signal(),
+                kind => Err(fault::forced_terminate_error(kind)),
+            };
+            #[cfg(not(test))]
+            let term_result = term_signal();
+            (term_result, earlier)
         };
-        #[cfg(not(test))]
-        let term_result = term_signal();
 
         // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
         // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
         // per-member rationale it shares.
-        //
-        // One shape reaches this arm that the sync twin cannot produce: the unpinned-pid refusal
-        // (`Child::unpinned_pid_refusal`, Windows), where NO signal was sent at all. Held anyway
-        // — not because a reply may still arrive, but for the sweep and, on a drain-observing
-        // mechanism, the window; see this function's rustdoc for what it costs per mechanism.
         let term = match term_result {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
@@ -427,7 +415,7 @@ impl Child {
             (false, false, Some(e))
         } else if self.containment().can_observe_drain() {
             match crate::tokio::wait::wait_tree_drained_dispatch(
-                &self.os.attached,
+                &self.inner.attached,
                 crate::tokio::wait::deadline_from(grace),
             )
             .await
@@ -472,7 +460,7 @@ impl Child {
             let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {
+                if (root_exited || sweep.root_ended) && !self.inner.root_is_unpinned() {
                     // Best-effort reap so a dead root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
@@ -490,12 +478,8 @@ impl Child {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         #[cfg(target_os = "macos")]
-        if self.root_is_unpinned() {
+        if self.inner.root_is_unpinned() {
             return Err(crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"));
-        }
-        #[cfg(unix)]
-        if self.os.proc.as_ref().is_some_and(|proc| proc.forgot_unproven()) {
-            return Err(crate::child::tree_call::status_of_an_unproven_root(self.pid()));
         }
         #[cfg(unix)]
         let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.pid())?;
@@ -526,18 +510,16 @@ impl Child {
         grace: Duration,
         why: &str,
     ) -> Error {
-        let shutdown =
-            match crate::child::PidfdShutdown::start(self.terminate_gate(), || self.term_root_through_handle()) {
-                Ok(shutdown) => shutdown,
-                Err(unkillable) => return unkillable,
-            };
+        let shutdown = match crate::child::PidfdShutdown::start(self.inner.terminate_gate(), || {
+            self.inner.proc.signal(crate::signal::Sig::Term)
+        }) {
+            Ok(shutdown) => shutdown,
+            Err(unkillable) => return unkillable,
+        };
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
         let exited = if shutdown.needs_grace() {
-            Some(match self.os.proc.as_ref() {
-                Some(proc) => proc.exited_within(grace).await,
-                None => Ok(true),
-            })
+            Some(self.exited_through_handle(Some(grace)).await)
         } else {
             None
         };
@@ -545,8 +527,12 @@ impl Child {
             call,
             why,
             exited,
-            || self.kill_gate(),
-            || self.kill_root_through_handle(),
+            || self.inner.kill_gate(),
+            || {
+                self.inner
+                    .kill_root()
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.inner.is_elevated_wrapper()))
+            },
         )
     }
 
@@ -554,9 +540,11 @@ impl Child {
     #[cfg(target_os = "macos")]
     async fn shut_down_holders_only(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
         let term = call.holders_term();
-        if let Err(e) =
-            crate::tokio::wait::wait_tree_drained_dispatch(&self.os.attached, crate::tokio::wait::deadline_from(grace))
-                .await
+        if let Err(e) = crate::tokio::wait::wait_tree_drained_dispatch(
+            &self.inner.attached,
+            crate::tokio::wait::deadline_from(grace),
+        )
+        .await
         {
             call.holders_grace_failed(&e);
         }

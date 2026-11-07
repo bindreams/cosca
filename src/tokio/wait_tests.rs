@@ -14,10 +14,13 @@ use crate::test_child::Console;
 use super::armed_deadline_seam::Armed;
 use crate::identity::ProcessId;
 
-/// The exit watch these tests drive: [`exited_opening`](crate::tokio::drive::exited_opening) over the
-/// process `id` names. Nothing outside the tests watches by number.
+/// The exit watch these tests drive: [`exited_held`](crate::tokio::drive::exited_held) over the
+/// process `id` names; one that is gone has exited. Nothing outside the tests watches by number.
 async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, crate::error::Error> {
-    crate::tokio::drive::exited_opening(|| crate::os_process::open(id), timeout).await
+    let Some(process) = crate::os_process::open(id)? else {
+        return Ok(true);
+    };
+    crate::tokio::drive::exited_held(&*process, timeout).await
 }
 
 // A long-lived std child (leak-proof: killed + reaped by each test) that only a kill or a closed
@@ -1099,31 +1102,4 @@ async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
 
     drop(stdin);
     child.wait().expect("reap /bin/sh");
-}
-
-/// A grace too long to arm a timer for waits on the pidfd with none, and answers the exit it sees.
-///
-/// Mutant: an overflowing grace answered as expired (`Ok(false)`) without waiting.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn pidfd_exited_within_an_overflowing_grace_waits_with_no_timer() {
-    use std::os::fd::AsFd as _;
-    crate::tokio::test_runtime::assert_current_thread();
-    let mut child = std_blocker();
-    let pid = child.id();
-    child.kill().expect("kill the child");
-    crate::test_child::wait_until_zombie(pid);
-    let pidfd = rustix::process::pidfd_open(
-        rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
-        rustix::process::PidfdFlags::empty(),
-    )
-    .expect("pidfd_open the zombie");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _seam = super::armed_deadline_seam::install(tx);
-
-    let exited = super::pidfd_exited_within(pidfd.as_fd(), Duration::MAX).await;
-
-    assert!(matches!(exited, Ok(true)), "{exited:?}");
-    assert!(rx.try_recv().is_err(), "no timer is armed for a grace that overflows");
-    child.wait().expect("reap the child");
 }

@@ -8,16 +8,6 @@ use std::path::PathBuf;
 use super::*;
 
 #[cfg(target_os = "linux")]
-use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Left, Past, Reach};
-#[cfg(target_os = "linux")]
-use crate::child::owned::OwnedChild;
-#[cfg(target_os = "linux")]
-use crate::child::spawn::held_teardown::{look_at_failed_spawn_front, tear_down_expecting};
-#[cfg(target_os = "linux")]
-use crate::error::ChildFate;
-#[cfg(target_os = "linux")]
-use crate::os_process::linux::LinuxProcess;
-#[cfg(target_os = "linux")]
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -210,8 +200,7 @@ pub(crate) struct CgroupLeaf {
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
     /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
-    /// abandoned before its verdict, an async `Drop` released it
-    /// ([`release_without_waiting`](Self::release_without_waiting)), or it was torn down.
+    /// abandoned before its verdict, or it was torn down.
     pub(super) abandoned: bool,
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
@@ -548,9 +537,6 @@ impl CgroupLeaf {
         deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use event_listener::Listener as _;
-
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
 
         // Only the bounded arm advances the frozen clock, so only it is checked.
         #[cfg(test)]
@@ -1052,25 +1038,6 @@ impl CgroupLeaf {
     }
 }
 
-/// How an abandoned spawn's child ended up (see [`CgroupLeaf::abandon_before_verdict`]).
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Abandoned {
-    /// The child's teardown collected it: nothing of it is owed more. Says what became of it.
-    Ended(ChildFate),
-    /// The teardown of the child left it uncollected (its kill refused and it running, a wait or
-    /// look that failed). Says what the teardown found: its clause, for the caller's one warn,
-    /// which the failed spawn's label leads, and what its warn asserts, for the caller to log
-    /// through [`Left::warn`].
-    Uncollected(Left),
-    /// The child is an elevation front, which was sent no signal of its own (see
-    /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
-    Front(crate::child::spawn::FrontFate),
-    /// The exchange was already ended: a breach of the call-once contract, which debug builds
-    /// assert. Nothing is claimed of the child.
-    Repeated,
-}
-
 /// What [`CgroupLeaf::abandon_without_child`] found of a child it was given no handle for.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,109 +1056,9 @@ pub(crate) enum WithoutChild {
 }
 
 #[cfg(target_os = "linux")]
-impl Abandoned {
-    /// The answer for a child torn down through its pidfd as `torn` says. A child the teardown
-    /// collected is `Ended`, and the teardown's clause is said as a failed spawn's. One it left
-    /// uncollected is [`Uncollected`](Abandoned::Uncollected), with the clause as the one warn the
-    /// caller logs, and the teardown's verdict. `why`, what the abandonment found wrong on the way,
-    /// leads that one warn, or is logged on its own if the teardown has none.
-    fn of_teardown(torn: HandleTeardown, why: &mut crate::child::spawn::Diagnosis) -> Abandoned {
-        match torn.uncollected() {
-            Ok(mut left) => {
-                left.clause = why.fold(&left.clause);
-                Abandoned::Uncollected(left)
-            }
-            Err(collected) => Abandoned::Ended(collected.say_as_failed_spawn(why).fate),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// End the exchange of a spawn that failed before its verdict (see the module's contract),
-    /// and answer for its `child`: kill it, kill through the leaf if it entered, reap it, and
-    /// remove the leaf.
-    ///
-    /// Called once per leaf: the channel is taken once, and a repeat is a breach, which debug
-    /// builds assert and which is answered [`Abandoned::Repeated`]. `Drop` does nothing
-    /// after it.
-    ///
-    /// `child` is the pidfd the spawn's handshake holds for the child, with what the handshake
-    /// knows became of it ([`Past`]). The leaf is its one owner from here. A spawn path that
-    /// still holds its child takes the verdict first, so only a spawn whose child no handle owns
-    /// reaches this: tokio drops a child it forked and then failed to set up, neither killed nor
-    /// reaped. A spawn that has no child to give (`std` collected it, or none was forked) ends
-    /// through [`abandon_without_child`](Self::abandon_without_child).
-    ///
-    /// A child that exec'd outside the leaf is killed as the process group it leads first
-    /// ([`kill_group_outside_leaf`]). Then, whatever the child, the leaf is killed through if the
-    /// child entered it (one write: a failure is final and reported), the child is torn down (a
-    /// kill its pidfd refuses is reaped if the leaf's kill reached it), and only then is the leaf
-    /// removed: a child that entered but whose report the shut beat is still in the leaf until it
-    /// is gone. A leaf whose id cannot be read places the child through `/proc`.
-    ///
-    /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
-    /// its own, which would orphan its elevated program: it is looked at instead, and waited for
-    /// if the leaf's kill reached it.
-    ///
-    /// `warn` is for the wait for the leaf's drain and for the child's exit.
-    pub(crate) fn abandon_before_verdict(
-        &mut self,
-        front: bool,
-        (pidfd, past): (OwnedFd, Past),
-        warn: &mut dyn TeardownWarn,
-    ) -> Abandoned {
-        let Some(received) = self.shut_exchange() else {
-            debug_assert!(false, "the leaf answers for a child once");
-            return Abandoned::Repeated;
-        };
-        let owned = OwnedChild::new(Box::new(LinuxProcess::new(received.pid, pidfd)));
-        // What the abandonment finds wrong on the way, owed to the event's one warn.
-        let mut why = crate::child::spawn::Diagnosis::default();
-        // A child that never named itself is no front. Only a child that reported goes on to
-        // `exec`: one that named itself and sent no report never runs the program, and is answered
-        // as any child.
-        let front_pid = received.pid.filter(|_| front && received.report.is_some());
-        if let Some(pid) = front_pid {
-            self.watch_front(pid);
-        } else if let (Some(pid), Some(PlacementReport::WriteFailed(_))) = (received.pid, received.report) {
-            if let Some(refused) = kill_group_outside_leaf(&owned, pid) {
-                why.add(refused);
-            }
-        }
-        // A kill through the leaf can reach something only if the child entered it. An id that
-        // cannot be read leaves the subtree to place a task through `/proc`.
-        let subtree = self.entered.then(|| {
-            self.subtree().unwrap_or_else(|e| {
-                log::debug!("cgroup v2: an abandoned spawn's leaf subtree cannot be read ({e}); placing by /proc");
-                self.subtree_with(None)
-            })
-        });
-        self.kill_entered(&mut why);
-        let tree = subtree.as_ref().map(|subtree| subtree as &dyn Reach);
-        // The leaf stays until the child is gone: a child that entered it but whose report the shut
-        // beat is not counted entered, and its leaf cannot be removed while it runs.
-        let abandoned = if front_pid.is_some() {
-            let (fate, torn) =
-                look_at_failed_spawn_front(&owned, None, Ok(tree), Disposition::Leave, warn.warn_after());
-            HandleTeardown::new(torn, Expect::of(&owned, past)).say_as_failed_spawn(&mut why);
-            Abandoned::Front(fate)
-        } else {
-            let kill = Kill {
-                disposition: Disposition::Leave,
-                tree,
-            };
-            Abandoned::of_teardown(
-                tear_down_expecting(&owned, None, kill, past, warn.warn_after()),
-                &mut why,
-            )
-        };
-        self.remove_abandoned(warn);
-        abandoned
-    }
-
-    /// End the exchange of a spawn that has no child to give the leaf (see
-    /// [`abandon_before_verdict`](Self::abandon_before_verdict)): kill through the leaf if the
+    /// End the exchange of a spawn that has no child to give the leaf (a spawn failed before its
+    /// verdict, and `std` collected the child, or none was forked): kill through the leaf if the
     /// child entered it, and remove the leaf. Nothing is sent to the child, which nothing here
     /// holds. Answers whether the child named itself ([`WithoutChild`]).
     ///
@@ -1341,8 +1208,7 @@ impl CgroupLeaf {
     }
 
     /// Says what is to be said of a leaf whose `rmdir` failed with `first`, that this teardown did
-    /// not kill through and does not wait for. The one table for [`tear_down`](Self::tear_down)
-    /// and `release_without_waiting`:
+    /// not kill through and does not wait for. The one table for [`tear_down`](Self::tear_down):
     ///
     /// | child entered | a kill failed | said                                                  |
     /// |---------------|---------------|-------------------------------------------------------|
@@ -1399,39 +1265,6 @@ impl CgroupLeaf {
             format_args!("rmdir failed ({first}) after its spawn was abandoned; {why}"),
         );
     }
-}
-
-/// `SIGKILL` the process group the abandoned spawn's child `pid` leads, through its handle `child`:
-/// a child that reported a failed placement exec'd outside the leaf, so what it forked is reached
-/// only as that group. Through the child's pidfd, which names the group exactly while the group has a
-/// member (Linux 6.9+); by `pid` only where the kernel refuses that, right after a check that the
-/// child is still unreaped through its handle. A group that has no member left is logged at
-/// `debug`. One the kill is refused or not sent to is returned, worded for the abandonment's one
-/// warn, which the caller owes: its members may be left running. Sent before anything else is,
-/// while the child is as it was.
-#[cfg(target_os = "linux")]
-fn kill_group_outside_leaf(child: &OwnedChild, pid: u32) -> Option<String> {
-    let Some(pgid) = i32::try_from(pid).ok().filter(|pgid| *pgid > 0) else {
-        debug_assert!(false, "a received pid names a process: {pid}");
-        return None;
-    };
-    let sent = {
-        let held = child.hold(pid);
-        crate::containment::unix::send_to_group(pgid, nix::sys::signal::Signal::SIGKILL, &held.group())
-    };
-    let refused = match sent {
-        Ok(Ok(())) => return None,
-        Ok(Err(nix::errno::Errno::ESRCH)) => {
-            log::debug!("cgroup v2: an abandoned spawn's child's process group {pid} has no member left");
-            return None;
-        }
-        Ok(Err(e)) => e.to_string(),
-        Err(e) => e.to_string(),
-    };
-    Some(format!(
-        "cgroup v2: could not kill an abandoned spawn's child's process group {pid} ({refused}); \
-         its members may be left running"
-    ))
 }
 
 /// What can make a leaf refuse its `rmdir` after its tree was killed and drained and its child
@@ -1666,8 +1499,6 @@ pub(crate) const ABANDONED_EXIT: i32 = 125;
 pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
     // Safety: the caller's guarantee: this is the forked child.
     unsafe { slot.close_parents_end() };
-    #[cfg(test)]
-    fault::die_if_at(fault::ChildDeath::BeforeIntent);
     // Safety: the caller's guarantee.
     match unsafe { place_self_in_cgroup_pre_exec(procs_fd, slot) } {
         // Safety: `_exit` is async-signal-safe, and runs nothing of this process's.
@@ -1710,8 +1541,6 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
             _ => Ok(()),
         };
     }
-    #[cfg(test)]
-    fault::die_if_at(fault::ChildDeath::BeforeReport);
     // Test-only fault seam: a write that returns this instead of writing (take semantics — see
     // `fault`), so a failed placement leaves the child out of the leaf, as a real one does.
     #[cfg(test)]
@@ -1748,23 +1577,11 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     }
 }
 
-#[cfg(all(feature = "tokio", target_os = "linux"))]
-#[path = "leaf/release.rs"]
-mod release;
-
 #[cfg(target_os = "linux")]
 #[path = "leaf/slow_drain.rs"]
 mod slow_drain;
 #[cfg(target_os = "linux")]
 pub(crate) use slow_drain::*;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "leaf/group_kill_tests.rs"]
-mod group_kill_tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "leaf/of_teardown_tests.rs"]
-mod of_teardown_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]
@@ -1777,10 +1594,6 @@ mod leaf_state_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "placement_reuse_tests.rs"]
 mod placement_reuse_tests;
-
-#[cfg(all(test, target_os = "linux", feature = "tokio"))]
-#[path = "leaf/slow_teardown_tests.rs"]
-mod slow_teardown_tests;
 
 #[cfg(all(test, target_os = "linux", feature = "tokio"))]
 #[path = "leaf/abandon_drain_tests.rs"]

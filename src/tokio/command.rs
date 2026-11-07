@@ -241,7 +241,7 @@ impl Command {
     }
 
     /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.inner.set_elevation_front(front);
     }
@@ -256,7 +256,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.wait().await {
             Ok(status) => Ok(status),
-            Err(e) => Err(after_the_spawn(e, &mut child).await),
+            Err(e) => Err(after_the_spawn(e, child).await),
         }
     }
 
@@ -270,7 +270,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.communicate(None).await {
             Ok(output) => Ok(output),
-            Err(e) => Err(after_the_spawn(e, &mut child).await),
+            Err(e) => Err(after_the_spawn(e, child).await),
         }
     }
 
@@ -283,7 +283,7 @@ impl Command {
         let mut child = self.spawn()?;
         let out = match child.communicate(None).await {
             Ok(out) => out,
-            Err(e) => return Err(after_the_spawn(e, &mut child).await),
+            Err(e) => return Err(after_the_spawn(e, child).await),
         };
         // `communicate` collected the exit.
         String::from_utf8(out.stdout).map_err(|e| {
@@ -295,29 +295,15 @@ impl Command {
             )
         })
     }
-
-    /// Test-only spawn variant that installs a per-instance wait observer on the resulting raw
-    /// child, so a cancellation test observes exactly THIS child's blocking wait (see the raw
-    /// backend's `WaitObserver`) rather than racing a parallel test. Routes through the normal
-    /// spawn, so the config must reach the raw backend (executable, uncontained, no fd >= 3).
-    #[cfg(all(test, windows))]
-    pub(crate) fn spawn_with_wait_observer(
-        &mut self,
-        started: ::tokio::sync::oneshot::Sender<()>,
-        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
-    ) -> Result<Child, Error> {
-        let mut child = self.spawn()?;
-        child.install_wait_observer(started, outcome);
-        Ok(child)
-    }
 }
 
 /// The error of a run-to-completion helper that failed after its spawn: the program may have
 /// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
-/// The teardown says what became of the child.
-pub(super) async fn after_the_spawn(error: Error, child: &mut Child) -> Error {
-    let fate = child.tear_down_awaiting().await;
-    crate::child::spawn::after_the_spawn(error, fate, None, child.behind_wrapper())
+/// The teardown says what became of the child, and hands it back if it could not end it.
+pub(super) async fn after_the_spawn(error: Error, child: Child) -> Error {
+    let behind_wrapper = child.behind_wrapper();
+    let (fate, unreaped) = child.tear_down_awaiting().await;
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
 }
 
 #[cfg(test)]

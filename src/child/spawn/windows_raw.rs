@@ -67,11 +67,6 @@ mod proc;
 
 // The exit-status reader, which `wait::exit_only` reads a signalled handle's code through too.
 pub(crate) use proc::exit_status;
-// Additional seams the async raw backend reuses: the cancellable handle wait + its
-// outcome. The sync path uses these only inside `proc`, so the re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
-// needs no re-export.)
-#[cfg(feature = "tokio")]
-pub(crate) use proc::{wait_handle_or_cancel, WaitOutcome};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

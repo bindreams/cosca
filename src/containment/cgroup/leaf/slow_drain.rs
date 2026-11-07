@@ -4,17 +4,15 @@
 use super::*;
 use crate::wait::teardown_warn::{wait_warning, Due};
 
-/// What a teardown's blocking waits say once they are slow (principles 2 and 3). The caller that
-/// abandons the leaf passes it; the leaf's own `Drop` makes its own from the spawn's policy.
-/// [`warn_after`](Self::warn_after) is also the threshold of the wait for the child a leaf's
-/// abandonment kills, which the child's own teardown warns of.
+/// What a teardown's blocking waits say once they are slow (principles 2 and 3). The leaf's own
+/// `Drop` makes its own from the spawn's policy; a test passes its own. `warn_after` is how long
+/// into a wait the warn is due, or `None` if it does not warn.
 pub(crate) trait TeardownWarn {
+    /// How long into a wait the warn is due, or `None` if it does not warn.
+    fn warn_after(&self) -> Option<std::time::Duration>;
     /// When a wait starting now warns, or `None` if it does not.
-    fn due(&self) -> Option<Due>;
-    /// How long into a wait the warn is due, or `None` if it does not warn: the threshold the
-    /// teardown of a child gets, whose own wait starts later and builds its own [`Due`].
-    fn warn_after(&self) -> Option<std::time::Duration> {
-        self.due().map(|due| due.after)
+    fn due(&self) -> Option<Due> {
+        Due::in_(self.warn_after())
     }
     /// The one warn of the wait for the drain of the leaf at `leaf` that passed
     /// [`due`](Self::due).
@@ -27,7 +25,7 @@ pub(crate) struct NoWarn;
 
 #[cfg(test)]
 impl TeardownWarn for NoWarn {
-    fn due(&self) -> Option<Due> {
+    fn warn_after(&self) -> Option<std::time::Duration> {
         None
     }
 
@@ -39,8 +37,8 @@ impl TeardownWarn for NoWarn {
 pub(crate) struct WarnAfter(pub(crate) Option<std::time::Duration>);
 
 impl TeardownWarn for WarnAfter {
-    fn due(&self) -> Option<Due> {
-        Due::in_(self.0)
+    fn warn_after(&self) -> Option<std::time::Duration> {
+        self.0
     }
 
     fn warn(&mut self, leaf: &std::path::Path) {
@@ -60,8 +58,6 @@ impl CgroupLeaf {
     /// joined first, so the wait needs no thread. Every blocking teardown wait for a leaf's drain is
     /// this one; see [`wait_warning`].
     pub(crate) fn wait_drained_then_warn(&mut self, warn: &mut dyn TeardownWarn) -> Result<(), crate::error::Error> {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
         let path = &self.leaf_path;
         match self.watch.get_mut() {
             Some(watch) => wait_warning(
@@ -77,11 +73,5 @@ impl CgroupLeaf {
             ),
             None => Ok(()),
         }
-    }
-
-    /// Drop the leaf as [`Drop`] does, with `warn` for each wait.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn drop_warning(mut self, warn: &mut dyn TeardownWarn) {
-        self.tear_down(warn);
     }
 }

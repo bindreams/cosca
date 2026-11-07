@@ -26,20 +26,6 @@ pub(crate) struct Forgot {
     pub(crate) cause: Option<String>,
 }
 
-impl Forgot {
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the async child forgets tokio's `Child`")
-    )]
-    /// Whether the child was shown reaped by someone else (or held by launchd), rather than merely
-    /// not shown to be ours, in which case it may still be running.
-    pub(crate) fn reaped_elsewhere(&self) -> bool {
-        self.now
-            .as_ref()
-            .is_none_or(|state| !matches!(state, RootState::Unknown(_)))
-    }
-}
-
 /// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
 /// event reported from something new.
 #[derive(Debug, Clone, PartialEq, Eq)]

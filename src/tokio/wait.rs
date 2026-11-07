@@ -157,23 +157,6 @@ pub(crate) async fn watch_pidfd<F: std::os::fd::AsRawFd>(pidfd: F) -> Result<(),
     }
 }
 
-/// Whether the process `pidfd` names has exited by the time `grace` is over, read only through the
-/// pidfd: non-reaping, and no pid is looked up. A `grace` that overflows, or sits inside tokio's
-/// timer margin, is unbounded.
-#[cfg(target_os = "linux")]
-pub(crate) async fn pidfd_exited_within(pidfd: std::os::fd::BorrowedFd<'_>, grace: Duration) -> Result<bool, Error> {
-    let watched = pidfd.try_clone_to_owned().map_err(Error::Io)?;
-    match deadline_from(grace) {
-        Some(at) => match arm_at(at, watch_pidfd(watched)).await {
-            Some(watch) => watch.map(|()| true),
-            // The timer can win the first poll before the reactor reports an exit that was already
-            // pending: answer from one final non-blocking look.
-            None => crate::os_process::poll::poll_readable(pidfd, Some(crate::wait::now())).map_err(Error::Io),
-        },
-        None => watch_pidfd(watched).await.map(|()| true),
-    }
-}
-
 /// Map a pidfd readiness to the watch verdict; `None` = unclassified readiness (tokio's
 /// documented `ready()` false positive) — re-await: never a false "exited" (which would skip
 /// escalation on a live child) and never a false watch failure (which would force-kill a
@@ -430,12 +413,6 @@ pub(crate) async fn cgroup_wait_tree_drained(
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::cgroup::DrainStep;
 
-    #[cfg(test)]
-    if crate::tokio::child::fault::take_fail_drain_watch() {
-        return Err(Error::Io(std::io::Error::other(
-            "forced drain watch failure (test seam)",
-        )));
-    }
     loop {
         match leaf.drain_step_on(deadline, tokio_now)? {
             DrainStep::Done(drain) => return Ok(drain),
