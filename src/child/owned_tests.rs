@@ -33,6 +33,9 @@ mod traced;
 mod tracer;
 #[path = "owned_tests/unreaped.rs"]
 mod unreaped;
+#[cfg(feature = "tokio")]
+#[path = "owned_tests/wait_async.rs"]
+mod wait_async;
 #[cfg(windows)]
 #[path = "owned_tests/windows.rs"]
 mod windows;

@@ -84,6 +84,12 @@ pub(crate) const LEAVING_RUNNING: &str = if cfg!(unix) {
     "; leaving it running"
 };
 
+/// What every line about a refused kill says of the child, after its subject: it "could not be
+/// terminated", with the error.
+pub(crate) fn kill_refused(refused: &impl std::fmt::Display) -> String {
+    format!("could not be terminated ({refused})")
+}
+
 /// How [`OwnedChild::tear_down`] kills the child, then settles it as the module doc says.
 pub(crate) struct Kill<'a> {
     pub(crate) disposition: Disposition,
@@ -587,7 +593,7 @@ impl OwnedChild {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
         let refused_kind = refusal_kind(&refused);
-        let subject = format!("{} could not be terminated ({refused})", child_named(self.pid()));
+        let subject = format!("{} {}", child_named(self.pid()), kill_refused(&refused));
         // Still running: the caller that leaves it says so, and that nothing reaps it.
         let running = match disposition {
             Disposition::Leave => format!("{subject}{LEAVING_RUNNING}"),
