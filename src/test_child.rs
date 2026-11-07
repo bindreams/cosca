@@ -15,6 +15,16 @@ pub(crate) mod pid_reuse;
 #[cfg(windows)]
 pub(crate) mod ctrl_break;
 
+/// The handle a spawn's parent end holds, for a test that inspects it.
+#[cfg(windows)]
+pub(crate) fn parent_handle(end: &crate::pipe::ParentEnd) -> std::os::windows::io::BorrowedHandle<'_> {
+    use std::os::windows::io::AsHandle;
+    match end {
+        crate::pipe::ParentEnd::Reader(r) => r.as_handle(),
+        crate::pipe::ParentEnd::Writer(w) => w.as_handle(),
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod unwaitable;
 

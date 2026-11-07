@@ -1860,7 +1860,7 @@ fn every_pipe_a_spawn_makes_is_overlapped_in_the_parent_and_synchronous_in_the_c
             "{dir:?}: the child's end is overlapped"
         );
         assert!(
-            is_overlapped(parent_end.as_handle()).expect("query the parent's end"),
+            is_overlapped(crate::test_child::parent_handle(&parent_end)).expect("query the parent's end"),
             "{dir:?}: the parent's end is synchronous"
         );
     }

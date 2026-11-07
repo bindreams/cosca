@@ -15,10 +15,6 @@
 //! it aborts the process instead.
 
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
-#[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
 
 #[cfg(unix)]
 mod unix;
@@ -32,52 +28,11 @@ use windows as sys;
 
 pub(crate) use sys::child_pipe;
 
-/// A parent-side pipe end retained for a configured descriptor. Projects to the end it holds
-/// through `AsHandle`/`AsRawHandle` (Windows) and `AsFd`/`AsRawFd` (Unix).
+/// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
     Reader(PipeReader),
     Writer(PipeWriter),
-}
-
-#[cfg(windows)]
-impl AsHandle for ParentEnd {
-    fn as_handle(&self) -> BorrowedHandle<'_> {
-        match self {
-            ParentEnd::Reader(r) => r.as_handle(),
-            ParentEnd::Writer(w) => w.as_handle(),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl AsRawHandle for ParentEnd {
-    fn as_raw_handle(&self) -> RawHandle {
-        match self {
-            ParentEnd::Reader(r) => r.as_raw_handle(),
-            ParentEnd::Writer(w) => w.as_raw_handle(),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl AsFd for ParentEnd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            ParentEnd::Reader(r) => r.as_fd(),
-            ParentEnd::Writer(w) => w.as_fd(),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for ParentEnd {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            ParentEnd::Reader(r) => r.as_raw_fd(),
-            ParentEnd::Writer(w) => w.as_raw_fd(),
-        }
-    }
 }
 
 /// The parent's read end of a pipe to a child.

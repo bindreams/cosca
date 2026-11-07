@@ -112,6 +112,21 @@ fn two_threads_read_one_end_without_abort() {
     }
 }
 
+/// A clone reads the same stream as its original: what one took, the other does not see again.
+/// (Which thread reads what in the two-thread row is the scheduler's; this pins the clone itself.)
+#[skuld::test]
+fn a_clone_reads_on_where_its_original_stopped() {
+    let (reader, mut theirs) = reader_pair();
+    let clone = reader.try_clone().expect("clone");
+    theirs.write_all(b"ab").expect("send");
+    drop(theirs);
+    let mut first = [0; 1];
+    (&reader).read_exact(&mut first).expect("the original reads");
+    let mut rest = Vec::new();
+    (&clone).read_to_end(&mut rest).expect("the clone reads");
+    assert_eq!((&first[..], &rest[..]), (&b"a"[..], &b"b"[..]));
+}
+
 #[skuld::test]
 fn two_threads_write_one_end_without_abort() {
     for _ in 0..20 {

@@ -3,15 +3,13 @@
 //! takes them: the raw backend's std slots and fd >= 3, and a std-path merge target. The std
 //! path's other piped slots are tokio's own.
 
-use std::os::windows::io::AsHandle as _;
-
 use crate::pipe::windows::is_overlapped;
 use crate::pipe::ParentEnd;
 use crate::stdio::{Direction, Fd, Stdio};
 use crate::test_child::Console;
 
 fn overlapped(end: &ParentEnd) -> bool {
-    is_overlapped(end.as_handle()).expect("query the mode")
+    is_overlapped(crate::test_child::parent_handle(end)).expect("query the mode")
 }
 
 /// Mutant: the raw backend or the merge pre-pass makes its pipe with `std::io::pipe`.

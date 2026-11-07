@@ -85,7 +85,7 @@ fn associated_pipe(dir: crate::stdio::Direction) -> (ParentEnd, std::fs::File, s
     use windows::Win32::System::IO::CreateIoCompletionPort;
 
     let (theirs, ours) = crate::pipe::child_pipe(dir).expect("make the pipe");
-    let handle = ours.as_raw_handle();
+    let handle = std::os::windows::io::AsRawHandle::as_raw_handle(&crate::test_child::parent_handle(&ours));
     // SAFETY: no file handle and no existing port: makes a new port, which the guard closes.
     let port = unsafe { CreateIoCompletionPort(HANDLE(-1isize as *mut _), None, 0, 0) }.expect("make the port");
     // SAFETY: `port` is new and ours alone.
@@ -157,6 +157,7 @@ fn assert_write_peer_saw_epipe(mut peer: impl Write) {
 #[skuld::test]
 async fn fd_read_end_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -175,6 +176,7 @@ async fn fd_read_end_warns_returns_none_and_closes_the_end_on_a_failed_conversio
 #[skuld::test]
 async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -193,6 +195,7 @@ async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversi
 #[skuld::test]
 async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -215,6 +218,7 @@ async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conver
 #[skuld::test]
 async fn take_owned_in_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();

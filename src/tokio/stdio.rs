@@ -152,8 +152,10 @@ fn adopt(
     );
     let handle = end.into_raw_handle();
     // SAFETY: `from_raw_handle` requires a valid handle the caller owns and passes on to the
-    // server: `handle` is, from `end`'s `into_raw_handle`. An end that another completion port
-    // already holds is refused by tokio with an error (os error 87), which the caller handles.
+    // server: `handle` is, from `end`'s `into_raw_handle`. The reactor issues overlapped I/O on it,
+    // so it must be an overlapped pipe handle: every end reaching here is `make_pipe`'s (asserted
+    // above in debug). An end that another completion port already holds is refused by tokio with
+    // an error (os error 87), which the caller handles.
     unsafe { ::tokio::net::windows::named_pipe::NamedPipeServer::from_raw_handle(handle) }
 }
 
