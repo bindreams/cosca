@@ -108,7 +108,7 @@ impl Pending {
     /// Makes the pipe and publishes its write end to the hook. `_lock` is the witness that no other
     /// cosca fork can inherit the ends before they are close-on-exec.
     pub(crate) fn open(self, _lock: &SpawnLockGuard) -> Result<Channel, Error> {
-        let (read_end, write_end) = std::io::pipe().map_err(|e| Error::Io(crate::error::io_context("pipe", e)))?;
+        let (read_end, write_end) = crate::pipe::pair().map_err(|e| Error::Io(crate::error::io_context("pipe", e)))?;
         let (write_end, read_end) = publish_ends(&self.shared, OwnedFd::from(write_end), OwnedFd::from(read_end))?;
         set_nonblocking(&read_end)?;
         Ok(Channel {

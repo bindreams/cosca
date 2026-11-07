@@ -10,18 +10,23 @@ use crate::stdio::Direction;
 pub(super) type Reader = std::io::PipeReader;
 pub(super) type Writer = std::io::PipeWriter;
 
-/// The pipe for one piped slot: the child's end, and the parent's, as `dir` says (`In`: the child
-/// reads, the parent writes).
+/// A new pipe, both ends close-on-exec; on macOS the caller holds `spawn_lock`.
 ///
-/// On macOS the caller holds `spawn_lock`: `std::io::pipe` is `pipe()` and then `FD_CLOEXEC`, so
-/// another cosca fork between the two would inherit an end. Linux's `pipe2(O_CLOEXEC)` needs none.
-pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedFd, ParentEnd)> {
+/// `std::io::pipe` is `pipe()` and then `FD_CLOEXEC` there, so another cosca fork between the two
+/// would inherit an end. Linux's `pipe2(O_CLOEXEC)` needs no lock.
+pub(crate) fn pair() -> io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     debug_assert!(
         crate::child::spawn::spawn_lock_held_by_this_thread(),
         "a pipe is made under spawn_lock on macOS"
     );
-    let (reader, writer) = std::io::pipe()?;
+    std::io::pipe()
+}
+
+/// The pipe for one piped slot: the child's end, and the parent's, as `dir` says (`In`: the child
+/// reads, the parent writes). The caller holds `spawn_lock` on macOS, as for [`pair`].
+pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedFd, ParentEnd)> {
+    let (reader, writer) = pair()?;
     Ok(match dir {
         Direction::In => (reader.into(), ParentEnd::Writer(writer.into())),
         Direction::Out => (writer.into(), ParentEnd::Reader(reader.into())),

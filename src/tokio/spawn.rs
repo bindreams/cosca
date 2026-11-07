@@ -226,6 +226,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
     #[cfg(not(target_os = "macos"))]
     let (mut prepared, child, parent_ends) = {
+        // Before `prepare`: a refused stdio fails before a cgroup leaf exists (Linux) and before
+        // `prepare` mutates this process (Windows).
         let parent_ends = crate::child::spawn::resolve_into_std(
             tcmd.as_std_mut(),
             #[cfg(unix)]

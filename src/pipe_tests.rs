@@ -331,3 +331,19 @@ fn a_pipe_end_round_trips_through_a_raw_fd() {
     reader.read_to_end(&mut got).expect("read to the end");
     assert_eq!(got, b"raw");
 }
+
+/// Both ends of `pair()` are close-on-exec, so no exec'd child inherits one.
+#[cfg(unix)]
+#[skuld::test]
+fn pair_makes_both_ends_close_on_exec() {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    let _lock = crate::child::spawn::spawn_lock();
+    let (reader, writer) = super::pair().expect("make the pipe");
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        // SAFETY: `fcntl(F_GETFD)` on a descriptor the pipe ends above keep open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "fd {fd} lacks FD_CLOEXEC");
+    }
+}

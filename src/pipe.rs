@@ -27,6 +27,8 @@ pub(crate) mod windows;
 use windows as sys;
 
 pub(crate) use sys::child_pipe;
+#[cfg(unix)]
+pub(crate) use sys::pair;
 
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]

@@ -11,7 +11,9 @@
 ///
 /// The child closes every descriptor above 2 but `keep`, the ones `body` uses, first thing: a
 /// concurrent test's pipe end, made outside `spawn_lock`, is in the fork's copy and would stay open
-/// as long as the child.
+/// as long as the child. That needs `close_range(2)`, Linux 5.9 (the crate supports 5.6): on an older
+/// kernel the child exits with [`CLOSE_RANGE_FAILED_EXIT`], which [`reap_status`] and [`KillOnDrop`]'s
+/// drop report as a failure.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(keep: &[std::os::fd::RawFd], body: impl FnOnce()) -> KillOnDrop {
     let guard =
@@ -178,6 +180,11 @@ pub(crate) const REPORT_WRITE_FAILED_EXIT: i32 = 113;
 #[cfg(target_os = "linux")]
 pub(crate) const CLOSE_RANGE_FAILED_EXIT: i32 = 114;
 
+/// What a reaped [`fork_running`] child that exited with [`CLOSE_RANGE_FAILED_EXIT`] means.
+#[cfg(target_os = "linux")]
+const CLOSE_RANGE_FAILED_MESSAGE: &str =
+    "the forked child could not close its descriptors: close_range needs Linux 5.9";
+
 /// Closes every descriptor but those in `keep` (sorted ascending, duplicate-free), one
 /// `close_range(2)` per gap. `false` if a call failed. Async-signal-safe: for a child just forked
 /// from this multithreaded process, whose copy holds the descriptors of every concurrent test.
@@ -288,6 +295,14 @@ impl Drop for KillOnDrop {
             } else {
                 debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
             }
+        } else if reaped
+            .is_ok_and(|status| status.is_some_and(|status| status.exit_status() == Some(CLOSE_RANGE_FAILED_EXIT)))
+        {
+            if panicking {
+                _ = writeln!(std::io::stderr(), "KillOnDrop: {CLOSE_RANGE_FAILED_MESSAGE}");
+            } else {
+                panic!("{CLOSE_RANGE_FAILED_MESSAGE}");
+            }
         }
     }
 }
@@ -305,6 +320,10 @@ pub(crate) fn reap_status(pid: u32) -> i32 {
     // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
     let reaped = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
     assert_eq!(reaped, pid as i32, "waitpid: {}", std::io::Error::last_os_error());
+    assert!(
+        !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == CLOSE_RANGE_FAILED_EXIT),
+        "{CLOSE_RANGE_FAILED_MESSAGE}"
+    );
     status
 }
 

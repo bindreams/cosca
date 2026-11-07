@@ -824,7 +824,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                     // macOS: `pipe()` then `FD_CLOEXEC`; a cosca fork between the two would inherit an end.
                     #[cfg(target_os = "macos")]
                     let _guard = crate::child::spawn::spawn_lock();
-                    std::io::pipe().map_err(Error::Io)?
+                    crate::pipe::pair().map_err(Error::Io)?
                 };
                 let reader_file = File::from(OwnedFd::from(reader));
                 derived.stdin(Stdio::from_file(reader_file))?;
