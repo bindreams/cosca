@@ -267,15 +267,11 @@ fn pause_end_is_the_step_cut_at_the_deadline() {
     // A frozen clock that `now` is not: a `pause_end` that read a clock of its own would differ.
     let (_clock, start) = test_clock::FrozenClockGuard::install();
     let now = start + ms(100);
-    // A step that ends before the deadline.
     assert_eq!(pause_end(now, ms(2), Some(now + ms(10))), Some(now + ms(2)));
-    // A step that would pass the deadline is cut to it; one that ends on it is not cut.
     assert_eq!(pause_end(now, ms(4), Some(now + ms(1))), Some(now + ms(1)));
     assert_eq!(pause_end(now, ms(4), Some(now + ms(4))), Some(now + ms(4)));
-    // No pause once the deadline is at or before `now`.
     assert_eq!(pause_end(now, ms(1), Some(now)), None);
     assert_eq!(pause_end(now, ms(1), Some(now - ms(1))), None);
-    // No deadline: the whole step.
     assert_eq!(pause_end(now, ms(4), None), Some(now + ms(4)));
 }
 
@@ -378,6 +374,29 @@ fn control_makes_the_look_after_a_released_wait_final() {
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
     c.waited(Ended::Released);
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::DeadlinePassed);
+}
+
+/// A done look ends the loop even right after a released wait: the final look is not an expiry.
+///
+/// Mutant: the released flag turns a done look into `DeadlinePassed`.
+#[skuld::test]
+fn control_ends_on_a_done_look_after_a_released_wait() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    assert_eq!(looked_at(&mut c, Looked::Done, None), Next::Done);
+}
+
+/// The released flag clears when a later wait is woken: the look after it waits again.
+///
+/// Mutant: the flag is set once and never cleared.
+#[skuld::test]
+fn control_clears_the_released_flag_after_a_woken_wait() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    c.waited(Ended::NotReleased);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
 }
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends

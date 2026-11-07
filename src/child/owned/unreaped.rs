@@ -12,6 +12,7 @@ use crate::child::lifecycle::{wait_for_status, wait_to_exit, Orphaned, Settlemen
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::child_named;
+use crate::signal::Sig;
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
 /// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
@@ -27,7 +28,8 @@ use crate::os_process::child_named;
 /// until it exits, which the failed call would have done anyway.
 ///
 /// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
-/// running unreaped until this process exits, and logs one `warn` naming its pid.
+/// running unreaped until this process exits, and logs one `warn` naming its pid. A cancelled
+/// [`wait_async`](Unreaped::wait_async) does not block either: see there.
 ///
 /// ```
 /// use cosca::error::Error;
@@ -47,14 +49,30 @@ pub struct Unreaped {
     /// Empty once `wait`, `leak` or the drop has taken the child: it is settled once.
     child: ChildSlot,
     id: Option<ProcessId>,
+    /// Whether the child is an elevation front, which the drop sends no kill.
+    front: bool,
+    drop_kind: DropKind,
+}
+
+/// What dropping an [`Unreaped`] that still holds its child does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropKind {
+    /// Block until the child exits and reap it; while the thread is panicking, give it up and warn.
+    Wait,
+    /// Kill it once more (not a front), look once without waiting and reap it if it exited; if it
+    /// did not, warn once naming the pid and give it up, unreaped.
+    LetGo,
 }
 
 impl Unreaped {
-    /// Own `child`, whose identity the spawn read as `id`, if it did.
-    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>) -> Unreaped {
+    /// Own `child`, whose identity the spawn read as `id`, if it did; `front`: it is an elevation
+    /// front. Its drop waits.
+    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>, front: bool) -> Unreaped {
         Unreaped {
             child: ChildSlot::new(child),
             id,
+            front,
+            drop_kind: DropKind::Wait,
         }
     }
 
@@ -76,21 +94,23 @@ impl Unreaped {
     }
 
     /// [`wait`](Unreaped::wait), awaited: the same status and errors, without blocking the runtime
-    /// thread. Dropping the future drops this value, which then settles the child as any drop does
-    /// (see the type's docs): the child stays in the value until the wait has an outcome.
+    /// thread. Dropping the future, polled or not, lets the child go, warned: it kills the child
+    /// once more (a front, which is sent nothing, excepted), looks at it once without waiting and
+    /// reaps it if it exited, and otherwise warns once naming the pid and gives it up, unreaped.
     ///
-    /// Needs the `tokio` feature. On Linux and macOS the wait registers a descriptor with the IO
-    /// driver (the pidfd on Linux, a kqueue on macOS), and a recheck pause arms a timer on the time
-    /// driver. On Windows it waits on the blocking pool and never rechecks. Portable code needs
-    /// the IO and time drivers (the `#[tokio::main]` / `#[tokio::test]` defaults); on a hand-built
-    /// runtime missing one that a Unix platform uses, tokio panics rather than returning a typed
-    /// error.
+    /// Needs the `tokio` feature and a runtime with the IO and time drivers (the `#[tokio::main]` /
+    /// `#[tokio::test]` defaults); a hand-built runtime missing one makes tokio panic rather than
+    /// return an error.
     #[cfg(feature = "tokio")]
-    pub async fn wait_async(mut self) -> Result<ExitStatus, Error> {
-        let outcome = self.child.wait_async().await;
-        // Settled once, whatever the outcome, as `wait` does.
-        let child = self.child.take().expect("a live Unreaped holds its child");
-        unbounded_status(child.pid(), outcome?, Orphaned::Warn)
+    pub fn wait_async(mut self) -> impl std::future::Future<Output = Result<ExitStatus, Error>> {
+        // Before the future exists, so a future dropped unpolled never blocks either.
+        self.drop_kind = DropKind::LetGo;
+        async move {
+            let outcome = self.child.wait_async().await;
+            // Settled once, whatever the outcome, as `wait` does.
+            let child = self.child.take().expect("a live Unreaped holds its child");
+            unbounded_status(child.pid(), outcome?, Orphaned::Warn)
+        }
     }
 
     /// Give the child up, unreaped. Logs nothing.
@@ -106,6 +126,18 @@ impl Drop for Unreaped {
         };
         let pid = child.pid();
         let who = child_named(pid);
+        if self.drop_kind == DropKind::LetGo {
+            // Whether the kill is refused does not change the look below, which says what is left.
+            if !self.front {
+                _ = child.signal(Sig::Kill);
+            }
+            let settlement = Settlement::new(child.wait(Some(crate::wait::now())), false);
+            let subject = format!("{who} was dropped without wait or leak");
+            let running = format!("{subject}; it still runs, so gave it up, unreaped");
+            let said = settlement.wording(&subject, Some(&running), Some(Disposition::Leave));
+            log::log!(said.level(), "{}", said.text());
+            return;
+        }
         // A destructor that blocks on a child during unwinding can hang the panic for good.
         if std::thread::panicking() {
             log::warn!("{who} was dropped without wait or leak while the thread is panicking; gave it up, unreaped");

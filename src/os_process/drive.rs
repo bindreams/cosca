@@ -82,7 +82,6 @@ pub(crate) fn pause_end(now: Instant, step: Duration, deadline: Option<Instant>)
     if crate::wait::remaining_at(deadline, now) == Some(Duration::ZERO) {
         return None;
     }
-    // The deadline instant itself when it cuts, never one rebuilt from a duration.
     Some(deadline.map_or(now + step, |deadline| deadline.min(now + step)))
 }
 
@@ -143,9 +142,8 @@ pub(crate) enum Ended {
     Released,
 }
 
-/// What a driver's wait returned (`Ok(false)` = released without an exit signal), as [`Control`]
-/// is told. A failed wait goes to [`Waitable::block_failed`], which ends the loop with the error
-/// unless the `Waitable` survives it.
+/// Maps a driver's wait result to [`Ended`]. A failed wait goes to [`Waitable::block_failed`], which
+/// ends the loop with the error unless the `Waitable` survives it.
 pub(crate) fn wait_ended<W: Waitable>(w: &mut W, waited: Result<bool, Error>) -> Result<Ended, Error> {
     Ok(match waited {
         Ok(true) => Ended::NotReleased,
@@ -158,14 +156,13 @@ pub(crate) fn wait_ended<W: Waitable>(w: &mut W, waited: Result<bool, Error>) ->
 }
 
 /// The control of the one wait loop, which the synchronous and the asynchronous driver both run.
-/// Pure and non-blocking: it reads no clock and waits on nothing. A driver calls [`before_look`],
+/// Reads no clock and waits on nothing. A driver calls [`before_look`],
 /// looks, calls [`after_look`] and does what it answers, and after a wait calls [`waited`].
 ///
 /// A look made at or after the deadline, or after a wait released without an exit signal, is the
 /// final one: it starts no wait and no pause, and a look that is not done ends the loop with
 /// [`Next::DeadlinePassed`]. A pause is the next step of one backoff, uncut: the driver cuts it to
-/// the deadline where it arms or sleeps, so no step goes stale between a clock read here and the
-/// block. The backoff starts over after every wait.
+/// the deadline where it arms or sleeps. The backoff starts over after every wait.
 ///
 /// [`before_look`]: Control::before_look
 /// [`after_look`]: Control::after_look

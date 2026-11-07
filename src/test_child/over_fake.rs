@@ -36,7 +36,7 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
 }
 
 pub(crate) fn unreaped_over(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
-    Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id)
+    Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id, false)
 }
 
 /// A boxed `Unreaped` over a fake that has exited, so dropping it waits for nothing.

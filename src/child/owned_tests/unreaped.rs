@@ -221,7 +221,7 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     let (child, stdin) = spawn_std_blocker();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id));
+    let unreaped = Unreaped::new(owned, Some(blocker_id), false);
     let stdin = Rc::new(RefCell::new(Some(stdin)));
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking({
@@ -262,7 +262,7 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     let (child, stdin) = spawn_std_blocker();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id));
+    let unreaped = Unreaped::new(owned, Some(blocker_id), false);
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(move || drop(stdin));
     drop(unreaped);
@@ -293,12 +293,19 @@ async fn wait_async_returns_the_status_wait_would() {
     use super::wait_async::exits_three_on_eof;
     use crate::tokio::drive::drive_tests::poll_once;
 
+    crate::log_capture::install();
     let (owned, stdin) = exits_three_on_eof();
-    let child = Unreaped::new(owned, None);
+    let child = Unreaped::new(owned, None, false);
+    let mark = crate::log_capture::mark();
     let mut wait = std::pin::pin!(child.wait_async());
     assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
     drop(stdin);
     assert_eq!(wait.await.expect("the child exits").code(), Some(3));
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "the settled value's drop is silent"
+    );
 }
 
 /// A child reaped elsewhere is the error `wait` gives for it, not a status and not a hang.
@@ -307,12 +314,21 @@ async fn wait_async_returns_the_status_wait_would() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn wait_async_on_a_child_reaped_elsewhere_is_the_error_wait_gives() {
+    crate::log_capture::install();
     let gone = || fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
     let sync = unreaped(&gone(), Some(id())).wait().expect_err("reaped elsewhere");
-    let asynchronous = unreaped(&gone(), Some(id()))
+    let fake = gone();
+    let mark = crate::log_capture::mark();
+    let asynchronous = unreaped(&fake, Some(id()))
         .wait_async()
         .await
         .expect_err("reaped elsewhere");
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "the settled value's drop is silent"
+    );
+    assert_eq!(fake.looks(), 1, "the drop made no further look");
     let (Error::Io(sync), Error::Io(asynchronous)) = (&sync, &asynchronous) else {
         panic!("{sync:?} / {asynchronous:?}");
     };
@@ -320,34 +336,90 @@ async fn wait_async_on_a_child_reaped_elsewhere_is_the_error_wait_gives() {
     assert_eq!(asynchronous.raw_os_error(), sync.raw_os_error());
 }
 
-/// A cancelled `wait_async` leaves the `Unreaped` its child: the future owns the value, and its drop
-/// still waits for the child and says so. The child is ended before the drop, so the drop does not
-/// hang.
+/// A cancelled `wait_async` lets the child go: the drop on the runtime thread returns without
+/// waiting (the child's stdin stays open, so a drop that waited would hang the test), the child was
+/// sent one kill and looked at once, and the one line says it was reaped or, if it had not exited
+/// yet, names its pid as given up.
 ///
-/// Mutant: `wait_async` takes the child out of the slot before it awaits, so the drop finds nothing
-/// to wait for and says nothing.
+/// Mutants: the drop waits; it sends no kill; it looks more than once; it says nothing, or twice.
 #[cfg(feature = "tokio")]
 #[skuld::test]
-async fn a_cancelled_wait_async_leaves_the_unreaped_its_child() {
-    use super::wait_async::exits_three_on_eof;
+async fn a_cancelled_wait_async_lets_the_child_go_without_blocking() {
+    use crate::child::owned::OwnedChild;
+    use crate::os_process::child::adopted_blocker;
+    use crate::signal::Sig;
     use crate::tokio::drive::drive_tests::poll_once;
 
     crate::log_capture::install();
-    let (owned, stdin) = exits_three_on_eof();
-    let pid = owned.pid().expect("a spawned child has a pid");
-    let child = Unreaped::new(owned, None);
+    let (os, blocker_id, stdin) = adopted_blocker();
+    let fake = FakeProcess::over(os);
+    let child = Unreaped::new(OwnedChild::new(Box::new(fake.clone())), Some(blocker_id), false);
     let mark = crate::log_capture::mark();
     {
         let mut wait = std::pin::pin!(child.wait_async());
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
-        drop(stdin);
+        assert_eq!(fake.looks(), 1);
     }
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "one kill");
+    assert_eq!(fake.looks(), 2, "one look");
+    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    assert!(
+        matches!(
+            records.as_slice(),
+            [(log::Level::Debug, text)] if text.contains("reaped it")
+        ) || matches!(
+            records.as_slice(),
+            [(log::Level::Warn, text)]
+                if text.contains(&blocker_id.pid().to_string()) && text.contains("gave it up")
+        ),
+        "{records:?}"
+    );
+    drop(stdin);
+}
+
+/// A future that was never polled still lets the child go when it drops: the kind is set when
+/// `wait_async` is called, not at its first poll.
+///
+/// Mutant: the kind is set inside the future's body.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn an_unpolled_wait_async_lets_the_child_go_when_it_drops() {
+    use crate::signal::{Sent, Sig};
+
+    let fake = fake()
+        .signals([Ok(Sent::Delivered)])
+        .reaps([ReapAnswer::Reaped(exit())]);
+    drop(unreaped(&fake, Some(id())).wait_async());
+    assert_eq!(fake.signal_calls(), [Sig::Kill]);
+    assert_eq!(fake.looks(), 1, "one look, which does not wait");
+}
+
+/// A cancelled `wait_async` over an elevation front sends it nothing: it is looked at once and, if
+/// it still runs, given up with one `warn` naming the pid.
+///
+/// Mutant: the drop kills a front.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn a_cancelled_wait_async_sends_a_front_nothing() {
+    use crate::child::owned::OwnedChild;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    crate::log_capture::install();
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running]);
+    let child = Unreaped::new(OwnedChild::new(Box::new(fake.clone())), Some(id()), true);
+    let mark = crate::log_capture::mark();
+    {
+        let mut wait = std::pin::pin!(child.wait_async());
+        assert!(poll_once(wait.as_mut()).is_pending(), "a running front is waited for");
+    }
+    assert_eq!(fake.signal_calls(), [], "a front is sent nothing");
+    assert_eq!(fake.looks(), 2, "one look");
     let records = crate::log_capture::records_since_on_current_thread(mark, "");
     assert!(
         matches!(
             records.as_slice(),
             [(log::Level::Warn, text)]
-                if text.contains(&pid.to_string()) && text.contains("dropped without wait or leak")
+                if text.contains(&PID.to_string()) && text.contains("gave it up")
         ),
         "{records:?}"
     );

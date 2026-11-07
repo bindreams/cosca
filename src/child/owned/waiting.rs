@@ -101,6 +101,10 @@ impl OwnedChild {
             RunOutcome::Done(outcome) => outcome,
             RunOutcome::DeadlinePassed => ChildWaitOutcome::DeadlinePassed,
         };
+        debug_assert!(
+            !matches!(outcome, ChildWaitOutcome::DeadlinePassed),
+            "an unbounded wait ended with no exit"
+        );
         if let ChildWaitOutcome::Exited(record) = outcome {
             self.log_unreadable(record);
         }

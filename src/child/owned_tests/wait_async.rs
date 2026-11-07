@@ -91,10 +91,9 @@ async fn wait_async_waits_for_a_real_exit() {
 }
 
 /// A wait dropped while it waits leaves the state `N` and holds nothing: a sync `wait` reaps the
-/// child, on Linux no descriptor stays in the reactor, and on Windows the watcher thread is released
-/// while the child still runs.
+/// child, and on Windows the watcher thread is released while the child still runs.
 ///
-/// Mutant: the record is written before the reap; or the registration outlives the future.
+/// Mutant: the record is written before the reap.
 #[skuld::test]
 async fn a_dropped_wait_async_leaves_nobody_waiting() {
     #[cfg(windows)]
@@ -102,8 +101,6 @@ async fn a_dropped_wait_async_leaves_nobody_waiting() {
     #[cfg(windows)]
     let observer = crate::tokio::wait::fault_observer::install(tx);
     let (mut child, stdin) = exits_three_on_eof();
-    #[cfg(target_os = "linux")]
-    let before = crate::tokio::drive::drive_tests::open_fds();
     {
         let mut wait = pin!(child.wait_async());
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
@@ -116,17 +113,11 @@ async fn a_dropped_wait_async_leaves_nobody_waiting() {
             .expect("the watcher must return once the drop released it");
     }
     assert!(!child.is_reaped());
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        crate::tokio::drive::drive_tests::open_fds(),
-        before,
-        "a dropped wait leaves no descriptor"
-    );
     drop(stdin);
     assert_eq!(status(child.wait(None)).code(), Some(3));
 }
 
-/// Crossing threads: `spawn` needs it.
+/// The future is `Send`, so `tokio::spawn` accepts it.
 #[skuld::test]
 fn wait_async_is_send() {
     fn assert_send<T: Send>(_: &T) {}

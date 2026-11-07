@@ -226,8 +226,7 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
 }
 
 /// [`wait_to_exit`] with no threshold, as the status the public blocking waits answer:
-/// `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`. `Unreaped::wait_async` does
-/// not go through it (it blocks nowhere); it shares only [`unbounded_status`].
+/// `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`.
 pub(super) fn wait_for_status(proc: &OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
     unbounded_status(proc.pid(), wait_to_exit(proc, None)?, orphaned)
 }
