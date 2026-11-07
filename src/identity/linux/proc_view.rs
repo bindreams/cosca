@@ -47,6 +47,10 @@ pub(crate) enum ProcView {
 /// Why a [`ProcView::Diverged`] `/proc` cannot answer questions about the caller's pids.
 pub(crate) const DIVERGED_REASON: &str = "this process's /proc is an outer pid namespace's";
 
+/// Why a [`ProcView::Unassessable`] `/proc` could not say which namespace it is: reading
+/// `self/status` failed, as I/O or as invalid UTF-8.
+pub(crate) const UNREADABLE_STATUS_REASON: &str = "self/status could not be read";
+
 impl ProcView {
     /// The `/proc` directory of a [`Same`](Self::Same) view; any other view is why not.
     pub(crate) fn into_dir(self) -> Result<ProcDir, ViewUnreadable> {
@@ -132,21 +136,6 @@ pub(crate) struct ProcDir(OwnedFd);
 impl ProcDir {
     /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
     pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
-        #[cfg(test)]
-        if let Some(errno) = fault::forced_openat2_errno() {
-            return Err(ViewUnreadable::from_open_errno(errno));
-        }
-        Self::open_root()
-    }
-
-    /// [`open`](Self::open) that no test fault answers in place of: for test support that observes
-    /// the kernel while a test arms faults for the code under test.
-    #[cfg(test)]
-    pub(crate) fn open_unforced() -> Result<ProcDir, ViewUnreadable> {
-        Self::open_root()
-    }
-
-    fn open_root() -> Result<ProcDir, ViewUnreadable> {
         let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
@@ -212,11 +201,7 @@ impl ProcDir {
     }
 
     /// The pids listed under this `/proc`: its decimal-named entries.
-    pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
-        #[cfg(test)]
-        if let Some(errno) = fault::forced_pids_errno() {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
+    pub(super) fn pids(&self) -> io::Result<Vec<u32>> {
         let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
         collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
     }
@@ -270,7 +255,7 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
-            return ProcView::Unassessable(ViewUnreadable::new("self/status could not be read", Some(e)));
+            return ProcView::Unassessable(ViewUnreadable::new(UNREADABLE_STATUS_REASON, Some(e)));
         }
     };
     let verdict = match classify_status(&status, || ns_pid_exists(&dir)) {
@@ -456,9 +441,7 @@ pub(crate) mod fault {
         static FORCE_PROC_VIEW_SKIP: Cell<u32> = const { Cell::new(0) };
         static PROC_VIEW_CALLS: Cell<u32> = const { Cell::new(0) };
         static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
-        static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
-        static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
     }
 
     /// Disarms every forced value on drop, even unconsumed — so a test that panics before
@@ -472,33 +455,8 @@ pub(crate) mod fault {
             FORCE_PROC_VIEW_SKIP.with(|f| f.set(0));
             PROC_VIEW_CALLS.with(|f| f.set(0));
             PROC_VIEW_FIRED_AT.with(|f| f.set(None));
-            FORCE_PIDS_ERRNO.with(|f| f.set(None));
             FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
-            FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
         }
-    }
-
-    /// Make EVERY [`ProcDir::open`](super::ProcDir::open) on THIS thread fail as its `openat2`
-    /// answering `errno`, as on a kernel older than 5.6 (`NOSYS`) or under a seccomp filter
-    /// (`PERM`), until the guard drops.
-    pub(crate) fn force_openat2_errno(errno: rustix::io::Errno) -> Forced {
-        FORCE_OPENAT2_ERRNO.with(|f| f.set(Some(errno)));
-        Forced(())
-    }
-
-    pub(crate) fn forced_openat2_errno() -> Option<rustix::io::Errno> {
-        FORCE_OPENAT2_ERRNO.with(|f| f.get())
-    }
-
-    /// Make EVERY [`ProcDir::pids`](super::ProcDir::pids) on THIS thread fail with `errno` until
-    /// the guard drops.
-    pub(crate) fn force_pids_errno(errno: i32) -> Forced {
-        FORCE_PIDS_ERRNO.with(|f| f.set(Some(errno)));
-        Forced(())
-    }
-
-    pub(crate) fn forced_pids_errno() -> Option<i32> {
-        FORCE_PIDS_ERRNO.with(|f| f.get())
     }
 
     /// Make every by-pid identity read of `pid`'s `stat` on THIS thread fail with `errno` (a
