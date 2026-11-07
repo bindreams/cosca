@@ -495,7 +495,13 @@ async fn tokio_kill_tree_of_a_backend_forgotten_unproven_treats_the_root_as_unkn
     #[cfg(target_os = "macos")]
     {
         let _ = MAY_STILL_RUN;
-        result.expect("every marker holder was reached");
+        // The holders are not the tree: a kill that skipped the rest is `Unassessable`, though every
+        // holder was reached.
+        crate::child::unpinned_public_tests::assert_holders_only(
+            &result.expect_err("the sweep skipped the rest of the tree"),
+            "kill_tree",
+            crate::child::unpinned_public_tests::Untrusted::Unknown,
+        );
         assert!(
             holders.killed().contains(&pid),
             "the root holds the marker: {:?}",
