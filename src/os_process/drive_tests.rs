@@ -264,7 +264,9 @@ fn run_never_pauses_after_the_deadline() {
 /// Mutant: do not cut; cut off by one; pause at the deadline; read a clock of its own.
 #[skuld::test]
 fn pause_end_is_the_step_cut_at_the_deadline() {
-    let now = Instant::now();
+    // A frozen clock that `now` is not: a `pause_end` that read a clock of its own would differ.
+    let (_clock, start) = test_clock::FrozenClockGuard::install();
+    let now = start + ms(100);
     // A step that ends before the deadline.
     assert_eq!(pause_end(now, ms(2), Some(now + ms(10))), Some(now + ms(2)));
     // A step that would pass the deadline is cut to it; one that ends on it is not cut.

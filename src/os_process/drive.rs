@@ -79,11 +79,11 @@ pub(crate) enum RunOutcome<T> {
 /// look. Both drivers call it with a clock read immediately before they sleep or arm, so the
 /// deadline it cuts to is the one the block is armed from (principle 13).
 pub(crate) fn pause_end(now: Instant, step: Duration, deadline: Option<Instant>) -> Option<Instant> {
-    match crate::wait::remaining_at(deadline, now) {
-        Some(Duration::ZERO) => None,
-        Some(left) => Some(now + step.min(left)),
-        None => Some(now + step),
+    if crate::wait::remaining_at(deadline, now) == Some(Duration::ZERO) {
+        return None;
     }
+    // The deadline instant itself when it cuts, never one rebuilt from a duration.
+    Some(deadline.map_or(now + step, |deadline| deadline.min(now + step)))
 }
 
 /// The schedule of pauses for [`Step::Recheck`]: 1 ms, doubling, at most 50 ms, never ending, no
@@ -136,8 +136,7 @@ pub(crate) enum Next {
 /// How a wait ended, as the driver tells [`Control`]: the one thing it reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ended {
-    /// Not released without an exit signal: the source signalled, or the wait failed and the
-    /// [`Waitable`] survived it.
+    /// The wait ended on a signal from the source, or failed and the [`Waitable`] survived it.
     NotReleased,
     /// Released without an exit signal: the deadline passed (or, in the async Windows wait, the
     /// cancel event fired).
