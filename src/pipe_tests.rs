@@ -19,7 +19,7 @@ fn reader_pair() -> (PipeReader, File) {
     #[cfg(windows)]
     {
         let (ours, theirs) = super::windows::child_pipe(true).expect("make the pipe");
-        (PipeReader::from_overlapped(ours), File::from(theirs))
+        (PipeReader::from(ours), File::from(theirs))
     }
     #[cfg(unix)]
     {
@@ -33,7 +33,7 @@ fn writer_pair() -> (PipeWriter, File) {
     #[cfg(windows)]
     {
         let (ours, theirs) = super::windows::child_pipe(false).expect("make the pipe");
-        (PipeWriter::from_overlapped(ours), File::from(theirs))
+        (PipeWriter::from(ours), File::from(theirs))
     }
     #[cfg(unix)]
     {

@@ -2025,18 +2025,12 @@ pub(crate) fn make_pipe(dir: Direction) -> Result<(ChildEnd, ParentEnd), Error> 
             // Child reads: child gets the readable end; parent keeps the writable one.
             Direction::In => {
                 let (ours, theirs) = crate::pipe::windows::child_pipe(false).map_err(Error::Io)?;
-                Ok((
-                    ChildEnd::from(theirs),
-                    ParentEnd::Writer(PipeWriter::from_overlapped(ours)),
-                ))
+                Ok((ChildEnd::from(theirs), ParentEnd::Writer(PipeWriter::from(ours))))
             }
             // Child writes: child gets the writable end; parent keeps the readable one.
             Direction::Out => {
                 let (ours, theirs) = crate::pipe::windows::child_pipe(true).map_err(Error::Io)?;
-                Ok((
-                    ChildEnd::from(theirs),
-                    ParentEnd::Reader(PipeReader::from_overlapped(ours)),
-                ))
+                Ok((ChildEnd::from(theirs), ParentEnd::Reader(PipeReader::from(ours))))
             }
         }
     }

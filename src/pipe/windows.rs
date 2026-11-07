@@ -310,20 +310,6 @@ fn overlapped_io(
 
 // Conversions =====
 
-impl PipeReader {
-    /// The parent's end of a pipe [`child_pipe`] made: overlapped, and readable.
-    pub(crate) fn from_overlapped(end: OwnedHandle) -> PipeReader {
-        PipeReader(Handle { handle: end })
-    }
-}
-
-impl PipeWriter {
-    /// The parent's end of a pipe [`child_pipe`] made: overlapped, and writable.
-    pub(crate) fn from_overlapped(end: OwnedHandle) -> PipeWriter {
-        PipeWriter(Handle { handle: end })
-    }
-}
-
 /// A std pipe end is synchronous: each operation completes inside its call, and is still safe to
 /// use from several threads at once.
 impl From<std::io::PipeReader> for PipeReader {
