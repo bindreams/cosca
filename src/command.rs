@@ -567,7 +567,7 @@ impl Command {
     /// whose OS refuses that fails** (`Error::MayHaveStarted`, the refusal as its cause): the child
     /// is still armed, so it is torn down, never handed over as one cosca no longer kills. A job
     /// the spawning process itself runs in is the launcher's concern;
-    /// [`breakaway_from_job`](Command::breakaway_from_job) is the way out of it.
+    /// `breakaway_from_job()` (Windows) is the way out of it.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self

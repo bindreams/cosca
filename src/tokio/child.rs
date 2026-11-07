@@ -1230,7 +1230,7 @@ impl Child {
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs
     /// in: that job's lifetime is the launcher's concern, and
-    /// [`breakaway_from_job`](crate::tokio::Command::breakaway_from_job) is the way out of it.
+    /// `breakaway_from_job()` (Windows) is the way out of it.
     ///
     /// # Errors
     ///

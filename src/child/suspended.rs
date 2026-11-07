@@ -91,11 +91,15 @@ impl SuspendedChild {
     /// # Errors
     ///
     /// [`Error::MayHaveStarted`] when the resume failed or only partly happened (a thread that
-    /// something else also suspended stays suspended). The child is then torn down and the error's
-    /// `fate` says how. A child whose kill is refused and which still runs is left and warned, with
-    /// `fate` `Running` and `unreaped` `None`: a failed release may leave its initial thread frozen,
-    /// so waiting for it could block for ever. A child killed by something else *before* the call is
-    /// this error too.
+    /// something else also suspended stays suspended), or, on Windows, when the command had
+    /// `kill_on_drop(false)` and the job refused the disarm (the cause is then [`Error::Io`]). The
+    /// child is then torn down and the error's `fate` says how. A child killed by something else
+    /// *before* the call is this error too.
+    ///
+    /// If the kill is refused and the child still runs, `unreaped` depends on the arm. After a failed
+    /// release it is `None`: the child is left and warned, with `fate` `Running`, since its initial
+    /// thread may stay frozen and waiting for it could block for ever. After a successful release
+    /// (the disarm refusal) it is `Some`: the child is handed back to settle.
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,
