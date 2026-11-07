@@ -299,10 +299,10 @@ pub enum ElevatedVia {
 }
 
 impl ElevatedVia {
-    /// Whether the child cosca spawns is a backend whose elevated program is its own child, and may
-    /// outlive it.
+    /// Whether the child cosca spawns is an elevation front, whose elevated program may outlive it:
+    /// the fronts [`front::front`] names, and no other (pkexec execs the program, #955).
     pub(crate) fn program_outlives_child(&self) -> bool {
-        matches!(self, ElevatedVia::Wrapped(_) | ElevatedVia::MacosOsascript)
+        front::front(Some(self)).is_some()
     }
 }
 
