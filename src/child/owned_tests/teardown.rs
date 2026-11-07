@@ -89,7 +89,7 @@ fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log
 /// Turns a wait that blocks into a recorded fact: the fake's wait is fired as the block begins, so
 /// a teardown that waits where it must not fails the count instead of hanging. The count starts
 /// empty: a block an earlier test left on this thread is dropped.
-pub(super) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
+pub(crate) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
     crate::wait::block_probe::take();
     let fake = fake.clone();
     crate::wait::block_probe::on_blocking(move || fake.wake())
@@ -752,7 +752,7 @@ fn the_first_half_of_a_teardown_of_a_reaped_child_is_done() {
 }
 
 /// The slow-teardown warns that `step` logs on this thread.
-fn slow_warns_during(step: impl FnOnce()) -> usize {
+pub(crate) fn slow_warns_during(step: impl FnOnce()) -> usize {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     step();

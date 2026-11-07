@@ -8,6 +8,7 @@
 //! write, still succeeds.
 
 use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use crate::test_child::Console;
 use std::io::Read as _;
@@ -22,7 +23,10 @@ use std::sync::Arc;
 use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
 };
+use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
 use crate::child::owned::seams::record_root_teardowns;
+use crate::child::owned::unreaped::DropKind;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
 use crate::os_process::fake::ReapAnswer;
@@ -636,6 +640,85 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
     let mut rest = Vec::new();
     stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
     assert_nothing_ended_by_itself(&rest);
+}
+
+/// A policy that warns of a wait the moment it starts, and waits as the sync spawn does.
+const WARNING: SpawnPolicy = SpawnPolicy {
+    teardown_warn_after: Some(Duration::ZERO),
+    unreaped_drop: DropKind::Wait,
+};
+
+/// The drop of a front its leaf's kill ended, with nothing left to look at, reaps it through the
+/// wait the cgroup kill bounds, which warns past the threshold of the spawn's policy, once. The
+/// first two answers to the reap are scripted `Running` (the wait is still running when it starts,
+/// then blocks); the real front's exit follows.
+///
+/// Mutant: `drop_unix`'s cgroup-only reap hands the wait no threshold.
+#[skuld::test]
+fn cgroup_a_drops_reap_of_a_front_its_leaf_killed_warns_past_its_spawns_threshold(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    child.policy = WARNING;
+    let pid = child.pid();
+    let front = pidfd_of(pid);
+    let fake = child
+        .proc
+        .script_over(|fake| fake.reaps([ReapAnswer::Running, ReapAnswer::Running]));
+    let _fire = fire_on_block(&fake);
+    // Released as the kill returns; see [`KillRelease`].
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
+
+    let warns = slow_warns_during(|| drop(child));
+
+    release.assert_killed();
+    assert_eq!(warns, 1);
+    assert!(reaped(&front), "the drop reaps the front its cgroup kill ended");
+}
+
+/// The look a drop takes at a front it cannot be sure its leaf's kill reached waits for one the
+/// kill ended, warning past the threshold of the spawn's policy, once. As for
+/// `cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it`, plus the wait's bounded try,
+/// answered `Running`.
+///
+/// Mutant: `look_at_front`'s wait is given no threshold by the drop.
+#[skuld::test]
+fn cgroup_a_drops_look_at_a_front_its_leaf_killed_warns_past_its_spawns_threshold(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
+    crate::log_capture::install();
+    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    child.policy = WARNING;
+    let pid = child.pid();
+    let front = pidfd_of(pid);
+    let release = release_after_cgroup_kill(stdin);
+    release.observe(pid);
+    let unreadable = Arc::new(std::sync::Mutex::new(None));
+    fault::record_leaf_steps();
+    child
+        .proc
+        .script_over(|fake| fake.reaps([ReapAnswer::Running, ReapAnswer::Running]))
+        .on_look({
+            let unreadable = Arc::clone(&unreadable);
+            move |_| {
+                if fault::peek_leaf_steps().iter().any(|step| step == "kill") {
+                    drop(unreadable.lock().expect("lock").take());
+                }
+            }
+        });
+    let warns = slow_warns_during(|| {
+        let _arming = fault::set_before_kill_write({
+            let unreadable = Arc::clone(&unreadable);
+            move || *unreadable.lock().expect("lock") = Some(fault::fail_pidfd_info())
+        });
+        let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
+        drop(child);
+    });
+    fault::take_leaf_steps();
+
+    release.assert_killed();
+    assert_eq!(warns, 1);
+    assert!(reaped(&front), "the drop reaps the front");
 }
 
 /// The same front whose place cannot be read (its pidfd's cgroup id fails) is not called running,

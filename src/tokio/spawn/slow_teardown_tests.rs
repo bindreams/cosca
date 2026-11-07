@@ -189,7 +189,7 @@ fn a_front_whose_spawn_failed_after_its_fork_warns_once_past_1s(
 /// hook that runs right after the warn (or, for a teardown that never warns, when the wait is about
 /// to block, so a missing warn fails the count below instead of hanging).
 ///
-/// Mutants: the leaf's drop waits with no warn; the failed spawn sets no `teardown_warn_after`.
+/// Mutants: the leaf's drop waits with no warn; the async spawn hands `prepare` no threshold.
 #[skuld::test]
 fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
     #[fixture(tracer_group)] _tracer: &Group,

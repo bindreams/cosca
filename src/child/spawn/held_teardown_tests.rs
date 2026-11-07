@@ -3,18 +3,21 @@
 //! read from a cgroup.
 
 use std::io;
+use std::time::Duration;
 
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::policy::SpawnPolicy;
 use super::Diagnosis;
+use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
+use crate::child::owned::unreaped::DropKind;
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
 use crate::log_capture::warns_since;
-use crate::os_process::child::{Foreign, KillRefusal};
+use crate::os_process::child::{ExitRecord, Foreign, KillRefusal};
 use crate::os_process::fake::{failed_signal, FakeProcess, ReapAnswer};
 use crate::test_child::{held_uncontained_blocker, tear_down_held_holding};
 
@@ -567,5 +570,91 @@ fn a_clean_teardown_with_a_diagnosis_owed_is_one_labelled_warn() {
         [format!(
             "teardown after a failed spawn: the identity check failed; {clause}"
         )]
+    );
+}
+
+// The spawn's policy -----
+
+/// `tear_down_held` over a front, handing back one it cannot end, under `policy`.
+fn tear_down_front_under(
+    owned: OwnedChild,
+    subtree: Option<&Subtree>,
+    policy: SpawnPolicy,
+) -> (Error, ChildFate, Option<crate::Unreaped>) {
+    let how = HeldTeardown {
+        front: Some(Front::Sudo),
+        id: None,
+        subtree,
+        disposition: Disposition::HandBack,
+        policy,
+    };
+    tear_down_held(owned, how, &mut Diagnosis::default(), failed())
+}
+
+/// The wait for a front its leaf's kill reached warns past the threshold the spawn's policy gave
+/// the teardown, once. The look, the wait's first bounded try, its second, and the block it ends
+/// in, are the four answers; the last is scripted, and the real blocker is reaped by the test.
+///
+/// Mutant: `tear_down_held` hands the front's look no threshold.
+#[skuld::test]
+fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold() {
+    let record = ExitRecord::Status(std::process::ExitStatus::default());
+    let mut fake = None;
+    let (owned, stdin) = held_blocker(|f| {
+        fake = Some(f.clone());
+        f.reaps([
+            ReapAnswer::Running,
+            ReapAnswer::Running,
+            ReapAnswer::Running,
+            ReapAnswer::Reaped(record),
+        ])
+    });
+    let _blocker = ReapsBlocker::new(&owned, stdin);
+    let _fire = fire_on_block(&fake.expect("the script ran"));
+    let subtree = killed_subtree();
+    let mut handed_back = None;
+
+    let warns = slow_warns_during(|| {
+        let _placed = fault::force_pidfd_cgroup_id(7);
+        let policy = SpawnPolicy {
+            teardown_warn_after: Some(Duration::ZERO),
+            unreaped_drop: DropKind::Wait,
+        };
+        handed_back = Some(tear_down_front_under(owned, Some(&subtree), policy).2);
+    });
+
+    assert!(
+        handed_back.expect("the teardown ran").is_none(),
+        "a reaped front is not handed back"
+    );
+    assert_eq!(warns, 1);
+}
+
+/// The `Unreaped` a failed spawn hands back for a front does what the spawn's policy says when
+/// dropped: under `LetGo` it looks once and gives the front up, and does not wait for it. The look
+/// after the teardown's own is the scripted `Reaped`, which a `Wait` drop's wait finds as well.
+///
+/// Mutant: `tear_down_held` hands the front's `Unreaped` the sync drop kind.
+#[skuld::test]
+fn the_unreaped_a_failed_spawn_hands_back_for_a_front_does_what_its_policy_says_on_drop() {
+    crate::log_capture::install();
+    let record = ExitRecord::Status(std::process::ExitStatus::default());
+    let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Reaped(record)]));
+    let _blocker = ReapsBlocker::new(&owned, stdin);
+    let policy = SpawnPolicy {
+        teardown_warn_after: None,
+        unreaped_drop: DropKind::LetGo,
+    };
+    let (_, _, handed_back) = tear_down_front_under(owned, None, policy);
+    let handed_back = handed_back.expect("a front left running is handed back");
+    let mark = crate::log_capture::mark();
+
+    drop(handed_back);
+
+    let warns = warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("dropped without wait or leak") && !warns[0].contains("waited for it"),
+        "{warns:?}"
     );
 }

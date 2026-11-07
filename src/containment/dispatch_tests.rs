@@ -5,6 +5,8 @@ use super::is_nested;
 use crate::test_child::Console;
 #[cfg(unix)]
 use crate::test_groups::setuid;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// Without the marker the process is the root (not nested).
 #[skuld::test]
@@ -1564,6 +1566,40 @@ fn attached_fd_marker_is_actionable() {
         None,
     );
     assert!(Attached::FdMarker(marker).is_actionable());
+}
+
+/// The leaf `prepare` creates for a contained Linux root holds the warn threshold its spawn's
+/// policy gave it, for the waits of its own teardown (the cgroup lane: a leaf is a real directory).
+///
+/// Mutants: `prepare` hands `try_create_leaf` no threshold; `try_create_leaf` or `create_leaf_under`
+/// stores none.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn prepare_creates_the_leaf_with_its_spawns_warn_threshold(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+
+    let threshold = std::time::Duration::from_millis(1234);
+    let mut cmd = std::process::Command::new("true");
+    let prepared = super::prepare(
+        &mut cmd,
+        &mut crate::child::spawn::in_child::InChild::default(),
+        &ContainRequest {
+            mode: Some(ContainMode::Strongest),
+            nesting: Nesting::Mark,
+        },
+        &crate::command::flags::FlagsRequest::default(),
+        &[],
+        false,
+        &[],
+        Some(threshold),
+    )
+    .expect("prepare is infallible off Windows");
+
+    let leaf = prepared
+        .cgroup_leaf
+        .as_ref()
+        .expect("a contained Linux root gets a leaf");
+    assert_eq!(leaf.warn().0, Some(threshold));
 }
 
 /// `prepare` must thread the caller's reserved child fds through to the placement, or a user

@@ -82,8 +82,8 @@ fn abandoned_drain_warns_at_release(name: &str, child_argv: &[&str], front: bool
 /// A child that named itself and entered its leaf: the leaf is killed through, the child is torn
 /// down through its handle, and the leaf is drained.
 ///
-/// Mutants: `abandon_before_verdict` hands `remove_killing_through` a `NoWarn`; the leaf is created
-/// with no threshold.
+/// Mutant: `abandon_before_verdict` hands `remove_killing_through` a `NoWarn`. The leaf here is built
+/// with its threshold; that `prepare` gives it one is `dispatch_tests`' row.
 #[skuld::test]
 fn an_abandoned_childs_leaf_drained_slowly_warns_once() {
     let (at_release, levels) = abandoned_drain_warns_at_release("cosca-abandoned-slow-drain", &["cat"], false);
@@ -113,7 +113,8 @@ fn an_abandoned_fronts_leaf_drained_slowly_warns_once() {
 /// A leaf its child entered (the verdict is taken), dropped while its member still runs, waits for
 /// the drain through the warn its spawn's policy gave it at creation.
 ///
-/// Mutants: the leaf's `Drop` waits with a `NoWarn`; the leaf is created with no threshold.
+/// Mutant: the leaf's `Drop` waits with a `NoWarn`. The leaf here is built with its threshold; that
+/// `prepare` gives it one is `dispatch_tests`' row.
 #[skuld::test]
 fn a_dropped_leafs_slow_drain_warns_once() {
     let fake = FakeLeaf::new("cosca-dropped-slow-drain", true);

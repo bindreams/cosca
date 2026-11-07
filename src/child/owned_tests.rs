@@ -20,11 +20,13 @@ mod slot;
 #[path = "owned_tests/states.rs"]
 mod states;
 #[path = "owned_tests/teardown.rs"]
-mod teardown;
+pub(crate) mod teardown;
 #[path = "owned_tests/teardown_lines.rs"]
 pub(crate) mod teardown_lines;
 #[path = "owned_tests/teardown_look.rs"]
 mod teardown_look;
+#[path = "owned_tests/teardown_policy.rs"]
+mod teardown_policy;
 #[cfg(target_os = "macos")]
 #[path = "owned_tests/traced.rs"]
 mod traced;
