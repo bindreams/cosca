@@ -407,7 +407,6 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
@@ -669,7 +668,6 @@ fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_t
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
-    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
