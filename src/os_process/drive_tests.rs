@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use super::{absolute, exited_held, run, run_with, ProcessExit, RunOutcome, Step, Waitable};
+use super::{
+    absolute, exited_held, pause_end, run, run_with, Control, Ended, Looked, Next, ProcessExit, RunOutcome, Step,
+    Waitable,
+};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -91,7 +94,7 @@ fn duration_max_is_unbounded() {
 
 /// What a [`Scripted`] look does.
 #[derive(Clone, Copy)]
-enum Move {
+pub(crate) enum Move {
     Done,
     Recheck,
     /// Wait on a source that is already fired: the block returns at once.
@@ -103,21 +106,21 @@ enum Move {
 
 /// A [`Waitable`] that plays `moves`. A row drives it with [`run_with`] and its own pause, which
 /// records what it is asked for (and moves the frozen clock, where the row needs it) and returns at
-/// once.
-struct Scripted {
+/// once. The async driver's rows play it too.
+pub(crate) struct Scripted {
     moves: std::collections::VecDeque<Move>,
     source: FakeProcess,
-    looks: usize,
-    on_look: Box<dyn FnMut(usize)>,
+    pub(crate) looks: usize,
+    pub(crate) on_look: Box<dyn FnMut(usize)>,
     /// Whether [`Waitable::block_failed`] lets the loop go on.
-    survive_block_errors: bool,
-    block_errors: usize,
+    pub(crate) survive_block_errors: bool,
+    pub(crate) block_errors: usize,
     #[cfg(target_os = "linux")]
     broken: Option<std::io::PipeWriter>,
 }
 
 impl Scripted {
-    fn new(moves: impl IntoIterator<Item = Move>) -> Self {
+    pub(crate) fn new(moves: impl IntoIterator<Item = Move>) -> Self {
         let moves: std::collections::VecDeque<Move> = moves.into_iter().collect();
         let waits = moves.iter().filter(|m| matches!(m, Move::Wait)).count();
         let source = fake(vec![Answer::Running; waits]);
@@ -169,13 +172,13 @@ impl Waitable for Scripted {
     }
 }
 
-fn ms(n: u64) -> Duration {
+pub(crate) fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
 /// `pauses` in whole milliseconds: `backon` multiplies through `f32` seconds, so a step can come out
 /// a microsecond over (16.000001 ms).
-fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
+pub(crate) fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
     pauses
         .iter()
         .map(|d| (d.as_secs_f64() * 1000.0).round() as u64)
@@ -255,6 +258,23 @@ fn run_never_pauses_after_the_deadline() {
     assert_eq!(w.looks, 2);
 }
 
+/// The pause ends a step after `now`, cut to the deadline, and there is none once the deadline has
+/// passed at `now`.
+///
+/// Mutant: do not cut; cut off by one; pause at the deadline; read a clock of its own.
+#[skuld::test]
+fn pause_end_is_the_step_cut_at_the_deadline() {
+    // A frozen clock that `now` is not: a `pause_end` that read a clock of its own would differ.
+    let (_clock, start) = test_clock::FrozenClockGuard::install();
+    let now = start + ms(100);
+    assert_eq!(pause_end(now, ms(2), Some(now + ms(10))), Some(now + ms(2)));
+    assert_eq!(pause_end(now, ms(4), Some(now + ms(1))), Some(now + ms(1)));
+    assert_eq!(pause_end(now, ms(4), Some(now + ms(4))), Some(now + ms(4)));
+    assert_eq!(pause_end(now, ms(1), Some(now)), None);
+    assert_eq!(pause_end(now, ms(1), Some(now - ms(1))), None);
+    assert_eq!(pause_end(now, ms(4), None), Some(now + ms(4)));
+}
+
 /// A failed block is the `Waitable`'s to answer: by default it ends the loop with the error.
 ///
 /// Mutant: swallow the error in `run`; or never hand it to the `Waitable`.
@@ -278,6 +298,105 @@ fn run_looks_again_after_a_block_error_the_waitable_survives() {
     assert!(matches!(run_with(&mut w, None, |_| {}).unwrap(), RunOutcome::Done(())));
     assert_eq!(w.block_errors, 1);
     assert_eq!(w.looks, 3);
+}
+
+// `Control` =====
+
+/// A look at `time_left` that found `looked`, as the loop control sees it.
+fn looked_at(c: &mut Control, looked: Looked, time_left: Option<Duration>) -> Next {
+    c.before_look(time_left);
+    c.after_look(looked, time_left)
+}
+
+/// A done look ends the loop whatever the clock says.
+///
+/// Mutant: a done look at the deadline is answered `DeadlinePassed`.
+#[skuld::test]
+fn control_ends_on_a_done_look_even_at_the_deadline() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Done, Some(Duration::ZERO)), Next::Done);
+}
+
+/// The look made at the deadline is the final one: it starts no wait and no pause.
+///
+/// Mutant: wait or pause at the deadline; or answer `DeadlinePassed` for a look that began before it.
+#[skuld::test]
+fn control_makes_the_look_at_the_deadline_final() {
+    let mut c = Control::new();
+    assert_eq!(
+        looked_at(&mut c, Looked::Wait, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+    assert_eq!(
+        looked_at(&mut c, Looked::Recheck, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+    // The deadline passes during the look: nothing to wait or pause in, and the next look is final.
+    c.before_look(Some(ms(5)));
+    assert_eq!(c.after_look(Looked::Wait, Some(Duration::ZERO)), Next::Look);
+    c.before_look(Some(Duration::ZERO));
+    assert_eq!(
+        c.after_look(Looked::Recheck, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+}
+
+/// A pause is the next backoff step, uncut by the time left (the driver cuts it where it blocks),
+/// and the backoff starts over after a wait.
+///
+/// Mutant: cut the step to the time left; or keep the schedule across a wait.
+#[skuld::test]
+fn control_paces_a_pause_on_the_backoff_and_restarts_it_after_a_wait() {
+    let paused = |c: &mut Control, time_left| match looked_at(c, Looked::Recheck, time_left) {
+        Next::Pause(d) => whole_ms(&[d])[0],
+        other => panic!("a recheck with time left pauses: {other:?}"),
+    };
+    let mut c = Control::new();
+    assert_eq!(paused(&mut c, None), 1);
+    assert_eq!(paused(&mut c, Some(ms(10))), 2);
+    assert_eq!(paused(&mut c, Some(ms(1))), 4);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::NotReleased);
+    assert_eq!(paused(&mut c, None), 1);
+}
+
+/// A wait released without an exit signal makes the next look the final one, whatever the clock
+/// reads; a woken wait does not.
+///
+/// Mutant: ignore the release; or treat a woken wait as one.
+#[skuld::test]
+fn control_makes_the_look_after_a_released_wait_final() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::NotReleased);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::DeadlinePassed);
+}
+
+/// A done look ends the loop even right after a released wait: the final look is not an expiry.
+///
+/// Mutant: the released flag turns a done look into `DeadlinePassed`.
+#[skuld::test]
+fn control_ends_on_a_done_look_after_a_released_wait() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    assert_eq!(looked_at(&mut c, Looked::Done, None), Next::Done);
+}
+
+/// The released flag clears when a later wait is woken: the look after it waits again.
+///
+/// Mutant: the flag is set once and never cleared.
+#[skuld::test]
+fn control_clears_the_released_flag_after_a_woken_wait() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    c.waited(Ended::NotReleased);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
 }
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends

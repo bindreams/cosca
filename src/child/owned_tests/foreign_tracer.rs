@@ -55,6 +55,41 @@ fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait
     hand_back(EXIT, Wait::Unbounded, false);
 }
 
+/// The async twin of the first row: `wait_async` finds the zombie held, pauses on tokio's timer
+/// (the first poll is pending, and a pause was taken), and returns the kill once the tracer reaps it.
+///
+/// Mutant: a `Recheck` read as an exit, or as a wait on the readable pidfd (which spins).
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn wait_async_waits_out_a_tracer_held_zombie(#[fixture(tracer_group)] _group: &Group) {
+    let mut b = Blocker::spawn_with(foreign_tracer::allow_any_tracer);
+    let mut tracer = foreign_tracer::spawn_helper(b.pid);
+    kill_own_child(b.pid);
+    let pidfd = b.owned.os_handle();
+    let mut fds = [rustix::event::PollFd::new(&pidfd, rustix::event::PollFlags::IN)];
+    crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
+    assert!(
+        matches!(try_wait(&b.owned), Ok(ChildWaitOutcome::DeadlinePassed)),
+        "the tracer still holds it"
+    );
+
+    crate::wait::block_probe::take();
+    let owned = Arc::get_mut(&mut b.owned).expect("the blocker's child is not shared");
+    let mut wait = std::pin::pin!(owned.wait_async());
+    assert!(
+        crate::tokio::drive::drive_tests::poll_once(wait.as_mut()).is_pending(),
+        "the tracer still holds the zombie"
+    );
+    assert!(
+        !crate::wait::block_probe::take().is_empty(),
+        "the wait paused for a recheck"
+    );
+    tracer.send(REAP);
+    tracer.expect("reaped");
+    assert_eq!(status(wait.await).signal(), Some(libc::SIGKILL));
+    tracer.finish();
+}
+
 /// A tracee the foreign tracer has stopped is no exit: `try_wait` and a short bounded `wait` find
 /// it running. The kill and the hand-back then go as above.
 ///

@@ -939,7 +939,10 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     Some(_) => ChildFate::Running { id },
                     None => crate::child::spawn::fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), id),
                 };
-                (format!("the elevated child could not be terminated ({e})"), fate)
+                (
+                    format!("the elevated child {}", crate::child::owned::teardown::kill_refused(&e)),
+                    fate,
+                )
             }
         }
     };
