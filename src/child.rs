@@ -934,6 +934,9 @@ impl Child {
     /// A child that stops reading stdin ends the input; it is not an error. Errors from the pipes
     /// are returned after the child has been waited for.
     ///
+    /// `input` of `Some` for a child whose stdin is not piped, or was already taken, is an
+    /// [`Error::Io`] of kind `InvalidInput`; no pipe is taken then.
+    ///
     /// The streams are served by one loop on the calling thread (`poll` on Unix, overlapped I/O on
     /// Windows), so no thread is started after the child is. As with
     /// [`std::process::Command::output`], a grandchild that inherits a pipe

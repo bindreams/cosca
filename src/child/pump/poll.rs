@@ -1,6 +1,4 @@
-//! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread. No pipe can
-//! fill and stall the child, and nothing after the spawn needs a thread, so a caller under a task
-//! limit (`RLIMIT_NPROC`, a cgroup's `TasksMax`) cannot fail for want of one.
+//! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::AsFd;

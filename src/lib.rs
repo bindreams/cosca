@@ -186,6 +186,10 @@ mod test_groups_tests;
 #[cfg(test)]
 mod test_harness;
 
+// Also mounted into `tests/common`.
+#[cfg(test)]
+mod test_pattern;
+
 #[cfg(test)]
 mod test_reexec;
 #[cfg(test)]

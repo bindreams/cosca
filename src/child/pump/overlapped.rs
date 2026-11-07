@@ -1,6 +1,5 @@
 //! Windows: stdin, stdout and stderr go through overlapped operations on the calling thread, which
-//! waits for whichever completes first. No pipe can fill and stall the child, and nothing after the
-//! spawn needs a thread, so no thread can fail to be created.
+//! waits for whichever completes first.
 //!
 //! Each open stream has one operation in flight, an [`Op`] with an `OVERLAPPED` and an event of its
 //! own and the buffer the kernel reads or writes. The ends are the spawn's (overlapped, made by
@@ -21,8 +20,7 @@ use crate::pipe::{PipeReader, PipeWriter};
 /// is over.
 pub(super) struct Op<E: AsHandle> {
     // Drop order matters: a pending `operation` cancels itself and waits for the kernel to let go
-    // when it drops, which must come before the buffer and the end are freed. Declaration order is
-    // drop order.
+    // when it drops, which must come before the buffer and the end are freed.
     operation: Operation,
     buffer: Vec<u8>,
     end: E,
@@ -52,8 +50,7 @@ impl<E: AsHandle> Op<E> {
         self.operation.event()
     }
 
-    /// Whether the operation in flight has completed: a check of the event's state, which does not
-    /// wait.
+    /// Whether the operation has completed; does not wait.
     pub(super) fn is_done(&self) -> io::Result<bool> {
         // SAFETY: the event is the operation's own, live for the call.
         match unsafe { WaitForSingleObject(self.event(), 0) } {
@@ -146,7 +143,6 @@ impl<'a> Pump<'a, Op<PipeWriter>, Op<PipeReader>> {
         }
     }
 
-    /// Whether the operation of `slot`, which has one in flight, has completed.
     fn is_done(&self, slot: Slot) -> io::Result<bool> {
         match slot {
             Slot::Stdin => self.feed.as_ref().map_or(Ok(false), |feed| feed.pipe.is_done()),
@@ -211,8 +207,8 @@ impl Drain<Op<PipeReader>> {
     }
 }
 
-/// Waits until one of `events` fires. `INFINITE`: an event fires only when its operation completes,
-/// and each is one in flight, so there is no time to wait out.
+/// Waits until one of `events` fires. `INFINITE`: each event fires when its in-flight operation
+/// completes, so no timeout applies.
 fn wait_any(events: &[HANDLE]) -> io::Result<()> {
     // SAFETY: the events are those of live operations, each owned by its `Op`.
     let waited = unsafe { WaitForMultipleObjects(events, false, INFINITE) };

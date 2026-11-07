@@ -287,7 +287,6 @@ pub(crate) fn eof_as_zero(read: io::Result<usize>) -> io::Result<usize> {
 /// The wait is on the operation's own event, so another operation on the same handle, in another
 /// thread, does not release it.
 fn overlapped_io(start: impl FnOnce(&mut Operation<OVERLAPPED>) -> io::Result<StartOutcome>) -> io::Result<usize> {
-    // The `OVERLAPPED` stays on this stack frame: the operation is not moved once started.
     let mut operation = Operation::<OVERLAPPED>::new()?;
     if start(&mut operation)? == StartOutcome::Pending {
         wait_or_abort(operation.event());
@@ -300,15 +299,20 @@ fn overlapped_io(start: impl FnOnce(&mut Operation<OVERLAPPED>) -> io::Result<St
 fn wait_or_abort(event: HANDLE) {
     // SAFETY: a wait on an event the caller owns.
     if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
-        // `eprintln!` panics when writing to stderr fails (e.g. a pipe whose reader has
-        // gone), which would unwind with the buffer still in the kernel's hands.
-        Write::write_all(
-            &mut io::stderr(),
-            b"cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands\n",
-        )
-        .ok();
-        std::process::abort();
+        abort_with_buffer_in_kernel("waiting for a pipe operation");
     }
+}
+
+/// Aborts the process after `step` failed with the caller's buffer still owned by the kernel.
+fn abort_with_buffer_in_kernel(step: &str) -> ! {
+    // `eprintln!` panics when writing to stderr fails (e.g. a pipe whose reader has
+    // gone), which would unwind with the buffer still in the kernel's hands.
+    Write::write_all(
+        &mut io::stderr(),
+        format!("cosca: {step} failed with the buffer still in the kernel's hands\n").as_bytes(),
+    )
+    .ok();
+    std::process::abort();
 }
 
 // The operation =====
@@ -338,10 +342,9 @@ enum State {
 /// pending `Operation` cancels it and waits for the kernel to let go, so a panic cannot free what
 /// the kernel owns. The buffer and the end must outlive the `Operation`.
 ///
-/// `S` is where the `OVERLAPPED` lives, whose address the kernel keeps while the operation is
-/// pending. `OVERLAPPED` itself keeps it in place, on the stack, for an operation that never moves
-/// once started (the synchronous reads and writes); `Box<OVERLAPPED>` is for one that may be moved
-/// while pending (the pump's, whose owner is passed by value).
+/// `S` is where the `OVERLAPPED` lives, since the kernel keeps its address while pending:
+/// `OVERLAPPED` for an operation that never moves once started, `Box<OVERLAPPED>` for one that may
+/// move.
 pub(crate) struct Operation<S: BorrowMut<OVERLAPPED> = Box<OVERLAPPED>> {
     event: OwnedHandle,
     overlapped: S,
@@ -477,12 +480,11 @@ impl<S: BorrowMut<OVERLAPPED>> Drop for Operation<S> {
         // SAFETY: cancels this operation's own `OVERLAPPED`, started on `handle`, which is open by
         // the contract of `read` and `write`.
         if let Err(e) = unsafe { CancelIoEx(self.handle, Some(self.overlapped.borrow())) } {
-            // The operation completed first.
-            debug_assert_eq!(
-                e.code(),
-                windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0),
-                "cancel a pending pipe operation: {e}"
-            );
+            // `ERROR_NOT_FOUND`: the operation completed first. Any other error leaves the kernel
+            // with the buffer, and unwinding would free it.
+            if e.code() != windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0) {
+                abort_with_buffer_in_kernel(&format!("cancelling a pipe operation ({e})"));
+            }
         }
         wait_or_abort(self.event());
         let mut moved = 0u32;

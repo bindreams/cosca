@@ -23,16 +23,21 @@ mod poll;
 /// How many bytes one read or write moves.
 const CHUNK: usize = 64 * 1024;
 
+/// The error of `communicate` given input with no stdin to take it to. Nothing has been taken yet.
+pub(crate) fn input_without_stdin() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "communicate was given input, but the child's stdin is not piped or was already taken",
+    ))
+}
+
 pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Output, Error> {
     let stdin = child.take_stdin_writer();
+    if input.is_some() && stdin.is_none() {
+        return Err(input_without_stdin());
+    }
     let stdout = child.take_reader(Fd::STDOUT);
     let stderr = child.take_reader(Fd::STDERR);
-    // Caller contract: input can only be delivered if stdin was piped; surface the misuse rather
-    // than silently dropping the bytes.
-    debug_assert!(
-        input.is_none() || stdin.is_some(),
-        "communicate given input but stdin was not piped"
-    );
 
     let mut pump = Pump::new(stdin, input.unwrap_or(&[]), stdout, stderr);
     let pump_error = pump.run().err();
@@ -119,8 +124,7 @@ enum Slot {
 }
 
 impl<'a, W, R> Pump<'a, W, R> {
-    /// The pump over the ends `open_writer` and `open_reader` make ready; an end that cannot be made
-    /// ready is closed and its stream fails.
+    /// An end that cannot be made ready is closed and its stream fails.
     fn assemble(
         stdin: Option<PipeWriter>,
         input: &'a [u8],

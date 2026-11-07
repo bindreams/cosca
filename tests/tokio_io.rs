@@ -147,6 +147,31 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
     assert!(out.status.success());
 }
 
+/// Input for a child whose stdin is not piped is an `InvalidInput` error, and the piped stdout is
+/// left in place for the next call.
+///
+/// Mutant: the bytes are dropped and `communicate` returns `Ok`.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn async_communicate_input_without_a_piped_stdin_is_invalid_input() {
+    let mut cmd = common::tokio_command(common::Console::Hidden);
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "emit", "3", "0"]);
+    cmd.stdin(cosca::Stdio::null()).unwrap();
+    cmd.stdout(cosca::Stdio::pipe()).unwrap();
+    let mut child = cmd.spawn().expect("spawn");
+    let error = child
+        .communicate(Some(b"x".to_vec()))
+        .await
+        .expect_err("input has nowhere to go");
+    assert!(
+        matches!(&error, cosca::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    let out = child.communicate(None).await.expect("the pipes were not taken");
+    assert_eq!(out.stdout, b"ooo");
+}
+
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_read_errors_on_invalid_utf8() {

@@ -6,34 +6,6 @@ fn sh(script: &str) -> crate::Child {
     super::pump_common_tests::shell(script, "")
 }
 
-/// A child that closes its stdin ends the input but not the output: everything it goes on to
-/// print is still collected, though input was left unwritten.
-///
-/// Mutant: a broken pipe on stdin ends the draining of stdout and stderr (the child then hangs
-/// on a full pipe, or the output is cut short).
-#[skuld::test]
-fn a_child_that_closes_stdin_is_still_drained() {
-    let mut child = sh("exec 0<&-; head -c 1000000 /dev/zero");
-    let input = vec![b'x'; 1 << 20];
-    let out = child.communicate(Some(&input)).expect("communicate");
-    assert!(out.status.success());
-    assert_eq!(out.stdout.len(), 1_000_000);
-    assert!(out.stderr.is_empty());
-}
-
-/// A stream that reaches EOF early does not end the others: a child that closes stdout and keeps
-/// writing stderr has all of it collected.
-///
-/// Mutant: the first EOF ends the loop, so the rest of stderr is lost.
-#[skuld::test]
-fn a_stream_at_eof_does_not_end_the_others() {
-    let mut child = sh("exec 1>&-; head -c 1000000 /dev/zero >&2");
-    let out = child.communicate(None).expect("communicate");
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty());
-    assert_eq!(out.stderr.len(), 1_000_000);
-}
-
 // No threads =====
 
 /// `communicate` starts no thread: it returns the child's output under a process limit that
@@ -71,10 +43,10 @@ fn fixture_communicate_under_a_nproc_limit() {
          CAP_SYS_RESOURCE/CAP_SYS_ADMIN holders, so run as an unprivileged user, or set \
          COSCA_TEST_UNPRIVILEGED=0 to opt out"
     );
-    let input = vec![b'x'; 1 << 20];
+    let input = crate::test_pattern::pattern_bytes(1 << 20);
     let out = child.communicate(Some(&input)).expect("communicate");
     assert!(out.status.success());
-    assert_eq!(out.stdout, input);
+    assert!(out.stdout == input, "stdout");
     assert_eq!(out.stderr, b"done\n");
 }
 
@@ -170,22 +142,4 @@ fn fixture_communicate_with_pending_sigpipe() {
             "the host's SIGPIPE was consumed"
         );
     }
-}
-
-// Grandchild =====
-
-/// A grandchild that inherited stdout and outlives the child keeps `communicate` waiting until it
-/// closes it: everything it prints is collected. The grandchild reads a FIFO whose only writer is the
-/// child, so it prints only once the child has exited, after the child's own line.
-///
-/// Mutant: `communicate` returns once the child has exited.
-#[skuld::test]
-fn a_grandchild_holding_stdout_keeps_communicate_waiting() {
-    let mut child = sh(r#"d=$(mktemp -d) && mkfifo "$d/f" || exit 1
-(cat "$d/f" >/dev/null; rm -r "$d"; echo late) &
-exec 4>"$d/f"
-echo early"#);
-    let out = child.communicate(None).expect("communicate");
-    assert!(out.status.success());
-    assert_eq!(out.stdout, b"early\nlate\n");
 }

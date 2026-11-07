@@ -306,7 +306,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     // > a pipe buffer (~64 KiB) in every direction: child copies stdin to BOTH
     // stdout and stderr while the parent writes stdin and reads both outputs.
     // A non-concurrent pump would deadlock here.
-    let input = vec![b'x'; 512 * 1024];
+    let input = common::test_pattern::pattern_bytes(512 * 1024);
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
@@ -315,8 +315,8 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     let mut child = cmd.spawn().expect("spawn");
     let out = child.communicate(Some(&input)).expect("communicate");
     assert!(out.status.success());
-    assert_eq!(out.stdout, input);
-    assert_eq!(out.stderr, input);
+    assert!(out.stdout == input, "stdout");
+    assert!(out.stderr == input, "stderr");
 }
 
 /// The input is closed the moment its last byte is written, not when the output ends: `tee-both`
