@@ -21,7 +21,6 @@ pub(crate) use proc_source::HANDED_TO_ORPHAN_REAPER;
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
-#[cfg(unix)]
 use crate::child::ParentEnd;
 use crate::containment::dispatch::{SweepFailure, TeardownCaller, TreeKillOutcome};
 use crate::containment::{Attached, Containment};
@@ -32,14 +31,47 @@ use crate::stdio::Fd;
 #[cfg(unix)]
 use crate::wait::teardown_warn::{wait_warning, Due};
 
-/// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
-/// (converted to a reactor pipe at take time); Windows stashes the already-registered overlapped
-/// async end (the raw backend's fd >= 3 pipes), taken directly (no `from_raw_handle`, which would
-/// double-register the IOCP handle).
-#[cfg(unix)]
+/// Parent ends of fd >= 3 pipes, keyed by descriptor: the raw sync `ParentEnd`, converted to a
+/// reactor pipe at take time.
 pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
-#[cfg(windows)]
-pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
+
+/// Take the read end on `fd` out of `ends` (the first call moves it out, later calls find none) as a
+/// reactor pipe. A write end is put back. If registering the end fails it drops, with a warn naming
+/// `what`: the child sees a broken pipe on writes, visibly, never a hang.
+fn take_reader(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::OwnedRead> {
+    match ends.remove(&fd)? {
+        ParentEnd::Reader(r) => match super::stdio::register_reader(r) {
+            Ok(end) => Some(end),
+            Err(e) => {
+                log::warn!(
+                    "{fd} {what} dropped: tokio conversion failed ({e}); the child will see a broken pipe on writes"
+                );
+                None
+            }
+        },
+        end => {
+            ends.insert(fd, end);
+            None
+        }
+    }
+}
+
+/// [`take_reader`] for a write end: a failed registration leaves the child EOF on reads.
+fn take_writer(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::OwnedWrite> {
+    match ends.remove(&fd)? {
+        ParentEnd::Writer(w) => match super::stdio::register_writer(w) {
+            Ok(end) => Some(end),
+            Err(e) => {
+                log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); the child will see EOF on reads");
+                None
+            }
+        },
+        end => {
+            ends.insert(fd, end);
+            None
+        }
+    }
+}
 
 /// The `expect` behind the backend accessors: only a teardown takes `proc` (it moves every resource
 /// out of the handle, so no handle method runs after that, and the teardown reads the pid from what
@@ -534,77 +566,18 @@ impl Child {
 
     /// Take the stashed our-owned read end of an Out-direction merge target (plain
     /// `BTreeMap::remove` — TAKE semantics: the first call moves the end out, later calls
-    /// return `None`, matching the tokio-owned branch's `Option::take`). Unix converts the
-    /// raw end to a reactor pipe here; on a conversion failure the end drops (with a
-    /// `log::warn!`), so the child observes EPIPE on writes — visible, never a hang.
-    #[cfg(unix)]
+    /// return `None`, matching the tokio-owned branch's `Option::take`). The raw end is converted
+    /// to a reactor pipe here; on a conversion failure the end drops (with a `log::warn!`), so the
+    /// child observes a broken pipe on writes — visible, never a hang.
     fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
-        use std::os::fd::OwnedFd;
-        match self.os.owned_std.remove(&fd)? {
-            ParentEnd::Reader(r) => match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
-                Ok(recv) => Some(super::stdio::OutInner::Owned(recv)),
-                Err(e) => {
-                    log::warn!(
-                        "{fd} merge-target read end dropped: tokio conversion failed ({e}); the child will see EPIPE on writes"
-                    );
-                    None
-                }
-            },
-            end => {
-                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
-                None
-            }
-        }
-    }
-
-    /// The Windows twin yields the stashed `WinOwnedRead` DIRECTLY — the `NamedPipeServer`
-    /// and its connect task were created at spawn, inside the runtime, so no conversion
-    /// (and no `from_raw_handle`, which would double-register the IOCP handle) exists here.
-    #[cfg(windows)]
-    fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
-        match self.os.owned_std.remove(&fd)? {
-            super::stdio::OwnedStd::Read(r) => Some(super::stdio::OutInner::Owned(r)),
-            end => {
-                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_read_end mirror)
-                None
-            }
-        }
+        take_reader(&mut self.os.owned_std, fd, "merge-target read end").map(super::stdio::OutInner::Owned)
     }
 
     /// Take the stashed our-owned write end of an In-direction merge target (TAKE
-    /// semantics, as [`take_owned_out`](Child::take_owned_out)). On a Unix conversion
-    /// failure the dropped end closes the pipe, so the child observes EOF on reads.
-    #[cfg(unix)]
+    /// semantics, as [`take_owned_out`](Child::take_owned_out)). On a conversion failure the
+    /// dropped end closes the pipe, so the child observes EOF on reads.
     fn take_owned_in(&mut self, fd: Fd) -> Option<super::stdio::InInner> {
-        use std::os::fd::OwnedFd;
-        match self.os.owned_std.remove(&fd)? {
-            ParentEnd::Writer(w) => match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
-                Ok(send) => Some(super::stdio::InInner::Owned(send)),
-                Err(e) => {
-                    log::warn!(
-                        "{fd} merge-target write end dropped: tokio conversion failed ({e}); the child will see EOF on reads"
-                    );
-                    None
-                }
-            },
-            end => {
-                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
-                None
-            }
-        }
-    }
-
-    /// The Windows twin of [`take_owned_in`](Child::take_owned_in) — direct, no conversion
-    /// (see [`take_owned_out`](Child::take_owned_out)).
-    #[cfg(windows)]
-    fn take_owned_in(&mut self, fd: Fd) -> Option<super::stdio::InInner> {
-        match self.os.owned_std.remove(&fd)? {
-            super::stdio::OwnedStd::Write(w) => Some(super::stdio::InInner::Owned(w)),
-            end => {
-                self.os.owned_std.insert(fd, end); // wrong direction — put it back (fd_write_end mirror)
-                None
-            }
-        }
+        take_writer(&mut self.os.owned_std, fd, "merge-target write end").map(super::stdio::InInner::Owned)
     }
 
     /// Take the parent's read end of the pipe on child descriptor `fd` (configured via
@@ -623,25 +596,7 @@ impl Child {
     /// observes EPIPE on its write end — a visible failure, never a hang).
     #[cfg(unix)]
     pub fn fd_read_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Receiver> {
-        use std::os::fd::OwnedFd;
-        let fd = fd.into();
-        match self.os.pipes.remove(&fd)? {
-            crate::child::ParentEnd::Reader(r) => {
-                match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
-                    Ok(recv) => Some(recv),
-                    Err(e) => {
-                        log::warn!(
-                            "{fd} read end dropped: tokio conversion failed ({e}); the child will see EPIPE on writes"
-                        );
-                        None
-                    }
-                }
-            }
-            end => {
-                self.os.pipes.insert(fd, end); // wrong direction — put it back (sync mirror)
-                None
-            }
-        }
+        take_reader(&mut self.os.pipes, fd.into(), "read end")
     }
 
     /// Take the parent's write end of the pipe on child descriptor `fd` (configured via
@@ -660,72 +615,52 @@ impl Child {
     /// observes EOF on its read end — a visible failure, never a hang).
     #[cfg(unix)]
     pub fn fd_write_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Sender> {
-        use std::os::fd::OwnedFd;
-        let fd = fd.into();
-        match self.os.pipes.remove(&fd)? {
-            crate::child::ParentEnd::Writer(w) => {
-                match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
-                    Ok(send) => Some(send),
-                    Err(e) => {
-                        log::warn!(
-                            "{fd} write end dropped: tokio conversion failed ({e}); the child will see EOF on reads"
-                        );
-                        None
-                    }
-                }
-            }
-            end => {
-                self.os.pipes.insert(fd, end);
-                None
-            }
-        }
+        take_writer(&mut self.os.pipes, fd.into(), "write end")
     }
 
     /// Take the parent's read end of the pipe on child descriptor `fd` (configured via
     /// `Command::fd(n, Stdio::pipe_out())`), as an async [`ChildStdout`](super::stdio::ChildStdout).
-    /// The raw `CreateProcessW` backend serves fd >= 3 on Windows; the end is the overlapped
-    /// named-pipe async end created at spawn (inside the runtime), yielded directly.
+    /// The raw `CreateProcessW` backend serves fd >= 3 on Windows.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
+    /// reactor).
     ///
     /// # Returns
     ///
-    /// `Some(reader)` on success. `None` if the fd was not configured as a piped read end, or was
-    /// already taken. A wrong-direction take (a write end) leaves the end in place for
-    /// [`fd_write_end`](Child::fd_write_end).
+    /// `Some(reader)` on success. `None` if the fd was not configured as a piped read end, if it
+    /// was already taken, or if registering the end with the reactor failed (logged at warn; the
+    /// dropped end closes the pipe, so the child observes a broken pipe on its write end — a
+    /// visible failure, never a hang). A wrong-direction take (a write end) leaves the end in place
+    /// for [`fd_write_end`](Child::fd_write_end).
     #[cfg(windows)]
     pub fn fd_read_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdout> {
-        let fd = fd.into();
-        match self.os.pipes.remove(&fd)? {
-            super::stdio::OwnedStd::Read(r) => Some(super::stdio::ChildStdout {
-                inner: super::stdio::OutInner::Owned(r),
-            }),
-            end => {
-                self.os.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
-                None
-            }
-        }
+        take_reader(&mut self.os.pipes, fd.into(), "read end").map(|r| super::stdio::ChildStdout {
+            inner: super::stdio::OutInner::Owned(r),
+        })
     }
 
     /// Take the parent's write end of the pipe on child descriptor `fd` (configured via
     /// `Command::fd(n, Stdio::pipe_in())`), as an async [`ChildStdin`](super::stdio::ChildStdin).
     /// See [`fd_read_end`](Child::fd_read_end) for the Windows raw-backend surface.
     ///
+    /// # Panics
+    ///
+    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
+    /// reactor).
+    ///
     /// # Returns
     ///
-    /// `Some(writer)` on success. `None` if the fd was not configured as a piped write end, or was
-    /// already taken. A wrong-direction take leaves the end in place for
-    /// [`fd_read_end`](Child::fd_read_end).
+    /// `Some(writer)` on success. `None` if the fd was not configured as a piped write end, if it
+    /// was already taken, or if registering the end with the reactor failed (logged at warn; the
+    /// dropped end closes the pipe, so the child observes EOF on its read end). A wrong-direction
+    /// take leaves the end in place for [`fd_read_end`](Child::fd_read_end).
     #[cfg(windows)]
     pub fn fd_write_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdin> {
-        let fd = fd.into();
-        match self.os.pipes.remove(&fd)? {
-            super::stdio::OwnedStd::Write(w) => Some(super::stdio::ChildStdin {
-                inner: super::stdio::InInner::Owned(w),
-            }),
-            end => {
-                self.os.pipes.insert(fd, end); // wrong direction — put it back (Unix mirror)
-                None
-            }
-        }
+        take_writer(&mut self.os.pipes, fd.into(), "write end").map(|w| super::stdio::ChildStdin {
+            inner: super::stdio::InInner::Owned(w),
+        })
     }
 
     /// Test-only: whether this child is inside the crate's Job Object (`IsProcessInJob`
