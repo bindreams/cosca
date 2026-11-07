@@ -294,36 +294,6 @@ async fn a_forgotten_child_answers_echild_to_wait_and_try_wait() {
     }
 }
 
-/// The streams are separate objects, so forgetting the child leaks nothing by keeping them: a
-/// caller who waits and then reads `stdout()` keeps its output.
-///
-/// Mutant: `forget_foreign` drops the streams.
-#[cfg(unix)]
-#[skuld::test]
-async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
-    use ::tokio::io::AsyncReadExt as _;
-    let child = crate::test_spawn::spawn_tokio(
-        ::tokio::process::Command::new("sh")
-            .args(["-c", "echo hello"])
-            .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn");
-    let pid = child.id().expect("tokio owns an un-reaped child");
-    let mut proc = proc_source(child);
-    reap_behind_the_owner(pid);
-
-    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
-    proc.forget_foreign();
-
-    let ProcSource::Foreign { stdout, .. } = &mut proc else {
-        panic!("a forgotten backend");
-    };
-    let mut stdout = stdout.take().expect("the untaken stdout survives the forget");
-    let mut line = String::new();
-    stdout.read_to_string(&mut line).await.expect("read");
-    assert_eq!(line, "hello\n");
-}
-
 /// Dropping a backend that nothing released or forgot, which is what an unwind does to one, hands
 /// tokio's `Child` to its own drop only when the handle shows the child ours.
 ///
@@ -381,8 +351,7 @@ async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
 }
 
-/// `wait` closes the untaken stdin before it waits, so a child that reads stdin to EOF can exit. A
-/// failure is a hang, which the `death_watch_` name bounds.
+/// `wait` closes the untaken stdin before it waits, so a child that reads stdin to EOF can exit.
 ///
 /// Mutant: `wait` leaves stdin open.
 #[skuld::test]
@@ -390,6 +359,35 @@ async fn death_watch_wait_closes_the_untaken_stdin() {
     let mut cmd = crate::test_child::tokio_command(crate::test_child::Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
+}
+
+/// The same when another slot merges into the stdin pipe: the merge is a copy of the child's end,
+/// so the parent's end is still the only writer and closes with the wait.
+///
+/// Mutant: the merge's resolution keeps a second parent end of the pipe open.
+#[skuld::test]
+async fn death_watch_wait_closes_an_untaken_stdin_another_slot_merges_into() {
+    let mut cmd = crate::test_child::tokio_command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::merge(crate::Fd::STDIN)).expect("merge fd 3");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
+}
+
+/// The same for a raw-backend child (an fd >= 3 pipe routes the spawn there on Windows): the
+/// untaken stdin closes with the wait, beside the fd 3 pipe it leaves open.
+///
+/// Mutant: the raw backend's pipes are not the ones `wait` closes.
+#[cfg(windows)]
+#[skuld::test]
+async fn death_watch_wait_closes_the_untaken_stdin_of_a_raw_child() {
+    let mut cmd = crate::test_child::tokio_command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("fd 3 pipe");
     let mut child = cmd.spawn().expect("spawn");
     child.wait().await.expect("the child ends on the EOF wait made");
 }
@@ -834,14 +832,15 @@ async fn reap_now_of_a_child_reaped_behind_the_owner_after_the_kill_is_killed() 
 #[skuld::test]
 async fn exited_within_of_a_child_never_shown_ours_is_false() {
     crate::tokio::test_runtime::assert_current_thread();
-    // `cat` runs until the backend, which keeps its stdin, drops.
-    let child = crate::test_spawn::spawn_tokio(
+    // `cat` runs until `stdin`, which the test holds, drops.
+    let mut child = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null()),
     )
     .expect("spawn");
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let stdin = child.stdin.take();
     let mut proc = proc_source(child);
     proc.forget_foreign();
 
@@ -852,6 +851,7 @@ async fn exited_within_of_a_child_never_shown_ours_is_false() {
         "its child may still be running"
     );
     drop(proc);
+    drop(stdin);
     reap_behind_the_owner(pid);
 }
 

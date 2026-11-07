@@ -90,6 +90,22 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         "the refusal ran after the mutation it was supposed to precede"
     );
 
+    // A refused stdio and a refused descriptor table: both are checked before the mutation too.
+    for (slot, target, what) in [
+        (3, crate::Stdio::inherit(), "inherit on fd 3 has no parent stream"),
+        (100_000, crate::Stdio::null(), "the descriptor table is too large"),
+    ] {
+        let mut refused = crate::test_child::tokio_command(Console::Hidden);
+        refused.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
+        refused.fd(slot, target).expect("configure the slot");
+        let err = crate::child::spawn::failure::expect_not_started(refused.spawn().expect_err(what));
+        assert!(matches!(err, Error::Unsupported { .. }), "{what}: got {err:?}");
+        assert!(
+            !observe::take_inheritance_cleared(),
+            "{what}: the refusal ran after the mutation it was supposed to precede"
+        );
+    }
+
     let mut allowed = crate::test_child::tokio_command(Console::Hidden);
     allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
     let mut child = allowed

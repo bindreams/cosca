@@ -941,8 +941,7 @@ async fn async_communicate_reads_a_merged_stream() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_merged_stream_accessor_has_take_semantics() {
-    // stdout() as a piped merge target: first take yields the reader, second is None
-    // (take semantics, matching the tokio-owned branch).
+    // stdout() as a piped merge target: first take yields the reader, second is None.
     let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "3", "2"]);
@@ -956,7 +955,7 @@ async fn async_merged_stream_accessor_has_take_semantics() {
         child.stdout().is_none(),
         "second stdout() take must be None (take semantics)"
     );
-    // The MERGING slot (stderr) has no stream of its own: tokio's stderr was never piped.
+    // The MERGING slot (stderr) has no pipe of its own, so no stream.
     assert!(child.stderr().is_none(), "a merged-away slot yields no stream");
     drop(first); // close the parent end so the child's writes cannot block forever
     let _ = child.wait().await;
@@ -965,8 +964,8 @@ async fn async_merged_stream_accessor_has_take_semantics() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_non_merged_stream_accessor_has_take_semantics() {
-    // Regression: the pre-pass skips slots it does not assign, so stdin/stdout/stderr keep
-    // plain take-semantics in a non-merge config.
+    // Without a merge, stdin/stdout/stderr keep plain take-semantics: each piped slot's parent end
+    // is held in the child's `pipes` map until taken.
     let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "emit", "5", "0"]);
@@ -985,29 +984,11 @@ async fn async_non_merged_stream_accessor_has_take_semantics() {
 }
 
 #[cfg(feature = "tokio")]
-#[skuld::test]
-async fn async_plain_piped_stream_accessor_has_take_semantics() {
-    // The tokio-owned (non-merge) branch's take-semantics: stdout piped (no merge), so
-    // tokio owns the internal pipe. Verifies parity with the merge-owned case above.
-    let mut cmd = common::tokio_command(common::Console::Hidden);
-    cmd.executable(common::testbin())
-        .args(["cosca_testbin", "emit", "3", "0"]);
-    cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
-    let mut child = cmd.spawn().expect("spawn");
-    let first = child.stdout();
-    assert!(first.is_some(), "first take yields the tokio-owned reader");
-    assert!(child.stdout().is_none(), "second take must be None (take semantics)");
-    drop(first);
-    let _ = child.wait().await;
-}
-
-#[cfg(feature = "tokio")]
-/// In-direction merge target on ALL platforms: stdin is piped and stderr merges into it,
-/// so the pre-pass owns stdin's pipe (tokio cannot share its internal one). The child's
-/// `stdin-split-echo` mode reads EXACTLY 3 bytes from fd 0, then fd 2 to EOF: dup'd
+/// In-direction merge target on ALL platforms: stdin is piped and stderr merges into it. The
+/// child's `stdin-split-echo` mode reads EXACTLY 3 bytes from fd 0, then fd 2 to EOF: dup'd
 /// descriptors share ONE pipe, so `abc|def` proves the merging slot's handle is a LIVE dup
-/// of that pipe — a silently skipped dup could not produce the tail. Parent writes via the
-/// OWNED stdin path (Windows `NamedPipeServer`; Unix `pipe::Sender`), EOF by drop.
+/// of that pipe — a silently skipped dup could not produce the tail. Parent writes through the
+/// `stdin()` writer, EOF by drop.
 #[skuld::test]
 async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1019,7 +1000,7 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDIN))
         .expect("stderr merges into stdin");
     let mut child = cmd.spawn().expect("spawn merged-stdin child");
-    let mut stdin = child.stdin().expect("owned stdin writer");
+    let mut stdin = child.stdin().expect("stdin writer");
     stdin.write_all(b"abcdef").await.expect("write");
     drop(stdin); // buffered data is delivered first, then EOF (verified teardown order)
     let mut buf = Vec::new();
@@ -1034,9 +1015,9 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
 }
 
 #[cfg(feature = "tokio")]
-/// fd >= 3 as a merge SOURCE into a piped Out target: the pre-pass routes the dup'd write
-/// end through fd_map (never silently dropped). testbin's `fd3-write` emits its token
-/// on fd 3 — a dup of stdout's owned pipe — so the token arrives on the stdout reader.
+/// fd >= 3 as a merge SOURCE into a piped Out target: `resolve_stdio` makes fd 3 a dup of stdout's
+/// child end, which the fd map installs (never silently dropped). testbin's `fd3-write` emits its
+/// token on fd 3, so it arrives on the stdout reader.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_fd3_source_merges_into_piped_stdout() {
@@ -1061,7 +1042,7 @@ async fn async_fd3_source_merges_into_piped_stdout() {
 
 #[cfg(feature = "tokio")]
 /// fd >= 3 as a merge SOURCE into a piped In target (one parent writer, several child read
-/// fds — the user-decided shape): fd 3 is a dup of the owned stdin read end; testbin's
+/// fds — the user-decided shape): fd 3 is a dup of stdin's read end; testbin's
 /// `fd3-echo` copies fd 3 to stdout, so the parent's stdin writes round-trip through the DUP.
 #[cfg(unix)]
 #[skuld::test]

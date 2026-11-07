@@ -209,8 +209,8 @@ impl FirstRead {
 /// Whether the pipe std's spawn opens to learn of a failed `exec` takes one of fds 0 to 2 for its
 /// write end. The child replaces each of those with its own stdio before any hook runs, so std
 /// returns before the report and cannot see whether the `exec` ran. std makes its own pipe on the
-/// two lowest free fds (std 1.96 `sys/process/unix`: `pipe`), after the spawn made every stdio pipe
-/// itself. Read under `spawn_lock`, just before the spawn.
+/// two lowest free fds (std 1.96 `sys/process/unix`: `pipe`). Read under `spawn_lock`, just before
+/// the spawn.
 ///
 /// Another thread can change fds 0 to 2 between this read and the spawn, and the check then answers
 /// for a state that is gone, in both directions:

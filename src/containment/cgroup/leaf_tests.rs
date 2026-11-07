@@ -2387,7 +2387,7 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     let procs_fd = procs_write.into_raw_fd();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let guard = fork_running(move || {
+    let guard = fork_running(&[gate, procs_fd, slot.fd, slot.parent_fd], move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
         _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };

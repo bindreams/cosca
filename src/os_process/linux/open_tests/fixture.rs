@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::child::spawn::{spawn_lock, SpawnLockGuard};
-use crate::containment::cgroup::test_support::{fork_running_locked, KillOnDrop};
+use crate::containment::cgroup::test_support::{close_range_except, fork_running_locked, KillOnDrop};
 use crate::identity::ProcessId;
 
 // Child exit codes ====================================================================
@@ -230,32 +230,9 @@ fn write_decimal(mut n: u32, buf: &mut [u8; 10]) -> &[u8] {
 /// a concurrently running test's fds are still in the snapshot, and a lingering child would pin
 /// them. `force_failure` skips the syscall and fails the step, as on Linux < 5.9.
 fn close_range_except_or_exit(keep: &[RawFd], exit_code_on_failure: i32, force_failure: bool) {
-    if force_failure {
+    if force_failure || !close_range_except(keep) {
         exit_child(exit_code_on_failure);
     }
-    let close_gap = |first: RawFd, last: RawFd| {
-        if first > last {
-            return;
-        }
-        // SAFETY: close_range(2) with no flags; both bounds are non-negative. rustix has no wrapper.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                first as libc::c_long,
-                last as libc::c_long,
-                0 as libc::c_long,
-            )
-        };
-        if rc != 0 {
-            exit_child(exit_code_on_failure);
-        }
-    };
-    let mut prev_end: RawFd = -1;
-    for &fd in keep {
-        close_gap(prev_end + 1, fd - 1);
-        prev_end = fd;
-    }
-    close_gap(prev_end + 1, RawFd::MAX);
 }
 
 /// `waitpid(pid)` for this process's own child, retrying `EINTR`; returns the raw wait status.

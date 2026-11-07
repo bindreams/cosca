@@ -143,8 +143,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // Forwarding the builder's `kill_on_drop` to `tcmd` would add a second, unsequenced kill
     // inside that release, where nothing orders it against the tree kill.
 
-    // Stdio is resolved before `prepare` on Linux and Windows, under the lock on macOS; see the sync
-    // spawn for why.
     let reserved = crate::child::spawn::reserved_fds(&fds);
 
     // The pidfd the handshake opens; the child keeps it (Linux).
@@ -289,8 +287,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(target_os = "linux")]
         let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
-        // Register the one hook, whose steps (the fd map's included) all run in the child in a fixed
-        // order; see child/spawn.rs.
         #[cfg(unix)]
         steps.register(tcmd.as_std_mut());
 

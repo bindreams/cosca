@@ -16,8 +16,8 @@ impl Child {
             return Err(error);
         }
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
-        // `self.proc_mut()` (so the four-future join compiles). That wait is the inner one, which
-        // closes no stdin, so nothing but the write future, which owns it, closes it on this path.
+        // `self.proc_mut()` (so the four-future join compiles). The inner wait closes no stdin; only
+        // the write future, which owns it, does.
         let mut stdin = self.stdin();
         let mut stdout = self.stdout();
         let mut stderr = self.stderr();

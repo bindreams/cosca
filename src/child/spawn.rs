@@ -523,11 +523,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut std_cmd = build_std_command(cmd).not_started()?;
 
-    // Stdio is resolved (`resolve_into_std`) before `prepare` on Linux and Windows, so a refused
-    // stdio fails before containment makes anything (a cgroup leaf on Linux; on Windows `prepare`
-    // mutates this process). Their pipes need no lock to be made: `pipe2(O_CLOEXEC)`, and
-    // non-inheritable handles. macOS makes them under the lock (`std::io::pipe` is `pipe()` then
-    // `FD_CLOEXEC`), so it takes the lock first.
     let reserved = reserved_fds(&fds);
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps go
@@ -548,6 +543,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let (mut prepared, child, unique, parent_ends) = {
         let (prepared, spawned, first, parent_ends) = {
             let _guard = spawn_lock();
+            // Under the lock, which macOS needs to make a pipe (see `pipe::unix::child_pipe`).
             let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
             let prepared = crate::containment::prepare(
                 &mut std_cmd,
@@ -583,6 +579,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // Everything from the channel's creation to the helper's join is under `spawn_lock`.
     #[cfg(target_os = "linux")]
     let (mut prepared, child, pidfd, parent_ends) = {
+        // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
         let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -618,6 +615,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     #[cfg(windows)]
     let (mut prepared, child, parent_ends) = {
+        // Before `prepare`, which mutates this process.
         let parent_ends = resolve_into_std(&mut std_cmd, &fds).not_started()?;
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -1842,10 +1840,9 @@ pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
 /// [`resolve_stdio`].
 pub(crate) type ResolvedStdioEnds = (BTreeMap<Fd, ChildEnd>, BTreeMap<Fd, ParentEnd>);
 
-/// Resolves every slot of a spawn to its child end, and every piped slot to its parent end, for all
-/// four spawn paths: 0/1/2 (inheriting when unconfigured) and every configured fd >= 3. The
-/// per-caller tails (the final `Stdio` assignment, the Windows raw backend's handle table) stay
-/// with each spawn.
+/// Resolves every slot of a spawn to its child end, and every piped slot to its parent end: 0/1/2
+/// (inheriting when unconfigured) and every configured fd >= 3. The per-caller tails (the final
+/// `Stdio` assignment, the Windows raw backend's handle table) stay with each spawn.
 ///
 /// On macOS the caller holds `spawn_lock` (see `pipe::unix::child_pipe`).
 pub(crate) fn resolve_stdio(
@@ -1908,13 +1905,10 @@ pub(crate) fn resolve_stdio(
     Ok((child_ends, parent_ends))
 }
 
-/// [`resolve_stdio`] for a spawn through `std::process::Command`, which both the sync and the async
-/// std spawns are: 0/1/2 go to `cmd` (std closes its copies at spawn), and on Unix each fd >= 3 child
-/// end goes to the fd map in `steps`, whose step `dup2`s it to its number after the fork. Returns
-/// every parent end.
-///
-/// The hook is registered later, by the caller, once `prepare` has added its steps. Runs under
-/// `spawn_lock` on macOS only (see [`resolve_stdio`]).
+/// [`resolve_stdio`] for a spawn through `std::process::Command`: 0/1/2 go to `cmd` (std closes its
+/// copies at spawn), and on Unix each fd >= 3 child end goes to the fd map in `steps`, whose step
+/// `dup2`s it to its number after the fork. Returns every parent end. The caller registers the hook
+/// after `prepare` has added its steps.
 pub(crate) fn resolve_into_std(
     cmd: &mut std::process::Command,
     #[cfg(unix)] steps: &mut in_child::InChild,
@@ -1938,8 +1932,7 @@ pub(crate) fn resolve_into_std(
         };
     }
     // The step runs after every other, so it cannot replace a descriptor one still needs, and std
-    // `dup2`s 0/1/2 before any `pre_exec` hook runs, so a mapping never clobbers stdio. A duplicate
-    // child fd number is unreachable: `child_ends` is keyed by `Fd`.
+    // `dup2`s 0/1/2 before any `pre_exec` hook runs, so a mapping never clobbers stdio.
     #[cfg(unix)]
     {
         let mappings: Vec<fd_map::FdMapping> = child_ends

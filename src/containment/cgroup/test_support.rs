@@ -8,23 +8,28 @@
 /// Forks under [`spawn_lock`], so the never-exec child cannot inherit an fd another spawn holds
 /// transiently non-`CLOEXEC` inside its own `spawn_lock` section. Held across `fork()` until the
 /// parent's `pidfd_open` resolves.
+///
+/// The child closes every descriptor above 2 but `keep`, the ones `body` uses, first thing: a
+/// concurrent test's pipe end, made outside `spawn_lock`, is in the fork's copy and would stay open
+/// as long as the child.
 #[cfg(target_os = "linux")]
-pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
+pub(crate) fn fork_running(keep: &[std::os::fd::RawFd], body: impl FnOnce()) -> KillOnDrop {
     let guard =
         crate::child::spawn::spawn_lock_tracked(crate::containment::cgroup::fault::run_fork_running_lock_contended);
-    fork_running_held(Held::Owned(guard), body)
+    fork_running_held(Held::Owned(guard), Some(keep), body)
 }
 
 /// [`fork_running`] under a `spawn_lock` the caller already holds: forks without re-acquiring
 /// it (the mutex is not reentrant) and leaves it held on return. For a caller whose own fds must
-/// stay unpinned by other forks for longer than this fork.
+/// stay unpinned by other forks for longer than this fork. Closes no descriptor: `body` does, as it
+/// needs.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running_locked(guard: &crate::child::spawn::SpawnLockGuard, body: impl FnOnce()) -> KillOnDrop {
     debug_assert!(
         crate::child::spawn::spawn_lock_held_by_this_thread(),
         "fork_running_locked: the guard must be this thread's spawn_lock"
     );
-    fork_running_held(Held::Borrowed(guard), body)
+    fork_running_held(Held::Borrowed(guard), None, body)
 }
 
 /// The `spawn_lock` a fork runs under: taken by [`fork_running`], or the caller's.
@@ -47,15 +52,28 @@ impl Held<'_> {
 }
 
 #[cfg(target_os = "linux")]
-fn fork_running_held(held: Held<'_>, body: impl FnOnce()) -> KillOnDrop {
+fn fork_running_held(held: Held<'_>, keep: Option<&[std::os::fd::RawFd]>, body: impl FnOnce()) -> KillOnDrop {
     // Taken before the fork: the child uses this captured value, not the thread-local.
     let report_fd = crate::containment::cgroup::fault::take_fork_running_lock_held_report_fd();
+    // Built before the fork: the child allocates nothing.
+    let kept: Option<Vec<std::os::fd::RawFd>> = keep.map(|keep| {
+        let mut kept: Vec<_> = (0..=2).chain(keep.iter().copied()).chain(report_fd).collect();
+        kept.sort_unstable();
+        kept.dedup();
+        kept
+    });
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
     // `_exit`s without unwinding or running destructors.
     let raw_pid = unsafe { libc::fork() };
     match raw_pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
+            if let Some(kept) = &kept {
+                if !close_range_except(kept) {
+                    // SAFETY: async-signal-safe.
+                    unsafe { libc::_exit(CLOSE_RANGE_FAILED_EXIT) };
+                }
+            }
             // Report whether the forked copy saw the lock held: a plain `Cell` read and a raw
             // `write(2)`, both async-signal-safe. Reading it in the child (not the parent) can't
             // be fooled by drop-before/reacquire-after the fork.
@@ -155,6 +173,40 @@ fn fork_running_held(held: Held<'_>, body: impl FnOnce()) -> KillOnDrop {
 /// Exit code of a [`fork_running`] child whose lock-held report `write(2)` failed or was short.
 #[cfg(target_os = "linux")]
 pub(crate) const REPORT_WRITE_FAILED_EXIT: i32 = 113;
+
+/// Exit code of a [`fork_running`] child whose `close_range(2)` failed.
+#[cfg(target_os = "linux")]
+pub(crate) const CLOSE_RANGE_FAILED_EXIT: i32 = 114;
+
+/// Closes every descriptor but those in `keep` (sorted ascending, duplicate-free), one
+/// `close_range(2)` per gap. `false` if a call failed. Async-signal-safe: for a child just forked
+/// from this multithreaded process, whose copy holds the descriptors of every concurrent test.
+#[cfg(target_os = "linux")]
+pub(crate) fn close_range_except(keep: &[std::os::fd::RawFd]) -> bool {
+    let close_gap = |first: std::os::fd::RawFd, last: std::os::fd::RawFd| {
+        if first > last {
+            return true;
+        }
+        // SAFETY: close_range(2) with no flags; both bounds are non-negative. rustix has no wrapper.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first as libc::c_long,
+                last as libc::c_long,
+                0 as libc::c_long,
+            )
+        };
+        rc == 0
+    };
+    let mut prev_end: std::os::fd::RawFd = -1;
+    for &fd in keep {
+        if !close_gap(prev_end + 1, fd - 1) {
+            return false;
+        }
+        prev_end = fd;
+    }
+    close_gap(prev_end + 1, std::os::fd::RawFd::MAX)
+}
 
 /// SIGKILLs and reaps a forked child on drop unless [`defuse`](Self::defuse)d. Uses a pidfd, not
 /// the pid, which the kernel may recycle after a reap.

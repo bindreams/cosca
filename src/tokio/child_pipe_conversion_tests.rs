@@ -2,9 +2,9 @@
 //! drops the end so its peer observes the close. Unix: an end of the wrong direction. Windows: an
 //! overlapped end that a completion port already holds (the registration fails with os error 87),
 //! which fails in debug and release alike; a synchronous end, which `adopt` forbids, would trip its
-//! debug assertion instead. Each test keys its log assertion on a warn no other test provokes (an
-//! fd number or an accessor no other test fails on), so a concurrent test's warn cannot satisfy it. Each test holds `spawn_lock` for its whole body
-//! for Unix's sake: a concurrent fork would otherwise inherit the pipe ends and keep them open
+//! debug assertion instead. Each test keys its log assertion on a warn no other test provokes (its
+//! own fd number or accessor), so a concurrent test's warn cannot satisfy it. Each test holds
+//! `spawn_lock` for its whole body for Unix's sake: a concurrent fork would otherwise inherit the pipe ends and keep them open
 //! past the drop. Windows ends are created non-inheritable, so the lock is unneeded there.
 
 use std::io::{ErrorKind, Read, Write};

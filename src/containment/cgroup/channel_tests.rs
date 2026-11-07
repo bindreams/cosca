@@ -86,7 +86,7 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     let slot = channel.slot();
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
-    let guard = fork_running(move || {
+    let guard = fork_running(&[gate, slot.fd], move || {
         block_on(gate);
         // SAFETY: the channel's child end is this child's inherited copy; its parent holds
         // its own end.
@@ -120,8 +120,8 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
     let gate = gate_read.as_raw_fd();
     // Inherits the child's end, and keeps it until released through the gate.
-    let holder = fork_running(move || block_on(gate));
-    let child = fork_running(|| {});
+    let holder = fork_running(&[gate, channel.slot().fd], move || block_on(gate));
+    let child = fork_running(&[], || {});
 
     assert_eq!(
         channel.wait(pidfd_of(child.pid()).as_fd()),
