@@ -221,7 +221,7 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     let (child, stdin) = spawn_std_blocker();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id));
+    let unreaped = Unreaped::new(owned, Some(blocker_id), false);
     let stdin = Rc::new(RefCell::new(Some(stdin)));
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking({
@@ -262,7 +262,7 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     let (child, stdin) = spawn_std_blocker();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id));
+    let unreaped = Unreaped::new(owned, Some(blocker_id), false);
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(move || drop(stdin));
     drop(unreaped);
@@ -279,5 +279,310 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
         blocker_id.is_alive(),
         crate::identity::Liveness::Dead,
         "the drop waited for the child"
+    );
+}
+
+// `wait_async` =====
+
+/// The same status `wait` gives, for a real child that is still running at the first poll.
+///
+/// Mutant: the status is not the child's.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn wait_async_returns_the_status_wait_would() {
+    use super::wait_async::exits_three_on_eof;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    crate::log_capture::install();
+    let (owned, stdin) = exits_three_on_eof();
+    let child = Unreaped::new(owned, None, false);
+    let mark = crate::log_capture::mark();
+    let mut wait = std::pin::pin!(child.wait_async());
+    assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
+    drop(stdin);
+    assert_eq!(wait.await.expect("the child exits").code(), Some(3));
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "the settled value's drop is silent"
+    );
+}
+
+/// A child reaped elsewhere is the error `wait` gives for it, not a status and not a hang.
+///
+/// Mutant: `wait_async` maps the outcome another way.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn wait_async_on_a_child_reaped_elsewhere_is_the_error_wait_gives() {
+    crate::log_capture::install();
+    let gone = || fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
+    let sync = unreaped(&gone(), Some(id())).wait().expect_err("reaped elsewhere");
+    let fake = gone();
+    let mark = crate::log_capture::mark();
+    let asynchronous = unreaped(&fake, Some(id()))
+        .wait_async()
+        .await
+        .expect_err("reaped elsewhere");
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, ""),
+        [],
+        "the settled value's drop is silent"
+    );
+    assert_eq!(fake.looks(), 1, "the drop made no further look");
+    let (Error::Io(sync), Error::Io(asynchronous)) = (&sync, &asynchronous) else {
+        panic!("{sync:?} / {asynchronous:?}");
+    };
+    assert_eq!(asynchronous.kind(), sync.kind());
+    assert_eq!(asynchronous.raw_os_error(), sync.raw_os_error());
+}
+
+/// A cancelled `wait_async` lets a real child go: the drop on the runtime thread returns without
+/// waiting (the child's stdin stays open, so a drop that waited would hang the test), the child was
+/// sent one kill and looked at once, and the drop said one thing. A child the look did not reap is
+/// reaped here on Unix, so no zombie outlives the test.
+///
+/// Mutants: the drop waits; it sends no kill; it looks more than once; it says nothing, or twice.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
+    use crate::child::owned::OwnedChild;
+    use crate::os_process::child::adopted_blocker;
+    use crate::signal::Sig;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    crate::log_capture::install();
+    let (os, blocker_id, stdin) = adopted_blocker();
+    let fake = FakeProcess::over(os);
+    let child = Unreaped::new(OwnedChild::new(Box::new(fake.clone())), Some(blocker_id), false);
+    let mark = crate::log_capture::mark();
+    {
+        let mut wait = std::pin::pin!(child.wait_async());
+        assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
+        assert_eq!(fake.looks(), 1);
+    }
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "one kill");
+    assert_eq!(fake.looks(), 2, "one look");
+    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    let [(log::Level::Warn, said)] = records.as_slice() else {
+        panic!("the drop warns once: {records:?}");
+    };
+    assert!(said.contains(&blocker_id.pid().to_string()), "{said}");
+    // The look may or may not have reaped the child: the OS says, not the log. `waitpid(WNOHANG)`
+    // returns the pid for a zombie (now reaped), `0` for a child that has not changed state (still
+    // running, or not yet a zombie), and `-1` with `ECHILD` for one already reaped.
+    #[cfg(unix)]
+    {
+        let pid = blocker_id.pid() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: `status` is a valid out-pointer.
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            0 => {
+                // SAFETY: as above; the child was sent SIGKILL, so the wait ends.
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            }
+            -1 => assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD)),
+            reaped => assert_eq!(reaped, pid),
+        }
+    }
+    drop(stdin);
+}
+
+/// Every line a let-go drop can say, and its level: one row per (kill, look) that can occur, over
+/// the pure `let_go_line`, so no process is involved. A row says the key phrases of its line and what
+/// it must not claim; every line names the child, is one line, and says "unreaped" at most once.
+/// Where a child is still ours (running, or its wait failed), Windows wording says nothing of reaping.
+///
+/// Mutants: any cell worded another way: a kill not said (or said though none was sent), a refusal
+/// without its error, a foreign reap above `debug` (or a refused kill's line below `warn`), a
+/// running child said reaped, a child whose kill found nothing to signal also said to be running,
+/// the wrong per-OS clause, a doubled "unreaped".
+#[skuld::test]
+fn the_let_go_line_is_pinned_for_every_kill_and_look() {
+    use crate::child::lifecycle::Settlement;
+    use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
+    use crate::child::owned::unreaped::let_go_line;
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::os_process::child::ExitRecord;
+    use crate::signal::Sent;
+    use log::Level::{Debug, Warn};
+
+    // What `child.signal(Sig::Kill)` answered, as the drop gets it; `None`: none was sent (a front).
+    type Kill = Option<Result<Sent, Error>>;
+    type Look = Result<ChildWaitOutcome, Error>;
+    // A kill: how it is said, what a line of it must not claim, and the clauses and the claims
+    // to avoid when the look found the child still running.
+    type KillCase = (
+        fn() -> Kill,
+        &'static str,
+        &'static [&'static str],
+        Vec<&'static str>,
+        &'static [&'static str],
+    );
+    // A look: the level of a line of it, and what the line says of the child.
+    type LookCase<'a> = (fn() -> Look, log::Level, Vec<&'a str>);
+    let status = std::process::ExitStatus::default().to_string();
+
+    // Every kill the drop can have, over every look it can see: all 5 x 6 pairs the types allow,
+    // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
+    // look right after it may still find the zombie not yet collectable. The wording is pinned for
+    // each.
+    let kills: [KillCase; 5] = [
+        (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
+        (
+            || Some(Ok(Sent::Delivered)),
+            "(killed it)",
+            &["refused", "terminated"],
+            vec!["it had not exited yet", LEFT],
+            &["refused", "terminated", LEAVING_RUNNING],
+        ),
+        (
+            || Some(Ok(Sent::Gone)),
+            "its kill found nothing to signal",
+            &["killed it"],
+            vec!["the look saw no exit yet", LEFT],
+            &["killed it", "running", LEAVING_RUNNING],
+        ),
+        (
+            || Some(Ok(Sent::Unverified)),
+            "its kill was not sent: the child could not be verified",
+            &["killed it"],
+            vec![LEAVING_RUNNING],
+            &["killed it"],
+        ),
+        (
+            || Some(Err(Error::Io(std::io::Error::other("denied")))),
+            "could not be terminated (denied)",
+            &["killed it"],
+            vec![LEAVING_RUNNING],
+            &["killed it"],
+        ),
+    ];
+    // A refused kill raises a look's `debug` to `warn`.
+    let looks: [LookCase; 5] = [
+        (
+            || Ok(ChildWaitOutcome::Exited(exit())),
+            Warn,
+            vec!["reaped it", &status],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
+            Warn,
+            vec!["unreadable"],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Foreign(Foreign::Gone)),
+            Debug,
+            vec!["reaped by someone else"],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
+            Warn,
+            vec!["launchd"],
+        ),
+        (
+            || Err(Error::Io(std::io::Error::other("boom"))),
+            Warn,
+            vec!["the wait failed: boom", LEFT],
+        ),
+    ];
+    let running = || -> Look { Ok(ChildWaitOutcome::DeadlinePassed) };
+
+    let mut cases = Vec::new();
+    for (kill, said, never, running_says, running_never) in &kills {
+        // A front says no kill: nothing of the kill to find in its line.
+        let said: Vec<&str> = (!said.is_empty()).then_some(*said).into_iter().collect();
+        for (look, level, says) in &looks {
+            // Principle 7: a refused kill is at least `warn`.
+            let level = if matches!(kill(), Some(Err(_))) { Warn } else { *level };
+            let says: Vec<&str> = [said.clone(), says.clone()].concat();
+            cases.push((kill(), look(), level, says, never.to_vec()));
+        }
+        let says: Vec<&str> = [said, running_says.clone()].concat();
+        cases.push((kill(), running(), Warn, says, running_never.to_vec()));
+    }
+    for (kill, look, level, says, never) in cases {
+        let look = Settlement::new(look, false);
+        let (got, line) = let_go_line(Some(PID), kill.as_ref(), &look);
+        let case = format!("{kill:?} / {look:?}: {line}");
+        assert_eq!(got, level, "{case}");
+        assert!(line.contains("child 4242") && !line.contains('\n'), "{case}");
+        for phrase in &says {
+            assert!(line.contains(phrase), "missing {phrase:?}: {case}");
+        }
+        for phrase in never {
+            assert!(!line.contains(phrase), "claims {phrase:?}: {case}");
+        }
+        assert!(line.matches("unreaped").count() <= 1, "{case}");
+        let ours = matches!(
+            look.fate(None),
+            crate::error::ChildFate::Running { .. } | crate::error::ChildFate::Unknown
+        );
+        if cfg!(windows) && ours {
+            assert!(!line.contains("reap"), "{case}");
+        }
+    }
+}
+
+/// What a let-go drop of `fake`'s child, as a front or not, logged on this thread, after `polls`
+/// polls of `wait_async`'s future (none: it never ran, and the kind was set when `wait_async` was
+/// called), then dropped.
+#[cfg(feature = "tokio")]
+fn let_go(fake: &FakeProcess, front: bool, polls: usize) -> Vec<(log::Level, String)> {
+    use crate::child::owned::OwnedChild;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    crate::log_capture::install();
+    let child = Unreaped::new(OwnedChild::new(Box::new(fake.clone())), Some(id()), front);
+    let mark = crate::log_capture::mark();
+    {
+        let mut wait = std::pin::pin!(child.wait_async());
+        for _ in 0..polls {
+            assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
+        }
+    }
+    crate::log_capture::records_since_on_current_thread(mark, "")
+}
+
+/// An elevation front whose `wait_async` was polled once and then cancelled: it is sent no signal,
+/// and the drop makes exactly one more look, which does not wait.
+///
+/// Mutants: the drop kills a front; it looks more than once, or not at all.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn a_polled_then_cancelled_front_is_sent_nothing_and_looked_at_once_more() {
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running]);
+    let records = let_go(&fake, true, 1);
+    assert_eq!(fake.signal_calls(), [], "a front is sent nothing");
+    assert_eq!(fake.looks(), 2, "the poll's look, and the drop's one");
+    let [(log::Level::Warn, said)] = records.as_slice() else {
+        panic!("one warn: {records:?}");
+    };
+    assert!(
+        said.contains("child 4242") && said.contains("leaving it running"),
+        "{said}"
+    );
+}
+
+/// A child someone else reaped, dropped with its future never polled: the kill is still sent (the
+/// kind is set at the call), and the drop's one line is `debug`.
+///
+/// Mutants: no kill; the line is a `warn`.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn a_let_go_of_a_child_someone_else_reaped_logs_one_debug_line() {
+    use crate::signal::{Sent, Sig};
+
+    let fake = fake()
+        .signals([Ok(Sent::Gone)])
+        .reaps([ReapAnswer::Foreign(Foreign::Gone)]);
+    let records = let_go(&fake, false, 0);
+    assert_eq!(fake.signal_calls(), [Sig::Kill]);
+    assert_eq!(fake.looks(), 1, "one look, which does not wait");
+    assert!(
+        matches!(
+            records.as_slice(),
+            [(log::Level::Debug, said)] if said.contains("child 4242") && said.contains("reaped by someone else")
+        ),
+        "{records:?}"
     );
 }

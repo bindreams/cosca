@@ -237,7 +237,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 // The non-blocking look reaps a child that has exited by now.
-                let note = format!("the elevated child could not be terminated ({e})");
+                let note = format!("the elevated child {}", crate::child::owned::teardown::kill_refused(&e));
                 let looked = child.proc.look_after_refused_kill(child.id(), e, Disposition::HandBack);
                 (
                     root_after_a_refused_kill(note, looked.refused_look()),

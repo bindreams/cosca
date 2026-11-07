@@ -5,7 +5,7 @@ mod child;
 #[path = "tokio/command.rs"]
 mod command;
 #[path = "tokio/drive.rs"]
-mod drive;
+pub(crate) mod drive;
 #[path = "tokio/process.rs"]
 mod process;
 #[path = "tokio/pump.rs"]

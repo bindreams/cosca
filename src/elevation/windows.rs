@@ -503,7 +503,10 @@ fn untracked_outcome(pid: Result<u32, windows::core::Error>, outcome: Terminatio
             ChildFate::Killed,
         ),
         Termination::Failed(e) => (
-            format!("{who} launched but {why} and could not be terminated ({e}); it may still be running"),
+            format!(
+                "{who} launched but {why} and {}; it may still be running",
+                crate::child::owned::teardown::kill_refused(&e)
+            ),
             // Its identity is what could not be resolved.
             ChildFate::Running { id: None },
         ),

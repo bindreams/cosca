@@ -1134,7 +1134,7 @@ impl Child {
     fn into_unreaped(mut self) -> Unreaped {
         debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
         let root = self.proc.take().expect("a child handed back still holds its root");
-        Unreaped::new(root, self.id)
+        Unreaped::new(root, self.id, self.front.is_some())
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
