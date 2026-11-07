@@ -4,7 +4,7 @@
 use std::process::ExitStatus;
 
 use super::slot::ChildSlot;
-use super::teardown::Disposition;
+use super::teardown::{Disposition, LookOutcome};
 use super::OwnedChild;
 #[cfg(feature = "tokio")]
 use crate::child::lifecycle::unbounded_status;
@@ -12,7 +12,7 @@ use crate::child::lifecycle::{wait_for_status, wait_to_exit, Orphaned, Settlemen
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::child_named;
-use crate::signal::Sig;
+use crate::signal::{Sent, Sig};
 
 /// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
 /// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
@@ -59,8 +59,8 @@ pub struct Unreaped {
 enum DropKind {
     /// Block until the child exits and reap it; while the thread is panicking, give it up and warn.
     Wait,
-    /// Kill it once more (not a front), look once without waiting and reap it if it exited; if it
-    /// did not, warn once naming the pid and give it up, unreaped.
+    /// Kill it once more (not a front), look once without waiting and reap it if it exited; warn
+    /// once naming the pid, and if it was not reaped, give it up, unreaped.
     LetGo,
 }
 
@@ -96,11 +96,12 @@ impl Unreaped {
     /// [`wait`](Unreaped::wait), awaited: the same status and errors, without blocking the runtime
     /// thread. Dropping the future, polled or not, lets the child go, warned: it kills the child
     /// once more (a front, which is sent nothing, excepted), looks at it once without waiting and
-    /// reaps it if it exited, and otherwise warns once naming the pid and gives it up, unreaped.
+    /// reaps it if it exited. It warns once naming the pid, and a child not reaped is given up,
+    /// unreaped.
     ///
-    /// Needs the `tokio` feature and a runtime with the IO and time drivers (the `#[tokio::main]` /
-    /// `#[tokio::test]` defaults); a hand-built runtime missing one makes tokio panic rather than
-    /// return an error.
+    /// Needs the `tokio` feature. Portable code needs a runtime with the IO and time drivers (the
+    /// `#[tokio::main]` / `#[tokio::test]` defaults): on Unix a runtime missing either makes tokio
+    /// panic. On Windows the wait runs on the blocking pool and needs neither.
     #[cfg(feature = "tokio")]
     pub fn wait_async(mut self) -> impl std::future::Future<Output = Result<ExitStatus, Error>> {
         // Before the future exists, so a future dropped unpolled never blocks either.
@@ -119,6 +120,57 @@ impl Unreaped {
     }
 }
 
+impl Unreaped {
+    /// The [`LetGo`](DropKind::LetGo) drop: the one kill (a front is sent none) and the one look,
+    /// then one line led by `subject`. The look is [`look_at_front`](OwnedChild::look_at_front) or
+    /// [`look_after_refused_kill`](OwnedChild::look_after_refused_kill) where those fit; after a kill
+    /// that sent something, or nothing and no refusal, it is a local one, since neither helper
+    /// takes that case. `Settlement` is not given the kill: it asserts a kill is followed by a wait
+    /// with no deadline, and this look has one.
+    fn let_go(&self, child: &OwnedChild, subject: &str) {
+        if self.front {
+            let look = child.look_at_front(self.id, Ok(None), None).look;
+            let ended = match &look {
+                LookOutcome::Ended(settlement) => Some(settlement),
+                _ => None,
+            };
+            say_let_go(subject, ended, false);
+            return;
+        }
+        match child.signal(Sig::Kill) {
+            Err(refused) => {
+                let torn = child.look_after_refused_kill(self.id, refused, Disposition::Leave);
+                say_let_go(subject, torn.refused_look(), false);
+            }
+            Ok(sent) => {
+                let look = Settlement::new(child.wait(Some(crate::wait::now())), false);
+                say_let_go(subject, look.ended().then_some(&look), matches!(sent, Sent::Delivered));
+            }
+        }
+    }
+}
+
+/// The one line of a let-go drop. `ended` is the look's settlement if it found an answer about the
+/// child, `None` if the child was not yet collected; `killed`: a kill was delivered to it.
+fn say_let_go(subject: &str, ended: Option<&Settlement>, killed: bool) {
+    let Some(settlement) = ended else {
+        let left = Disposition::Leave.suffix(true);
+        if killed {
+            log::warn!("{subject}; killed it and gave it up before it could be reaped{left}");
+        } else {
+            log::warn!("{subject}; it still runs, so gave it up{left}");
+        }
+        return;
+    };
+    if let Some(status) = settlement.status() {
+        let after = if killed { "killed it and " } else { "" };
+        log::warn!("{subject}; {after}reaped it ({status})");
+        return;
+    }
+    let said = settlement.wording(subject, None, Some(Disposition::Leave));
+    log::log!(said.level(), "{}", said.text());
+}
+
 impl Drop for Unreaped {
     fn drop(&mut self) {
         let Some(child) = self.child.take() else {
@@ -127,15 +179,7 @@ impl Drop for Unreaped {
         let pid = child.pid();
         let who = child_named(pid);
         if self.drop_kind == DropKind::LetGo {
-            // Whether the kill is refused does not change the look below, which says what is left.
-            if !self.front {
-                _ = child.signal(Sig::Kill);
-            }
-            let settlement = Settlement::new(child.wait(Some(crate::wait::now())), false);
-            let subject = format!("{who} was dropped without wait or leak");
-            let running = format!("{subject}; it still runs, so gave it up, unreaped");
-            let said = settlement.wording(&subject, Some(&running), Some(Disposition::Leave));
-            log::log!(said.level(), "{}", said.text());
+            self.let_go(&child, &format!("{who} was dropped without wait or leak"));
             return;
         }
         // A destructor that blocks on a child during unwinding can hang the panic for good.
