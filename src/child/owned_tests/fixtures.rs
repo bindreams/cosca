@@ -23,7 +23,6 @@ pub(super) struct Blocker {
 }
 
 /// A blocker spawned under `spawn_lock`, not yet adopted.
-#[cfg(unix)]
 pub(super) fn spawn_std_blocker() -> (std::process::Child, ChildStdin) {
     spawn_std_blocker_with(|_| {})
 }
