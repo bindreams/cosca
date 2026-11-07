@@ -312,7 +312,7 @@ impl Child {
     }
 
     /// Whether this handle already killed its tree completely.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, unix, not(target_os = "macos")))]
     pub(super) fn tree_killed(&self) -> bool {
         self.tree_killed.is_set()
     }

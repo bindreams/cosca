@@ -400,14 +400,13 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
-    use crate::identity::{ProcessId, Resolved};
+    use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
@@ -663,13 +662,12 @@ fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_h
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder() {
-    use crate::identity::{ProcessId, Resolved};
+    use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
-    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();

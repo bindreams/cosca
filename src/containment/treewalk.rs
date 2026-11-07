@@ -783,17 +783,28 @@ pub(crate) mod fault {
         /// A non-root member.
         Descendant,
         /// The root and a non-root member.
+        #[cfg(not(target_os = "macos"))]
         RootAndDescendant,
     }
 
     #[cfg(unix)]
     impl LeftBehind {
         pub(super) fn leaves_root(self) -> bool {
-            matches!(self, LeftBehind::Root | LeftBehind::RootAndDescendant)
+            match self {
+                LeftBehind::Root => true,
+                LeftBehind::Descendant => false,
+                #[cfg(not(target_os = "macos"))]
+                LeftBehind::RootAndDescendant => true,
+            }
         }
 
         pub(super) fn leaves_descendant(self) -> bool {
-            matches!(self, LeftBehind::Descendant | LeftBehind::RootAndDescendant)
+            match self {
+                LeftBehind::Root => false,
+                LeftBehind::Descendant => true,
+                #[cfg(not(target_os = "macos"))]
+                LeftBehind::RootAndDescendant => true,
+            }
         }
     }
 
