@@ -1,5 +1,6 @@
-//! The `communicate` rows that hold on every platform; the ones that need a Unix shell are in
-//! `pump_tests.rs`.
+//! The `communicate` rows that hold on every platform. `pump_tests.rs` holds the Unix-only ones:
+//! a child that closes its own stdin or stdout (`cmd` cannot close a standard handle), and the ones
+//! about signals, `RLIMIT_NPROC`, FIFOs and process groups, which Windows does not have.
 
 use crate::test_child::Console;
 use crate::Stdio;
@@ -33,6 +34,40 @@ fn a_child_that_stops_reading_stdin_ends_the_input() {
     assert_eq!(out.stdout, if cfg!(windows) { &b"out\r\n"[..] } else { &b"out\n"[..] });
 }
 
+/// Each output stream is read while the other is idle: a child that fills stderr past a pipe
+/// buffer before it writes stdout, and the reverse, both finish.
+///
+/// Mutant: stdout is read to EOF before stderr is read at all, or the reverse.
+#[skuld::test]
+fn each_stream_is_read_while_the_other_is_idle() {
+    // `cmd` cannot make output of a size, so it prints a file of that size. The path has no space
+    // or quote, which `cmd` would not read as the spawn quotes them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let big = dir.path().join("big");
+    std::fs::write(&big, vec![b'x'; 1_000_000]).expect("write the file");
+    let big = big.display().to_string();
+    assert!(
+        !big.contains([' ', '"']),
+        "the temp path {big} has a space or quote: set TEMP to one that has not"
+    );
+    for (unix, windows) in [
+        (
+            "head -c 1000000 /dev/zero >&2; head -c 1000000 /dev/zero".to_owned(),
+            format!("type {big} 1>&2& type {big}"),
+        ),
+        (
+            "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero >&2".to_owned(),
+            format!("type {big}& type {big} 1>&2"),
+        ),
+    ] {
+        let mut child = shell(&unix, &windows);
+        let out = child.communicate(None).expect("communicate");
+        assert!(out.status.success(), "{unix}");
+        assert_eq!(out.stdout.len(), 1_000_000, "{unix}");
+        assert_eq!(out.stderr.len(), 1_000_000, "{unix}");
+    }
+}
+
 /// With a piped stdin and no input, the child sees EOF at once.
 ///
 /// Mutant: the stdin pipe is held open until the child exits.
@@ -42,17 +77,4 @@ fn no_input_closes_stdin() {
     let out = child.communicate(None).expect("communicate");
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
-}
-
-/// The input is closed the moment its last byte is written, not when the output ends: a child that
-/// prints only after it has seen the end of its input still gets that end while `communicate` is
-/// draining.
-///
-/// Mutant: stdin's end is held open until the pump finishes.
-#[skuld::test]
-fn the_input_is_closed_once_it_is_written() {
-    let mut child = shell("cat", "sort");
-    let out = child.communicate(Some(b"b\nb\n")).expect("communicate");
-    assert!(out.status.success());
-    assert_eq!(out.stdout, b"b\nb\n");
 }

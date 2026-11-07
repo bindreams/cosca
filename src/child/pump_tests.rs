@@ -6,24 +6,6 @@ fn sh(script: &str) -> crate::Child {
     super::pump_common_tests::shell(script, "")
 }
 
-/// Each output stream is read while the other is idle: a child that fills stderr past a pipe
-/// buffer before it writes stdout, and the reverse, both finish.
-///
-/// Mutant: stdout is read to EOF before stderr is read at all, or the reverse.
-#[skuld::test]
-fn each_stream_is_read_while_the_other_is_idle() {
-    for script in [
-        "head -c 1000000 /dev/zero >&2; head -c 1000000 /dev/zero",
-        "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero >&2",
-    ] {
-        let mut child = sh(script);
-        let out = child.communicate(None).expect("communicate");
-        assert!(out.status.success(), "{script}");
-        assert_eq!(out.stdout.len(), 1_000_000, "{script}");
-        assert_eq!(out.stderr.len(), 1_000_000, "{script}");
-    }
-}
-
 /// A child that closes its stdin ends the input but not the output: everything it goes on to
 /// print is still collected, though input was left unwritten.
 ///

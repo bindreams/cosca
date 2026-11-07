@@ -319,6 +319,25 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     assert_eq!(out.stderr, input);
 }
 
+/// The input is closed the moment its last byte is written, not when the output ends: `tee-both`
+/// copies stdin until it reads EOF and exits only then, so `communicate` returns only if the pump
+/// closed stdin while it was still draining.
+///
+/// Mutant: stdin's end is held open until the pump finishes.
+#[skuld::test]
+fn communicate_closes_stdin_once_the_input_is_written() {
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
+    cmd.stdin(Stdio::pipe()).unwrap();
+    cmd.stdout(Stdio::pipe()).unwrap();
+    cmd.stderr(Stdio::pipe()).unwrap();
+    let mut child = cmd.spawn().expect("spawn");
+    let out = child.communicate(Some(b"b\nb\n")).expect("communicate");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"b\nb\n");
+    assert_eq!(out.stderr, b"b\nb\n");
+}
+
 #[skuld::test]
 fn output_captures_stdout_and_stderr_with_sizes() {
     let mut cmd = common::command(common::Console::Hidden);

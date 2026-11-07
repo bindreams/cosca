@@ -184,7 +184,7 @@ impl<R> Drain<R> {
 
 impl Collected {
     /// Takes the result of one read: the bytes read, held in `chunk`. Whether the stream is still
-    /// open: an empty read is its EOF, and an error ends it.
+    /// open: `Ok(0)` is its EOF (the caller maps the platform's own EOF to it), and an error ends it.
     fn took(&mut self, read: io::Result<usize>, chunk: &[u8]) -> bool {
         match read {
             Ok(0) => false,

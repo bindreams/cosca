@@ -4,7 +4,7 @@ use std::os::windows::io::AsHandle;
 
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
-use super::Op;
+use super::{Drain, Op};
 use crate::pipe::windows::child_pipe;
 use crate::pipe::ParentEnd;
 use crate::stdio::Direction;
@@ -54,12 +54,45 @@ fn a_read_completes_with_the_bytes_the_child_wrote() {
 #[skuld::test]
 fn a_write_completes_with_its_byte_count() {
     let (mut op, mut theirs) = writer_pipe();
-    op.start_write(b"abc").expect("start");
+    // SAFETY: a literal outlives the operation.
+    unsafe { op.start_write(b"abc") }.expect("start");
     wait_for(&op);
     assert_eq!(op.complete().expect("complete"), 3);
     let mut got = [0u8; 3];
     theirs.read_exact(&mut got).expect("read");
     assert_eq!(&got, b"abc");
+}
+
+/// A read that succeeds with no bytes is not the end of the stream: only `ERROR_BROKEN_PIPE` is. The
+/// stream stays open and the next read collects what the child wrote.
+///
+/// A zero-length `ReadFile` on a pipe completes with success and 0 bytes once data arrives; no child
+/// can cause one (a 0-byte `WriteFile` to a byte-mode pipe wakes no reader, measured on Windows 11
+/// 26100), so the row starts one itself.
+///
+/// Mutant: a successful empty read ends the stream.
+#[skuld::test]
+fn an_empty_read_is_not_the_end_of_the_stream() {
+    let (theirs, ours) = child_pipe(Direction::Out).expect("pipe");
+    let ParentEnd::Reader(ours) = ours else {
+        unreachable!("an Out pipe has a reader")
+    };
+    let mut theirs = File::from(theirs);
+    let mut drain = Drain::open(Some(ours), Op::new);
+
+    let op = drain.pipe.as_mut().expect("open");
+    let handle = op.handle();
+    // SAFETY: the empty buffer needs no storage; the end is the op's own.
+    unsafe { op.operation.read(handle, &mut []) }.expect("start");
+    theirs.write_all(b"x").expect("write");
+    wait_for(op);
+    drain.complete();
+    assert!(drain.pipe.is_some(), "an empty read ended the stream");
+
+    drain.issue();
+    wait_for(drain.pipe.as_ref().expect("open"));
+    drain.complete();
+    assert_eq!(drain.collected.finish().expect("no error"), b"x");
 }
 
 /// An operation dropped while its read is pending is cancelled and waited out before its buffer is
@@ -83,7 +116,9 @@ fn a_pending_read_dropped_is_cancelled_and_its_end_closed() {
 #[skuld::test]
 fn a_pending_write_dropped_is_cancelled_and_its_end_closed() {
     let (mut op, mut theirs) = writer_pipe();
-    op.start_write(&vec![0u8; 1 << 20]).expect("start");
+    let bytes = vec![0u8; 1 << 20];
+    // SAFETY: `bytes` outlives the operation, which the drop below ends.
+    unsafe { op.start_write(&bytes) }.expect("start");
     drop(op);
     // Our end is closed: the child reads what the pipe held, then the end of the stream.
     let mut got = Vec::new();

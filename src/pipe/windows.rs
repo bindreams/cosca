@@ -9,6 +9,7 @@
 //! port (a handle can have only one such association, and these operations make none). The
 //! conversions record nothing and make no system call.
 
+use std::borrow::BorrowMut;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::io::{
@@ -257,18 +258,14 @@ impl Read for &Handle {
         }
         // SAFETY: `buf` is live until `overlapped_io` returns, and it does not return while the
         // kernel may write into it.
-        eof_as_zero(overlapped_io(self.as_raw(), |operation| unsafe {
-            operation.read(self.as_raw(), buf)
-        }))
+        eof_as_zero(overlapped_io(|operation| unsafe { operation.read(self.as_raw(), buf) }))
     }
 }
 
 impl Write for &Handle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: as for `read`.
-        overlapped_io(self.as_raw(), |operation| unsafe {
-            operation.write(self.as_raw(), buf)
-        })
+        overlapped_io(|operation| unsafe { operation.write(self.as_raw(), buf) })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -285,16 +282,17 @@ pub(crate) fn eof_as_zero(read: io::Result<usize>) -> io::Result<usize> {
     }
 }
 
-/// One overlapped operation on `handle`, started by `start`, run to its end: the bytes it moved.
+/// One overlapped operation, started by `start`, run to its end: the bytes it moved.
 ///
 /// The wait is on the operation's own event, so another operation on the same handle, in another
 /// thread, does not release it.
-fn overlapped_io(handle: HANDLE, start: impl FnOnce(&mut Operation) -> io::Result<StartOutcome>) -> io::Result<usize> {
-    let mut operation = Operation::new()?;
+fn overlapped_io(start: impl FnOnce(&mut Operation<OVERLAPPED>) -> io::Result<StartOutcome>) -> io::Result<usize> {
+    // The `OVERLAPPED` stays on this stack frame: the operation is not moved once started.
+    let mut operation = Operation::<OVERLAPPED>::new()?;
     if start(&mut operation)? == StartOutcome::Pending {
         wait_or_abort(operation.event());
     }
-    operation.finish(handle)
+    operation.finish()
 }
 
 /// A wait that fails leaves the kernel owning the caller's buffer, and nothing safe is left to do:
@@ -335,29 +333,39 @@ enum State {
 /// for the next one. Each operation has an event of its own (never the handle), so any number of
 /// operations on one end can be waited on separately.
 ///
-/// Started with [`read`](Self::read) or [`write`](Self::write), whose buffer the kernel owns until
-/// [`finish`](Self::finish) or [`cancel`](Self::cancel) ends the operation. Dropping a pending
-/// `Operation` frees an `OVERLAPPED` the kernel holds: whoever owns one cancels it first.
-pub(crate) struct Operation {
+/// Started with [`read`](Self::read) or [`write`](Self::write), whose buffer and pipe end the kernel
+/// holds until [`finish`](Self::finish) ends the operation or the drop cancels it: dropping a
+/// pending `Operation` cancels it and waits for the kernel to let go, so a panic cannot free what
+/// the kernel owns. The buffer and the end must outlive the `Operation`.
+///
+/// `S` is where the `OVERLAPPED` lives, whose address the kernel keeps while the operation is
+/// pending. `OVERLAPPED` itself keeps it in place, on the stack, for an operation that never moves
+/// once started (the synchronous reads and writes); `Box<OVERLAPPED>` is for one that may be moved
+/// while pending (the pump's, whose owner is passed by value).
+pub(crate) struct Operation<S: BorrowMut<OVERLAPPED> = Box<OVERLAPPED>> {
     event: OwnedHandle,
-    /// Boxed: the kernel keeps its address while the operation is pending.
-    overlapped: Box<OVERLAPPED>,
+    overlapped: S,
+    /// The end the operation was started on, valid while it is not idle.
+    handle: HANDLE,
     state: State,
 }
 
-impl Operation {
-    pub(crate) fn new() -> io::Result<Operation> {
+impl<S: BorrowMut<OVERLAPPED> + Default> Operation<S> {
+    pub(crate) fn new() -> io::Result<Self> {
         // SAFETY: an unnamed manual-reset event, no preconditions.
         let event = unsafe { CreateEventW(None, true, false, None) }.map_err(win32_io_error)?;
         // SAFETY: `event` is new and ours alone.
         let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
         Ok(Operation {
             event,
-            overlapped: Box::default(),
+            overlapped: S::default(),
+            handle: HANDLE::default(),
             state: State::Idle,
         })
     }
+}
 
+impl<S: BorrowMut<OVERLAPPED>> Operation<S> {
     /// The event that fires when the operation completes. It is the event itself, the handle to wait
     /// on: the one in the `OVERLAPPED` has its low bit set.
     pub(crate) fn event(&self) -> HANDLE {
@@ -368,15 +376,17 @@ impl Operation {
     ///
     /// # Safety
     ///
-    /// `buf` must stay live, unmoved and unread until `finish` or `cancel` has ended the operation,
+    /// `buf` must stay live, unmoved and unread until `finish` or the drop has ended the operation,
     /// and the operation must be idle. `handle` is an overlapped pipe end that stays open until
-    /// then.
+    /// then. If `S` is `OVERLAPPED`, `self` must not move until then either.
     pub(crate) unsafe fn read(&mut self, handle: HANDLE, buf: &mut [u8]) -> io::Result<StartOutcome> {
         let len = buf.len().min(u32::MAX as usize);
         let buf = &mut buf[..len];
         // SAFETY: `begin`'s closure gets this operation's own `OVERLAPPED`; `buf` is the caller's
         // contract.
-        self.begin(|overlapped| unsafe { ReadFile(handle, Some(buf), None, Some(overlapped)) })
+        self.begin(handle, |overlapped| unsafe {
+            ReadFile(handle, Some(buf), None, Some(overlapped))
+        })
     }
 
     /// Starts one `WriteFile` of up to `u32::MAX` bytes of `buf` on `handle`.
@@ -387,24 +397,31 @@ impl Operation {
     pub(crate) unsafe fn write(&mut self, handle: HANDLE, buf: &[u8]) -> io::Result<StartOutcome> {
         let buf = &buf[..buf.len().min(u32::MAX as usize)];
         // SAFETY: as in `read`.
-        self.begin(|overlapped| unsafe { WriteFile(handle, Some(buf), None, Some(overlapped)) })
+        self.begin(handle, |overlapped| unsafe {
+            WriteFile(handle, Some(buf), None, Some(overlapped))
+        })
     }
 
-    fn begin(&mut self, start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>) -> io::Result<StartOutcome> {
+    fn begin(
+        &mut self,
+        handle: HANDLE,
+        start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+    ) -> io::Result<StartOutcome> {
         debug_assert!(
             self.state == State::Idle,
             "an operation is started while one is under way"
         );
+        self.handle = handle;
         // The low bit of `hEvent` tells the kernel not to queue a completion packet for this
         // operation to a completion port the file object may be associated with. Tokio associates
         // the end it adopts, and a clone of that end shares the association: without the bit, a
         // synchronous read through the clone posts a packet pointing at an `OVERLAPPED` for the
         // reactor to dequeue after its owner is gone.
-        *self.overlapped = OVERLAPPED {
+        *self.overlapped.borrow_mut() = OVERLAPPED {
             hEvent: HANDLE(self.event.as_raw_handle().map_addr(|address| address | 1)),
             ..Default::default()
         };
-        match start(&mut *self.overlapped) {
+        match start(self.overlapped.borrow_mut()) {
             Ok(()) => {
                 self.state = State::Completed;
                 Ok(StartOutcome::Completed)
@@ -419,11 +436,12 @@ impl Operation {
 
     /// Ends the operation: the bytes it moved, or the error it ended with. Call it once the event has
     /// fired, or the start returned [`StartOutcome::Completed`].
-    pub(crate) fn finish(&mut self, handle: HANDLE) -> io::Result<usize> {
+    pub(crate) fn finish(&mut self) -> io::Result<usize> {
         debug_assert!(self.state != State::Idle, "finish on an operation that was not started");
         let mut moved = 0u32;
-        // SAFETY: the operation is complete, so `overlapped` holds its result; it does not wait.
-        let result = unsafe { GetOverlappedResult(handle, &*self.overlapped, &mut moved, false) };
+        // SAFETY: the operation is complete, so `overlapped` holds its result; it does not wait. The
+        // end is open, by the contract of `read` and `write`.
+        let result = unsafe { GetOverlappedResult(self.handle, self.overlapped.borrow(), &mut moved, false) };
         match result {
             Ok(()) => {
                 self.state = State::Idle;
@@ -440,12 +458,14 @@ impl Operation {
             }
         }
     }
+}
 
-    /// Cancels the operation if it is pending and waits for the kernel to let go of its buffer, whatever
-    /// the operation ended with; does nothing if it is idle. The wait is the abortable step (see
-    /// [`wait_or_abort`]); the operation's own status is not read as a failure (it is
-    /// `ERROR_OPERATION_ABORTED` after a cancel).
-    pub(crate) fn cancel(&mut self, handle: HANDLE) {
+/// Cancels the operation if it is pending and waits for the kernel to let go of its buffer, whatever
+/// the operation ended with; does nothing if it is idle. The wait is the abortable step (see
+/// [`wait_or_abort`]); the operation's own status is not read as a failure (it is
+/// `ERROR_OPERATION_ABORTED` after a cancel).
+impl<S: BorrowMut<OVERLAPPED>> Drop for Operation<S> {
+    fn drop(&mut self) {
         match self.state {
             State::Idle => return,
             State::Completed => {
@@ -454,8 +474,9 @@ impl Operation {
             }
             State::Pending => {}
         }
-        // SAFETY: cancels this operation's own `OVERLAPPED`, started on `handle`.
-        if let Err(e) = unsafe { CancelIoEx(handle, Some(&*self.overlapped)) } {
+        // SAFETY: cancels this operation's own `OVERLAPPED`, started on `handle`, which is open by
+        // the contract of `read` and `write`.
+        if let Err(e) = unsafe { CancelIoEx(self.handle, Some(self.overlapped.borrow())) } {
             // The operation completed first.
             debug_assert_eq!(
                 e.code(),
@@ -466,7 +487,7 @@ impl Operation {
         wait_or_abort(self.event());
         let mut moved = 0u32;
         // SAFETY: the event fired, so the operation is over; it does not wait.
-        unsafe { GetOverlappedResult(handle, &*self.overlapped, &mut moved, false) }.ok();
+        unsafe { GetOverlappedResult(self.handle, self.overlapped.borrow(), &mut moved, false) }.ok();
         self.state = State::Idle;
     }
 }
