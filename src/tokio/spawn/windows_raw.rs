@@ -267,9 +267,8 @@ pub(crate) fn spawn_raw(
     sync_raw::ensure_fd_table_fits(&fds).not_started()?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3 to child handles: piped slots via the
-    // `make_pipe` (we own the parent ends, which an accessor registers with the reactor — std slots
-    // via the stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), merges as dups, the rest
-    // (inherit/file/null) via the shared core (which rejects inherit on fd >= 3).
+    // `make_pipe`, merges as dups, the rest (inherit/file/null) via the shared core (which rejects
+    // inherit on fd >= 3).
     let parent_std = ParentStd::read();
     let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds, parent_std).not_started()?;
 
@@ -411,9 +410,8 @@ fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>, parent_std: ParentStd) ->
     let mut child_ends: BTreeMap<Fd, ChildEnd> = BTreeMap::new();
     let mut owned_std: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
     let mut fd_pipes: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
-    // First pass: non-merge slots. Piped slots use `make_pipe` (parent end stashed —
-    // std slots for the stdin/stdout/stderr accessors, fd >= 3 for fd_read_end/fd_write_end); the
-    // rest (inherit/file/null/unconfigured std) resolve via the shared core.
+    // First pass: non-merge slots. Piped slots: `make_pipe`; the parent end is stashed for its
+    // accessor. The rest (inherit/file/null/unconfigured std) resolve via the shared core.
     for &slot in &slots {
         match fds.get(&slot) {
             Some(ResolvedStdio::Merge(_)) => continue, // second pass

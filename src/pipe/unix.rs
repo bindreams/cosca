@@ -1,12 +1,25 @@
 //! Unix: std's pipe ends, which already read and write through a shared reference from any thread.
 
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::Stdio;
 
 use super::{PipeReader, PipeWriter};
+use crate::child::ParentEnd;
+use crate::stdio::Direction;
 
 pub(super) type Reader = std::io::PipeReader;
 pub(super) type Writer = std::io::PipeWriter;
+
+/// The pipe for one piped slot: the child's end, and the parent's, as `dir` says (`In`: the child
+/// reads, the parent writes).
+pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedFd, ParentEnd)> {
+    let (reader, writer) = std::io::pipe()?;
+    Ok(match dir {
+        Direction::In => (reader.into(), ParentEnd::Writer(writer.into())),
+        Direction::Out => (writer.into(), ParentEnd::Reader(reader.into())),
+    })
+}
 
 impl From<std::io::PipeReader> for PipeReader {
     fn from(p: std::io::PipeReader) -> PipeReader {

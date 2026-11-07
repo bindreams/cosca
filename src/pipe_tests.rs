@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use super::{PipeReader, PipeWriter};
+use crate::child::ParentEnd;
+use crate::stdio::Direction;
 
 const MIB: usize = 1024 * 1024;
 
@@ -16,30 +18,20 @@ fn pattern(i: usize) -> u8 {
 
 /// A pipe whose reading end is ours and whose writing end is `File`.
 fn reader_pair() -> (PipeReader, File) {
-    #[cfg(windows)]
-    {
-        let (ours, theirs) = super::windows::child_pipe(true).expect("make the pipe");
-        (PipeReader::from(ours), File::from(theirs))
-    }
-    #[cfg(unix)]
-    {
-        let (r, w) = std::io::pipe().expect("make the pipe");
-        (PipeReader::from(r), File::from(std::os::fd::OwnedFd::from(w)))
-    }
+    let (theirs, ours) = super::child_pipe(Direction::Out).expect("make the pipe");
+    let ParentEnd::Reader(ours) = ours else {
+        panic!("an Out pipe keeps the read end")
+    };
+    (ours, File::from(theirs))
 }
 
 /// A pipe whose writing end is ours and whose reading end is `File`.
 fn writer_pair() -> (PipeWriter, File) {
-    #[cfg(windows)]
-    {
-        let (ours, theirs) = super::windows::child_pipe(false).expect("make the pipe");
-        (PipeWriter::from(ours), File::from(theirs))
-    }
-    #[cfg(unix)]
-    {
-        let (r, w) = std::io::pipe().expect("make the pipe");
-        (PipeWriter::from(w), File::from(std::os::fd::OwnedFd::from(r)))
-    }
+    let (theirs, ours) = super::child_pipe(Direction::In).expect("make the pipe");
+    let ParentEnd::Writer(ours) = ours else {
+        panic!("an In pipe keeps the write end")
+    };
+    (ours, File::from(theirs))
 }
 
 /// Read `from` to its end, in chunks of at most 4096 bytes. Each chunk must continue the pattern
@@ -64,8 +56,42 @@ fn sum(bytes: impl IntoIterator<Item = u8>) -> u64 {
     bytes.into_iter().map(u64::from).sum()
 }
 
+/// Whether `a` and `b`, the chunks two threads read, each thread's in the order it read them,
+/// interleave into the pattern from byte 0 with no gap and no overlap. `tiled[i][j]` holds if the
+/// first `i` chunks of `a` and the first `j` of `b` tile the stream up to their total length.
+fn tile_the_stream(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
+    let continues_at = |chunk: &[u8], at: usize| chunk.iter().enumerate().all(|(i, &byte)| byte == pattern(at + i));
+    let prefix = |chunks: &[Vec<u8>]| {
+        let mut lens = vec![0];
+        for chunk in chunks {
+            lens.push(lens.last().expect("starts with 0") + chunk.len());
+        }
+        lens
+    };
+    let (len_a, len_b) = (prefix(a), prefix(b));
+    let mut tiled = vec![vec![false; b.len() + 1]; a.len() + 1];
+    tiled[0][0] = true;
+    for i in 0..=a.len() {
+        for j in 0..=b.len() {
+            if !tiled[i][j] {
+                continue;
+            }
+            let at = len_a[i] + len_b[j];
+            if i < a.len() && continues_at(&a[i], at) {
+                tiled[i + 1][j] = true;
+            }
+            if j < b.len() && continues_at(&b[j], at) {
+                tiled[i][j + 1] = true;
+            }
+        }
+    }
+    tiled[a.len()][b.len()]
+}
+
 #[skuld::test]
 fn two_threads_read_one_end_without_abort() {
+    // Which thread takes which chunk is the scheduler's; over all rounds, each must read something.
+    let (mut a_read, mut b_read) = (0, 0);
     for _ in 0..20 {
         let (reader, mut theirs) = reader_pair();
         let sent: Vec<u8> = (0..MIB).map(pattern).collect();
@@ -80,14 +106,18 @@ fn two_threads_read_one_end_without_abort() {
             let b = scope.spawn(|| chunks(&clone));
             (a.join().expect("reader a"), b.join().expect("reader b"))
         });
-        let all: Vec<&Vec<u8>> = a.iter().chain(&b).collect();
+        assert_eq!(a.iter().chain(&b).map(Vec::len).sum::<usize>(), MIB);
         assert!(
-            all.iter().all(|c| is_contiguous(c)),
-            "a chunk is not a stretch of the stream"
+            tile_the_stream(&a, &b),
+            "the chunks do not tile the stream: a gap, an overlap or a torn chunk"
         );
-        assert_eq!(all.iter().map(|c| c.len()).sum::<usize>(), MIB);
-        assert_eq!(sum(all.iter().flat_map(|c| c.iter().copied())), sum(sent));
+        a_read += a.len();
+        b_read += b.len();
     }
+    assert!(
+        a_read > 0 && b_read > 0,
+        "a thread read nothing: {a_read} and {b_read} chunks"
+    );
 }
 
 #[skuld::test]
@@ -149,6 +179,22 @@ fn a_read_at_eof_is_zero() {
     assert_eq!(reader.read(&mut buf).expect("read again"), 0);
 }
 
+/// The other end is open and idle, so a zero-length read that waited for data would never return.
+#[skuld::test]
+fn a_zero_length_read_returns_zero_at_once() {
+    let (mut reader, _theirs) = reader_pair();
+    assert_eq!(reader.read(&mut []).expect("zero-length read"), 0);
+    assert_eq!((&reader).read(&mut []).expect("shared zero-length read"), 0);
+}
+
+/// Nobody reads, so a zero-length write that waited for a reader would never return.
+#[skuld::test]
+fn a_zero_length_write_returns_zero_at_once() {
+    let (mut writer, _theirs) = writer_pair();
+    assert_eq!(writer.write(&[]).expect("zero-length write"), 0);
+    assert_eq!((&writer).write(&[]).expect("shared zero-length write"), 0);
+}
+
 #[skuld::test]
 fn a_write_after_the_reader_left_is_broken_pipe() {
     let (mut writer, theirs) = writer_pair();
@@ -199,6 +245,7 @@ fn a_sync_read_on_a_clone_of_an_associated_end_queues_nothing() {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+    use windows::Win32::System::Pipes::PeekNamedPipe;
     use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
     let (reader, mut theirs) = reader_pair();
@@ -220,6 +267,23 @@ fn a_sync_read_on_a_clone_of_an_associated_end_queues_nothing() {
     .expect("associate the clone with the port");
 
     theirs.write_all(b"sync").expect("send");
+    // The bytes are in the pipe before the read starts, so `ReadFile` completes synchronously, and
+    // any packet it queued was queued before it returned: the zero-timeout poll below cannot miss
+    // one that is still on its way.
+    let mut available = 0u32;
+    // SAFETY: the handle is live; only the available-byte count is asked for.
+    unsafe {
+        PeekNamedPipe(
+            HANDLE(reader.as_raw_handle()),
+            None,
+            0,
+            None,
+            Some(&mut available),
+            None,
+        )
+    }
+    .expect("peek the pipe");
+    assert_eq!(available, 4, "the read would not complete synchronously");
     let mut got = [0u8; 4];
     (&reader)
         .read_exact(&mut got)

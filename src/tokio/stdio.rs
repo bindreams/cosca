@@ -49,7 +49,7 @@ pub(super) enum OutInner {
 }
 
 /// A parent end of an our-owned merge-target pipe, stashed at spawn (keyed by the target
-/// slot) until its accessor takes it and registers it with the reactor.
+/// slot) until its accessor takes it.
 pub(super) type OwnedStd = crate::child::ParentEnd;
 
 impl AsyncWrite for ChildStdin {
@@ -110,8 +110,7 @@ impl std::fmt::Debug for ChildStderr {
     }
 }
 
-/// Registers a parent read end with the reactor. On failure the end is closed. On Windows the end
-/// must be a `make_pipe` end, which is overlapped.
+/// Registers a parent read end with the reactor. On failure the end is closed.
 ///
 /// # Panics
 ///

@@ -26,12 +26,14 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 use windows::Win32::System::IO::{GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED};
 
 use super::{PipeReader, PipeWriter};
+use crate::child::ParentEnd;
 use crate::error::win32_io_error;
+use crate::stdio::Direction;
 
 // The NT create =====
 //
-// Values are std's, from `child_pipe.rs` of the toolchain's std (`child_pipe`, lines 56-189):
-// the access and share masks, the options, and `PIPE_BUFFER_CAPACITY` (line 58).
+// Values are std's, from `child_pipe.rs` of the toolchain's std: the access and share masks, the
+// options, and `PIPE_BUFFER_CAPACITY`.
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -45,9 +47,9 @@ const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const FILE_PIPE_BYTE_STREAM_TYPE: u32 = 0;
 const FILE_PIPE_BYTE_STREAM_MODE: u32 = 0;
 const FILE_PIPE_QUEUE_OPERATION: u32 = 0;
-/// A 64 KiB pipe capacity is the same as a typical Linux default (std, line 57).
+/// A 64 KiB pipe capacity is the same as a typical Linux default.
 const PIPE_BUFFER_CAPACITY: u32 = 64 * 1024;
-/// The pipe filesystem's directory, where an unnamed pipe is created (std, line 87).
+/// The pipe filesystem's directory, where an unnamed pipe is created.
 const PIPE_DIRECTORY: &str = r"\Device\NamedPipe\";
 
 // `windows` 0.62 does not bind `NtCreateNamedPipeFile`.
@@ -80,9 +82,9 @@ fn nt_error(status: NTSTATUS) -> io::Error {
 /// `ours_readable`, else writable; `theirs` is synchronous and the other direction, the end the
 /// child is given. Neither is inheritable: the spawn gives the child its end explicitly.
 ///
-/// The one place a child pipe is made, for the sync and the async spawn alike. A failed NT call is
-/// an error; there is no fall back to `CreatePipe`, whose ends cannot be overlapped.
-pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+/// A failed NT call is an error; there is no fall back to `CreatePipe`, whose ends cannot be
+/// overlapped.
+fn nt_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut io_status = IO_STATUS_BLOCK::default();
     let directory: Vec<u16> = PIPE_DIRECTORY.encode_utf16().collect();
     let directory_name = UNICODE_STRING {
@@ -96,7 +98,6 @@ pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedH
         ..Default::default()
     };
 
-    // The pipe filesystem, to create the pipe in.
     let mut directory_handle = HANDLE::default();
     // SAFETY: every pointer is to a live local; the attributes name a directory by a string that
     // outlives the call.
@@ -117,13 +118,12 @@ pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedH
     let directory_handle = unsafe { OwnedHandle::from_raw_handle(directory_handle.0) };
 
     // With the directory as root and an empty name, the pipe is unnamed. std passes a null buffer
-    // for the empty name (line 117).
+    // for the empty name.
     let empty = UNICODE_STRING::default();
     attributes.ObjectName = &empty;
     attributes.RootDirectory = HANDLE(directory_handle.as_raw_handle());
 
-    // A negative timeout is relative, in 100 ns units: 50 ms, `CreateNamedPipeW`'s default
-    // (std, line 130).
+    // A negative timeout is relative, in 100 ns units: 50 ms, `CreateNamedPipeW`'s default.
     let timeout = -(50_i64 * 10_000);
     let mut ours = HANDLE::default();
     // SAFETY: as above; `timeout` outlives the call.
@@ -157,7 +157,6 @@ pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedH
     // SAFETY: `NtCreateNamedPipeFile` succeeded.
     let ours = unsafe { OwnedHandle::from_raw_handle(ours.0) };
 
-    // Their end: opened through ours, by an empty name, for synchronous access.
     attributes.RootDirectory = HANDLE(ours.as_raw_handle());
     let mut theirs = HANDLE::default();
     // SAFETY: as above.
@@ -182,6 +181,20 @@ pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedH
     // SAFETY: `NtOpenFile` succeeded.
     let theirs = unsafe { OwnedHandle::from_raw_handle(theirs.0) };
     Ok((ours, theirs))
+}
+
+/// The pipe for one piped slot: the child's end, and the parent's, overlapped, as `dir` says
+/// (`In`: the child reads, the parent writes). Neither is inheritable: the spawn gives the child
+/// its end explicitly.
+pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedHandle, ParentEnd)> {
+    let (ours, theirs) = nt_pipe(dir == Direction::Out)?;
+    Ok((
+        theirs,
+        match dir {
+            Direction::In => ParentEnd::Writer(PipeWriter::from(ours)),
+            Direction::Out => ParentEnd::Reader(PipeReader::from(ours)),
+        },
+    ))
 }
 
 // The ends =====
@@ -238,6 +251,10 @@ impl Handle {
 
 impl Read for &Handle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length `ReadFile` on a pipe waits for data to arrive.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let len = buf.len().min(u32::MAX as usize);
         let buf = &mut buf[..len];
         // SAFETY (the closure's `ReadFile`): `buf` is live until `overlapped_io` returns, and it
@@ -296,7 +313,13 @@ fn overlapped_io(
         Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) => {
             // SAFETY: a wait on an event this call owns.
             if unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), INFINITE) } != WAIT_OBJECT_0 {
-                eprintln!("cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands");
+                // `eprintln!` panics when stderr is closed, which would unwind with the buffer
+                // still in the kernel's hands.
+                Write::write_all(
+                    &mut io::stderr(),
+                    b"cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands\n",
+                )
+                .ok();
                 std::process::abort();
             }
         }
@@ -409,14 +432,13 @@ impl AsRawHandle for PipeWriter {
     }
 }
 
-/// The child gets the handle as it is, overlapped or not, as std's own `ChildStdout` does: neither
-/// `ReOpenFile` (it opens a client of the pipe, never another handle on the end) nor
-/// `NtSetInformationFile` (it refuses the synchronous flags) can make an overlapped pipe end
-/// synchronous.
+/// The child gets the handle as it is, overlapped or not, as std's own `ChildStdout` does: an
+/// overlapped pipe end cannot be made synchronous.
 ///
-/// While the child reads or writes through it, the parent must not use another handle to the same
-/// end (a [`try_clone`](PipeReader::try_clone), a duplicate): the end's operations are not
-/// serialized across handles.
+/// If the end is overlapped, the parent must not use another handle to it (a
+/// [`try_clone`](PipeReader::try_clone), a duplicate) while the child reads or writes through it:
+/// the child's plain `ReadFile` waits on the shared file object, so the parent's operation through
+/// another handle can wake it.
 impl From<PipeReader> for Stdio {
     fn from(p: PipeReader) -> Stdio {
         Stdio::from(OwnedHandle::from(p))

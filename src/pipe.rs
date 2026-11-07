@@ -11,13 +11,13 @@
 //! A raw handle taken out of an end and wrapped in std's types is the caller's own act: std's types
 //! wait on the handle itself, and are not safe to share between threads.
 //!
-//! On Windows a wait that fails after the kernel took a buffer cannot be answered with an error,
-//! since the kernel may still write into the buffer; it aborts the process instead.
+//! On Windows a wait that fails after the kernel took a buffer cannot be answered with an error;
+//! it aborts the process instead.
 
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 
 #[cfg(unix)]
-mod unix;
+pub(crate) mod unix;
 #[cfg(unix)]
 use unix as sys;
 
@@ -25,6 +25,8 @@ use unix as sys;
 pub(crate) mod windows;
 #[cfg(windows)]
 use windows as sys;
+
+pub(crate) use sys::child_pipe;
 
 /// The parent's read end of a pipe to a child.
 #[derive(Debug)]

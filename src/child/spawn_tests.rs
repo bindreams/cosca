@@ -1837,31 +1837,81 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }
 
-/// Our end of a child's stdout is overlapped, as std makes it: no synchronous-I/O flag in the file
-/// object's mode. A `CreatePipe` end, the pipe this spawn made before, has one.
+/// Every pipe a spawn makes is std's kind: the parent's end overlapped (no synchronous-I/O flag in
+/// the file object's mode), the child's synchronous. A `CreatePipe` end, the pipe this spawn made
+/// before, has the flag on both. The rows are the pipe in both directions, then the parent ends of
+/// real spawns: the std slots, a merge target, and fd >= 3 (the raw backend).
 ///
 /// Mutant: the spawn makes its pipe with `std::io::pipe`.
 #[cfg(windows)]
 #[skuld::test]
-fn a_spawned_childs_stdout_end_is_overlapped() {
-    use std::io::Read as _;
-    use std::os::windows::io::AsHandle as _;
+fn every_pipe_a_spawn_makes_is_overlapped_in_the_parent_and_synchronous_in_the_child() {
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _, BorrowedHandle};
 
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(["cmd", "/C", "echo overlapped"]);
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    let mut child = cmd.spawn().expect("spawn");
-    let mut stdout = child.stdout().expect("piped stdout");
+    use crate::child::ParentEnd;
+    use crate::pipe::windows::is_overlapped;
+    use crate::stdio::{Direction, Fd, Stdio};
 
-    assert!(
-        crate::pipe::windows::is_overlapped(stdout.as_handle()).expect("query the mode"),
-        "the parent's end carries a synchronous-I/O flag"
-    );
+    for dir in [Direction::In, Direction::Out] {
+        let (child_end, parent_end) = super::make_pipe(dir).expect("make the pipe");
+        // SAFETY: `child_end` is live and outlives the borrow.
+        let theirs = unsafe { BorrowedHandle::borrow_raw(child_end.as_raw_handle()) };
+        assert!(
+            !is_overlapped(theirs).expect("query the child's end"),
+            "{dir:?}: the child's end is overlapped"
+        );
+        let ours = match &parent_end {
+            ParentEnd::Reader(r) => r.as_handle(),
+            ParentEnd::Writer(w) => w.as_handle(),
+        };
+        assert!(
+            is_overlapped(ours).expect("query the parent's end"),
+            "{dir:?}: the parent's end is synchronous"
+        );
+    }
 
-    let mut out = String::new();
-    stdout.read_to_string(&mut out).expect("read the child's output");
-    assert_eq!(out.trim(), "overlapped");
-    child.wait().expect("reap");
+    // (row, pipes by slot, merge slot and target)
+    type Row<'a> = (&'a str, &'a [(i32, Direction)], Option<(i32, i32)>);
+    let rows: [Row; 3] = [
+        (
+            "std slots",
+            &[(0, Direction::In), (1, Direction::Out), (2, Direction::Out)],
+            None,
+        ),
+        ("merge target", &[(1, Direction::Out)], Some((2, 1))),
+        ("fd >= 3", &[(3, Direction::Out), (4, Direction::In)], None),
+    ];
+    for (row, pipes, merge) in rows {
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        cmd.args(["cmd", "/C", "exit 0"]);
+        for &(slot, dir) in pipes {
+            cmd.fd(
+                slot,
+                match dir {
+                    Direction::In => Stdio::pipe_in(),
+                    Direction::Out => Stdio::pipe_out(),
+                },
+            )
+            .expect("set the pipe");
+        }
+        if let Some((slot, target)) = merge {
+            cmd.fd(slot, Stdio::merge(Fd::from(target))).expect("set the merge");
+        }
+        let mut child = cmd.spawn().expect("spawn");
+        for &(slot, dir) in pipes {
+            let slot = Fd::from(slot);
+            let mode = match dir {
+                Direction::In => child
+                    .fd_write_end(slot)
+                    .map(|w| is_overlapped(w.as_handle()).expect("query the mode")),
+                Direction::Out => child
+                    .fd_read_end(slot)
+                    .map(|r| is_overlapped(r.as_handle()).expect("query the mode")),
+            };
+            assert_eq!(mode, Some(true), "{row}: the parent's end for {slot} is not overlapped");
+        }
+        child.wait().expect("reap");
+    }
 }
 
 /// Our overlapped end of one child's stdout, given to another child as its stdin, reaches it: the

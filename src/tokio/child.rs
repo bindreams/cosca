@@ -539,6 +539,12 @@ impl Child {
         self.graceful
     }
 
+    /// Take the child's stdin, once; `None` if it is not piped or already taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
+    /// reactor).
     pub fn stdin(&mut self) -> Option<super::stdio::ChildStdin> {
         if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
             return Some(super::stdio::ChildStdin { inner: owned });
@@ -547,6 +553,12 @@ impl Child {
             inner: super::stdio::InInner::Tokio(s),
         })
     }
+    /// Take the child's stdout, once; `None` if it is not piped or already taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
+    /// reactor).
     pub fn stdout(&mut self) -> Option<super::stdio::ChildStdout> {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
             return Some(super::stdio::ChildStdout { inner: owned });
@@ -555,6 +567,12 @@ impl Child {
             inner: super::stdio::OutInner::Stdout(s),
         })
     }
+    /// Take the child's stderr, once; `None` if it is not piped or already taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
+    /// reactor).
     pub fn stderr(&mut self) -> Option<super::stdio::ChildStderr> {
         if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
             return Some(super::stdio::ChildStderr { inner: owned });
@@ -1356,6 +1374,10 @@ mod windows_signal_tests;
 #[path = "child/windows_teardown_tests.rs"]
 mod windows_teardown_tests;
 
+#[cfg(all(test, windows))]
+#[path = "child/pipe_mode_tests.rs"]
+mod pipe_mode_tests;
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "child/bypass_drop_tests.rs"]
 mod bypass_drop_tests;
@@ -1376,7 +1398,7 @@ mod front_kill_tests;
 #[path = "child/front_cgroup_tests.rs"]
 mod front_cgroup_tests;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
 

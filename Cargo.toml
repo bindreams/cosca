@@ -96,6 +96,8 @@ static_assertions = "1"
 # - `Win32_System_TaskScheduler` (with `Win32_System_Ole` and `Win32_System_Variant`, which its `Connect` needs):
 #   only the `windows_elevation_routes` harness needs it, to ask the Task Scheduler COM API whether a probe's task
 #   is gone, rather than read a `schtasks` exit code.
+# - `Win32_System_Pipes`: only `pipe_tests.rs` needs it, for `PeekNamedPipe`, to show that the read it
+#   polls after completed synchronously.
 #
 # Declaring them here, in dev-dependencies, keeps them out of the published crate's own
 # dependency footprint for downstream consumers who only pull in `[dependencies]`. The `windows_*`
@@ -119,6 +121,7 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
@@ -137,7 +140,7 @@ libc = "0.2"
 # see the dev-dependencies' feature.
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
-    # `NtOpenFile`, for the child pipe (`src/pipe/windows.rs`).
+    # `NtOpenFile`, for the child pipe.
     "Wdk_Storage_FileSystem",
     "Wdk_System_Threading",
     "Win32_Foundation",

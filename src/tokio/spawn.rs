@@ -179,7 +179,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             };
             let dir = *dir;
             // Our pipe: the child end goes to the target slot and (dup'd) to each merging
-            // slot; the parent end is stashed for the accessor, which registers it with the reactor.
+            // slot; the parent end is stashed for its accessor.
             let (child_end, parent_end) = crate::child::spawn::make_pipe(dir).not_started()?;
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
