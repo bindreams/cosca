@@ -4,7 +4,7 @@
 use std::process::ExitStatus;
 
 use super::slot::ChildSlot;
-use super::teardown::{Disposition, LookOutcome};
+use super::teardown::{Disposition, LEAVING_RUNNING, LEFT};
 use super::OwnedChild;
 #[cfg(feature = "tokio")]
 use crate::child::lifecycle::unbounded_status;
@@ -60,7 +60,8 @@ enum DropKind {
     /// Block until the child exits and reap it; while the thread is panicking, give it up and warn.
     Wait,
     /// Kill it once more (not a front), look once without waiting and reap it if it exited; warn
-    /// once naming the pid, and if it was not reaped, give it up, unreaped.
+    /// once naming the pid, and if it was not reaped, give it up, unreaped. A child someone else
+    /// reaped is logged at `debug` instead, unless the kill was refused.
     LetGo,
 }
 
@@ -96,8 +97,9 @@ impl Unreaped {
     /// [`wait`](Unreaped::wait), awaited: the same status and errors, without blocking the runtime
     /// thread. Dropping the future, polled or not, lets the child go, warned: it kills the child
     /// once more (a front, which is sent nothing, excepted), looks at it once without waiting and
-    /// reaps it if it exited. It warns once naming the pid, and a child not reaped is given up,
-    /// unreaped.
+    /// reaps it if it exited. It warns once naming the pid, except a child someone else reaped,
+    /// which is logged at `debug` (a refused kill is warned regardless); a child not reaped is
+    /// given up, unreaped.
     ///
     /// Needs the `tokio` feature. Portable code needs a runtime with the IO and time drivers (the
     /// `#[tokio::main]` / `#[tokio::test]` defaults): on Unix a runtime missing either makes tokio
@@ -120,55 +122,97 @@ impl Unreaped {
     }
 }
 
-impl Unreaped {
-    /// The [`LetGo`](DropKind::LetGo) drop: the one kill (a front is sent none) and the one look,
-    /// then one line led by `subject`. The look is [`look_at_front`](OwnedChild::look_at_front) or
-    /// [`look_after_refused_kill`](OwnedChild::look_after_refused_kill) where those fit; after a kill
-    /// that sent something, or nothing and no refusal, it is a local one, since neither helper
-    /// takes that case. `Settlement` is not given the kill: it asserts a kill is followed by a wait
-    /// with no deadline, and this look has one.
-    fn let_go(&self, child: &OwnedChild, subject: &str) {
-        if self.front {
-            let look = child.look_at_front(self.id, Ok(None), None).look;
-            let ended = match &look {
-                LookOutcome::Ended(settlement) => Some(settlement),
-                _ => None,
-            };
-            say_let_go(subject, ended, false);
-            return;
-        }
-        match child.signal(Sig::Kill) {
-            Err(refused) => {
-                let torn = child.look_after_refused_kill(self.id, refused, Disposition::Leave);
-                say_let_go(subject, torn.refused_look(), false);
-            }
-            Ok(sent) => {
-                let look = Settlement::new(child.wait(Some(crate::wait::now())), false);
-                say_let_go(subject, look.ended().then_some(&look), matches!(sent, Sent::Delivered));
-            }
+/// What the [`LetGo`](DropKind::LetGo) drop's kill came to.
+#[derive(Debug)]
+pub(crate) enum LetGoKill {
+    /// None was sent: the child is an elevation front.
+    NotSent,
+    /// The signal was handed to the OS.
+    Delivered,
+    /// The signal found nothing to send to: the child is gone.
+    Gone,
+    /// The signal was not sent: nothing could verify the child. It may be running.
+    Unverified,
+    /// The kill failed; the text of its error.
+    Refused(String),
+}
+
+impl LetGoKill {
+    /// The kill as a clause of the line; `None` when none was sent.
+    fn clause(&self) -> Option<String> {
+        match self {
+            LetGoKill::NotSent => None,
+            LetGoKill::Delivered => Some("killed it".to_owned()),
+            LetGoKill::Gone => Some("its kill found nothing to signal".to_owned()),
+            LetGoKill::Unverified => Some("its kill was not sent: the child could not be verified".to_owned()),
+            LetGoKill::Refused(error) => Some(format!("its kill was refused: {error}")),
         }
     }
 }
 
-/// The one line of a let-go drop. `ended` is the look's settlement if it found an answer about the
-/// child, `None` if the child was not yet collected; `killed`: a kill was delivered to it.
-fn say_let_go(subject: &str, ended: Option<&Settlement>, killed: bool) {
-    let Some(settlement) = ended else {
-        let left = Disposition::Leave.suffix(true);
-        if killed {
-            log::warn!("{subject}; killed it and gave it up before it could be reaped{left}");
-        } else {
-            log::warn!("{subject}; it still runs, so gave it up{left}");
-        }
-        return;
+/// What both drops say of the child before anything else; `who` is [`child_named`].
+fn dropped(who: &str) -> String {
+    format!("{who} was dropped without wait or leak")
+}
+
+/// What both drops say of a child they reaped.
+fn reaped_it(status: ExitStatus) -> String {
+    format!("reaped it ({status})")
+}
+
+/// The one line of a [`LetGo`](DropKind::LetGo) drop, and its level: `kill` is what the kill came
+/// to and `look` the one look at the present moment after it (never given the kill: it has a
+/// deadline, and a settlement after a kill has none). Every case is worded here and nowhere else.
+///
+/// - The level is `warn`, except a child someone else reaped, which is `debug` (principle 7), and
+///   a refused kill, which is at least `warn` whatever the look found.
+/// - The kill is said whenever one was sent, a refusal with its error.
+/// - A child the look did not collect says where it goes: given up, so nothing waits for it
+///   ([`LEFT`], [`LEAVING_RUNNING`]).
+pub(crate) fn let_go_line(pid: Option<u32>, kill: &LetGoKill, look: &Settlement) -> (log::Level, String) {
+    let dropped = dropped(&child_named(pid));
+    let subject = match kill.clause() {
+        Some(clause) => format!("{dropped} ({clause})"),
+        None => dropped,
     };
-    if let Some(status) = settlement.status() {
-        let after = if killed { "killed it and " } else { "" };
-        log::warn!("{subject}; {after}reaped it ({status})");
-        return;
+    let (level, line) = match look.status() {
+        Some(status) => (log::Level::Warn, format!("{subject}: {}", reaped_it(status))),
+        None => {
+            let running = match kill {
+                LetGoKill::Delivered => format!("{subject}; it had not exited yet{LEFT}"),
+                _ => format!("{subject}{LEAVING_RUNNING}"),
+            };
+            let said = look.wording(&subject, Some(&running), Some(Disposition::Leave));
+            (said.level(), said.text().to_owned())
+        }
+    };
+    // Principle 7: a failed kill logs at least at `warn`.
+    let level = if matches!(kill, LetGoKill::Refused(_)) {
+        level.min(log::Level::Warn)
+    } else {
+        level
+    };
+    (level, line)
+}
+
+impl Unreaped {
+    /// The [`LetGo`](DropKind::LetGo) drop: the one kill (a front is sent none), the one look, and
+    /// the one line [`let_go_line`] words.
+    fn let_go(&self, child: &OwnedChild) {
+        let kill = if self.front {
+            LetGoKill::NotSent
+        } else {
+            match child.signal(Sig::Kill) {
+                Ok(Sent::Delivered) => LetGoKill::Delivered,
+                Ok(Sent::Gone) => LetGoKill::Gone,
+                Ok(Sent::Unverified) => LetGoKill::Unverified,
+                Err(refused) => LetGoKill::Refused(refused.to_string()),
+            }
+        };
+        let look = Settlement::new(child.wait(Some(crate::wait::now())), false);
+        let (level, line) = let_go_line(child.pid(), &kill, &look);
+        log::log!(level, "{line}");
     }
-    let said = settlement.wording(subject, None, Some(Disposition::Leave));
-    log::log!(said.level(), "{}", said.text());
 }
 
 impl Drop for Unreaped {
@@ -176,25 +220,23 @@ impl Drop for Unreaped {
         let Some(child) = self.child.take() else {
             return;
         };
-        let pid = child.pid();
-        let who = child_named(pid);
         if self.drop_kind == DropKind::LetGo {
-            self.let_go(&child, &format!("{who} was dropped without wait or leak"));
+            self.let_go(&child);
             return;
         }
+        let who = child_named(child.pid());
         // A destructor that blocks on a child during unwinding can hang the panic for good.
         if std::thread::panicking() {
-            log::warn!("{who} was dropped without wait or leak while the thread is panicking; gave it up, unreaped");
+            log::warn!("{} while the thread is panicking; gave it up, unreaped", dropped(&who));
             return;
         }
         let settlement = Settlement::new(wait_to_exit(&child, None), false);
         // The drop's own warn for a status, which the table words at debug: it names the status.
         if let Some(status) = settlement.status() {
-            log::warn!("{who} was dropped without wait or leak; waited for it and reaped it ({status})");
+            log::warn!("{}; waited for it and {}", dropped(&who), reaped_it(status));
             return;
         }
-        let subject = format!("{who} was dropped without wait or leak");
-        let said = settlement.wording(&subject, None, Some(Disposition::Leave));
+        let said = settlement.wording(&dropped(&who), None, Some(Disposition::Leave));
         log::log!(said.level(), "{}", said.text());
     }
 }
