@@ -367,8 +367,9 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
         panic!("the drop warns once: {records:?}");
     };
     assert!(said.contains(&blocker_id.pid().to_string()), "{said}");
-    // The look may or may not have reaped the child: the OS says, not the log. `ECHILD` is a child
-    // already reaped; `0` is a zombie, or a child still dying, which the kill ends.
+    // The look may or may not have reaped the child: the OS says, not the log. `waitpid(WNOHANG)`
+    // returns the pid for a zombie (now reaped), `0` for a child that has not changed state (still
+    // running, or not yet a zombie), and `-1` with `ECHILD` for one already reaped.
     #[cfg(unix)]
     {
         let pid = blocker_id.pid() as libc::pid_t;
@@ -393,199 +394,119 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
 ///
 /// Mutants: any cell worded another way: a kill not said (or said though none was sent), a refusal
 /// without its error, a foreign reap above `debug` (or a refused kill's line below `warn`), a
-/// running child said reaped, the wrong per-OS clause, a doubled "unreaped".
+/// running child said reaped, a child whose kill found nothing to signal also said to be running,
+/// the wrong per-OS clause, a doubled "unreaped".
 #[skuld::test]
 fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     use crate::child::lifecycle::Settlement;
     use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
-    use crate::child::owned::unreaped::{let_go_line, LetGoKill};
+    use crate::child::owned::unreaped::let_go_line;
     use crate::child::owned::ChildWaitOutcome;
     use crate::os_process::child::ExitRecord;
-
-    struct Row {
-        kill: LetGoKill,
-        look: Result<ChildWaitOutcome, Error>,
-        level: log::Level,
-        says: Vec<String>,
-        never: Vec<&'static str>,
-    }
-    let status = std::process::ExitStatus::default().to_string();
-    let reaped = || Ok(ChildWaitOutcome::Exited(exit()));
-    let unreadable = || Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 }));
-    let running = || Ok(ChildWaitOutcome::DeadlinePassed);
-    let elsewhere = || Ok(ChildWaitOutcome::Foreign(Foreign::Gone));
-    let launchd = || Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned));
-    let failed = || Err(Error::Io(std::io::Error::other("boom")));
-    let refused = || LetGoKill::Refused("denied".to_owned());
-    let row = |kill, look, level, says: &[&str], never: &[&'static str]| Row {
-        kill,
-        look,
-        level,
-        says: says.iter().map(|s| (*s).to_owned()).collect(),
-        never: never.to_vec(),
-    };
+    use crate::signal::Sent;
     use log::Level::{Debug, Warn};
-    let rows = [
-        // No kill: an elevation front.
-        row(LetGoKill::NotSent, running(), Warn, &[LEAVING_RUNNING], &["kill"]),
-        row(LetGoKill::NotSent, reaped(), Warn, &["reaped it", &status], &["kill"]),
-        row(LetGoKill::NotSent, unreadable(), Warn, &["unreadable"], &["kill"]),
-        row(
-            LetGoKill::NotSent,
-            elsewhere(),
-            Debug,
-            &["reaped by someone else"],
-            &["kill"],
+
+    // What `child.signal(Sig::Kill)` answered, as the drop gets it; `None`: none was sent (a front).
+    type Kill = Option<Result<Sent, Error>>;
+    type Look = Result<ChildWaitOutcome, Error>;
+    // A kill: how it is said, what a line of it must not claim, and the clauses and the claims
+    // to avoid when the look found the child still running.
+    type KillCase = (
+        fn() -> Kill,
+        &'static str,
+        &'static [&'static str],
+        Vec<&'static str>,
+        &'static [&'static str],
+    );
+    // A look: the level of a line of it, and what the line says of the child.
+    type LookCase<'a> = (fn() -> Look, log::Level, Vec<&'a str>);
+    let status = std::process::ExitStatus::default().to_string();
+
+    // Every kill the drop can have, over every look it can see: the types allow all 5 x 6 pairs,
+    // and each is reachable (a child someone else reaped, or one launchd holds, meets any kill).
+    let kills: [KillCase; 5] = [
+        (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
+        (
+            || Some(Ok(Sent::Delivered)),
+            "(killed it)",
+            &["refused", "terminated"],
+            vec!["it had not exited yet", LEFT],
+            &["refused", "terminated", LEAVING_RUNNING],
         ),
-        row(LetGoKill::NotSent, launchd(), Warn, &["launchd"], &["kill"]),
-        row(
-            LetGoKill::NotSent,
-            failed(),
-            Warn,
-            &["the wait failed: boom", LEFT],
-            &["kill"],
+        (
+            || Some(Ok(Sent::Gone)),
+            "its kill found nothing to signal",
+            &["killed it"],
+            vec!["the look saw no exit yet", LEFT],
+            &["killed it", "running", LEAVING_RUNNING],
         ),
-        // Delivered.
-        row(
-            LetGoKill::Delivered,
-            running(),
-            Warn,
-            &["(killed it)", "it had not exited yet", LEFT],
-            &["still runs", "refused"],
-        ),
-        row(
-            LetGoKill::Delivered,
-            reaped(),
-            Warn,
-            &["(killed it)", "reaped it", &status],
-            &[],
-        ),
-        row(
-            LetGoKill::Delivered,
-            unreadable(),
-            Warn,
-            &["(killed it)", "unreadable"],
-            &[],
-        ),
-        row(
-            LetGoKill::Delivered,
-            elsewhere(),
-            Debug,
-            &["(killed it)", "reaped by someone else"],
-            &[],
-        ),
-        row(LetGoKill::Delivered, launchd(), Warn, &["(killed it)", "launchd"], &[]),
-        row(
-            LetGoKill::Delivered,
-            failed(),
-            Warn,
-            &["(killed it)", "the wait failed: boom", LEFT],
-            &[],
-        ),
-        // Refused: at least `warn`, with the error, and no claim of a kill.
-        row(
-            refused(),
-            running(),
-            Warn,
-            &["its kill was refused: denied", LEAVING_RUNNING],
+        (
+            || Some(Ok(Sent::Unverified)),
+            "its kill was not sent: the child could not be verified",
+            &["killed it"],
+            vec![LEAVING_RUNNING],
             &["killed it"],
         ),
-        row(
-            refused(),
-            reaped(),
-            Warn,
-            &["refused: denied", "reaped it", &status],
+        (
+            || Some(Err(Error::Io(std::io::Error::other("denied")))),
+            "could not be terminated (denied)",
             &["killed it"],
-        ),
-        row(
-            refused(),
-            unreadable(),
-            Warn,
-            &["refused: denied", "unreadable"],
-            &["killed it"],
-        ),
-        row(
-            refused(),
-            elsewhere(),
-            Warn,
-            &["refused: denied", "reaped by someone else"],
-            &["killed it"],
-        ),
-        row(
-            refused(),
-            launchd(),
-            Warn,
-            &["refused: denied", "launchd"],
-            &["killed it"],
-        ),
-        row(
-            refused(),
-            failed(),
-            Warn,
-            &["refused: denied", "the wait failed: boom", LEFT],
-            &["killed it"],
-        ),
-        // The signal found nothing to send to.
-        row(
-            LetGoKill::Gone,
-            elsewhere(),
-            Debug,
-            &["found nothing to signal", "reaped by someone else"],
-            &["killed it"],
-        ),
-        row(
-            LetGoKill::Gone,
-            reaped(),
-            Warn,
-            &["found nothing to signal", "reaped it", &status],
-            &["killed it"],
-        ),
-        row(
-            LetGoKill::Gone,
-            running(),
-            Warn,
-            &["found nothing to signal", LEAVING_RUNNING],
-            &["killed it"],
-        ),
-        // The signal could not be verified, so none was sent.
-        row(
-            LetGoKill::Unverified,
-            running(),
-            Warn,
-            &["could not be verified", LEAVING_RUNNING],
-            &["killed it"],
-        ),
-        row(
-            LetGoKill::Unverified,
-            reaped(),
-            Warn,
-            &["could not be verified", "reaped it", &status],
-            &["killed it"],
-        ),
-        row(
-            LetGoKill::Unverified,
-            elsewhere(),
-            Debug,
-            &["could not be verified", "reaped by someone else"],
+            vec![LEAVING_RUNNING],
             &["killed it"],
         ),
     ];
-    assert_eq!(rows.len(), 24, "a row was added or dropped: say so here");
-    for Row {
-        kill,
-        look,
-        level,
-        says,
-        never,
-    } in rows
-    {
+    // A refused kill raises a look's `debug` to `warn`.
+    let looks: [LookCase; 5] = [
+        (
+            || Ok(ChildWaitOutcome::Exited(exit())),
+            Warn,
+            vec!["reaped it", &status],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
+            Warn,
+            vec!["unreadable"],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Foreign(Foreign::Gone)),
+            Debug,
+            vec!["reaped by someone else"],
+        ),
+        (
+            || Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
+            Warn,
+            vec!["launchd"],
+        ),
+        (
+            || Err(Error::Io(std::io::Error::other("boom"))),
+            Warn,
+            vec!["the wait failed: boom", LEFT],
+        ),
+    ];
+    let running = || -> Look { Ok(ChildWaitOutcome::DeadlinePassed) };
+
+    let mut cases = Vec::new();
+    for (kill, said, never, running_says, running_never) in &kills {
+        for (look, level, says) in &looks {
+            let level = if said.contains("could not be terminated") {
+                Warn
+            } else {
+                *level
+            };
+            let says: Vec<&str> = [vec![*said], says.clone()].concat();
+            cases.push((kill(), look(), level, says, never.to_vec()));
+        }
+        let says: Vec<&str> = [vec![*said], running_says.clone()].concat();
+        cases.push((kill(), running(), Warn, says, running_never.to_vec()));
+    }
+    for (kill, look, level, says, never) in cases {
         let look = Settlement::new(look, false);
-        let (got, line) = let_go_line(Some(PID), &kill, &look);
+        let (got, line) = let_go_line(Some(PID), kill.as_ref(), &look);
         let case = format!("{kill:?} / {look:?}: {line}");
         assert_eq!(got, level, "{case}");
         assert!(line.contains("child 4242") && !line.contains('\n'), "{case}");
         for phrase in &says {
-            assert!(line.contains(phrase.as_str()), "missing {phrase:?}: {case}");
+            assert!(line.contains(phrase), "missing {phrase:?}: {case}");
         }
         for phrase in never {
             assert!(!line.contains(phrase), "claims {phrase:?}: {case}");
