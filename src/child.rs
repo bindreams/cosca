@@ -6,12 +6,14 @@ use std::collections::BTreeMap;
 use crate::child::owned::teardown::{Disposition, Kill, Remains};
 #[cfg(unix)]
 use crate::child::owned::teardown::{FrontLook, TeardownOutcome};
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::containment::dispatch::{SweepFailure, TeardownCaller};
 use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
+use crate::wait::teardown_warn::Due;
 
 #[path = "child/pump.rs"]
 pub(crate) mod pump;
@@ -146,6 +148,8 @@ pub struct Child {
     /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
     #[cfg(unix)]
     reported: Vec<crate::child::drop_report::PartKey>,
+    /// What the spawn that made this child was told about its teardowns.
+    policy: SpawnPolicy,
 }
 
 impl Child {
@@ -155,6 +159,7 @@ impl Child {
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
+        policy: SpawnPolicy,
     ) -> Child {
         debug_assert!(proc.pid().is_some(), "a child's process has the pid its spawn learned");
         debug_assert!(
@@ -174,6 +179,7 @@ impl Child {
             front: None,
             #[cfg(unix)]
             reported: Vec::new(),
+            policy,
         }
     }
 
@@ -488,7 +494,9 @@ impl Child {
         };
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
-        let look = self.proc.look_at_front(self.id, reach, None);
+        let look = self
+            .proc
+            .look_at_front(self.id, reach, Due::in_(self.policy.teardown_warn_after));
         word_front(self.pid(), why, disposition, look)
     }
 
@@ -1170,7 +1178,7 @@ impl Child {
     fn into_unreaped(mut self) -> Unreaped {
         debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
         let root = self.proc.take().expect("a child handed back still holds its root");
-        Unreaped::new(root, self.id, self.front.is_some())
+        Unreaped::new(root, self.id, self.front.is_some(), self.policy.unreaped_drop)
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
@@ -1195,7 +1203,7 @@ impl Child {
                     disposition,
                     tree: None,
                 },
-                None,
+                Due::in_(self.policy.teardown_warn_after),
             );
             let (warn, remains) = torn.take_warn(caller.label());
             left.extend(
@@ -1292,7 +1300,7 @@ impl Child {
                         disposition,
                         tree: reach,
                     },
-                    None,
+                    Due::in_(self.policy.teardown_warn_after),
                 )
             }
         };

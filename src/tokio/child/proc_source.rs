@@ -13,6 +13,8 @@ use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 #[cfg(target_os = "linux")]
 use crate::child::spawn::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
+#[cfg(target_os = "linux")]
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::Diagnosis;
 use crate::containment::dispatch::TeardownCaller;
 use crate::error::{ChildFate, Error};
@@ -1580,7 +1582,10 @@ impl ProcSource {
             id,
             subtree,
             disposition: Disposition::Leave,
-            due: Due::in_(super::slow_teardown_after()),
+            policy: SpawnPolicy {
+                teardown_warn_after: super::slow_teardown_after(),
+                ..SpawnPolicy::SYNC
+            },
         };
         let (error, fate, _) = tear_down_held(child, how, why, error);
         (error, fate)

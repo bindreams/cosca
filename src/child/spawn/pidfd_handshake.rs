@@ -77,6 +77,7 @@ use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
 use super::{SpawnFailure, SpawnLockGuard};
 use crate::child::owned::teardown::{Disposition, Past, Remains};
 use crate::child::owned::OwnedChild;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
 use crate::wait::teardown_warn::Due;
@@ -351,8 +352,7 @@ impl Handshake {
 
     /// Has a spawn that fails after its fork warn once, naming the child, if a wait of its teardown
     /// for a child it killed passes `after`; the wait goes on. Messaging only: no wait ends on it.
-    /// Set by the async spawn, whose teardown blocks a runtime thread (principle 2).
-    #[cfg(feature = "tokio")]
+    /// Set from the spawn's [`SpawnPolicy::teardown_warn_after`].
     pub(crate) fn warning_past(mut self, after: Option<std::time::Duration>) -> Handshake {
         self.warn_after = after;
         self
@@ -898,7 +898,11 @@ fn conclude<T: Spawned>(
                     id: None,
                     subtree: None,
                     disposition: Disposition::Leave,
-                    due: None,
+                    // A front left is never handed back, so no `Unreaped` takes the drop kind.
+                    policy: SpawnPolicy {
+                        teardown_warn_after: warn_after,
+                        ..SpawnPolicy::SYNC
+                    },
                 };
                 let (error, fate, _) = tear_down_held(child, how, &mut super::Diagnosis::default(), error);
                 (error, fate)

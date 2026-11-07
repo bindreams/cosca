@@ -227,6 +227,10 @@ pub(crate) struct CgroupLeaf {
     /// Where the watched front was when the leaf was last about to be removed, shared with the
     /// leaf's [`Subtree`]s.
     placed: super::PlacedAtRemoval,
+    /// This long into each of its waits for the leaf's drain, [`Drop`] warns once and keeps waiting
+    /// (principle 2); `None`: it does not. The spawn's policy sets it
+    /// ([`warn_past`](Self::warn_past)).
+    teardown_warn_after: Option<std::time::Duration>,
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -397,6 +401,12 @@ impl CgroupLeaf {
             self.placed.clone(),
             std::sync::Arc::clone(&self.kill),
         )
+    }
+
+    /// Has [`Drop`] warn once, `after` into each of its waits for the leaf's drain, and keep
+    /// waiting.
+    pub(crate) fn warn_past(&mut self, after: Option<std::time::Duration>) {
+        self.teardown_warn_after = after;
     }
 
     /// Watch the elevation front `pid`, this leaf's child: its place is recorded before each
@@ -909,6 +919,7 @@ impl CgroupLeaf {
             kill: std::sync::Arc::default(),
             watched: None,
             placed: super::PlacedAtRemoval::default(),
+            teardown_warn_after: None,
         }
     }
 
@@ -931,7 +942,7 @@ impl CgroupLeaf {
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
-        self.tear_down(&mut NoWarn);
+        self.tear_down(&mut WarnAfter(self.teardown_warn_after));
     }
 }
 
@@ -1613,6 +1624,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         kill: std::sync::Arc::default(),
         watched: None,
         placed: super::PlacedAtRemoval::default(),
+        teardown_warn_after: None,
     })
 }
 

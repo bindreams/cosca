@@ -5,9 +5,9 @@ use super::*;
 use crate::wait::teardown_warn::{wait_warning, Due};
 
 /// What a teardown's blocking waits say once they are slow (principles 2 and 3). The caller that
-/// drops or abandons the leaf passes it; the leaf keeps none. [`due`](Self::due) is also the
-/// threshold of the wait for the child a leaf's abandonment kills, which the child's own teardown
-/// warns of.
+/// abandons the leaf passes it; the leaf's own `Drop` makes its own from the spawn's policy.
+/// [`due`](Self::due) is also the threshold of the wait for the child a leaf's abandonment kills,
+/// which the child's own teardown warns of.
 pub(crate) trait TeardownWarn {
     /// When a wait starting now warns, or `None` if it does not.
     fn due(&self) -> Option<Due>;
@@ -16,9 +16,11 @@ pub(crate) trait TeardownWarn {
     fn warn(&mut self, leaf: &std::path::Path);
 }
 
-/// No warn: every wait but an async teardown's.
+/// A test's waits, which warn of nothing.
+#[cfg(test)]
 pub(crate) struct NoWarn;
 
+#[cfg(test)]
 impl TeardownWarn for NoWarn {
     fn due(&self) -> Option<Due> {
         None
@@ -27,11 +29,10 @@ impl TeardownWarn for NoWarn {
     fn warn(&mut self, _: &std::path::Path) {}
 }
 
-/// A failed async spawn's teardown: each wait warns once, this long into it (principle 2).
-#[cfg(feature = "tokio")]
+/// A teardown's waits as the spawn's policy says: each warns once, this long into it, if there is a
+/// threshold (principle 2).
 pub(crate) struct WarnAfter(pub(crate) Option<std::time::Duration>);
 
-#[cfg(feature = "tokio")]
 impl TeardownWarn for WarnAfter {
     fn due(&self) -> Option<Due> {
         Due::in_(self.0)
@@ -74,7 +75,6 @@ impl CgroupLeaf {
     }
 
     /// Drop the leaf as [`Drop`] does, with `warn` for each wait.
-    #[cfg(feature = "tokio")]
     pub(crate) fn drop_warning(mut self, warn: &mut dyn TeardownWarn) {
         self.tear_down(warn);
     }

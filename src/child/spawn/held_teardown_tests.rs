@@ -5,6 +5,7 @@
 use std::io;
 
 use super::held_teardown::{tear_down_held, HeldTeardown};
+use super::policy::SpawnPolicy;
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
@@ -308,7 +309,7 @@ fn tear_down_leaving(
         id: None,
         subtree: None,
         disposition: Disposition::Leave,
-        due: None,
+        policy: SpawnPolicy::SYNC,
     };
     tear_down_held(owned, how, why, failed())
 }
@@ -515,8 +516,15 @@ fn after_a_pidfd_kill_refused_with(errno: i32, past: Past) -> ChildFate {
     crate::log_capture::install();
     let (owned, stdin) = held_blocker(|f| f.signals([failed_signal(errno)]));
     let _reaped = ReapsBlocker::new(&owned, stdin);
-    super::held_teardown::tear_down_failed_spawn(owned, None, past, Disposition::Leave, None, &mut Diagnosis::default())
-        .0
+    super::held_teardown::tear_down_failed_spawn(
+        owned,
+        None,
+        past,
+        Disposition::Leave,
+        SpawnPolicy::SYNC,
+        &mut Diagnosis::default(),
+    )
+    .0
 }
 
 /// A kill of a pidfd refused with `EPERM` is within the contract, a setuid child's.

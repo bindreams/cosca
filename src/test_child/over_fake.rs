@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::child::owned::OwnedChild;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::{Attached, Attachment, Containment};
 use crate::graceful::GracefulMechanism;
 use crate::identity::{Key, ProcessId};
@@ -32,11 +33,17 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
                 GracefulMechanism::Process
             },
         },
+        SpawnPolicy::SYNC,
     )
 }
 
 pub(crate) fn unreaped_over(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
-    Unreaped::new(OwnedChild::new(Box::new(fake.clone())), id, false)
+    Unreaped::new(
+        OwnedChild::new(Box::new(fake.clone())),
+        id,
+        false,
+        SpawnPolicy::SYNC.unreaped_drop,
+    )
 }
 
 /// A boxed `Unreaped` over a fake that has exited, so dropping it waits for nothing.

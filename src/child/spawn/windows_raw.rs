@@ -89,6 +89,7 @@ use windows::Win32::System::Threading::{
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
     Diagnosis, ParentStd, SpawnFailure,
@@ -108,6 +109,7 @@ pub(crate) fn spawn_raw(
     cmd: &Command,
     fds: BTreeMap<Fd, ResolvedStdio>,
     kill_on_drop: bool,
+    policy: SpawnPolicy,
 ) -> Result<Child, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
@@ -227,7 +229,7 @@ pub(crate) fn spawn_raw(
                 None,
                 Past::Clean,
                 Disposition::HandBack,
-                None,
+                policy,
                 &mut Diagnosis::default(),
             );
             return Err(SpawnFailure::started(
@@ -246,14 +248,21 @@ pub(crate) fn spawn_raw(
                 id_read,
                 Past::Clean,
                 Disposition::HandBack,
-                None,
+                policy,
                 &mut Diagnosis::default(),
             );
             return Err(SpawnFailure::started(e, fate, unreaped));
         }
     };
 
-    Ok(Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment))
+    Ok(Child::from_parts(
+        owned,
+        id_read,
+        parent_ends,
+        kill_on_drop,
+        attachment,
+        policy,
+    ))
 }
 
 /// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`

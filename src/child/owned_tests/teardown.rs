@@ -5,7 +5,7 @@ use std::process::ExitStatus;
 use super::teardown_lines::said_of;
 use super::teardown_look::FakeReach;
 use crate::child::lifecycle::Wording;
-use crate::child::owned::teardown::{Disposition, Kill, TeardownOutcome};
+use crate::child::owned::teardown::{BeginOutcome, Disposition, Kill, TeardownOutcome};
 use crate::child::owned::OwnedChild;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -725,4 +725,29 @@ fn a_failed_bounded_wait_is_the_result_and_is_not_repeated() {
         "{torn:?}"
     );
     assert_eq!(slow_warns(&records), Vec::<&String>::new());
+}
+
+/// The first half of a teardown of a child that has already exited and been reaped ends there: it
+/// answers `Done`, and no wait is left for the caller to make.
+///
+/// Mutant: `begin_tear_down` always answers a pending wait.
+#[skuld::test]
+fn the_first_half_of_a_teardown_of_a_reaped_child_is_done() {
+    let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+    child.wait(None).expect("the fake reaps the child");
+    let looks = fake.looks();
+    let begun = child.begin_tear_down(
+        Some(id()),
+        Kill {
+            disposition: Disposition::Leave,
+            tree: None,
+        },
+        Some(due_now()),
+    );
+    let BeginOutcome::Done(torn) = begun else {
+        panic!("a reaped child has nothing to wait for: {begun:?}");
+    };
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+    assert_eq!(fake.looks(), looks, "the first half looked at a reaped child");
 }

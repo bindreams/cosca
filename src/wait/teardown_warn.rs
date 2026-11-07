@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 /// When a teardown's warn is due, and how long into the wait that is.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Due {
     pub(crate) until: Instant,
     pub(crate) after: Duration,
@@ -13,10 +13,6 @@ pub(crate) struct Due {
 
 impl Due {
     /// Due `after` from now, if there is a threshold.
-    #[cfg_attr(
-        not(any(test, feature = "tokio")),
-        allow(dead_code, reason = "only an async spawn's teardown has a threshold to start from")
-    )]
     pub(crate) fn in_(after: Option<Duration>) -> Option<Due> {
         after.map(|after| Due {
             until: crate::wait::now() + after,

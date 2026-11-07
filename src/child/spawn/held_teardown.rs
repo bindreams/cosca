@@ -14,7 +14,9 @@ use super::FrontFate;
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past};
 #[cfg(target_os = "linux")]
 use crate::child::owned::teardown::{Reach, TeardownOutcome};
+use crate::child::owned::unreaped::DropKind;
 use crate::child::owned::OwnedChild;
+use crate::child::spawn::policy::SpawnPolicy;
 #[cfg(target_os = "linux")]
 use crate::containment::cgroup::Subtree;
 #[cfg(target_os = "linux")]
@@ -39,8 +41,9 @@ pub(crate) struct HeldTeardown<'a> {
     pub(crate) subtree: Option<&'a Subtree>,
     /// What the caller does with a child that still runs: hand it back, or leave it.
     pub(crate) disposition: Disposition,
-    /// When the wait for a child the teardown killed, or a front its leaf's kill ended, warns.
-    pub(crate) due: Option<Due>,
+    /// What the spawn was told of its teardowns: when the wait for a child the teardown killed, or a
+    /// front its leaf's kill ended, warns, and what a child handed back does when dropped.
+    pub(crate) policy: SpawnPolicy,
 }
 
 /// Tears `child` down after `error` failed the spawn, and returns `error` with what became of the
@@ -61,19 +64,20 @@ pub(crate) fn tear_down_held(
         id,
         subtree,
         disposition,
-        due,
+        policy,
     } = how;
     let pid = child.pid();
     // Nothing here states what became of the held child's handle, so a wait on it may fail: only the
     // uncollected-after-wait check is waived, not what a kill may be refused for.
     if front.is_none() {
-        let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, due, why);
+        let (fate, unreaped) = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, policy, why);
         return (error, fate, unreaped);
     }
     let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
+    let due = Due::in_(policy.teardown_warn_after);
     let (front_fate, torn) = look_at_failed_spawn_front(&child, id, reach, disposition, due);
     let torn = HandleTeardown::new(torn, Expect::of(&child, Past::WaitMayFail));
-    let (fate, unreaped) = say_failed_spawn(child, id, true, torn, disposition, why);
+    let (fate, unreaped) = say_failed_spawn(child, id, true, torn, disposition, policy.unreaped_drop, why);
     let error = if unreaped.is_some() {
         front_fate.note_handed_back(error, front, pid)
     } else {
@@ -84,23 +88,23 @@ pub(crate) fn tear_down_held(
 
 /// Kills `child`, which a failed spawn holds, and reaps it, and says how that went as the failed
 /// spawn's one warn, `why` leading it. The child itself comes back if `disposition` hands back one
-/// the teardown could not collect. With `due`, the wait for the killed child warns once it passes.
-/// `past`: what the caller knows became of the child's handle, see [`Past`]; what the handle allows is
-/// its own.
+/// the teardown could not collect, to do what `policy` says when dropped; the wait for the killed
+/// child warns once past its threshold. `past`: what the caller knows became of the child's handle,
+/// see [`Past`]; what the handle allows is its own.
 pub(crate) fn tear_down_failed_spawn(
     child: OwnedChild,
     id: Option<ProcessId>,
     past: Past,
     disposition: Disposition,
-    due: Option<Due>,
+    policy: SpawnPolicy,
     why: &mut Diagnosis,
 ) -> (ChildFate, Option<Unreaped>) {
     let kill = Kill {
         disposition,
         tree: None,
     };
-    let torn = tear_down_expecting(&child, id, kill, past, due);
-    say_failed_spawn(child, id, false, torn, disposition, why)
+    let torn = tear_down_expecting(&child, id, kill, past, Due::in_(policy.teardown_warn_after));
+    say_failed_spawn(child, id, false, torn, disposition, policy.unreaped_drop, why)
 }
 
 /// Tears `child` down as `kill` says, over its handle, expecting `past` of it (see [`Past`]); the
@@ -135,19 +139,20 @@ pub(crate) fn look_at_failed_spawn_front(
 }
 
 /// Says `torn` as the failed spawn's one warn; hands `child` back per `disposition` if it is
-/// uncollected. `front`: the child is an elevation front.
+/// uncollected, to do `unreaped_drop` when dropped. `front`: the child is an elevation front.
 fn say_failed_spawn(
     child: OwnedChild,
     id: Option<ProcessId>,
     front: bool,
     torn: HandleTeardown,
     disposition: Disposition,
+    unreaped_drop: DropKind,
     why: &mut Diagnosis,
 ) -> (ChildFate, Option<Unreaped>) {
     let remains = torn.say_as_failed_spawn(why);
     let unreaped = disposition
         .hands_back(&remains)
-        .then(|| Unreaped::new(child, id, front));
+        .then(|| Unreaped::new(child, id, front, unreaped_drop));
     (remains.fate, unreaped)
 }
 

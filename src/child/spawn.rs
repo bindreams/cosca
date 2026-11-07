@@ -12,6 +12,7 @@ use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, failed_after_the_spawn, Classify, SpawnFailure};
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp};
 #[cfg(any(unix, feature = "tokio"))]
@@ -28,12 +29,13 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
-    spawn_uncommitted(cmd)?.commit_kill_on_drop()
+    spawn_uncommitted(cmd, SpawnPolicy::SYNC)?.commit_kill_on_drop()
 }
 
 /// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
-/// on drop whatever `kill_on_drop` says.
-pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure> {
+/// on drop whatever `kill_on_drop` says. `policy` is every teardown's of the child it makes: a
+/// failed spawn's, the handle's own, its cgroup leaf's drain, and the `Unreaped` they hand back.
+pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Result<Child, SpawnFailure> {
     let kill_on_drop = cmd.kill_on_drop_flag();
     // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
     // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
@@ -41,7 +43,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     if cmd.elevation_request().enabled {
         #[cfg(windows)]
         {
-            return crate::elevation::windows::spawn_elevated(cmd, kill_on_drop);
+            return crate::elevation::windows::spawn_elevated(cmd, kill_on_drop, policy);
         }
         #[cfg(unix)]
         {
@@ -58,7 +60,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
                 // yields the same kind and stays a plain Io). An already-elevated derived
                 // (sanitized original) has no backend path, so it is never remapped.
-                let r = spawn_unelevated(&mut derived, kill_on_drop);
+                let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
                 let mut child = match backend_path.as_deref() {
                     Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
                     None => r?,
@@ -81,7 +83,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             }));
         }
     }
-    spawn_unelevated(cmd, kill_on_drop)
+    spawn_unelevated(cmd, kill_on_drop, policy)
 }
 
 /// Finish a POSIX elevated spawn whose deferred password write returned `written`.
@@ -395,10 +397,14 @@ pub(crate) fn fate_of_a_look(
 }
 
 /// The wait for the root after its kill, which a test can force to fail. The forced failure still
-/// REAPS first, so the test that asks for it leaks nothing.
+/// REAPS first, so the test that asks for it leaks nothing. It warns once past the spawn's
+/// threshold ([`SpawnPolicy::teardown_warn_after`]).
 #[cfg(unix)]
 fn wait_killed_elevated(child: &Child) -> Result<ChildWaitOutcome, Error> {
-    let waited = wait_to_exit(&child.proc, None);
+    let waited = wait_to_exit(
+        &child.proc,
+        crate::wait::teardown_warn::Due::in_(child.policy.teardown_warn_after),
+    );
     #[cfg(test)]
     if let Some(marker) = fault::take_force_reap_failure() {
         return waited.and(Err(Error::Io(std::io::Error::other(marker))));
@@ -492,7 +498,11 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
 /// re-entering the elevation branch).
 ///
 /// Every failure says whether the program could have started; see [`SpawnFailure`].
-pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, SpawnFailure> {
+pub(crate) fn spawn_unelevated(
+    cmd: &mut Command,
+    kill_on_drop: bool,
+    policy: SpawnPolicy,
+) -> Result<Child, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
     crate::os_process::linux::open::probe_pidfd_support_with(&crate::identity::HostKernel).not_started()?;
@@ -510,7 +520,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // CONTAINED children (Job Object / TreeWalk).
     #[cfg(windows)]
     if to_raw_backend {
-        return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop, policy);
     }
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
@@ -579,7 +589,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let (mut prepared, child, pidfd, parent_ends) = {
         // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
         let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
-        let prepared = crate::containment::prepare(
+        let mut prepared = crate::containment::prepare(
             &mut std_cmd,
             &mut steps,
             &cmd.contain_request(),
@@ -589,6 +599,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.env_ops(),
         )
         .not_started()?;
+        // Until `attach` takes the leaf, a failed spawn's teardown drops or abandons it here.
+        prepared.teardown_warn_after = policy.teardown_warn_after;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         if let Some(leaf) = prepared
             .cgroup_leaf
@@ -602,7 +614,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // The handshake's hook was registered first of all (see `build_std_command_with`), so the fd
         // map, which may `dup2` a mapping onto any number including the channel's, runs after the
         // handshake is done.
-        let handshake = handshake.open(&_guard).not_started()?;
+        let handshake = handshake
+            .open(&_guard)
+            .not_started()?
+            .warning_past(policy.teardown_warn_after);
         steps.register(&mut std_cmd);
 
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
@@ -680,7 +695,15 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(target_os = "macos")]
     let unique = match unique_report::adopted_id(unique, pid) {
         Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared)),
+        Err(not_adopted) => {
+            return Err(abandon_unadopted(
+                child,
+                not_adopted,
+                front,
+                prepared,
+                policy.teardown_warn_after,
+            ))
+        }
     };
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
@@ -752,7 +775,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     id: None,
                     subtree: subtree.as_ref(),
                     disposition: crate::child::owned::teardown::Disposition::HandBack,
-                    due: None,
+                    policy,
                 },
                 &mut why,
                 error,
@@ -764,7 +787,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 None,
                 crate::child::owned::teardown::Past::Clean,
                 crate::child::owned::teardown::Disposition::HandBack,
-                None,
+                policy,
                 &mut why,
             );
             #[cfg(target_os = "macos")]
@@ -803,7 +826,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                         ChildFate::Running { id: id_read },
                     )
                 } else {
-                    (None, teardown_after_attach_failure(child, unique, id_read))
+                    (
+                        None,
+                        teardown_after_attach_failure(child, unique, id_read, policy.teardown_warn_after),
+                    )
                 }
             };
             // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
@@ -818,7 +844,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     id: id_read,
                     subtree: subtree.as_ref(),
                     disposition: crate::child::owned::teardown::Disposition::HandBack,
-                    due: None,
+                    policy,
                 },
                 &mut why,
                 error,
@@ -832,7 +858,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     id_read,
                     crate::child::owned::teardown::Past::Clean,
                     crate::child::owned::teardown::Disposition::HandBack,
-                    None,
+                    policy,
                     &mut why,
                 );
                 return Err(SpawnFailure::started(error, child_fate, unreaped));
@@ -861,7 +887,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     ChildFate::Running { id: id_read },
                 )
             } else {
-                (None, teardown_after_attach_failure(child, unique, id_read))
+                (
+                    None,
+                    teardown_after_attach_failure(child, unique, id_read, policy.teardown_warn_after),
+                )
             };
             return Err(SpawnFailure::started(
                 note_front(fate, error, front, Some(pid)),
@@ -870,7 +899,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             ));
         }
     };
-    let mut child = Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment);
+    let mut child = Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment, policy);
     child.set_front(cmd.elevation_front());
     Ok(child)
 }
@@ -911,8 +940,13 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Option<ProcessId>) -> ChildFate {
-    let fate = kill_and_reap_verified(child.id(), unique, id, ZOMBIE_NOTE, None);
+fn teardown_after_attach_failure(
+    child: std::process::Child,
+    unique: u64,
+    id: Option<ProcessId>,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
+    let fate = kill_and_reap_verified(child.id(), unique, id, ZOMBIE_NOTE, warn_after);
     drop(child);
     fate
 }
@@ -1430,6 +1464,7 @@ fn abandon_unadopted(
     not_adopted: unique_report::NotAdopted,
     front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
+    warn_after: Option<std::time::Duration>,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -1459,7 +1494,7 @@ fn abandon_unadopted(
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
             // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
-            let done = kill_and_reap_unreported(pid, unique, prepared, None);
+            let done = kill_and_reap_unreported(pid, unique, prepared, warn_after);
             let tail = done.zombie_tail();
             let fate = done.warn(pid, tail);
             drop(child);
@@ -3281,6 +3316,10 @@ pub(crate) mod failure;
 #[cfg(target_os = "linux")]
 #[path = "spawn/pidfd_handshake.rs"]
 pub(crate) mod pidfd_handshake;
+
+// What a spawn is told about the teardowns of the child it makes.
+#[path = "spawn/policy.rs"]
+pub(crate) mod policy;
 
 // Linux and Windows: a failed spawn's teardown of the child it holds.
 #[cfg(any(target_os = "linux", windows))]

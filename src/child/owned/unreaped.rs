@@ -56,7 +56,7 @@ pub struct Unreaped {
 
 /// What dropping an [`Unreaped`] that still holds its child does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DropKind {
+pub(crate) enum DropKind {
     /// Block until the child exits and reap it; while the thread is panicking, give it up and warn.
     Wait,
     /// Kill it once more (not a front), look once without waiting and reap it if it exited; warn
@@ -67,13 +67,15 @@ enum DropKind {
 
 impl Unreaped {
     /// Own `child`, whose identity the spawn read as `id`, if it did; `front`: it is an elevation
-    /// front. Its drop waits.
-    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>, front: bool) -> Unreaped {
+    /// front. Its drop does what `drop_kind` says (the spawn's, [`SpawnPolicy::unreaped_drop`]).
+    ///
+    /// [`SpawnPolicy::unreaped_drop`]: crate::child::spawn::policy::SpawnPolicy::unreaped_drop
+    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>, front: bool, drop_kind: DropKind) -> Unreaped {
         Unreaped {
             child: ChildSlot::new(child),
             id,
             front,
-            drop_kind: DropKind::Wait,
+            drop_kind,
         }
     }
 

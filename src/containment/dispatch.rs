@@ -13,10 +13,10 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
-    /// Set by a failed async spawn's teardown: this long into each of its waits for the leaf's
-    /// drain, a leaf dropped or abandoned here, before `attach` takes it, warns once and keeps
-    /// waiting (principle 2). The handle's armed drop warns for a leaf `attach` took.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    /// Set from the spawn's policy: this long into each of its waits for the leaf's drain, a leaf
+    /// dropped or abandoned here, before `attach` takes it, warns once and keeps waiting
+    /// (principle 2). `attach` hands the same threshold to the leaf it takes.
+    #[cfg(target_os = "linux")]
     pub teardown_warn_after: Option<std::time::Duration>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
     /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
@@ -146,10 +146,7 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            #[cfg(feature = "tokio")]
             let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
-            #[cfg(not(feature = "tokio"))]
-            let mut warn = crate::containment::cgroup::NoWarn;
             let Some(child) = child else {
                 use crate::containment::cgroup::WithoutChild;
                 return match leaf.abandon_without_child(&mut warn) {
@@ -195,7 +192,7 @@ impl Prepared {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[cfg(target_os = "linux")]
 impl Drop for Prepared {
     fn drop(&mut self) {
         if let Some(leaf) = self.cgroup_leaf.take() {
@@ -1803,7 +1800,7 @@ pub(crate) fn prepare(
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
-            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            #[cfg(target_os = "linux")]
             teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
@@ -1845,7 +1842,7 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
-                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        #[cfg(target_os = "linux")]
                         teardown_warn_after: None,
                     });
                 }
@@ -1856,7 +1853,7 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
-                        #[cfg(all(target_os = "linux", feature = "tokio"))]
+                        #[cfg(target_os = "linux")]
                         teardown_warn_after: None,
                     });
                 }
@@ -1889,7 +1886,7 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
-                #[cfg(all(target_os = "linux", feature = "tokio"))]
+                #[cfg(target_os = "linux")]
                 teardown_warn_after: None,
             });
         }
@@ -1897,7 +1894,7 @@ pub(crate) fn prepare(
             mode,
             is_root,
             cgroup_leaf: None,
-            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            #[cfg(target_os = "linux")]
             teardown_warn_after: None,
         });
     }
@@ -1943,7 +1940,7 @@ pub(crate) fn prepare(
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        #[cfg(target_os = "linux")]
         teardown_warn_after: None,
         #[cfg(target_os = "macos")]
         marker,
@@ -2030,7 +2027,10 @@ fn attach_tree(
                     // exited. Taking the verdict waits for that report — `spawn` returning does
                     // not mean the child has made it — then releases the leaf's fd and pipe.
                     match leaf.take_placement(child) {
-                        Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
+                        Ok(()) => {
+                            leaf.warn_past(prepared.teardown_warn_after);
+                            return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
+                        }
                         // Nothing of the child's is in the leaf: its final report is not Placed. The
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.

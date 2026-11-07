@@ -22,6 +22,7 @@ use windows::Win32::System::Threading::{WaitForSingleObject, PROCESS_ACCESS_RIGH
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
     attach_or_fault, resolve_identity, resolve_stdio, spawn_lock, Classify, Diagnosis, ParentStd, SpawnFailure,
@@ -33,7 +34,6 @@ use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel};
 use crate::os_process::windows::{WindowsProcess, CREATE_PROCESS_ACCESS};
 use crate::stdio::{Fd, ResolvedStdio};
 use crate::tokio::child::{Child, ProcSource};
-use crate::wait::teardown_warn::Due;
 
 use sync_raw::{exit_status, wait_handle_or_cancel, WaitOutcome};
 
@@ -367,7 +367,10 @@ fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::P
         id,
         Past::Clean,
         Disposition::Leave,
-        Due::in_(crate::tokio::child::slow_teardown_after()),
+        SpawnPolicy {
+            teardown_warn_after: crate::tokio::child::slow_teardown_after(),
+            ..SpawnPolicy::SYNC
+        },
         &mut Diagnosis::default(),
     );
     fate

@@ -428,7 +428,7 @@ pub(crate) fn tear_down_held_holding<R>(
         id,
         subtree,
         disposition: crate::child::owned::teardown::Disposition::HandBack,
-        due: None,
+        policy: crate::child::spawn::policy::SpawnPolicy::SYNC,
     };
     let (error, fate, unreaped) = crate::child::spawn::held_teardown::tear_down_held(child, how, why, error);
     (error, fate, HandedBack::new(release, unreaped))

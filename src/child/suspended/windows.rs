@@ -1,5 +1,6 @@
 //! The Windows frozen spawn: the ordinary spawn with a suspended request, and the token it leaves.
 
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{spawn_uncommitted, SpawnFailure};
 use crate::child::{Child, SuspendedChild};
 use crate::command::Command;
@@ -80,7 +81,7 @@ pub(crate) fn spawn_frozen<T>(
 }
 
 pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
-    let (child, wanted_kill_on_drop) = spawn_frozen(cmd, spawn_uncommitted)?;
+    let (child, wanted_kill_on_drop) = spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, SpawnPolicy::SYNC))?;
     Ok(SuspendedChild {
         child,
         wanted_kill_on_drop,
