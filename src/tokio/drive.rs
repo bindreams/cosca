@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::os_process::drive::{Control, Ended, Next, ProcessExit, RunOutcome, Step, Waitable};
+use crate::os_process::drive::{wait_ended, Control, Next, ProcessExit, RunOutcome, Step, Waitable};
 use crate::os_process::{OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
@@ -71,6 +71,7 @@ fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
 /// future does not hold a `W::Output` across an await, so it is `Send` whenever `W` is.
 enum Act<'a> {
     Wait(WaitFor<'a>),
+    /// The backoff step, uncut: [`pause`] cuts it where it arms.
     Pause(Duration),
 }
 
@@ -92,34 +93,30 @@ pub(crate) async fn run<W: Waitable>(
             (Next::Done, Step::Done(out)) => return Ok(RunOutcome::Done(out)),
             (Next::DeadlinePassed, _) => return Ok(RunOutcome::DeadlinePassed),
             (Next::Look, _) => continue,
-            (Next::Pause(d), _) => Act::Pause(d),
+            (Next::Pause(step), _) => Act::Pause(step),
             (Next::Wait, Step::Wait(wait_for)) => Act::Wait(wait_for),
             (next, _) => unreachable!("{next:?} answers a look that found something else"),
         };
         match act {
-            Act::Pause(d) => pause(d).await?,
+            Act::Pause(step) => pause(step, deadline).await?,
             Act::Wait(wait_for) => {
-                let ended = match wait(&wait_for, deadline).await {
-                    Ok(true) => Ended::Woke,
-                    Ok(false) => Ended::Released,
-                    Err(e) => {
-                        w.block_failed(e)?;
-                        Ended::Failed
-                    }
-                };
-                control.waited(ended);
+                let waited = wait(&wait_for, deadline).await;
+                control.waited(wait_ended(w, waited)?);
             }
         }
     }
 }
 
-/// [`run`]'s pause for a [`Step::Recheck`]: `d` from now. Nothing wakes it early, so a `Waitable`
-/// that others must reach during the pause holds no lock across it.
+/// [`run`]'s pause for a [`Step::Recheck`]: `step` from now, cut at `deadline`. Nothing wakes it
+/// early, so a `Waitable` that others must reach during the pause holds no lock across it.
 #[cfg(unix)]
-async fn pause(d: Duration) -> Result<(), Error> {
+async fn pause(step: Duration, deadline: Option<std::time::Instant>) -> Result<(), Error> {
+    let now = crate::tokio::wait::tokio_now();
+    let by_step = now + step;
+    // An instant, never a duration re-derived from the deadline (`arm_at`'s contract).
+    let at = deadline.map_or(by_step, |deadline| deadline.min(by_step));
     #[cfg(test)]
-    crate::wait::block_probe::record_pause(d);
-    let at = crate::tokio::wait::tokio_now() + d;
+    crate::wait::block_probe::record_pause(at.saturating_duration_since(now));
     // Only the timer ends it.
     _ = crate::tokio::wait::arm_at(at, std::future::pending::<()>()).await;
     Ok(())
@@ -128,7 +125,7 @@ async fn pause(d: Duration) -> Result<(), Error> {
 /// No Windows `Waitable` asks for a recheck ([`crate::os_process::child::OsChild::try_reap`] answers
 /// `Running` or an exit there), so there is nothing to pause on.
 #[cfg(windows)]
-async fn pause(_d: Duration) -> Result<(), Error> {
+async fn pause(_step: Duration, _deadline: Option<std::time::Instant>) -> Result<(), Error> {
     debug_assert!(false, "a Windows Waitable asked for a recheck");
     Err(Error::Io(std::io::Error::other(
         "a Windows Waitable asked for a recheck, which no Windows wait has",

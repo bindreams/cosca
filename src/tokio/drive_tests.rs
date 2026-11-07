@@ -283,6 +283,35 @@ async fn async_run_cuts_a_pause_to_the_deadline_and_looks_once_more() {
     assert_eq!(w.looks, 3, "the last look is made at the deadline");
 }
 
+/// A pause the deadline cuts is armed at the deadline instant, not at a duration from a later clock
+/// read: the clock moves between the look and the arm, and the timer still ends at the deadline.
+///
+/// Mutant: arm `tokio_now() + <the step cut to the time left>`.
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_run_arms_a_cut_pause_at_the_deadline_instant() {
+    use crate::tokio::wait::armed_deadline_seam::{install, Armed};
+    use crate::tokio::wait::{now_override, tokio_now};
+
+    let (tx, armed) = std::sync::mpsc::channel();
+    let _seam = install(tx);
+    // Under a quarter of the first 1 ms step: the deadline cuts the first pause.
+    let deadline = absolute(Some(Duration::from_micros(500))).expect("a finite deadline");
+    // The clock reads later in the pause than when the look ended.
+    let moved = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _moves = block_probe::on_pause({
+        let moved = moved.clone();
+        move || *moved.borrow_mut() = Some(now_override::install(tokio_now() + Duration::from_micros(200)))
+    });
+    let mut w = Scripted::new([Move::Recheck, Move::Done]);
+    assert!(matches!(
+        run(&mut w, Some(deadline)).await.unwrap(),
+        RunOutcome::Done(())
+    ));
+    assert!(moved.borrow().is_some(), "the clock moved before the arm");
+    assert_eq!(armed.try_iter().collect::<Vec<_>>(), [Armed::At(deadline)]);
+}
+
 /// Mutant: keep the schedule across a wait.
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]

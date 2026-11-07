@@ -113,23 +113,36 @@ pub(crate) enum Next {
     DeadlinePassed,
     /// Wait on the [`WaitFor`] the look returned, until the deadline.
     Wait,
-    /// Pause for this long (the time left cuts it), then look.
+    /// Pause for this step, which the driver cuts to the time left at the instant it arms or
+    /// sleeps, then look.
     Pause(Duration),
     /// Look again at once: the deadline passed during the look, so there is no time to wait or
     /// pause in, and the next look is the final one.
     Look,
 }
 
-/// How a wait ended, as the driver tells [`Control`].
+/// How a wait ended, as the driver tells [`Control`]: the one thing it reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ended {
-    /// The source signalled.
+    /// Not released: the source signalled, or the wait failed and the [`Waitable`] survived it.
     Woke,
     /// Released without an exit signal: the deadline passed (or, in the async Windows wait, the
     /// cancel event fired).
     Released,
-    /// The wait failed.
-    Failed,
+}
+
+/// What a driver's wait returned (`Ok(false)` = released without an exit signal), as [`Control`]
+/// is told. A failed wait goes to [`Waitable::block_failed`], which ends the loop with the error
+/// unless the `Waitable` survives it.
+pub(crate) fn wait_ended<W: Waitable>(w: &mut W, waited: Result<bool, Error>) -> Result<Ended, Error> {
+    Ok(match waited {
+        Ok(true) => Ended::Woke,
+        Ok(false) => Ended::Released,
+        Err(e) => {
+            w.block_failed(e)?;
+            Ended::Woke
+        }
+    })
 }
 
 /// The control of the one wait loop, which the synchronous and the asynchronous driver both run.
@@ -138,8 +151,9 @@ pub(crate) enum Ended {
 ///
 /// A look made at or after the deadline, or after a wait released without an exit signal, is the
 /// final one: it starts no wait and no pause, and a look that is not done ends the loop with
-/// [`Next::DeadlinePassed`]. A pause is the next step of one backoff, cut to the time left; the
-/// backoff starts over after every wait.
+/// [`Next::DeadlinePassed`]. A pause is the next step of one backoff, uncut: the driver cuts it to
+/// the deadline where it arms or sleeps, so no step goes stale between a clock read here and the
+/// block. The backoff starts over after every wait.
 ///
 /// [`before_look`]: Control::before_look
 /// [`after_look`]: Control::after_look
@@ -172,10 +186,7 @@ impl Control {
             Looked::Wait | Looked::Recheck if self.final_look => Next::DeadlinePassed,
             _ if left == Some(Duration::ZERO) => Next::Look,
             Looked::Wait => Next::Wait,
-            Looked::Recheck => {
-                let step = self.steps.next().expect("a backoff without a cap never ends");
-                Next::Pause(left.map_or(step, |left| step.min(left)))
-            }
+            Looked::Recheck => Next::Pause(self.steps.next().expect("a backoff without a cap never ends")),
         }
     }
 
@@ -194,8 +205,8 @@ pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<R
     run_with(w, deadline, pause)
 }
 
-/// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the step already cut to
-/// the time remaining, and returns once it has passed.
+/// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the step cut to the time
+/// remaining, read immediately before the call, and returns once it has passed.
 fn run_with<W: Waitable>(
     w: &mut W,
     deadline: Option<Instant>,
@@ -210,17 +221,10 @@ fn run_with<W: Waitable>(
             (Next::Done, Step::Done(out)) => return Ok(RunOutcome::Done(out)),
             (Next::DeadlinePassed, _) => return Ok(RunOutcome::DeadlinePassed),
             (Next::Look, _) => {}
-            (Next::Pause(d), _) => pause(d),
+            (Next::Pause(step), _) => pause(remaining(deadline).map_or(step, |left| step.min(left))),
             (Next::Wait, Step::Wait(wait_for)) => {
-                let ended = match block(&wait_for, deadline) {
-                    Ok(true) => Ended::Woke,
-                    Ok(false) => Ended::Released,
-                    Err(e) => {
-                        w.block_failed(e)?;
-                        Ended::Failed
-                    }
-                };
-                control.waited(ended);
+                let waited = block(&wait_for, deadline);
+                control.waited(wait_ended(w, waited)?);
             }
             (next, _) => unreachable!("{next:?} answers a look that found something else"),
         }

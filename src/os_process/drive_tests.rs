@@ -323,11 +323,12 @@ fn control_makes_the_look_at_the_deadline_final() {
     );
 }
 
-/// A pause is a backoff step cut to the time left, and the backoff starts over after a wait.
+/// A pause is the next backoff step, uncut by the time left (the driver cuts it where it blocks),
+/// and the backoff starts over after a wait.
 ///
-/// Mutant: pause the whole step; or keep the schedule across a wait.
+/// Mutant: cut the step to the time left; or keep the schedule across a wait.
 #[skuld::test]
-fn control_cuts_a_pause_to_the_time_left_and_restarts_the_backoff_after_a_wait() {
+fn control_paces_a_pause_on_the_backoff_and_restarts_it_after_a_wait() {
     let paused = |c: &mut Control, time_left| match looked_at(c, Looked::Recheck, time_left) {
         Next::Pause(d) => whole_ms(&[d])[0],
         other => panic!("a recheck with time left pauses: {other:?}"),
@@ -335,24 +336,22 @@ fn control_cuts_a_pause_to_the_time_left_and_restarts_the_backoff_after_a_wait()
     let mut c = Control::new();
     assert_eq!(paused(&mut c, None), 1);
     assert_eq!(paused(&mut c, Some(ms(10))), 2);
-    assert_eq!(paused(&mut c, Some(ms(3))), 3);
+    assert_eq!(paused(&mut c, Some(ms(1))), 4);
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
     c.waited(Ended::Woke);
     assert_eq!(paused(&mut c, None), 1);
 }
 
 /// A wait released without an exit signal makes the next look the final one, whatever the clock
-/// reads; a woken or failed wait does not.
+/// reads; a woken wait does not.
 ///
-/// Mutant: ignore the release; or treat a failed wait as one.
+/// Mutant: ignore the release; or treat a woken wait as one.
 #[skuld::test]
 fn control_makes_the_look_after_a_released_wait_final() {
-    for ended in [Ended::Woke, Ended::Failed] {
-        let mut c = Control::new();
-        assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
-        c.waited(ended);
-        assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait, "{ended:?}");
-    }
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Woke);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
     let mut c = Control::new();
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
     c.waited(Ended::Released);

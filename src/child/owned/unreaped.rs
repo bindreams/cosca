@@ -79,10 +79,12 @@ impl Unreaped {
     /// thread. Dropping the future drops this value, which then settles the child as any drop does
     /// (see the type's docs): the child stays in the value until the wait has an outcome.
     ///
-    /// Needs the `tokio` feature, and a runtime with the IO **and** time drivers enabled (the
-    /// `#[tokio::main]` / `#[tokio::test]` defaults): a recheck pause arms a timer, and the wait
-    /// registers the child's pidfd or handle. On a hand-built runtime missing either, tokio panics
-    /// rather than returning a typed error.
+    /// Needs the `tokio` feature. On Linux and macOS the wait registers a descriptor with the IO
+    /// driver (the pidfd on Linux, a kqueue on macOS), and a recheck pause arms a timer on the time
+    /// driver. On Windows it waits on the blocking pool and never rechecks. Portable code needs
+    /// the IO and time drivers (the `#[tokio::main]` / `#[tokio::test]` defaults); on a hand-built
+    /// runtime missing one that a Unix platform uses, tokio panics rather than returning a typed
+    /// error.
     #[cfg(feature = "tokio")]
     pub async fn wait_async(mut self) -> Result<ExitStatus, Error> {
         let outcome = self.child.wait_async().await;
