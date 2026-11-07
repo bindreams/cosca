@@ -4,8 +4,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::Stdio;
 
-use super::{PipeReader, PipeWriter};
-use crate::child::ParentEnd;
+use super::{ParentEnd, PipeReader, PipeWriter};
 use crate::stdio::Direction;
 
 pub(super) type Reader = std::io::PipeReader;

@@ -1848,7 +1848,6 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
 fn every_pipe_a_spawn_makes_is_overlapped_in_the_parent_and_synchronous_in_the_child() {
     use std::os::windows::io::{AsHandle as _, AsRawHandle as _, BorrowedHandle};
 
-    use crate::child::ParentEnd;
     use crate::pipe::windows::is_overlapped;
     use crate::stdio::{Direction, Fd, Stdio};
 
@@ -1860,12 +1859,8 @@ fn every_pipe_a_spawn_makes_is_overlapped_in_the_parent_and_synchronous_in_the_c
             !is_overlapped(theirs).expect("query the child's end"),
             "{dir:?}: the child's end is overlapped"
         );
-        let ours = match &parent_end {
-            ParentEnd::Reader(r) => r.as_handle(),
-            ParentEnd::Writer(w) => w.as_handle(),
-        };
         assert!(
-            is_overlapped(ours).expect("query the parent's end"),
+            is_overlapped(parent_end.as_handle()).expect("query the parent's end"),
             "{dir:?}: the parent's end is synchronous"
         );
     }

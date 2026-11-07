@@ -1,6 +1,6 @@
 //! The owned child handle.
 
-use crate::pipe::{PipeReader, PipeWriter};
+use crate::pipe::{ParentEnd, PipeReader, PipeWriter};
 use std::collections::BTreeMap;
 
 use crate::child::owned::teardown::{Disposition, Kill, Remains};
@@ -117,13 +117,6 @@ pub(crate) mod front_kill_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/front_cgroup_tests.rs"]
 pub(crate) mod front_cgroup_tests;
-
-/// A parent-side pipe end retained for a configured descriptor.
-#[derive(Debug)]
-pub(crate) enum ParentEnd {
-    Reader(PipeReader),
-    Writer(PipeWriter),
-}
 
 /// A spawned child process the crate owns.
 #[derive(Debug)]

@@ -3,14 +3,15 @@
 //! overlapped end that a completion port already holds (the registration fails with os error 87),
 //! which fails in debug and release alike; a synchronous end, which `adopt` forbids, would trip its
 //! debug assertion instead. Each test keys its log assertion on an fd number no other test uses,
-//! so a concurrent test's warn cannot satisfy it. Each test holds `spawn_lock` for its whole body:
-//! a concurrent fork would otherwise inherit the pipe ends and keep them open past the drop.
+//! so a concurrent test's warn cannot satisfy it. Each test holds `spawn_lock` for its whole body
+//! for Unix's sake: a concurrent fork would otherwise inherit the pipe ends and keep them open
+//! past the drop. Windows ends are created non-inheritable, so the lock is unneeded there.
 
 use std::io::{ErrorKind, Read, Write};
 
-use crate::child::ParentEnd;
 use crate::containment::Containment;
 use crate::identity::ProcessId;
+use crate::pipe::ParentEnd;
 use crate::stdio::Fd;
 
 use super::{Child, OsResources};
@@ -84,10 +85,7 @@ fn associated_pipe(dir: crate::stdio::Direction) -> (ParentEnd, std::fs::File, s
     use windows::Win32::System::IO::CreateIoCompletionPort;
 
     let (theirs, ours) = crate::pipe::child_pipe(dir).expect("make the pipe");
-    let handle = match &ours {
-        ParentEnd::Reader(r) => r.as_raw_handle(),
-        ParentEnd::Writer(w) => w.as_raw_handle(),
-    };
+    let handle = ours.as_raw_handle();
     // SAFETY: no file handle and no existing port: makes a new port, which the guard closes.
     let port = unsafe { CreateIoCompletionPort(HANDLE(-1isize as *mut _), None, 0, 0) }.expect("make the port");
     // SAFETY: `port` is new and ours alone.

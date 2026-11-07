@@ -25,8 +25,7 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows::Win32::System::IO::{GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED};
 
-use super::{PipeReader, PipeWriter};
-use crate::child::ParentEnd;
+use super::{ParentEnd, PipeReader, PipeWriter};
 use crate::error::win32_io_error;
 use crate::stdio::Direction;
 
@@ -313,8 +312,8 @@ fn overlapped_io(
         Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) => {
             // SAFETY: a wait on an event this call owns.
             if unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), INFINITE) } != WAIT_OBJECT_0 {
-                // `eprintln!` panics when stderr is closed, which would unwind with the buffer
-                // still in the kernel's hands.
+                // `eprintln!` panics when writing to stderr fails (e.g. a pipe whose reader has
+                // gone), which would unwind with the buffer still in the kernel's hands.
                 Write::write_all(
                     &mut io::stderr(),
                     b"cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands\n",

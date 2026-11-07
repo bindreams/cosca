@@ -5,17 +5,13 @@
 
 use std::os::windows::io::AsHandle as _;
 
-use crate::child::ParentEnd;
 use crate::pipe::windows::is_overlapped;
+use crate::pipe::ParentEnd;
 use crate::stdio::{Direction, Fd, Stdio};
 use crate::test_child::Console;
 
 fn overlapped(end: &ParentEnd) -> bool {
-    let handle = match end {
-        ParentEnd::Reader(r) => r.as_handle(),
-        ParentEnd::Writer(w) => w.as_handle(),
-    };
-    is_overlapped(handle).expect("query the mode")
+    is_overlapped(end.as_handle()).expect("query the mode")
 }
 
 /// Mutant: the raw backend or the merge pre-pass makes its pipe with `std::io::pipe`.

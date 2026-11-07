@@ -3,7 +3,7 @@
 
 use tokio::io::AsyncReadExt;
 
-use crate::child::ParentEnd;
+use crate::pipe::ParentEnd;
 use crate::stdio::Direction;
 
 // A child writes on its end; the parent's end, registered with the reactor, reads to EOF.

@@ -50,7 +50,7 @@ pub(super) enum OutInner {
 
 /// A parent end of an our-owned merge-target pipe, stashed at spawn (keyed by the target
 /// slot) until its accessor takes it.
-pub(super) type OwnedStd = crate::child::ParentEnd;
+pub(super) type OwnedStd = crate::pipe::ParentEnd;
 
 impl AsyncWrite for ChildStdin {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
@@ -151,8 +151,9 @@ fn adopt(
         "a pipe end registered with the reactor is overlapped"
     );
     let handle = end.into_raw_handle();
-    // SAFETY: `handle` is an open overlapped pipe handle that nothing else owns or has associated
-    // with a completion port; tokio takes it, and closes it if the registration fails.
+    // SAFETY: `from_raw_handle` requires a valid handle the caller owns and passes on to the
+    // server: `handle` is, from `end`'s `into_raw_handle`. An end that another completion port
+    // already holds is refused by tokio with an error (os error 87), which the caller handles.
     unsafe { ::tokio::net::windows::named_pipe::NamedPipeServer::from_raw_handle(handle) }
 }
 

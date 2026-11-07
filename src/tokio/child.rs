@@ -21,11 +21,11 @@ pub(crate) use proc_source::HANDED_TO_ORPHAN_REAPER;
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
-use crate::child::ParentEnd;
 use crate::containment::dispatch::{SweepFailure, TeardownCaller, TreeKillOutcome};
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::pipe::ParentEnd;
 use crate::signal::{Sent, Sig};
 use crate::stdio::Fd;
 #[cfg(unix)]
@@ -539,7 +539,8 @@ impl Child {
         self.graceful
     }
 
-    /// Take the child's stdin, once; `None` if it is not piped or already taken.
+    /// Take the child's stdin, once; `None` if it is not piped, already taken, or registering the
+    /// end with the reactor failed (logged at warn).
     ///
     /// # Panics
     ///
@@ -553,7 +554,8 @@ impl Child {
             inner: super::stdio::InInner::Tokio(s),
         })
     }
-    /// Take the child's stdout, once; `None` if it is not piped or already taken.
+    /// Take the child's stdout, once; `None` if it is not piped, already taken, or registering the
+    /// end with the reactor failed (logged at warn).
     ///
     /// # Panics
     ///
@@ -567,7 +569,8 @@ impl Child {
             inner: super::stdio::OutInner::Stdout(s),
         })
     }
-    /// Take the child's stderr, once; `None` if it is not piped or already taken.
+    /// Take the child's stderr, once; `None` if it is not piped, already taken, or registering the
+    /// end with the reactor failed (logged at warn).
     ///
     /// # Panics
     ///

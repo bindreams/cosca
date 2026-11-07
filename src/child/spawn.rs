@@ -12,12 +12,13 @@ use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
-use crate::child::{Child, ParentEnd};
+use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp};
 #[cfg(any(unix, feature = "tokio"))]
 use crate::error::ChildFate;
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::pipe::ParentEnd;
 use crate::stdio::{Direction, Fd, ResolvedStdio};
 
 // A child-side descriptor handed to std via `Stdio::from`.
