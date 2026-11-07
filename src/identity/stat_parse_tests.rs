@@ -1,5 +1,5 @@
 use super::super::StartToken;
-use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat};
+use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture};
 use crate::identity::Liveness;
 
 fn tok(v: u64) -> StartToken {
@@ -85,12 +85,6 @@ fn rejects_missing_close_paren() {
 }
 
 // running_from_stat =====
-
-// Fixture: state at index 0 after last ')', starttime (field 22, index 19) = 8675309.
-// "pid (comm) STATE ppid pgroup session tty tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice numthreads itrealvalue starttime ..."
-fn stat_fixture(state: &str, starttime: u64) -> Vec<u8> {
-    format!("1234 (myproc) {state} 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {starttime} 0 0").into_bytes()
-}
 
 #[skuld::test]
 fn running_from_stat_running_state_matching_token() {
