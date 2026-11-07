@@ -523,12 +523,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut std_cmd = build_std_command(cmd).not_started()?;
 
-    // Stdio is resolved (`resolve_into_std`) before `prepare` on Linux and Windows: `prepare` opens
-    // descriptors on Linux (a cgroup leaf's), which would land on a closed fd 0/1/2 of the parent and
-    // be inherited from it as stdio; on Windows it mutates this process, which a refused stdio must
-    // not leave behind. Their pipes need no lock to be made: `pipe2(O_CLOEXEC)`, and non-inheritable
-    // handles. macOS makes them under the lock (`std::io::pipe` is `pipe()` then `FD_CLOEXEC`), so
-    // it takes the lock first.
+    // Stdio is resolved (`resolve_into_std`) before `prepare` on Linux and Windows, so a refused
+    // stdio fails before containment makes anything (a cgroup leaf on Linux; on Windows `prepare`
+    // mutates this process). Their pipes need no lock to be made: `pipe2(O_CLOEXEC)`, and
+    // non-inheritable handles. macOS makes them under the lock (`std::io::pipe` is `pipe()` then
+    // `FD_CLOEXEC`), so it takes the lock first.
     let reserved = reserved_fds(&fds);
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps go
