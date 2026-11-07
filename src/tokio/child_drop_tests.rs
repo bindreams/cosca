@@ -274,10 +274,10 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
     let teardown = release_between_kill_and_wait(child.stdin().expect("piped stdin"));
-    let Some(crate::tokio::child::ProcSource::Tokio { stdout, .. }) = child.os.proc.as_ref() else {
-        panic!("a fresh child is a tokio backend");
+    let Some(crate::pipe::ParentEnd::Reader(stdout)) = child.os.pipes.get(&crate::stdio::Fd::STDOUT) else {
+        panic!("piped stdout");
     };
-    let stdout = stdout.as_ref().expect("piped stdout").as_raw_fd();
+    let stdout = stdout.as_raw_fd();
     // SAFETY: `fcntl(F_GETFD)` reads a flag and changes nothing.
     assert_ne!(
         unsafe { libc::fcntl(stdout, libc::F_GETFD) },

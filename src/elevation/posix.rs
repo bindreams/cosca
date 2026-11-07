@@ -820,7 +820,12 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             // written after spawn (the fd0 conflict was rejected in the structural gate).
             let mut password_write = None;
             if let Auth::Stdin(secret) = &auth {
-                let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
+                let (reader, writer) = {
+                    // macOS: `pipe()` then `FD_CLOEXEC`; a cosca fork between the two would inherit an end.
+                    #[cfg(target_os = "macos")]
+                    let _guard = crate::child::spawn::spawn_lock();
+                    crate::pipe::pair().map_err(Error::Io)?
+                };
                 let reader_file = File::from(OwnedFd::from(reader));
                 derived.stdin(Stdio::from_file(reader_file))?;
                 password_write = Some(PendingPassword {

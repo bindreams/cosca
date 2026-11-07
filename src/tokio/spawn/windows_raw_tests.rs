@@ -36,6 +36,8 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
         .unwrap();
     // The test-only variant injects the observer into THIS child only (no process-global seam).
     let mut child = c.spawn_with_wait_observer(started_tx, outcome_tx).unwrap();
+    // Taken before the wait, which closes an untaken stdin, so findstr stays wedged.
+    let stdin = child.stdin().expect("owned stdin writer");
 
     // Poll the wait future to parking (an unpolled `async fn` runs no code, so this is what brings
     // `spawn_blocking` + `CancelGuard` into existence), await the "parked" signal, then drop the
@@ -54,7 +56,7 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
     assert_eq!(outcome_rx.await.unwrap(), WaitOutcome::Cancelled);
 
     // Child stays waitable: closing its stdin (EOF) lets findstr exit, and a FRESH wait resolves.
-    drop(child.stdin().expect("owned stdin writer"));
+    drop(stdin);
     child
         .wait()
         .await
@@ -87,6 +89,22 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         !observe::take_inheritance_cleared(),
         "the refusal ran after the mutation it was supposed to precede"
     );
+
+    // A refused stdio and a refused descriptor table: both are checked before the mutation too.
+    for (slot, target, what) in [
+        (3, crate::Stdio::inherit(), "inherit on fd 3 has no parent stream"),
+        (100_000, crate::Stdio::null(), "the descriptor table is too large"),
+    ] {
+        let mut refused = crate::test_child::tokio_command(Console::Hidden);
+        refused.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();
+        refused.fd(slot, target).expect("configure the slot");
+        let err = crate::child::spawn::failure::expect_not_started(refused.spawn().expect_err(what));
+        assert!(matches!(err, Error::Unsupported { .. }), "{what}: got {err:?}");
+        assert!(
+            !observe::take_inheritance_cleared(),
+            "{what}: the refusal ran after the mutation it was supposed to precede"
+        );
+    }
 
     let mut allowed = crate::test_child::tokio_command(Console::Hidden);
     allowed.executable("cmd").args(["cmd", "/C", "exit 0"]).contain();

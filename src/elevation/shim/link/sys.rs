@@ -200,7 +200,7 @@ pub(super) fn prepare_conn(conn: &UnixStream) -> io::Result<()> {
 /// byte is for.
 pub(super) fn pipe(probe: &Probe) -> io::Result<(PipeReader, PipeWriter)> {
     create_fds(probe, || {
-        let (reader, writer) = std::io::pipe()?;
+        let (reader, writer) = crate::pipe::pair()?;
         let flags = rustix::fs::fcntl_getfl(&writer)?;
         rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK)?;
         Ok((reader, writer))

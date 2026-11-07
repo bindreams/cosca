@@ -523,46 +523,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut std_cmd = build_std_command(cmd).not_started()?;
 
-    // Resolve every configured slot to a child end via the shared core. Slots: 0/1/2
-    // (defaulting to inherit) plus, on Unix, any configured n>=3. We own our pipes
-    // (`std::io::pipe`) and keep the parent ends.
-    let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
-    let all_slots: Vec<Fd> = {
-        // Yield 0/1/2 first (even unconfigured, for inherit defaulting), then any
-        // configured n>=3. The n>=3 collection is Unix-only: on Windows the routing
-        // above (any fd>=3 goes to the raw backend) guarantees `fds` holds no fd>=3,
-        // so the push is dead code there — cfg-gate it to make that explicit.
-        #[cfg_attr(not(unix), allow(unused_mut, reason = "the n>=3 push below is unix-only"))]
-        let mut v: Vec<Fd> = std_slots.to_vec();
-        #[cfg(unix)]
-        for &fd in fds.keys() {
-            if fd.raw() >= 3 {
-                v.push(fd);
-            }
-        }
-        v
-    };
-    let (mut child_ends, parent_ends) =
-        resolve_stdio(&fds, &all_slots, PipeOwnership::Owned, ParentStd::read()).not_started()?;
-
-    // Hand 0/1/2 child ends to std (consumes them; std closes its copies on spawn).
-    for slot in std_slots {
-        if let Some(end) = child_ends.remove(&slot) {
-            let stdio = StdStdio::from(end);
-            match slot {
-                Fd::STDIN => std_cmd.stdin(stdio),
-                Fd::STDOUT => std_cmd.stdout(stdio),
-                _ => std_cmd.stderr(stdio),
-            };
-        }
-    }
-
-    // Every child fd number this spawn will occupy, so the macOS fd-marker install (below)
-    // places its own descriptor above all of them rather than colliding with a user mapping.
-    #[cfg(unix)]
-    let reserved: Vec<i32> = child_ends.keys().map(|fd| fd.raw()).collect();
-    #[cfg(not(unix))]
-    let reserved: Vec<i32> = Vec::new();
+    let reserved = reserved_fds(&fds);
 
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, whose in-child steps go
     // into `steps` (order and why: see `in_child`). The hook is registered right before the spawn,
@@ -579,9 +540,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
     // code can close.
     #[cfg(target_os = "macos")]
-    let (mut prepared, child, unique) = {
-        let (prepared, spawned, first) = {
+    let (mut prepared, child, unique, parent_ends) = {
+        let (prepared, spawned, first, parent_ends) = {
             let _guard = spawn_lock();
+            // Under the lock, which macOS needs to make a pipe (see `pipe::unix::child_pipe`).
+            let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
             let prepared = crate::containment::prepare(
                 &mut std_cmd,
                 &mut steps,
@@ -593,21 +556,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             )
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
-
-            // On Unix, hand n>=3 child ends to fd_map, whose step dup2's each OwnedFd to its target
-            // number post-fork. The hook runs it last, after every step that may still need a
-            // descriptor it could replace; std also dup2's 0/1/2 before any pre_exec runs (std
-            // disables posix_spawn when hooks are registered), so our n>=3 mappings never clobber the
-            // std stdio fds either. A duplicate child fd number is unreachable: child_ends keys come
-            // from a BTreeMap, so each child fd number is unique.
-            let mappings: Vec<fd_map::FdMapping> = child_ends
-                .into_iter()
-                .map(|(fd, owned)| fd_map::FdMapping {
-                    parent_fd: owned,
-                    child_fd: fd.raw(),
-                })
-                .collect();
-            fd_map::install(&mut steps, mappings).not_started()?;
             steps.register(&mut std_cmd);
 
             #[allow(
@@ -616,7 +564,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             )]
             let (spawned, first) = report.run(|| std_cmd.spawn().map_err(Error::Io), |c| Some(c.id()));
             drop(std_cmd);
-            (prepared, spawned, first)
+            (prepared, spawned, first, parent_ends)
         };
         // Outside the lock, which covers only the window before the ends are close-on-exec: the wait
         // for a report the first read missed has no bound.
@@ -625,12 +573,14 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         let c = spawned
             .map_err(|e| unique_report::failed_spawn_error(e, &unique))
             .not_started()?;
-        (prepared, c, unique)
+        (prepared, c, unique, parent_ends)
     };
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
     // Everything from the channel's creation to the helper's join is under `spawn_lock`.
     #[cfg(target_os = "linux")]
-    let (mut prepared, child, pidfd) = {
+    let (mut prepared, child, pidfd, parent_ends) = {
+        // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
+        let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &mut steps,
@@ -655,24 +605,18 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // map, which may `dup2` a mapping onto any number including the channel's, runs after the
         // handshake is done.
         let handshake = handshake.open(&_guard).not_started()?;
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(&mut steps, mappings).not_started()?;
         steps.register(&mut std_cmd);
 
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
         #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
         let held = handshake.run(|| std_cmd.spawn())?;
-        (prepared, held.child, held.pidfd)
+        (prepared, held.child, held.pidfd, parent_ends)
     };
     #[cfg(windows)]
-    let (mut prepared, child) = {
+    let (mut prepared, child, parent_ends) = {
+        // Before `prepare`, which mutates this process.
+        let parent_ends = resolve_into_std(&mut std_cmd, &fds).not_started()?;
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
@@ -696,7 +640,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
             spawned.not_started()?
         };
-        (prepared, c)
+        (prepared, c, parent_ends)
     };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.
@@ -1892,41 +1836,27 @@ pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
     }
 }
 
-/// The child-side ends (keyed by slot) plus, for `Owned` pipes, the parent ends — the
-/// result of [`resolve_stdio`].
+/// The child-side ends (keyed by slot) and the parent ends of the piped slots — the result of
+/// [`resolve_stdio`].
 pub(crate) type ResolvedStdioEnds = (BTreeMap<Fd, ChildEnd>, BTreeMap<Fd, ParentEnd>);
 
-/// How pipe slots are handled during stdio resolution — the sole axis on which the
-/// sync and async spawn paths diverge.
-#[derive(Clone, Copy)]
-pub(crate) enum PipeOwnership {
-    /// Sync: create the OS pipe now (`std::io::pipe`), keep the child end for the
-    /// child, and return the parent end to the caller.
-    Owned,
-    /// Async: tokio owns the piped STD ends (0/1/2) — those slots are left out of the
-    /// resolved child ends (the caller assigns `Stdio::piped()`), and a merge into a piped
-    /// STD target is rejected (its end is tokio's, not ours to dup). fd >= 3 pipes are OURS
-    /// on every path: they resolve like `Owned` and produce parent ends.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only the async spawn path constructs Deferred")
-    )]
-    Deferred,
-}
-
-/// Shared stdio-resolution core for both spawn paths. `slots` is the resolution order (0/1/2
-/// always; the sync path adds Unix n>=3); the per-caller tails (fd>=3 policy, fd_map wiring,
-/// final `Stdio` assignment) stay with each spawn.
+/// Resolves every slot of a spawn to its child end, and every piped slot to its parent end: 0/1/2
+/// (inheriting when unconfigured) and every configured fd >= 3. The per-caller tails (the final
+/// `Stdio` assignment, the Windows raw backend's handle table) stay with each spawn.
+///
+/// On macOS the caller holds `spawn_lock` (see `pipe::unix::child_pipe`).
 pub(crate) fn resolve_stdio(
     fds: &BTreeMap<Fd, ResolvedStdio>,
-    slots: &[Fd],
-    pipe: PipeOwnership,
     parent_std: ParentStd,
 ) -> Result<ResolvedStdioEnds, Error> {
+    let slots: Vec<Fd> = [Fd::STDIN, Fd::STDOUT, Fd::STDERR]
+        .into_iter()
+        .chain(fds.keys().copied().filter(|f| f.raw() >= 3))
+        .collect();
     // Reject merge-targeting-a-merge: the two-pass algorithm resolves only one level of
     // indirection. Transitive chaining (a fixpoint loop) is an unsupported design limit — redirect
     // to a concrete slot (pipe/file/null/inherit) instead.
-    for &slot in slots {
+    for &slot in &slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
             if matches!(fds.get(target), Some(ResolvedStdio::Merge(_))) {
                 return Err(Error::Unsupported {
@@ -1943,14 +1873,12 @@ pub(crate) fn resolve_stdio(
     let mut child_ends: BTreeMap<Fd, ChildEnd> = BTreeMap::new();
     let mut parent_ends: BTreeMap<Fd, ParentEnd> = BTreeMap::new();
 
-    // First pass: resolve non-merge slots. `Deferred` pipe slots are tokio-owned — skip
-    // them. Std slots 0/1/2 default to inherit when unconfigured; an n>=3 slot has no
-    // default, so skip an unconfigured one.
-    for &slot in slots {
+    // First pass: resolve non-merge slots. Std slots 0/1/2 default to inherit when unconfigured;
+    // an n>=3 slot has no default, so skip an unconfigured one.
+    for &slot in &slots {
         let resolved = fds.get(&slot);
         match resolved {
             Some(ResolvedStdio::Merge(_)) => continue, // second pass
-            Some(ResolvedStdio::Pipe(_)) if matches!(pipe, PipeOwnership::Deferred) && slot.raw() < 3 => continue,
             None if slot.raw() >= 3 => continue,
             _ => {
                 let (child_end, parent) = resolve_non_merge(slot, resolved, parent_std)?;
@@ -1962,23 +1890,9 @@ pub(crate) fn resolve_stdio(
         }
     }
 
-    // Second pass: dup each merge from its already-resolved target. With `Deferred` pipes
-    // a merge into a pipe target has no child end of ours to dup — reject it.
-    for &slot in slots {
+    // Second pass: dup each merge from its already-resolved target.
+    for &slot in &slots {
         if let Some(ResolvedStdio::Merge(target)) = fds.get(&slot) {
-            if matches!(pipe, PipeOwnership::Deferred)
-                && target.raw() < 3
-                && matches!(fds.get(target), Some(ResolvedStdio::Pipe(_)))
-            {
-                return Err(Error::Unsupported {
-                    op: format!("async merge {slot} -> {target} (piped)"),
-                    platform: std::env::consts::OS,
-                    detail: "merging into a piped target with a deferred (tokio-owned) pipe end needs \
-                             the merge target resolved first; merge into file/null/inherit, or capture \
-                             separately"
-                        .into(),
-                });
-            }
             let src = child_ends.get(target).ok_or_else(|| Error::Unsupported {
                 op: format!("merge {slot} -> {target}"),
                 platform: std::env::consts::OS,
@@ -1989,6 +1903,57 @@ pub(crate) fn resolve_stdio(
     }
 
     Ok((child_ends, parent_ends))
+}
+
+/// [`resolve_stdio`] for a spawn through `std::process::Command`: 0/1/2 go to `cmd` (std closes its
+/// copies at spawn), and on Unix each fd >= 3 child end goes to the fd map in `steps`, whose step
+/// `dup2`s it to its number after the fork. Returns every parent end. The caller registers the hook
+/// after `prepare` has added its steps.
+pub(crate) fn resolve_into_std(
+    cmd: &mut std::process::Command,
+    #[cfg(unix)] steps: &mut in_child::InChild,
+    fds: &BTreeMap<Fd, ResolvedStdio>,
+) -> Result<BTreeMap<Fd, ParentEnd>, Error> {
+    #[cfg(windows)]
+    debug_assert!(
+        fds.keys().all(|f| f.raw() < 3),
+        "an fd >= 3 routes to the raw backend, never the std path"
+    );
+    let (mut child_ends, parent_ends) = resolve_stdio(fds, ParentStd::read())?;
+    for slot in [Fd::STDIN, Fd::STDOUT, Fd::STDERR] {
+        let end = child_ends
+            .remove(&slot)
+            .unwrap_or_else(|| unreachable!("resolve_stdio resolves 0/1/2 always"));
+        let stdio = StdStdio::from(end);
+        match slot {
+            Fd::STDIN => cmd.stdin(stdio),
+            Fd::STDOUT => cmd.stdout(stdio),
+            _ => cmd.stderr(stdio),
+        };
+    }
+    // The step runs after every other, so it cannot replace a descriptor one still needs, and std
+    // `dup2`s 0/1/2 before any `pre_exec` hook runs, so a mapping never clobbers stdio.
+    #[cfg(unix)]
+    {
+        let mappings: Vec<fd_map::FdMapping> = child_ends
+            .into_iter()
+            .map(|(fd, owned)| fd_map::FdMapping {
+                parent_fd: owned,
+                child_fd: fd.raw(),
+            })
+            .collect();
+        fd_map::install(steps, mappings).map_err(Error::Io)?;
+    }
+    #[cfg(not(unix))]
+    debug_assert!(child_ends.is_empty(), "the std path on Windows has no fd >= 3 end");
+    Ok(parent_ends)
+}
+
+/// Every child fd number above stdio that a spawn occupies, so the macOS fd-marker install places
+/// its own descriptor above all of them rather than colliding with a user mapping. `prepare` ignores
+/// it elsewhere; the std path on Windows has none.
+pub(crate) fn reserved_fds(fds: &BTreeMap<Fd, ResolvedStdio>) -> Vec<i32> {
+    fds.keys().map(|fd| fd.raw()).filter(|&n| n >= 3).collect()
 }
 
 // Resolve a non-merge slot to its child-side end + the parent's pipe end (if any).

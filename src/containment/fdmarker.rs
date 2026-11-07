@@ -648,12 +648,13 @@ pub(crate) fn install(
 // own `#[cfg(test)]` check) — see the `fault` module doc for why exactly one of the three fires
 // per test, never more.
 
+/// The caller holds `spawn_lock` on macOS: `containment::prepare` runs inside a spawn's lock.
 fn create_pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
     #[cfg(test)]
     if fault::take_if(fault::Fault::Pipe) {
         return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
     }
-    std::io::pipe()
+    crate::pipe::pair()
 }
 
 fn place_write_end(write: std::io::PipeWriter, want: RawFd) -> Result<OwnedFd, nix::errno::Errno> {

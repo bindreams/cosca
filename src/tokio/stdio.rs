@@ -1,7 +1,5 @@
-//! Opaque async child-stream types. Each wraps EITHER tokio's own child stream (tokio-owned
-//! std pipes — the default) OR an our-owned reactor-registered pipe end (merge-into-piped
-//! targets, where tokio's internal pipe cannot be shared) — std's `ChildStdout` opacity
-//! pattern. Public API: `AsyncRead`/`AsyncWrite` only.
+//! Opaque async child-stream types. Each wraps one of our pipe ends, registered with the reactor
+//! when taken — std's `ChildStdout` opacity pattern. Public API: `AsyncRead`/`AsyncWrite` only.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -17,13 +15,7 @@ pub(super) type OwnedRead = ::tokio::net::windows::named_pipe::NamedPipeServer;
 
 /// The child's stdin (write end). Dropping it closes the pipe (EOF to the child).
 pub struct ChildStdin {
-    pub(super) inner: InInner,
-}
-
-pub(super) enum InInner {
-    Tokio(::tokio::process::ChildStdin),
-    /// An our-owned merge-target write end (a piped In target with mergers), reactor-registered.
-    Owned(OwnedWrite),
+    pub(super) inner: OwnedWrite,
 }
 
 #[cfg(unix)]
@@ -33,64 +25,34 @@ pub(super) type OwnedWrite = ::tokio::net::windows::named_pipe::NamedPipeServer;
 
 /// The child's stdout (read end).
 pub struct ChildStdout {
-    pub(super) inner: OutInner,
+    pub(super) inner: OwnedRead,
 }
 
 /// The child's stderr (read end).
 pub struct ChildStderr {
-    pub(super) inner: OutInner,
+    pub(super) inner: OwnedRead,
 }
-
-pub(super) enum OutInner {
-    Stdout(::tokio::process::ChildStdout),
-    Stderr(::tokio::process::ChildStderr),
-    /// An our-owned merge-target pipe end, reactor-registered.
-    Owned(OwnedRead),
-}
-
-/// A parent end of an our-owned merge-target pipe, stashed at spawn (keyed by the target
-/// slot) until its accessor takes it.
-pub(super) type OwnedStd = crate::pipe::ParentEnd;
 
 impl AsyncWrite for ChildStdin {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        match &mut self.inner {
-            InInner::Tokio(s) => Pin::new(s).poll_write(cx, buf),
-            InInner::Owned(s) => Pin::new(s).poll_write(cx, buf),
-        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut self.inner {
-            InInner::Tokio(s) => Pin::new(s).poll_flush(cx),
-            InInner::Owned(s) => Pin::new(s).poll_flush(cx),
-        }
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut self.inner {
-            InInner::Tokio(s) => Pin::new(s).poll_shutdown(cx),
-            InInner::Owned(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
-
-impl OutInner {
-    fn poll_read_inner(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        match self {
-            OutInner::Stdout(s) => Pin::new(s).poll_read(cx, buf),
-            OutInner::Stderr(s) => Pin::new(s).poll_read(cx, buf),
-            OutInner::Owned(s) => Pin::new(s).poll_read(cx, buf),
-        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
 impl AsyncRead for ChildStdout {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_read_inner(cx, buf)
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 impl AsyncRead for ChildStderr {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_read_inner(cx, buf)
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 

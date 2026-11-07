@@ -91,7 +91,7 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    Diagnosis, ParentStd, PipeOwnership, SpawnFailure,
+    Diagnosis, ParentStd, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
@@ -136,9 +136,9 @@ pub(crate) fn spawn_raw(
     // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
     // spawns CREATE_SUSPENDED and is job-assigned + resumed in `attach_or_fault`.
     let req = cmd.contain_request();
-    // Composed and validated BEFORE `clear_std_handle_inheritance`, which is a process-global
-    // `SetHandleInformation` on THIS process's std handles that nothing undoes: a refused spawn
-    // must not have mutated the parent.
+    // Composed and validated, like the stdio below, BEFORE `clear_std_handle_inheritance`, which is
+    // a process-global `SetHandleInformation` on THIS process's std handles that nothing undoes: a
+    // refused spawn must not have mutated the parent.
     let plan = crate::command::flags::windows_spawn(
         &req,
         *cmd.flags_request(),
@@ -147,9 +147,6 @@ pub(crate) fn spawn_raw(
     )
     .not_started()?;
     debug_assert_eq!(plan.marker_env, spawn_env.marker_env, "the marker decision drifted");
-    if req.mode.is_some() {
-        crate::containment::windows::clear_std_handle_inheritance();
-    }
 
     let cwd_w = Some(to_wide_nul(cwd.as_os_str()));
 
@@ -157,20 +154,15 @@ pub(crate) fn spawn_raw(
     ensure_fd_table_fits(&fds).not_started()?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3. `resolve_stdio` rejects inherit on fd >= 3.
-    let slots: Vec<Fd> = {
-        let mut v = vec![Fd::STDIN, Fd::STDOUT, Fd::STDERR];
-        v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
-        v
-    };
     let parent_std = ParentStd::read();
-    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned, parent_std).not_started()?;
+    let (child_ends, parent_ends) = resolve_stdio(&fds, parent_std).not_started()?;
 
     // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
     // fd-table the child CRT reads back from `lpReserved2`.
     let table = build_fd_table(&child_ends).not_started()?;
 
     // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let mut startup = startup_info(&child_ends, &table, parent_std).not_started()?;
+    let startup = startup_info(&child_ends, &table, parent_std).not_started()?;
     // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
     // fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or, when that is
     // empty, the filler. No duplicate reaches the list.
@@ -179,13 +171,19 @@ pub(crate) fn spawn_raw(
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
 
+    // Nothing above is refused after this point.
+    if req.mode.is_some() {
+        crate::containment::windows::clear_std_handle_inheritance();
+    }
+
     // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
-    // the attribute list BEFORE the guard releases on EVERY path. An early `?` here would drop the
-    // inner-scope guard before `child_ends`/`startup` (Rust drops inner locals first), leaving
-    // inheritable handles exposed to a concurrent spawn — so compute a Result and drop explicitly.
+    // the attribute list BEFORE the guard releases on EVERY path.
     let spawned = {
         let _guard = spawn_lock();
-        let r = spawn_step(
+        // Rebound after the guard: locals drop in reverse order, so on success, an error or a panic
+        // the inheritable ends close before the lock is released.
+        let (_child_ends, mut startup) = (child_ends, startup);
+        spawn_step(
             &all_handles,
             &app_name,
             &mut cmdline,
@@ -194,10 +192,7 @@ pub(crate) fn spawn_raw(
             &cwd_w,
             flags,
             *cmd.flags_request(),
-        );
-        drop(child_ends); // close the child ends inside the lock, on success AND error
-        drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
-        r
+        )
     };
     let (proc, pid) = spawned.not_started()?;
 

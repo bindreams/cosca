@@ -270,7 +270,7 @@ fn cgroup_a_sweep_leaves_a_busy_cgroup_and_does_not_count_it(#[fixture(cgroup)] 
     let scratch = Scratch::new("sweep-busy");
     let busy = scratch.make("busy");
     scratch.make("idle");
-    let task = crate::containment::cgroup::test_support::fork_running(|| loop {
+    let task = crate::containment::cgroup::test_support::fork_running(&[], || loop {
         // SAFETY: `pause` is async-signal-safe.
         unsafe { libc::pause() };
     });

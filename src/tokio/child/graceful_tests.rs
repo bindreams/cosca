@@ -181,6 +181,56 @@ async fn async_graceful_shutdown_graceful_path() {
     );
 }
 
+/// An untaken piped stdin stays open through the grace, so the signal or the kill, not an EOF on
+/// stdin, ends a child that reads it. The child ends on EOF with status 0 (Unix: it ignores `SIGTERM`
+/// and only the kill ends it), so a grace that closed stdin shows as a clean exit. The reap closes
+/// the stdin.
+///
+/// Mutant: `graceful_shutdown` closes the untaken stdin before or during the grace.
+#[skuld::test]
+async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    #[cfg(unix)]
+    {
+        cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    }
+    #[cfg(windows)]
+    {
+        cmd.executable(crate::test_child::windows_more()).args(["more"]);
+        cmd.stdout(crate::Stdio::null()).expect("null stdout");
+    }
+    cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    {
+        use ::tokio::io::AsyncReadExt as _;
+        let mut ready = [0u8; 1];
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_exact(&mut ready)
+            .await
+            .expect("the readiness byte: the trap is installed");
+    }
+
+    let status = child
+        .graceful_shutdown(Duration::from_secs(1))
+        .await
+        .expect("graceful_shutdown");
+
+    #[cfg(unix)]
+    crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "the child must not end by an EOF on its stdin: {status:?}"
+    );
+    assert!(child.stdin().is_none(), "the reap closed the untaken stdin");
+}
+
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_shutdown_tree_graceful_root_sigterm() {

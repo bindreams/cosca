@@ -1,18 +1,14 @@
-//! Async spawn: a `::tokio::process::Command` over the sync spawn core via `as_std_mut`;
-//! tokio owns piped std fds (except piped MERGE TARGETS — the pre-pass owns those pipes), we
-//! own file/null/inherit/merge ends; identity is read before any await, then attach (with
-//! error-path teardown).
-
-use std::collections::BTreeMap;
-use std::process::Stdio as StdStdio;
+//! Async spawn: a `::tokio::process::Command` over the sync spawn core via `as_std_mut`. Every
+//! stdio end is ours: `resolve_into_std` makes the pipes as the sync spawn does and hands tokio's
+//! `Command` only child ends, and the parent ends wait in the `Child` until an accessor registers
+//! one with the reactor. Identity is read before any await, then attach (with error-path teardown).
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
-use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, ParentStd, PipeOwnership, SpawnFailure};
+use crate::child::spawn::{resolve_identity, Classify, SpawnFailure};
 use crate::command::Command;
 use crate::error::{ChildFate, Error};
 use crate::identity::Resolved;
-use crate::stdio::{Fd, ResolvedStdio};
 
 use super::child::{Child, ProcSource};
 #[cfg(unix)]
@@ -68,7 +64,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                         kill_on_drop,
                         crate::containment::Attachment::uac_elevated(),
                         super::child::FdPipes::new(),
-                        std::collections::BTreeMap::new(),
                     );
                     child.set_elevation(Some(report));
                     return Ok(child);
@@ -111,7 +106,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // would take the std path and lose its descriptors in silence.
     #[cfg(windows)]
     let to_raw_backend = crate::child::spawn::routes_to_raw_backend(cmd);
-    let mut fds = std::mem::take(cmd.fds_mut());
+    let fds = std::mem::take(cmd.fds_mut());
 
     // Route the cases tokio's `Command` cannot express to the raw `CreateProcessW` backend:
     // an `executable()` loaded independently of argv[0], OR arbitrary descriptors
@@ -148,134 +143,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // Forwarding the builder's `kill_on_drop` to `tcmd` would add a second, unsequenced kill
     // inside that release, where nothing orders it against the tree kill.
 
-    // Merge pre-pass: a piped STD slot targeted by a merge cannot stay tokio-owned (tokio's
-    // internal pipe end is not ours to dup into the merging slots), so build OUR pipe for it
-    // — BOTH directions (matches sync; no surprising asymmetry) —
-    // assign every child end here, and stash the parent end for the accessors. Slots this
-    // pass assigns are removed from `fds` (and from the resolution slot list below), so
-    // `resolve_stdio` never sees them; any piped-merge shape NOT handled here still hits
-    // the core's `Deferred` rejection — loud, never a silent fall-through. A chained merge
-    // is left untouched for `resolve_stdio` to reject with the canonical error.
-    let mut preassigned: BTreeMap<Fd, StdStdio> = BTreeMap::new();
-    let mut owned_std: BTreeMap<Fd, super::stdio::OwnedStd> = BTreeMap::new();
-    #[cfg(unix)]
-    let mut merge_fd_ends: Vec<(Fd, crate::child::spawn::ChildEnd)> = Vec::new();
-    let chained = fds
-        .values()
-        .any(|r| matches!(r, ResolvedStdio::Merge(t) if matches!(fds.get(t), Some(ResolvedStdio::Merge(_)))));
-    if !chained {
-        let targets: std::collections::BTreeSet<Fd> = fds
-            .values()
-            .filter_map(|r| match r {
-                ResolvedStdio::Merge(t) if t.raw() < 3 && matches!(fds.get(t), Some(ResolvedStdio::Pipe(_))) => {
-                    Some(*t)
-                }
-                _ => None,
-            })
-            .collect();
-        for target in targets {
-            let Some(ResolvedStdio::Pipe(dir)) = fds.get(&target) else {
-                unreachable!("targets were filtered to piped slots")
-            };
-            let dir = *dir;
-            // Our pipe: the child end goes to the target slot and (dup'd) to each merging
-            // slot; the parent end is stashed for its accessor.
-            let (child_end, parent_end) = crate::child::spawn::make_pipe(dir).not_started()?;
-            // Merging slots: each gets a dup of the child end. A merging slot with
-            // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
-            // assignable as std stdio: it joins the fd >= 3 child-ends collection the fd_map
-            // block consumes, dup2'd into the child like any other fd >= 3 end — sync parity,
-            // never silently dropped.
-            let mergers: Vec<Fd> = fds
-                .iter()
-                .filter_map(|(slot, r)| match r {
-                    ResolvedStdio::Merge(t) if *t == target => Some(*slot),
-                    _ => None,
-                })
-                .collect();
-            for slot in mergers {
-                fds.remove(&slot);
-                if slot.raw() < 3 {
-                    preassigned.insert(slot, StdStdio::from(dup(&child_end).not_started()?));
-                } else {
-                    #[cfg(unix)]
-                    merge_fd_ends.push((slot, dup(&child_end).not_started()?));
-                    #[cfg(windows)]
-                    unreachable!("fd >= 3 routed to the raw backend above");
-                }
-            }
-            fds.remove(&target);
-            preassigned.insert(target, StdStdio::from(child_end));
-            owned_std.insert(target, parent_end);
-        }
-    }
-
-    // Resolve our-owned child ends via the shared core. Piped STD slots are tokio-owned
-    // (`Deferred`): they get no child end here and are assigned `Stdio::piped()` below.
-    // Slots the merge pre-pass assigned are excluded — resolving them would fabricate
-    // inherit ends that could leak into the fd_map mappings.
-    let std_slots = [Fd::STDIN, Fd::STDOUT, Fd::STDERR];
-    let resolve_std_slots = std_slots.iter().copied().filter(|s| !preassigned.contains_key(s));
-    #[cfg(unix)]
-    let all_slots: Vec<Fd> = {
-        let mut v: Vec<Fd> = resolve_std_slots.collect();
-        v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
-        v
-    };
-    // Windows: fd >= 3 was routed to the raw backend above, and the slot list NEVER includes
-    // fd >= 3 — a stray end cannot exist by construction, so no assert/drop pairing to keep in sync.
-    #[cfg(windows)]
-    let all_slots: Vec<Fd> = resolve_std_slots.collect();
-    let (mut child_ends, parent_ends) =
-        resolve_stdio(&fds, &all_slots, PipeOwnership::Deferred, ParentStd::read()).not_started()?;
-    // Deferred skips only the piped STD slots; every parent end here is an fd >= 3 pipe's.
-    debug_assert!(
-        parent_ends.keys().all(|f| f.raw() >= 3),
-        "Deferred pipe ownership must only produce fd >= 3 parent ends"
-    );
-
-    // macOS: std makes these pipes itself, ahead of its error pipe (`unique_report::Channel`).
-    #[cfg(target_os = "macos")]
-    let mut std_pipes = 0;
-    for slot in std_slots {
-        let stdio: StdStdio = match preassigned.remove(&slot) {
-            // The merge pre-pass already assigned this slot (our owned pipe's child end,
-            // or a dup of it for a merging slot).
-            Some(pre) => pre,
-            None => match fds.get(&slot) {
-                Some(ResolvedStdio::Pipe(_)) => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        std_pipes += 1;
-                    }
-                    StdStdio::piped()
-                }
-                _ => StdStdio::from(
-                    child_ends
-                        .remove(&slot)
-                        .unwrap_or_else(|| unreachable!("a configured non-pipe slot must have a resolved child end")),
-                ),
-            },
-        };
-        match slot {
-            Fd::STDIN => tcmd.stdin(stdio),
-            Fd::STDOUT => tcmd.stdout(stdio),
-            _ => tcmd.stderr(stdio),
-        };
-    }
-    debug_assert!(preassigned.is_empty(), "the pre-pass only assigns std slots");
-
-    // Every child fd number this spawn will occupy, including fd >= 3 merge sources (not yet
-    // folded into `child_ends` — see below), so the macOS fd-marker install places its own
-    // descriptor above all of them rather than colliding with a user mapping.
-    #[cfg(unix)]
-    let reserved: Vec<i32> = child_ends
-        .keys()
-        .map(|fd| fd.raw())
-        .chain(merge_fd_ends.iter().map(|(fd, _)| fd.raw()))
-        .collect();
-    #[cfg(not(unix))]
-    let reserved: Vec<i32> = Vec::new();
+    let reserved = crate::child::spawn::reserved_fds(&fds);
 
     // The pidfd the handshake opens; the child keeps it (Linux).
     #[cfg(target_os = "linux")]
@@ -288,9 +156,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, child, unique) = {
-        let (mut prepared, spawned, first) = {
+    let (mut prepared, child, unique, parent_ends) = {
+        let (mut prepared, spawned, first, parent_ends) = {
             let _guard = crate::child::spawn::spawn_lock();
+            let parent_ends =
+                crate::child::spawn::resolve_into_std(tcmd.as_std_mut(), &mut steps, &fds).not_started()?;
             let prepared = crate::containment::prepare(
                 tcmd.as_std_mut(),
                 &mut steps,
@@ -301,24 +171,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 cmd.env_ops(),
             )
             .not_started()?;
-            let report = report.open(&_guard).not_started()?.std_makes_pipes(std_pipes);
-
-            // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
-            // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
-            for (fd, end) in merge_fd_ends {
-                let prev = child_ends.insert(fd, end);
-                debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
-            }
-
-            use crate::child::spawn::fd_map;
-            let mappings: Vec<fd_map::FdMapping> = child_ends
-                .into_iter()
-                .map(|(fd, owned)| fd_map::FdMapping {
-                    parent_fd: owned,
-                    child_fd: fd.raw(),
-                })
-                .collect();
-            fd_map::install(&mut steps, mappings).not_started()?;
+            let report = report.open(&_guard).not_started()?;
             steps.register(tcmd.as_std_mut());
 
             #[allow(
@@ -335,7 +188,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 ::tokio::process::Child::id,
             );
             drop(tcmd);
-            (prepared, spawned, first)
+            (prepared, spawned, first, parent_ends)
         };
         // Outside the lock, as the sync spawn does. It still blocks this thread: principle 2's spawn
         // exception.
@@ -369,10 +222,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 });
             }
         };
-        (prepared, c, unique)
+        (prepared, c, unique, parent_ends)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, child) = {
+    let (mut prepared, child, parent_ends) = {
+        // Before `prepare`: a refused stdio fails before a cgroup leaf exists (Linux) and before
+        // `prepare` mutates this process (Windows).
+        let parent_ends = crate::child::spawn::resolve_into_std(
+            tcmd.as_std_mut(),
+            #[cfg(unix)]
+            &mut steps,
+            &fds,
+        )
+        .not_started()?;
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             #[cfg(unix)]
@@ -398,14 +260,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             .filter(|_| cmd.elevation_front().is_some())
         {
             crate::containment::cgroup::front_placement(&crate::identity::HostKernel, || leaf.id()).not_started()?;
-        }
-
-        // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
-        // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
-        #[cfg(unix)]
-        for (fd, end) in merge_fd_ends {
-            let prev = child_ends.insert(fd, end);
-            debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
         }
 
         // Serialize the spawn against the raw backend's inheritable-handle window via the shared
@@ -435,29 +289,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(target_os = "linux")]
         let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
-        // On Unix, hand n>=3 child ends to fd_map, whose dup2 step `steps` runs LAST in the child
-        // (see the ordering rationale in child/spawn.rs), and register the one hook.
         #[cfg(unix)]
-        {
-            use crate::child::spawn::fd_map;
-
-            let mappings: Vec<fd_map::FdMapping> = child_ends
-                .into_iter()
-                .map(|(fd, owned)| fd_map::FdMapping {
-                    parent_fd: owned,
-                    child_fd: fd.raw(),
-                })
-                .collect();
-            fd_map::install(&mut steps, mappings).not_started()?;
-            steps.register(tcmd.as_std_mut());
-        }
+        steps.register(tcmd.as_std_mut());
 
         let c = {
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
             // the wrong domain for this attribution.
             //
-            // tokio can fail this spawn after its fork succeeded (its `build_child`: stdio
-            // registration, its pidfd reaper, its signal driver), dropping the child neither killed
+            // tokio can fail this spawn after its fork succeeded (its `build_child`: its pidfd
+            // reaper, its signal driver), dropping the child neither killed
             // nor reaped, and it returns no pid. A cgroup leaf is still killed through when
             // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). The
             // handshake's pidfd kills and reaps the child, and, on 6.9+, kills its process group
@@ -519,7 +359,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 }
             }
         };
-        (prepared, c)
+        (prepared, c, parent_ends)
     };
 
     // Identity must be read before any await: spawn + attach are synchronous, so the runtime cannot
@@ -774,22 +614,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         }
     };
 
-    // fd >= 3 parent ends: Unix's `fd_map`-wired reactor pipes; on Windows the std path
-    // resolves none (fd >= 3 routes to the raw backend), so `parent_ends` is provably empty and the
-    // Windows `FdPipes` (overlapped async ends) is empty.
-    #[cfg(unix)]
-    let pipes = parent_ends;
-    #[cfg(windows)]
-    let pipes = {
-        debug_assert!(
-            parent_ends.is_empty(),
-            "the async std path resolves no fd >= 3 ends on Windows"
-        );
-        drop(parent_ends);
-        super::child::FdPipes::new()
-    };
-
-    let mut child = Child::from_parts(proc, id_read, kill_on_drop, attachment, pipes, owned_std);
+    let mut child = Child::from_parts(proc, id_read, kill_on_drop, attachment, parent_ends);
     #[cfg(windows)]
     child.set_elevation(elevation_report);
     child.set_front(cmd.elevation_front());

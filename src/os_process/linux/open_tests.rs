@@ -388,7 +388,7 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
     let forker = std::thread::spawn(move || {
         let _contended = set_fork_running_lock_contended(move || tx_contended.send(Event::Contended).unwrap());
         let _forked = set_after_fork_still_locked(move || tx_forked.send(Event::Forked).unwrap());
-        fork_running(|| {}).defuse()
+        fork_running(&[], || {}).defuse()
     });
 
     assert_eq!(

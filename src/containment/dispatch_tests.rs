@@ -1574,6 +1574,8 @@ fn attached_fd_marker_is_actionable() {
 #[skuld::test]
 fn prepare_places_the_marker_above_the_callers_reserved_fds() {
     use crate::containment::{ContainMode, ContainRequest, Nesting};
+    // `prepare` makes the marker pipe, which a spawn does under `spawn_lock`.
+    let _lock = crate::child::spawn::spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::prepare(
         &mut cmd,

@@ -11,7 +11,7 @@ fn a_panic_after_fork_running_still_reaps_the_child() {
 
     let probe: RefCell<Option<std::os::fd::OwnedFd>> = RefCell::new(None);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let guard = fork_running(|| {
+        let guard = fork_running(&[], || {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -41,7 +41,7 @@ fn a_panic_after_fork_running_still_reaps_the_child() {
 fn drop_without_a_panic_reaps_the_child() {
     use std::os::fd::AsFd;
 
-    let guard = fork_running(|| {
+    let guard = fork_running(&[], || {
         // SAFETY: `pause` is async-signal-safe.
         unsafe { libc::pause() };
     });
@@ -69,7 +69,7 @@ fn drop_without_a_panic_reaps_the_child() {
 fn drop_retries_waitid_on_eintr() {
     use std::os::fd::AsFd;
 
-    let guard = fork_running(|| {
+    let guard = fork_running(&[], || {
         // SAFETY: `pause` is async-signal-safe.
         unsafe { libc::pause() };
     });
@@ -101,7 +101,7 @@ fn drop_retries_waitid_on_eintr() {
 fn drop_reports_a_kill_failure_without_blocking() {
     use std::os::fd::AsFd;
 
-    let guard = fork_running(|| {
+    let guard = fork_running(&[], || {
         // SAFETY: `pause` is async-signal-safe.
         unsafe { libc::pause() };
     });
@@ -150,7 +150,7 @@ fn a_pidfd_open_failure_still_reaps_the_child() {
 
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     let unwound = std::panic::catch_unwind(|| {
-        _ = fork_running(|| {
+        _ = fork_running(&[], || {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -190,7 +190,7 @@ fn a_probe_pidfd_open_failure_does_not_skip_the_cleanup() {
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_fork_running_probe_pidfd_failure(true);
     let unwound = std::panic::catch_unwind(|| {
-        _ = fork_running(|| {
+        _ = fork_running(&[], || {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -239,7 +239,7 @@ fn defuse_disarms_the_guard() {
     let gate = gate_read.as_raw_fd();
     let (ack_read, ack_write) = std::io::pipe().expect("open the ack pipe");
     let ack_write_fd = ack_write.as_raw_fd();
-    let guard = fork_running(move || {
+    let guard = fork_running(&[gate, ack_write_fd], move || {
         super::block_on(gate);
         // SAFETY (in the child): `write`, `_exit` and `pause` are async-signal-safe.
         unsafe {
@@ -365,7 +365,7 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         });
         // The child reports, runs this empty body, and `_exit`s on its own; the test waits for
         // that exit instead of killing it, which could land before the report.
-        fork_running(|| {})
+        fork_running(&[], || {})
     });
 
     let guard = match fork_thread.join() {
@@ -402,7 +402,7 @@ fn fork_running_child_exits_with_a_dedicated_code_when_its_report_write_fails() 
     let _report_guard =
         crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_read.as_raw_fd());
 
-    let guard = fork_running(|| {});
+    let guard = fork_running(&[], || {});
     let status = reap_status(guard.defuse());
 
     assert!(
@@ -464,7 +464,7 @@ fn fork_running_waits_for_a_held_spawn_lock() {
                     holder_released: released.load(Ordering::SeqCst),
                 });
             });
-            fork_running(|| {})
+            fork_running(&[], || {})
         })
     };
 
@@ -504,7 +504,7 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
         let _cleanup_guard = crate::containment::cgroup::fault::set_fork_running_cleanup(move || {
             _ = tx.send(crate::child::spawn::spawn_lock_held_by_this_thread());
         });
-        _ = fork_running(|| {
+        _ = fork_running(&[], || {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -526,7 +526,7 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
 fn fork_running_under_an_outer_spawn_lock_panics_naming_the_reentry() {
     let outer = crate::child::spawn::spawn_lock();
     let unwound = std::panic::catch_unwind(|| {
-        _ = fork_running(|| {});
+        _ = fork_running(&[], || {});
     });
     drop(outer);
     let payload = unwound.expect_err("fork_running must refuse to run under an outer spawn_lock");
@@ -538,5 +538,51 @@ fn fork_running_under_an_outer_spawn_lock_panics_naming_the_reentry() {
     assert!(
         message.contains("spawn_lock re-entered"),
         "the panic must name the re-entry, got: {message}"
+    );
+}
+
+/// The never-exec child holds no descriptor above 2 but the ones it was told to keep, so a pipe end
+/// another test made outside `spawn_lock` cannot stay open in it. Read from the child's own
+/// `/proc/<pid>/fd` once it reports it closed the rest.
+///
+/// Mutant: the child closes nothing, or closes a kept descriptor.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn fork_running_child_keeps_only_the_descriptors_it_was_told_to() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let (mut ready_read, ready_write) = std::io::pipe().expect("open the ready pipe");
+    let ready_fd = ready_write.as_raw_fd();
+    // Stands in for a concurrent test's pipe end, made outside `spawn_lock`.
+    let (_other_read, _other_write) = std::io::pipe().expect("open the other pipe");
+
+    let guard = fork_running(&[ready_fd], move || {
+        // SAFETY (in the child): `write` and `pause` are async-signal-safe.
+        unsafe {
+            if libc::write(ready_fd, b"r".as_ptr().cast(), 1) != 1 {
+                libc::_exit(1);
+            }
+            libc::pause();
+        }
+    });
+    let mut byte = [0u8; 1];
+    ready_read.read_exact(&mut byte).expect("the child reports it is ready");
+
+    let mut held: Vec<i32> = std::fs::read_dir(format!("/proc/{}/fd", guard.pid()))
+        .expect("list the child's descriptors")
+        .map(|entry| {
+            let name = entry.expect("a descriptor entry").file_name();
+            name.to_str()
+                .and_then(|n| n.parse().ok())
+                .expect("a numeric descriptor")
+        })
+        .filter(|&fd| fd > 2)
+        .collect();
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        [ready_fd],
+        "the child holds exactly the descriptor it was told to keep"
     );
 }
