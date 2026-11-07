@@ -163,7 +163,7 @@ pub(crate) fn let_go_line(
         None => {
             let running = match kill {
                 Some(Ok(Sent::Delivered)) => format!("{subject}; it had not exited yet{LEFT}"),
-                Some(Ok(Sent::Gone)) => format!("{subject}; the look saw no exit yet; gave it up"),
+                Some(Ok(Sent::Gone)) => format!("{subject}; the look saw no exit yet{LEFT}"),
                 _ => format!("{subject}{LEAVING_RUNNING}"),
             };
             let said = look.wording(&subject, Some(&running), Some(Disposition::Leave));

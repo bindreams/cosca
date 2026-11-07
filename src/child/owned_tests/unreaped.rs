@@ -423,8 +423,9 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     let status = std::process::ExitStatus::default().to_string();
 
     // Every kill the drop can have, over every look it can see: all 5 x 6 pairs the types allow,
-    // reachable or not on a given platform (on Linux a kill answers `Gone` only after this handle
-    // reaped the child, so a later look never finds it running there). The wording is pinned for each.
+    // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
+    // look right after it may still find the zombie not yet collectable. The wording is pinned for
+    // each.
     let kills: [KillCase; 5] = [
         (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
         (
@@ -438,8 +439,8 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
             || Some(Ok(Sent::Gone)),
             "its kill found nothing to signal",
             &["killed it"],
-            vec!["the look saw no exit yet", "gave it up"],
-            &["killed it", "running", "unreaped", LEFT, LEAVING_RUNNING],
+            vec!["the look saw no exit yet", LEFT],
+            &["killed it", "running", LEAVING_RUNNING],
         ),
         (
             || Some(Ok(Sent::Unverified)),
@@ -488,15 +489,14 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
 
     let mut cases = Vec::new();
     for (kill, said, never, running_says, running_never) in &kills {
+        // A front says no kill: nothing of the kill to find in its line.
+        let said: Vec<&str> = (!said.is_empty()).then_some(*said).into_iter().collect();
         for (look, level, says) in &looks {
             // Principle 7: a refused kill is at least `warn`.
             let level = if matches!(kill(), Some(Err(_))) { Warn } else { *level };
-            // A front says no kill: nothing of the kill to find in its line.
-            let said: Vec<&str> = (!said.is_empty()).then_some(*said).into_iter().collect();
             let says: Vec<&str> = [said.clone(), says.clone()].concat();
             cases.push((kill(), look(), level, says, never.to_vec()));
         }
-        let said: Vec<&str> = (!said.is_empty()).then_some(*said).into_iter().collect();
         let says: Vec<&str> = [said, running_says.clone()].concat();
         cases.push((kill(), running(), Warn, says, running_never.to_vec()));
     }
