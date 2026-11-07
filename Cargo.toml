@@ -140,6 +140,8 @@ libc = "0.2"
 # see the dev-dependencies' feature.
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
+    # `NtOpenFile`, for the child pipe (`src/pipe/windows.rs`).
+    "Wdk_Storage_FileSystem",
     "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Globalization",

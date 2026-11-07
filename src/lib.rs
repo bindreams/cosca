@@ -105,6 +105,9 @@ pub use stdio::{Fd, Stdio};
 mod child;
 pub use child::{Child, SuspendedChild, Unreaped};
 
+mod pipe;
+pub use pipe::{PipeReader, PipeWriter};
+
 // Lets `tests/common/locked.rs`, which names `cosca::test_spawn_lock`, compile into the lib's tests.
 #[cfg(test)]
 extern crate self as cosca;
