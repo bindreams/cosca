@@ -117,6 +117,10 @@ impl Child {
     /// cooperative-signal error propagates immediately: no grace is waited, nothing is killed,
     /// and the child is left running for the caller to `kill`.
     ///
+    /// An untaken stdin pipe stays open through the grace: unlike [`wait`](Child::wait), the grace
+    /// does not close it, so the signal, not an EOF on stdin, is what ends the child. The reap
+    /// after the exit or the kill closes it.
+    ///
     /// **Windows: the two halves have different radii.** The cooperative half reaches the
     /// child's whole console group; the forced half reaches only the child. So a descendant
     /// that stayed in the child's group can be left told-to-exit but not killed: if the child
@@ -287,6 +291,10 @@ impl Child {
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.
+    ///
+    /// An untaken stdin pipe stays open through the grace, as for
+    /// [`graceful_shutdown`](Child::graceful_shutdown): the signal, not an EOF on stdin, is what
+    /// ends the root.
     ///
     /// # Runtime
     ///

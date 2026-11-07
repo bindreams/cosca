@@ -16,22 +16,29 @@ fn pattern(i: usize) -> u8 {
     (i % 251) as u8
 }
 
+/// A pipe as a spawn makes one, which on macOS is under `spawn_lock`.
+fn pipe(dir: Direction) -> (impl Into<File>, ParentEnd) {
+    #[cfg(target_os = "macos")]
+    let _lock = crate::child::spawn::spawn_lock();
+    super::child_pipe(dir).expect("make the pipe")
+}
+
 /// A pipe whose reading end is ours and whose writing end is `File`.
 fn reader_pair() -> (PipeReader, File) {
-    let (theirs, ours) = super::child_pipe(Direction::Out).expect("make the pipe");
+    let (theirs, ours) = pipe(Direction::Out);
     let ParentEnd::Reader(ours) = ours else {
         panic!("an Out pipe keeps the read end")
     };
-    (ours, File::from(theirs))
+    (ours, theirs.into())
 }
 
 /// A pipe whose writing end is ours and whose reading end is `File`.
 fn writer_pair() -> (PipeWriter, File) {
-    let (theirs, ours) = super::child_pipe(Direction::In).expect("make the pipe");
+    let (theirs, ours) = pipe(Direction::In);
     let ParentEnd::Writer(ours) = ours else {
         panic!("an In pipe keeps the write end")
     };
-    (ours, File::from(theirs))
+    (ours, theirs.into())
 }
 
 /// Read `from` to its end, in chunks of at most 4096 bytes. Each chunk must continue the pattern

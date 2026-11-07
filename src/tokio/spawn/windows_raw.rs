@@ -264,29 +264,31 @@ pub(crate) fn spawn_raw(
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
     sync_raw::ensure_fd_table_fits(&fds).not_started()?;
 
+    // Resolve 0/1/2 (always) plus any configured fd >= 3 to child handles, and every piped slot to
+    // its parent end (the shared `resolve_stdio` rejects inherit on fd >= 3).
+    let parent_std = ParentStd::read();
+    let (child_ends, pipes) = resolve_stdio(&fds, parent_std).not_started()?;
+
+    // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
+    // SAME layout + HANDLE_LIST source as the sync backend.
+    let table = sync_raw::build_fd_table(&child_ends).not_started()?;
+
+    // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
+    let mut startup = sync_raw::startup_info(&child_ends, &table, parent_std).not_started()?;
+    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
+    // fresh dup, its 0/1/2 entries being the hStd* handles) or, when that is empty, the filler. No
+    // duplicate reaches the list.
+    let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
 
-    // UNDER THE LOCK, from the pipes on (mirrors the sync raw backend): resolve every slot to a child
-    // handle, mark the listed child ends inheritable, spawn, then CLOSE the child ends and the
-    // attribute list BEFORE the guard releases on EVERY path. The guard is declared first, so an
-    // early `?` drops it last, after `child_ends` and `startup`.
-    let parent_std = ParentStd::read();
-    let (spawned, pipes) = {
-        let guard = spawn_lock();
-        let (child_ends, pipes) = resolve_stdio(&guard, &fds, parent_std).not_started()?;
-
-        // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` —
-        // the SAME layout + HANDLE_LIST source as the sync backend.
-        let table = sync_raw::build_fd_table(&child_ends).not_started()?;
-
-        // `table` (`bytes`) and the attribute list stay alive until after CreateProcessW.
-        let mut startup = sync_raw::startup_info(&child_ends, &table, parent_std).not_started()?;
-        // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a
-        // distinct fresh dup, its 0/1/2 entries being the hStd* handles) or, when that is empty, the
-        // filler. No duplicate reaches the list.
-        let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
+    // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
+    // the attribute list BEFORE the guard releases on EVERY path (mirrors the sync raw backend —
+    // an early `?` would drop the inner guard before `child_ends`/`startup`, exposing inheritable
+    // handles to a concurrent spawn).
+    let spawned = {
+        let _guard = spawn_lock();
         let r = sync_raw::spawn_step(
             &all_handles,
             &app_name,
@@ -299,7 +301,7 @@ pub(crate) fn spawn_raw(
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
         drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
-        (r, pipes)
+        r
     };
     let (proc, pid) = spawned.not_started()?;
 

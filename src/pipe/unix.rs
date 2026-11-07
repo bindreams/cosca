@@ -12,7 +12,15 @@ pub(super) type Writer = std::io::PipeWriter;
 
 /// The pipe for one piped slot: the child's end, and the parent's, as `dir` says (`In`: the child
 /// reads, the parent writes).
+///
+/// On macOS the caller holds `spawn_lock`: `std::io::pipe` is `pipe()` and then `FD_CLOEXEC`, so
+/// another cosca fork between the two would inherit an end. Linux's `pipe2(O_CLOEXEC)` needs none.
 pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedFd, ParentEnd)> {
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    debug_assert!(
+        crate::child::spawn::spawn_lock_held_by_this_thread(),
+        "a pipe is made under spawn_lock on macOS"
+    );
     let (reader, writer) = std::io::pipe()?;
     Ok(match dir {
         Direction::In => (reader.into(), ParentEnd::Writer(writer.into())),

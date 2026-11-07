@@ -143,12 +143,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // Forwarding the builder's `kill_on_drop` to `tcmd` would add a second, unsequenced kill
     // inside that release, where nothing orders it against the tree kill.
 
-    // Every child fd number this spawn will occupy, so the macOS fd-marker install places its own
-    // descriptor above all of them rather than colliding with a user mapping.
-    #[cfg(unix)]
-    let reserved: Vec<i32> = fds.keys().map(|fd| fd.raw()).filter(|&n| n >= 3).collect();
-    #[cfg(not(unix))]
-    let reserved: Vec<i32> = Vec::new();
+    // Stdio is resolved before `prepare` on Linux and Windows, under the lock on macOS; see the sync
+    // spawn for why.
+    let reserved = crate::child::spawn::reserved_fds(&fds);
 
     // The pidfd the handshake opens; the child keeps it (Linux).
     #[cfg(target_os = "linux")]
@@ -164,9 +161,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     let (mut prepared, child, unique, parent_ends) = {
         let (mut prepared, spawned, first, parent_ends) = {
             let _guard = crate::child::spawn::spawn_lock();
-            // Under the lock, with the pipes it makes (see the sync spawn).
-            let (child_ends, parent_ends) =
-                crate::child::spawn::resolve_into_std(&_guard, tcmd.as_std_mut(), &fds).not_started()?;
+            let parent_ends =
+                crate::child::spawn::resolve_into_std(tcmd.as_std_mut(), &mut steps, &fds).not_started()?;
             let prepared = crate::containment::prepare(
                 tcmd.as_std_mut(),
                 &mut steps,
@@ -178,16 +174,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             )
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
-
-            use crate::child::spawn::fd_map;
-            let mappings: Vec<fd_map::FdMapping> = child_ends
-                .into_iter()
-                .map(|(fd, owned)| fd_map::FdMapping {
-                    parent_fd: owned,
-                    child_fd: fd.raw(),
-                })
-                .collect();
-            fd_map::install(&mut steps, mappings).not_started()?;
             steps.register(tcmd.as_std_mut());
 
             #[allow(
@@ -242,11 +228,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     };
     #[cfg(not(target_os = "macos"))]
     let (mut prepared, child, parent_ends) = {
-        // Windows takes the lock before `prepare`, as the sync spawn does (see there).
-        #[cfg(windows)]
-        let _guard = crate::child::spawn::spawn_lock();
-        #[cfg(windows)]
-        let (_, parent_ends) = crate::child::spawn::resolve_into_std(&_guard, tcmd.as_std_mut(), &fds).not_started()?;
+        let parent_ends = crate::child::spawn::resolve_into_std(
+            tcmd.as_std_mut(),
+            #[cfg(unix)]
+            &mut steps,
+            &fds,
+        )
+        .not_started()?;
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             #[cfg(unix)]
@@ -277,13 +265,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         // Serialize the spawn against the raw backend's inheritable-handle window via the shared
         // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
         // `CreateProcessW` spawn on another thread (mirrors the sync std path). On Linux the lock
-        // also spans the pidfd handshake's channel, from its creation to its helper's join, and is
-        // taken here, after `prepare`, with the pipes made under it.
-        #[cfg(unix)]
+        // also spans the pidfd handshake's channel, from its creation to its helper's join.
         let _guard = crate::child::spawn::spawn_lock();
-        #[cfg(unix)]
-        let (child_ends, parent_ends) =
-            crate::child::spawn::resolve_into_std(&_guard, tcmd.as_std_mut(), &fds).not_started()?;
 
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
         // the child then keeps. Its hook was registered first of all, so the fd map, which may
@@ -306,22 +289,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
         #[cfg(target_os = "linux")]
         let handshake = handshake.killing_group(prepared.leafless_group_is_containment());
 
-        // On Unix, hand n>=3 child ends to fd_map, whose dup2 step `steps` runs LAST in the child
-        // (see the ordering rationale in child/spawn.rs), and register the one hook.
+        // Register the one hook, whose steps (the fd map's included) all run in the child in a fixed
+        // order; see child/spawn.rs.
         #[cfg(unix)]
-        {
-            use crate::child::spawn::fd_map;
-
-            let mappings: Vec<fd_map::FdMapping> = child_ends
-                .into_iter()
-                .map(|(fd, owned)| fd_map::FdMapping {
-                    parent_fd: owned,
-                    child_fd: fd.raw(),
-                })
-                .collect();
-            fd_map::install(&mut steps, mappings).not_started()?;
-            steps.register(tcmd.as_std_mut());
-        }
+        steps.register(tcmd.as_std_mut());
 
         let c = {
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
