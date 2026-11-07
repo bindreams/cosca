@@ -95,6 +95,18 @@ pub(crate) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Arm
     crate::wait::block_probe::on_blocking(move || fake.wake())
 }
 
+/// A live blocker as a spawn's teardown holds it: its root, answering as `script` says (see
+/// `script_over`), with the handle inert, as `into_unreaped` leaves it, so the teardown owns the
+/// root. The write end of its stdin comes with it.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn held_owned_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, crate::PipeWriter) {
+    let (mut child, stdin) = crate::test_child::held_uncontained_blocker(true);
+    child.proc.script_over(script);
+    child.kill_on_drop = false;
+    let owned = child.proc.take().expect("the child holds its root");
+    (owned, stdin)
+}
+
 /// A leftover about a child whose reap consumed the zombie but read no exit record: the child is
 /// collected, so a caller that hands children back has none to hand back, and the leftover does not
 /// say it did.

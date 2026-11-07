@@ -3,12 +3,13 @@
 //! read from a cgroup.
 
 use std::io;
-use std::time::Duration;
 
 use super::held_teardown::{tear_down_held, HeldTeardown};
 use super::policy::SpawnPolicy;
 use super::Diagnosis;
-use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
+use crate::child::owned::owned_tests::teardown::{
+    fire_on_block, held_owned_blocker as held_blocker, slow_warns_during,
+};
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
 use crate::child::owned::unreaped::DropKind;
@@ -18,23 +19,12 @@ use crate::elevation::front::Front;
 use crate::error::{ChildFate, Error};
 use crate::log_capture::warns_since;
 use crate::os_process::child::{ExitRecord, Foreign, KillRefusal};
-use crate::os_process::fake::{failed_signal, FakeProcess, ReapAnswer};
-use crate::test_child::{held_uncontained_blocker, tear_down_held_holding};
+use crate::os_process::fake::{failed_signal, ReapAnswer};
+use crate::test_child::tear_down_held_holding;
 
 /// The `Error` a failed spawn arm tears down after.
 fn failed() -> Error {
     Error::Io(io::Error::other("the spawn failed"))
-}
-
-/// A live blocker the sync spawn would hold, the write end of its stdin, and the script the test
-/// gives its answers through.
-fn held_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, crate::PipeWriter) {
-    let (mut child, stdin) = held_uncontained_blocker(true);
-    child.proc.script_over(script);
-    // What `into_unreaped` does: the teardown below owns the root, so the handle drops inert.
-    child.kill_on_drop = false;
-    let owned = child.proc.take().expect("the child holds its root");
-    (owned, stdin)
 }
 
 /// A subtree of a leaf with id 7, killed through, which places a task by its pidfd's cgroup id.
@@ -616,11 +606,7 @@ fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold(
 
     let warns = slow_warns_during(|| {
         let _placed = fault::force_pidfd_cgroup_id(7);
-        let policy = SpawnPolicy {
-            teardown_warn_after: Some(Duration::ZERO),
-            unreaped_drop: DropKind::Wait,
-        };
-        handed_back = Some(tear_down_front_under(owned, Some(&subtree), policy).2);
+        handed_back = Some(tear_down_front_under(owned, Some(&subtree), SpawnPolicy::WARNS_AT_ONCE).2);
     });
 
     assert!(

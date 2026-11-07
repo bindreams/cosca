@@ -8,7 +8,6 @@
 //! write, still succeeds.
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
 
 use crate::test_child::Console;
 use std::io::Read as _;
@@ -25,7 +24,6 @@ use crate::child::front_kill_tests::{
 };
 use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
 use crate::child::owned::seams::record_root_teardowns;
-use crate::child::owned::unreaped::DropKind;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
@@ -498,12 +496,66 @@ pub(crate) fn wait_until_exited(pidfd: &OwnedFd) {
     crate::wait::poll_ready(&mut fds).expect("poll the pidfd");
 }
 
+/// What the drop's looks do once the leaf's kill was written.
+#[derive(Clone, Copy)]
+enum AtTheLook {
+    /// Await the front's end. Before Linux 6.19 a task leaves its cgroup before it can be
+    /// collected, so a front the leaf's kill ended may still read as running at the look; this look
+    /// awaits its end, but only once the kill was written. A failed kill would otherwise hang the
+    /// look; the assertions fail on the missing write instead.
+    AwaitsTheFront,
+    /// End the fault that makes the place read fail ([`Unreadable`]), and await nothing: the front
+    /// is waited for by the drop's own wait alone.
+    ReadsThePlaceAgain,
+}
+
+/// The fault that makes the front's place read fail, once armed, parked so that
+/// [`AtTheLook::ReadsThePlaceAgain`] can end it.
+type Unreadable = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+
+/// What differs between the drops [`assert_drop_kills_the_leaf_and_reaps_the_front`] makes.
+struct FrontDrop {
+    /// The spawn's policy, which the drop's waits carry.
+    policy: SpawnPolicy,
+    /// The scripted answers to the drop's reaps, before the real front's own.
+    reaps: Vec<ReapAnswer>,
+    at_the_look: AtTheLook,
+}
+
+impl FrontDrop {
+    /// Under the sync spawn's policy, every look awaiting the front.
+    fn awaiting_the_front() -> FrontDrop {
+        FrontDrop {
+            policy: SpawnPolicy::SYNC,
+            reaps: Vec::new(),
+            at_the_look: AtTheLook::AwaitsTheFront,
+        }
+    }
+}
+
+/// The failure of the place read from the leaf's kill write on, for a drop that cannot tell from
+/// it whether the kill reached the front, and an exit read that says the front is running.
+fn fail_the_place_read_from_the_kill(unreadable: &Unreadable) -> Box<dyn std::any::Any> {
+    use crate::containment::cgroup::fault;
+
+    let arming = fault::set_before_kill_write({
+        let unreadable = Arc::clone(unreadable);
+        move || *unreadable.lock().expect("lock") = Some(Box::new(fault::fail_pidfd_info()))
+    });
+    let running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
+    Box::new((arming, running))
+}
+
 /// What a drop that keeps its leaf armed does with a front in the leaf: the leaf's kill ends the
 /// front and every other member, the drop reaps the front (a later `waitid` on its pidfd finds
 /// nothing to wait for), says so at `debug` with how it died, and never says the front is left
-/// running. `fault` arms whatever made the drop's own look at the front fail.
+/// running. `fault` arms whatever made the drop's own look at the front fail. Returns how many
+/// slow-teardown warns the drop made.
 #[track_caller]
-fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dyn std::any::Any>) {
+fn assert_drop_kills_the_leaf_and_reaps_the_front(
+    drop_of: FrontDrop,
+    fault: impl FnOnce(&Unreadable) -> Box<dyn std::any::Any>,
+) -> usize {
     crate::log_capture::install();
     let FrontWithMember {
         mut child,
@@ -512,40 +564,49 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
         member,
         mut stdout,
     } = spawn_front_with_member();
+    child.policy = drop_of.policy;
     let front = pidfd_of(child.pid());
     let pid = child.pid();
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill((stdin, member_stdin));
     release.observe(pid);
-    // Before Linux 6.19 a task leaves its cgroup before it can be collected, so a front the leaf's
-    // kill ended may still read as running at the look: the look awaits its end, but only once the
-    // kill was written. A failed kill would otherwise hang the look; the assertions below fail on
-    // the missing write instead.
     let awaited = Arc::new(AtomicBool::new(false));
+    let unreadable = Unreadable::default();
     crate::containment::cgroup::fault::record_leaf_steps();
-    child.proc.script_over(|fake| fake).on_look({
+    child.proc.script_over(|fake| fake.reaps(drop_of.reaps)).on_look({
         let awaited = Arc::clone(&awaited);
+        let unreadable = Arc::clone(&unreadable);
+        let at_the_look = drop_of.at_the_look;
         move |_| {
-            if crate::containment::cgroup::fault::peek_leaf_steps()
+            if !crate::containment::cgroup::fault::peek_leaf_steps()
                 .iter()
                 .any(|step| step == "kill")
             {
-                crate::test_child::wait_until_zombie(pid);
-                awaited.store(true, Ordering::SeqCst);
+                return;
+            }
+            match at_the_look {
+                AtTheLook::AwaitsTheFront => {
+                    crate::test_child::wait_until_zombie(pid);
+                    awaited.store(true, Ordering::SeqCst);
+                }
+                AtTheLook::ReadsThePlaceAgain => drop(unreadable.lock().expect("lock").take()),
             }
         }
     });
     let mark = crate::log_capture::mark();
-    {
-        let _fault = fault();
+    let warns = slow_warns_during(|| {
+        let _fault = fault(&unreadable);
         drop(child);
-    }
+        drop(unreadable.lock().expect("lock").take());
+    });
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
-    assert!(
-        awaited.load(Ordering::SeqCst),
-        "some look came after the leaf's kill was written, and awaited the front's end"
-    );
+    if matches!(drop_of.at_the_look, AtTheLook::AwaitsTheFront) {
+        assert!(
+            awaited.load(Ordering::SeqCst),
+            "some look came after the leaf's kill was written, and awaited the front's end"
+        );
+    }
     let said =
         crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
@@ -555,6 +616,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
     let mut rest = Vec::new();
     stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
     assert_nothing_ended_by_itself(&rest);
+    warns
 }
 
 /// A drop whose placement read fails (so it cannot tell the front is in its leaf) still lets the
@@ -562,7 +624,9 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
 /// "the drop disarms the leaf" (the front survives), "the drop does not reap".
 #[skuld::test]
 fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf_and_reaps_the_front(#[fixture(cgroup)] _group: &Group) {
-    assert_drop_kills_the_leaf_and_reaps_the_front(|| Box::new(crate::containment::cgroup::fault::fail_pidfd_info()));
+    assert_drop_kills_the_leaf_and_reaps_the_front(FrontDrop::awaiting_the_front(), |_| {
+        Box::new(crate::containment::cgroup::fault::fail_pidfd_info())
+    });
 }
 
 /// A drop whose kill landed but whose reach cannot be read: the front is looked at once the leaf
@@ -570,15 +634,7 @@ fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf_and_reaps_the_front(#
 /// looking".
 #[skuld::test]
 fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fixture(cgroup)] _group: &Group) {
-    assert_drop_kills_the_leaf_and_reaps_the_front(|| {
-        let unreadable = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let arming = crate::containment::cgroup::fault::set_before_kill_write({
-            let unreadable = std::rc::Rc::clone(&unreadable);
-            move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
-        });
-        let running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
-        Box::new((arming, running, unreadable))
-    });
+    assert_drop_kills_the_leaf_and_reaps_the_front(FrontDrop::awaiting_the_front(), fail_the_place_read_from_the_kill);
 }
 
 /// What a drop does with a front its leaf's kill ended, when the look at its exit still reads it as
@@ -592,61 +648,17 @@ fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fix
 /// first look finds the place readable again.
 #[skuld::test]
 fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    use crate::containment::cgroup::fault;
-
-    crate::log_capture::install();
-    let FrontWithMember {
-        mut child,
-        stdin,
-        member_stdin,
-        member,
-        mut stdout,
-    } = spawn_front_with_member();
-    let pid = child.pid();
-    let front = pidfd_of(pid);
-    let release = release_after_cgroup_kill((stdin, member_stdin));
-    release.observe(pid);
-    let unreadable = Arc::new(std::sync::Mutex::new(None));
-    fault::record_leaf_steps();
     // The look reads the front as running, as on a kernel before 6.19. A look after the kill finds
     // the place readable again; one before it (none is known) would find it as it was.
-    child
-        .proc
-        .script_over(|fake| fake.reaps([ReapAnswer::Running]))
-        .on_look({
-            let unreadable = Arc::clone(&unreadable);
-            move |_| {
-                if fault::peek_leaf_steps().iter().any(|step| step == "kill") {
-                    drop(unreadable.lock().expect("lock").take());
-                }
-            }
-        });
-    let mark = crate::log_capture::mark();
-    {
-        let _arming = fault::set_before_kill_write({
-            let unreadable = Arc::clone(&unreadable);
-            move || *unreadable.lock().expect("lock") = Some(fault::fail_pidfd_info())
-        });
-        let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
-        drop(child);
-    }
-    fault::take_leaf_steps();
-    release.assert_killed();
-    let said =
-        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
-    assert_said_reaped_at_debug(&said, pid, "a front reaped with its status needs no warn");
-    assert!(reaped(&front), "the drop reaps the front");
-    wait_until_exited(&member);
-    let mut rest = Vec::new();
-    stdout.read_to_end(&mut rest).expect("every member of the tree is gone");
-    assert_nothing_ended_by_itself(&rest);
+    assert_drop_kills_the_leaf_and_reaps_the_front(
+        FrontDrop {
+            policy: SpawnPolicy::SYNC,
+            reaps: vec![ReapAnswer::Running],
+            at_the_look: AtTheLook::ReadsThePlaceAgain,
+        },
+        fail_the_place_read_from_the_kill,
+    );
 }
-
-/// A policy that warns of a wait the moment it starts, and waits as the sync spawn does.
-const WARNING: SpawnPolicy = SpawnPolicy {
-    teardown_warn_after: Some(Duration::ZERO),
-    unreaped_drop: DropKind::Wait,
-};
 
 /// The drop of a front its leaf's kill ended, with nothing left to look at, reaps it through the
 /// wait the cgroup kill bounds, which warns past the threshold of the spawn's policy, once. The
@@ -658,7 +670,7 @@ const WARNING: SpawnPolicy = SpawnPolicy {
 fn cgroup_a_drops_reap_of_a_front_its_leaf_killed_warns_past_its_spawns_threshold(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    child.policy = WARNING;
+    child.policy = SpawnPolicy::WARNS_AT_ONCE;
     let pid = child.pid();
     let front = pidfd_of(pid);
     let fake = child
@@ -684,41 +696,16 @@ fn cgroup_a_drops_reap_of_a_front_its_leaf_killed_warns_past_its_spawns_threshol
 /// Mutant: `look_at_front`'s wait is given no threshold by the drop.
 #[skuld::test]
 fn cgroup_a_drops_look_at_a_front_its_leaf_killed_warns_past_its_spawns_threshold(#[fixture(cgroup)] _group: &Group) {
-    use crate::containment::cgroup::fault;
+    let warns = assert_drop_kills_the_leaf_and_reaps_the_front(
+        FrontDrop {
+            policy: SpawnPolicy::WARNS_AT_ONCE,
+            reaps: vec![ReapAnswer::Running, ReapAnswer::Running],
+            at_the_look: AtTheLook::ReadsThePlaceAgain,
+        },
+        fail_the_place_read_from_the_kill,
+    );
 
-    crate::log_capture::install();
-    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    child.policy = WARNING;
-    let pid = child.pid();
-    let front = pidfd_of(pid);
-    let release = release_after_cgroup_kill(stdin);
-    release.observe(pid);
-    let unreadable = Arc::new(std::sync::Mutex::new(None));
-    fault::record_leaf_steps();
-    child
-        .proc
-        .script_over(|fake| fake.reaps([ReapAnswer::Running, ReapAnswer::Running]))
-        .on_look({
-            let unreadable = Arc::clone(&unreadable);
-            move |_| {
-                if fault::peek_leaf_steps().iter().any(|step| step == "kill") {
-                    drop(unreadable.lock().expect("lock").take());
-                }
-            }
-        });
-    let warns = slow_warns_during(|| {
-        let _arming = fault::set_before_kill_write({
-            let unreadable = Arc::clone(&unreadable);
-            move || *unreadable.lock().expect("lock") = Some(fault::fail_pidfd_info())
-        });
-        let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
-        drop(child);
-    });
-    fault::take_leaf_steps();
-
-    release.assert_killed();
     assert_eq!(warns, 1);
-    assert!(reaped(&front), "the drop reaps the front");
 }
 
 /// The same front whose place cannot be read (its pidfd's cgroup id fails) is not called running,

@@ -23,4 +23,12 @@ impl SpawnPolicy {
         teardown_warn_after: None,
         unreaped_drop: DropKind::Wait,
     };
+
+    /// The sync spawn's, but a teardown's wait warns the moment it starts: its threshold has
+    /// already passed.
+    #[cfg(test)]
+    pub(crate) const WARNS_AT_ONCE: SpawnPolicy = SpawnPolicy {
+        teardown_warn_after: Some(std::time::Duration::ZERO),
+        unreaped_drop: DropKind::Wait,
+    };
 }

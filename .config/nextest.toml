@@ -262,9 +262,12 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
 # (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way, and
-# the hand-back tests hold the release of a child the call under test might wrongly wait for. Under
-# `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/)'
+# the hand-back tests hold the release of a child the call under test might wrongly wait for. The
+# `*_warns_past_*threshold` rows (the `owned_tests` ones, and the front and held-teardown ones that
+# live elsewhere) script a wait that blocks once, which the test ends; a teardown that is not given
+# its policy's threshold blocks once more and nothing wakes it, so the regression they guard is a
+# hang, not a failed assertion. Under `profile.default` so `profile.ci` and local runs inherit it.
+filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/) | test(/_warns_past_(its_(spawns|policys)|the)_threshold/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]

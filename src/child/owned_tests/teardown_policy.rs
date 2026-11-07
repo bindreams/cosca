@@ -5,30 +5,15 @@
 //! dropped on the way. The Linux-only teardowns (a front's look, the cgroup-only reap, the held
 //! child's) have their rows beside the lanes that reach them.
 
-use std::time::Duration;
-
 use super::teardown::{fire_on_block, slow_warns_during};
-use crate::child::owned::unreaped::DropKind;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::test_child::held_uncontained_blocker;
 
-/// Warns past a threshold that has already passed, and waits as the sync spawn does.
-const WARNING: SpawnPolicy = SpawnPolicy {
-    teardown_warn_after: Some(Duration::ZERO),
-    unreaped_drop: DropKind::Wait,
-};
-
-/// A live blocker whose reaps answer `Running` twice, so its teardown's wait is still running when
-/// it starts and blocks once, then are the real child's. The kill is the real one. The write end of
-/// its stdin comes with it.
-fn slow_to_be_reaped(policy: SpawnPolicy) -> (crate::Child, FakeProcess, crate::PipeWriter) {
-    let (mut child, stdin) = held_uncontained_blocker(true);
-    child.policy = policy;
-    let fake = child
-        .proc
-        .script_over(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Running]));
-    (child, fake, stdin)
+/// The reaps of a child whose teardown's wait is still running when it starts and blocks once:
+/// `Running` twice, then the real child's. The kill is the real one.
+fn slow_to_be_reaped(fake: FakeProcess) -> FakeProcess {
+    fake.reaps([ReapAnswer::Running, ReapAnswer::Running])
 }
 
 /// A child dropped under a policy that warns waits for the root its kill ended past the policy's
@@ -37,7 +22,9 @@ fn slow_to_be_reaped(policy: SpawnPolicy) -> (crate::Child, FakeProcess, crate::
 /// Mutants: `Child::tear_down` hands the root's teardown no threshold on Unix, or on Windows.
 #[skuld::test]
 fn a_dropped_childs_wait_warns_past_its_spawns_threshold() {
-    let (child, fake, _stdin) = slow_to_be_reaped(WARNING);
+    let (mut child, _stdin) = held_uncontained_blocker(true);
+    child.policy = SpawnPolicy::WARNS_AT_ONCE;
+    let fake = child.proc.script_over(slow_to_be_reaped);
     let _fire = fire_on_block(&fake);
 
     let warns = slow_warns_during(|| drop(child));
@@ -48,28 +35,28 @@ fn a_dropped_childs_wait_warns_past_its_spawns_threshold() {
 /// The failed spawn's teardown of a child it holds exists on Linux and Windows.
 #[cfg(any(target_os = "linux", windows))]
 mod failed_spawn {
-    use super::{slow_to_be_reaped, WARNING};
-    use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
+    use super::slow_to_be_reaped;
+    use crate::child::owned::owned_tests::teardown::{fire_on_block, held_owned_blocker, slow_warns_during};
     use crate::child::owned::teardown::{Disposition, Past};
     use crate::child::owned::unreaped::DropKind;
-    use crate::child::owned::OwnedChild;
     use crate::child::spawn::held_teardown::tear_down_failed_spawn;
     use crate::child::spawn::policy::SpawnPolicy;
     use crate::child::spawn::Diagnosis;
     use crate::error::ChildFate;
     use crate::os_process::fake::ReapAnswer;
     use crate::signal::{Sent, Sig};
-    use crate::test_child::held_uncontained_blocker;
 
     /// A failed spawn's teardown of the child it holds warns past its policy's threshold, once.
     ///
     /// Mutant: `tear_down_failed_spawn` hands the teardown no threshold.
     #[skuld::test]
     fn a_failed_spawns_wait_warns_past_its_policys_threshold() {
-        let (mut child, fake, _stdin) = slow_to_be_reaped(SpawnPolicy::SYNC);
-        let _fire = fire_on_block(&fake);
-        child.kill_on_drop = false;
-        let owned: OwnedChild = child.proc.take().expect("the child holds its root");
+        let mut fake = None;
+        let (owned, _stdin) = held_owned_blocker(|f| {
+            fake = Some(f.clone());
+            slow_to_be_reaped(f)
+        });
+        let _fire = fire_on_block(&fake.expect("the script ran"));
         let mut fate = None;
 
         let warns = slow_warns_during(|| {
@@ -78,7 +65,7 @@ mod failed_spawn {
                 None,
                 Past::Clean,
                 Disposition::Leave,
-                WARNING,
+                SpawnPolicy::WARNS_AT_ONCE,
                 &mut Diagnosis::default(),
             );
             assert!(handed_back.is_none(), "a reaped child is not handed back");
@@ -95,14 +82,14 @@ mod failed_spawn {
     /// Mutant: `say_failed_spawn` hands `Unreaped::new` the sync drop kind.
     #[skuld::test]
     fn the_unreaped_a_failed_spawn_hands_back_does_what_its_policy_says_on_drop() {
-        let (mut child, stdin) = held_uncontained_blocker(true);
+        let mut fake = None;
         // The kill is scripted: the child runs until `stdin` closes, below.
-        let fake = child.proc.script_over(|f| {
+        let (owned, stdin) = held_owned_blocker(|f| {
+            fake = Some(f.clone());
             f.signals([Ok(Sent::Delivered), Ok(Sent::Delivered)])
                 .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         });
-        child.kill_on_drop = false;
-        let owned: OwnedChild = child.proc.take().expect("the child holds its root");
+        let fake = fake.expect("the script ran");
 
         let (_, handed_back) = tear_down_failed_spawn(
             owned,
