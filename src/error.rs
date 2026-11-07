@@ -296,9 +296,9 @@ pub enum Error {
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
     MayHaveStarted {
         fate: ChildFate,
-        /// Whether the child is an elevation backend (`sudo`, `doas`, `osascript`), whose
-        /// elevated program is its own child and may outlive it: `fate` is then about the backend
-        /// only (see [`ChildFate`]), and the message says so.
+        /// Whether the child is an elevation front (`sudo`, `doas`, `osascript`), whose elevated
+        /// program may outlive it: `fate` is then about the front only (see [`ChildFate`]), and the
+        /// message says so. A pkexec child is the program itself, so this is `false` for it.
         wrapper_elevated: bool,
         #[source]
         source: Box<Error>,
@@ -315,23 +315,23 @@ pub enum Error {
 /// What a spawn that failed after its program may have started did with its child: the `fate` of
 /// [`Error::MayHaveStarted`] (see [`Error::fate`]).
 ///
-/// It is about the child cosca spawned. On a wrapper-elevated spawn that child is the backend
-/// (`sudo`, `doas`, `osascript`; pkexec execs the program, so its child is the program), and the
-/// elevated program is its own child, which cosca
-/// never signals: `Reaped`, `Killed` and `Gone` say the backend is not running, not that the program
-/// is not. A front that had exited by itself is `Reaped` while the program it launched may still
-/// run. Descendants of a contained child are not covered either; the containment's own teardown is.
+/// It is about the child cosca spawned. Behind an elevation front (`sudo`, `doas`, `osascript`)
+/// that child is usually the front, and the elevated program its own child, which cosca never
+/// signals: `Reaped`, `Killed` and `Gone` say the front is not running, not that the program is
+/// not. A front that had exited by itself is `Reaped` while the program it launched may still run.
+/// (A pkexec child is the program itself.) Descendants of a contained child are not covered
+/// either; the containment's own teardown is.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildFate {
     /// cosca collected the child's exit: it killed the child, or found it had exited, and reaped it.
-    /// The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the
+    /// The child is not running; behind an elevation front, the elevated program may be (see the
     /// type's doc).
     Reaped,
     /// The child is dead or dying, but cosca did not collect its exit, and cosca's kill was delivered
     /// (or the child had exited by itself): the wait for it failed, someone else collected its exit
     /// or holds its zombie after the kill, a Windows child was terminated and not waited for, or a
-    /// containment teardown ended it. On a wrapper-elevated spawn, the elevated program may still
+    /// containment teardown ended it. Behind an elevation front, the elevated program may still
     /// run.
     Killed,
     /// The child may still be running: cosca left it alone (an elevation front, which it never
@@ -349,7 +349,7 @@ pub enum ChildFate {
     /// Someone else reaped the child, or its zombie is held by another process (on macOS, launchd
     /// holds a tracer-orphaned child's zombie), so cosca could not collect it, and cosca delivered
     /// no kill: a child that was gone already, or not ours, when cosca came to it. (One cosca killed
-    /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; behind an elevation front, the elevated program may be (see the type's doc).
     Gone,
     /// cosca cannot say what became of the child.
     Unknown,
