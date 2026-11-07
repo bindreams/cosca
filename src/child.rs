@@ -928,16 +928,15 @@ impl Child {
     }
 
     /// Feed `input` to stdin (if piped) and capture stdout/stderr (if piped),
-    /// pumping all streams concurrently to avoid deadlock. Returns the full
+    /// serving all streams together to avoid deadlock. Returns the full
     /// `Output` and exit status.
     ///
     /// A child that stops reading stdin ends the input; it is not an error. Errors from the pipes
     /// are returned after the child has been waited for.
     ///
-    /// On Unix the streams are served by one `poll` loop on the calling thread, so no thread is
-    /// started after the child is. On Windows each stream has a thread of its own, and a thread
-    /// that cannot be created panics, until the Windows half of #869 (overlapped pipes, #143)
-    /// removes them. As with [`std::process::Command::output`], a grandchild that inherits a pipe
+    /// The streams are served by one loop on the calling thread (`poll` on Unix, overlapped I/O on
+    /// Windows), so no thread is started after the child is. As with
+    /// [`std::process::Command::output`], a grandchild that inherits a pipe
     /// and holds it open keeps `communicate` waiting, whether or not the child has exited.
     pub fn communicate(&mut self, input: Option<&[u8]>) -> Result<crate::Output, Error> {
         #[cfg(test)]

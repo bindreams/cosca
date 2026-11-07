@@ -19,11 +19,12 @@ use std::process::Stdio;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::NtOpenFile;
 use windows::Win32::Foundation::{
-    RtlNtStatusToDosError, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, HANDLE, NTSTATUS, UNICODE_STRING, WAIT_OBJECT_0,
+    RtlNtStatusToDosError, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, HANDLE, NTSTATUS,
+    UNICODE_STRING, WAIT_OBJECT_0,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
-use windows::Win32::System::IO::{GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED};
 
 use super::{ParentEnd, PipeReader, PipeWriter};
 use crate::error::win32_io_error;
@@ -210,7 +211,7 @@ pub(super) type Writer = Handle;
 
 /// Whether `handle` is overlapped: its file object has no synchronous-I/O flag. Never call it on a
 /// pipe end another thread may be reading: the query can block behind a synchronous read.
-#[cfg(any(feature = "tokio", test))]
+#[cfg(any(feature = "tokio", test, debug_assertions))]
 pub(crate) fn is_overlapped(handle: BorrowedHandle<'_>) -> io::Result<bool> {
     use windows::Wdk::Storage::FileSystem::{FileModeInformation, NtQueryInformationFile, FILE_MODE_INFORMATION};
 
@@ -254,28 +255,19 @@ impl Read for &Handle {
         if buf.is_empty() {
             return Ok(0);
         }
-        let len = buf.len().min(u32::MAX as usize);
-        let buf = &mut buf[..len];
-        // SAFETY (the closure's `ReadFile`): `buf` is live until `overlapped_io` returns, and it
-        // does not return while the kernel may write into it.
-        let read = overlapped_io(self.as_raw(), |overlapped| unsafe {
-            ReadFile(self.as_raw(), Some(&mut *buf), None, Some(overlapped))
-        });
-        match read {
-            // Reading from a pipe whose other end is closed fails this way; std reads it as the end
-            // of the stream.
-            Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) => Ok(0),
-            read => read,
-        }
+        // SAFETY: `buf` is live until `overlapped_io` returns, and it does not return while the
+        // kernel may write into it.
+        eof_as_zero(overlapped_io(self.as_raw(), |operation| unsafe {
+            operation.read(self.as_raw(), buf)
+        }))
     }
 }
 
 impl Write for &Handle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let buf = &buf[..buf.len().min(u32::MAX as usize)];
-        // SAFETY (the closure's `WriteFile`): as for `read`.
-        overlapped_io(self.as_raw(), |overlapped| unsafe {
-            WriteFile(self.as_raw(), Some(buf), None, Some(overlapped))
+        // SAFETY: as for `read`.
+        overlapped_io(self.as_raw(), |operation| unsafe {
+            operation.write(self.as_raw(), buf)
         })
     }
 
@@ -284,50 +276,199 @@ impl Write for &Handle {
     }
 }
 
-/// One overlapped operation on `handle`, started by `start` with an `OVERLAPPED` whose event is new
-/// for this call, run to its end: the bytes it moved.
+/// A read's result, with a pipe whose other end is closed (`ERROR_BROKEN_PIPE`, at the call or at the
+/// completion) read as the end of the stream, as std does.
+pub(crate) fn eof_as_zero(read: io::Result<usize>) -> io::Result<usize> {
+    match read {
+        Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) => Ok(0),
+        read => read,
+    }
+}
+
+/// One overlapped operation on `handle`, started by `start`, run to its end: the bytes it moved.
 ///
-/// The wait is on the event, so another operation on the same handle, in another thread, does not
-/// release it. A wait that fails leaves the kernel owning the caller's buffer, and nothing safe is
-/// left to do: the process aborts.
-fn overlapped_io(
-    handle: HANDLE,
-    start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
-) -> io::Result<usize> {
-    // SAFETY: an unnamed manual-reset event, no preconditions.
-    let event = unsafe { CreateEventW(None, true, false, None) }.map_err(win32_io_error)?;
-    // SAFETY: `event` is new and ours alone; the guard closes it after the operation is over.
-    let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
-    // The low bit of `hEvent` tells the kernel not to queue a completion packet for this operation
-    // to a completion port the file object may be associated with. Tokio associates the end it
-    // adopts, and a clone of that end shares the association: without the bit, a synchronous read
-    // through the clone posts a packet pointing at `overlapped`, a stack frame, for the reactor to
-    // dequeue after this function has returned.
-    let mut overlapped = OVERLAPPED {
-        hEvent: HANDLE(event.as_raw_handle().map_addr(|address| address | 1)),
-        ..Default::default()
-    };
-    match start(&mut overlapped) {
-        Ok(()) => {}
-        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-            // SAFETY: a wait on an event this call owns.
-            if unsafe { WaitForSingleObject(HANDLE(event.as_raw_handle()), INFINITE) } != WAIT_OBJECT_0 {
-                // `eprintln!` panics when writing to stderr fails (e.g. a pipe whose reader has
-                // gone), which would unwind with the buffer still in the kernel's hands.
-                Write::write_all(
-                    &mut io::stderr(),
-                    b"cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands\n",
-                )
-                .ok();
-                std::process::abort();
+/// The wait is on the operation's own event, so another operation on the same handle, in another
+/// thread, does not release it.
+fn overlapped_io(handle: HANDLE, start: impl FnOnce(&mut Operation) -> io::Result<StartOutcome>) -> io::Result<usize> {
+    let mut operation = Operation::new()?;
+    if start(&mut operation)? == StartOutcome::Pending {
+        wait_or_abort(operation.event());
+    }
+    operation.finish(handle)
+}
+
+/// A wait that fails leaves the kernel owning the caller's buffer, and nothing safe is left to do:
+/// the process aborts.
+fn wait_or_abort(event: HANDLE) {
+    // SAFETY: a wait on an event the caller owns.
+    if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
+        // `eprintln!` panics when writing to stderr fails (e.g. a pipe whose reader has
+        // gone), which would unwind with the buffer still in the kernel's hands.
+        Write::write_all(
+            &mut io::stderr(),
+            b"cosca: waiting for a pipe operation failed with the buffer still in the kernel's hands\n",
+        )
+        .ok();
+        std::process::abort();
+    }
+}
+
+// The operation =====
+
+/// What starting an operation did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartOutcome {
+    /// The kernel has the operation and the buffer; the event fires when it completes.
+    Pending,
+    /// The operation finished inside the call; `finish` reads its result. The event is signalled.
+    Completed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Idle,
+    Pending,
+    Completed,
+}
+
+/// The `OVERLAPPED` and the event of one overlapped read or write at a time on a pipe end, reusable
+/// for the next one. Each operation has an event of its own (never the handle), so any number of
+/// operations on one end can be waited on separately.
+///
+/// Started with [`read`](Self::read) or [`write`](Self::write), whose buffer the kernel owns until
+/// [`finish`](Self::finish) or [`cancel`](Self::cancel) ends the operation. Dropping a pending
+/// `Operation` frees an `OVERLAPPED` the kernel holds: whoever owns one cancels it first.
+pub(crate) struct Operation {
+    event: OwnedHandle,
+    /// Boxed: the kernel keeps its address while the operation is pending.
+    overlapped: Box<OVERLAPPED>,
+    state: State,
+}
+
+impl Operation {
+    pub(crate) fn new() -> io::Result<Operation> {
+        // SAFETY: an unnamed manual-reset event, no preconditions.
+        let event = unsafe { CreateEventW(None, true, false, None) }.map_err(win32_io_error)?;
+        // SAFETY: `event` is new and ours alone.
+        let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
+        Ok(Operation {
+            event,
+            overlapped: Box::default(),
+            state: State::Idle,
+        })
+    }
+
+    /// The event that fires when the operation completes. It is the event itself, the handle to wait
+    /// on: the one in the `OVERLAPPED` has its low bit set.
+    pub(crate) fn event(&self) -> HANDLE {
+        HANDLE(self.event.as_raw_handle())
+    }
+
+    /// Starts one `ReadFile` of up to `u32::MAX` bytes of `buf` on `handle`.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must stay live, unmoved and unread until `finish` or `cancel` has ended the operation,
+    /// and the operation must be idle. `handle` is an overlapped pipe end that stays open until
+    /// then.
+    pub(crate) unsafe fn read(&mut self, handle: HANDLE, buf: &mut [u8]) -> io::Result<StartOutcome> {
+        let len = buf.len().min(u32::MAX as usize);
+        let buf = &mut buf[..len];
+        // SAFETY: `begin`'s closure gets this operation's own `OVERLAPPED`; `buf` is the caller's
+        // contract.
+        self.begin(|overlapped| unsafe { ReadFile(handle, Some(buf), None, Some(overlapped)) })
+    }
+
+    /// Starts one `WriteFile` of up to `u32::MAX` bytes of `buf` on `handle`.
+    ///
+    /// # Safety
+    ///
+    /// As [`read`](Self::read), with `buf` unwritten.
+    pub(crate) unsafe fn write(&mut self, handle: HANDLE, buf: &[u8]) -> io::Result<StartOutcome> {
+        let buf = &buf[..buf.len().min(u32::MAX as usize)];
+        // SAFETY: as in `read`.
+        self.begin(|overlapped| unsafe { WriteFile(handle, Some(buf), None, Some(overlapped)) })
+    }
+
+    fn begin(&mut self, start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>) -> io::Result<StartOutcome> {
+        debug_assert!(
+            self.state == State::Idle,
+            "an operation is started while one is under way"
+        );
+        // The low bit of `hEvent` tells the kernel not to queue a completion packet for this
+        // operation to a completion port the file object may be associated with. Tokio associates
+        // the end it adopts, and a clone of that end shares the association: without the bit, a
+        // synchronous read through the clone posts a packet pointing at an `OVERLAPPED` for the
+        // reactor to dequeue after its owner is gone.
+        *self.overlapped = OVERLAPPED {
+            hEvent: HANDLE(self.event.as_raw_handle().map_addr(|address| address | 1)),
+            ..Default::default()
+        };
+        match start(&mut *self.overlapped) {
+            Ok(()) => {
+                self.state = State::Completed;
+                Ok(StartOutcome::Completed)
+            }
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+                self.state = State::Pending;
+                Ok(StartOutcome::Pending)
+            }
+            Err(e) => Err(win32_io_error(e)),
+        }
+    }
+
+    /// Ends the operation: the bytes it moved, or the error it ended with. Call it once the event has
+    /// fired, or the start returned [`StartOutcome::Completed`].
+    pub(crate) fn finish(&mut self, handle: HANDLE) -> io::Result<usize> {
+        debug_assert!(self.state != State::Idle, "finish on an operation that was not started");
+        let mut moved = 0u32;
+        // SAFETY: the operation is complete, so `overlapped` holds its result; it does not wait.
+        let result = unsafe { GetOverlappedResult(handle, &*self.overlapped, &mut moved, false) };
+        match result {
+            Ok(()) => {
+                self.state = State::Idle;
+                Ok(moved as usize)
+            }
+            Err(e) => {
+                let incomplete = e.code() == windows::core::HRESULT::from_win32(ERROR_IO_INCOMPLETE.0);
+                debug_assert!(!incomplete, "finish before the operation's event fired");
+                // An operation still under way stays pending: its buffer is not yet ours.
+                if !incomplete {
+                    self.state = State::Idle;
+                }
+                Err(win32_io_error(e))
             }
         }
-        Err(e) => return Err(win32_io_error(e)),
     }
-    let mut moved = 0u32;
-    // SAFETY: the operation is complete, so `overlapped` holds its result; it does not wait.
-    unsafe { GetOverlappedResult(handle, &overlapped, &mut moved, false) }.map_err(win32_io_error)?;
-    Ok(moved as usize)
+
+    /// Cancels the operation if it is pending and waits for the kernel to let go of its buffer, whatever
+    /// the operation ended with; does nothing if it is idle. The wait is the abortable step (see
+    /// [`wait_or_abort`]); the operation's own status is not read as a failure (it is
+    /// `ERROR_OPERATION_ABORTED` after a cancel).
+    pub(crate) fn cancel(&mut self, handle: HANDLE) {
+        match self.state {
+            State::Idle => return,
+            State::Completed => {
+                self.state = State::Idle;
+                return;
+            }
+            State::Pending => {}
+        }
+        // SAFETY: cancels this operation's own `OVERLAPPED`, started on `handle`.
+        if let Err(e) = unsafe { CancelIoEx(handle, Some(&*self.overlapped)) } {
+            // The operation completed first.
+            debug_assert_eq!(
+                e.code(),
+                windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0),
+                "cancel a pending pipe operation: {e}"
+            );
+        }
+        wait_or_abort(self.event());
+        let mut moved = 0u32;
+        // SAFETY: the event fired, so the operation is over; it does not wait.
+        unsafe { GetOverlappedResult(handle, &*self.overlapped, &mut moved, false) }.ok();
+        self.state = State::Idle;
+    }
 }
 
 // Conversions =====

@@ -1,29 +1,9 @@
-use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{unprivileged, Group};
-use crate::Stdio;
 
 /// `/bin/sh -c script`, with all three standard streams piped.
 fn sh(script: &str) -> crate::Child {
-    let mut c = crate::test_child::command(Console::Hidden);
-    c.args(["/bin/sh", "-c", script]);
-    c.stdin(Stdio::pipe()).expect("stdin");
-    c.stdout(Stdio::pipe()).expect("stdout");
-    c.stderr(Stdio::pipe()).expect("stderr");
-    c.spawn().expect("spawn")
-}
-
-/// A child that exits without reading its input ends the input: `communicate` returns what it
-/// printed, not an error.
-///
-/// Mutant: a broken pipe on stdin is an `Err`.
-#[skuld::test]
-fn a_child_that_stops_reading_stdin_ends_the_input() {
-    let mut child = sh("echo out; exit 3");
-    let input = vec![b'x'; 1 << 20];
-    let out = child.communicate(Some(&input)).expect("communicate");
-    assert_eq!(out.status.code(), Some(3));
-    assert_eq!(out.stdout, b"out\n");
+    super::pump_common_tests::shell(script, "")
 }
 
 /// Each output stream is read while the other is idle: a child that fills stderr past a pipe
@@ -70,17 +50,6 @@ fn a_stream_at_eof_does_not_end_the_others() {
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
     assert_eq!(out.stderr.len(), 1_000_000);
-}
-
-/// With a piped stdin and no input, the child sees EOF at once.
-///
-/// Mutant: the stdin pipe is held open until the child exits.
-#[skuld::test]
-fn no_input_closes_stdin() {
-    let mut child = sh("cat");
-    let out = child.communicate(None).expect("communicate");
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty());
 }
 
 // No threads =====
