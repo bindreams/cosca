@@ -49,7 +49,7 @@ async fn tokio_kill_after_a_completed_wait_keeps_the_cached_status() {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
+pub(super) fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -432,7 +432,7 @@ mod macos {
     use crate::signal::Sig;
     use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
-    fn walked_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+    fn walked_blocker() -> (crate::tokio::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -553,7 +553,7 @@ mod macos {
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
     }
 
-    fn session_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+    fn session_blocker() -> (crate::tokio::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

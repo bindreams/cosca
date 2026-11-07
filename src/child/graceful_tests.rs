@@ -12,13 +12,13 @@ use crate::wait::fault;
 /// stdin writer, which the caller must keep for exactly as long as the child must stay running.
 /// `Existence::Present` is not proof of life — it is zombie-inclusive on every platform — so a
 /// liveness claim goes through [`assert_still_running`].
-fn blocker() -> (crate::Child, std::io::PipeWriter) {
+fn blocker() -> (crate::Child, crate::PipeWriter) {
     crate::test_child::held_contained_blocker_on_console(crate::Stdio::pipe())
 }
 
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.
 #[cfg(unix)]
-type Held = std::io::PipeWriter;
+type Held = crate::PipeWriter;
 #[cfg(windows)]
 type Held = std::net::TcpStream;
 
@@ -45,7 +45,7 @@ fn kill_only_blocker() -> (crate::Child, Held) {
 /// Instead, write a line containing `x`, close stdin, and require both a clean exit (`findstr`'s
 /// "a match was found" code) and the echoed match on stdout; a killed process produces neither.
 /// This consumes `stdin` and reaps the child.
-fn assert_still_running(child: &mut crate::Child, mut stdin: std::io::PipeWriter) {
+fn assert_still_running(child: &mut crate::Child, mut stdin: crate::PipeWriter) {
     #[cfg(unix)]
     {
         let mut stdout = child.stdout().expect("piped stdout");

@@ -35,7 +35,7 @@ fn quick_contained_child() -> crate::Child {
 /// child must stay running. On Windows it is `more.com`, not the `findstr` of
 /// [`crate::test_child::BLOCKER_ARGV`]: released stdin must not look like a kill to
 /// [`crate::test_child::assert_killed`].
-fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
+fn long_lived_contained_child() -> (crate::Child, crate::PipeWriter) {
     #[cfg(unix)]
     {
         crate::test_child::held_contained_blocker(crate::Stdio::null())
@@ -48,7 +48,7 @@ fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
 
 /// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
 /// assertion.
-fn kill_then_release(child: crate::Child, stdin: std::io::PipeWriter) {
+fn kill_then_release(child: crate::Child, stdin: crate::PipeWriter) {
     child.kill_tree().expect("kill_tree");
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
@@ -197,7 +197,7 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
 use std::time::Instant;
 
 /// A live, uncontained child that blocks on its piped stdin until EOF.
-fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
+fn spawn_never_exiting() -> (crate::Child, crate::PipeWriter) {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");

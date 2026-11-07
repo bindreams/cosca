@@ -48,7 +48,7 @@ pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 /// [`blocker`] whose stdin writer the caller keeps: for a test where only its own kill may end
 /// the child.
 #[cfg(unix)]
-fn blocker_with_held_stdin() -> (Command, std::io::PipeWriter) {
+fn blocker_with_held_stdin() -> (Command, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -1348,7 +1348,7 @@ fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
 
 /// End `child` and reap it behind its handle's back, as an application that owns SIGCHLD would.
 #[cfg(unix)]
-fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
+fn foreign_reap(child: &crate::Child, writer: crate::PipeWriter) {
     let pid = child.pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
@@ -1835,4 +1835,109 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let held = held_through(&kernel, pid);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
+}
+
+/// Every pipe a spawn makes is std's kind: the parent's end overlapped (no synchronous-I/O flag in
+/// the file object's mode), the child's synchronous. A `CreatePipe` end, the pipe this spawn made
+/// before, has the flag on both. The rows are the pipe in both directions, then the parent ends of
+/// real spawns: the std slots, a merge target, and fd >= 3 (the raw backend).
+///
+/// Mutant: the spawn makes its pipe with `std::io::pipe`.
+#[cfg(windows)]
+#[skuld::test]
+fn every_pipe_a_spawn_makes_is_overlapped_in_the_parent_and_synchronous_in_the_child() {
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _, BorrowedHandle};
+
+    use crate::pipe::windows::is_overlapped;
+    use crate::stdio::{Direction, Fd, Stdio};
+
+    for dir in [Direction::In, Direction::Out] {
+        let (child_end, parent_end) = super::make_pipe(dir).expect("make the pipe");
+        // SAFETY: `child_end` is live and outlives the borrow.
+        let theirs = unsafe { BorrowedHandle::borrow_raw(child_end.as_raw_handle()) };
+        assert!(
+            !is_overlapped(theirs).expect("query the child's end"),
+            "{dir:?}: the child's end is overlapped"
+        );
+        assert!(
+            is_overlapped(crate::test_child::parent_handle(&parent_end)).expect("query the parent's end"),
+            "{dir:?}: the parent's end is synchronous"
+        );
+    }
+
+    // (row, pipes by slot, merge slot and target)
+    type Row<'a> = (&'a str, &'a [(i32, Direction)], Option<(i32, i32)>);
+    let rows: [Row; 3] = [
+        (
+            "std slots",
+            &[(0, Direction::In), (1, Direction::Out), (2, Direction::Out)],
+            None,
+        ),
+        ("merge target", &[(1, Direction::Out)], Some((2, 1))),
+        ("fd >= 3", &[(3, Direction::Out), (4, Direction::In)], None),
+    ];
+    for (row, pipes, merge) in rows {
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        cmd.args(["cmd", "/C", "exit 0"]);
+        for &(slot, dir) in pipes {
+            cmd.fd(
+                slot,
+                match dir {
+                    Direction::In => Stdio::pipe_in(),
+                    Direction::Out => Stdio::pipe_out(),
+                },
+            )
+            .expect("set the pipe");
+        }
+        if let Some((slot, target)) = merge {
+            cmd.fd(slot, Stdio::merge(Fd::from(target))).expect("set the merge");
+        }
+        let mut child = cmd.spawn().expect("spawn");
+        for &(slot, dir) in pipes {
+            let slot = Fd::from(slot);
+            let mode = match dir {
+                Direction::In => child
+                    .fd_write_end(slot)
+                    .map(|w| is_overlapped(w.as_handle()).expect("query the mode")),
+                Direction::Out => child
+                    .fd_read_end(slot)
+                    .map(|r| is_overlapped(r.as_handle()).expect("query the mode")),
+            };
+            assert_eq!(mode, Some(true), "{row}: the parent's end for {slot} is not overlapped");
+        }
+        child.wait().expect("reap");
+    }
+}
+
+/// Our overlapped end of one child's stdout, given to another child as its stdin, reaches it: the
+/// second child's plain `ReadFile` (`findstr`) reads the overlapped handle. (Measured: the mode of
+/// a pipe end cannot be changed, so the child gets the end as it is.)
+#[cfg(windows)]
+#[skuld::test]
+fn piping_one_childs_stdout_into_anothers_stdin_delivers_the_bytes() {
+    use std::io::Read as _;
+
+    let mut first = crate::test_child::command(Console::Hidden);
+    first.args(["cmd", "/C", "echo x-through-the-pipe"]);
+    first.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut first = first.spawn().expect("spawn the writer");
+    let stdout = first.stdout().expect("piped stdout");
+
+    let mut second = crate::test_spawn::spawn(
+        std::process::Command::new("findstr")
+            .arg("x")
+            .stdin(std::process::Stdio::from(stdout))
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn the reader");
+    let mut out = String::new();
+    second
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .expect("read the second child's output");
+    assert_eq!(out.trim(), "x-through-the-pipe");
+    assert!(second.wait().expect("reap the reader").success());
+    first.wait().expect("reap the writer");
 }

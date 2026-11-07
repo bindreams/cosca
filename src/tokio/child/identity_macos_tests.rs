@@ -16,7 +16,7 @@ use crate::error::Error;
 use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
 
-fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
+fn tokio_blocker() -> (crate::tokio::Command, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

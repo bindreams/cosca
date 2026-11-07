@@ -34,7 +34,7 @@ enum Teardown {
 
 /// Ends `child`'s root alone by [`kill_own_child`] (the kill is setup here) and has `reap` reap it
 /// (see [`kill_and_reap_behind`] for `release`).
-async fn reap_root(child: &mut crate::tokio::Child, release: std::io::PipeWriter, reap: Reap) {
+async fn reap_root(child: &mut crate::tokio::Child, release: crate::PipeWriter, reap: Reap) {
     match reap {
         Reap::Own => {
             kill_own_child(child.pid());

@@ -23,7 +23,7 @@ pub(crate) const ROOT_LEAVING_A_MEMBER: [&str; 3] = [
 
 /// Arms the spawn's `BeforeIdentity` hook: it waits for the member, then reaps the root elsewhere,
 /// so the identity read finds it `Gone`. Dropping the guard disarms it.
-pub(crate) fn arm_reaped_elsewhere(started: std::io::PipeReader) -> Armed {
+pub(crate) fn arm_reaped_elsewhere(started: crate::PipeReader) -> Armed {
     let pid = std::rc::Rc::new(std::cell::Cell::new(0));
     let hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
         let pid = std::rc::Rc::clone(&pid);

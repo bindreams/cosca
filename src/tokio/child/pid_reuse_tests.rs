@@ -24,12 +24,12 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// A blocker whose stdin the caller can close, so it exits when told to.
-fn spawn_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+fn spawn_blocker() -> (crate::tokio::Child, crate::PipeWriter) {
     spawn_blocker_with(true)
 }
 
 /// [`spawn_blocker`] with `kill_on_drop` as given.
-fn spawn_blocker_with(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
+fn spawn_blocker_with(kill_on_drop: bool) -> (crate::tokio::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -64,7 +64,7 @@ fn tokio_child_holds_its_handshake_pidfd() {
 // Kill after a foreign reap and a reuse =====
 
 /// Ends the child, reaps it behind tokio's back and reuses its pid.
-fn foreign_reaped_and_reused(child: &crate::tokio::Child, writer: std::io::PipeWriter) -> std::process::Child {
+fn foreign_reaped_and_reused(child: &crate::tokio::Child, writer: crate::PipeWriter) -> std::process::Child {
     drop(writer);
     reap_behind_and_reuse(child.pid())
 }
@@ -1168,7 +1168,7 @@ in_fresh_pid_ns!(
 // Tree signals after a reap and a reuse =====
 
 /// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
-fn spawn_group_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+fn spawn_group_blocker() -> (crate::tokio::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

@@ -82,7 +82,7 @@ fn tokio_raw_executable_records_an_exact_spec() {
 
 /// A live blocker whose stdin this test holds, and that writer.
 #[cfg(unix)]
-fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
+fn held_blocker(kill_on_drop: bool) -> (super::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -100,7 +100,7 @@ fn held_blocker(kill_on_drop: bool) -> (super::Child, std::io::PipeWriter) {
 #[track_caller]
 fn assert_the_teardown_killed(
     #[cfg(target_os = "linux")] root: &Pidfd,
-    #[cfg(target_os = "linux")] writer: std::io::PipeWriter,
+    #[cfg(target_os = "linux")] writer: crate::PipeWriter,
     sends: &crate::send_log::Capture,
     pid: u32,
 ) {
@@ -124,7 +124,7 @@ fn assert_the_teardown_killed(
 /// poll and awaits the reap after. Needs `alone()` on Linux. Elsewhere the writer is dropped between
 /// the teardown's kill and its reap, and the reap's status must be `SIGKILL`, as on Linux.
 #[cfg(unix)]
-async fn after_a_pump_failure(child: &mut super::Child, writer: std::io::PipeWriter) -> crate::error::Error {
+async fn after_a_pump_failure(child: &mut super::Child, writer: crate::PipeWriter) -> crate::error::Error {
     use std::future::Future as _;
     use std::task::Poll;
 

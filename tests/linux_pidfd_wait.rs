@@ -15,7 +15,7 @@ use common::testbin;
 #[cfg(target_os = "linux")]
 /// Spawn the testbin `mode`, returning the child, its stdin writer, and the listener its control
 /// connection arrives on.
-fn spawn_tid_reporter(mode: &str) -> (cosca::Child, std::io::PipeWriter, std::net::TcpListener) {
+fn spawn_tid_reporter(mode: &str) -> (cosca::Child, cosca::PipeWriter, std::net::TcpListener) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
 
@@ -171,12 +171,12 @@ fn open_of_a_ptraced_zombie_thread_is_none() {
 struct Tracer {
     leader: libc::pid_t,
     worker: Option<libc::pid_t>,
-    writer: Option<std::io::PipeWriter>,
+    writer: Option<cosca::PipeWriter>,
 }
 
 #[cfg(target_os = "linux")]
 impl Tracer {
-    fn writer(&mut self) -> &mut std::io::PipeWriter {
+    fn writer(&mut self) -> &mut cosca::PipeWriter {
         self.writer
             .as_mut()
             .expect("the writer is open until the end of the test")

@@ -24,7 +24,7 @@ fn failed() -> Error {
 
 /// A live blocker the sync spawn would hold, the write end of its stdin, and the script the test
 /// gives its answers through.
-fn held_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, std::io::PipeWriter) {
+fn held_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, crate::PipeWriter) {
     let (mut child, stdin) = held_uncontained_blocker(true);
     child.proc.script_over(script);
     // What `into_unreaped` does: the teardown below owns the root, so the handle drops inert.
@@ -464,12 +464,12 @@ fn a_failed_wait_on_a_pidfd_a_look_failed_on_is_not_a_breach() {
 /// close, and is the test's to reap. A test that asserts the reap calls [`ReapsBlocker::finish`];
 /// otherwise the drop reaps. On unwind the drop closes stdin and neither blocks nor asserts.
 struct ReapsBlocker {
-    stdin: Option<std::io::PipeWriter>,
+    stdin: Option<crate::PipeWriter>,
     pid: Option<u32>,
 }
 
 impl ReapsBlocker {
-    fn new(owned: &OwnedChild, stdin: std::io::PipeWriter) -> ReapsBlocker {
+    fn new(owned: &OwnedChild, stdin: crate::PipeWriter) -> ReapsBlocker {
         ReapsBlocker {
             stdin: Some(stdin),
             pid: Some(owned.pid().expect("the held child has a pid")),

@@ -2,7 +2,7 @@
 //! fill and stall the child, and nothing after the spawn needs a thread, so a caller under a task
 //! limit (`RLIMIT_NPROC`, a cgroup's `TasksMax`) cannot fail for want of one.
 
-use std::io::{self, ErrorKind, PipeReader, PipeWriter, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::AsFd;
 
 use rustix::event::{PollFd, PollFlags};
@@ -10,6 +10,7 @@ use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 
 use crate::child::Child;
 use crate::error::Error;
+use crate::pipe::{PipeReader, PipeWriter};
 use crate::stdio::Fd;
 use crate::wait;
 use crate::Output;

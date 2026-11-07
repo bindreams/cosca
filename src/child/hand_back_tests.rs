@@ -239,7 +239,7 @@ fn a_job_contained_child_whose_kill_is_refused_and_look_shows_the_exit_is_not_ha
 /// An ordinary `cat` the test owns, reported as launched by `sudo`: a front, which is sent no kill,
 /// and the write end of its stdin.
 #[cfg(unix)]
-fn a_running_front() -> (Child, std::io::PipeWriter) {
+fn a_running_front() -> (Child, crate::PipeWriter) {
     use crate::elevation::{Backend, ElevatedVia};
 
     crate::log_capture::install();
@@ -256,7 +256,7 @@ fn assert_front_handed_back(
     id: crate::identity::ProcessId,
     mark: usize,
     fate: ChildFate,
-    handed_back: crate::test_child::HandedBack<std::io::PipeWriter>,
+    handed_back: crate::test_child::HandedBack<crate::PipeWriter>,
 ) {
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert_eq!(handed_back.unreaped().pid(), Some(id.pid()));
@@ -378,7 +378,7 @@ fn an_elevation_front_that_has_exited_is_reaped_not_handed_back() {
 
 #[cfg(target_os = "linux")]
 mod in_a_cgroup {
-    use std::io::PipeWriter;
+    use crate::PipeWriter;
     use std::path::Path;
 
     use super::{assert_front_handed_back, refuse_the_kill, warns_since};

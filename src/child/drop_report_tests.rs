@@ -19,7 +19,7 @@ fn refusal() -> String {
     std::io::Error::from_raw_os_error(libc::EPERM).to_string()
 }
 
-fn contained_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
+fn contained_blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -30,7 +30,7 @@ fn contained_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
 
 /// A child with no containment: nothing sweeps it before the root kill under test, on any platform
 /// (a macOS fd marker's sweep kills the root, which holds the marker).
-fn bare_blocker() -> (crate::Child, std::io::PipeWriter) {
+fn bare_blocker() -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -663,7 +663,7 @@ fn finish_elevated_hands_back_a_root_whose_reap_failed_after_a_delivered_kill() 
 #[cfg(target_os = "linux")]
 fn child_in_a_leaf_whose_kill_fails() -> (
     crate::Child,
-    std::io::PipeWriter,
+    crate::PipeWriter,
     std::path::PathBuf,
     std::path::PathBuf,
     tempfile::TempDir,

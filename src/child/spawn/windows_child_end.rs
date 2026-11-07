@@ -1,7 +1,6 @@
 //! [`ChildEnd`] on Windows: a handle the child receives, or none.
 
 use std::fs::File;
-use std::io::{PipeReader, PipeWriter};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::process::Stdio;
 
@@ -32,18 +31,6 @@ impl From<OwnedHandle> for ChildEnd {
             return ChildEnd(None);
         }
         ChildEnd(Some(h))
-    }
-}
-
-impl From<PipeReader> for ChildEnd {
-    fn from(p: PipeReader) -> ChildEnd {
-        ChildEnd(Some(p.into()))
-    }
-}
-
-impl From<PipeWriter> for ChildEnd {
-    fn from(p: PipeWriter) -> ChildEnd {
-        ChildEnd(Some(p.into()))
     }
 }
 

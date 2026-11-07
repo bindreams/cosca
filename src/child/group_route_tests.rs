@@ -7,7 +7,7 @@ use crate::test_child::Console;
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// A root that leads its own group (a session), blocked on a pipe whose write end is returned.
-fn group_root() -> (crate::Child, std::io::PipeWriter) {
+fn group_root() -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
