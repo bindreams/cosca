@@ -24,8 +24,6 @@ use crate::os_process::OsProcess;
 #[cfg(unix)]
 use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
-#[cfg(target_os = "linux")]
-use crate::wait::teardown_warn::Due;
 
 /// How [`ProcSource::wait_and_reap`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1645,7 +1643,7 @@ impl ProcSource {
             self.take_forgotten_pidfd(),
             id,
             past,
-            Due::in_(super::slow_teardown_after()),
+            super::slow_teardown_after(),
         );
         TornDown { torn, leak, why }
     }

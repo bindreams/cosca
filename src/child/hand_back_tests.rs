@@ -49,6 +49,32 @@ fn a_refused_kill_hands_the_child_back_and_says_so() {
     handed_back.wait();
 }
 
+/// The `Unreaped` a child hands back does what its spawn's policy says when dropped: one built under
+/// an async spawn's policy lets the child go (one more kill, one look), and does not wait for it.
+///
+/// Mutant: `into_unreaped` hands `Unreaped::new` the sync drop kind.
+#[skuld::test]
+fn the_unreaped_a_child_hands_back_does_what_its_spawns_policy_says_on_drop() {
+    use crate::child::owned::unreaped::DropKind;
+    use crate::child::spawn::policy::SpawnPolicy;
+    use crate::signal::Sig;
+
+    let (mut child, stdin) = held_uncontained_blocker(true);
+    child.policy = SpawnPolicy {
+        teardown_warn_after: None,
+        unreaped_drop: DropKind::LetGo,
+    };
+    let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
+    let (_, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+    handed_back.unreaped();
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the teardown's own kill");
+
+    drop(handed_back);
+
+    assert_eq!(fake.signal_calls(), [Sig::Kill, Sig::Kill], "the drop's kill");
+}
+
 /// A caller that leaves a child whose kill is refused gets it left, warned, and no `Unreaped`.
 ///
 /// Mutant: the teardown hands the child back whatever the caller said.

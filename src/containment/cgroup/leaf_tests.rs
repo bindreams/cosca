@@ -265,7 +265,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
+    let leaf = crate::containment::cgroup::try_create_leaf(None).unwrap_or_else(|e| {
         panic!(
             "the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created \
              ({e}) — is this process running inside a writable, delegated cgroup v2 slice with \
@@ -447,7 +447,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec(#[fixture(cgroup)] _group: &Group) {
-    let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
+    let leaf = crate::containment::cgroup::try_create_leaf(None).unwrap_or_else(|e| {
         panic!("the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created ({e})")
     });
     // SAFETY: `procs_fd` is open for as long as `leaf` lives.
@@ -492,7 +492,7 @@ fn create_leaf_under_reports_a_refused_mkdir() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parent = dir.path().join("no-such-slice");
 
-    let err = match crate::containment::cgroup::create_leaf_under(&parent) {
+    let err = match crate::containment::cgroup::create_leaf_under(&parent, None) {
         Err(e) => e,
         Ok(_) => panic!("creating a leaf under a nonexistent directory must fail"),
     };
@@ -512,7 +512,7 @@ fn create_leaf_under_reports_a_refused_mkdir() {
 #[skuld::test]
 fn create_leaf_under_reports_a_missing_cgroup_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -539,7 +539,7 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
     crate::containment::cgroup::fault::set_force_occupy_before_unwind(true);
 
     let mark = crate::log_capture::mark();
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -573,7 +573,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
     let parent = dir.path().to_path_buf();
     crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
-    let err = match crate::containment::cgroup::create_leaf_under(&parent) {
+    let err = match crate::containment::cgroup::create_leaf_under(&parent, None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -1453,7 +1453,7 @@ fn entered_real_leaf_of(
 ) {
     use std::os::unix::process::CommandExt;
 
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let mut leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
@@ -1649,7 +1649,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf(#[f
 #[skuld::test]
 fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created(#[fixture(cgroup)] _group: &Group) {
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
-    let result = crate::containment::cgroup::try_create_leaf();
+    let result = crate::containment::cgroup::try_create_leaf(None);
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
 
     assert!(consumed, "the creation must have tried, and failed, to watch");
@@ -2041,7 +2041,7 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
 fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.procs to open; leaf creation must fail"),
     };
@@ -2074,7 +2074,7 @@ fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf()
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
     crate::containment::cgroup::fault::set_force_report_channel_failure(true);
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("the report channel could not be opened; leaf creation must fail"),
     };
@@ -2457,7 +2457,7 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[fixture(cgroup)] _group: &Group) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
     // The occupant reports through a channel of its own, so the leaf's receives nothing.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
@@ -2833,7 +2833,7 @@ fn cgroup_an_abandoned_front_whose_leaf_kill_failed_is_left_unreaped_in_a_leaf_l
     use std::os::unix::process::CommandExt;
 
     crate::log_capture::install();
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let mut leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
     let mut cmd = std::process::Command::new("/bin/cat");
     cmd.stdin(std::process::Stdio::piped()).process_group(0);
@@ -3012,7 +3012,6 @@ fn abandoning_a_named_child_with_no_handle_is_a_breach() {
         mode: Some(crate::containment::ContainMode::Strongest),
         is_root: true,
         cgroup_leaf: Some(leaf),
-        teardown_warn_after: None,
     };
 
     prepared.abandon_before_verdict(false, None);
@@ -3101,7 +3100,7 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &Group) {
     // Placed: killed through, drained, swept. Nothing received: swept without a kill.
     for placed in [true, false] {
-        let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
+        let leaf = crate::containment::cgroup::try_create_leaf(None).expect("a delegated cgroup v2 leaf");
         let leaf_path = leaf.leaf_path.clone();
         std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
         if placed {
@@ -3355,7 +3354,7 @@ fn cgroup_terminate_warns_once_when_the_id_cannot_be_read_and_a_member_is_unsign
     #[fixture(cgroup)] _group: &Group,
 ) {
     crate::log_capture::install();
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let leaf_name = leaf_name_of(&leaf);
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
     let mark = crate::log_capture::mark();
@@ -3392,7 +3391,7 @@ fn real_leaf_with_members(
 ) {
     use std::os::unix::process::CommandExt;
 
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let members = (0..n)
         .map(|_| {
             // Each member reports through its own channel: the leaf's carries one report.
@@ -3471,7 +3470,7 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_reports_a_leaf_listing_only_pid_zero(#[fixture(cgroup)] _group: &Group) {
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let result = leaf.terminate_listed("0\n");
     drop(leaf);
     assert!(
@@ -3768,7 +3767,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
 #[skuld::test]
 fn cgroup_terminate_reports_a_listed_line_that_is_no_pid(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let leaf_name = leaf_name_of(&leaf);
     let mark = crate::log_capture::mark();
     let result = leaf.terminate_listed("abc\n");

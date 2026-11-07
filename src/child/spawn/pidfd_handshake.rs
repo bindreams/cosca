@@ -80,7 +80,6 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::error::{ChildFate, Error};
 use crate::os_process::linux::LinuxProcess;
-use crate::wait::teardown_warn::Due;
 
 const GO: u8 = 1;
 /// A report's tag: the child's pidfd is attached as `SCM_RIGHTS`; the value is 0.
@@ -890,8 +889,9 @@ fn conclude<T: Spawned>(
                 (error, ChildFate::Unknown)
             }
             LeftFront::Here(front) if !collected => {
-                // No subtree, so the front is never waited for and no threshold applies. Tokio's own
-                // teardown runs here, so a front still running is left: nothing is handed back.
+                // No subtree, so the front is never waited for: the policy's threshold goes unused.
+                // Tokio's own teardown runs here, so a front still running is left: nothing is handed
+                // back.
                 let child = OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
                 let how = HeldTeardown {
                     front: Some(front),
@@ -1012,7 +1012,7 @@ fn end_through_pidfd(
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> Remains {
-    tear_down_pidfd(pid, pidfd, None, past, Due::in_(warn_after)).say_as_failed_spawn(why)
+    tear_down_pidfd(pid, pidfd, None, past, warn_after).say_as_failed_spawn(why)
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program

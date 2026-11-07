@@ -561,6 +561,7 @@ pub(crate) fn spawn_unelevated(
                 &reserved,
                 cmd.fd_marker_suppressed(),
                 cmd.env_ops(),
+                policy.teardown_warn_after,
             )
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
@@ -589,7 +590,7 @@ pub(crate) fn spawn_unelevated(
     let (mut prepared, child, pidfd, parent_ends) = {
         // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
         let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
-        let mut prepared = crate::containment::prepare(
+        let prepared = crate::containment::prepare(
             &mut std_cmd,
             &mut steps,
             &cmd.contain_request(),
@@ -597,10 +598,9 @@ pub(crate) fn spawn_unelevated(
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
+            policy.teardown_warn_after,
         )
         .not_started()?;
-        // Until `attach` takes the leaf, a failed spawn's teardown drops or abandons it here.
-        prepared.teardown_warn_after = policy.teardown_warn_after;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         if let Some(leaf) = prepared
             .cgroup_leaf
@@ -637,6 +637,7 @@ pub(crate) fn spawn_unelevated(
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
+            policy.teardown_warn_after,
         )
         .not_started()?;
 

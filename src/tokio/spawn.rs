@@ -167,6 +167,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 &reserved,
                 cmd.fd_marker_suppressed(),
                 cmd.env_ops(),
+                super::child::slow_teardown_after(),
             )
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
@@ -242,14 +243,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
+            super::child::slow_teardown_after(),
         )
         .not_started()?;
-        // Until `attach` takes the leaf, a failed spawn's teardown drops or abandons it here, and its
-        // drain waits warn once past 1 s.
-        #[cfg(target_os = "linux")]
-        {
-            prepared.teardown_warn_after = super::child::slow_teardown_after();
-        }
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         #[cfg(target_os = "linux")]
         if let Some(leaf) = prepared

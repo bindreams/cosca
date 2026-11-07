@@ -13,7 +13,6 @@ use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
-use crate::wait::teardown_warn::Due;
 
 #[path = "child/pump.rs"]
 pub(crate) mod pump;
@@ -494,9 +493,7 @@ impl Child {
         };
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
-        let look = self
-            .proc
-            .look_at_front(self.id, reach, Due::in_(self.policy.teardown_warn_after));
+        let look = self.proc.look_at_front(self.id, reach, self.policy.teardown_warn_after);
         word_front(self.pid(), why, disposition, look)
     }
 
@@ -1203,7 +1200,7 @@ impl Child {
                     disposition,
                     tree: None,
                 },
-                Due::in_(self.policy.teardown_warn_after),
+                self.policy.teardown_warn_after,
             );
             let (warn, remains) = torn.take_warn(caller.label());
             left.extend(
@@ -1283,9 +1280,11 @@ impl Child {
                 };
                 match not_reached {
                     // The cgroup kill ended it: reap it, sending nothing. The reap is the front's.
-                    None => self
-                        .proc
-                        .reap_after_tree_kill(&crate::elevation::front::front_named(Some(self.pid())), disposition),
+                    None => self.proc.reap_after_tree_kill(
+                        &crate::elevation::front::front_named(Some(self.pid())),
+                        disposition,
+                        self.policy.teardown_warn_after,
+                    ),
                     // Never waited for. A kill that failed is final: the armed leaf writes no
                     // other. The front is looked at once the leaf is torn down.
                     Some(why) => self.tear_down_leaf_and_look_at_front(&why, disposition),
@@ -1300,7 +1299,7 @@ impl Child {
                         disposition,
                         tree: reach,
                     },
-                    Due::in_(self.policy.teardown_warn_after),
+                    self.policy.teardown_warn_after,
                 )
             }
         };

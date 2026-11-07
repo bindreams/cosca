@@ -155,8 +155,6 @@ fn nested_attach_is_delegated() {
             is_root: false, // nested member
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
-            #[cfg(target_os = "linux")]
-            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1588,6 +1586,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
         &[3, 4, 5, 6, 7, 8, 9, 10],
         false,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
@@ -1623,6 +1622,7 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
         &[],
         false,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
@@ -1645,6 +1645,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
         &[],
         true,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     assert!(
@@ -1809,8 +1810,6 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         mode: Some(crate::containment::ContainMode::Strongest),
         is_root: true,
         cgroup_leaf: Some(leaf),
-        #[cfg(target_os = "linux")]
-        teardown_warn_after: None,
     };
     super::attach_tree(
         std::process::id(),

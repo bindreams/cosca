@@ -227,9 +227,9 @@ pub(crate) struct CgroupLeaf {
     /// Where the watched front was when the leaf was last about to be removed, shared with the
     /// leaf's [`Subtree`]s.
     placed: super::PlacedAtRemoval,
-    /// This long into each of its waits for the leaf's drain, [`Drop`] warns once and keeps waiting
-    /// (principle 2); `None`: it does not. The spawn's policy sets it
-    /// ([`warn_past`](Self::warn_past)).
+    /// This long into each of its waits for the leaf's drain, a teardown of the leaf (its [`Drop`],
+    /// or its abandonment) warns once and keeps waiting (principle 2); `None`: it does not. The
+    /// spawn's policy sets it when the leaf is created.
     teardown_warn_after: Option<std::time::Duration>,
 }
 
@@ -403,10 +403,9 @@ impl CgroupLeaf {
         )
     }
 
-    /// Has [`Drop`] warn once, `after` into each of its waits for the leaf's drain, and keep
-    /// waiting.
-    pub(crate) fn warn_past(&mut self, after: Option<std::time::Duration>) {
-        self.teardown_warn_after = after;
+    /// The warn of this leaf's own waits for its drain, as its spawn's policy says.
+    pub(crate) fn warn(&self) -> WarnAfter {
+        WarnAfter(self.teardown_warn_after)
     }
 
     /// Watch the elevation front `pid`, this leaf's child: its place is recorded before each
@@ -902,6 +901,15 @@ impl CgroupLeaf {
     /// `take_placement`, `Drop`) then runs for real against the kernel's own errnos, on any
     /// Linux host and without a cgroupfs. It has no `cgroup.procs` fd.
     pub(crate) fn for_test_at(leaf_path: PathBuf) -> CgroupLeaf {
+        CgroupLeaf::for_test_warning_after(leaf_path, None)
+    }
+
+    /// [`for_test_at`](Self::for_test_at) for a leaf whose spawn's policy warns `teardown_warn_after`
+    /// into each wait for its drain.
+    pub(crate) fn for_test_warning_after(
+        leaf_path: PathBuf,
+        teardown_warn_after: Option<std::time::Duration>,
+    ) -> CgroupLeaf {
         let dir = LeafDir::open_for_test(&leaf_path);
         CgroupLeaf {
             watch: Box::new(Watcher::new(
@@ -919,7 +927,7 @@ impl CgroupLeaf {
             kill: std::sync::Arc::default(),
             watched: None,
             placed: super::PlacedAtRemoval::default(),
-            teardown_warn_after: None,
+            teardown_warn_after,
         }
     }
 
@@ -942,7 +950,8 @@ impl CgroupLeaf {
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLeaf {
     fn drop(&mut self) {
-        self.tear_down(&mut WarnAfter(self.teardown_warn_after));
+        let mut warn = self.warn();
+        self.tear_down(&mut warn);
     }
 }
 
@@ -1163,7 +1172,8 @@ impl CgroupLeaf {
         // The leaf stays until the child is gone: a child that entered it but whose report the shut
         // beat is not counted entered, and its leaf cannot be removed while it runs.
         let abandoned = if front_pid.is_some() {
-            let (fate, torn) = look_at_failed_spawn_front(&owned, None, Ok(tree), Disposition::Leave, warn.due());
+            let (fate, torn) =
+                look_at_failed_spawn_front(&owned, None, Ok(tree), Disposition::Leave, warn.warn_after());
             HandleTeardown::new(torn, Expect::of(&owned, past)).say_as_failed_spawn(&mut why);
             Abandoned::Front(fate)
         } else {
@@ -1171,7 +1181,10 @@ impl CgroupLeaf {
                 disposition: Disposition::Leave,
                 tree,
             };
-            Abandoned::of_teardown(tear_down_expecting(&owned, None, kill, past, warn.due()), &mut why)
+            Abandoned::of_teardown(
+                tear_down_expecting(&owned, None, kill, past, warn.warn_after()),
+                &mut why,
+            )
         };
         self.remove_abandoned(warn);
         abandoned
@@ -1448,7 +1461,7 @@ fn warn_leaf_left_behind(leaf_path: &Path, what_failed: fmt::Arguments<'_>) {
 /// current process not in a v2 cgroup (v1-only system), leaf directory not
 /// writable (undelegated slice), or `cgroup.kill` absent (kernel < 5.14).
 #[cfg(target_os = "linux")]
-pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
+pub(crate) fn try_create_leaf(teardown_warn_after: Option<std::time::Duration>) -> Result<CgroupLeaf, LeafError> {
     let cgroup_file = fs::read_to_string("/proc/self/cgroup").map_err(LeafError::ReadProcSelfCgroup)?;
     let rel_path = parse_v2_relative_path(&cgroup_file).ok_or_else(|| {
         let (line_count, controllers) = summarize_cgroup_controllers(&cgroup_file);
@@ -1458,7 +1471,10 @@ pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
         }
     })?;
 
-    let mut leaf = create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))?;
+    let mut leaf = create_leaf_under(
+        &Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')),
+        teardown_warn_after,
+    )?;
     let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
     leaf.cgroup_path = Some(format!("{}/{name}", rel_path.trim_end_matches('/')));
     Ok(leaf)
@@ -1484,8 +1500,12 @@ pub(crate) fn leaf_name() -> io::Result<String> {
 /// production, and a temp directory in the tests that fail each precondition for real.
 ///
 /// Every early return names its step: the caller degrades either way, but never silently.
+/// `teardown_warn_after`: see [`CgroupLeaf`]'s field of that name.
 #[cfg(target_os = "linux")]
-pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError> {
+pub(crate) fn create_leaf_under(
+    current: &Path,
+    teardown_warn_after: Option<std::time::Duration>,
+) -> Result<CgroupLeaf, LeafError> {
     let leaf_name = leaf_name().map_err(|source| LeafError::CreateLeafDir {
         path: current.join("cosca-*"),
         source,
@@ -1624,7 +1644,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         kill: std::sync::Arc::default(),
         watched: None,
         placed: super::PlacedAtRemoval::default(),
-        teardown_warn_after: None,
+        teardown_warn_after,
     })
 }
 

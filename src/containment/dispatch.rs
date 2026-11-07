@@ -13,11 +13,6 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
-    /// Set from the spawn's policy: this long into each of its waits for the leaf's drain, a leaf
-    /// dropped or abandoned here, before `attach` takes it, warns once and keeps waiting
-    /// (principle 2). `attach` hands the same threshold to the leaf it takes.
-    #[cfg(target_os = "linux")]
-    pub teardown_warn_after: Option<std::time::Duration>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
     /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
     /// process group).
@@ -146,7 +141,7 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
+            let mut warn = leaf.warn();
             let Some(child) = child else {
                 use crate::containment::cgroup::WithoutChild;
                 return match leaf.abandon_without_child(&mut warn) {
@@ -189,15 +184,6 @@ impl Prepared {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        if let Some(leaf) = self.cgroup_leaf.take() {
-            leaf.drop_warning(&mut crate::containment::cgroup::WarnAfter(self.teardown_warn_after));
-        }
     }
 }
 
@@ -1727,6 +1713,9 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup. On Unix, what the child
 /// does for itself between `fork` and `exec` goes into `steps`, which the caller registers.
 ///
+/// `teardown_warn_after` is the spawn policy's: the cgroup leaf made here warns once this long into
+/// each of its waits for its drain, whoever drops or abandons it (principle 2).
+///
 /// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
 /// Windows can honour.
@@ -1735,6 +1724,10 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
 /// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
 /// flags too.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each Unix platform reads its own subset of the arguments"
+)]
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
     #[cfg(unix)] steps: &mut crate::child::spawn::in_child::InChild,
@@ -1762,6 +1755,11 @@ pub(crate) fn prepare(
         allow(unused_variables, reason = "only the Windows path composes env ops into the request")
     )]
     env_ops: &[crate::command::EnvOp],
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup leaf waits for its drain")
+    )]
+    teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two
@@ -1800,8 +1798,6 @@ pub(crate) fn prepare(
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
-            #[cfg(target_os = "linux")]
-            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1842,8 +1838,6 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
-                        #[cfg(target_os = "linux")]
-                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::None => {
@@ -1853,8 +1847,6 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
-                        #[cfg(target_os = "linux")]
-                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::ProcessGroup => {
@@ -1866,7 +1858,7 @@ pub(crate) fn prepare(
             // A failed leaf creation degrades this spawn to the process group set above. The
             // decision is unchanged; only the silence is — `log_degrade` names the step that
             // failed and the kernel's reason for it.
-            let leaf = match crate::containment::cgroup::try_create_leaf() {
+            let leaf = match crate::containment::cgroup::try_create_leaf(teardown_warn_after) {
                 Ok(leaf) => Some(leaf),
                 Err(e) => {
                     crate::containment::cgroup::log_degrade(&e);
@@ -1886,16 +1878,12 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
-                #[cfg(target_os = "linux")]
-                teardown_warn_after: None,
             });
         }
         return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
-            #[cfg(target_os = "linux")]
-            teardown_warn_after: None,
         });
     }
 
@@ -1940,8 +1928,6 @@ pub(crate) fn prepare(
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
-        #[cfg(target_os = "linux")]
-        teardown_warn_after: None,
         #[cfg(target_os = "macos")]
         marker,
         #[cfg(windows)]
@@ -2028,7 +2014,6 @@ fn attach_tree(
                     // not mean the child has made it — then releases the leaf's fd and pipe.
                     match leaf.take_placement(child) {
                         Ok(()) => {
-                            leaf.warn_past(prepared.teardown_warn_after);
                             return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
                         }
                         // Nothing of the child's is in the leaf: its final report is not Placed. The
