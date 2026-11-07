@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    absolute, exited_held, run, run_with, Control, Ended, Looked, Next, ProcessExit, RunOutcome, Step, Waitable,
+    absolute, exited_held, pause_end, run, run_with, Control, Ended, Looked, Next, ProcessExit, RunOutcome, Step,
+    Waitable,
 };
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -257,6 +258,25 @@ fn run_never_pauses_after_the_deadline() {
     assert_eq!(w.looks, 2);
 }
 
+/// The pause ends a step after `now`, cut to the deadline, and there is none once the deadline has
+/// passed at `now`.
+///
+/// Mutant: do not cut; cut off by one; pause at the deadline; read a clock of its own.
+#[skuld::test]
+fn pause_end_is_the_step_cut_at_the_deadline() {
+    let now = Instant::now();
+    // A step that ends before the deadline.
+    assert_eq!(pause_end(now, ms(2), Some(now + ms(10))), Some(now + ms(2)));
+    // A step that would pass the deadline is cut to it; one that ends on it is not cut.
+    assert_eq!(pause_end(now, ms(4), Some(now + ms(1))), Some(now + ms(1)));
+    assert_eq!(pause_end(now, ms(4), Some(now + ms(4))), Some(now + ms(4)));
+    // No pause once the deadline is at or before `now`.
+    assert_eq!(pause_end(now, ms(1), Some(now)), None);
+    assert_eq!(pause_end(now, ms(1), Some(now - ms(1))), None);
+    // No deadline: the whole step.
+    assert_eq!(pause_end(now, ms(4), None), Some(now + ms(4)));
+}
+
 /// A failed block is the `Waitable`'s to answer: by default it ends the loop with the error.
 ///
 /// Mutant: swallow the error in `run`; or never hand it to the `Waitable`.
@@ -338,7 +358,7 @@ fn control_paces_a_pause_on_the_backoff_and_restarts_it_after_a_wait() {
     assert_eq!(paused(&mut c, Some(ms(10))), 2);
     assert_eq!(paused(&mut c, Some(ms(1))), 4);
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
-    c.waited(Ended::Woke);
+    c.waited(Ended::NotReleased);
     assert_eq!(paused(&mut c, None), 1);
 }
 
@@ -350,7 +370,7 @@ fn control_paces_a_pause_on_the_backoff_and_restarts_it_after_a_wait() {
 fn control_makes_the_look_after_a_released_wait_final() {
     let mut c = Control::new();
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
-    c.waited(Ended::Woke);
+    c.waited(Ended::NotReleased);
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
     let mut c = Control::new();
     assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);

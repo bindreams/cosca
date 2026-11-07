@@ -74,6 +74,18 @@ pub(crate) enum RunOutcome<T> {
     DeadlinePassed,
 }
 
+/// The instant a pause of `step` from `now` ends, cut to `deadline`; `None` once `deadline` has
+/// passed at `now`: there is no pause, and the driver looks again, which [`Control`] makes the final
+/// look. Both drivers call it with a clock read immediately before they sleep or arm, so the
+/// deadline it cuts to is the one the block is armed from (principle 13).
+pub(crate) fn pause_end(now: Instant, step: Duration, deadline: Option<Instant>) -> Option<Instant> {
+    match crate::wait::remaining_at(deadline, now) {
+        Some(Duration::ZERO) => None,
+        Some(left) => Some(now + step.min(left)),
+        None => Some(now + step),
+    }
+}
+
 /// The schedule of pauses for [`Step::Recheck`]: 1 ms, doubling, at most 50 ms, never ending, no
 /// jitter.
 fn backoff() -> ExponentialBackoff {
@@ -113,8 +125,8 @@ pub(crate) enum Next {
     DeadlinePassed,
     /// Wait on the [`WaitFor`] the look returned, until the deadline.
     Wait,
-    /// Pause for this step, which the driver cuts to the time left at the instant it arms or
-    /// sleeps, then look.
+    /// Pause for this step, which the driver cuts to the deadline with [`pause_end`] at the
+    /// instant it arms or sleeps, then look.
     Pause(Duration),
     /// Look again at once: the deadline passed during the look, so there is no time to wait or
     /// pause in, and the next look is the final one.
@@ -124,8 +136,9 @@ pub(crate) enum Next {
 /// How a wait ended, as the driver tells [`Control`]: the one thing it reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ended {
-    /// Not released: the source signalled, or the wait failed and the [`Waitable`] survived it.
-    Woke,
+    /// Not released without an exit signal: the source signalled, or the wait failed and the
+    /// [`Waitable`] survived it.
+    NotReleased,
     /// Released without an exit signal: the deadline passed (or, in the async Windows wait, the
     /// cancel event fired).
     Released,
@@ -136,11 +149,11 @@ pub(crate) enum Ended {
 /// unless the `Waitable` survives it.
 pub(crate) fn wait_ended<W: Waitable>(w: &mut W, waited: Result<bool, Error>) -> Result<Ended, Error> {
     Ok(match waited {
-        Ok(true) => Ended::Woke,
+        Ok(true) => Ended::NotReleased,
         Ok(false) => Ended::Released,
         Err(e) => {
             w.block_failed(e)?;
-            Ended::Woke
+            Ended::NotReleased
         }
     })
 }
@@ -205,8 +218,9 @@ pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<R
     run_with(w, deadline, pause)
 }
 
-/// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the step cut to the time
-/// remaining, read immediately before the call, and returns once it has passed.
+/// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the length of
+/// [`pause_end`]'s pause, read immediately before the call, and returns once it has passed. No
+/// pause is made, and `pause` is not called, once the deadline has passed.
 fn run_with<W: Waitable>(
     w: &mut W,
     deadline: Option<Instant>,
@@ -221,7 +235,12 @@ fn run_with<W: Waitable>(
             (Next::Done, Step::Done(out)) => return Ok(RunOutcome::Done(out)),
             (Next::DeadlinePassed, _) => return Ok(RunOutcome::DeadlinePassed),
             (Next::Look, _) => {}
-            (Next::Pause(step), _) => pause(remaining(deadline).map_or(step, |left| step.min(left))),
+            (Next::Pause(step), _) => {
+                let now = crate::wait::now();
+                if let Some(end) = pause_end(now, step, deadline) {
+                    pause(end - now);
+                }
+            }
             (Next::Wait, Step::Wait(wait_for)) => {
                 let waited = block(&wait_for, deadline);
                 control.waited(wait_ended(w, waited)?);

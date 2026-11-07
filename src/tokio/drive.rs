@@ -12,6 +12,8 @@
 use std::time::Duration;
 
 use crate::error::Error;
+#[cfg(unix)]
+use crate::os_process::drive::pause_end;
 use crate::os_process::drive::{wait_ended, Control, Next, ProcessExit, RunOutcome, Step, Waitable};
 use crate::os_process::{OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
@@ -107,18 +109,22 @@ pub(crate) async fn run<W: Waitable>(
     }
 }
 
-/// [`run`]'s pause for a [`Step::Recheck`]: `step` from now, cut at `deadline`. Nothing wakes it
-/// early, so a `Waitable` that others must reach during the pause holds no lock across it.
+/// [`run`]'s pause for a [`Step::Recheck`]: [`pause_end`]'s instant, read from [`tokio_now`] and
+/// armed at once; none once `deadline` has passed. Nothing wakes it early, so a `Waitable` that
+/// others must reach during the pause holds no lock across it.
+///
+/// [`tokio_now`]: crate::tokio::wait::tokio_now
 #[cfg(unix)]
 async fn pause(step: Duration, deadline: Option<std::time::Instant>) -> Result<(), Error> {
     let now = crate::tokio::wait::tokio_now();
-    let by_step = now + step;
-    // An instant, never a duration re-derived from the deadline (`arm_at`'s contract).
-    let at = deadline.map_or(by_step, |deadline| deadline.min(by_step));
+    let Some(end) = pause_end(now, step, deadline) else {
+        return Ok(());
+    };
     #[cfg(test)]
-    crate::wait::block_probe::record_pause(at.saturating_duration_since(now));
-    // Only the timer ends it.
-    _ = crate::tokio::wait::arm_at(at, std::future::pending::<()>()).await;
+    crate::wait::block_probe::record_pause(end.saturating_duration_since(now));
+    // An instant, never a duration re-derived from the deadline (`arm_at`'s contract). Only the
+    // timer ends it.
+    _ = crate::tokio::wait::arm_at(end, std::future::pending::<()>()).await;
     Ok(())
 }
 

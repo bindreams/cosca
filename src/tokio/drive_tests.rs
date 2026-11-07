@@ -295,7 +295,7 @@ async fn async_run_arms_a_cut_pause_at_the_deadline_instant() {
 
     let (tx, armed) = std::sync::mpsc::channel();
     let _seam = install(tx);
-    // Under a quarter of the first 1 ms step: the deadline cuts the first pause.
+    // Half of the first 1 ms step: the deadline cuts the first pause.
     let deadline = absolute(Some(Duration::from_micros(500))).expect("a finite deadline");
     // The clock reads later in the pause than when the look ended.
     let moved = std::rc::Rc::new(std::cell::RefCell::new(None));
