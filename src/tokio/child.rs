@@ -1229,16 +1229,19 @@ impl Child {
     ///
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs
-    /// in: that job's lifetime is the launcher's concern, and
-    /// `breakaway_from_job()` (Windows) is the way out of it.
+    /// in (see `breakaway_from_job()`).
     ///
     /// # Errors
     ///
     /// On Windows, the refusal of the OS to clear `KILL_ON_JOB_CLOSE` on the child's Job Object
     /// ([`Error::Io`], with the Win32 code). The handle is then unchanged and still armed: its
     /// drop kills the tree. Retry `detach`, keep the handle, or kill the tree on purpose. No other
-    /// platform's disarm can fail.
+    /// platform's disarm can fail. A child that `kill_on_drop(false)` already disarmed is `Ok`
+    /// without asking the OS.
     pub fn detach(&mut self) -> Result<(), Error> {
+        if !self.kill_on_drop {
+            return Ok(());
+        }
         self.os.attached.disarm().map_err(Error::Io)?;
         self.kill_on_drop = false;
         Ok(())

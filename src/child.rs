@@ -192,10 +192,8 @@ impl Child {
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
     /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
     ///
-    /// A `kill_on_drop(false)` child whose resource refuses the disarm (Windows) is still armed,
-    /// and the caller would be handed a child cosca kills. The commit fails instead: the child is
-    /// torn down as a failed run's is (handed back in the error, if its kill is refused), and the
-    /// refusal is the error's cause.
+    /// A refused disarm (Windows) fails the commit: the still-armed child is torn down as a failed
+    /// run's is (handed back in the error if its kill is refused), with the refusal as the cause.
     pub(crate) fn commit_kill_on_drop(mut self) -> Result<Child, crate::child::spawn::SpawnFailure> {
         let Err(refusal) = self.attached.honor_kill_on_drop(self.kill_on_drop) else {
             return Ok(self);
@@ -905,8 +903,7 @@ impl Child {
     ///
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs
-    /// in: that job's lifetime is the launcher's concern, and
-    /// `breakaway_from_job()` (Windows) is the way out of it.
+    /// in (see `breakaway_from_job()`).
     ///
     /// # Errors
     ///
@@ -914,11 +911,15 @@ impl Child {
     /// ([`Error::Io`], with the Win32 code). The disarm comes first, so nothing was consumed: the
     /// child comes back with the error, still armed, and dropping it kills the tree. Retry
     /// `detach`, keep the handle, or kill the tree on purpose. No other platform's disarm can fail.
+    /// A child that `kill_on_drop(false)` already disarmed is `Ok` without asking the OS.
     #[allow(
         clippy::result_large_err,
         reason = "the child is handed back untouched for the caller to deal with"
     )]
     pub fn detach(mut self) -> Result<(), (Child, Error)> {
+        if !self.kill_on_drop {
+            return Ok(());
+        }
         if let Err(refusal) = self.attached.disarm() {
             return Err((self, Error::Io(refusal)));
         }

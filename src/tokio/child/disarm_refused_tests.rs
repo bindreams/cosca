@@ -62,6 +62,22 @@ async fn a_refused_detach_is_returned_and_leaves_the_child_armed() {
     wait_for_exit(&observer);
 }
 
+/// A `detach` of a child the spawn already disarmed has nothing to clear: `Ok`, and the job is not
+/// asked again, so a job that would refuse changes nothing.
+///
+/// Mutant: `detach` clears the job's flag whatever `kill_on_drop` says.
+#[skuld::test]
+async fn detaching_a_child_that_is_already_disarmed_is_ok_without_asking_the_job() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, stdin, id) = refusing_child(false);
+
+    child.detach().expect("the child was already disarmed");
+
+    assert_eq!(id.is_alive(), Liveness::Alive);
+    drop(stdin);
+    drop(child);
+}
+
 /// A spawn with `kill_on_drop(false)` whose disarm is refused fails, and its child, still armed, is
 /// torn down.
 ///

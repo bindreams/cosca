@@ -43,8 +43,7 @@ use crate::error::Error;
 ///
 /// Dropping a live `Job` closes the underlying job handle, which — because
 /// `KILL_ON_JOB_CLOSE` is set — **terminates every process still in it**, exactly like
-/// [`kill_tree`](Job::kill_tree). Call [`disarm`](Job::disarm) first to opt out, and check that it
-/// returned `Ok`: a refused disarm leaves the job armed.
+/// [`kill_tree`](Job::kill_tree). Call [`disarm`](Job::disarm) first to opt out.
 #[derive(Debug)]
 pub struct Job(JobHandle);
 

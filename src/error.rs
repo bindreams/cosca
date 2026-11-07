@@ -285,8 +285,7 @@ pub enum Error {
     /// blocking wait on a runtime thread is forbidden). So do
     /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) and its tokio twin for the frozen
     /// child they could not kill after a failed release: that thread may stay frozen, so waiting
-    /// for the child could block for ever. After a successful release the sync `resume` hands the
-    /// child back like a sync spawn (below); the tokio one leaves it.
+    /// for the child could block for ever. The split by arm is in `resume`'s `# Errors`.
     ///
     /// A failed sync spawn hands back the child when the spawn or run could not end it: on Linux,
     /// when the identity read or the attach fails after the handshake, on every Unix, when the

@@ -435,6 +435,67 @@ mod on_windows {
         remote.wait_for_death();
     }
 
+    /// A frozen child that wants `kill_on_drop(false)` and whose job refuses the disarm, with the
+    /// write end of its stdin.
+    fn frozen_with_a_refusing_job() -> (crate::child::SuspendedChild, crate::PipeWriter) {
+        let (mut cmd, writer) = held_blocker(false);
+        let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
+        frozen.child.attached = crate::containment::Attached::JobObject(
+            crate::containment::windows::JobHandle::create_without_set_access_for_test(),
+        );
+        frozen.wanted_kill_on_drop = false;
+        (frozen, writer)
+    }
+
+    #[track_caller]
+    fn assert_access_denied(error: &Error) {
+        let Error::Io(io) = error else {
+            panic!("expected Io, got {error:?}");
+        };
+        assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{io:?}");
+    }
+
+    /// `resume` of a `kill_on_drop(false)` child whose job refuses the disarm fails with the
+    /// refusal as its cause, and the child is dead.
+    ///
+    /// Mutant: `resume` ignores the commit's failure and returns the child.
+    #[skuld::test]
+    fn resume_whose_disarm_is_refused_fails_and_kills_the_child() {
+        let (frozen, writer) = frozen_with_a_refusing_job();
+        let id = frozen.id().expect(crate::test_child::IDENTITY_READ);
+
+        let err = frozen.resume().expect_err("the disarm was refused");
+
+        let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, writer);
+        assert_access_denied(&cause);
+        assert_eq!(fate, ChildFate::Reaped);
+        assert!(handed_back.is_none(), "the kill worked, so nothing is handed back");
+        assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
+    }
+
+    /// The same refusal with the teardown's kill refused too: the still-running child is handed
+    /// back to settle, the one arm of `resume` that does.
+    ///
+    /// Mutant: `resume` hands nothing back after a successful release.
+    #[skuld::test]
+    fn resume_whose_disarm_and_kill_are_refused_hands_the_child_back() {
+        let (mut frozen, writer) = frozen_with_a_refusing_job();
+        let id = frozen.id().expect(crate::test_child::IDENTITY_READ);
+        frozen
+            .child
+            .proc
+            .script_over(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]));
+
+        let err = frozen.resume().expect_err("the disarm was refused");
+
+        let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, writer);
+        assert_access_denied(&cause);
+        assert_eq!(fate, ChildFate::Running { id: Some(id) });
+        assert!(!handed_back.is_none(), "resume handed no child back");
+        // Releasing the stdin ends the blocker: it exits 0 on EOF.
+        handed_back.wait();
+    }
+
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.

@@ -123,10 +123,10 @@ In order:
      `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child, a
      refused kill or a running elevation front, hands it back as `Unreaped`, in
      `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
-     the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`.
-     `SuspendedChild::resume` runs it too but leaves the child after a failed release, since a
-     frozen thread may never run; after a successful release its disarm refusal hands the child back.
-     Windows and macOS still tear down by themselves.
+     the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`, and so does
+     the sync Windows `kill_on_drop(false)` disarm refusal (`Child::commit_kill_on_drop`).
+     `SuspendedChild::resume` runs it too; `# Errors` there has the split by arm. Windows and macOS
+     still tear down by themselves for their other spawn failures.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`

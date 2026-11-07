@@ -56,6 +56,20 @@ fn the_child_a_refused_detach_gave_back_is_killed_on_drop() {
     assert_eq!(id.is_alive(), Liveness::Dead);
 }
 
+/// A `detach` of a child the spawn already disarmed has nothing to clear: `Ok`, and the job is not
+/// asked again, so a job that would refuse changes nothing.
+///
+/// Mutant: `detach` clears the job's flag whatever `kill_on_drop` says.
+#[skuld::test]
+fn detaching_a_child_that_is_already_disarmed_is_ok_without_asking_the_job() {
+    let (child, stdin, id) = refusing_child(false);
+
+    child.detach().expect("the child was already disarmed");
+
+    assert_eq!(id.is_alive(), Liveness::Alive);
+    drop(stdin);
+}
+
 /// A spawn with `kill_on_drop(false)` whose disarm is refused fails, and its child, still armed, is
 /// torn down: the caller is not handed a child that cosca will kill.
 ///
