@@ -17,18 +17,18 @@ use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
 use crate::identity::kinfo::P_WEXIT;
 use crate::test_groups::{tracer_group, Group};
 
-fn tracee() -> (crate::Child, std::io::PipeWriter) {
+fn tracee() -> (crate::Child, crate::PipeWriter) {
     tracee_with(Tracee::Plain)
 }
 
 /// [`tracee`] of `kind` (see [`super::spawn_tracee`]).
-fn tracee_with(kind: Tracee) -> (crate::Child, std::io::PipeWriter) {
+fn tracee_with(kind: Tracee) -> (crate::Child, crate::PipeWriter) {
     tracee_receiving(kind, &[])
 }
 
 /// [`tracee`] of `kind`, which the test sends each of `signals` while it is traced: asserts that
 /// it receives them as the helper's contract needs ([`assert_receives`]).
-fn tracee_receiving(kind: Tracee, signals: &[i32]) -> (crate::Child, std::io::PipeWriter) {
+fn tracee_receiving(kind: Tracee, signals: &[i32]) -> (crate::Child, crate::PipeWriter) {
     let (mut child, ready) = super::spawn_tracee(kind);
     for &signal in signals {
         let caught = kind == Tracee::CatchSigterm && signal == libc::SIGTERM;
@@ -258,7 +258,7 @@ fn assert_terminated(tracee: crate::Child) {
 /// After `detached`: the tracee may stay stopped (measured on CI on macOS 26), so it is ended
 /// with `SIGKILL` through its handle, before its stdin closes: a running one would otherwise
 /// exit on EOF first.
-fn end_detached(tracee: crate::Child, stdin: std::io::PipeWriter) {
+fn end_detached(tracee: crate::Child, stdin: crate::PipeWriter) {
     tracee.kill().expect("kill the detached tracee");
     drop(stdin);
     assert_sigkilled(tracee);

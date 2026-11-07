@@ -5,7 +5,9 @@
 //! Whether anything signalled the `cat` is read from how it ended: it exits 0 once the test closes
 //! its stdin, and dies of `SIGKILL` if it was killed first.
 
-use std::io::{PipeWriter, Read as _};
+use std::io::Read as _;
+
+use crate::PipeWriter;
 
 use crate::test_child::Console;
 use std::os::unix::process::ExitStatusExt as _;

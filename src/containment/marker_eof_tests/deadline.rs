@@ -145,7 +145,7 @@ fn interpret_read_event_suppresses_drain_when_told_to() {
 /// A marker pipe filled to capacity in this process BEFORE its holder exists, so no external
 /// writer races the test, and a live holder of its write end. Returns the holder, its stdin write
 /// end, the marker's read end and the bytes queued.
-fn full_marker_with_a_live_holder() -> (crate::Child, std::io::PipeWriter, std::io::PipeReader, i32) {
+fn full_marker_with_a_live_holder() -> (crate::Child, crate::PipeWriter, std::io::PipeReader, i32) {
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
     let queued = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
     assert!(

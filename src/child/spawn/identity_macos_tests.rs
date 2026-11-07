@@ -94,7 +94,7 @@ pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
     })
 }
 
-pub(crate) fn sync_blocker() -> (crate::Command, std::io::PipeWriter) {
+pub(crate) fn sync_blocker() -> (crate::Command, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -370,7 +370,7 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
 pub(crate) fn arm_launchd_hold(
     pid: &Rc<Cell<u32>>,
     armed: &Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
-    writer: std::io::PipeWriter,
+    writer: crate::PipeWriter,
 ) {
     pid.set(fault::spawn_pid());
     let UniqRead::Found(info) = uniq_info(pid.get(), ReadPurpose::Kill) else {

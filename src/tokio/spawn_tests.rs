@@ -351,7 +351,7 @@ async fn a_child_whose_teardown_kill_is_refused_twice_stays_running_and_unreaped
 /// and the hook that waits for the helper's ready byte before the identity check (it is fully root
 /// once it has written it), armed for the spawn's `BeforeIdentity` point.
 #[cfg(target_os = "linux")]
-fn setuid_blocker_ready_before_identity() -> (Command, std::io::PipeWriter, crate::oneshot_hook::Armed) {
+fn setuid_blocker_ready_before_identity() -> (Command, crate::PipeWriter, crate::oneshot_hook::Armed) {
     use crate::child::spawn::fault::SpawnPoint;
 
     let (cmd, writer, until_root) = setuid_blocker_with_ready();
@@ -362,7 +362,7 @@ fn setuid_blocker_ready_before_identity() -> (Command, std::io::PipeWriter, crat
 /// and the function that waits for the helper's ready byte (it is fully root once it has written
 /// it), for the caller to run where a refused kill is to be refused.
 #[cfg(target_os = "linux")]
-fn setuid_blocker_with_ready() -> (Command, std::io::PipeWriter, impl FnOnce() + 'static) {
+fn setuid_blocker_with_ready() -> (Command, crate::PipeWriter, impl FnOnce() + 'static) {
     use std::io::Read as _;
 
     let (stdin, writer) = crate::test_child::held_writer_stdin();

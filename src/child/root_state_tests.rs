@@ -40,7 +40,7 @@ mod linux {
     use crate::test_groups::namespaces;
     use crate::ContainMode;
 
-    fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+    fn session_blocker() -> (crate::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -318,7 +318,7 @@ mod macos {
     use crate::ContainMode;
 
     /// A tree-walk child: the walk names no marker holder, so the only sends are the root's own.
-    fn walked_blocker() -> (crate::Child, std::io::PipeWriter) {
+    fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -421,7 +421,7 @@ mod macos {
 
     /// A Session (fd-marker) tree: its holders-only sweep must not signal the root, which holds the
     /// marker like any member but is not pinned by this process.
-    fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+    fn session_blocker() -> (crate::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());

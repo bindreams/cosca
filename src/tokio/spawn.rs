@@ -12,8 +12,6 @@ use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, Parent
 use crate::command::Command;
 use crate::error::{ChildFate, Error};
 use crate::identity::Resolved;
-#[cfg(unix)]
-use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
 use super::child::{Child, ProcSource};
@@ -181,24 +179,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             };
             let dir = *dir;
             // Our pipe: the child end goes to the target slot and (dup'd) to each merging
-            // slot; the parent end is stashed for the accessor. Windows: an overlapped
-            // named-pipe pair whose mandatory `ConnectNamedPipe` is spawned as a real task
-            // here, INSIDE the runtime (the stream wrapper polls it before its first I/O).
-            #[cfg(unix)]
-            let (child_end, parent_end) = {
-                use crate::child::spawn::ChildEnd;
-                use crate::child::ParentEnd;
-                let (reader, writer) = std::io::pipe().not_started()?;
-                match dir {
-                    Direction::In => (ChildEnd::from(reader), ParentEnd::Writer(writer)),
-                    Direction::Out => (ChildEnd::from(writer), ParentEnd::Reader(reader)),
-                }
-            };
-            #[cfg(windows)]
-            let (child_end, parent_end) = {
-                let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;
-                (crate::child::spawn::ChildEnd::from(child_end), parent_end)
-            };
+            // slot; the parent end is stashed for its accessor.
+            let (child_end, parent_end) = crate::child::spawn::make_pipe(dir).not_started()?;
             // Merging slots: each gets a dup of the child end. A merging slot with
             // raw() >= 3 (Unix only — Windows routed fd >= 3 to the raw backend above) is not
             // assignable as std stdio: it joins the fd >= 3 child-ends collection the fd_map

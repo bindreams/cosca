@@ -6,8 +6,9 @@
 //! TreeWalk) — the full sync feature set. It reuses the sync backend's `CreateProcessW` FFI verbatim
 //! (`spawn_step`/`create_process`, the fd-table encode + cap, the STARTUPINFOEXW/HANDLE_LIST build,
 //! the containment decision, the lock/close discipline, the error-teardown) and differs only where
-//! async demands it: piped ends come from the tokio overlapped-named-pipe machinery (std slots via
-//! the stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), and the owned child is
+//! async demands it: the parent ends of piped slots are the sync spawn's (`make_pipe`), which an
+//! accessor registers with the reactor when taken (std slots via the stdin/stdout/stderr
+//! accessors, fd >= 3 via fd_read_end/fd_write_end), and the owned child is
 //! a [`RawAsyncChild`] whose waits run on the blocking pool over a cancellable handle wait.
 
 use std::collections::BTreeMap;
@@ -23,8 +24,8 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{
-    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, Diagnosis, ParentStd,
-    SpawnFailure,
+    attach_or_fault, dup, make_pipe, resolve_identity, resolve_non_merge, spawn_lock, ChildEnd, Classify, Diagnosis,
+    ParentStd, SpawnFailure,
 };
 use crate::command::Command;
 use crate::error::{win32_io_error, ChildFate, Error};
@@ -266,9 +267,8 @@ pub(crate) fn spawn_raw(
     sync_raw::ensure_fd_table_fits(&fds).not_started()?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3 to child handles: piped slots via the
-    // tokio overlapped-pipe machinery (we own the async parent ends — std slots via the
-    // stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), merges as dups, the rest
-    // (inherit/file/null) via the shared core (which rejects inherit on fd >= 3).
+    // `make_pipe`, merges as dups, the rest (inherit/file/null) via the shared core (which rejects
+    // inherit on fd >= 3).
     let parent_std = ParentStd::read();
     let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds, parent_std).not_started()?;
 
@@ -383,7 +383,7 @@ fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::P
 type RawEnds = (BTreeMap<Fd, ChildEnd>, BTreeMap<Fd, OwnedStd>, BTreeMap<Fd, OwnedStd>);
 
 /// Resolve the child's handle ends (0/1/2 + fd >= 3) for the raw backend, plus the async parent ends
-/// we own. Piped slots use OUR overlapped pipe (tokio owns none here — there is no
+/// we own. Piped slots use `make_pipe`'s (tokio owns none here — there is no
 /// `tokio::process::Child`); merges dup their target's child end; the rest resolve via the shared
 /// core (which rejects inherit on fd >= 3).
 fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>, parent_std: ParentStd) -> Result<RawEnds, Error> {
@@ -410,15 +410,14 @@ fn resolve_raw_ends(fds: &BTreeMap<Fd, ResolvedStdio>, parent_std: ParentStd) ->
     let mut child_ends: BTreeMap<Fd, ChildEnd> = BTreeMap::new();
     let mut owned_std: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
     let mut fd_pipes: BTreeMap<Fd, OwnedStd> = BTreeMap::new();
-    // First pass: non-merge slots. Piped slots use our overlapped pipe (async parent end stashed —
-    // std slots for the stdin/stdout/stderr accessors, fd >= 3 for fd_read_end/fd_write_end); the
-    // rest (inherit/file/null/unconfigured std) resolve via the shared core.
+    // First pass: non-merge slots. Piped slots: `make_pipe`; the parent end is stashed for its
+    // accessor. The rest (inherit/file/null/unconfigured std) resolve via the shared core.
     for &slot in &slots {
         match fds.get(&slot) {
             Some(ResolvedStdio::Merge(_)) => continue, // second pass
             Some(ResolvedStdio::Pipe(dir)) => {
-                let (child_end, parent) = crate::tokio::stdio::owned_overlapped_pipe(*dir)?;
-                child_ends.insert(slot, ChildEnd::from(child_end));
+                let (child_end, parent) = make_pipe(*dir)?;
+                child_ends.insert(slot, child_end);
                 if slot.raw() < 3 {
                     owned_std.insert(slot, parent);
                 } else {

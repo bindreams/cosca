@@ -43,7 +43,7 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_grou
 }
 
 /// A tracee held by a tracer, its handle, and the stdin that ends it.
-fn held() -> (crate::Child, std::io::PipeWriter) {
+fn held() -> (crate::Child, crate::PipeWriter) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     (tracee, stdin)
@@ -133,7 +133,7 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
 
 /// The live blocker [`tracer::spawn_tracee`] makes, its stdin (closing it ends the tracee), and its
 /// unique id.
-fn tracee_with_unique() -> (crate::Child, std::io::PipeWriter, u64) {
+fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let unique = match uniq_info(tracee.pid(), ReadPurpose::Adopt) {

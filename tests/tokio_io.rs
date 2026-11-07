@@ -613,7 +613,7 @@ async fn async_unix_fd3_null_is_accepted() {
 }
 
 // Windows fd >= 3 routes through the async raw `CreateProcessW` backend (Plan 12 Task 8): the
-// MSVCRT fd-table wires the descriptor and the parent end is the overlapped-named-pipe async end.
+// MSVCRT fd-table wires the descriptor and the parent end is the overlapped pipe tokio adopts.
 // Its round-trips (both directions) + contained twin live in `tests/raw_windows_async.rs`,
 // alongside the rest of the raw-backend proofs.
 
@@ -1007,7 +1007,7 @@ async fn async_plain_piped_stream_accessor_has_take_semantics() {
 /// `stdin-split-echo` mode reads EXACTLY 3 bytes from fd 0, then fd 2 to EOF: dup'd
 /// descriptors share ONE pipe, so `abc|def` proves the merging slot's handle is a LIVE dup
 /// of that pipe — a silently skipped dup could not produce the tail. Parent writes via the
-/// OWNED stdin path (Windows `WinOwnedWrite`; Unix `pipe::Sender`), EOF by drop.
+/// OWNED stdin path (Windows `NamedPipeServer`; Unix `pipe::Sender`), EOF by drop.
 #[skuld::test]
 async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

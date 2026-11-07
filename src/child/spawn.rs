@@ -12,12 +12,13 @@ use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
-use crate::child::{Child, ParentEnd};
+use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp};
 #[cfg(any(unix, feature = "tokio"))]
 use crate::error::ChildFate;
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::pipe::ParentEnd;
 use crate::stdio::{Direction, Fd, ResolvedStdio};
 
 // A child-side descriptor handed to std via `Stdio::from`.
@@ -2000,19 +2001,15 @@ pub(crate) fn resolve_non_merge(
         None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot, parent_std)?, None)),
         Some(ResolvedStdio::Null) => Ok((null_end()?, None)),
         Some(ResolvedStdio::File(f)) => Ok((file_end(f)?, None)),
-        Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir),
+        Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir).map(|(child_end, parent_end)| (child_end, Some(parent_end))),
         Some(ResolvedStdio::Merge(_)) => unreachable!("merge handled in second pass"),
     }
 }
 
-fn make_pipe(dir: Direction) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
-    let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
-    match dir {
-        // Child reads: child gets the reader; parent keeps the writer.
-        Direction::In => Ok((ChildEnd::from(reader), Some(ParentEnd::Writer(writer)))),
-        // Child writes: child gets the writer; parent keeps the reader.
-        Direction::Out => Ok((ChildEnd::from(writer), Some(ParentEnd::Reader(reader)))),
-    }
+/// The pipe for one piped slot, for every spawn: the child's end and the parent's.
+pub(crate) fn make_pipe(dir: Direction) -> Result<(ChildEnd, ParentEnd), Error> {
+    let (child_end, parent_end) = crate::pipe::child_pipe(dir).map_err(Error::Io)?;
+    Ok((ChildEnd::from(child_end), parent_end))
 }
 
 pub(crate) fn dup(end: &ChildEnd) -> Result<ChildEnd, Error> {

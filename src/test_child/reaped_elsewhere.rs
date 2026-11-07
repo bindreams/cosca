@@ -197,8 +197,8 @@ pub(crate) fn assert_left_the_group(holder: u32, root: u32) {
 pub(crate) struct EscapedHolder {
     pub(crate) pid: u32,
     /// Held so the holder's `cat` ends only when killed.
-    _stdin: std::io::PipeWriter,
-    stderr: std::io::PipeReader,
+    _stdin: crate::PipeWriter,
+    stderr: crate::PipeReader,
 }
 
 #[cfg(target_os = "macos")]

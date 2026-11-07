@@ -152,9 +152,9 @@ fn kill_tree_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
 /// `converge` lists it.
 pub(crate) struct EmptiedGroup {
     root: crate::Child,
-    stdin: std::io::PipeWriter,
-    stdout: std::io::PipeReader,
-    stderr: std::io::PipeReader,
+    stdin: crate::PipeWriter,
+    stdout: crate::PipeReader,
+    stderr: crate::PipeReader,
     other: std::process::Child,
 }
 
@@ -226,8 +226,8 @@ impl EmptiedGroup {
 /// An armed [`EmptiedGroup`] without its root.
 pub(crate) struct Armed {
     guard: Box<dyn std::any::Any>,
-    stdin: std::io::PipeWriter,
-    stderr: std::io::PipeReader,
+    stdin: crate::PipeWriter,
+    stderr: crate::PipeReader,
     other: std::process::Child,
 }
 

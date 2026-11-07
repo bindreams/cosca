@@ -49,7 +49,7 @@ fn session(argv: &[&str]) -> Command {
 /// must see a kill end it drops the writer only after the kill: a `kill` that sent nothing then
 /// fails the assertion on how the root ended, instead of leaving a wait unbounded. A drop that
 /// blocks until the root is reaped gets its writer through [`release_at_drop_kill`].
-fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+fn session_blocker() -> (crate::Child, crate::PipeWriter) {
     let mut cmd = session(crate::test_child::BLOCKER_ARGV);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -82,9 +82,9 @@ fn root_that_leaves(script: &str) -> Command {
     allow(dead_code, reason = "the echo round trip is the non-macOS test's")
 )]
 struct CatPipes {
-    stdin: std::io::PipeWriter,
-    stdout: std::io::PipeReader,
-    stderr: std::io::PipeReader,
+    stdin: crate::PipeWriter,
+    stdout: crate::PipeReader,
+    stderr: crate::PipeReader,
 }
 
 /// Spawn [`root_that_leaves_a_cat`] and read its `started`: the `cat` is forked, and the root is

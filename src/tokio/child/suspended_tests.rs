@@ -109,7 +109,7 @@ mod on_windows {
     /// `true` leg is `more.com` (exit 0 on EOF) and returns its write end, which the test drops only
     /// after the drop's kill, so the exit code tells a kill (1) from a release (0). The `false` leg
     /// pipes stdin and stdout, which [`drop_and_expect_it_runs`] keeps past the drop.
-    fn drop_leg_blocker(kill_on_drop: bool) -> (Command, Option<std::io::PipeWriter>) {
+    fn drop_leg_blocker(kill_on_drop: bool) -> (Command, Option<crate::PipeWriter>) {
         if kill_on_drop {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(true);
@@ -126,7 +126,7 @@ mod on_windows {
 
     /// Drop `child` (built by [`drop_leg_blocker`]`(true)`), then release its stdin: the drop's kill
     /// came first, so the child dies with the kill's exit code, or the test fails by assertion.
-    fn drop_and_expect_it_killed(child: Child, writer: Option<std::io::PipeWriter>, what: &str) {
+    fn drop_and_expect_it_killed(child: Child, writer: Option<crate::PipeWriter>, what: &str) {
         let remote = Remote::open(child.pid());
         drop(child);
         drop(writer);
@@ -469,7 +469,7 @@ mod on_windows {
 
     /// Hold `cmd`'s stdin (`more.com` exits 0 on EOF): the test releases it only after the drop, so
     /// the exit code tells the drop's kill (1) from a release (0).
-    fn hold_stdin(cmd: &mut Command) -> std::io::PipeWriter {
+    fn hold_stdin(cmd: &mut Command) -> crate::PipeWriter {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         cmd.stdin(stdin).expect("stdin");
         writer
@@ -480,7 +480,7 @@ mod on_windows {
     /// resumed, a kill that sent nothing lets the blocker exit 0 and fail the exit-code assertion
     /// instead of leaving the wait for its death to hang. After a real kill the resume fails, and is
     /// ignored.
-    fn release_and_expect_it_killed(thread: &InitialThread, writer: std::io::PipeWriter, remote: &Remote, what: &str) {
+    fn release_and_expect_it_killed(thread: &InitialThread, writer: crate::PipeWriter, remote: &Remote, what: &str) {
         drop(writer);
         thread.resume_whatever_the_outcome();
         remote.wait_for_death();
@@ -490,7 +490,7 @@ mod on_windows {
     /// Drop `frozen`, then release it (see [`release_and_expect_it_killed`]). The drop is the async
     /// `Child`'s bounded one: it signals and returns, so the proof is the process object, opened
     /// while the frozen child pins the pid.
-    fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: std::io::PipeWriter, what: &str) {
+    fn drop_frozen_and_expect_it_killed(frozen: crate::tokio::SuspendedChild, writer: crate::PipeWriter, what: &str) {
         let remote = Remote::open(frozen.pid());
         let thread = InitialThread::of(frozen.pid());
         drop(frozen);

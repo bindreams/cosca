@@ -10,7 +10,9 @@
 use std::cell::{Cell, RefCell};
 
 use crate::test_child::Console;
-use std::io::{PipeReader, PipeWriter, Read as _};
+use std::io::Read as _;
+
+use crate::{PipeReader, PipeWriter};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::rc::Rc;
@@ -465,7 +467,7 @@ pub(crate) fn spawn_front_with_member() -> FrontWithMember {
     FrontWithMember {
         child,
         stdin,
-        member_stdin,
+        member_stdin: member_stdin.into(),
         member: pidfd_of(member),
         stdout,
     }
@@ -998,7 +1000,7 @@ pub(crate) fn failed_held_front_spawns(
     arms.map(|force_arm| {
         arm += 1;
         let (reader, writer) = std::io::pipe().expect("pipe");
-        let stdin = Rc::new(RefCell::new(Some(writer)));
+        let stdin = Rc::new(RefCell::new(Some(writer.into())));
         let mut cmd = in_cgroup(cat());
         cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
             .expect("stdin");
@@ -1729,7 +1731,7 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
         .expect("stdin");
     cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
     crate::containment::cgroup::fault::set_force_placement_write_result(0);
-    (cmd, writer)
+    (cmd, writer.into())
 }
 
 /// Spawns `cmd`, a front, through `spawn` with its identity check failing (`Gone`), and returns the

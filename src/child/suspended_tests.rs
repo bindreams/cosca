@@ -66,7 +66,7 @@ mod on_windows {
     const BACKENDS: [bool; 2] = [false, true];
 
     /// [`blocker`] with a stdin whose write end the test holds, for a frozen child the test drops.
-    fn held_blocker(raw: bool) -> (crate::Command, std::io::PipeWriter) {
+    fn held_blocker(raw: bool) -> (crate::Command, crate::PipeWriter) {
         let mut cmd = blocker(raw);
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         cmd.stdin(stdin).expect("stdin");
@@ -78,7 +78,7 @@ mod on_windows {
     /// the blocker exit 0, which `assert_reaps_killed` rejects.
     fn release_at_teardown_kill(
         frozen: &crate::child::SuspendedChild,
-        writer: std::io::PipeWriter,
+        writer: crate::PipeWriter,
     ) -> crate::child::spawn::fault::TeardownBlocker {
         let thread = InitialThread::of(frozen.pid());
         crate::child::spawn::fault::release_at_drop_kill((writer, ResumeOnDrop(thread)))
