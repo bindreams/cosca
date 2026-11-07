@@ -140,12 +140,14 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_keeps_the_child_withou
     );
     assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
     assert!(has_not_exited(pid.get()), "the child must be left running, unreaped");
-    // The failed re-read is the event's one warn, logged when the spawn ends.
+    // A kept child warns nothing: the failed re-read is logged once, at debug.
     let warns = crate::log_capture::warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns.is_empty(), "{warns:?}");
+    let noted = crate::log_capture::records_since_on_current_thread(mark, "forced re-read refusal 5d1b");
     assert!(
-        warns[0].contains("could not be checked against its handle (forced re-read refusal 5d1b)"),
-        "the one warn names the failed re-read: {warns:?}"
+        matches!(&noted[..], [(log::Level::Debug, line)]
+            if line.contains("could not be checked against its handle (forced re-read refusal 5d1b)")),
+        "one debug record names the failed re-read: {noted:?}"
     );
     // A kept child is killed through its handle like any other.
     child.kill().expect("a kept child is killed through its unique id");
