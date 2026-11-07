@@ -95,7 +95,7 @@ pub(crate) fn run_hook(point: HookPoint) {
 /// ([`HookPoint::AfterRootLook`]). A failed spawn's cleanup looks once for its own kill, and an armed
 /// handle's drop starts with a look of its own, whatever it then logs: that second look shows the
 /// handle was armed, and its absence that it was not.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[must_use = "dropping this immediately clears the watch"]
 pub(crate) struct SecondLook {
     seen: std::rc::Rc<std::cell::Cell<bool>>,
@@ -104,7 +104,7 @@ pub(crate) struct SecondLook {
 }
 
 /// Start a [`SecondLook`] watch; arm it before the call.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn watch_for_a_second_look() -> SecondLook {
     let seen = std::rc::Rc::new(std::cell::Cell::new(false));
     let second: std::rc::Rc<std::cell::RefCell<Option<Armed>>> = std::rc::Rc::default();
@@ -119,7 +119,7 @@ pub(crate) fn watch_for_a_second_look() -> SecondLook {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl SecondLook {
     /// Whether a second look followed the first.
     pub(crate) fn seen(&self) -> bool {
