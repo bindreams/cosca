@@ -641,9 +641,9 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         attach_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
-        let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+        let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
         if commit {
-            child.commit_kill_on_drop();
+            child = child.commit_kill_on_drop().expect("commit");
         }
         child.kill().expect("end the stand-in root");
         // Released only after the kill, so a child that exits 0 was not killed.
@@ -678,7 +678,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
-    child.attached.disarm();
+    child.attached.disarm().expect("disarm");
 
     let written = Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
@@ -784,7 +784,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
-    child.attached.disarm();
+    child.attached.disarm().expect("disarm");
 
     // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
     // directory fails EISDIR.

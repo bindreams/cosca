@@ -11,7 +11,7 @@ use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 #[cfg(unix)]
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
-pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
+pub(crate) use crate::child::spawn::failure::{after_the_spawn, failed_after_the_spawn, Classify, SpawnFailure};
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp};
 #[cfg(any(unix, feature = "tokio"))]
@@ -28,9 +28,7 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
-    let child = spawn_uncommitted(cmd)?;
-    child.commit_kill_on_drop();
-    Ok(child)
+    spawn_uncommitted(cmd)?.commit_kill_on_drop()
 }
 
 /// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down

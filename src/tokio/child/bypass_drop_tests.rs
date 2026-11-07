@@ -120,7 +120,7 @@ fn force_evidence() -> impl Sized {
 #[skuld::test]
 async fn tokio_bypass_drop_of_a_detached_child_after_a_foreign_reap_reaps_nothing() {
     let (mut child, witness) = exited_unreaped(true);
-    child.detach();
+    child.detach().expect("detach");
     let _evidence = force_evidence();
     drop(child);
     witness.reap().expect("the drop must not have reaped the child by pid");

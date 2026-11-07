@@ -562,6 +562,12 @@ impl Command {
     /// drained it first. A `kill_tree()` that returned `Err` leaves nothing for the drop to wait
     /// for. cosca does not come back for a leaf it left: the empty `cosca-*` directory stays until
     /// something else removes it, such as systemd removing a stopped unit's cgroup subtree.
+    ///
+    /// **On Windows, opting out clears `KILL_ON_JOB_CLOSE` on the child's Job Object, and a spawn
+    /// whose OS refuses that fails** (`Error::MayHaveStarted`, the refusal as its cause): the child
+    /// is still armed, so it is torn down, never handed over as one cosca no longer kills. A job
+    /// the spawning process itself runs in is the launcher's concern;
+    /// [`breakaway_from_job`](Command::breakaway_from_job) is the way out of it.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {
         self.kill_on_drop = yes;
         self

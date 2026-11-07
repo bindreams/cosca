@@ -349,8 +349,23 @@ impl Child {
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
     /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
-    pub(super) fn commit_kill_on_drop(&self) {
-        self.os.attached.honor_kill_on_drop(self.kill_on_drop);
+    ///
+    /// A `kill_on_drop(false)` child whose resource refuses the disarm (Windows) fails the commit:
+    /// the child, still armed, is torn down as a failed run's is, and the refusal is the error's
+    /// cause.
+    pub(super) fn commit_kill_on_drop(mut self) -> Result<Child, crate::child::spawn::SpawnFailure> {
+        let Err(refusal) = self.os.attached.honor_kill_on_drop(self.kill_on_drop) else {
+            return Ok(self);
+        };
+        // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
+        self.kill_on_drop = true;
+        let fate = self.tear_down_now(crate::containment::dispatch::TeardownCaller::FailedRun);
+        Err(crate::child::spawn::failed_after_the_spawn(
+            Error::Io(refusal),
+            fate,
+            None,
+            self.behind_wrapper(),
+        ))
     }
 
     /// Kill the contained tree through its containment only, without the root's own kill that
@@ -1211,9 +1226,22 @@ impl Child {
     /// Dropping never waits: a leaf this handle killed and that has not drained is left behind
     /// with a warning, and one nothing killed is left at `debug`, since the caller asked for that.
     /// Call [`wait_tree`](Self::wait_tree) before dropping to observe the drain.
-    pub fn detach(&mut self) {
+    ///
+    /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
+    /// containment resource's close. It makes no promise about a job the caller's own process runs
+    /// in: that job's lifetime is the launcher's concern, and
+    /// [`breakaway_from_job`](crate::tokio::Command::breakaway_from_job) is the way out of it.
+    ///
+    /// # Errors
+    ///
+    /// On Windows, the refusal of the OS to clear `KILL_ON_JOB_CLOSE` on the child's Job Object
+    /// ([`Error::Io`], with the Win32 code). The handle is then unchanged and still armed: its
+    /// drop kills the tree. Retry `detach`, keep the handle, or kill the tree on purpose. No other
+    /// platform's disarm can fail.
+    pub fn detach(&mut self) -> Result<(), Error> {
+        self.os.attached.disarm().map_err(Error::Io)?;
         self.kill_on_drop = false;
-        self.os.attached.disarm();
+        Ok(())
     }
 }
 
@@ -1338,6 +1366,10 @@ mod windows_signal_tests;
 #[cfg(all(test, windows))]
 #[path = "child/windows_teardown_tests.rs"]
 mod windows_teardown_tests;
+
+#[cfg(all(test, windows))]
+#[path = "child/disarm_refused_tests.rs"]
+mod disarm_refused_tests;
 
 #[cfg(all(test, windows))]
 #[path = "child/pipe_mode_tests.rs"]

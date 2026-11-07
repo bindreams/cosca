@@ -82,8 +82,7 @@ impl SuspendedChild {
         match platform::release(&child) {
             Ok(()) => {
                 child.kill_on_drop = wanted_kill_on_drop;
-                child.commit_kill_on_drop();
-                Ok(child)
+                child.commit_kill_on_drop().map_err(Error::from)
             }
             Err(e) => {
                 let fate = child.tear_down_now(crate::containment::dispatch::TeardownCaller::FailedRun);

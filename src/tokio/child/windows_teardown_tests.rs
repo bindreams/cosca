@@ -54,7 +54,7 @@ fn blocker_child() -> (
 }
 
 /// A handle of our own to the process `pid`, which outlives tokio's.
-fn observer_handle(pid: u32) -> OwnedHandle {
+pub(super) fn observer_handle(pid: u32) -> OwnedHandle {
     // SAFETY: plain OpenProcess on the live pid that tokio's handle pins.
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .expect("open the child to observe it");

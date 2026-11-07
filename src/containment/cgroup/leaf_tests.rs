@@ -789,7 +789,7 @@ fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
 
     let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
     let mark = crate::log_capture::mark();
-    attached.disarm();
+    attached.disarm().expect("disarm");
     drop(attached);
 
     assert_eq!(
@@ -835,7 +835,7 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
     let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
-    attached.disarm();
+    attached.disarm().expect("disarm");
     drop(attached);
 
     assert!(

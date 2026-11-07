@@ -260,7 +260,7 @@ async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
     let mut child = foreign_reaped(session_blocker_cmd());
-    child.detach();
+    child.detach().expect("detach");
     drop(child);
     assert_eq!(
         (root.kills(), root.forgets(), backend_drops.get()),

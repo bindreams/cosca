@@ -741,7 +741,7 @@ fn detach_leaves_the_child_running() {
         "child runs while its stdin stays open"
     );
 
-    child.detach(); // consumes Child; with kill_on_drop=false, Drop neither kills nor reaps
+    child.detach().expect("detach"); // consumes Child; with kill_on_drop=false, Drop neither kills nor reaps
 
     // The key assertion: detach did NOT kill the process — it is still blocked
     // reading its (still-open) stdin.
@@ -1007,7 +1007,7 @@ fn windows_detach_leaves_the_tree_running() {
     } = spawn_contained_echo_tree(true);
     assert_eq!(child.containment(), cosca::Containment::JobObject);
 
-    child.detach();
+    child.detach().expect("detach");
 
     common::assert_echoes(&mut root, "the detached root");
     common::assert_echoes(&mut grand, "the detached grandchild");
@@ -1359,7 +1359,10 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group
 #[skuld::test]
 fn linux_cgroup_v2_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(true), |child| child.detach());
+    assert_opted_out_tree_survives(
+        || spawn_contained_echo_tree(true),
+        |child| child.detach().expect("detach"),
+    );
 }
 
 /// `kill_on_drop(false)` must leave a cgroup-contained tree running, exactly as `detach()`
