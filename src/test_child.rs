@@ -185,13 +185,13 @@ impl Drop for ClosedStdio {
 /// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.
-pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, std::io::PipeWriter) {
+pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, crate::PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
     let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
     #[cfg(windows)]
     let file = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-    (crate::stdio::Stdio::from_file(file), writer)
+    (crate::stdio::Stdio::from_file(file), writer.into())
 }
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
@@ -252,18 +252,18 @@ pub(crate) const IDENTITY_READ: &str = "the spawn read the child's identity";
 /// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin. On Windows it has
 /// a windowless console of its own, which a `CTRL_BREAK` from this process cannot reach: a test
 /// of the graceful signals takes [`held_contained_blocker_on_console`].
-pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, crate::PipeWriter) {
     held_blocker(stdout, Console::Hidden, |cmd| _ = cmd.contain())
 }
 
 /// [`held_contained_blocker`] on this process's console, for a test of the graceful signals.
-pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn held_contained_blocker_on_console(stdout: crate::Stdio) -> (crate::Child, crate::PipeWriter) {
     held_blocker(stdout, Console::Asked, |cmd| _ = cmd.contain())
 }
 
 /// A live [`held_contained_blocker`] with a null stdout and its identity.
 #[cfg(windows)]
-pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::identity::ProcessId) {
+pub(crate) fn live_blocker() -> (crate::Child, crate::PipeWriter, crate::identity::ProcessId) {
     let (child, stdin) = held_contained_blocker(crate::Stdio::null());
     let id = child.id().expect(IDENTITY_READ);
     (child, stdin, id)
@@ -271,14 +271,14 @@ pub(crate) fn live_blocker() -> (crate::Child, std::io::PipeWriter, crate::ident
 
 /// [`held_contained_blocker`], contained by [`contain_without_cgroup`].
 #[cfg(unix)]
-pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (crate::Child, crate::PipeWriter) {
     held_blocker(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup(cmd))
 }
 
 /// A spawned [`ContainMode::TreeWalk`](crate::ContainMode::TreeWalk) [`BLOCKER_ARGV`] child with a
 /// null stdout, and the write end of its stdin.
 #[cfg(target_os = "linux")]
-pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn held_treewalk_blocker() -> (crate::Child, crate::PipeWriter) {
     held_blocker(crate::Stdio::null(), Console::Hidden, |cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     })
@@ -288,7 +288,7 @@ pub(crate) fn held_treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
 #[cfg(target_os = "linux")]
 pub(crate) fn held_treewalk_blocker_leaving(
     left: crate::containment::treewalk::fault::LeftBehind,
-) -> (crate::Child, std::io::PipeWriter) {
+) -> (crate::Child, crate::PipeWriter) {
     let blocker = held_treewalk_blocker();
     crate::containment::treewalk::fault::force_incomplete_once(left);
     blocker
@@ -296,7 +296,7 @@ pub(crate) fn held_treewalk_blocker_leaving(
 
 /// A live [`BLOCKER_ARGV`] child with no containment, and the write end of its stdin, which the
 /// test holds. `kill_on_drop` is the command's.
-pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = held_writer_stdin();
     let mut cmd = command(Console::Hidden);
     cmd.args(BLOCKER_ARGV.iter().copied());
@@ -422,7 +422,7 @@ fn held_blocker(
     stdout: crate::Stdio,
     console: Console,
     contain: impl FnOnce(&mut crate::Command),
-) -> (crate::Child, std::io::PipeWriter) {
+) -> (crate::Child, crate::PipeWriter) {
     let mut cmd = command(console);
     cmd.args(BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
@@ -1492,18 +1492,18 @@ pub(crate) fn windows_more() -> std::path::PathBuf {
 /// A contained [`windows_more`] child blocked on a piped stdin the caller holds. It ends only by a
 /// real kill or the caller closing the pipe (exit 0). Stdout is nulled because `more` echoes.
 #[cfg(windows)]
-pub(crate) fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn windows_blocker() -> (crate::Child, crate::PipeWriter) {
     windows_blocker_with(Console::Hidden)
 }
 
 /// [`windows_blocker`] on this process's console, for a test of the graceful signals.
 #[cfg(windows)]
-pub(crate) fn windows_blocker_on_console() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn windows_blocker_on_console() -> (crate::Child, crate::PipeWriter) {
     windows_blocker_with(Console::Asked)
 }
 
 #[cfg(windows)]
-fn windows_blocker_with(console: Console) -> (crate::Child, std::io::PipeWriter) {
+fn windows_blocker_with(console: Console) -> (crate::Child, crate::PipeWriter) {
     let mut cmd = command(console);
     cmd.args([windows_more()]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
@@ -1588,7 +1588,7 @@ pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
 /// its stdin, returned once its readiness byte proves the trap is installed. A test whose only end
 /// for it is a sweep or escalation holds the stdin and releases it after the kill.
 #[cfg(unix)]
-pub(crate) fn term_ignoring_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn term_ignoring_blocker() -> (crate::Child, crate::PipeWriter) {
     use std::io::Read as _;
 
     let mut cmd = command(Console::Hidden);

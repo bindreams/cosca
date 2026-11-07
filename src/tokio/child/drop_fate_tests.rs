@@ -7,7 +7,7 @@ use crate::error::ChildFate;
 use crate::test_child::Console;
 use crate::wait::exit_only::seams::force_peeks;
 
-fn live(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
+fn live(kill_on_drop: bool) -> (crate::tokio::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -18,7 +18,7 @@ fn live(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
 
 /// Collects a forgotten child the test still owns: ends its stdin, waits for its exit, and answers
 /// how it ended.
-fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) -> std::process::ExitStatus {
+fn collect(id: crate::identity::ProcessId, writer: crate::PipeWriter) -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt as _;
     drop(writer);
     let mut status = 0;
@@ -104,7 +104,7 @@ async fn a_disarmed_teardown_with_a_failed_peek_says_running_not_gone() {
 
 /// A live child whose backend was forgotten, shown reaped elsewhere (`true`) or not shown to be
 /// ours (`false`).
-fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
+fn forgotten(reaped_elsewhere: bool) -> (crate::tokio::Child, crate::PipeWriter) {
     let (mut child, writer) = live(true);
     child.os.proc_mut().forget_as(
         "was forgotten by a test",

@@ -25,7 +25,7 @@ use crate::signal::Sig;
 use crate::wait::exit_only::seams::{force_peek_once, Forced};
 use crate::ContainMode;
 
-fn blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
+fn blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -36,7 +36,7 @@ fn blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
 
 /// A blocker spawned with the marker's install made to fail, so the spawn degrades to the
 /// mechanism the marker takes priority over.
-fn degraded_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
+fn degraded_blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
     use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
     // A failed install logs, and a sibling test scans the shared log for its own text.
     let _serialize = lock_for_log_assertion();
@@ -48,7 +48,7 @@ fn degraded_blocker(mode: ContainMode) -> (crate::Child, std::io::PipeWriter) {
 
 /// A tree-walk child: its root is signalled by identity. (On macOS `TreeWalk` is only the
 /// mechanism when the marker cannot be installed, which is made to happen here.)
-pub(crate) fn walked_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = degraded_blocker(ContainMode::TreeWalk);
     assert!(
         matches!(child.attached, crate::containment::Attached::TreeWalk(_)),
@@ -58,7 +58,7 @@ pub(crate) fn walked_blocker() -> (crate::Child, std::io::PipeWriter) {
 }
 
 /// A session (fd-marker) child: its group is signalled with `killpg`.
-pub(crate) fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = blocker(ContainMode::Session);
     assert!(
         matches!(child.attached, crate::containment::Attached::FdMarker(_)),
@@ -68,7 +68,7 @@ pub(crate) fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
 }
 
 /// A process-group child.
-pub(crate) fn group_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = degraded_blocker(ContainMode::Session);
     assert!(
         matches!(child.attached, crate::containment::Attached::ProcessGroup(_)),
@@ -80,7 +80,7 @@ pub(crate) fn group_blocker() -> (crate::Child, std::io::PipeWriter) {
 /// A session child whose root `cat` (held on its stdin, so only a signal ends it) holds one
 /// descendant `sleep`, a second marker holder, and that descendant's pid, read once the root has
 /// started it. Neither exits on its own, so the holders do not change under a sweep.
-pub(crate) fn session_tree() -> (crate::Child, std::io::PipeWriter, u32) {
+pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);

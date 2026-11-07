@@ -58,7 +58,7 @@ fn never_allocated_fd() -> BorrowedFd<'static> {
 /// supervisor bug the guard exists to catch, and would make `arm`/`probe` refuse rather
 /// than report `MembersRemain`. A real holder in ANOTHER process is what "the write end is
 /// open" is supposed to mean here.
-fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std::io::PipeWriter) {
+fn spawn_marker_holder(script: &str) -> (crate::Child, crate::PipeReader, crate::PipeWriter) {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable("/bin/sh").args(["sh", "-c", script]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");

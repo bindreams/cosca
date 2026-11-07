@@ -20,6 +20,18 @@ impl From<std::io::PipeWriter> for PipeWriter {
     }
 }
 
+impl From<OwnedFd> for PipeReader {
+    fn from(fd: OwnedFd) -> PipeReader {
+        PipeReader(fd.into())
+    }
+}
+
+impl From<OwnedFd> for PipeWriter {
+    fn from(fd: OwnedFd) -> PipeWriter {
+        PipeWriter(fd.into())
+    }
+}
+
 impl From<PipeReader> for OwnedFd {
     fn from(p: PipeReader) -> OwnedFd {
         p.0.into()

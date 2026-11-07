@@ -1,7 +1,7 @@
 //! The owned child handle.
 
+use crate::pipe::{PipeReader, PipeWriter};
 use std::collections::BTreeMap;
-use std::io::{PipeReader, PipeWriter};
 
 use crate::child::owned::teardown::{Disposition, Kill, Remains};
 #[cfg(unix)]

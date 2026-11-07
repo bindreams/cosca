@@ -12,8 +12,6 @@ use crate::child::spawn::{dup, resolve_identity, resolve_stdio, Classify, Parent
 use crate::command::Command;
 use crate::error::{ChildFate, Error};
 use crate::identity::Resolved;
-#[cfg(unix)]
-use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
 use super::child::{Child, ProcSource};
@@ -185,15 +183,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // named-pipe pair whose mandatory `ConnectNamedPipe` is spawned as a real task
             // here, INSIDE the runtime (the stream wrapper polls it before its first I/O).
             #[cfg(unix)]
-            let (child_end, parent_end) = {
-                use crate::child::spawn::ChildEnd;
-                use crate::child::ParentEnd;
-                let (reader, writer) = std::io::pipe().not_started()?;
-                match dir {
-                    Direction::In => (ChildEnd::from(reader), ParentEnd::Writer(writer)),
-                    Direction::Out => (ChildEnd::from(writer), ParentEnd::Reader(reader)),
-                }
-            };
+            let (child_end, parent_end) = crate::child::spawn::make_pipe(dir).not_started()?;
             #[cfg(windows)]
             let (child_end, parent_end) = {
                 let (child_end, parent_end) = super::stdio::owned_overlapped_pipe(dir).not_started()?;

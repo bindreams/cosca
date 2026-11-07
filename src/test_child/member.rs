@@ -27,16 +27,16 @@ pub(crate) const RELEASE_FD: i32 = 4;
 /// A test's ends of the pipes of [`ROOT_WITH_A_MEMBER`]'s member and root.
 pub(crate) struct Member {
     /// The write end of the member's stdin. Dropped, the member ends at its end of file.
-    stdin: std::rc::Rc<std::cell::Cell<Option<std::io::PipeWriter>>>,
-    stderr: std::io::PipeReader,
+    stdin: std::rc::Rc<std::cell::Cell<Option<crate::PipeWriter>>>,
+    stderr: crate::PipeReader,
     /// The write end of the root's release pipe. Dropped, the root exits by itself.
-    root_release: std::rc::Rc<std::cell::Cell<Option<std::io::PipeWriter>>>,
+    root_release: std::rc::Rc<std::cell::Cell<Option<crate::PipeWriter>>>,
 }
 
 impl Member {
     /// The pipes of a [`ROOT_WITH_A_MEMBER`] spawn, to give its stdin, stdout, stderr and
     /// [`RELEASE_FD`], and the read end of its stdout.
-    pub(crate) fn pipes() -> (MemberStdio, std::io::PipeReader, Member) {
+    pub(crate) fn pipes() -> (MemberStdio, crate::PipeReader, Member) {
         let (stdin_read, stdin) = std::io::pipe().expect("stdin pipe");
         let (started, stdout_write) = std::io::pipe().expect("stdout pipe");
         let (stderr, stderr_write) = std::io::pipe().expect("stderr pipe");
@@ -49,11 +49,11 @@ impl Member {
             release: stdio(release_read.into()),
         };
         let member = Member {
-            stdin: std::rc::Rc::new(std::cell::Cell::new(Some(stdin))),
-            stderr,
-            root_release: std::rc::Rc::new(std::cell::Cell::new(Some(root_release))),
+            stdin: std::rc::Rc::new(std::cell::Cell::new(Some(stdin.into()))),
+            stderr: stderr.into(),
+            root_release: std::rc::Rc::new(std::cell::Cell::new(Some(root_release.into()))),
         };
-        (child_ends, started, member)
+        (child_ends, started.into(), member)
     }
 
     /// Releases the root once a teardown's kill returned
@@ -123,7 +123,7 @@ pub(crate) struct MemberStdio {
 }
 
 /// Reads [`ROOT_WITH_A_MEMBER`]'s `started` from `stdout`, once its member exists.
-pub(crate) fn await_started(mut stdout: std::io::PipeReader) {
+pub(crate) fn await_started(mut stdout: crate::PipeReader) {
     let mut started = [0u8; 8];
     stdout.read_exact(&mut started).expect("read `started`");
     assert_eq!(&started, b"started\n");
@@ -143,7 +143,7 @@ const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
 #[cfg(feature = "tokio")]
 pub(crate) fn releasable_root_with_a_member_contained(
     contain: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, Member, std::io::PipeWriter) {
+) -> (crate::tokio::Child, Member, crate::PipeWriter) {
     let (stdio, started, member) = Member::pipes();
     let child = {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);

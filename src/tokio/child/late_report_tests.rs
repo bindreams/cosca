@@ -22,7 +22,7 @@ use crate::wait::exit_only::seams::force_peek_once;
 
 const LEAKS: &str = "forgetting tokio's handle for it leaks";
 
-fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
+fn tokio_blocker() -> (crate::tokio::Command, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -42,7 +42,7 @@ struct Late {
 /// Spawns a live blocker whose first report read finds nothing, with `arm` run just before, and
 /// answers what the spawn did. `writer` is held until `release` runs, so only the teardown ends the
 /// child.
-fn late_spawn(arm: impl FnOnce() -> Vec<Box<dyn std::any::Any>>) -> (Late, std::io::PipeWriter) {
+fn late_spawn(arm: impl FnOnce() -> Vec<Box<dyn std::any::Any>>) -> (Late, crate::PipeWriter) {
     crate::log_capture::install();
     let (mut cmd, writer) = tokio_blocker();
     let forgets = drop_fault::record();

@@ -41,7 +41,7 @@ fn nonblocking(fd: &impl std::os::fd::AsFd) {
 fn reader_over_a_write_end() -> (ParentEnd, std::io::PipeReader) {
     let (peer, write) = std::io::pipe().expect("pipe");
     nonblocking(&peer);
-    (ParentEnd::Reader(std::io::PipeReader::from(OwnedFd::from(write))), peer)
+    (ParentEnd::Reader(crate::PipeReader::from(OwnedFd::from(write))), peer)
 }
 
 /// `Writer` planted over a pipe's READ end: tokio's `Sender` rejects it (not writable). Returns
@@ -49,7 +49,7 @@ fn reader_over_a_write_end() -> (ParentEnd, std::io::PipeReader) {
 fn writer_over_a_read_end() -> (ParentEnd, std::io::PipeWriter) {
     let (read, peer) = std::io::pipe().expect("pipe");
     nonblocking(&peer);
-    (ParentEnd::Writer(std::io::PipeWriter::from(OwnedFd::from(read))), peer)
+    (ParentEnd::Writer(crate::PipeWriter::from(OwnedFd::from(read))), peer)
 }
 
 /// The one warn the failed conversion logged: `prefix` is where the record must START, so a

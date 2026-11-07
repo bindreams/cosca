@@ -10,7 +10,7 @@ use crate::test_groups::{pidfd_group_signal, Group};
 
 /// The sync `root_with_a_member`'s twin, and the writer whose drop ends its root with status `0`;
 /// drop it right after the kill.
-pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, std::io::PipeWriter) {
+pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, crate::PipeWriter) {
     releasable_root_with_a_member_contained(|cmd| {
         cmd.contain_with(crate::ContainMode::Session);
     })
@@ -18,7 +18,7 @@ pub(crate) fn releasable_root_with_a_member() -> (crate::tokio::Child, Member, s
 
 /// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) root in its own session, and the writer
 /// whose drop ends it with status `0`. Its group has no other member.
-pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWriter) {
+pub(crate) fn releasable_group_root() -> (crate::tokio::Child, crate::PipeWriter) {
     let (stdin, release) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -30,7 +30,7 @@ pub(crate) fn releasable_group_root() -> (crate::tokio::Child, std::io::PipeWrit
 /// Ends `child`'s root alone and reaps it behind the handle's back. The kill is setup, so it is
 /// [`kill_own_child`], which no route under test can turn into a no-op. `release` is dropped once
 /// the root is dead.
-pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: std::io::PipeWriter) {
+pub(crate) fn kill_and_reap_behind(child: &mut crate::tokio::Child, release: crate::PipeWriter) {
     let pid = child.pid();
     kill_own_child(pid);
     drop(release);
@@ -69,7 +69,7 @@ enum Seen {
 
 /// Kills `child`'s root alone, has another reaper reap it, and has `seen` observe that (see
 /// [`kill_and_reap_behind`] for `release`).
-async fn reap_behind_and_observe(child: &mut crate::tokio::Child, release: std::io::PipeWriter, seen: Seen) {
+async fn reap_behind_and_observe(child: &mut crate::tokio::Child, release: crate::PipeWriter, seen: Seen) {
     kill_and_reap_behind(child, release);
     match seen {
         Seen::TryWait => drop(child.try_wait().expect_err("a foreign reap answers ECHILD")),

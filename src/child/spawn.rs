@@ -2000,18 +2000,45 @@ pub(crate) fn resolve_non_merge(
         None | Some(ResolvedStdio::Inherit) => Ok((inherit_end(slot, parent_std)?, None)),
         Some(ResolvedStdio::Null) => Ok((null_end()?, None)),
         Some(ResolvedStdio::File(f)) => Ok((file_end(f)?, None)),
-        Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir),
+        Some(ResolvedStdio::Pipe(dir)) => make_pipe(*dir).map(|(child_end, parent_end)| (child_end, Some(parent_end))),
         Some(ResolvedStdio::Merge(_)) => unreachable!("merge handled in second pass"),
     }
 }
 
-fn make_pipe(dir: Direction) -> Result<(ChildEnd, Option<ParentEnd>), Error> {
-    let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
-    match dir {
-        // Child reads: child gets the reader; parent keeps the writer.
-        Direction::In => Ok((ChildEnd::from(reader), Some(ParentEnd::Writer(writer)))),
-        // Child writes: child gets the writer; parent keeps the reader.
-        Direction::Out => Ok((ChildEnd::from(writer), Some(ParentEnd::Reader(reader)))),
+/// The pipe for one piped slot, for every spawn: the child's end and the parent's. On Unix std's
+/// pipe; on Windows std's kind of child pipe, our end overlapped and the child's synchronous.
+pub(crate) fn make_pipe(dir: Direction) -> Result<(ChildEnd, ParentEnd), Error> {
+    #[cfg(unix)]
+    {
+        let (reader, writer) = std::io::pipe().map_err(Error::Io)?;
+        match dir {
+            // Child reads: child gets the reader; parent keeps the writer.
+            Direction::In => Ok((ChildEnd::from(reader), ParentEnd::Writer(writer.into()))),
+            // Child writes: child gets the writer; parent keeps the reader.
+            Direction::Out => Ok((ChildEnd::from(writer), ParentEnd::Reader(reader.into()))),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use crate::pipe::{PipeReader, PipeWriter};
+        match dir {
+            // Child reads: child gets the readable end; parent keeps the writable one.
+            Direction::In => {
+                let (ours, theirs) = crate::pipe::windows::child_pipe(false).map_err(Error::Io)?;
+                Ok((
+                    ChildEnd::from(theirs),
+                    ParentEnd::Writer(PipeWriter::from_overlapped(ours)),
+                ))
+            }
+            // Child writes: child gets the writable end; parent keeps the readable one.
+            Direction::Out => {
+                let (ours, theirs) = crate::pipe::windows::child_pipe(true).map_err(Error::Io)?;
+                Ok((
+                    ChildEnd::from(theirs),
+                    ParentEnd::Reader(PipeReader::from_overlapped(ours)),
+                ))
+            }
+        }
     }
 }
 

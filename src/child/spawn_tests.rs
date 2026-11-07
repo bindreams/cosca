@@ -48,7 +48,7 @@ pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 /// [`blocker`] whose stdin writer the caller keeps: for a test where only its own kill may end
 /// the child.
 #[cfg(unix)]
-fn blocker_with_held_stdin() -> (Command, std::io::PipeWriter) {
+fn blocker_with_held_stdin() -> (Command, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -1348,7 +1348,7 @@ fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
 
 /// End `child` and reap it behind its handle's back, as an application that owns SIGCHLD would.
 #[cfg(unix)]
-fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
+fn foreign_reap(child: &crate::Child, writer: crate::PipeWriter) {
     let pid = child.pid();
     drop(writer);
     crate::test_child::wait_until_zombie(pid);
@@ -1835,4 +1835,53 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let held = held_through(&kernel, pid);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
+}
+
+/// Our end of a child's stdout is overlapped, as std makes it: no synchronous-I/O flag in the file
+/// object's mode. A `CreatePipe` end, the pipe this spawn made before, has one.
+///
+/// Mutant: the spawn makes its pipe with `std::io::pipe`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_spawned_childs_stdout_end_is_overlapped() {
+    use std::io::Read as _;
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows::Wdk::Storage::FileSystem::{FileModeInformation, NtQueryInformationFile, FILE_MODE_INFORMATION};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+    const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x10;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["cmd", "/C", "echo overlapped"]);
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stdout = child.stdout().expect("piped stdout");
+
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let mut mode = FILE_MODE_INFORMATION::default();
+    // SAFETY: the handle is live (`stdout` owns it); `mode` is the buffer the class describes.
+    let status = unsafe {
+        NtQueryInformationFile(
+            HANDLE(stdout.as_raw_handle()),
+            &mut io_status,
+            std::ptr::from_mut(&mut mode).cast(),
+            std::mem::size_of::<FILE_MODE_INFORMATION>() as u32,
+            FileModeInformation,
+        )
+    };
+    assert!(status.is_ok(), "NtQueryInformationFile: {status:?}");
+    assert_eq!(
+        mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT),
+        0,
+        "the parent's end carries a synchronous-I/O flag (mode {:#x})",
+        mode.Mode
+    );
+
+    let mut out = String::new();
+    stdout.read_to_string(&mut out).expect("read the child's output");
+    assert_eq!(out.trim(), "overlapped");
+    child.wait().expect("reap");
 }

@@ -7,12 +7,6 @@
 //! tokio, which associates it with a completion port (a handle can have only one such
 //! association, and these operations make none).
 
-// Removed by the commit that makes the spawn use these.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the spawn takes the child pipe in the next commit")
-)]
-
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
@@ -286,6 +280,21 @@ impl PipeWriter {
     /// The parent's end of a pipe [`child_pipe`] made: overlapped, and writable.
     pub(crate) fn from_overlapped(end: OwnedHandle) -> PipeWriter {
         PipeWriter(Handle(end))
+    }
+}
+
+/// A std pipe end is synchronous: each operation completes inside its call, and is still safe to
+/// use from several threads at once.
+impl From<std::io::PipeReader> for PipeReader {
+    fn from(p: std::io::PipeReader) -> PipeReader {
+        PipeReader(Handle(p.into()))
+    }
+}
+
+/// A std pipe end is synchronous; see the reader's conversion.
+impl From<std::io::PipeWriter> for PipeWriter {
+    fn from(p: std::io::PipeWriter) -> PipeWriter {
+        PipeWriter(Handle(p.into()))
     }
 }
 

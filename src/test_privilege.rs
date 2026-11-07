@@ -37,7 +37,7 @@ pub(crate) fn setuid_blocker_command() -> crate::Command {
 /// # Panics
 /// As [`setuid::setuid_helper`] does, and (in `until_root`) when the ready byte does not come.
 #[cfg(target_os = "linux")]
-pub(crate) fn setuid_blocker_for_a_failing_spawn() -> (crate::Command, std::io::PipeWriter, impl FnOnce() + 'static) {
+pub(crate) fn setuid_blocker_for_a_failing_spawn() -> (crate::Command, crate::PipeWriter, impl FnOnce() + 'static) {
     use std::io::Read as _;
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let (mut ready, ready_end) = std::io::pipe().expect("pipe");
@@ -65,7 +65,7 @@ pub(crate) fn setuid_blocker_for_a_failing_spawn() -> (crate::Command, std::io::
 ///
 /// # Panics
 /// As [`setuid::setuid_helper`] does, and when the spawn or the ready byte fails.
-pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
+pub(crate) fn spawn_setuid_blocker() -> (crate::Child, crate::PipeWriter) {
     use std::io::Read as _;
     let mut cmd = setuid_blocker_command();
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
@@ -90,7 +90,7 @@ pub(crate) fn spawn_setuid_blocker() -> (crate::Child, std::io::PipeWriter) {
 pub(crate) fn root_over_setuid_blockers(
     count: usize,
     configure: impl FnOnce(&mut crate::Command),
-) -> (crate::Child, std::io::PipeWriter) {
+) -> (crate::Child, crate::PipeWriter) {
     use std::io::Read as _;
     // A background job's own stdin is `/dev/null`, so each helper reads fd 3.
     let job = r#""$0" setuid-stdin-block root <&3 3<&- &"#;

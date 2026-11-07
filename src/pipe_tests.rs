@@ -128,6 +128,18 @@ fn a_write_to_a_full_pipe_completes() {
     assert_eq!(sum(drained.iter().flat_map(|c| c.iter().copied())), sum(sent));
 }
 
+/// A std pipe end, which on Windows is a synchronous handle, goes through the same type.
+#[skuld::test]
+fn a_std_pipe_end_round_trips() {
+    let (r, w) = std::io::pipe().expect("make the pipe");
+    let (mut r, mut w) = (PipeReader::from(r), PipeWriter::from(w));
+    w.write_all(b"through").expect("write");
+    drop(w);
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).expect("read to the end");
+    assert_eq!(got, b"through");
+}
+
 #[skuld::test]
 fn a_read_at_eof_is_zero() {
     let (mut reader, theirs) = reader_pair();

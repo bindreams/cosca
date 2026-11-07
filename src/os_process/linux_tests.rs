@@ -8,7 +8,7 @@ use crate::test_child::{held_contained_blocker_without_cgroup, wait_until_zombie
 use crate::test_groups::{tracer_group, Group};
 
 /// A live blocker, its stdin (held open so it stays alive) and its identity.
-fn blocker() -> (crate::Child, std::io::PipeWriter, ProcessId) {
+fn blocker() -> (crate::Child, crate::PipeWriter, ProcessId) {
     let (child, stdin) = held_contained_blocker_without_cgroup(crate::Stdio::null());
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     (child, stdin, id)

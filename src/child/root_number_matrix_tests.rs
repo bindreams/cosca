@@ -753,8 +753,8 @@ fn finish_teardown(
     recorders: Recorders,
     root: u32,
     cat: u32,
-    stdin: std::rc::Rc<std::cell::Cell<Option<std::io::PipeWriter>>>,
-    mut stderr: std::io::PipeReader,
+    stdin: std::rc::Rc<std::cell::Cell<Option<crate::PipeWriter>>>,
+    mut stderr: crate::PipeReader,
 ) -> Sent {
     use std::io::Read as _;
     reap.assert_script_used(scripted.as_ref());

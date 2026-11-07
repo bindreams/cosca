@@ -7,7 +7,7 @@ use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_warn, REAP
 use crate::test_child::Console;
 use crate::test_groups::{namespaces, pidfd_group_signal};
 
-fn spawn_blocker() -> (crate::Child, std::io::PipeWriter) {
+fn spawn_blocker() -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -116,7 +116,7 @@ in_fresh_pid_ns!(
 // Tree signals after a reap and a reuse =====
 
 /// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
-fn spawn_group_blocker() -> (crate::Child, std::io::PipeWriter) {
+fn spawn_group_blocker() -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
