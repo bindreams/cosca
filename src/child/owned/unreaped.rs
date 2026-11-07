@@ -22,9 +22,9 @@ use crate::os_process::child_named;
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
-/// then logs one line naming the child. So the drop blocks: in async code, `wait_async` it or
-/// `leak` it. A front is waited for until it exits, which the
-/// failed call would have done anyway.
+/// then logs one line naming the child. So the drop blocks: in async code, settle it with
+/// [`wait_async`](Unreaped::wait_async) (the `tokio` feature) or `leak` it. A front is waited for
+/// until it exits, which the failed call would have done anyway.
 ///
 /// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
 /// running unreaped until this process exits, and logs one `warn` naming its pid.
@@ -78,6 +78,11 @@ impl Unreaped {
     /// [`wait`](Unreaped::wait), awaited: the same status and errors, without blocking the runtime
     /// thread. Dropping the future drops this value, which then settles the child as any drop does
     /// (see the type's docs): the child stays in the value until the wait has an outcome.
+    ///
+    /// Needs the `tokio` feature, and a runtime with the IO **and** time drivers enabled (the
+    /// `#[tokio::main]` / `#[tokio::test]` defaults): a recheck pause arms a timer, and the wait
+    /// registers the child's pidfd or handle. On a hand-built runtime missing either, tokio panics
+    /// rather than returning a typed error.
     #[cfg(feature = "tokio")]
     pub async fn wait_async(mut self) -> Result<ExitStatus, Error> {
         let outcome = self.child.wait_async().await;

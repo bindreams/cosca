@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use super::{absolute, exited_held, run, run_with, ProcessExit, RunOutcome, Step, Waitable};
+use super::{
+    absolute, exited_held, run, run_with, Control, Ended, Looked, Next, ProcessExit, RunOutcome, Step, Waitable,
+};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -278,6 +280,83 @@ fn run_looks_again_after_a_block_error_the_waitable_survives() {
     assert!(matches!(run_with(&mut w, None, |_| {}).unwrap(), RunOutcome::Done(())));
     assert_eq!(w.block_errors, 1);
     assert_eq!(w.looks, 3);
+}
+
+// `Control` =====
+
+/// A look at `time_left` that found `looked`, as the loop control sees it.
+fn looked_at(c: &mut Control, looked: Looked, time_left: Option<Duration>) -> Next {
+    c.before_look(time_left);
+    c.after_look(looked, time_left)
+}
+
+/// A done look ends the loop whatever the clock says.
+///
+/// Mutant: a done look at the deadline is answered `DeadlinePassed`.
+#[skuld::test]
+fn control_ends_on_a_done_look_even_at_the_deadline() {
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Done, Some(Duration::ZERO)), Next::Done);
+}
+
+/// The look made at the deadline is the final one: it starts no wait and no pause.
+///
+/// Mutant: wait or pause at the deadline; or answer `DeadlinePassed` for a look that began before it.
+#[skuld::test]
+fn control_makes_the_look_at_the_deadline_final() {
+    let mut c = Control::new();
+    assert_eq!(
+        looked_at(&mut c, Looked::Wait, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+    assert_eq!(
+        looked_at(&mut c, Looked::Recheck, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+    // The deadline passes during the look: nothing to wait or pause in, and the next look is final.
+    c.before_look(Some(ms(5)));
+    assert_eq!(c.after_look(Looked::Wait, Some(Duration::ZERO)), Next::Look);
+    c.before_look(Some(Duration::ZERO));
+    assert_eq!(
+        c.after_look(Looked::Recheck, Some(Duration::ZERO)),
+        Next::DeadlinePassed
+    );
+}
+
+/// A pause is a backoff step cut to the time left, and the backoff starts over after a wait.
+///
+/// Mutant: pause the whole step; or keep the schedule across a wait.
+#[skuld::test]
+fn control_cuts_a_pause_to_the_time_left_and_restarts_the_backoff_after_a_wait() {
+    let paused = |c: &mut Control, time_left| match looked_at(c, Looked::Recheck, time_left) {
+        Next::Pause(d) => whole_ms(&[d])[0],
+        other => panic!("a recheck with time left pauses: {other:?}"),
+    };
+    let mut c = Control::new();
+    assert_eq!(paused(&mut c, None), 1);
+    assert_eq!(paused(&mut c, Some(ms(10))), 2);
+    assert_eq!(paused(&mut c, Some(ms(3))), 3);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Woke);
+    assert_eq!(paused(&mut c, None), 1);
+}
+
+/// A wait released without an exit signal makes the next look the final one, whatever the clock
+/// reads; a woken or failed wait does not.
+///
+/// Mutant: ignore the release; or treat a failed wait as one.
+#[skuld::test]
+fn control_makes_the_look_after_a_released_wait_final() {
+    for ended in [Ended::Woke, Ended::Failed] {
+        let mut c = Control::new();
+        assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+        c.waited(ended);
+        assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait, "{ended:?}");
+    }
+    let mut c = Control::new();
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::Wait);
+    c.waited(Ended::Released);
+    assert_eq!(looked_at(&mut c, Looked::Wait, None), Next::DeadlinePassed);
 }
 
 /// One open serves a signal and a wait from different threads: `Sync`, `&self`. The wait ends
