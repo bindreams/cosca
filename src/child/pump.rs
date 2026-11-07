@@ -87,6 +87,12 @@ struct Feed<'a, W> {
     rest: &'a [u8],
 }
 
+// A pending write reads `rest`, and the pipe's drop cancels it. This empty `Drop` (no
+// `#[may_dangle]`) makes the borrow checker require the input to be live at that drop.
+impl<W> Drop for Feed<'_, W> {
+    fn drop(&mut self) {}
+}
+
 /// A pipe read to EOF, and what came out of it.
 struct Drain<R> {
     pipe: Option<R>,

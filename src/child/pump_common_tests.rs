@@ -40,16 +40,19 @@ fn a_child_that_stops_reading_stdin_ends_the_input() {
 /// Mutant: stdout is read to EOF before stderr is read at all, or the reverse.
 #[skuld::test]
 fn each_stream_is_read_while_the_other_is_idle() {
-    // `cmd` cannot make output of a size, so it prints a file of that size. The path has no space
-    // or quote, which `cmd` would not read as the spawn quotes them.
+    // `cmd` cannot make output of a size, so it prints a file of that size. The path cannot be
+    // quoted in the command: the spawn escapes a `"` in an argument as `\"`, which `cmd` does not
+    // read. So the path must hold nothing `cmd` treats as syntax.
     let dir = tempfile::tempdir().expect("tempdir");
     let big = dir.path().join("big");
     std::fs::write(&big, vec![b'x'; 1_000_000]).expect("write the file");
     let big = big.display().to_string();
-    assert!(
-        !big.contains([' ', '"']),
-        "the temp path {big} has a space or quote: set TEMP to one that has not"
-    );
+    if cfg!(windows) {
+        assert!(
+            !big.contains([' ', '"', '%', '!', '&', '|', '<', '>', '(', ')', '^', ',', ';', '=']),
+            "the temp path {big} has a space or a character `cmd` reads as syntax: set TEMP to a path that has not"
+        );
+    }
     for (unix, windows) in [
         (
             "head -c 1000000 /dev/zero >&2; head -c 1000000 /dev/zero".to_owned(),
