@@ -416,7 +416,7 @@ async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() 
     );
 }
 
-/// As above, but stdin is tokio's own pipe and was never taken. The unwind must close this
+/// As above, but stdin is a pipe that was never taken. The unwind must close this
 /// process's end of it, or a child reading stdin to EOF never exits. The end is recorded by its
 /// descriptor, which stays closed in this single-threaded test.
 #[skuld::test]
@@ -430,10 +430,10 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
     cmd.kill_on_drop(true);
     let child = cmd.spawn().expect("spawn");
     let witness = Witness::new(child.pid());
-    let crate::tokio::child::ProcSource::Tokio { stdin, .. } = child.os.proc.as_ref().expect("backend") else {
-        panic!("a fresh child is a tokio backend");
+    let Some(crate::pipe::ParentEnd::Writer(stdin)) = child.os.pipes.get(&crate::stdio::Fd::STDIN) else {
+        panic!("piped stdin");
     };
-    let fd = stdin.as_ref().expect("tokio's piped stdin").as_raw_fd();
+    let fd = stdin.as_raw_fd();
     let is_open = || {
         // SAFETY: `fcntl(F_GETFD)` reads a flag and changes nothing.
         unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }

@@ -128,12 +128,6 @@ pub(crate) enum ProcSource {
         /// (an unwind) does whichever is safe.
         child: Held,
         pid: u32,
-        /// The streams tokio had not handed out when the backend was built. They live here, not
-        /// in `child`, so that dropping the backend closes this process's ends whatever becomes
-        /// of tokio's `Child`.
-        stdin: Option<::tokio::process::ChildStdin>,
-        stdout: Option<::tokio::process::ChildStdout>,
-        stderr: Option<::tokio::process::ChildStderr>,
         /// The pidfd the spawn handshake opened while the child was held before `exec`. It names
         /// this process for good, so a signal through it cannot reach a process that later reuses
         /// the pid.
@@ -145,13 +139,9 @@ pub(crate) enum ProcSource {
         identity: Option<u64>,
     },
     /// A child something else reaped, or one that cannot be shown to be ours (macOS: no unique id,
-    /// or a peek that failed): tokio's `Child` is forgotten, and the streams it had not yet handed
-    /// out remain, so a caller who waits and then reads keeps its output.
+    /// or a peek that failed): tokio's `Child` is forgotten.
     #[cfg(unix)]
     Foreign {
-        stdin: Option<::tokio::process::ChildStdin>,
-        stdout: Option<::tokio::process::ChildStdout>,
-        stderr: Option<::tokio::process::ChildStderr>,
         /// What became of the child, as far as the forget knew.
         fate: Forgotten,
         pid: u32,
@@ -361,19 +351,6 @@ impl std::ops::DerefMut for Held {
     }
 }
 
-/// Split tokio's untaken streams off `child`, so they outlive whatever becomes of it.
-fn hold(
-    mut child: ::tokio::process::Child,
-) -> (
-    Held,
-    Option<::tokio::process::ChildStdin>,
-    Option<::tokio::process::ChildStdout>,
-    Option<::tokio::process::ChildStderr>,
-) {
-    let streams = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    (Held(Some(child)), streams.0, streams.1, streams.2)
-}
-
 /// `child`, counted when it is actually dropped (tests: `fault::count_backend_drops`), so a release
 /// that does not drop it is not counted either.
 #[cfg(test)]
@@ -386,9 +363,9 @@ fn counted(child: ::tokio::process::Child) -> ::tokio::process::Child {
 }
 
 /// Dropping a backend that nothing released or forgot (an unwind out of a caller does this) does
-/// the one safe thing: the untaken streams close with the fields, and tokio's `Child` goes to its
-/// own drop only if [`ProcSource::state`] shows it ours, else it is forgotten. It is quiet where
-/// it matters: no `log` call while unwinding, since a logger that panics there aborts.
+/// the one safe thing: tokio's `Child` goes to its own drop only if [`ProcSource::state`] shows it
+/// ours, else it is forgotten. It is quiet where it matters: no `log` call while unwinding, since a
+/// logger that panics there aborts.
 ///
 /// Nothing is killed: the backend does not know whether the handle was armed.
 #[cfg(unix)]
@@ -420,17 +397,22 @@ fn gone() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD))
 }
 
+/// The spawn keeps every pipe in `pipes`, so tokio's `Child` arrives with none of its own.
+fn debug_assert_no_tokio_pipes(child: &::tokio::process::Child) {
+    debug_assert!(
+        child.stdin.is_none() && child.stdout.is_none() && child.stderr.is_none(),
+        "the spawn keeps every pipe; tokio's Child must arrive with stdin, stdout and stderr taken"
+    );
+}
+
 impl ProcSource {
     /// A tokio child that `pidfd`, opened by the spawn handshake, names.
     #[cfg(target_os = "linux")]
     pub(crate) fn new(child: ::tokio::process::Child, pid: u32, pidfd: std::os::fd::OwnedFd) -> ProcSource {
-        let (child, stdin, stdout, stderr) = hold(child);
+        debug_assert_no_tokio_pipes(&child);
         ProcSource::Tokio {
-            child,
+            child: Held(Some(child)),
             pid,
-            stdin,
-            stdout,
-            stderr,
             pidfd: PinnedPidfd(Some(pidfd)),
         }
     }
@@ -438,13 +420,10 @@ impl ProcSource {
     /// A tokio child whose unique id was read as `identity`.
     #[cfg(target_os = "macos")]
     pub(crate) fn new(child: ::tokio::process::Child, pid: u32, identity: Option<u64>) -> ProcSource {
-        let (child, stdin, stdout, stderr) = hold(child);
+        debug_assert_no_tokio_pipes(&child);
         ProcSource::Tokio {
-            child,
+            child: Held(Some(child)),
             pid,
-            stdin,
-            stdout,
-            stderr,
             identity,
         }
     }
@@ -452,13 +431,10 @@ impl ProcSource {
     /// A tokio child on Windows, where tokio's own process handle is the one that names it.
     #[cfg(windows)]
     pub(crate) fn new(child: ::tokio::process::Child, pid: u32) -> ProcSource {
-        let (child, stdin, stdout, stderr) = hold(child);
+        debug_assert_no_tokio_pipes(&child);
         ProcSource::Tokio {
-            child,
+            child: Held(Some(child)),
             pid,
-            stdin,
-            stdout,
-            stderr,
         }
     }
 
@@ -522,36 +498,6 @@ impl ProcSource {
         Some(crate::containment::ChildHandle { pid, pidfd })
     }
 
-    /// Take tokio's own stdin stream (the Raw backend serves its piped std ends via `owned_std`,
-    /// so it has none here).
-    pub(crate) fn take_stdin(&mut self) -> Option<::tokio::process::ChildStdin> {
-        match self {
-            ProcSource::Tokio { stdin, .. } => stdin.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stdin, .. } => stdin.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-    pub(crate) fn take_stdout(&mut self) -> Option<::tokio::process::ChildStdout> {
-        match self {
-            ProcSource::Tokio { stdout, .. } => stdout.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stdout, .. } => stdout.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-    pub(crate) fn take_stderr(&mut self) -> Option<::tokio::process::ChildStderr> {
-        match self {
-            ProcSource::Tokio { stderr, .. } => stderr.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stderr, .. } => stderr.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-
     /// Wait until the child exits, returning its status.
     ///
     /// tokio's own `wait` and `try_wait` are a `waitpid` by pid, so on Unix the status is collected
@@ -562,9 +508,7 @@ impl ProcSource {
     /// [`Error::Unassessable`], since it may well be running; it is not forgotten.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
         match self {
-            ProcSource::Tokio { stdin, .. } => {
-                // As tokio's own `wait`: stdin closes first, so a child reading it to EOF can exit.
-                drop(stdin.take());
+            ProcSource::Tokio { .. } => {
                 #[cfg(unix)]
                 {
                     // Checked before the watch too, so a child already reaped elsewhere is not
@@ -893,8 +837,8 @@ impl ProcSource {
     }
 
     /// Forget the child: tokio's `Child` is leaked, never dropped, because its drop would reap by
-    /// pid, and the pid may name another process by now. The untaken streams close, and so does
-    /// cosca's own pidfd, unless the caller moved it out first. What leaks is tokio's own: on Linux
+    /// pid, and the pid may name another process by now. Cosca's own pidfd closes, unless the
+    /// caller moved it out first. What leaks is tokio's own: on Linux
     /// its pidfd and its reactor registration, on macOS its `SIGCHLD` watch.
     #[cfg(unix)]
     pub(crate) fn forget(mut self) {
@@ -1275,8 +1219,8 @@ impl ProcSource {
 
     /// Give up a child something else reaped, or that cannot be shown to be ours
     /// ([`Waited::Foreign`]): tokio's `Child` is forgotten, never dropped, because its drop
-    /// would reap by pid, and the pid may name another process by now. The untaken
-    /// streams are kept, and the backend is [`reaped`](ProcSource::is_reaped) from here on.
+    /// would reap by pid, and the pid may name another process by now. The backend is
+    /// [`reaped`](ProcSource::is_reaped) from here on.
     ///
     /// Forgetting leaks what tokio's `Child` holds — on Linux its pidfd and its reactor
     /// registration, on macOS its `SIGCHLD` watch — so it is logged at `warn`, naming the pid.
@@ -1368,9 +1312,6 @@ impl ProcSource {
         };
         let ProcSource::Tokio {
             pid,
-            stdin,
-            stdout,
-            stderr,
             #[cfg(target_os = "linux")]
             pidfd,
             ..
@@ -1380,9 +1321,6 @@ impl ProcSource {
         };
         let pid = *pid;
         let foreign = ProcSource::Foreign {
-            stdin: stdin.take(),
-            stdout: stdout.take(),
-            stderr: stderr.take(),
             fate,
             pid,
             // Moved, not duplicated: a duplicate can fail at the fd limit.

@@ -594,6 +594,8 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
     // asserts on the identical text) could otherwise satisfy each other's `contains_since`
     // check across threads in the shared `log_capture` buffer.
     let _serialize = super::fault::lock_for_log_assertion();
+    // `install` makes its pipe under `spawn_lock`, as a spawn does.
+    let _spawn_lock = test_spawn_lock();
     crate::log_capture::install();
     for (fault, marker) in [
         (Fault::Pipe, "fd marker: pipe() failed"),

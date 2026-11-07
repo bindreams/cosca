@@ -16,8 +16,8 @@ impl Child {
             return Err(error);
         }
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
-        // `self.proc_mut()` (so the four-future join compiles), and the Tokio backend's `wait` internally
-        // drops its own stdin, already taken here, so it cannot race the write future.
+        // `self.proc_mut()` (so the four-future join compiles). The inner wait closes no stdin; only
+        // the write future, which owns it, does.
         let mut stdin = self.stdin();
         let mut stdout = self.stdout();
         let mut stderr = self.stderr();

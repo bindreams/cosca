@@ -21,12 +21,11 @@ fn owned_over(pid: u32) -> OwnedChild {
 fn group_leader_ending_at_eof() -> (KillOnDrop, std::io::PipeWriter) {
     use std::os::fd::AsRawFd;
     let (from_test, to_child) = std::io::pipe().expect("pipe");
-    let (input, test_end) = (from_test.as_raw_fd(), to_child.as_raw_fd());
-    let child = fork_running(move || {
+    let input = from_test.as_raw_fd();
+    let child = fork_running(&[input], move || {
         // SAFETY: async-signal-safe syscalls on fds this process holds.
         unsafe {
             libc::setpgid(0, 0);
-            libc::close(test_end);
             let mut byte = 0u8;
             while libc::read(input, (&raw mut byte).cast(), 1) == 1 {}
         }
@@ -79,7 +78,7 @@ fn fork_leader_with_member(
         leader_input.as_raw_fd(),
         to_leader.as_raw_fd(),
     ];
-    let leader = fork_running(move || {
+    let leader = fork_running(&fds, move || {
         let [input, test_end, member_reader, output, leader_in, leader_test_end] = fds;
         // SAFETY: async-signal-safe syscalls on fds this process holds.
         unsafe {

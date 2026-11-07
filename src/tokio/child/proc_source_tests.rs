@@ -153,9 +153,6 @@ fn a_refused_kill_of_a_backend_already_forgotten_is_torn_down_through_its_pidfd(
     )
     .expect("pidfd_open");
     let proc = super::ProcSource::Foreign {
-        stdin: None,
-        stdout: None,
-        stderr: None,
         fate: super::Forgotten::Unproven,
         pid,
         pidfd: super::PinnedPidfd(Some(pidfd)),
@@ -231,9 +228,6 @@ fn the_refused_kill_warning_carries_every_clause_of_the_table() {
 #[should_panic(expected = "would block inside an async Drop")]
 fn exit_visible_by_refuses_inside_a_section() {
     let proc = super::ProcSource::Foreign {
-        stdin: None,
-        stdout: None,
-        stderr: None,
         fate: super::Forgotten::Unproven,
         pid: 0,
         // Never read: the refusal comes before the backend is looked at.

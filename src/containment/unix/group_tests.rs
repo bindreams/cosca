@@ -362,7 +362,7 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
     crate::log_capture::install();
     let (gate_r, gate_w) = std::io::pipe().expect("pipe");
     let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
-    let child = fork_running(|| block_on(gate_r_fd));
+    let child = fork_running(&[gate_r_fd], || block_on(gate_r_fd));
     let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
 
     for (errno, text) in [

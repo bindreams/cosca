@@ -16,22 +16,29 @@ fn pattern(i: usize) -> u8 {
     (i % 251) as u8
 }
 
+/// A pipe as a spawn makes one, which on macOS is under `spawn_lock`.
+fn pipe(dir: Direction) -> (impl Into<File>, ParentEnd) {
+    #[cfg(target_os = "macos")]
+    let _lock = crate::child::spawn::spawn_lock();
+    super::child_pipe(dir).expect("make the pipe")
+}
+
 /// A pipe whose reading end is ours and whose writing end is `File`.
 fn reader_pair() -> (PipeReader, File) {
-    let (theirs, ours) = super::child_pipe(Direction::Out).expect("make the pipe");
+    let (theirs, ours) = pipe(Direction::Out);
     let ParentEnd::Reader(ours) = ours else {
         panic!("an Out pipe keeps the read end")
     };
-    (ours, File::from(theirs))
+    (ours, theirs.into())
 }
 
 /// A pipe whose writing end is ours and whose reading end is `File`.
 fn writer_pair() -> (PipeWriter, File) {
-    let (theirs, ours) = super::child_pipe(Direction::In).expect("make the pipe");
+    let (theirs, ours) = pipe(Direction::In);
     let ParentEnd::Writer(ours) = ours else {
         panic!("an In pipe keeps the write end")
     };
-    (ours, File::from(theirs))
+    (ours, theirs.into())
 }
 
 /// Read `from` to its end, in chunks of at most 4096 bytes. Each chunk must continue the pattern
@@ -323,4 +330,20 @@ fn a_pipe_end_round_trips_through_a_raw_fd() {
     let mut got = Vec::new();
     reader.read_to_end(&mut got).expect("read to the end");
     assert_eq!(got, b"raw");
+}
+
+/// Both ends of `pair()` are close-on-exec, so no exec'd child inherits one.
+#[cfg(unix)]
+#[skuld::test]
+fn pair_makes_both_ends_close_on_exec() {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    let _lock = crate::child::spawn::spawn_lock();
+    let (reader, writer) = super::pair().expect("make the pipe");
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        // SAFETY: `fcntl(F_GETFD)` on a descriptor the pipe ends above keep open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "fd {fd} lacks FD_CLOEXEC");
+    }
 }
