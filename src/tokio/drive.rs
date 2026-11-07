@@ -1,6 +1,7 @@
-//! The asynchronous wait loop over an [`OsProcess`]: the twin of [`crate::os_process::drive`], with
-//! the same semantics. It loops "look; if running, wait on the [`WaitFor`] the look returned", and
-//! a wake is never the answer, the next look is.
+//! The asynchronous driver of the one wait loop, [`crate::os_process::drive`]'s: [`run`] loops "look;
+//! if not done, wait on the [`WaitFor`] the look returned, or pause for a recheck", and a wake is
+//! never the answer, the next look is. [`exited_held`] and [`exited_opening`] run it over a
+//! process's exit.
 //!
 //! The deadline differs per platform, as it does for the other async waits. Unix arms tokio's timer
 //! on [`tokio_now`]'s clock, and when the timer wins there is one final look. Windows has no
@@ -11,7 +12,8 @@
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::os_process::{Exit, OsProcess, WaitFor};
+use crate::os_process::drive::{backoff, ProcessExit, RunOutcome, Step, Waitable};
+use crate::os_process::{OsProcess, WaitFor};
 use crate::tokio::wait::deadline_from;
 
 /// What the entry point does before any open or look: the watch-fault seam.
@@ -37,7 +39,7 @@ pub(crate) async fn exited_opening(
     let deadline = absolute(timeout);
     match open()? {
         None => Ok(true),
-        Some(process) => drive(&*process, deadline).await,
+        Some(process) => exited(&*process, deadline).await,
     }
 }
 
@@ -45,7 +47,15 @@ pub(crate) async fn exited_opening(
 /// after the deadline's final look.
 pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
-    drive(p, absolute(timeout)).await
+    exited(p, absolute(timeout)).await
+}
+
+/// [`run`] over a process's [`OsProcess::exited`] look, against an absolute `deadline`.
+async fn exited(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
+    Ok(matches!(
+        run(&mut ProcessExit(p), deadline).await?,
+        RunOutcome::Done(())
+    ))
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
@@ -57,26 +67,83 @@ fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
     return crate::tokio::wait::to_real_clock(timeout.and_then(deadline_from));
 }
 
-/// The wait loop against an absolute `deadline` from [`absolute`]: look; if running, wait on what
-/// the look returned. Dropping the future releases the wait: the fd is deregistered on Unix, and the
-/// blocking thread is released on Windows.
-async fn drive(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
+/// What a look asked for, once it no longer borrows the `Waitable`'s output type: the future does
+/// not hold a `W::Output` across an await, so it is `Send` whenever `W` is.
+enum Next<'a> {
+    Wait(WaitFor<'a>),
+    Recheck,
+}
+
+/// The one asynchronous wait loop, with [`crate::os_process::drive::run`]'s contract: look; if not
+/// done, wait on what the look returned (or pause, for a recheck) and look again. `deadline` is
+/// absolute (from [`absolute`]); `None` waits for ever. A look made at or after the deadline, or
+/// after a wait released without an exit signal, is the final one: it starts no wait and no pause, and
+/// a look that is not done ends the loop with [`RunOutcome::DeadlinePassed`].
+///
+/// A pause is the next step of one backoff, cut to the time remaining; the backoff starts over after
+/// every wait. A failed wait goes to [`Waitable::block_failed`], which ends the loop with the error
+/// unless it is survived. Dropping the future releases the wait: the fd is deregistered on Unix, and
+/// the blocking thread is released on Windows.
+pub(crate) async fn run<W: Waitable>(
+    w: &mut W,
+    deadline: Option<std::time::Instant>,
+) -> Result<RunOutcome<W::Output>, Error> {
+    let mut steps = backoff();
     // Set when the wait was released without an exit signal: the next look is the final one
     // whatever the clock reads.
     let mut released = false;
     loop {
         // Read before the look: a look made at or after the deadline is the final one.
         let final_look = released || remaining(deadline) == Some(Duration::ZERO);
-        match p.exited()? {
-            Exit::Exited => return Ok(true),
-            Exit::Running(_) if final_look => return Ok(false),
-            Exit::Running(wait_for) => {
+        let next = match w.look()? {
+            Step::Done(out) => return Ok(RunOutcome::Done(out)),
+            Step::Wait(_) | Step::Recheck if final_look => return Ok(RunOutcome::DeadlinePassed),
+            Step::Wait(wait_for) => Next::Wait(wait_for),
+            Step::Recheck => Next::Recheck,
+        };
+        match next {
+            Next::Wait(wait_for) => {
                 if remaining(deadline) != Some(Duration::ZERO) {
-                    released = !wait(&wait_for, deadline).await?;
+                    let waited = wait(&wait_for, deadline).await;
+                    steps = backoff();
+                    match waited {
+                        Ok(woke) => released = !woke,
+                        Err(e) => w.block_failed(e)?,
+                    }
+                }
+            }
+            Next::Recheck => {
+                if remaining(deadline) != Some(Duration::ZERO) {
+                    pause(steps.next().expect("a backoff without a cap never ends"), deadline).await?;
                 }
             }
         }
     }
+}
+
+/// [`run`]'s pause for a [`Step::Recheck`]: `step`, cut to the time remaining. Nothing wakes it
+/// early, so a `Waitable` that others must reach during the pause holds no lock across it.
+#[cfg(unix)]
+async fn pause(step: Duration, deadline: Option<std::time::Instant>) -> Result<(), Error> {
+    let now = crate::tokio::wait::tokio_now();
+    let by_step = now + step;
+    // An instant, never a duration re-derived from the deadline (`arm_at`'s contract).
+    let at = deadline.map_or(by_step, |deadline| deadline.min(by_step));
+    #[cfg(test)]
+    crate::wait::block_probe::record_pause(at.saturating_duration_since(now));
+    // Only the timer ends it.
+    _ = crate::tokio::wait::arm_at(at, std::future::pending::<()>()).await;
+    Ok(())
+}
+
+/// No Windows `Waitable` asks for a recheck ([`crate::os_process::OsChild::try_reap`] answers
+/// `Running` or an exit there), so there is nothing to pause on.
+#[cfg(windows)]
+async fn pause(_step: Duration, _deadline: Option<std::time::Instant>) -> Result<(), Error> {
+    debug_assert!(false, "a Windows Waitable asked for a recheck");
+    Err(Error::Io(std::io::Error::other(
+        "a Windows Waitable asked for a recheck, which no Windows wait has",
+    )))
 }
 
 /// The time left to `deadline` on the clock this platform's wait runs on.

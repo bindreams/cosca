@@ -76,7 +76,7 @@ pub(crate) enum RunOutcome<T> {
 
 /// The schedule of pauses for [`Step::Recheck`]: 1 ms, doubling, at most 50 ms, never ending, no
 /// jitter.
-fn backoff() -> ExponentialBackoff {
+pub(crate) fn backoff() -> ExponentialBackoff {
     ExponentialBuilder::new()
         .with_min_delay(Duration::from_millis(1))
         .with_factor(2.0)
@@ -143,7 +143,7 @@ fn pause(d: Duration) {
 }
 
 /// An open process's exit, as a [`Waitable`]: `look` is [`OsProcess::exited`].
-struct ProcessExit<'a>(&'a dyn OsProcess);
+pub(crate) struct ProcessExit<'a>(pub(crate) &'a dyn OsProcess);
 
 impl Waitable for ProcessExit<'_> {
     type Output = ();
@@ -193,4 +193,4 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<(), Error>
 
 #[cfg(test)]
 #[path = "drive_tests.rs"]
-mod drive_tests;
+pub(crate) mod drive_tests;

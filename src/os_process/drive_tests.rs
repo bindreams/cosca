@@ -91,7 +91,7 @@ fn duration_max_is_unbounded() {
 
 /// What a [`Scripted`] look does.
 #[derive(Clone, Copy)]
-enum Move {
+pub(crate) enum Move {
     Done,
     Recheck,
     /// Wait on a source that is already fired: the block returns at once.
@@ -103,21 +103,21 @@ enum Move {
 
 /// A [`Waitable`] that plays `moves`. A row drives it with [`run_with`] and its own pause, which
 /// records what it is asked for (and moves the frozen clock, where the row needs it) and returns at
-/// once.
-struct Scripted {
+/// once. The async driver's rows play it too.
+pub(crate) struct Scripted {
     moves: std::collections::VecDeque<Move>,
     source: FakeProcess,
-    looks: usize,
-    on_look: Box<dyn FnMut(usize)>,
+    pub(crate) looks: usize,
+    pub(crate) on_look: Box<dyn FnMut(usize)>,
     /// Whether [`Waitable::block_failed`] lets the loop go on.
-    survive_block_errors: bool,
-    block_errors: usize,
+    pub(crate) survive_block_errors: bool,
+    pub(crate) block_errors: usize,
     #[cfg(target_os = "linux")]
     broken: Option<std::io::PipeWriter>,
 }
 
 impl Scripted {
-    fn new(moves: impl IntoIterator<Item = Move>) -> Self {
+    pub(crate) fn new(moves: impl IntoIterator<Item = Move>) -> Self {
         let moves: std::collections::VecDeque<Move> = moves.into_iter().collect();
         let waits = moves.iter().filter(|m| matches!(m, Move::Wait)).count();
         let source = fake(vec![Answer::Running; waits]);
@@ -169,13 +169,13 @@ impl Waitable for Scripted {
     }
 }
 
-fn ms(n: u64) -> Duration {
+pub(crate) fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
 /// `pauses` in whole milliseconds: `backon` multiplies through `f32` seconds, so a step can come out
 /// a microsecond over (16.000001 ms).
-fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
+pub(crate) fn whole_ms(pauses: &[Duration]) -> Vec<u64> {
     pauses
         .iter()
         .map(|d| (d.as_secs_f64() * 1000.0).round() as u64)

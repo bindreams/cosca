@@ -3,10 +3,21 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use super::{absolute, drive};
+#[cfg(unix)]
+use super::absolute;
+use super::{exited_held, run};
 use crate::error::Error;
+use crate::os_process::drive::ProcessExit;
 use crate::os_process::fake::{Answer, FakeProcess};
 use crate::wait::fault;
+#[cfg(unix)]
+use crate::{
+    os_process::drive::{
+        drive_tests::{ms, whole_ms, Move, Scripted},
+        RunOutcome,
+    },
+    wait::block_probe,
+};
 
 fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
     FakeProcess::new(exits)
@@ -21,7 +32,7 @@ fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
 #[skuld::test]
 async fn zero_timeout_looks_once_and_never_waits() {
     let p = fake([Answer::Running]);
-    let Poll::Ready(answer) = poll_once(drive(&p, absolute(Some(Duration::ZERO)))) else {
+    let Poll::Ready(answer) = poll_once(exited_held(&p, Some(Duration::ZERO))) else {
         panic!("a zero timeout must not wait");
     };
     assert!(!answer.unwrap());
@@ -32,7 +43,7 @@ async fn zero_timeout_looks_once_and_never_waits() {
 #[skuld::test]
 async fn a_failed_look_is_returned_without_waiting() {
     let p = fake([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let Poll::Ready(answer) = poll_once(drive(&p, absolute(None))) else {
+    let Poll::Ready(answer) = poll_once(exited_held(&p, None)) else {
         panic!("a failed look must not wait");
     };
     let err = answer.unwrap_err();
@@ -47,7 +58,7 @@ async fn a_failed_look_is_returned_without_waiting() {
 #[skuld::test]
 async fn exited_before_first_look_returns_true_without_waiting() {
     let p = fake([Answer::Exited]);
-    let Poll::Ready(answer) = poll_once(drive(&p, absolute(None))) else {
+    let Poll::Ready(answer) = poll_once(exited_held(&p, None)) else {
         panic!("an exited process must not wait");
     };
     assert!(answer.unwrap());
@@ -59,7 +70,7 @@ async fn exited_before_first_look_returns_true_without_waiting() {
 async fn wakes_and_looks_again() {
     let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&p, absolute(Some(Duration::from_secs(60)))).await.unwrap());
+    assert!(exited_held(&p, Some(Duration::from_secs(60))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
 
@@ -70,7 +81,7 @@ async fn expiry_ends_in_one_final_look() {
     let timeout = Duration::from_millis(50);
     let p = fake([Answer::Running, Answer::Running]);
     let start = crate::wait::now();
-    assert!(!drive(&p, absolute(Some(timeout))).await.unwrap());
+    assert!(!exited_held(&p, Some(timeout)).await.unwrap());
     assert_eq!(p.looks(), 2);
     let last = *p.look_times().last().unwrap();
     assert!(
@@ -84,7 +95,7 @@ async fn expiry_ends_in_one_final_look() {
 #[skuld::test]
 async fn the_final_look_can_find_an_exit() {
     let p = fake([Answer::Running, Answer::Exited]);
-    assert!(drive(&p, absolute(Some(Duration::from_millis(50)))).await.unwrap());
+    assert!(exited_held(&p, Some(Duration::from_millis(50))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
 
@@ -105,7 +116,7 @@ async fn duration_max_is_unbounded() {
     let _log = crate::wait::read_probe::install(log_tx);
     let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&p, absolute(Some(Duration::MAX))).await.unwrap());
+    assert!(exited_held(&p, Some(Duration::MAX)).await.unwrap());
     #[cfg(unix)]
     assert_eq!(armed.try_iter().count(), 0, "an overflowing timeout arms no timer");
     #[cfg(windows)]
@@ -141,7 +152,7 @@ async fn a_bounded_wait_arms_the_timer_at_the_deadline() {
     let before = crate::tokio::wait::tokio_now();
     let p = fake([Answer::Running, Answer::Exited]);
     p.wake();
-    assert!(drive(&p, absolute(Some(timeout))).await.unwrap());
+    assert!(exited_held(&p, Some(timeout)).await.unwrap());
     let after = crate::tokio::wait::tokio_now();
     let [Armed::At(at)] = armed.try_iter().collect::<Vec<_>>()[..] else {
         panic!("one wait arms one timer");
@@ -164,7 +175,7 @@ fn dropped_wait_releases_the_watch() {
         .expect("build a runtime");
     let p = fake([Answer::Running]);
     runtime.block_on(async {
-        let mut wait = pin!(drive(&p, absolute(None)));
+        let mut wait = pin!(exited_held(&p, None));
         assert!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
             "a running process with nothing fired waits"
@@ -211,7 +222,7 @@ fn a_wait_round_adds_only_a_duplicate_of_the_held_pidfd() {
         .expect("build a runtime");
     let before = open_fds();
     let during = runtime.block_on(async {
-        let mut wait = pin!(drive(&*process, absolute(None)));
+        let mut wait = pin!(exited_held(&*process, None));
         assert!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
             "a running process waits"
@@ -229,9 +240,70 @@ fn async_waits_are_send() {
     fn assert_send<T: Send>(_: &T) {}
 
     let p = fake([]);
-    assert_send(&drive(&p, absolute(None)));
+    assert_send(&exited_held(&p, None));
+    assert_send(&run(&mut ProcessExit(&p), None));
     let process = crate::tokio::Process::current().expect("open this process");
     assert_send(&process.wait());
+}
+
+/// The pauses `run` recorded, in whole milliseconds.
+#[cfg(unix)]
+fn pauses() -> Vec<u64> {
+    let pauses: Vec<_> = block_probe::take()
+        .into_iter()
+        .map(|pause| pause.expect("a pause is bounded"))
+        .collect();
+    whole_ms(&pauses)
+}
+
+/// Mutant: pause a constant, or restart the schedule at every pause, or arm no timer.
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_run_pauses_on_the_backoff_for_a_recheck() {
+    block_probe::take();
+    let mut w = Scripted::new([Move::Recheck, Move::Recheck, Move::Recheck, Move::Done]);
+    assert!(matches!(run(&mut w, None).await.unwrap(), RunOutcome::Done(())));
+    assert_eq!(pauses(), [1, 2, 4]);
+    assert_eq!(w.looks, 4, "one look per pause, and one more");
+}
+
+/// A pause never outlasts the deadline: the last one is cut to the time remaining, and the look
+/// after it is the final one.
+///
+/// Mutant: pause the whole step; or make no final look after the last pause; or pause again at the
+/// deadline.
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_run_cuts_a_pause_to_the_deadline_and_looks_once_more() {
+    block_probe::take();
+    let mut w = Scripted::new([Move::Recheck; 3]);
+    let outcome = run(&mut w, absolute(Some(ms(3)))).await.unwrap();
+    assert!(matches!(outcome, RunOutcome::DeadlinePassed), "{outcome:?}");
+    assert_eq!(pauses(), [1, 2]);
+    assert_eq!(w.looks, 3, "the last look is made at the deadline");
+}
+
+/// Mutant: keep the schedule across a wait.
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_run_restarts_the_backoff_after_a_wait() {
+    block_probe::take();
+    let mut w = Scripted::new([Move::Recheck, Move::Recheck, Move::Wait, Move::Recheck, Move::Done]);
+    assert!(matches!(run(&mut w, None).await.unwrap(), RunOutcome::Done(())));
+    assert_eq!(pauses(), [1, 2, 1]);
+}
+
+/// A failed wait is the `Waitable`'s to answer: one that survives it is looked at again.
+///
+/// Mutant: end the loop on a wait error the `Waitable` survived; or never hand it to the `Waitable`.
+#[cfg(target_os = "linux")]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_run_survives_a_failed_wait_when_the_waitable_does() {
+    let mut w = Scripted::new([Move::WaitFails, Move::Recheck, Move::Done]);
+    w.survive_block_errors = true;
+    assert!(matches!(run(&mut w, None).await.unwrap(), RunOutcome::Done(())));
+    assert_eq!(w.block_errors, 1);
+    assert_eq!(w.looks, 3);
 }
 
 #[cfg(windows)]
@@ -381,7 +453,7 @@ mod windows {
         let (tx, armed) = std::sync::mpsc::channel();
         let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
         let p = fake([Answer::Running, Answer::Exited]);
-        assert!(super::drive(&p, super::absolute(None)).await.unwrap());
+        assert!(super::exited_held(&p, None).await.unwrap());
         assert_eq!(
             armed.try_iter().count(),
             1,
@@ -402,7 +474,7 @@ mod windows {
         let (tx, armed) = std::sync::mpsc::channel();
         let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
         let p = fake([Answer::Running, Answer::Running]);
-        assert!(!super::drive(&p, super::absolute(None)).await.unwrap());
+        assert!(!super::exited_held(&p, None).await.unwrap());
         assert_eq!(p.looks(), 2, "one look, one wait, one final look");
         assert_eq!(armed.try_iter().count(), 1, "the wait armed once");
     }
