@@ -613,7 +613,7 @@ async fn async_unix_fd3_null_is_accepted() {
 }
 
 // Windows fd >= 3 routes through the async raw `CreateProcessW` backend (Plan 12 Task 8): the
-// MSVCRT fd-table wires the descriptor and the parent end is the overlapped-named-pipe async end.
+// MSVCRT fd-table wires the descriptor and the parent end is the overlapped pipe tokio adopts.
 // Its round-trips (both directions) + contained twin live in `tests/raw_windows_async.rs`,
 // alongside the rest of the raw-backend proofs.
 

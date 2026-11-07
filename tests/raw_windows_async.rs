@@ -12,7 +12,7 @@ mod common;
 /// Async twin of sync `executable_independent_of_argv0_on_windows`: the raw backend loads
 /// `executable()` while argv[0] is the command line's first token. `argv0-report` echoes both,
 /// proving the loaded image (`testbin`) differs from the reported argv[0] (`pretend-name`). The
-/// stdout pipe is served by the tokio overlapped-named-pipe machinery.
+/// stdout pipe is the overlapped pipe `make_pipe` made, adopted by tokio at take time.
 #[skuld::test]
 async fn async_executable_independent_of_argv0() {
     let exe = common::testbin();
@@ -294,7 +294,7 @@ async fn async_an_unlisted_inheritable_handle_does_not_reach_the_child() {
 
 #[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `no_inheritable_handle_outlives_a_raw_spawn`, over the tokio backend's child
-/// ends (overlapped named pipes included). Mutant: `drop(child_ends)` in the tokio `spawn_raw`
+/// ends (overlapped pipes included). Mutant: `drop(child_ends)` in the tokio `spawn_raw`
 /// replaced by `std::mem::forget(child_ends)`.
 #[skuld::test]
 async fn async_no_inheritable_handle_outlives_a_raw_spawn() {

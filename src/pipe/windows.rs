@@ -9,11 +9,15 @@
 
 use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
+};
 use std::process::Stdio;
 
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows::Wdk::Storage::FileSystem::NtOpenFile;
+use windows::Wdk::Storage::FileSystem::{
+    FileModeInformation, NtOpenFile, NtQueryInformationFile, FILE_MODE_INFORMATION,
+};
 use windows::Win32::Foundation::{
     RtlNtStatusToDosError, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, HANDLE, NTSTATUS, UNICODE_STRING, WAIT_OBJECT_0,
 };
@@ -37,6 +41,7 @@ const FILE_SHARE_READ: u32 = 0x1;
 const FILE_SHARE_WRITE: u32 = 0x2;
 const FILE_CREATE: u32 = 0x2;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x10;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const FILE_PIPE_BYTE_STREAM_TYPE: u32 = 0;
 const FILE_PIPE_BYTE_STREAM_MODE: u32 = 0;
@@ -182,21 +187,64 @@ pub(crate) fn child_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedH
 
 // The ends =====
 
-/// An overlapped pipe end. It is used only through [`read`](Handle::read) and
-/// [`write`](Handle::write), which never wait on the handle.
+/// A pipe end, overlapped or synchronous. It is used only through the `Read` and `Write` impls
+/// below, which never wait on the handle, so either mode works.
 #[derive(Debug)]
-pub(super) struct Handle(OwnedHandle);
+pub(super) struct Handle {
+    handle: OwnedHandle,
+    /// Whether the handle was opened without a synchronous-I/O flag. The adoption by tokio needs
+    /// it: a synchronous end would block the reactor.
+    overlapped: bool,
+}
 
 pub(super) type Reader = Handle;
 pub(super) type Writer = Handle;
 
+/// The file object mode bits that make a handle synchronous (`FILE_SYNCHRONOUS_IO_ALERT` and
+/// `FILE_SYNCHRONOUS_IO_NONALERT`).
+const FILE_SYNCHRONOUS_IO_MASK: u32 = FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT;
+
+/// Whether `handle` is overlapped: its file object has no synchronous-I/O flag.
+pub(crate) fn is_overlapped(handle: BorrowedHandle<'_>) -> io::Result<bool> {
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let mut mode = FILE_MODE_INFORMATION::default();
+    // SAFETY: the handle is live for the call; `mode` is the buffer the class describes.
+    let status = unsafe {
+        NtQueryInformationFile(
+            HANDLE(handle.as_raw_handle()),
+            &mut io_status,
+            std::ptr::from_mut(&mut mode).cast(),
+            size_of::<FILE_MODE_INFORMATION>() as u32,
+            FileModeInformation,
+        )
+    };
+    if status.is_err() {
+        return Err(nt_error(status));
+    }
+    Ok(mode.Mode & FILE_SYNCHRONOUS_IO_MASK == 0)
+}
+
 impl Handle {
+    /// A handle of unknown mode, which is asked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle's mode cannot be queried, which means it is not a file handle.
+    fn of_unknown_mode(handle: OwnedHandle) -> Handle {
+        let overlapped = is_overlapped(handle.as_handle()).expect("the handle of a pipe end can be queried");
+        Handle { handle, overlapped }
+    }
+
     pub(super) fn try_clone(&self) -> io::Result<Handle> {
-        self.0.try_clone().map(Handle)
+        let handle = self.handle.try_clone()?;
+        Ok(Handle {
+            handle,
+            overlapped: self.overlapped,
+        })
     }
 
     fn as_raw(&self) -> HANDLE {
-        HANDLE(self.0.as_raw_handle())
+        HANDLE(self.handle.as_raw_handle())
     }
 }
 
@@ -246,8 +294,13 @@ fn overlapped_io(
     let event = unsafe { CreateEventW(None, true, false, None) }.map_err(win32_io_error)?;
     // SAFETY: `event` is new and ours alone; the guard closes it after the operation is over.
     let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
+    // The low bit of `hEvent` tells the kernel not to queue a completion packet for this operation
+    // to a completion port the file object may be associated with. Tokio associates the end it
+    // adopts, and a clone of that end shares the association: without the bit, a synchronous read
+    // through the clone posts a packet pointing at `overlapped`, a stack frame, for the reactor to
+    // dequeue after this function has returned.
     let mut overlapped = OVERLAPPED {
-        hEvent: HANDLE(event.as_raw_handle()),
+        hEvent: HANDLE(event.as_raw_handle().map_addr(|address| address | 1)),
         ..Default::default()
     };
     match start(&mut overlapped) {
@@ -272,14 +325,32 @@ fn overlapped_io(
 impl PipeReader {
     /// The parent's end of a pipe [`child_pipe`] made: overlapped, and readable.
     pub(crate) fn from_overlapped(end: OwnedHandle) -> PipeReader {
-        PipeReader(Handle(end))
+        PipeReader(Handle {
+            handle: end,
+            overlapped: true,
+        })
+    }
+
+    /// Whether the end's handle is overlapped. Only an overlapped end can go to the reactor.
+    #[cfg(any(feature = "tokio", test))]
+    pub(crate) fn is_overlapped(&self) -> bool {
+        self.0.overlapped
     }
 }
 
 impl PipeWriter {
     /// The parent's end of a pipe [`child_pipe`] made: overlapped, and writable.
     pub(crate) fn from_overlapped(end: OwnedHandle) -> PipeWriter {
-        PipeWriter(Handle(end))
+        PipeWriter(Handle {
+            handle: end,
+            overlapped: true,
+        })
+    }
+
+    /// Whether the end's handle is overlapped. Only an overlapped end can go to the reactor.
+    #[cfg(any(feature = "tokio", test))]
+    pub(crate) fn is_overlapped(&self) -> bool {
+        self.0.overlapped
     }
 }
 
@@ -287,59 +358,127 @@ impl PipeWriter {
 /// use from several threads at once.
 impl From<std::io::PipeReader> for PipeReader {
     fn from(p: std::io::PipeReader) -> PipeReader {
-        PipeReader(Handle(p.into()))
+        PipeReader::from(OwnedHandle::from(p))
     }
 }
 
 /// A std pipe end is synchronous; see the reader's conversion.
 impl From<std::io::PipeWriter> for PipeWriter {
     fn from(p: std::io::PipeWriter) -> PipeWriter {
-        PipeWriter(Handle(p.into()))
+        PipeWriter::from(OwnedHandle::from(p))
+    }
+}
+
+/// The handle must be a readable pipe end. Its mode, overlapped or synchronous, is asked and
+/// recorded.
+///
+/// # Panics
+///
+/// Panics if the handle's mode cannot be queried, which means it is not a file handle.
+impl From<OwnedHandle> for PipeReader {
+    fn from(handle: OwnedHandle) -> PipeReader {
+        PipeReader(Handle::of_unknown_mode(handle))
+    }
+}
+
+/// The handle must be a writable pipe end. Its mode is asked and recorded, as for
+/// [`PipeReader`].
+///
+/// # Panics
+///
+/// Panics if the handle's mode cannot be queried, which means it is not a file handle.
+impl From<OwnedHandle> for PipeWriter {
+    fn from(handle: OwnedHandle) -> PipeWriter {
+        PipeWriter(Handle::of_unknown_mode(handle))
+    }
+}
+
+/// # Panics
+///
+/// Panics if the handle's mode cannot be queried, which means it is not a file handle.
+impl FromRawHandle for PipeReader {
+    /// # Safety
+    ///
+    /// As [`OwnedHandle::from_raw_handle`]: `handle` is open and owned by nothing else. It must be
+    /// a readable pipe end.
+    unsafe fn from_raw_handle(handle: RawHandle) -> PipeReader {
+        // SAFETY: the caller's contract.
+        PipeReader::from(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+/// # Panics
+///
+/// Panics if the handle's mode cannot be queried, which means it is not a file handle.
+impl FromRawHandle for PipeWriter {
+    /// # Safety
+    ///
+    /// As [`OwnedHandle::from_raw_handle`]: `handle` is open and owned by nothing else. It must be
+    /// a writable pipe end.
+    unsafe fn from_raw_handle(handle: RawHandle) -> PipeWriter {
+        // SAFETY: the caller's contract.
+        PipeWriter::from(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
 }
 
 impl From<PipeReader> for OwnedHandle {
     fn from(p: PipeReader) -> OwnedHandle {
-        p.0 .0
+        p.0.handle
     }
 }
 
 impl From<PipeWriter> for OwnedHandle {
     fn from(p: PipeWriter) -> OwnedHandle {
-        p.0 .0
+        p.0.handle
+    }
+}
+
+impl IntoRawHandle for PipeReader {
+    fn into_raw_handle(self) -> RawHandle {
+        self.0.handle.into_raw_handle()
+    }
+}
+
+impl IntoRawHandle for PipeWriter {
+    fn into_raw_handle(self) -> RawHandle {
+        self.0.handle.into_raw_handle()
     }
 }
 
 impl AsHandle for PipeReader {
     fn as_handle(&self) -> BorrowedHandle<'_> {
-        self.0 .0.as_handle()
+        self.0.handle.as_handle()
     }
 }
 
 impl AsHandle for PipeWriter {
     fn as_handle(&self) -> BorrowedHandle<'_> {
-        self.0 .0.as_handle()
+        self.0.handle.as_handle()
     }
 }
 
 impl AsRawHandle for PipeReader {
-    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.0 .0.as_raw_handle()
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0.handle.as_raw_handle()
     }
 }
 
 impl AsRawHandle for PipeWriter {
-    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.0 .0.as_raw_handle()
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0.handle.as_raw_handle()
     }
 }
 
+/// The child gets the handle as it is, overlapped or not: neither `ReOpenFile` (it opens a client
+/// of the pipe, never another handle on the end) nor `NtSetInformationFile` (it refuses the
+/// synchronous flags) can make an overlapped pipe end synchronous.
 impl From<PipeReader> for Stdio {
     fn from(p: PipeReader) -> Stdio {
         Stdio::from(OwnedHandle::from(p))
     }
 }
 
+/// See the reader's conversion.
 impl From<PipeWriter> for Stdio {
     fn from(p: PipeWriter) -> Stdio {
         Stdio::from(OwnedHandle::from(p))

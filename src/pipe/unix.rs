@@ -1,6 +1,6 @@
 //! Unix: std's pipe ends, which already read and write through a shared reference from any thread.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::Stdio;
 
 use super::{PipeReader, PipeWriter};
@@ -29,6 +29,40 @@ impl From<OwnedFd> for PipeReader {
 impl From<OwnedFd> for PipeWriter {
     fn from(fd: OwnedFd) -> PipeWriter {
         PipeWriter(fd.into())
+    }
+}
+
+impl FromRawFd for PipeReader {
+    /// # Safety
+    ///
+    /// As [`OwnedFd::from_raw_fd`]: `fd` is open and owned by nothing else. It must be a pipe's
+    /// read end.
+    unsafe fn from_raw_fd(fd: RawFd) -> PipeReader {
+        // SAFETY: the caller's contract.
+        PipeReader::from(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+impl FromRawFd for PipeWriter {
+    /// # Safety
+    ///
+    /// As [`OwnedFd::from_raw_fd`]: `fd` is open and owned by nothing else. It must be a pipe's
+    /// write end.
+    unsafe fn from_raw_fd(fd: RawFd) -> PipeWriter {
+        // SAFETY: the caller's contract.
+        PipeWriter::from(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+impl IntoRawFd for PipeReader {
+    fn into_raw_fd(self) -> RawFd {
+        OwnedFd::from(self).into_raw_fd()
+    }
+}
+
+impl IntoRawFd for PipeWriter {
+    fn into_raw_fd(self) -> RawFd {
+        OwnedFd::from(self).into_raw_fd()
     }
 }
 

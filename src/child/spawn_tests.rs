@@ -1845,14 +1845,7 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
 #[skuld::test]
 fn a_spawned_childs_stdout_end_is_overlapped() {
     use std::io::Read as _;
-    use std::os::windows::io::AsRawHandle as _;
-
-    use windows::Wdk::Storage::FileSystem::{FileModeInformation, NtQueryInformationFile, FILE_MODE_INFORMATION};
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::IO::IO_STATUS_BLOCK;
-
-    const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x10;
-    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    use std::os::windows::io::AsHandle as _;
 
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cmd", "/C", "echo overlapped"]);
@@ -1860,28 +1853,46 @@ fn a_spawned_childs_stdout_end_is_overlapped() {
     let mut child = cmd.spawn().expect("spawn");
     let mut stdout = child.stdout().expect("piped stdout");
 
-    let mut io_status = IO_STATUS_BLOCK::default();
-    let mut mode = FILE_MODE_INFORMATION::default();
-    // SAFETY: the handle is live (`stdout` owns it); `mode` is the buffer the class describes.
-    let status = unsafe {
-        NtQueryInformationFile(
-            HANDLE(stdout.as_raw_handle()),
-            &mut io_status,
-            std::ptr::from_mut(&mut mode).cast(),
-            std::mem::size_of::<FILE_MODE_INFORMATION>() as u32,
-            FileModeInformation,
-        )
-    };
-    assert!(status.is_ok(), "NtQueryInformationFile: {status:?}");
-    assert_eq!(
-        mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT),
-        0,
-        "the parent's end carries a synchronous-I/O flag (mode {:#x})",
-        mode.Mode
+    assert!(
+        crate::pipe::windows::is_overlapped(stdout.as_handle()).expect("query the mode"),
+        "the parent's end carries a synchronous-I/O flag"
     );
 
     let mut out = String::new();
     stdout.read_to_string(&mut out).expect("read the child's output");
     assert_eq!(out.trim(), "overlapped");
     child.wait().expect("reap");
+}
+
+/// Our overlapped end of one child's stdout, given to another child as its stdin, reaches it: the
+/// second child's plain `ReadFile` (`findstr`) reads the overlapped handle. (Measured: the mode of
+/// a pipe end cannot be changed, so the child gets the end as it is.)
+#[cfg(windows)]
+#[skuld::test]
+fn piping_one_childs_stdout_into_anothers_stdin_delivers_the_bytes() {
+    use std::io::Read as _;
+
+    let mut first = crate::test_child::command(Console::Hidden);
+    first.args(["cmd", "/C", "echo x-through-the-pipe"]);
+    first.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut first = first.spawn().expect("spawn the writer");
+    let stdout = first.stdout().expect("piped stdout");
+
+    let mut second = crate::test_spawn::spawn(
+        std::process::Command::new("findstr")
+            .arg("x")
+            .stdin(std::process::Stdio::from(stdout))
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn the reader");
+    let mut out = String::new();
+    second
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .expect("read the second child's output");
+    assert_eq!(out.trim(), "x-through-the-pipe");
+    assert!(second.wait().expect("reap the reader").success());
+    first.wait().expect("reap the writer");
 }

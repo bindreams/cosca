@@ -1,10 +1,10 @@
 //! Windows: one thread per active stream, so stdin, stdout and stderr are serviced concurrently and
-//! no full pipe buffer can wedge the others. The `CreatePipe` ends cannot be polled; draining all
-//! three on the calling thread would need overlapped pipes made at spawn.
+//! no full pipe buffer can wedge the others. The ends are overlapped NT pipes made at spawn, but
+//! the pump does not poll them yet: the per-stream threads stay until #143's drain lands.
 //!
 //! A thread that cannot be created panics here (`thread::scope`'s `spawn`), where Unix returns
-//! the error. That stays until the Windows half of #869: the spawn boundary and overlapped pipes
-//! (#143) remove the threads.
+//! the error. That stays until the Windows half of #869: the spawn boundary and #143's drain
+//! remove the threads.
 
 use std::io::{Read, Write};
 use std::thread;
