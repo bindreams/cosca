@@ -110,8 +110,8 @@ impl std::fmt::Debug for ChildStderr {
     }
 }
 
-/// Registers a parent read end with the reactor. On failure the end is closed. On Windows a
-/// synchronous end is refused with `InvalidInput`, since it would block the reactor.
+/// Registers a parent read end with the reactor. On failure the end is closed. On Windows the end
+/// must be a `make_pipe` end, which is overlapped.
 ///
 /// # Panics
 ///
@@ -123,7 +123,7 @@ pub(super) fn register_reader(end: crate::PipeReader) -> std::io::Result<OwnedRe
     }
     #[cfg(windows)]
     {
-        adopt(end.is_overlapped(), end.into())
+        adopt(end.into())
     }
 }
 
@@ -135,25 +135,22 @@ pub(super) fn register_writer(end: crate::PipeWriter) -> std::io::Result<OwnedWr
     }
     #[cfg(windows)]
     {
-        adopt(end.is_overlapped(), end.into())
+        adopt(end.into())
     }
 }
 
 /// Windows: an overlapped end that nothing has associated with a completion port (the sync pipe
-/// types' I/O does not), so tokio can. A synchronous one would block the reactor's thread on every
-/// operation, so it is refused, never wrapped.
+/// types' I/O does not), so tokio can. Only `make_pipe` ends arrive here; a synchronous one would
+/// block the reactor's thread on every operation.
 #[cfg(windows)]
 fn adopt(
-    overlapped: bool,
     end: std::os::windows::io::OwnedHandle,
 ) -> std::io::Result<::tokio::net::windows::named_pipe::NamedPipeServer> {
-    use std::os::windows::io::IntoRawHandle;
-    if !overlapped {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "a synchronous pipe end cannot be registered with the reactor: it would block the runtime thread",
-        ));
-    }
+    use std::os::windows::io::{AsHandle, IntoRawHandle};
+    debug_assert!(
+        crate::pipe::windows::is_overlapped(end.as_handle()).expect("query the end's mode"),
+        "a pipe end registered with the reactor is overlapped"
+    );
     let handle = end.into_raw_handle();
     // SAFETY: `handle` is an open overlapped pipe handle that nothing else owns or has associated
     // with a completion port; tokio takes it, and closes it if the registration fails.

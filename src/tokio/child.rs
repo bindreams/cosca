@@ -40,20 +40,15 @@ pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 /// `what`: the child sees a broken pipe on writes, visibly, never a hang.
 fn take_reader(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::OwnedRead> {
     match ends.remove(&fd)? {
-        ParentEnd::Reader(r) => {
-            // Only `make_pipe` fills the maps, and its ends are overlapped.
-            #[cfg(windows)]
-            debug_assert!(r.is_overlapped(), "a parent end of a spawn is overlapped");
-            match super::stdio::register_reader(r) {
-                Ok(end) => Some(end),
-                Err(e) => {
-                    log::warn!(
-                        "{fd} {what} dropped: tokio conversion failed ({e}); the child will see a broken pipe on writes"
-                    );
-                    None
-                }
+        ParentEnd::Reader(r) => match super::stdio::register_reader(r) {
+            Ok(end) => Some(end),
+            Err(e) => {
+                log::warn!(
+                    "{fd} {what} dropped: tokio conversion failed ({e}); the child will see a broken pipe on writes"
+                );
+                None
             }
-        }
+        },
         end => {
             ends.insert(fd, end);
             None
@@ -64,18 +59,13 @@ fn take_reader(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::O
 /// [`take_reader`] for a write end: a failed registration leaves the child EOF on reads.
 fn take_writer(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::OwnedWrite> {
     match ends.remove(&fd)? {
-        ParentEnd::Writer(w) => {
-            // As for the reader.
-            #[cfg(windows)]
-            debug_assert!(w.is_overlapped(), "a parent end of a spawn is overlapped");
-            match super::stdio::register_writer(w) {
-                Ok(end) => Some(end),
-                Err(e) => {
-                    log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); the child will see EOF on reads");
-                    None
-                }
+        ParentEnd::Writer(w) => match super::stdio::register_writer(w) {
+            Ok(end) => Some(end),
+            Err(e) => {
+                log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); the child will see EOF on reads");
+                None
             }
-        }
+        },
         end => {
             ends.insert(fd, end);
             None

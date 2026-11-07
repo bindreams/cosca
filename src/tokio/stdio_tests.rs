@@ -6,17 +6,6 @@ use tokio::io::AsyncReadExt;
 use crate::child::ParentEnd;
 use crate::stdio::Direction;
 
-// A synchronous end would block the reactor's thread, so a std-built end is refused, never wrapped.
-// Neither call needs a runtime: the refusal comes before the registration.
-#[skuld::test]
-fn adopting_a_std_built_end_is_invalid_input() {
-    let (r, w) = std::io::pipe().expect("pipe");
-    let e = super::register_reader(crate::PipeReader::from(r)).expect_err("a std read end is synchronous");
-    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
-    let e = super::register_writer(crate::PipeWriter::from(w)).expect_err("a std write end is synchronous");
-    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
-}
-
 // A child writes on its end; the parent's end, registered with the reactor, reads to EOF.
 #[skuld::test]
 async fn an_adopted_read_end_reads_a_real_childs_output() {

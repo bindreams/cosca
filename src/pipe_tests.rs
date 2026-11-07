@@ -187,46 +187,54 @@ async fn tokio_adopts_an_end_the_sync_type_used() {
     sender.join().expect("sender");
 }
 
-/// A clone of an end tokio adopted shares its completion port, so a synchronous read through the
-/// clone would queue a packet pointing at the read's own stack frame unless its `OVERLAPPED` opts
-/// out. The reactor dequeues whatever the port holds on its next turn, so each round ends with an
-/// async read that makes it turn: a stray packet crashes the process there.
+/// A clone of an end a completion port is associated with shares the association, so a synchronous
+/// read through the other clone would queue a packet pointing at the read's own stack frame unless
+/// its `OVERLAPPED` opts out. Tokio's reactor is such a port; this test makes its own, and looks at
+/// it directly.
 ///
 /// Mutant: `overlapped_io` stores the event handle in `hEvent` without its low bit.
-#[cfg(all(windows, feature = "tokio"))]
+#[cfg(windows)]
 #[skuld::test]
-async fn a_sync_read_on_a_clone_tokio_adopted_queues_nothing() {
-    use std::os::windows::io::{IntoRawHandle, OwnedHandle};
-    use tokio::io::AsyncReadExt;
-    use tokio::net::windows::named_pipe::NamedPipeServer;
+fn a_sync_read_on_a_clone_of_an_associated_end_queues_nothing() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-    for _ in 0..20 {
-        let (reader, mut theirs) = reader_pair();
-        let clone = reader.try_clone().expect("clone");
-        let handle = OwnedHandle::from(reader).into_raw_handle();
-        // SAFETY: the handle is the one `reader` owned, handed over whole.
-        let mut server = unsafe { NamedPipeServer::from_raw_handle(handle) }.expect("tokio takes the end");
+    use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+    use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
-        // Tokio reads ahead into its own buffer from the moment it adopts an end, and keeps one
-        // read outstanding until that buffer is taken: this byte fills it, so the bytes after it
-        // stay in the pipe for the synchronous read.
-        theirs.write_all(b"A").expect("send");
-        theirs.write_all(b"sync").expect("send");
-        let mut sync = [0u8; 4];
-        (&clone).read_exact(&mut sync).expect("sync read through the clone");
-        assert_eq!(&sync, b"sync");
+    let (reader, mut theirs) = reader_pair();
+    let associated = reader.try_clone().expect("clone");
 
-        let mut ahead = [0u8; 1];
-        server.read_exact(&mut ahead).await.expect("tokio's first read");
-        assert_eq!(&ahead, b"A");
-        theirs.write_all(b"async").expect("send");
-        let mut asynchronous = [0u8; 5];
-        server
-            .read_exact(&mut asynchronous)
-            .await
-            .expect("async read through tokio");
-        assert_eq!(&asynchronous, b"async");
+    // SAFETY: no file handle and no existing port: makes a new port, which the guard closes.
+    let port = unsafe { CreateIoCompletionPort(HANDLE(-1isize as *mut _), None, 0, 0) }.expect("make the port");
+    // SAFETY: `port` is new and ours alone.
+    let port = unsafe { OwnedHandle::from_raw_handle(port.0) };
+    // SAFETY: both handles are live; the end is overlapped and associated with no other port.
+    unsafe {
+        CreateIoCompletionPort(
+            HANDLE(associated.as_raw_handle()),
+            Some(HANDLE(port.as_raw_handle())),
+            0,
+            0,
+        )
     }
+    .expect("associate the clone with the port");
+
+    theirs.write_all(b"sync").expect("send");
+    let mut got = [0u8; 4];
+    (&reader)
+        .read_exact(&mut got)
+        .expect("sync read through the other clone");
+    assert_eq!(&got, b"sync");
+
+    let (mut bytes, mut key, mut overlapped) = (0u32, 0usize, std::ptr::null_mut::<OVERLAPPED>());
+    // SAFETY: the out-pointers are to live locals; a zero timeout polls.
+    let status =
+        unsafe { GetQueuedCompletionStatus(HANDLE(port.as_raw_handle()), &mut bytes, &mut key, &mut overlapped, 0) };
+    let e = status.expect_err("the port holds no packet");
+    assert!(
+        overlapped.is_null() && e.code() == windows::core::HRESULT::from_win32(WAIT_TIMEOUT.0),
+        "a packet was queued for the sync read: {e}"
+    );
 }
 
 /// An end taken out as a raw descriptor and wrapped again, as std's own pipe ends allow.
@@ -244,39 +252,4 @@ fn a_pipe_end_round_trips_through_a_raw_fd() {
     let mut got = Vec::new();
     reader.read_to_end(&mut got).expect("read to the end");
     assert_eq!(got, b"raw");
-}
-
-/// A wrapped handle records whether it is overlapped, by asking, whichever way it arrives.
-///
-/// Mutant: a conversion records `true` without asking.
-#[cfg(windows)]
-#[skuld::test]
-fn a_wrapped_handle_records_whether_it_is_overlapped() {
-    use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
-
-    let (overlapped, _theirs) = super::windows::child_pipe(true).expect("make the pipe");
-    let (synchronous, _writer) = std::io::pipe().expect("make a std pipe");
-    let synchronous = OwnedHandle::from(synchronous);
-
-    assert!(
-        PipeReader::from(overlapped).is_overlapped(),
-        "From<OwnedHandle> of an overlapped handle"
-    );
-    assert!(
-        !PipeReader::from(synchronous.try_clone().expect("clone")).is_overlapped(),
-        "From<OwnedHandle> of a synchronous handle"
-    );
-    let (r, w) = std::io::pipe().expect("make a std pipe");
-    assert!(!PipeReader::from(r).is_overlapped(), "From<std PipeReader>");
-    assert!(!PipeWriter::from(w).is_overlapped(), "From<std PipeWriter>");
-
-    let (overlapped, _theirs) = super::windows::child_pipe(true).expect("make the pipe");
-    let raw = PipeReader::from_overlapped(overlapped).into_raw_handle();
-    // SAFETY: `raw` is the handle the reader owned, handed over whole.
-    let again = unsafe { PipeReader::from_raw_handle(raw) };
-    assert!(again.is_overlapped(), "FromRawHandle of an overlapped handle");
-    let raw = PipeReader::from(synchronous).into_raw_handle();
-    // SAFETY: as above.
-    let again = unsafe { PipeReader::from_raw_handle(raw) };
-    assert!(!again.is_overlapped(), "FromRawHandle of a synchronous handle");
 }
