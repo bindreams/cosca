@@ -486,6 +486,57 @@ fn cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixtu
     teardown.assert_killed();
 }
 
+// ===== A closed stdout is not a cgroup leaf's =====
+
+/// A spawn that inherits a stdout this process has closed fails with `EBADF`, though a cgroup leaf
+/// is contained for it: the leaf's descriptors never stand in for the stdout. Runs in a re-exec'd
+/// child, since the closed fd 1 is process-wide.
+///
+/// Mutant: `prepare` runs before stdio is resolved, and a descriptor it keeps open takes fd 1.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_a_spawn_with_stdout_closed_and_inherited_is_refused(#[fixture(cgroup)] _group: &Group) {
+    let fixture = crate::test_child::fixture_path!(fixture_cgroup_spawn_with_stdout_closed);
+    crate::test_child::run_fixture_command(fixture, crate::test_child::fixture_command(fixture));
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn fixture_cgroup_spawn_with_stdout_closed() {
+    use crate::child::front_cgroup_tests::in_cgroup;
+    use crate::Stdio;
+
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    let command = || {
+        let mut cmd = in_cgroup(crate::test_child::command(Console::Hidden));
+        cmd.args(["true"]);
+        cmd
+    };
+    // The control: with stdout open, the same command gets a cgroup leaf, so a refusal below is
+    // the closed stdout's and not a leaf that could not be made.
+    let mut control = command();
+    control.stdout(Stdio::null()).expect("stdout to null");
+    let child = control.spawn().expect("the control spawns");
+    assert_eq!(child.containment(), crate::Containment::CgroupV2);
+    child.wait().expect("reap the control");
+
+    let mut cmd = command();
+    cmd.stdout(Stdio::inherit()).expect("inherit stdout");
+    let closed = crate::test_child::close_stdout_keeping_a_copy();
+    let spawned = cmd.spawn();
+    drop(closed);
+    let refused = match spawned {
+        Ok(_child) => panic!("a spawn inheriting a closed stdout must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&refused, Error::Io(e) if e.raw_os_error() == Some(libc::EBADF)),
+        "{refused:?}"
+    );
+}
+
 // ===== A refused spawn leaves our handle inheritance alone =====
 
 /// A refused spawn must not have mutated this process first. `clear_std_handle_inheritance` is a

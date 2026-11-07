@@ -113,12 +113,13 @@ pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
     crate::stdio::Stdio::from_file(file)
 }
 
-/// This process's stdio, closed with copies kept at 10 or above, put back when dropped. For a
-/// re-exec'd fixture that needs the lowest free numbers to be stdio slots: drop every descriptor
+/// Some of this process's stdio, closed with copies kept at 10 or above, put back when dropped. For
+/// a re-exec'd fixture that needs the lowest free numbers to be stdio slots: drop every descriptor
 /// created meanwhile first, or the restoring `dup2` replaces it.
 #[cfg(unix)]
 pub(crate) struct ClosedStdio {
-    saved: [std::os::fd::OwnedFd; 3],
+    /// Each closed slot with its copy.
+    saved: Vec<(i32, std::os::fd::OwnedFd)>,
 }
 
 /// Lowers this process's descriptor limit to its lowest free descriptor, so that no further one can
@@ -167,14 +168,28 @@ impl Drop for RestoreNofile {
 /// Closes fds 0 to 2; see [`ClosedStdio`].
 #[cfg(unix)]
 pub(crate) fn close_stdio_keeping_a_copy() -> ClosedStdio {
+    close_keeping_copies(&[0, 1, 2])
+}
+
+/// Closes fd 1 alone; see [`ClosedStdio`].
+#[cfg(target_os = "linux")]
+pub(crate) fn close_stdout_keeping_a_copy() -> ClosedStdio {
+    close_keeping_copies(&[1])
+}
+
+#[cfg(unix)]
+fn close_keeping_copies(slots: &[i32]) -> ClosedStdio {
     use std::os::fd::BorrowedFd;
-    let copy = |fd: i32| {
-        // SAFETY: fds 0 to 2 are open in a running test process.
-        let stdio = unsafe { BorrowedFd::borrow_raw(fd) };
-        rustix::io::fcntl_dupfd_cloexec(stdio, 10).expect("copy a stdio descriptor")
-    };
-    let saved = [copy(0), copy(1), copy(2)];
-    for fd in 0..3 {
+    let saved: Vec<(i32, std::os::fd::OwnedFd)> = slots
+        .iter()
+        .map(|&fd| {
+            // SAFETY: fds 0 to 2 are open in a running test process.
+            let stdio = unsafe { BorrowedFd::borrow_raw(fd) };
+            let copy = rustix::io::fcntl_dupfd_cloexec(stdio, 10).expect("copy a stdio descriptor");
+            (fd, copy)
+        })
+        .collect();
+    for &fd in slots {
         // SAFETY: closes a descriptor the copies above preserve.
         assert_eq!(unsafe { libc::close(fd) }, 0);
     }
@@ -185,9 +200,9 @@ pub(crate) fn close_stdio_keeping_a_copy() -> ClosedStdio {
 impl Drop for ClosedStdio {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
-        for (fd, saved) in self.saved.iter().enumerate() {
+        for (fd, saved) in &self.saved {
             // SAFETY: `dup2` of a copy this guard owns onto a stdio slot.
-            unsafe { libc::dup2(saved.as_raw_fd(), fd as i32) };
+            unsafe { libc::dup2(saved.as_raw_fd(), *fd) };
         }
     }
 }
