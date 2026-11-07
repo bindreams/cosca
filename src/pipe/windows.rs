@@ -464,9 +464,9 @@ impl<S: BorrowMut<OVERLAPPED>> Operation<S> {
 }
 
 /// Cancels the operation if it is pending and waits for the kernel to let go of its buffer, whatever
-/// the operation ended with; does nothing if it is idle. The wait is the abortable step (see
-/// [`wait_or_abort`]); the operation's own status is not read as a failure (it is
-/// `ERROR_OPERATION_ABORTED` after a cancel).
+/// the operation ended with; does nothing if it is idle. The cancel and the wait are the abortable
+/// steps (see [`abort_with_buffer_in_kernel`]); the operation's own status is not read as a failure
+/// (it is `ERROR_OPERATION_ABORTED` after a cancel).
 impl<S: BorrowMut<OVERLAPPED>> Drop for Operation<S> {
     fn drop(&mut self) {
         match self.state {

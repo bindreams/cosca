@@ -3,7 +3,8 @@
 
 use std::io;
 
-use super::Pump;
+use super::{merge, Finished, Pump};
+use crate::error::Error;
 use crate::pipe::{PipeReader, PipeWriter};
 use crate::stdio::Fd;
 use crate::test_child::Console;
@@ -52,6 +53,24 @@ fn a_child_that_stops_reading_stdin_ends_the_input() {
     assert_eq!(out.stdout, if cfg!(windows) { &b"out\r\n"[..] } else { &b"out\n"[..] });
 }
 
+/// `path` as text for a command line that does not quote it, refused if the shell (`cmd` on Windows,
+/// `sh` elsewhere) would read part of it as syntax.
+fn unquotable(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    let syntax: &[char] = if cfg!(windows) {
+        &['"', '%', '!', '&', '|', '<', '>', '(', ')', '^', ',', ';', '=']
+    } else {
+        &[
+            '"', '\'', '\\', '$', '`', '&', '|', ';', '<', '>', '(', ')', '*', '?', '[', ']', '{', '}',
+        ]
+    };
+    assert!(
+        !path.contains(|c: char| c.is_whitespace() || syntax.contains(&c)),
+        "the temp path {path} has whitespace or a character the shell reads as syntax: set TMPDIR (TEMP on Windows) to a path that has not"
+    );
+    path
+}
+
 /// Each output stream is read while the other is idle: a child that fills stderr past a pipe
 /// buffer before it writes stdout, and the reverse, both finish.
 ///
@@ -60,18 +79,12 @@ fn a_child_that_stops_reading_stdin_ends_the_input() {
 fn each_stream_is_read_while_the_other_is_idle() {
     // `cmd` cannot make output of a size, so both shells print a file of that size. The path cannot
     // be quoted in the command: the spawn escapes a `"` in an argument as `\"`, which `cmd` does not
-    // read. So the path must hold nothing `cmd` treats as syntax.
+    // read. So the path must hold nothing the shell treats as syntax.
     let dir = tempfile::tempdir().expect("tempdir");
     let big = dir.path().join("big");
     let expected = pattern_bytes(1_000_000);
     std::fs::write(&big, &expected).expect("write the file");
-    let big = big.display().to_string();
-    if cfg!(windows) {
-        assert!(
-            !big.contains([' ', '"', '%', '!', '&', '|', '<', '>', '(', ')', '^', ',', ';', '=']),
-            "the temp path {big} has a space or a character `cmd` reads as syntax: set TEMP to a path that has not"
-        );
-    }
+    let big = unquotable(&big);
     for (unix, windows) in [
         (
             format!("cat {big} >&2; cat {big}"),
@@ -223,7 +236,48 @@ fn a_stdin_that_cannot_be_made_ready_fails_the_stdin_stream() {
     assert!(finished.stdout.is_ok() && finished.stderr.is_ok());
 }
 
-/// A read error on a stream ends and fails that stream, and the bytes of the other stay.
+/// An end whose reads fail, for the stdout of a pump, and the stdin end the child keeps: Unix, a
+/// directory (`read` is `EISDIR`); Windows, the child's own stdin writer, which `ReadFile` refuses
+/// as access denied.
+fn unreadable(stdin: Option<PipeWriter>) -> (Option<PipeWriter>, PipeReader) {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(std::env::temp_dir()).expect("open a directory");
+        (stdin, PipeReader::from(std::os::fd::OwnedFd::from(dir)))
+    }
+    #[cfg(windows)]
+    {
+        let writer = stdin.expect("the child's stdin");
+        (None, PipeReader::from(std::os::windows::io::OwnedHandle::from(writer)))
+    }
+}
+
+/// The loop of the platform's pump ends a stream whose read fails and fails that stream alone: the
+/// other stream's bytes are all collected.
+///
+/// Mutant: the loop reads a failed read as the stream's EOF, drops the error, or stops the loop.
+#[skuld::test]
+fn a_read_the_loop_gets_an_error_from_fails_its_stream_and_keeps_the_others_bytes() {
+    let mut child = shell("echo keep >&2", "echo keep>&2");
+    let (stdin, bad) = unreadable(child.take_stdin_writer());
+    let mut pump = Pump::new(stdin, &[], Some(bad), child.take_reader(Fd::STDERR));
+    pump.run().expect("a read error does not fail the loop");
+    let finished = pump.finish();
+    assert!(finished.stdout.is_err(), "stdout's read error is its own");
+    assert_eq!(
+        finished.stderr.expect("stderr"),
+        if cfg!(windows) {
+            &b"keep\r\n"[..]
+        } else {
+            &b"keep\n"[..]
+        }
+    );
+    child.wait().expect("wait");
+}
+
+/// A read error on a stream ends and fails that stream, and the bytes of the other stay. This row
+/// pins `Collected::took`, the bookkeeping both platforms' loops share;
+/// the row above reaches the loop's own handling.
 ///
 /// Mutant: a read error on one stream discards the other's bytes, or is read as its EOF.
 #[skuld::test]
@@ -245,6 +299,85 @@ fn a_read_error_fails_its_stream_and_keeps_the_others_bytes() {
     let finished = pump.finish();
     assert_eq!(kind(finished.stderr), Some(io::ErrorKind::ConnectionReset));
     assert_eq!(finished.stdout.expect("stdout"), b"abc");
+}
+
+// Precedence of the merge -----
+
+fn exit_zero() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(0)
+}
+
+fn finished(stdin: io::Result<()>, stdout: io::Result<Vec<u8>>, stderr: io::Result<Vec<u8>>) -> Finished {
+    Finished { stdin, stdout, stderr }
+}
+
+fn failed(kind: io::ErrorKind) -> io::Error {
+    io::Error::from(kind)
+}
+
+fn merged_kind(
+    status: Result<std::process::ExitStatus, Error>,
+    pump: Option<io::Error>,
+    finished: Finished,
+) -> Option<io::ErrorKind> {
+    match merge(status, pump, finished) {
+        Err(Error::Io(e)) => Some(e.kind()),
+        Err(other) => panic!("not an I/O error: {other:?}"),
+        Ok(_) => None,
+    }
+}
+
+/// With several failures the first is returned, in the order wait, pump, stdout, stderr, stdin.
+/// Each is the one returned when every later one is present too.
+///
+/// Mutant: any two of the five swapped, or the wait's error returned after a stream's.
+#[skuld::test]
+fn the_first_failure_is_returned_in_the_documented_order() {
+    use io::ErrorKind::{BrokenPipe, ConnectionReset, NotFound, PermissionDenied, TimedOut, Unsupported};
+    let all = || {
+        finished(
+            Err(failed(Unsupported)),
+            Err(failed(PermissionDenied)),
+            Err(failed(NotFound)),
+        )
+    };
+    let wait = || Err(Error::Io(failed(TimedOut)));
+    assert_eq!(merged_kind(wait(), Some(failed(BrokenPipe)), all()), Some(TimedOut));
+    assert_eq!(
+        merged_kind(Ok(exit_zero()), Some(failed(BrokenPipe)), all()),
+        Some(BrokenPipe)
+    );
+    assert_eq!(merged_kind(Ok(exit_zero()), None, all()), Some(PermissionDenied));
+    let no_stdout = finished(Err(failed(Unsupported)), Ok(Vec::new()), Err(failed(NotFound)));
+    assert_eq!(merged_kind(Ok(exit_zero()), None, no_stdout), Some(NotFound));
+    let only_stdin = finished(Err(failed(ConnectionReset)), Ok(Vec::new()), Ok(Vec::new()));
+    assert_eq!(merged_kind(Ok(exit_zero()), None, only_stdin), Some(ConnectionReset));
+}
+
+/// A failure of a stream is returned even when the child exited successfully, and no failure
+/// leaves the bytes of both streams in the `Output`.
+///
+/// Mutant: a stream's failure is dropped when the wait succeeds, or the bytes are not returned.
+#[skuld::test]
+fn a_stream_failure_after_a_successful_exit_is_returned_and_none_returns_the_bytes() {
+    let failing = finished(Ok(()), Ok(b"out".to_vec()), Err(failed(io::ErrorKind::NotFound)));
+    assert_eq!(
+        merged_kind(Ok(exit_zero()), None, failing),
+        Some(io::ErrorKind::NotFound)
+    );
+
+    let out = merge(
+        Ok(exit_zero()),
+        None,
+        finished(Ok(()), Ok(b"out".to_vec()), Ok(b"err".to_vec())),
+    )
+    .expect("nothing failed");
+    assert!(out.status.success());
+    assert_eq!((out.stdout, out.stderr), (b"out".to_vec(), b"err".to_vec()));
 }
 
 /// A write error on stdin that is not a broken pipe fails the stdin stream and ends the input; a

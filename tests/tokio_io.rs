@@ -97,7 +97,7 @@ async fn async_communicate_is_deadlock_free() {
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
     cmd.stderr(cosca::Stdio::pipe()).unwrap();
     let mut child = cmd.spawn().expect("spawn");
-    let payload = vec![b'z'; 4 * 1024 * 1024];
+    let payload = common::test_pattern::pattern_bytes(4 * 1024 * 1024);
     let out = child.communicate(Some(payload.clone())).await.expect("communicate");
     assert_eq!(out.stdout, payload);
     assert_eq!(out.stderr, payload);
@@ -117,7 +117,7 @@ async fn async_communicate_tolerates_early_stdin_close() {
     // 4 MiB > any pipe buffer, so write_all is still in flight when `emit` exits and closes its
     // stdin read end — deterministically forcing the BrokenPipe the tolerance branch handles.
     let out = child
-        .communicate(Some(vec![b'x'; 4 * 1024 * 1024]))
+        .communicate(Some(common::test_pattern::pattern_bytes(4 * 1024 * 1024)))
         .await
         .expect("communicate tolerates BrokenPipe");
     assert_eq!(out.stdout, vec![b'o'; 2]);

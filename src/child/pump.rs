@@ -42,11 +42,18 @@ pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Out
     let mut pump = Pump::new(stdin, input.unwrap_or(&[]), stdout, stderr);
     let pump_error = pump.run().err();
     // Every pipe end is closed from here on: the child sees EOF, or a broken pipe.
-    let Finished { stdin, stdout, stderr } = pump.finish();
+    let finished = pump.finish();
 
-    let status = child.wait();
-    // The first failure is returned: the wait's, else the pump's, else a stream's. The others are
-    // logged, each with its stream named.
+    merge(child.wait(), pump_error, finished)
+}
+
+/// The first failure is returned: the wait's, else the pump's, else stdout's, stderr's or stdin's,
+/// in that order. The others are logged, each with its stream named.
+fn merge(
+    status: Result<std::process::ExitStatus, Error>,
+    pump_error: Option<io::Error>,
+    Finished { stdin, stdout, stderr }: Finished,
+) -> Result<Output, Error> {
     let mut failures: Vec<(&str, io::Error)> = Vec::new();
     failures.extend(pump_error.map(|e| ("pump", e)));
     let stdout = stdout.unwrap_or_else(|e| {
