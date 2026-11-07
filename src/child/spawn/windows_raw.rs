@@ -91,7 +91,7 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    Diagnosis, ParentStd, PipeOwnership, SpawnFailure,
+    Diagnosis, ParentStd, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
@@ -156,35 +156,29 @@ pub(crate) fn spawn_raw(
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
     ensure_fd_table_fits(&fds).not_started()?;
 
-    // Resolve 0/1/2 (always) plus any configured fd >= 3. `resolve_stdio` rejects inherit on fd >= 3.
-    let slots: Vec<Fd> = {
-        let mut v = vec![Fd::STDIN, Fd::STDOUT, Fd::STDERR];
-        v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
-        v
-    };
-    let parent_std = ParentStd::read();
-    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned, parent_std).not_started()?;
-
-    // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
-    // fd-table the child CRT reads back from `lpReserved2`.
-    let table = build_fd_table(&child_ends).not_started()?;
-
-    // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
-    let mut startup = startup_info(&child_ends, &table, parent_std).not_started()?;
-    // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a distinct
-    // fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or, when that is
-    // empty, the filler. No duplicate reaches the list.
-    let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
 
-    // UNDER THE LOCK: mark the listed child ends inheritable, spawn, then CLOSE the child ends and
-    // the attribute list BEFORE the guard releases on EVERY path. An early `?` here would drop the
-    // inner-scope guard before `child_ends`/`startup` (Rust drops inner locals first), leaving
-    // inheritable handles exposed to a concurrent spawn — so compute a Result and drop explicitly.
-    let spawned = {
-        let _guard = spawn_lock();
+    // UNDER THE LOCK, from the pipes on: resolve every slot (`resolve_stdio` rejects inherit on fd >=
+    // 3), mark the listed child ends inheritable, spawn, then CLOSE the child ends and the attribute
+    // list BEFORE the guard releases on EVERY path. The guard is declared first, so an early `?`
+    // drops it last, after `child_ends` and `startup`.
+    let parent_std = ParentStd::read();
+    let (spawned, parent_ends) = {
+        let guard = spawn_lock();
+        let (child_ends, parent_ends) = resolve_stdio(&guard, &fds, parent_std).not_started()?;
+
+        // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
+        // fd-table the child CRT reads back from `lpReserved2`.
+        let table = build_fd_table(&child_ends).not_started()?;
+
+        // The table (`bytes`) and the attribute list stay alive until after CreateProcessW.
+        let mut startup = startup_info(&child_ends, &table, parent_std).not_started()?;
+        // The listed handles: `table.handles` (the non-null ends among 0/1/2 + fd >= 3, each a
+        // distinct fresh dup from `resolve_stdio`, its 0/1/2 entries being the hStd* handles) or,
+        // when that is empty, the filler. No duplicate reaches the list.
+        let all_handles: Vec<HANDLE> = startup.handles(&table).to_vec();
         let r = spawn_step(
             &all_handles,
             &app_name,
@@ -197,7 +191,7 @@ pub(crate) fn spawn_raw(
         );
         drop(child_ends); // close the child ends inside the lock, on success AND error
         drop(startup); // DeleteProcThreadAttributeList and the filler before the guard releases
-        r
+        (r, parent_ends)
     };
     let (proc, pid) = spawned.not_started()?;
 

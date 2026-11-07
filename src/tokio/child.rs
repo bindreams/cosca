@@ -31,8 +31,8 @@ use crate::stdio::Fd;
 #[cfg(unix)]
 use crate::wait::teardown_warn::{wait_warning, Due};
 
-/// Parent ends of fd >= 3 pipes, keyed by descriptor: the raw sync `ParentEnd`, converted to a
-/// reactor pipe at take time.
+/// Parent ends of the child's pipes (0/1/2 and fd >= 3), keyed by descriptor: the raw sync
+/// `ParentEnd`, converted to a reactor pipe at take time.
 pub(super) type FdPipes = BTreeMap<Fd, ParentEnd>;
 
 /// Take the read end on `fd` out of `ends` (the first call moves it out, later calls find none) as a
@@ -91,14 +91,10 @@ pub(crate) struct OsResources {
     /// takes it. Read it through [`proc_mut`](OsResources::proc_mut), never directly.
     pub(crate) proc: Option<ProcSource>,
     pub(crate) attached: Attached,
-    /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
-    /// [`fd_write_end`](Child::fd_write_end). Unix: `fd_map`-wired reactor pipes; Windows: the
-    /// raw backend's overlapped async ends (empty on the std path, which routes fd >= 3 to the raw
-    /// backend).
+    /// Parent ends of every piped slot, read by [`stdin`](Child::stdin), [`stdout`](Child::stdout),
+    /// [`stderr`](Child::stderr), [`fd_read_end`](Child::fd_read_end) and
+    /// [`fd_write_end`](Child::fd_write_end). tokio's `Command` makes none of them.
     pub(crate) pipes: FdPipes,
-    /// Our-owned parent ends of piped std-slot MERGE TARGETS (the spawn pre-pass owns those
-    /// pipes; tokio's internal ones cannot be shared), keyed by the target slot.
-    pub(crate) owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
 }
 
 impl OsResources {
@@ -264,14 +260,12 @@ pub struct Child {
 }
 
 impl Child {
-    // The only caller is the sibling `spawn` (and `OwnedStd` is module-scoped).
     pub(super) fn from_parts(
         proc: ProcSource,
         id: Option<ProcessId>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
         pipes: FdPipes,
-        owned_std: BTreeMap<Fd, super::stdio::OwnedStd>,
     ) -> Child {
         debug_assert!(
             id.is_none_or(|id| proc.pid() == id.pid()),
@@ -282,7 +276,6 @@ impl Child {
                 proc: Some(proc),
                 attached: attachment.attached,
                 pipes,
-                owned_std,
             },
             id,
             kill_on_drop,
@@ -544,61 +537,30 @@ impl Child {
     ///
     /// # Panics
     ///
-    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
-    /// reactor).
+    /// Panics outside a runtime with the IO driver enabled: the end registers with the reactor
+    /// when taken, in the runtime current then, not in the one that spawned the child.
     pub fn stdin(&mut self) -> Option<super::stdio::ChildStdin> {
-        if let Some(owned) = self.take_owned_in(crate::stdio::Fd::STDIN) {
-            return Some(super::stdio::ChildStdin { inner: owned });
-        }
-        self.proc_mut().take_stdin().map(|s| super::stdio::ChildStdin {
-            inner: super::stdio::InInner::Tokio(s),
-        })
+        take_writer(&mut self.os.pipes, Fd::STDIN, "write end").map(|inner| super::stdio::ChildStdin { inner })
     }
     /// Take the child's stdout, once; `None` if it is not piped, already taken, or registering the
     /// end with the reactor failed (logged at warn).
     ///
     /// # Panics
     ///
-    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
-    /// reactor).
+    /// Panics outside a runtime with the IO driver enabled: the end registers with the reactor
+    /// when taken, in the runtime current then, not in the one that spawned the child.
     pub fn stdout(&mut self) -> Option<super::stdio::ChildStdout> {
-        if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDOUT) {
-            return Some(super::stdio::ChildStdout { inner: owned });
-        }
-        self.proc_mut().take_stdout().map(|s| super::stdio::ChildStdout {
-            inner: super::stdio::OutInner::Stdout(s),
-        })
+        take_reader(&mut self.os.pipes, Fd::STDOUT, "read end").map(|inner| super::stdio::ChildStdout { inner })
     }
     /// Take the child's stderr, once; `None` if it is not piped, already taken, or registering the
     /// end with the reactor failed (logged at warn).
     ///
     /// # Panics
     ///
-    /// Panics outside a runtime with the IO driver enabled (the pipe registers with the
-    /// reactor).
+    /// Panics outside a runtime with the IO driver enabled: the end registers with the reactor
+    /// when taken, in the runtime current then, not in the one that spawned the child.
     pub fn stderr(&mut self) -> Option<super::stdio::ChildStderr> {
-        if let Some(owned) = self.take_owned_out(crate::stdio::Fd::STDERR) {
-            return Some(super::stdio::ChildStderr { inner: owned });
-        }
-        self.proc_mut().take_stderr().map(|s| super::stdio::ChildStderr {
-            inner: super::stdio::OutInner::Stderr(s),
-        })
-    }
-
-    /// Take the stashed our-owned read end of an Out-direction merge target (plain
-    /// `BTreeMap::remove` — TAKE semantics: the first call moves the end out, later calls
-    /// return `None`, matching the tokio-owned branch's `Option::take`). The raw end is converted
-    /// to a reactor pipe here; on a conversion failure the end drops (with a `log::warn!`), so the
-    /// child observes a broken pipe on writes — visible, never a hang.
-    fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
-        take_reader(&mut self.os.owned_std, fd, "merge-target read end").map(super::stdio::OutInner::Owned)
-    }
-
-    /// Take the stashed our-owned write end of an In-direction merge target (TAKE
-    /// semantics, as [`take_owned_out`](Child::take_owned_out)). On a conversion failure the
-    /// dropped end closes the pipe, so the child observes EOF on reads.
-    fn take_owned_in(&mut self, fd: Fd) -> Option<super::stdio::InInner> {
-        take_writer(&mut self.os.owned_std, fd, "merge-target write end").map(super::stdio::InInner::Owned)
+        take_reader(&mut self.os.pipes, Fd::STDERR, "read end").map(|inner| super::stdio::ChildStderr { inner })
     }
 
     /// Take the parent's read end of the pipe on child descriptor `fd` (configured via
@@ -657,9 +619,7 @@ impl Child {
     /// for [`fd_write_end`](Child::fd_write_end).
     #[cfg(windows)]
     pub fn fd_read_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdout> {
-        take_reader(&mut self.os.pipes, fd.into(), "read end").map(|r| super::stdio::ChildStdout {
-            inner: super::stdio::OutInner::Owned(r),
-        })
+        take_reader(&mut self.os.pipes, fd.into(), "read end").map(|inner| super::stdio::ChildStdout { inner })
     }
 
     /// Take the parent's write end of the pipe on child descriptor `fd` (configured via
@@ -679,9 +639,7 @@ impl Child {
     /// take leaves the end in place for [`fd_read_end`](Child::fd_read_end).
     #[cfg(windows)]
     pub fn fd_write_end(&mut self, fd: impl Into<Fd>) -> Option<super::stdio::ChildStdin> {
-        take_writer(&mut self.os.pipes, fd.into(), "write end").map(|w| super::stdio::ChildStdin {
-            inner: super::stdio::InInner::Owned(w),
-        })
+        take_writer(&mut self.os.pipes, fd.into(), "write end").map(|inner| super::stdio::ChildStdin { inner })
     }
 
     /// Test-only: whether this child is inside the crate's Job Object (`IsProcessInJob`
@@ -720,11 +678,15 @@ impl Child {
     /// Block until the child exits, returning its status. For a bounded wait, fix a deadline
     /// instant once (`let deadline = tokio::time::Instant::now() + d;`) and use
     /// `tokio::time::timeout_at(deadline, child.wait())`, not a duration re-derived later.
+    ///
+    /// Closes the stdin pipe first if it was not taken, so a child that reads stdin to EOF can
+    /// exit. That includes a stdin that is a merge target, and a Windows raw-backend child's.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
+        drop(self.os.pipes.remove(&Fd::STDIN));
         self.proc_mut().wait().await
     }
     /// Exit status if the child has already exited (non-blocking).

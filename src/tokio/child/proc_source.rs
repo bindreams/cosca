@@ -130,9 +130,22 @@ pub(crate) enum ProcSource {
         pid: u32,
         /// The streams tokio had not handed out when the backend was built. They live here, not
         /// in `child`, so that dropping the backend closes this process's ends whatever becomes
-        /// of tokio's `Child`.
+        /// of tokio's `Child`. Always `None` since the async spawn makes every pipe itself
+        /// (`Child::os.pipes`); deleted with `ProcSource`.
+        #[cfg_attr(
+            windows,
+            allow(dead_code, reason = "only the Unix forget moves them out; held to close")
+        )]
         stdin: Option<::tokio::process::ChildStdin>,
+        #[cfg_attr(
+            windows,
+            allow(dead_code, reason = "only the Unix forget moves them out; held to close")
+        )]
         stdout: Option<::tokio::process::ChildStdout>,
+        #[cfg_attr(
+            windows,
+            allow(dead_code, reason = "only the Unix forget moves them out; held to close")
+        )]
         stderr: Option<::tokio::process::ChildStderr>,
         /// The pidfd the spawn handshake opened while the child was held before `exec`. It names
         /// this process for good, so a signal through it cannot reach a process that later reuses
@@ -146,11 +159,15 @@ pub(crate) enum ProcSource {
     },
     /// A child something else reaped, or one that cannot be shown to be ours (macOS: no unique id,
     /// or a peek that failed): tokio's `Child` is forgotten, and the streams it had not yet handed
-    /// out remain, so a caller who waits and then reads keeps its output.
+    /// out remain. Always `None` since the async spawn makes every pipe itself; deleted with
+    /// `ProcSource`.
     #[cfg(unix)]
     Foreign {
+        #[allow(dead_code, reason = "only tests read them; held to close")]
         stdin: Option<::tokio::process::ChildStdin>,
+        #[allow(dead_code, reason = "only tests read them; held to close")]
         stdout: Option<::tokio::process::ChildStdout>,
+        #[allow(dead_code, reason = "only tests read them; held to close")]
         stderr: Option<::tokio::process::ChildStderr>,
         /// What became of the child, as far as the forget knew.
         fate: Forgotten,
@@ -522,36 +539,6 @@ impl ProcSource {
         Some(crate::containment::ChildHandle { pid, pidfd })
     }
 
-    /// Take tokio's own stdin stream (the Raw backend serves its piped std ends via `owned_std`,
-    /// so it has none here).
-    pub(crate) fn take_stdin(&mut self) -> Option<::tokio::process::ChildStdin> {
-        match self {
-            ProcSource::Tokio { stdin, .. } => stdin.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stdin, .. } => stdin.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-    pub(crate) fn take_stdout(&mut self) -> Option<::tokio::process::ChildStdout> {
-        match self {
-            ProcSource::Tokio { stdout, .. } => stdout.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stdout, .. } => stdout.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-    pub(crate) fn take_stderr(&mut self) -> Option<::tokio::process::ChildStderr> {
-        match self {
-            ProcSource::Tokio { stderr, .. } => stderr.take(),
-            #[cfg(unix)]
-            ProcSource::Foreign { stderr, .. } => stderr.take(),
-            #[cfg(windows)]
-            ProcSource::Raw(_) => None,
-        }
-    }
-
     /// Wait until the child exits, returning its status.
     ///
     /// tokio's own `wait` and `try_wait` are a `waitpid` by pid, so on Unix the status is collected
@@ -562,9 +549,7 @@ impl ProcSource {
     /// [`Error::Unassessable`], since it may well be running; it is not forgotten.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
         match self {
-            ProcSource::Tokio { stdin, .. } => {
-                // As tokio's own `wait`: stdin closes first, so a child reading it to EOF can exit.
-                drop(stdin.take());
+            ProcSource::Tokio { .. } => {
                 #[cfg(unix)]
                 {
                     // Checked before the watch too, so a child already reaped elsewhere is not

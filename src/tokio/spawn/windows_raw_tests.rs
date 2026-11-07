@@ -36,6 +36,8 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
         .unwrap();
     // The test-only variant injects the observer into THIS child only (no process-global seam).
     let mut child = c.spawn_with_wait_observer(started_tx, outcome_tx).unwrap();
+    // Taken before the wait, which closes an untaken stdin, so findstr stays wedged.
+    let stdin = child.stdin().expect("owned stdin writer");
 
     // Poll the wait future to parking (an unpolled `async fn` runs no code, so this is what brings
     // `spawn_blocking` + `CancelGuard` into existence), await the "parked" signal, then drop the
@@ -54,7 +56,7 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
     assert_eq!(outcome_rx.await.unwrap(), WaitOutcome::Cancelled);
 
     // Child stays waitable: closing its stdin (EOF) lets findstr exit, and a FRESH wait resolves.
-    drop(child.stdin().expect("owned stdin writer"));
+    drop(stdin);
     child
         .wait()
         .await

@@ -2,8 +2,8 @@
 //! drops the end so its peer observes the close. Unix: an end of the wrong direction. Windows: an
 //! overlapped end that a completion port already holds (the registration fails with os error 87),
 //! which fails in debug and release alike; a synchronous end, which `adopt` forbids, would trip its
-//! debug assertion instead. Each test keys its log assertion on an fd number no other test uses,
-//! so a concurrent test's warn cannot satisfy it. Each test holds `spawn_lock` for its whole body
+//! debug assertion instead. Each test keys its log assertion on a warn no other test provokes (an
+//! fd number or an accessor no other test fails on), so a concurrent test's warn cannot satisfy it. Each test holds `spawn_lock` for its whole body
 //! for Unix's sake: a concurrent fork would otherwise inherit the pipe ends and keep them open
 //! past the drop. Windows ends are created non-inheritable, so the lock is unneeded there.
 
@@ -193,7 +193,7 @@ async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversi
 }
 
 #[skuld::test]
-async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
+async fn stdout_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
     #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
@@ -201,22 +201,18 @@ async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conver
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_reader();
-    child.os.owned_std.insert(Fd::from(93), end);
-    assert!(child.take_owned_out(Fd::from(93)).is_none());
-    assert_one_warn_starting_with(
-        mark,
-        "fd 93 merge-target read end dropped",
-        "fd 93 merge-target read end dropped",
-    );
+    child.os.pipes.insert(Fd::STDOUT, end);
+    assert!(child.stdout().is_none());
+    assert_one_warn_starting_with(mark, "stdout read end dropped", "stdout read end dropped");
     assert!(
-        !child.os.owned_std.contains_key(&Fd::from(93)),
+        !child.os.pipes.contains_key(&Fd::STDOUT),
         "the failed end must leave the map"
     );
     closed();
 }
 
 #[skuld::test]
-async fn take_owned_in_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
+async fn stdin_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();
     #[cfg(unix)]
     let _no_fork = crate::child::spawn::spawn_lock();
@@ -224,15 +220,11 @@ async fn take_owned_in_warns_returns_none_and_closes_the_end_on_a_failed_convers
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_writer();
-    child.os.owned_std.insert(Fd::from(94), end);
-    assert!(child.take_owned_in(Fd::from(94)).is_none());
-    assert_one_warn_starting_with(
-        mark,
-        "fd 94 merge-target write end dropped",
-        "fd 94 merge-target write end dropped",
-    );
+    child.os.pipes.insert(Fd::STDIN, end);
+    assert!(child.stdin().is_none());
+    assert_one_warn_starting_with(mark, "stdin write end dropped", "stdin write end dropped");
     assert!(
-        !child.os.owned_std.contains_key(&Fd::from(94)),
+        !child.os.pipes.contains_key(&Fd::STDIN),
         "the failed end must leave the map"
     );
     closed();

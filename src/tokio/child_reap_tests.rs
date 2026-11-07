@@ -315,7 +315,10 @@ async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
     assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
     proc.forget_foreign();
 
-    let mut stdout = proc.take_stdout().expect("the untaken stdout survives the forget");
+    let ProcSource::Foreign { stdout, .. } = &mut proc else {
+        panic!("a forgotten backend");
+    };
+    let mut stdout = stdout.take().expect("the untaken stdout survives the forget");
     let mut line = String::new();
     stdout.read_to_string(&mut line).await.expect("read");
     assert_eq!(line, "hello\n");
@@ -378,53 +381,17 @@ async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
 }
 
-/// `wait` closes the untaken stdin before it waits, as tokio's own `wait` does, so a child that
-/// reads stdin to EOF can exit. The streams live in the backend, not in tokio's `Child`, so the
-/// backend does it. Observed after one poll, which has run the close and not the wait.
-///
-/// The test holds a second write end of `cat`'s stdin so the close cannot end it: if `cat` exited
-/// early, the single poll could reap it, and `reap_now` requires a never-awaited child.
+/// `wait` closes the untaken stdin before it waits, so a child that reads stdin to EOF can exit. A
+/// failure is a hang, which the `death_watch_` name bounds.
 ///
 /// Mutant: `wait` leaves stdin open.
-#[cfg(unix)]
 #[skuld::test]
-async fn wait_closes_the_untaken_stdin_first() {
-    use std::future::Future;
-    use std::os::fd::AsFd;
-    let child = crate::test_spawn::spawn_tokio(
-        ::tokio::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    )
-    .expect("spawn");
-    let pid = child.id().expect("tokio owns an un-reaped child");
-    let held_writer = child
-        .stdin
-        .as_ref()
-        .expect("piped stdin")
-        .as_fd()
-        .try_clone_to_owned()
-        .expect("duplicate the stdin write end");
-    let mut proc = proc_source(child);
-    // Released between `reap_now`'s kill and its reap, below.
-    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(held_writer);
-    {
-        let mut waiting = Box::pin(proc.wait());
-        std::future::poll_fn(|cx| {
-            drop(waiting.as_mut().poll(cx));
-            std::task::Poll::Ready(())
-        })
-        .await;
-    }
-    let ProcSource::Tokio { stdin, .. } = &proc else {
-        panic!("a tokio backend");
-    };
-    let closed = stdin.is_none();
-    assert!(!proc.is_reaped(), "the one poll finished the wait");
-    proc.reap_now(pid, None); // the test's own `cat`: end it whatever happened
-    teardown.assert_killed();
-    assert!(closed, "wait must close stdin before it waits");
+async fn death_watch_wait_closes_the_untaken_stdin() {
+    let mut cmd = crate::test_child::tokio_command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
 }
 
 /// An implicit drop after `wait` has collected the status (tokio's `id()` is `None`: nothing is
