@@ -296,7 +296,7 @@ pub enum Error {
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
     MayHaveStarted {
         fate: ChildFate,
-        /// Whether the child is an elevation backend (`sudo`, `doas`, `pkexec`, `osascript`), whose
+        /// Whether the child is an elevation backend (`sudo`, `doas`, `osascript`), whose
         /// elevated program is its own child and may outlive it: `fate` is then about the backend
         /// only (see [`ChildFate`]), and the message says so.
         wrapper_elevated: bool,
@@ -316,7 +316,8 @@ pub enum Error {
 /// [`Error::MayHaveStarted`] (see [`Error::fate`]).
 ///
 /// It is about the child cosca spawned. On a wrapper-elevated spawn that child is the backend
-/// (`sudo`, `doas`, `pkexec`, `osascript`), and the elevated program is its own child, which cosca
+/// (`sudo`, `doas`, `osascript`; pkexec execs the program, so its child is the program), and the
+/// elevated program is its own child, which cosca
 /// never signals: `Reaped`, `Killed` and `Gone` say the backend is not running, not that the program
 /// is not. A front that had exited by itself is `Reaped` while the program it launched may still
 /// run. Descendants of a contained child are not covered either; the containment's own teardown is.

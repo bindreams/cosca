@@ -16,6 +16,25 @@ fn secret_exposes_bytes_for_the_effect_layer() {
 
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 
+/// Only a backend that runs the program as its own child is one whose program may outlive it: sudo,
+/// doas and osascript. pkexec execs the program, so its child is the program (#955).
+///
+/// Mutant: pkexec counted as outliving its child.
+#[skuld::test]
+fn only_a_backend_whose_program_is_its_child_may_be_outlived() {
+    let cases = [
+        (ElevatedVia::Wrapped(Backend::Sudo), true),
+        (ElevatedVia::Wrapped(Backend::Doas), true),
+        (ElevatedVia::MacosOsascript, true),
+        (ElevatedVia::Wrapped(Backend::Pkexec), false),
+        (ElevatedVia::WindowsUac, false),
+        (ElevatedVia::AlreadyElevated, false),
+    ];
+    for (via, outlives) in cases {
+        assert_eq!(via.program_outlives_child(), outlives, "{via:?}");
+    }
+}
+
 #[skuld::test]
 fn backend_defaults_to_auto() {
     assert_eq!(Backend::default(), Backend::Auto);

@@ -300,9 +300,12 @@ pub enum ElevatedVia {
 
 impl ElevatedVia {
     /// Whether the child cosca spawns is a backend whose elevated program is its own child, and may
-    /// outlive it.
+    /// outlive it. pkexec is not: it execs the program, so the child is the program (#955).
     pub(crate) fn program_outlives_child(&self) -> bool {
-        matches!(self, ElevatedVia::Wrapped(_) | ElevatedVia::MacosOsascript)
+        matches!(
+            self,
+            ElevatedVia::Wrapped(Backend::Sudo | Backend::Doas) | ElevatedVia::MacosOsascript
+        )
     }
 }
 
