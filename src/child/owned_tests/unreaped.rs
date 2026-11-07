@@ -284,6 +284,16 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
 
 // `wait_async` =====
 
+/// This thread's records since `mark`, less the reap's own: on macOS every consuming reap is
+/// followed by a second one that logs at debug (`exit_only::second_reap`), which is not the drop's.
+#[cfg(feature = "tokio")]
+fn drop_records(mark: usize) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(_, line)| !line.starts_with("second reap of pid"))
+        .collect()
+}
+
 /// The same status `wait` gives, for a real child that is still running at the first poll.
 ///
 /// Mutant: the status is not the child's.
@@ -301,11 +311,7 @@ async fn wait_async_returns_the_status_wait_would() {
     assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
     drop(stdin);
     assert_eq!(wait.await.expect("the child exits").code(), Some(3));
-    assert_eq!(
-        crate::log_capture::records_since_on_current_thread(mark, ""),
-        [],
-        "the settled value's drop is silent"
-    );
+    assert_eq!(drop_records(mark), [], "the settled value's drop is silent");
 }
 
 /// A child reaped elsewhere is the error `wait` gives for it, not a status and not a hang.
@@ -362,7 +368,7 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
     }
     assert_eq!(fake.signal_calls(), [Sig::Kill], "one kill");
     assert_eq!(fake.looks(), 2, "one look");
-    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    let records = drop_records(mark);
     let [(log::Level::Warn, said)] = records.as_slice() else {
         panic!("the drop warns once: {records:?}");
     };
