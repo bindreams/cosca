@@ -228,7 +228,7 @@ fn disarm_leaves_every_descendant_running() {
     root_member.assert_alive("the root, before disarm");
     grand_member.assert_alive("the grandchild, before disarm");
 
-    job.disarm();
+    job.disarm().expect("disarm");
     drop(job);
 
     root_member.assert_alive("the root, after disarm + drop(Job)");

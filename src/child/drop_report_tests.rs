@@ -686,7 +686,7 @@ fn child_in_a_leaf_whose_kill_fails() -> (
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("spawn");
-    child.attached.disarm();
+    child.attached.disarm().expect("disarm");
     (child, writer, leaf_path, kill_file, dir)
 }
 

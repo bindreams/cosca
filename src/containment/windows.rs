@@ -132,7 +132,11 @@ impl JobHandle {
     /// Clear `KILL_ON_JOB_CLOSE` so closing this handle does NOT kill the tree.
     /// Called by `Child::detach()` before the handle is released: otherwise
     /// dropping the job handle terminates the tree the caller intended to keep alive.
-    pub(crate) fn disarm(&self) {
+    ///
+    /// Returns the `SetInformationJobObject` failure, with the plain Win32 code: the flag is then
+    /// still set, and closing this handle still kills the tree. A consumed handle has nothing to
+    /// clear, and is `Ok`.
+    pub(crate) fn disarm(&self) -> io::Result<()> {
         // Held across the call: this WRITES to the handle, so landing on a recycled value
         // would clear KILL_ON_JOB_CLOSE on an unrelated job and quietly let its tree
         // outlive its owner.
@@ -142,19 +146,16 @@ impl JobHandle {
             let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             // SAFETY: job is a valid handle; info is fully initialised (zeroed by default()).
             unsafe {
-                if let Err(e) = SetInformationJobObject(
+                SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     std::ptr::addr_of!(info).cast(),
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ) {
-                    log::warn!(
-                        "SetInformationJobObject(disarm) failed ({e}); KILL_ON_JOB_CLOSE is still set, so \
-                         closing this handle will still kill the tree"
-                    );
-                }
+                )
             }
-        });
+            .map_err(win32_io_error)
+        })
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -181,6 +182,35 @@ impl JobHandle {
         let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
             .expect("CreateJobObjectW for test placeholder");
         JobHandle::new(handle)
+    }
+
+    /// Test-only: an empty job reached through a handle without `JOB_OBJECT_SET_ATTRIBUTES`, so the
+    /// OS refuses `SetInformationJobObject` on it with `ERROR_ACCESS_DENIED`: a real refusal of
+    /// `disarm`, which a handle the crate made itself never gives.
+    pub(crate) fn create_without_set_access_for_test() -> JobHandle {
+        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS};
+        use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        let full = JobHandle::create_empty_for_test();
+        let mut weak = HANDLE::default();
+        full.with_handle(|job| {
+            // SAFETY: `job` is live under `full`'s lock; `weak` is an out-parameter.
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    job,
+                    GetCurrentProcess(),
+                    &mut weak,
+                    JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE,
+                    false,
+                    DUPLICATE_HANDLE_OPTIONS(0),
+                )
+            }
+        })
+        .expect("the empty job is live")
+        .expect("DuplicateHandle with reduced access");
+        JobHandle::new(weak)
     }
 }
 

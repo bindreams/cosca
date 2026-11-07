@@ -138,7 +138,7 @@ fn treewalk_mode_reaches_the_orphan_through_the_marker_alone() {
 fn detach_leaves_a_marked_tree_running() {
     let (child, mut root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     let (root_pid, grand_pid) = (root.pid, grand.pid);
-    child.detach();
+    child.detach().expect("detach");
     root.assert_alive("the detached root");
     grand.assert_alive("the detached orphan");
     reap(&[root_pid, grand_pid]);

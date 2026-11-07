@@ -383,7 +383,7 @@ async fn async_detach_leaves_the_tree_running() {
     let leaf = cgroup_leaf_of(&child);
     let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id().expect("the spawn read the child's identity");
-    child.detach();
+    child.detach().expect("detach");
     drop(child); // detached → Drop must NOT kill
                  // Positive liveness (no race — we never signaled it): a buggy detach that let Drop kill the
                  // root would make this false.
@@ -469,7 +469,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn linux_cgroup_v2_async_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
-    assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
+    assert_async_opted_out_tree_survives(true, |mut child| child.detach().expect("detach")).await;
 }
 
 #[cfg(feature = "tokio")]
