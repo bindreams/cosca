@@ -24,7 +24,7 @@ fn fake(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
 }
 
 /// Poll `fut` once, with a waker that wakes nothing.
-fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
+pub(crate) fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
     pin!(fut).as_mut().poll(&mut Context::from_waker(Waker::noop()))
 }
 
@@ -195,7 +195,7 @@ fn dropped_wait_releases_the_watch() {
 
 /// Open descriptors of this process (each count includes the directory handle that reads it).
 #[cfg(target_os = "linux")]
-fn open_fds() -> usize {
+pub(crate) fn open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd").count()
 }
 

@@ -220,4 +220,4 @@ async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> R
 
 #[cfg(test)]
 #[path = "drive_tests.rs"]
-mod drive_tests;
+pub(crate) mod drive_tests;

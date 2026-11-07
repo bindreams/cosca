@@ -1,5 +1,7 @@
 //! `wait`: the dispatch on the state, and the holder's wait loop.
 
+#[cfg(feature = "tokio")]
+use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use super::holder::HolderGuard;
@@ -85,6 +87,62 @@ impl OwnedChild {
         }
         Ok(outcome)
     }
+
+    /// [`wait`](OwnedChild::wait) with no deadline, awaited: reaps through [`crate::tokio::drive::run`].
+    /// `&mut self` means no other holder or waiter exists, so the state is written through
+    /// `Mutex::get_mut`, with no lock and no wake. A dropped future leaves the state `N`: a record
+    /// is written only by the look that reaps, and the future ends in the same poll.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_async(&mut self) -> Result<ChildWaitOutcome, Error> {
+        if let State::E(record) = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner).state {
+            return Ok(ChildWaitOutcome::Exited(record));
+        }
+        let outcome = match crate::tokio::drive::run(&mut AsyncReap(self), None).await? {
+            RunOutcome::Done(outcome) => outcome,
+            RunOutcome::DeadlinePassed => ChildWaitOutcome::DeadlinePassed,
+        };
+        if let ChildWaitOutcome::Exited(record) = outcome {
+            self.log_unreadable(record);
+        }
+        Ok(outcome)
+    }
+}
+
+/// What a [`try_reap`](crate::os_process::child::OsChild::try_reap) answer means for the state, and
+/// for the loop: the state to write (`None`: leave it), and the step. Shared by the holder and
+/// [`OwnedChild::wait_async`], which differ in how they write the state.
+fn reap_step(outcome: TryReapOutcome<'_>) -> (Option<State>, Step<'_, ChildWaitOutcome>) {
+    match outcome {
+        TryReapOutcome::Reaped(record) => (Some(State::E(record)), Step::Done(ChildWaitOutcome::Exited(record))),
+        TryReapOutcome::Foreign(foreign) => (Some(State::N), Step::Done(ChildWaitOutcome::Foreign(foreign))),
+        TryReapOutcome::Recheck => (None, Step::Recheck),
+        TryReapOutcome::Running(wait_for) => (None, Step::Wait(wait_for)),
+    }
+}
+
+/// The wait loop of [`OwnedChild::wait_async`], for [`crate::tokio::drive::run`]: each look reaps if
+/// there is a record. Nothing is locked.
+#[cfg(feature = "tokio")]
+struct AsyncReap<'c>(&'c mut OwnedChild);
+
+#[cfg(feature = "tokio")]
+impl Waitable for AsyncReap<'_> {
+    type Output = ChildWaitOutcome;
+
+    fn look(&mut self) -> Result<Step<'_, ChildWaitOutcome>, Error> {
+        let OwnedChild { os, inner, .. } = &mut *self.0;
+        let inner = inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(
+            !matches!(inner.state, State::W { .. }),
+            "a holder exists though the handle is borrowed mutably: {:?}",
+            inner.state
+        );
+        let (state, step) = reap_step(os.try_reap()?);
+        if let Some(state) = state {
+            inner.set(state);
+        }
+        Ok(step)
+    }
 }
 
 /// The holder's wait loop, for [`run`]: each look reaps if there is a record, and the wait it
@@ -116,24 +174,12 @@ impl<'c> Waitable for Holder<'c> {
         let child: &'c OwnedChild = self.child;
         // Re-read the state before acting on a look.
         self.guard().relock();
-        match child.os.try_reap()? {
-            // Nothing between the reap and the `E` write may panic.
-            TryReapOutcome::Reaped(record) => {
-                self.finish(State::E(record));
-                Ok(Step::Done(ChildWaitOutcome::Exited(record)))
-            }
-            TryReapOutcome::Foreign(foreign) => {
-                self.finish(State::N);
-                Ok(Step::Done(ChildWaitOutcome::Foreign(foreign)))
-            }
-            TryReapOutcome::Recheck => {
-                self.guard().unlock();
-                Ok(Step::Recheck)
-            }
-            TryReapOutcome::Running(wait_for) => {
-                self.guard().unlock();
-                Ok(Step::Wait(wait_for))
-            }
+        // Nothing between the reap and the state write may panic.
+        let (state, step) = reap_step(child.os.try_reap()?);
+        match state {
+            Some(state) => self.finish(state),
+            None => self.guard().unlock(),
         }
+        Ok(step)
     }
 }
