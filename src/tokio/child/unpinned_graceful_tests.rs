@@ -14,7 +14,8 @@ use crate::child::unpinned_public_tests::{
 use crate::error::Error;
 use crate::log_capture::warns_since;
 use crate::os_process::child::{Foreign, PeekOutcome};
-use crate::send_log::Capture;
+use crate::send_log::{Capture, Via};
+use crate::signal::Sig;
 use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks, forced_peeks_left, Forced};
 
 /// A hook slot that holds a forced peek until the test is over, so the guard is not dropped (and the
@@ -67,6 +68,7 @@ async fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::term_ignoring_blocker_async().await;
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let (slot, set) = hold_forced();
@@ -87,8 +89,8 @@ async fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace
     );
     assert_eq!(
         sends.entries(),
-        vec![],
-        "the escalation must send nothing to a root we do not pin"
+        vec![(pid, Sig::Term, Via::Identity)],
+        "the escalation must send nothing to a root we do not pin: the terminate's SIGTERM is the only send"
     );
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(hook);
@@ -111,6 +113,7 @@ async fn graceful_shutdown_watch_stays_quiet_for_an_orphaned_root() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::term_ignoring_blocker_async().await;
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let _looks = force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]);
@@ -122,7 +125,11 @@ async fn graceful_shutdown_watch_stays_quiet_for_an_orphaned_root() {
 
     assert_peeks_exhausted();
     assert_refused(&err, "kill");
-    assert_eq!(sends.entries(), vec![], "nothing by pid");
+    assert_eq!(
+        sends.entries(),
+        vec![(pid, Sig::Term, Via::Identity)],
+        "only the terminate's SIGTERM went by pid"
+    );
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     drop(writer);
 }
