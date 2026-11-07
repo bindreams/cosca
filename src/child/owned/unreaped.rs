@@ -6,6 +6,8 @@ use std::process::ExitStatus;
 use super::slot::ChildSlot;
 use super::teardown::Disposition;
 use super::OwnedChild;
+#[cfg(feature = "tokio")]
+use crate::child::lifecycle::unbounded_status;
 use crate::child::lifecycle::{wait_for_status, wait_to_exit, Orphaned, Settlement};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -20,8 +22,8 @@ use crate::os_process::child_named;
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
 /// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
-/// then logs one line naming the child. So the drop blocks: in async code, take the value off the
-/// runtime thread (`spawn_blocking`) or `leak` it. A front is waited for until it exits, which the
+/// then logs one line naming the child. So the drop blocks: in async code, `wait_async` it or
+/// `leak` it. A front is waited for until it exits, which the
 /// failed call would have done anyway.
 ///
 /// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
@@ -71,6 +73,17 @@ impl Unreaped {
     pub fn wait(mut self) -> Result<ExitStatus, Error> {
         let child = self.child.take().expect("a live Unreaped holds its child");
         wait_for_status(&child, Orphaned::Warn)
+    }
+
+    /// [`wait`](Unreaped::wait), awaited: the same status and errors, without blocking the runtime
+    /// thread. Dropping the future drops this value, which then settles the child as any drop does
+    /// (see the type's docs): the child stays in the value until the wait has an outcome.
+    #[cfg(feature = "tokio")]
+    pub async fn wait_async(mut self) -> Result<ExitStatus, Error> {
+        let outcome = self.child.wait_async().await;
+        // Settled once, whatever the outcome, as `wait` does.
+        let child = self.child.take().expect("a live Unreaped holds its child");
+        unbounded_status(child.pid(), outcome?, Orphaned::Warn)
     }
 
     /// Give the child up, unreaped. Logs nothing.

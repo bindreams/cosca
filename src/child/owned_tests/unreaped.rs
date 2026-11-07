@@ -281,3 +281,74 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
         "the drop waited for the child"
     );
 }
+
+// `wait_async` =====
+
+/// The same status `wait` gives, for a real child that is still running at the first poll.
+///
+/// Mutant: the status is not the child's.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn wait_async_returns_the_status_wait_would() {
+    use super::wait_async::exits_three_on_eof;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    let (owned, stdin) = exits_three_on_eof();
+    let child = Unreaped::new(owned, None);
+    let mut wait = std::pin::pin!(child.wait_async());
+    assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
+    drop(stdin);
+    assert_eq!(wait.await.expect("the child exits").code(), Some(3));
+}
+
+/// A child reaped elsewhere is the error `wait` gives for it, not a status and not a hang.
+///
+/// Mutant: `wait_async` maps the outcome another way.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn wait_async_on_a_child_reaped_elsewhere_is_the_error_wait_gives() {
+    let gone = || fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
+    let sync = unreaped(&gone(), Some(id())).wait().expect_err("reaped elsewhere");
+    let asynchronous = unreaped(&gone(), Some(id()))
+        .wait_async()
+        .await
+        .expect_err("reaped elsewhere");
+    let (Error::Io(sync), Error::Io(asynchronous)) = (&sync, &asynchronous) else {
+        panic!("{sync:?} / {asynchronous:?}");
+    };
+    assert_eq!(asynchronous.kind(), sync.kind());
+    assert_eq!(asynchronous.raw_os_error(), sync.raw_os_error());
+}
+
+/// A cancelled `wait_async` leaves the `Unreaped` its child: the future owns the value, and its drop
+/// still waits for the child and says so. The child is ended before the drop, so the drop does not
+/// hang.
+///
+/// Mutant: `wait_async` takes the child out of the slot before it awaits, so the drop finds nothing
+/// to wait for and says nothing.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn a_cancelled_wait_async_leaves_the_unreaped_its_child() {
+    use super::wait_async::exits_three_on_eof;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    crate::log_capture::install();
+    let (owned, stdin) = exits_three_on_eof();
+    let pid = owned.pid().expect("a spawned child has a pid");
+    let child = Unreaped::new(owned, None);
+    let mark = crate::log_capture::mark();
+    {
+        let mut wait = std::pin::pin!(child.wait_async());
+        assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
+        drop(stdin);
+    }
+    let records = crate::log_capture::records_since_on_current_thread(mark, "");
+    assert!(
+        matches!(
+            records.as_slice(),
+            [(log::Level::Warn, text)]
+                if text.contains(&pid.to_string()) && text.contains("dropped without wait or leak")
+        ),
+        "{records:?}"
+    );
+}
