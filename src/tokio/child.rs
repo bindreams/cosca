@@ -58,17 +58,21 @@ fn take_reader(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::O
 
 /// [`take_reader`] for a write end: a failed registration leaves the child EOF on reads.
 fn take_writer(ends: &mut FdPipes, fd: Fd, what: &str) -> Option<super::stdio::OwnedWrite> {
-    match ends.remove(&fd)? {
-        ParentEnd::Writer(w) => match super::stdio::register_writer(w) {
-            Ok(end) => Some(end),
-            Err(e) => {
-                log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); the child will see EOF on reads");
-                None
-            }
-        },
-        end => {
+    try_take_writer(ends, fd).unwrap_or_else(|e| {
+        log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); the child will see EOF on reads");
+        None
+    })
+}
+
+/// [`take_writer`] that returns the registration's error instead of logging it. The end is closed
+/// then.
+fn try_take_writer(ends: &mut FdPipes, fd: Fd) -> std::io::Result<Option<super::stdio::OwnedWrite>> {
+    match ends.remove(&fd) {
+        None => Ok(None),
+        Some(ParentEnd::Writer(w)) => super::stdio::register_writer(w).map(Some),
+        Some(end) => {
             ends.insert(fd, end);
-            None
+            Ok(None)
         }
     }
 }
@@ -556,6 +560,11 @@ impl Child {
     /// when taken, in the runtime current then, not in the one that spawned the child.
     pub fn stdin(&mut self) -> Option<super::stdio::ChildStdin> {
         take_writer(&mut self.os.pipes, Fd::STDIN, "write end").map(|inner| super::stdio::ChildStdin { inner })
+    }
+
+    /// [`stdin`](Self::stdin) that returns the reactor's refusal as an error, not `None`.
+    pub(super) fn stdin_or_error(&mut self) -> std::io::Result<Option<super::stdio::ChildStdin>> {
+        Ok(try_take_writer(&mut self.os.pipes, Fd::STDIN)?.map(|inner| super::stdio::ChildStdin { inner }))
     }
     /// Take the child's stdout, once; `None` if it is not piped, already taken, or registering the
     /// end with the reactor failed (logged at warn).

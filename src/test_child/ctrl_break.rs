@@ -227,24 +227,6 @@ fn accept_tagged(listener: &TcpListener, root: crate::identity::ProcessId, tag: 
     sock
 }
 
-/// The path of the GUI-subsystem testbin. A lib test has no `CARGO_BIN_EXE_*`, so it is read from
-/// beside the test binary's own `deps` directory, where cargo puts the package's `[[bin]]` targets
-/// (a `--lib`-only build does not make them).
-fn gui_testbin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let path = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the test binary lives in <target>/<profile>/deps")
-        .join("cosca_testbin_gui.exe");
-    assert!(
-        path.is_file(),
-        "{} is missing: build the package's bin targets (`cargo nextest run` does; `--lib` does not)",
-        path.display()
-    );
-    path
-}
-
 /// Spawns the GUI-subsystem testbin as a contained root, and returns it with its control socket,
 /// which keeps it running while held, after its handshake. Such an image never attaches to its
 /// spawner's console, so it has none to detach: no break reaches it, with no console host
@@ -254,7 +236,8 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::command(Console::Asked);
     // `args` is the whole argv, program name included.
-    cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
+    cmd.executable(super::testbin("cosca_testbin_gui"))
+        .args(["cosca_testbin_gui", addr.as_str()]);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();
@@ -268,7 +251,8 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
 pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::tokio_command(Console::Asked);
-    cmd.executable(gui_testbin()).args(["cosca_testbin_gui", addr.as_str()]);
+    cmd.executable(super::testbin("cosca_testbin_gui"))
+        .args(["cosca_testbin_gui", addr.as_str()]);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();

@@ -96,6 +96,10 @@ mod std_loads;
 #[path = "null_std.rs"]
 mod null_std;
 
+/// The byte stream the `close-std` mode writes, shared with the tests that compare it.
+#[path = "../src/test_pattern.rs"]
+mod test_pattern;
+
 /// `tests/elevation_pkexec_version.rs`'s fake pkexec: this binary, copied to `real/pkexec-impl`.
 /// Appends one line to `../pkexec.log` (next to `real/`): `argv[0]`, the file running (so the
 /// test sees which inode was exec'd), the arguments, and, for a launch, whether its program
@@ -186,6 +190,32 @@ fn borrow_std_file(handle: std::os::windows::io::RawHandle) -> std::mem::Manuall
     use std::os::windows::io::FromRawHandle;
     // SAFETY: the handle is live per the contract above; ManuallyDrop prevents the close.
     std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// Closes this process's own standard stream `which` (`stdin` or `stdout`), which is not used again.
+fn close_std(which: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let fd = match which {
+            "stdin" => 0,
+            "stdout" => 1,
+            other => panic!("close_std: not stdin or stdout: {other}"),
+        };
+        // SAFETY: the descriptor is open, and nothing here uses it after the drop closes it.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        let handle = match which {
+            "stdin" => std::io::stdin().as_raw_handle(),
+            "stdout" => std::io::stdout().as_raw_handle(),
+            other => panic!("close_std: not stdin or stdout: {other}"),
+        };
+        // SAFETY: the handle is open, and nothing here uses it after the drop closes it.
+        drop(unsafe { OwnedHandle::from_raw_handle(handle) });
+    }
 }
 
 /// Wrap CRT fd `fd` as a `File` for the `read-fd`/`write-fd` relay modes. Callers must
@@ -520,6 +550,49 @@ fn main() {
                 .map(|hex| u8::from_str_radix(hex, 16).unwrap())
                 .collect();
             quiet_io::put_stdout(&bytes, "emit-raw: write stdout");
+        }
+        "close-std" => {
+            // `close-std <stdin|stdout> <n>`: closes that standard stream of its own, then writes
+            // `n` bytes of the test pattern to stdout (stdin closed) or to stderr (stdout closed).
+            let closed = args[2].as_str();
+            let n: usize = args[3].parse().unwrap();
+            close_std(closed);
+            let pattern = test_pattern::pattern_bytes(n);
+            match closed {
+                "stdin" => quiet_io::put_stdout(&pattern, "close-std: write stdout"),
+                "stdout" => quiet_io::put(&mut std::io::stderr().lock(), &pattern, "close-std: write stderr"),
+                other => panic!("close-std: not stdin or stdout: {other}"),
+            };
+        }
+        "print-then-leave-grandchild" => {
+            // Prints a line, starts a grandchild that shares stdout and stderr and prints a second
+            // line only once its stdin reaches EOF, then exits with the write end of that stdin
+            // still open: the EOF comes with this process's exit, so the second line follows it.
+            quiet_io::put_stdout(b"early\n", "print-then-leave-grandchild: write stdout");
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("print-after-stdin-eof").stdin(std::process::Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // Without it the grandchild opens a console window of its own.
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none"
+            )]
+            let grandchild = cmd.spawn().unwrap();
+            // Dropping it would close the grandchild's stdin now.
+            std::mem::forget(grandchild);
+        }
+        "print-after-stdin-eof" => {
+            // The grandchild of `print-then-leave-grandchild`.
+            let mut buf = [0u8; 64];
+            let mut stdin = std::io::stdin().lock();
+            while stdin.read(&mut buf).unwrap() > 0 {}
+            quiet_io::put_stdout(b"late\n", "print-after-stdin-eof: write stdout");
         }
         "exit" => {
             let code: i32 = args[2].parse().unwrap();

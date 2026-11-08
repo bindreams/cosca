@@ -7,14 +7,9 @@ use std::io::{Read, Write};
 use super::{PipeReader, PipeWriter};
 use crate::pipe::ParentEnd;
 use crate::stdio::Direction;
+use crate::test_pattern::pattern;
 
 const MIB: usize = 1024 * 1024;
-
-/// Byte `i` of the stream every test sends: a period coprime to every power of two, so a chunk that
-/// lost or repeated bytes cannot sum to the right total by accident.
-fn pattern(i: usize) -> u8 {
-    (i % 251) as u8
-}
 
 /// A pipe as a spawn makes one, which on macOS is under `spawn_lock`.
 fn pipe(dir: Direction) -> (impl Into<File>, ParentEnd) {

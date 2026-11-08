@@ -74,6 +74,25 @@ pub(crate) fn tokio_command(console: Console) -> crate::tokio::Command {
     cmd
 }
 
+/// The path of the package's `[[bin]]` target `name`. A lib test has no `CARGO_BIN_EXE_*`, so it is
+/// read from beside the test binary's own `deps` directory, where cargo puts them (a `--lib`-only
+/// build does not make them).
+#[cfg(windows)]
+pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let path = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the test binary lives in <target>/<profile>/deps")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        path.is_file(),
+        "{} is missing: build the package's bin targets (`cargo nextest run` does; `--lib` does not)",
+        path.display()
+    );
+    path
+}
+
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or

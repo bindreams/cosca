@@ -306,7 +306,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     // > a pipe buffer (~64 KiB) in every direction: child copies stdin to BOTH
     // stdout and stderr while the parent writes stdin and reads both outputs.
     // A non-concurrent pump would deadlock here.
-    let input = vec![b'x'; 512 * 1024];
+    let input = common::test_pattern::pattern_bytes(512 * 1024);
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
@@ -315,8 +315,81 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     let mut child = cmd.spawn().expect("spawn");
     let out = child.communicate(Some(&input)).expect("communicate");
     assert!(out.status.success());
-    assert_eq!(out.stdout, input);
-    assert_eq!(out.stderr, input);
+    assert!(out.stdout == input, "stdout");
+    assert!(out.stderr == input, "stderr");
+}
+
+/// The input is closed the moment its last byte is written, not when the output ends: `tee-both`
+/// copies stdin until it reads EOF and exits only then, so `communicate` returns only if the pump
+/// closed stdin while it was still draining.
+///
+/// Mutant: stdin's end is held open until the pump finishes.
+#[skuld::test]
+fn communicate_closes_stdin_once_the_input_is_written() {
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
+    cmd.stdin(Stdio::pipe()).unwrap();
+    cmd.stdout(Stdio::pipe()).unwrap();
+    cmd.stderr(Stdio::pipe()).unwrap();
+    let mut child = cmd.spawn().expect("spawn");
+    let out = child.communicate(Some(b"b\nb\n")).expect("communicate");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"b\nb\n");
+    assert_eq!(out.stderr, b"b\nb\n");
+}
+
+/// A `cosca_testbin` child running `mode`, with all three standard streams piped.
+fn testbin_child(mode: &[&str]) -> cosca::Child {
+    let mut cmd = common::command(common::Console::Hidden);
+    // `args` is the whole argv, program name included.
+    cmd.executable(testbin())
+        .args(["cosca_testbin"])
+        .args(mode.iter().copied());
+    cmd.stdin(Stdio::pipe()).unwrap();
+    cmd.stdout(Stdio::pipe()).unwrap();
+    cmd.stderr(Stdio::pipe()).unwrap();
+    cmd.spawn().expect("spawn")
+}
+
+/// A child that closes its stdin ends the input but not the output: everything it goes on to
+/// print is still collected, though input was left unwritten.
+///
+/// Mutant: a broken pipe on stdin ends the draining of stdout and stderr (the child then hangs
+/// on a full pipe, or the output is cut short).
+#[skuld::test]
+fn a_child_that_closes_stdin_is_still_drained() {
+    let mut child = testbin_child(&["close-std", "stdin", "1000000"]);
+    let input = common::test_pattern::pattern_bytes(1 << 20);
+    let out = child.communicate(Some(&input)).expect("communicate");
+    assert!(out.status.success());
+    assert!(out.stdout == common::test_pattern::pattern_bytes(1_000_000), "stdout");
+    assert!(out.stderr.is_empty());
+}
+
+/// A stream that reaches EOF early does not end the others: a child that closes stdout and keeps
+/// writing stderr has all of it collected.
+///
+/// Mutant: the first EOF ends the loop, so the rest of stderr is lost.
+#[skuld::test]
+fn a_stream_at_eof_does_not_end_the_others() {
+    let mut child = testbin_child(&["close-std", "stdout", "1000000"]);
+    let out = child.communicate(None).expect("communicate");
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr == common::test_pattern::pattern_bytes(1_000_000), "stderr");
+}
+
+/// A grandchild that inherited stdout and outlives the child keeps `communicate` waiting until it
+/// closes it: everything it prints is collected. The grandchild prints only once its stdin, whose
+/// only writer is the child, reaches EOF, so after the child has exited and after its own line.
+///
+/// Mutant: `communicate` returns once the child has exited.
+#[skuld::test]
+fn a_grandchild_holding_stdout_keeps_communicate_waiting() {
+    let mut child = testbin_child(&["print-then-leave-grandchild"]);
+    let out = child.communicate(None).expect("communicate");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"early\nlate\n");
 }
 
 #[skuld::test]

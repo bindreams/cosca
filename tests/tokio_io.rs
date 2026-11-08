@@ -97,7 +97,7 @@ async fn async_communicate_is_deadlock_free() {
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
     cmd.stderr(cosca::Stdio::pipe()).unwrap();
     let mut child = cmd.spawn().expect("spawn");
-    let payload = vec![b'z'; 4 * 1024 * 1024];
+    let payload = common::test_pattern::pattern_bytes(4 * 1024 * 1024);
     let out = child.communicate(Some(payload.clone())).await.expect("communicate");
     assert_eq!(out.stdout, payload);
     assert_eq!(out.stderr, payload);
@@ -117,7 +117,7 @@ async fn async_communicate_tolerates_early_stdin_close() {
     // 4 MiB > any pipe buffer, so write_all is still in flight when `emit` exits and closes its
     // stdin read end — deterministically forcing the BrokenPipe the tolerance branch handles.
     let out = child
-        .communicate(Some(vec![b'x'; 4 * 1024 * 1024]))
+        .communicate(Some(common::test_pattern::pattern_bytes(4 * 1024 * 1024)))
         .await
         .expect("communicate tolerates BrokenPipe");
     assert_eq!(out.stdout, vec![b'o'; 2]);
@@ -145,6 +145,31 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
         "no input → tee-both emits nothing"
     );
     assert!(out.status.success());
+}
+
+/// Input for a child whose stdin is not piped is an `InvalidInput` error, and the piped stdout is
+/// left in place for the next call.
+///
+/// Mutant: the bytes are dropped and `communicate` returns `Ok`.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn async_communicate_input_without_a_piped_stdin_is_invalid_input() {
+    let mut cmd = common::tokio_command(common::Console::Hidden);
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "emit", "3", "0"]);
+    cmd.stdin(cosca::Stdio::null()).unwrap();
+    cmd.stdout(cosca::Stdio::pipe()).unwrap();
+    let mut child = cmd.spawn().expect("spawn");
+    let error = child
+        .communicate(Some(b"x".to_vec()))
+        .await
+        .expect_err("input has nowhere to go");
+    assert!(
+        matches!(&error, cosca::error::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    let out = child.communicate(None).await.expect("the pipes were not taken");
+    assert_eq!(out.stdout, b"ooo");
 }
 
 #[cfg(feature = "tokio")]
