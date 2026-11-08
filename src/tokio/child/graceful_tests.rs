@@ -836,11 +836,11 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
     );
 }
 
-// The pid guard must not swallow the refusals that never address a pid. An uncontained Windows
-// child records `GracefulMechanism::None` — permanent and pid-independent — so it must keep
-// answering `Unsupported` (what its own doc promises, and what the sync mirror returns for the
-// identical child) after the backend has unpinned the pid, not `Unassessable`, which is
-// documented as a transient could-not-determine condition a caller may retry.
+// A refusal that never addresses a pid survives the reap. An uncontained Windows child records
+// `GracefulMechanism::None` — permanent and pid-independent — so it keeps answering `Unsupported`
+// (what its own doc promises, and what the sync mirror returns for the identical child) after the
+// reap, not `Unassessable`, which is documented as a transient could-not-determine condition a
+// caller may retry.
 #[cfg(windows)]
 #[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
@@ -854,7 +854,7 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
     child.kill().expect("kill");
     // Released only after the kill, so a no-op kill fails `assert_killed`.
     drop(stdin);
-    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap")); // tokio unpins the pid here
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap"));
     let err = child.terminate().expect_err("a child that leads no group is refused");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
 }

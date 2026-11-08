@@ -231,7 +231,6 @@ impl Child {
 
     /// Take the parent's read end of the pipe on child descriptor `fd` (configured via
     /// `Command::fd(n, Stdio::pipe_out())`), as an async [`ChildStdout`](super::stdio::ChildStdout).
-    /// The raw `CreateProcessW` backend serves fd >= 3 on Windows.
     ///
     /// # Panics
     ///
@@ -254,7 +253,6 @@ impl Child {
 
     /// Take the parent's write end of the pipe on child descriptor `fd` (configured via
     /// `Command::fd(n, Stdio::pipe_in())`), as an async [`ChildStdin`](super::stdio::ChildStdin).
-    /// See [`fd_read_end`](Child::fd_read_end) for the Windows raw-backend surface.
     ///
     /// # Panics
     ///
@@ -299,7 +297,7 @@ impl Child {
     /// `tokio::time::timeout_at(deadline, child.wait())`, not a duration re-derived later.
     ///
     /// Closes the stdin pipe first if it was not taken, so a child that reads stdin to EOF can
-    /// exit. That includes a stdin that is a merge target, and a Windows raw-backend child's.
+    /// exit. That includes a stdin that is a merge target.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
@@ -398,12 +396,14 @@ impl Child {
         super::wait::wait_tree_drained_dispatch(&self.inner.attached, deadline).await
     }
 
-    /// Leave the child (and its contained tree) running after this handle drops. The drop then
-    /// never signals the tree or the root.
-    ///
-    /// Dropping never waits: a leaf this handle killed and that has not drained is left behind
-    /// with a warning, and one nothing killed is left at `debug`, since the caller asked for that.
-    /// Call [`wait_tree`](Self::wait_tree) before dropping to observe the drain.
+    /// Leave the child (and its contained tree) running after this handle drops (opt out of
+    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` never kills the
+    /// tree itself, though if [`kill_tree`](Self::kill_tree) already returned `Ok` on this handle,
+    /// its `Drop` still waits for that kill's drain before giving up the leaf: on Linux the
+    /// dropping thread blocks until the leaf drains, and warns past 1 s. Await
+    /// [`wait_tree`](Self::wait_tree) first and the drop finds nothing to wait for. A `kill_tree()`
+    /// that returned `Err` leaves nothing to wait for; see
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what that leaves behind.
     ///
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs

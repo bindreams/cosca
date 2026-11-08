@@ -114,9 +114,9 @@ impl Command {
     /// Contain the child's tree with the strongest available mechanism. See
     /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
     ///
-    /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
-    /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and
-    /// a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
+    /// A spawn that fails after forking the child tears it down, as the sync
+    /// [`Command::spawn`](SyncCommand::spawn) does. On Linux the spawn's pidfd kills and reaps the
+    /// root, and a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
     /// is killed with its leaf. On Linux 6.9+ a process-group or session root's whole group is
     /// killed too, through the root's pidfd, while the group has a member, whoever reaped the root.
     /// Below 6.9 the root alone is killed, and a `warn` says the group's members may be left
@@ -202,13 +202,14 @@ impl Command {
     ///
     /// # Runtime
     ///
-    /// Must be called from within an IO-enabled Tokio runtime (the default `#[tokio::main]` /
-    /// `#[tokio::test]`, or a builder with `enable_io()`/`enable_all()`), which the async waits need.
-    /// Called outside any runtime, `spawn` returns [`Error::Io`](crate::error::Error::Io). On a
-    /// runtime built *without* it, tokio's behavior applies and is platform-specific — on Unix `spawn`
-    /// panics (child reaping needs the runtime driver: IO on Linux, signal on macOS), on Windows it
-    /// currently succeeds — and tokio exposes no way to preflight it, so neither can be turned into a
-    /// typed error.
+    /// Must be called from within a Tokio runtime, and one with the IO driver enabled (the default
+    /// `#[tokio::main]` / `#[tokio::test]`, or a builder with `enable_io()`/`enable_all()`) for the
+    /// child's waits and pipes. Called outside any runtime, `spawn` returns
+    /// [`Error::Io`](crate::error::Error::Io). `spawn` itself does not need the IO driver: on a
+    /// runtime built without it, the child starts, and on Unix its first wait panics if the child
+    /// is still running (the wait registers it with the reactor: IO on Linux, signal on macOS), as
+    /// taking a pipe does on any platform. The child is still torn down by its drop. tokio exposes no way to preflight
+    /// the driver, so the panic cannot be turned into a typed error.
     /// `status`/`output`/`read` and the [`run`](crate::tokio::run)/[`run_line`](crate::tokio::run_line)
     /// free functions spawn eagerly, so the same applies to them.
     ///
@@ -233,9 +234,8 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// Every error says whether the program could have started, as the sync
-    /// [`Command::spawn`](SyncCommand::spawn)'s does. Unlike it, a failed `exec` is
-    /// [`Error::MayHaveStarted`] here (see its list).
+    /// The errors are the sync [`Command::spawn`](SyncCommand::spawn)'s: this is the same spawn, and
+    /// every error says whether the program could have started.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         Ok(super::spawn::spawn(&mut self.inner)?)
     }

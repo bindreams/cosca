@@ -14,22 +14,24 @@ use crate::identity::ProcessId;
 use crate::os_process::child_named;
 use crate::signal::{Sent, Sig};
 
-/// A child a failed spawn, or a sync [`Command::status`](crate::Command::status),
-/// [`output`](crate::Command::output) or [`read`](crate::Command::read) that failed after it, could
-/// not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or it is an elevation front, which is
-/// sent none, or the wait for it failed after the kill; and it is not known to have been collected.
-/// Its fate in the error is one of a child not known to be collected; see [`Error::MayHaveStarted`],
-/// which it comes back in and the caller owns from then on.
+/// A child a failed spawn, or a [`Command::status`](crate::Command::status),
+/// [`output`](crate::Command::output) or [`read`](crate::Command::read) (sync or tokio) that failed
+/// after it, could not end: its kill was refused (`EPERM`, `ACCESS_DENIED`), or it is an elevation
+/// front, which is sent none, or the wait for it failed after the kill; and it is not known to have
+/// been collected. Its fate in the error is one of a child not known to be collected; see
+/// [`Error::MayHaveStarted`], which it comes back in and the caller owns from then on.
 ///
 /// Settle it with [`wait`](Unreaped::wait), which blocks until the child exits and reaps it, or
-/// [`leak`](Unreaped::leak), which gives it up. A value dropped otherwise does what `wait` does,
-/// then logs one line naming the child. So the drop blocks: in async code, settle it with
-/// [`wait_async`](Unreaped::wait_async) (the `tokio` feature) or `leak` it. A front is waited for
-/// until it exits, which the failed call would have done anyway.
+/// [`leak`](Unreaped::leak), which gives it up. A value from a sync call, dropped otherwise, does
+/// what `wait` does, then logs one line naming the child, so the drop blocks. A value from a tokio
+/// call, dropped otherwise, never blocks: it lets the child go, as a cancelled
+/// [`wait_async`](Unreaped::wait_async) does (see there). In async code settle either with
+/// `wait_async` (the `tokio` feature) or `leak` it. `wait` waits for a front until it exits, which
+/// the failed call would have done anyway.
 ///
-/// A value dropped while its thread is panicking does not wait: it gives the child up, which keeps
-/// running unreaped until this process exits, and logs one `warn` naming its pid. A cancelled
-/// [`wait_async`](Unreaped::wait_async) does not block either: see there.
+/// A value from a sync call, dropped while its thread is panicking, does not wait: it gives the
+/// child up, which keeps running unreaped until this process exits, and logs one `warn` naming its
+/// pid.
 ///
 /// ```
 /// use cosca::error::Error;

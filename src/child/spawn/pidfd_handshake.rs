@@ -329,9 +329,9 @@ impl Handshake {
                 }
             };
 
-            // A panic on this thread from here on (a panicking logger, tokio's no-IO panic after
-            // the fork) unwinds into a join of the helper, which waits for EOF on the child's end:
-            // a forked copy of it would hold the join for as long as the copy lives.
+            // A panic on this thread from here on (a panicking logger) unwinds into a join of the
+            // helper, which waits for EOF on the child's end: a forked copy of it would hold the
+            // join for as long as the copy lives.
             let _eof_on_unwind = ForceEofOnUnwind(parent_end);
             #[cfg(test)]
             let _wait_over = fault::WaitOverOnDrop;

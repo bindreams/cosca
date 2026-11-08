@@ -75,37 +75,24 @@ In order:
    `Attached::wait_drained`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
-   - The async `Child` (the PR that moves it onto the stack): `GroupRoot::new` with no
-     `ReapHold`; its tests' hooks, `exit_only::seams` and `signal::seams`, which `Process::kill`'s
-     tests share.
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
      identity, `kill_and_reap_*` and `unique_report` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
      through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`); the
      `exit_only::seams` their tests use. `OwnedChild::tear_down`
-     is the one kill-then-settle policy, and `Child::drop` uses it. On Linux it also ends every
-     sync spawn failure (the handshake's `conclude`, and the identity and attach arms,
-     `held_teardown.rs`) and, in the async spawn, the failures of a child the handshake holds by
-     pidfd (`conclude`'s `(Err, Opened)` and unexecuted arms), an elevation front at the identity
-     and attach arms (`ProcSource::leave_front_noting`), the second teardown of a refused kill
-     (`ProcSource::tear_down_forgotten`), and the cgroup leaf's abandonment of every child it is
-     left (`CgroupLeaf::abandon_before_verdict`: the group a child that exec'd outside the leaf
-     leads, through `OwnedChild::hold`, then the leaf killed through, then `tear_down` with the
-     leaf's kill as its `Kill` tree, or `look_at_front` for a front, then the leaf removed). The
-     sync spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
-     ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`), in
-     the async raw spawn too; a refused kill comes back in the sync spawn's failure as an
-     `Unreaped`, and the async raw spawn leaves the child, warned. Both spawns build their
-     `OwnedChild` once, right after the process is created. Until the
-     async-child slice, tokio's own code ends the rest of the async spawn. `conclude`'s
-     `Ok(child)` arms are `Spawned` for tokio's `Child`: `reap_unexecuted` kills through the
-     pidfd and collects with tokio's `try_wait`, leaving a zombie it cannot yet collect to
-     tokio's orphan queue, and `abandon_unreported` leaves the child to that queue, which
-     `waitpid`s by pid. The async non-front attach arm and the
-     identity arm (`ProcSource::reap_now_noting`) make the first kill the
-     backend's. A refused kill goes on to `tear_down`, through `after_refused_kill`, once tokio's
-     `Child` is forgotten; `reap_now_noting` collects with tokio's `try_wait`, so it reaps by pid.
-     An identity read the OS refuses fails no spawn: the child is kept with no identity, and only
+     is the one kill-then-settle policy, split at its one wait (`begin_tear_down` returns the
+     teardown's end or a pending wait, which `settle` blocks on and `settle_async` awaits), and
+     `Child::drop` uses it. The async spawn is the sync spawn told the async `SpawnPolicy` (the
+     warn threshold of its waits, and what an `Unreaped` it hands back does when dropped). On
+     Linux the teardown also ends every spawn failure (the handshake's `conclude`, and the
+     identity and attach arms, `held_teardown.rs`), and the cgroup leaf's abandonment of every
+     child it is left (`CgroupLeaf::abandon_before_verdict`: the group a child that exec'd outside
+     the leaf leads, through `OwnedChild::hold`, then the leaf killed through, then `tear_down`
+     with the leaf's kill as its `Kill` tree, or `look_at_front` for a front, then the leaf
+     removed). The spawn builds the `OwnedChild` once when the handshake succeeds. On Windows it
+     ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`); a
+     refused kill comes back in the spawn's failure as an `Unreaped`. The `OwnedChild` is built
+     once, right after the process is created. An identity read the OS refuses fails no spawn: the child is kept with no identity, and only
      a containment that needs one fails the attach. A teardown through a pidfd
      (`held_teardown::tear_down_pidfd`) is told once what its caller knows became of the pidfd
      (`Past`, in `child::owned::teardown`); what the handle allows is its constructor's
@@ -122,11 +109,12 @@ In order:
      the teardowns,
      `finish_elevated` and `Unreaped` all ask it. A teardown that cannot end a child, a
      refused kill or a running elevation front, hands it back as `Unreaped`, in
-     `Error::MayHaveStarted`: the sync Linux spawn does, and so does the sync `finish_elevated`;
-     the `Command::{status, output, read}` do through `Child::tear_down_or_hand_back`, and so does
-     the sync Windows `kill_on_drop(false)` disarm refusal (`Child::commit_kill_on_drop`).
-     `SuspendedChild::resume` runs it too; `# Errors` there has the split by arm. Windows and macOS
-     still tear down by themselves for their other spawn failures.
+     `Error::MayHaveStarted`: the Linux spawn does, and so does `finish_elevated`; the
+     `Command::{status, output, read}` do through `Child::tear_down_or_hand_back` (awaited, for
+     the async ones), and so does the Windows `kill_on_drop(false)` disarm refusal
+     (`Child::commit_kill_on_drop`). `SuspendedChild::resume` runs it too; `# Errors` there has the
+     split by arm. Windows and macOS still tear down by themselves for their other spawn failures;
+     on macOS a refused kill leaves the child running, with a warn, until the macOS hand-back.
    - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
      kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
      `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
@@ -139,16 +127,14 @@ In order:
    doas or osascript.
 3. **Containment mechanisms:** today an enum whose callers ask which mechanism they hold. It
    becomes operations on the tree, taking the root as an `OwnedChild`.
-4. **The `Child` core:** with 1–3 done, the sync and async `Child` become one policy and two
-   drivers. It also removes `child::fault::force_root_reads` and `force_next_root_read`, a
+4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
+   `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`). What is
+   left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
    `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
    those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
    [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes the Windows
    exiting-refusal hook (`identity::windows_fault::refuse_next_terminate_as_exiting`), which answers
    in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
-   enter with their first caller, and those tests state rows (owner, 2026-11-06). The sweep bodies of
-   the sync and tokio `kill_tree_after` (the front gate, the root check, the refusal to walk, the
-   cgroup-front arm, the handle backstop and `SweepFailure::of`) merge there: today each is written
-   twice.
+   enter with their first caller, and those tests state rows (owner, 2026-11-06).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.

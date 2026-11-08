@@ -133,9 +133,8 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         // it back and re-sends `NOTE_EXIT` (`:2864-2912`). On CI launchd never did, in a 30 s
         // window, so it is reported apart, as `Orphaned`: not ours to reap, and its fate is `Gone`
         // (see `Foreign::fate`). The sync child's later `wait` or `try_wait` still reaps the zombie
-        // if that hand-back ever comes; the tokio backend forgets it. A spawn that meets it fails
-        // with its child `Gone`, and its child (dropped or forgotten) is not reaped by pid, so a
-        // hand-back leaves the zombie.
+        // if that hand-back ever comes. A spawn that meets it fails with its child `Gone`, and its
+        // child (dropped) is not reaped by pid, so a hand-back leaves the zombie.
         PeekOutcome::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
             Held::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             Held::Parent(ppid) if ppid == LAUNCHD => Ok((PeekOutcome::Foreign(Foreign::Orphaned), None)),

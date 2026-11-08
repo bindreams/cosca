@@ -491,11 +491,10 @@ impl Command {
     /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
     /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
     /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
-    /// has a member left, and sends nothing and logs no skipped kill once it has none (the async
-    /// drop after a foreign reap still warns that it forgot tokio's `Child`). A root whose
+    /// has a member left, and sends nothing and logs no skipped kill once it has none. A root whose
     /// handle cannot say whether it was reaped has its group killed the same way while the group has
-    /// a member; an async handle keeps the root's pidfd when it forgets tokio's `Child`. The rest of
-    /// this paragraph is about other mechanisms, kernels before 6.9 and macOS.
+    /// a member. The rest of this paragraph is about other mechanisms, kernels before 6.9 and
+    /// macOS.
     ///
     /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
@@ -531,13 +530,13 @@ impl Command {
     /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown (see
     /// principle 3 for the one early exception in a failed elevation).
     ///
-    /// **Both handles block until the root is reaped and a cgroup leaf has drained.** The sync
-    /// [`Child`](crate::Child) does so as sync Rust normally does. The async
-    /// [`Child`](crate::tokio::Child) does so on the dropping thread, which may be a tokio worker:
-    /// a destructor cannot be awaited. Its root's kill bounds the wait, as does the tree's
-    /// `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state) or a foreign
-    /// tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows the async drop
-    /// terminates the root and the tree, and waits for neither.
+    /// **Both handles block until the root is reaped and a cgroup leaf has drained**, and warn once
+    /// past 1 s. The sync [`Child`](crate::Child) does so as sync Rust normally does. The async
+    /// [`Child`](crate::tokio::Child) is the same policy, and does so on the dropping thread, which
+    /// may be a tokio worker: a destructor cannot be awaited. Its root's kill bounds the wait, as
+    /// does the tree's `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state)
+    /// or a foreign tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows both
+    /// terminate the root and the tree, and wait for the root.
     ///
     /// An elevated child this process cannot signal is the one case neither handle blocks on: the
     /// teardown gives up rather than wait forever, and the child is left running. So is an elevated
@@ -545,9 +544,8 @@ impl Command {
     /// drop also leaves unreaped. Each logs a `warn` naming it. The rest of the tree is still
     /// killed: the drop's cgroup leaf stays armed, and its `cgroup.kill` ends what it holds, a front
     /// among it. The sync drop waits for that and reaps a front that has exited or that the leaf
-    /// held, and warns of one still running outside it. The async drop reaps a front the leaf's kill
-    /// is shown to have reached, as it reaps any killed root; it waits for no other front, and
-    /// tokio reaps that one once it exits.
+    /// held, and warns of one still running outside it; so does the async drop. That front stays
+    /// unreaped, a zombie once it exits.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
@@ -556,11 +554,11 @@ impl Command {
     /// a `SIGTERM` is catchable, so the tree may outlive it — which
     /// [`wait_tree`](crate::Child::wait_tree) before the drop is what proves either case is done.
     /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so once it has
-    /// returned `Ok`, a sync drop after it waits for that kill's drain before giving up the leaf,
-    /// the same as it would with `kill_on_drop` left on. The async drop does not wait: it leaves
-    /// the leaf behind with a warning unless [`wait_tree`](crate::tokio::Child::wait_tree)
-    /// drained it first. A `kill_tree()` that returned `Err` leaves nothing for the drop to wait
-    /// for. cosca does not come back for a leaf it left: the empty `cosca-*` directory stays until
+    /// returned `Ok`, a drop after it waits for that kill's drain before giving up the leaf, the
+    /// same as it would with `kill_on_drop` left on. The async drop does too, on the dropping
+    /// thread, warning past 1 s: await [`wait_tree`](crate::tokio::Child::wait_tree) first and the
+    /// drop finds nothing to wait for. A `kill_tree()` that returned `Err` leaves nothing for the
+    /// drop to wait for. cosca does not come back for a leaf it left: the empty `cosca-*` directory stays until
     /// something else removes it, such as systemd removing a stopped unit's cgroup subtree.
     ///
     /// **On Windows, opting out clears `KILL_ON_JOB_CLOSE` on the child's Job Object, and a spawn
@@ -579,9 +577,9 @@ impl Command {
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
     /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
-    /// process group's, through the root's pidfd (an async handle keeps it when it forgets tokio's
-    /// `Child`). Below 6.9 and on macOS, kills named by the root's pid (a
-    /// process group; a macOS fd marker's group and walk) are skipped on evidence of a foreign reap,
+    /// process group's, through the root's pidfd. Below 6.9 and on macOS, kills named by the root's
+    /// pid (a process group; a macOS fd marker's group and walk) are skipped on evidence of a
+    /// foreign reap,
     /// and [`kill_tree`](crate::Child::kill_tree),
     /// [`terminate_tree`](crate::Child::terminate_tree) and
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) return

@@ -17,8 +17,7 @@ async fn async_spawn_status_reports_exit_code() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_id_is_a_real_stable_identity() {
-    // id() returns the stored ProcessId — a real, resolvable identity that survives wait (tokio's
-    // own Child::id() would be None after reap).
+    // id() returns the stored ProcessId — a real, resolvable identity that survives wait.
     use std::io::Write as _;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     let id = child.id().expect("the spawn read the child's identity");
@@ -439,8 +438,8 @@ async fn async_detach_leaves_the_tree_running() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
-    // `kill_on_drop(false)` hits the async Drop early-return, so the teardown (hard_kill + the
-    // root's kill) must not run and the root stays alive. Proven by positive liveness on the
+    // `kill_on_drop(false)` disarms the drop, so the teardown (hard_kill + the root's kill) must
+    // not run and the root stays alive. Proven by positive liveness on the
     // never-signaled root (race-free, mirroring async_detach_leaves_the_tree_running).
     // UNCONTAINED on purpose: `Attached::None` isolates the early-return itself from the
     // containment resource's own drop, which
@@ -516,9 +515,9 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 
 #[cfg(feature = "tokio")]
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
-/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle never
-/// waits for a drain, so one that killed its tree removes the leaf only if the caller awaited the
-/// drain first.
+/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle that
+/// killed its tree waits for the drain on the dropping thread, so this pins the path that never
+/// blocks, where the caller awaited the drain first and the drop has nothing left to wait for.
 ///
 /// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.

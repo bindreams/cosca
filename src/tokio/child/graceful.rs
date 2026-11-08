@@ -51,23 +51,17 @@ impl Child {
     /// forced.
     ///
     /// **Windows, after the exit has been observed.** A console control event is addressed by
-    /// pid alone, and this handle stops pinning the child's pid the moment `wait`/`try_wait`
-    /// reports the exit — the async backend releases the process handle there, so the OS may
-    /// reissue the pid to an unrelated group leader. From that point the call is refused
-    /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
-    /// pid. The sync [`Child`](crate::Child) pins for its whole life and answers `Ok`. A
-    /// mechanism that addresses no pid keeps its own answer: an uncontained Windows child is
-    /// `Unsupported` before and after the reap alike, because nothing was ever going to be sent
-    /// to a pid in the first place.
+    /// pid alone. This handle pins the child's pid for its whole life, as the sync
+    /// [`Child`](crate::Child) does, so the call answers `Ok` before and after the exit has been
+    /// observed, and never reaches a reissued pid. A mechanism that addresses no pid keeps its
+    /// own answer: an uncontained Windows child is `Unsupported` before and after the reap alike,
+    /// because nothing was ever going to be sent to a pid in the first place.
     ///
     /// **A macOS graphically-elevated child** is refused, as for the sync
     /// [`Child::terminate`](crate::Child::terminate).
     ///
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for the sync [`Child::kill`](crate::Child::kill).
-    ///
-    /// **macOS, a child not shown to be ours** (its handle forgotten as unproven) is sent no `SIGTERM`
-    /// and the call is `Ok`: nothing proves the number is still the child's.
     pub fn terminate(&self) -> Result<(), Error> {
         self.inner.terminate()
     }
@@ -130,10 +124,6 @@ impl Child {
     /// [`Child::kill`](crate::Child::kill). A root orphaned during the grace is not killed: the
     /// escalation returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying the kill
     /// sent nothing though the `SIGTERM` was sent.
-    ///
-    /// **macOS, a child not shown to be ours** (its handle forgotten as unproven) is sent nothing,
-    /// neither the `SIGTERM` nor the kill, and the call returns `Err(`[`Error::Io`](crate::error::Error::Io)`(ECHILD))`
-    /// at once, with no grace waited: nothing proves the number is still the child's.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
         #[cfg(test)]
@@ -247,20 +237,6 @@ impl Child {
     /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
-    ///
-    /// **Windows, once the root's exit has been observed**, the cooperative half is refused
-    /// outright — this handle has stopped pinning the root's pid, see
-    /// [`terminate_tree`](Child::terminate_tree). That refusal is held rather than returned:
-    /// nothing was sent, so nothing is owed a reply, and the sweep still has to run.
-    ///
-    /// **What the grace then buys is a property of the mechanism, and one arm buys nothing.**
-    /// On a **job object** the wait watches the whole tree, so descendants that the root's own
-    /// exit is already ending — one reading a pipe whose write end the root held gets EOF and
-    /// exits on its own — are given the window to finish, and the sweep takes only what is left.
-    /// On **`TreeWalk`** there is no drain edge, so the wait watches the ROOT alone; the root
-    /// has already exited by this refusal's own precondition, the watch resolves at once, and
-    /// the sweep follows immediately. Descendants get no window there, whatever `grace` says
-    /// (bindreams/cosca#125).
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.

@@ -1301,7 +1301,7 @@ fn kill_and_reap_noting(
                     notes.push("is still running after its kill".to_owned());
                     ChildFate::Running { id }
                 }
-                // Nothing reaps it after this: the std `Child` reaps nothing, and tokio's is forgotten.
+                // Nothing reaps it after this: the std `Child` reaps nothing.
                 Err(e) => {
                     notes.push(format!(
                         "could not be waited for ({e}), so it is left unreaped: it stays a zombie once it exits"
@@ -2798,8 +2798,7 @@ pub(crate) mod fault {
     /// A point in a spawn where a test can run a hook.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum SpawnPoint {
-        /// Right before the spawn reads the child's identity (the tokio spawn's macOS unique id is
-        /// read earlier, before the backend exists).
+        /// Right before the spawn reads the child's identity.
         BeforeIdentity,
         /// Right before the spawn attaches the containment.
         BeforeAttach,

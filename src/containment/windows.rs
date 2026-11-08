@@ -1676,8 +1676,8 @@ pub(crate) fn resume_initial_threads(
 /// initial threads.
 ///
 /// `proc_handle` must remain open for the whole call (it pins the pid against reuse during the
-/// Toolhelp thread walk in `resume_initial_threads`). Both callers hold the owning `Child` —
-/// sync `std::process::Child`, async `::tokio::process::Child` — across the call, so it does.
+/// Toolhelp thread walk in `resume_initial_threads`). Every caller holds the process it spawned
+/// across the call, so it does.
 ///
 /// Returns `Ok(Some(JobHandle))` on full success (job assigned AND resumed).
 /// Returns `Ok(None)` when job assignment fails — the caller falls back to the

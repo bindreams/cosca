@@ -39,9 +39,6 @@
 //!   non-inheritable here, duplicates them into a helper process, and creates the child with
 //!   that helper as its parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
 //!
-//! `windows_raw` here is `crate::child::spawn::windows_raw`; the async backend
-//! `crate::tokio::spawn::windows_raw` has the same properties.
-//!
 //! [`CreateProcessW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 //! [Handle Inheritance]: https://learn.microsoft.com/en-us/windows/win32/sysinfo/handle-inheritance
 //! [`UpdateProcThreadAttribute`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
@@ -478,7 +475,7 @@ pub(crate) fn target_with(
 ///
 /// It earns its place because the primary gate is an argument rather than a check: `program_token`
 /// yielding `Some` for every `CommandInput` arm that `raw_program_and_line` rejects is a
-/// *pairwise agreement* between two functions, duplicated across the sync and async backends, and
+/// *pairwise agreement* between two functions, and
 /// the `CommandLine` arm re-derives `first_token_wide` independently rather than reusing
 /// `program_token`. A fourth `CommandInput` variant, or a change to `first_token_wide`'s
 /// empty-input contract, would break that agreement — and this is what stops the break becoming

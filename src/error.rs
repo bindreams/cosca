@@ -268,30 +268,26 @@ pub enum Error {
     /// - every failure after `exec`, such as an identity read that finds the child gone, a
     ///   containment attach (one that needs the child's identity fails with the error of the read
     ///   the OS refused), or a password write to the elevation backend;
-    /// - on Unix, a [`tokio::Command`](crate::tokio::Command) whose child failed between its first
-    ///   `pre_exec` hook and `exec` (a failed `exec`, `ENOENT` included, or a failed descriptor
-    ///   mapping), and on Windows, any failed spawn of one through `std`: tokio can fail a spawn after
-    ///   `std`'s succeeded, and the error does not say which of the two failed;
     /// - on macOS, a child whose unique-id report was not yet written, or could not be read, when
     ///   the spawn looked.
     ///
     /// `Command::output`, `status` and `read`, sync and tokio, return this variant for every
     /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
     /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
-    /// was collected (`Reaped`). When the sync methods' teardown cannot end the child (a refused
-    /// kill, or an elevation front, which is sent none) and it is not known to have been collected,
-    /// they return it in `unreaped`. The tokio methods do not: they leave it running and warn,
-    /// with `unreaped` `None` and `fate` `Running`, until the async child can wait for one (a
-    /// blocking wait on a runtime thread is forbidden). So do
-    /// [`SuspendedChild::resume`](crate::SuspendedChild::resume) and its tokio twin for the frozen
-    /// child they could not kill after a failed release: that thread may stay frozen, so waiting
-    /// for the child could block for ever. The split by arm is in `resume`'s `# Errors`.
+    /// was collected (`Reaped`). When their teardown cannot end the child (a refused kill, or an
+    /// elevation front, which is sent none) and it is not known to have been collected, they
+    /// return it in `unreaped`; a tokio method's is dropped without blocking (see
+    /// [`Unreaped`](crate::Unreaped)). [`SuspendedChild::resume`](crate::SuspendedChild::resume)
+    /// and its tokio twin do not, for the frozen child they could not kill after a failed
+    /// release: they leave it running and warn, with `unreaped` `None` and `fate` `Running`, since
+    /// that thread may stay frozen, so waiting for the child could block for ever. The split by
+    /// arm is in `resume`'s `# Errors`.
     ///
-    /// A failed sync spawn hands back the child when the spawn or run could not end it: on Linux,
-    /// when the identity read or the attach fails after the handshake, on every Unix, when the
-    /// elevation backend's password write fails, and on Windows, when a `kill_on_drop(false)`
-    /// child's job refuses the disarm and the kill that follows is refused too. The other failed
-    /// spawns leave a child they could not end running and warn.
+    /// A failed spawn, sync or tokio, hands back the child when the spawn or run could not end it:
+    /// on Linux, when the identity read or the attach fails after the handshake, on every Unix,
+    /// when the elevation backend's password write fails, and on Windows, when a
+    /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused
+    /// too. The other failed spawns leave a child they could not end running and warn.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]

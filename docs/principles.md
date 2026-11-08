@@ -29,16 +29,15 @@ must wait is an `async fn`. Sync code may block, as sync Rust normally does.
 
 The armed async `Drop` is an exception: it blocks until what it killed is reaped and drained
 (principle 3). A destructor cannot await. So are the places a destructor runs inside an `async fn`:
-a run-to-completion teardown (`status`, `output`, `read` failing after the spawn) dropped mid-reap
-or mid-drain finishes as the `Drop` does, and one whose exit or drain cannot be watched (the
-reactor refuses the registration, or the handle reports an error) waits for it in place instead of
-forgetting a child that is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's
-teardown waits in place too. Exactly these of its blocking waits for something it killed warn once
-past 1 s, as the drop's does, each naming what it waits for:
+a run-to-completion teardown (`status`, `output`, `read` failing after the spawn) awaits its
+root's reap and its leaf's drain, and dropped mid-wait it finishes as the `Drop` does. A leaf
+whose drain cannot be watched (the reactor refuses the registration, or the handle reports an
+error) is left to the leaf's `Drop`, which waits for it in place instead of giving up a leaf that
+is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's teardown waits in place
+too (the spawn is the sync one). Exactly these of its blocking waits for something it killed warn
+once past 1 s, as the drop's does, each naming what it waits for:
 
-- the wait for the root, once the spawn has a child handle (on Linux and Windows, and on macOS
-  including the teardown of a child whose unique-id report came after the spawn returned,
-  [`reap_unreported`](../src/tokio/child/proc_source.rs));
+- the wait for the root, once the spawn has a child handle;
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
   leaf's abandonment, which tears the child down through the pidfd the handshake left it
@@ -76,56 +75,56 @@ context ([tokio shutdown.rs]).
 
 **Applies to:** every spawn, control and teardown path under [`src/tokio/`](../src/tokio/).
 
-## 3. Async `Drop` waits only for what it killed
+## 3. A `Drop` waits only for what a landed kill bounds
 
-With `kill_on_drop` set, an async `Drop` kills the contained tree and the root through their
-handles, then blocks until the root's exit shows through its handle and is collected, and a cgroup
-leaf has drained and been removed, as the sync `Drop` does. The collect is tokio's `try_wait`, a
-reap by the root's number (principle 4). It waits in place on the dropping thread, on every
-runtime, never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a multi-thread
-runtime, and offers no way to ask first. Once the wait passes 1 s, the drop logs one `warn` naming
-the root's pid, and keeps waiting. The 1 s is for that message only: no wait ends on it. Failed
-async spawns wait the same way, with the warns principle 2 lists.
+With `kill_on_drop` set, a `Drop` kills the contained tree and the root through their handles, then
+blocks until the root's exit shows through its handle and is collected, and a cgroup leaf has
+drained and been removed. The async `Child` holds the sync one, so its `Drop` is the sync `Drop`.
+The collect is the root handle's own reap (principle 4). It waits in place on the dropping thread,
+on every runtime, never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a
+multi-thread runtime, and offers no way to ask first. Once the wait passes 1 s, the drop logs one
+`warn` naming the root's pid, and keeps waiting. The 1 s is for that message only: no wait ends on
+it. Failed async spawns wait the same way, with the warns principle 2 lists.
 
 The kills bound the wait, except for a process stuck in uninterruptible I/O (D state) or a root
 whose zombie a foreign tracer holds; either holds the dropping thread, which may be a tokio worker.
 `kill()` then `wait().await`, plus `wait_tree().await` for a tree, before the drop is the path that
 never blocks: the drop then finds nothing to wait for.
 
-A drop that kills nothing does bounded work only: disarmed (`detach()`, `kill_on_drop(false)`), or
-armed with a root kill that failed or could not be sent, so the root may still run. It may send a
-bounded number of signals and write `cgroup.kill`, one bounded file write, and never waits for a
-process exit or a cgroup drain. On Linux 6.9+ the signals include the signal-0 send through the
-root's pidfd that decides whether a reaped root's process group is killed (principle 4). A leaf it
-leaves undrained stays behind, logged as principle 7 says.
+The wait is bounded by a kill that landed, not by who sent it. A disarmed drop (`detach()`,
+`kill_on_drop(false)`) kills nothing, but if a `kill_tree()` on the handle returned `Ok`, its
+`cgroup.kill` landed, and the drop waits for that leaf's drain, warning past 1 s, before it removes
+the leaf ([#194]). On the async `Child` that drop blocks the dropping thread: await `wait_tree()`
+first.
+
+A drop with no landed kill does bounded work only: disarmed and never killed, or armed with a root
+kill that failed or could not be sent, so the root may still run. It may send a bounded number of
+signals and write `cgroup.kill`, one bounded file write, and never waits for a process exit or a
+cgroup drain. On Linux 6.9+ the signals include the signal-0 send through the root's pidfd that
+decides whether a reaped root's process group is killed (principle 4). A leaf it leaves undrained
+stays behind, logged as principle 7 says.
 A leaf whose `cgroup.kill` fails, and on which no earlier kill landed, is given up the same way,
 though the drop still reaps a root its kill reached. A teardown writes `cgroup.kill` once, and a
 failed write is final for it. The one place that writes again within a call is `finish_elevated`,
 when its first tree kill did not settle the tree (it failed or was skipped): it makes the drop's
 tree kill itself, early, because it hands the root back and disarms the handle, so the drop that
 would have made that kill never runs. Everywhere else a second write is a different teardown's (a
-`kill_tree()`, then the drop). A leaf the async drop gives up leaves its still-running root to
-tokio's drop of its `Child`: an in-drop `try_wait` ([tokio reap.rs], [tokio pidfd_reaper.rs]),
-then tokio's orphan queue. Both are tokio's state, not
-cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4). The orphan
-queue is best-effort: it drains only while some tokio runtime parks ([tokio runtime/process.rs]),
-and until then the root stays a zombie.
+`kill_tree()`, then the drop). A root a drop gives up is still the handle's unreaped child: a
+zombie once it exits, since cosca starts no reaper (principle 1).
 
 On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
-included), cosca instead takes the child's stdio out, forgets tokio's `Child`, and logs what the
-forget leaks as principle 7 says: on Linux the pidfd and its reactor registration
-([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
-[#174] and open with the owner.
+included), the drop neither signals nor waits for the root by its number, and logs what it skipped
+as principle 7 says (principle 5).
 
-tokio discards a PID that is already reaped: the queue drops it on `ECHILD` ([tokio orphan.rs]).
-Neither step can detect a foreign reap followed by the number's reuse for another child of ours,
-which it would then reap, and cosca's drop-time check can't close the window between itself and
-tokio's `try_wait`.
+On Windows the `Drop` terminates the tree and the root, then waits for the root.
 
-On Windows the async `Drop` terminates the tree and the root, and waits for neither.
+An [`Unreaped`](../src/child/owned/unreaped.rs) a tokio call hands back does not block when it is
+dropped: it kills the child once more (an elevation front is sent none), looks once without
+waiting, and warns naming its pid (a refused kill warns regardless). A child it did not reap is
+given up, unreaped. An `Unreaped` from a sync call waits, as the `Drop` does.
 
-**Why:** a kill the drop delivered makes the wait as bounded as the kernel makes it, the same wait
-the sync `Drop` already does, and a drop that returns early leaks the zombie and the cgroup leaf.
+**Why:** a kill that landed makes the wait as bounded as the kernel makes it, whether the drop or an
+earlier `kill_tree()` sent it, and a drop that returns early leaks the zombie and the cgroup leaf.
 A kill that failed bounds nothing, so that drop stays bounded.
 Global reapers (`waitpid(-1)`, a subreaper) belong to programs that own the whole process, such as
 tini and the containerd shim. Embeddable libraries decline the role: sd-event avoids
@@ -134,8 +133,8 @@ reaper for containers without their own PID namespace ([runc CHANGELOG]).
 
 **Applies to:** `Drop` of [`cosca::tokio::Child`](../src/tokio/child.rs) and everything it owns,
 which includes an unresumed [`cosca::tokio::SuspendedChild`](../src/tokio/child/suspended.rs): its
-drop is its `Child`'s. The sync [`Child`](../src/child.rs) kills and reaps in its `Drop`, which is
-allowed.
+drop is its `Child`'s. The sync [`Child`](../src/child.rs) kills and reaps in its `Drop` by the
+same policy, and blocking there is allowed.
 
 ## 4. Don't act on a bare PID after it may be reused
 
@@ -167,18 +166,16 @@ reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`
 send through it shows whether the group still has a member; while it has one, its number cannot be
 reissued. So a tree call, a drop and a failed spawn's cleanup (a spawn that fails at its identity
 read, an elevated spawn that cannot finish, an abandoned spawn whose cgroup leaf did not take its
-root, a tokio spawn that fails after its fork) still kill the group of a reaped root while it has a
-member, whoever reaped the root, and send nothing once it has none; that signal-0 send is also the
-check before each send by the group's number. A tokio handle keeps its pidfd when it forgets tokio's
-`Child`, so that holds after it too.
-cosca detects the flag by acting, and an older kernel's `EINVAL` is handled per path. A tree call, a
-drop and the cleanup of an elevated spawn that cannot finish fall back to the group's number,
-checked against the root's state, and send nothing once that check fails. The cleanup of an
-abandoned spawn does the same while its child is unreaped, and sends the group of a reaped child
-nothing. The cleanups of a spawn that fails at its identity read and of a tokio spawn that fails
-after its fork send the group nothing, whatever the root's state. These last three `warn` once that
-members of the root's process group may be left running. On macOS, which has no exact kill of a
-group, the cleanup of a group root whose spawn fails at its identity read warns the same.
+root) still kill the group of a reaped root while it has a member, whoever reaped the root, and
+send nothing once it has none; that signal-0 send is also the check before each send by the
+group's number. cosca detects the flag by acting, and an older kernel's `EINVAL` is handled per
+path. A tree call, a drop and the cleanup of an elevated spawn that cannot finish fall back to the
+group's number, checked against the root's state, and send nothing once that check fails. The
+cleanup of an abandoned spawn does the same while its child is unreaped, and sends the group of a
+reaped child nothing. The cleanup of a spawn that fails at its identity read sends the group
+nothing, whatever the root's state. These last two `warn` once that members of the root's process
+group may be left running. On macOS, which has no exact kill of a group, the cleanup of a group
+root whose spawn fails at its identity read warns the same.
 On Linux a member's identity is told through a pidfd on every kernel (its inode on 6.9+), so a
 member whose own `pidfd_open` fails (`EMFILE`, a refusal) is not signalled: it is reported
 unassessable, and a group whose members cannot all be opened cannot be listed. Below 6.9 and on
@@ -191,20 +188,9 @@ check and use are two back-to-back actions. Every send by number has its own che
 never one check for several sends (a `killpg`, its resends, a walk), and no field or variable holds
 a checked PID for later use.
 
-The by-number reaps outside this rule are all tokio's `waitpid(pid)`. One is its reap of an async
-root cosca did not kill and leaves to it: a dropped root whose drop killed nothing, disarmed
-(`detach()`, `kill_on_drop(false)`) or armed with a failed kill (principle 3), or, on macOS, a
-child whose async spawn failed and whose kill did not end it, which cosca releases to tokio's
-orphan queue rather than forget it and leave a zombie nothing collects
-(`ProcSource::reap_now_noting` and `ProcSource::reap_unreported` in
-[`proc_source.rs`](../src/tokio/child/proc_source.rs), and the attach-failure arm of
-`spawn_uncommitted` in [`tokio/spawn.rs`](../src/tokio/spawn.rs)). The other is every collect of an
-async root, which is tokio's `try_wait` right after cosca's own look through the root's handle
-showed the exit. A collect never goes without its look: an async wait whose look finds nothing to
-collect, as for a zombie a foreign tracer holds, waits for the handle's next event (on macOS, or for
-a tracer's event or a re-check timer) and looks again.
-The root is then an unreaped zombie of ours, but a foreign reap between a look and its collect is
-not detected.
+The async `Child` reaps through the same handle as the sync one: its wait looks through the root's
+handle, and a look that finds nothing to collect, as for a zombie a foreign tracer holds, waits for
+the handle's next event (on macOS, or for a tracer's event or a re-check timer) and looks again.
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
@@ -436,12 +422,7 @@ stacked fix PR that resolves it.
 [tokio shutdown.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/blocking/shutdown.rs#L51-L54
 [sd-event.c]: https://github.com/systemd/systemd/blob/885fe07ee37cff7316680b5088d11081e01813b1/src/libsystemd/sd-event/sd-event.c#L3753-L3765
 [runc CHANGELOG]: https://github.com/opencontainers/runc/blob/41b74772b651b3b42a1f04a43a803db16f0e7e9b/CHANGELOG.md?plain=1#L1217-L1220
-[tokio reap.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/reap.rs#L122-L128
-[tokio pidfd_reaper.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/pidfd_reaper.rs#L203-L209
-[tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124
-[tokio runtime/process.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/process.rs#L30-L39
-[tokio unix/mod.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/mod.rs#L124
-[#174]: https://github.com/bindreams/cosca/issues/174
+[#194]: https://github.com/bindreams/cosca/issues/194
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#207]: https://github.com/bindreams/cosca/pull/207
 [#210]: https://github.com/bindreams/cosca/pull/210
