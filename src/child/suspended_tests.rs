@@ -575,7 +575,8 @@ mod on_windows {
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
         cmd.stderr(crate::Stdio::null()).expect("stderr null");
-        let child = crate::child::spawn::spawn_uncommitted(&mut cmd).expect("an ordinary spawn");
+        let child = crate::child::spawn::spawn_uncommitted(&mut cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
+            .expect("an ordinary spawn");
 
         assert_eq!(
             InitialThread::of(child.pid()).suspend_count(),

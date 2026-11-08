@@ -895,8 +895,6 @@ impl JobHandle {
         deadline: Option<std::time::Instant>,
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for a job to drain");
         // Duplicate under the lock, then wait on the duplicate. The wait can block for the
         // whole deadline, and holding the lock for that long would stall `hard_kill`/`Drop`
         // (and, with an unbounded deadline, forever). The duplicate is an independent
@@ -1059,8 +1057,6 @@ pub(crate) fn wait_drained_raw(
     use crate::containment::TreeDrain;
     use crate::error::Error;
 
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a job to drain");
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
         // Cancellation is checked BEFORE any work this round, including the very first — a
@@ -1680,8 +1676,8 @@ pub(crate) fn resume_initial_threads(
 /// initial threads.
 ///
 /// `proc_handle` must remain open for the whole call (it pins the pid against reuse during the
-/// Toolhelp thread walk in `resume_initial_threads`). Both callers hold the owning `Child` —
-/// sync `std::process::Child`, async `::tokio::process::Child` — across the call, so it does.
+/// Toolhelp thread walk in `resume_initial_threads`). Every caller holds the process it spawned
+/// across the call, so it does.
 ///
 /// Returns `Ok(Some(JobHandle))` on full success (job assigned AND resumed).
 /// Returns `Ok(None)` when job assignment fails — the caller falls back to the

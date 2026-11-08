@@ -200,8 +200,6 @@ impl Wording {
 /// foreign reap, a failure) is the result, and nothing waits again. Only after the warn does the
 /// unbounded wait run.
 pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildWaitOutcome, Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("a wait for a child's exit");
     let pid = proc.pid();
     // The state carries the bounded wait's answer to `wait` when it is the result.
     let answer = wait_warning(
@@ -229,6 +227,13 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
 /// `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`.
 pub(super) fn wait_for_status(proc: &OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
     unbounded_status(proc.pid(), wait_to_exit(proc, None)?, orphaned)
+}
+
+/// [`wait_for_status`] awaited, through [`OwnedChild::wait_async`], as the async `Child::wait` answers.
+#[cfg(feature = "tokio")]
+pub(super) async fn wait_for_status_async(proc: &mut OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
+    let outcome = proc.wait_async().await?;
+    unbounded_status(proc.pid(), outcome, orphaned)
 }
 
 /// The status an unbounded wait's `outcome` on the child `pid` answers: a deadline that passed is
@@ -309,6 +314,13 @@ impl Child {
     /// from the clock after every wake, never from a primitive's own "timed out".
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.wait_root(Some(deadline), Orphaned::Warn)
+    }
+
+    /// [`wait`](Child::wait) awaited: the async `Child`'s wait, which registers the root with the
+    /// runtime and blocks no thread.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_async(&mut self) -> Result<ExitStatus, Error> {
+        wait_for_status_async(&mut self.proc, Orphaned::Warn).await
     }
 
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is

@@ -1,6 +1,5 @@
-//! The `CreateProcessW`/wait FFI primitives of the raw backend. [`create_process`] is the sole
-//! `CreateProcessW` call site, shared with the async backend, which also reuses
-//! [`wait_handle_or_cancel`], a cancellable process wait.
+//! The `CreateProcessW` FFI primitives of the raw backend. [`create_process`] is the sole
+//! `CreateProcessW` call site.
 
 use std::io;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
@@ -16,55 +15,8 @@ use windows::Win32::System::Threading::{
 
 use crate::error::{win32_io_error, Error};
 
-/// `WaitForSingleObject`/`WaitForMultipleObjects` "no timeout" sentinel.
-#[cfg(feature = "tokio")]
-const INFINITE: u32 = 0xFFFF_FFFF;
-
-/// The outcome of [`wait_handle_or_cancel`]. `Copy`/`Eq`: the async backend clones it across the
-/// per-instance test observer channel and asserts on it.
-#[cfg(feature = "tokio")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaitOutcome {
-    /// The process handle signaled — the child exited.
-    Exited,
-    /// The cancel handle signaled first (async grace cancellation).
-    Cancelled,
-}
-
-/// Wait for `proc` to exit, or for `cancel` (if given) to signal first. With no cancel handle this
-/// is a plain blocking wait; the cancel arm backs the async backend's grace cancellation.
-#[cfg(feature = "tokio")]
-pub(crate) fn wait_handle_or_cancel(proc: HANDLE, cancel: Option<HANDLE>) -> io::Result<WaitOutcome> {
-    use windows::Win32::Foundation::{WAIT_EVENT, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
-
-    match cancel {
-        Some(cancel) => {
-            let handles = [proc, cancel];
-            // SAFETY: both handles are live for the duration of the wait.
-            let r = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-            if r == WAIT_OBJECT_0 {
-                Ok(WaitOutcome::Exited)
-            } else if r == WAIT_EVENT(WAIT_OBJECT_0.0 + 1) {
-                Ok(WaitOutcome::Cancelled)
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-        None => {
-            // SAFETY: `proc` is live for the duration of the wait.
-            let r = unsafe { WaitForSingleObject(proc, INFINITE) };
-            if r == WAIT_OBJECT_0 {
-                Ok(WaitOutcome::Exited)
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-    }
-}
-
-/// Read an exited process's status. Only valid after the handle has signaled. `pub(crate)`: the
-/// async raw backend reads its exit status through the same seam.
+/// Read an exited process's status. Only valid after the handle has signaled. `pub(crate)`:
+/// `wait::exit_only` reads a signalled handle's code through the same seam.
 pub(crate) fn exit_status(handle: HANDLE) -> io::Result<ExitStatus> {
     let mut code: u32 = 0;
     // SAFETY: `handle` is a live, owned process handle; the process has exited so its code is final.

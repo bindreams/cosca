@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::time::Duration;
 
 use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
@@ -12,7 +13,6 @@ use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
-use crate::wait::teardown_warn::Due;
 
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
 pub(super) struct FakeReach {
@@ -44,17 +44,17 @@ impl Reach for FakeReach {
 /// none; or the failure of reading the subtree that kill went through.
 type Reaches<'a> = Result<Option<&'a dyn Reach>, io::Error>;
 
-/// `look_at_front(id, reach, due)` over `fake`, and everything it logged on this thread.
+/// `look_at_front(id, reach, warn_after)` over `fake`, and everything it logged on this thread.
 fn look_logged(
     fake: &FakeProcess,
     id: Option<ProcessId>,
     reach: Reaches<'_>,
-    due: Option<Due>,
+    warn_after: Option<Duration>,
 ) -> (FrontLook, Vec<(log::Level, String)>) {
     crate::log_capture::install();
     let child = OwnedChild::new(Box::new(fake.clone()));
     let mark = crate::log_capture::mark();
-    let torn = child.look_at_front(id, reach, due);
+    let torn = child.look_at_front(id, reach, warn_after);
     (torn, crate::log_capture::records_since_on_current_thread(mark, ""))
 }
 

@@ -552,15 +552,6 @@ fn exited_held_takes_the_watch_fault_seam() {
     assert_eq!(p.looks(), 0, "the seam comes before any look");
 }
 
-/// Mutant: `exited_held` skips the bounded-section assert.
-#[cfg(feature = "tokio")]
-#[skuld::test]
-#[should_panic(expected = "would block inside an async Drop")]
-fn exited_held_refuses_inside_a_bounded_section() {
-    let _section = crate::bounded::Section::enter();
-    _ = super::exited_held(&fake([Answer::Exited]), Some(Duration::ZERO));
-}
-
 /// Mutant: `exited_held` drops the timeout, or looks twice at zero.
 #[skuld::test]
 fn exited_held_zero_is_one_look() {

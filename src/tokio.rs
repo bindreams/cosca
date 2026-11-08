@@ -25,8 +25,6 @@ pub(crate) use child::{fault::warn_slow_teardowns, slow_teardown_after};
 pub use child::{Child, SuspendedChild};
 pub use command::Command;
 pub use process::Process;
-#[cfg(all(test, unix))]
-pub(crate) use spawn::finish_elevated;
 pub use stdio::{ChildStderr, ChildStdin, ChildStdout};
 
 /// Start building an async command from an argument vector.

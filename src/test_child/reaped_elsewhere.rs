@@ -157,10 +157,6 @@ pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
     (child, pid)
 }
 
-/// Every record of the tree ops' skip for a root whose handle was forgotten unproven contains this.
-#[cfg(feature = "tokio")]
-pub(crate) const MAY_STILL_RUN: &str = "may still be running";
-
 /// A root `sh` that leaves a marker holder outside its process group, then sleeps. The holder is a
 /// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
 /// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It

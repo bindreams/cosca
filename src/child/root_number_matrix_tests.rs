@@ -1,6 +1,7 @@
 //! What the tree paths send, for every mechanism that has a root, every way the root can be reaped
 //! or its handle fail to vouch for it, and every entry point that decides on one look at the root:
-//! the tree calls, the armed drop and a failed spawn's `finish_elevated`, sync and tokio. After a reap the
+//! the tree calls, the armed drop and a failed spawn's `finish_elevated`, and the async graceful
+//! shutdown, which is the one entry point the async `Child` makes its own waits for. After a reap the
 //! root's number may name another process, so nothing may go out by it: no `killpg`, no walk from
 //! the root's pid, no signal by a bare pid. What names the tree exactly still runs: an fd marker's
 //! holders, a cgroup's kill. A `TreeWalk` checks the root after its snapshot instead, and walks
@@ -154,8 +155,7 @@ enum Reap {
     OwnUnknown,
     ForeignFree,
     ForeignReused,
-    /// [`ForeignFree`](Reap::ForeignFree), seen by a `try_wait` first: it answers `ECHILD`, and a
-    /// tokio handle forgets its backend as reaped elsewhere.
+    /// [`ForeignFree`](Reap::ForeignFree), seen by a `try_wait` first: it answers `ECHILD`.
     ForeignSeen,
 }
 
@@ -264,48 +264,20 @@ impl Reap {
         let _ = (self, script);
     }
 
-    /// Arms what makes the root read as this reap, until the guard drops. The tokio cell's looks are
-    /// forced through the `exit_only` hook, which the async child still answers by.
-    #[cfg(feature = "tokio")]
-    fn force(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
-        #[cfg(target_os = "linux")]
-        if self == Reap::Unanswered {
-            let failed = Err(std::io::Error::other("forced peek failure"));
-            return Some(Box::new(crate::wait::exit_only::seams::force_peek_once(failed)));
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use crate::os_process::child::{Foreign, PeekOutcome};
-            use crate::wait::exit_only::seams::force_every_peek;
-            match self {
-                Reap::Unanswered => {
-                    return Some(Box::new(force_every_peek(|| {
-                        Err(std::io::Error::other("forced peek failure"))
-                    })));
-                }
-                Reap::Unpinned => {
-                    return Some(Box::new(force_every_peek(|| {
-                        Ok(PeekOutcome::Foreign(Foreign::Orphaned))
-                    })));
-                }
-                _ => {}
-            }
-        }
-        self.force_reads(id)
-    }
-
     /// Arms what makes the root's number read as this reap, until the guard drops.
     fn force_reads(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
         self.read(id)
             .map(|read| Box::new(crate::child::fault::force_root_reads(read)) as Box<dyn std::any::Any>)
     }
 
-    /// Checks that the failed peek was the one look at the root the entry point took (Linux).
-    #[cfg(feature = "tokio")]
-    fn assert_forced_used(self) {
-        #[cfg(target_os = "linux")]
-        if self == Reap::Unanswered {
-            crate::wait::exit_only::seams::assert_peeks_exhausted();
+    /// Puts the real root's answers back in place of [`script`](Self::script)'s, for the cell's
+    /// cleanup, which kills and reaps the root for real.
+    fn lift(scripted: Option<&crate::os_process::fake::FakeProcess>) {
+        if let Some(fake) = scripted {
+            let lifted = fake.clone().peeks([]).reaps([]);
+            #[cfg(target_os = "macos")]
+            let lifted = lifted.no_repeats();
+            drop(lifted);
         }
     }
 
@@ -377,6 +349,17 @@ impl Api {
     const ALL: &[Api] = &[Api::Sync];
     #[cfg(feature = "tokio")]
     const ALL: &[Api] = &[Api::Sync, Api::Tokio];
+
+    /// Whether the cell exists for `op`: the async `Child` calls the sync one's entry points through,
+    /// except the graceful shutdown, whose waits it makes itself.
+    fn runs(self, op: Op) -> bool {
+        #[cfg(feature = "tokio")]
+        if self == Api::Tokio {
+            return op == Op::GracefulShutdown;
+        }
+        let _ = op;
+        true
+    }
 }
 
 /// What one cell sent, through the recording seams.
@@ -687,13 +670,8 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
         drop(forced.take());
-        if let Some(fake) = &scripted {
-            // The root's kill and reap below are the real ones.
-            let lifted = fake.clone().peeks([]).reaps([]);
-            #[cfg(target_os = "macos")]
-            let lifted = lifted.no_repeats();
-            drop(lifted);
-        }
+        // The root's kill and reap below are the real ones.
+        Reap::lift(scripted.as_ref());
     }
 
     // The tree is gone before the drop, which runs under the recorders: it sends no killpg.
@@ -770,9 +748,11 @@ fn finish_teardown(
     sent
 }
 
-/// Runs one tokio cell and returns what it sent.
+/// Runs one tokio cell, the async graceful shutdown (the one entry point whose waits are the async
+/// driver's), and returns what it sent. The other entry points are the sync `Child`'s, which the
+/// async one calls through.
 #[cfg(feature = "tokio")]
-async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
+async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
     use ::tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     mechanism.configure(cmd.as_sync_mut());
@@ -798,61 +778,21 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
             }
         }
     }
-    let mut forced = reap.force(child.id().expect(crate::test_child::IDENTITY_READ));
+    let scripted = reap.script(&mut child.inner);
+    let mut forced = reap.force_reads(child.id().expect(crate::test_child::IDENTITY_READ));
 
-    // A teardown that does not wait for the drain leaves the leaf, so the cell removes it.
-    #[cfg(target_os = "linux")]
-    let leaf = child
-        .leaf_path_for_test()
-        .map(|path| (crate::test_groups::cgroup_leaf::LeafGuard::new(path.clone()), path));
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
     let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
-    let teardown = match op {
-        Op::Kill => {
-            _ = child.kill_tree();
-            false
-        }
-        Op::Terminate => {
-            _ = child.terminate_tree();
-            false
-        }
-        Op::GracefulShutdown => {
-            _ = child.graceful_shutdown_tree(Duration::ZERO).await;
-            false
-        }
-        Op::Drop => true,
-        Op::FinishElevated => true,
-    };
-    if teardown {
-        if op == Op::Drop {
-            drop(child);
-        } else {
-            _ = crate::tokio::finish_elevated(child, failed_write());
-        }
-        reap.assert_forced_used();
-        let mut sent = recorders.sent(root, cat);
-        drop(forced);
-        drop(stdin.take());
-        let mut rest = Vec::new();
-        stderr
-            .read_to_end(&mut rest)
-            .await
-            .expect("the root and the cat are gone, closing stderr");
-        sent.survivor_ended_alone = said_eof(&rest);
-        #[cfg(target_os = "linux")]
-        if let Some((_guard, path)) = leaf {
-            crate::test_groups::cgroup_leaf::drain_and_remove_leaf(&path);
-        }
-        drop(recorders);
-        return sent;
-    }
-    reap.assert_forced_used();
+    _ = child.graceful_shutdown_tree(Duration::ZERO).await;
+    reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
         drop(forced.take());
+        // The root's kill and reap below are the real ones.
+        Reap::lift(scripted.as_ref());
     }
 
     if !reap.reaped() {
@@ -888,11 +828,11 @@ fn check_matrix(mechanisms: &[Mechanism]) {
     for &mechanism in mechanisms {
         for &reap in Reap::ALL.iter().filter(|reap| reap.applies_to(mechanism)) {
             for op in Op::ALL {
-                for &api in Api::ALL {
+                for &api in Api::ALL.iter().filter(|api| api.runs(op)) {
                     let sent = match api {
                         Api::Sync => run_sync(mechanism, reap, op),
                         #[cfg(feature = "tokio")]
-                        Api::Tokio => runtime.block_on(run_tokio(mechanism, reap, op)),
+                        Api::Tokio => runtime.block_on(run_tokio(mechanism, reap)),
                     };
                     let want = expected(mechanism, reap, op);
                     let wrong = mismatches(&want, &sent);
@@ -934,8 +874,7 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 ///
 /// Mutants: `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
 /// reused, (macOS, an fd marker) an own reap whose pid names nothing, or (macOS) a root that is
-/// `Unpinned` or `Unknown`; a tokio backend forgotten as reaped elsewhere counted as its own reap;
-/// the holders sweep skipped after a reap or for an untrusted root; an
+/// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
 /// without `anchor`.
 #[skuld::test]

@@ -203,12 +203,8 @@ fn refused(pid: u32, errno: i32) -> WalkError {
     ))
 }
 
-/// Subscribes to `pid`'s exit and signals, or the refusal a test queued for it.
+/// Subscribes to `pid`'s exit and signals.
 fn arm(kq: &Kqueue, pid: u32) -> Result<(), crate::error::Error> {
-    #[cfg(test)]
-    if let Some(errno) = seams::take_refused_registration() {
-        return Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(errno)));
-    }
     kq.subscribe(watched(pid))
 }
 
@@ -228,30 +224,6 @@ pub(crate) mod seams {
 
     thread_local! {
         static LINKS: RefCell<VecDeque<Link>> = const { RefCell::new(VecDeque::new()) };
-        static REFUSED_REGISTRATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    }
-
-    /// The next registration a walk on this thread makes on a tracer is refused with `errno`, as a
-    /// kqueue refuses one. The guard clears an unused refusal.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn refuse_next_registration(errno: i32) -> RefusedRegistration {
-        REFUSED_REGISTRATION.with(|r| r.set(Some(errno)));
-        RefusedRegistration(())
-    }
-
-    #[cfg(feature = "tokio")]
-    #[must_use = "the refusal is cleared as soon as the guard is dropped"]
-    pub(crate) struct RefusedRegistration(());
-
-    #[cfg(feature = "tokio")]
-    impl Drop for RefusedRegistration {
-        fn drop(&mut self) {
-            REFUSED_REGISTRATION.with(|r| r.set(None));
-        }
-    }
-
-    pub(super) fn take_refused_registration() -> Option<i32> {
-        REFUSED_REGISTRATION.with(std::cell::Cell::take)
     }
 
     /// While the guard lives, the walks on this thread take their `link` reads from `links`, in

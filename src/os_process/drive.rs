@@ -8,11 +8,8 @@ use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::wait::remaining;
 
-/// What the entry point does before any look: the bounded-section assert, then the watch-fault
-/// seam.
+/// What the entry point does before any look: the watch-fault seam.
 fn enter() -> Result<(), Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a process to exit");
     #[cfg(test)]
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());

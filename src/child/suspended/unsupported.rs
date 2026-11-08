@@ -21,7 +21,10 @@ pub(crate) fn spawn_frozen<T>(
 }
 
 pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
-    spawn_frozen(cmd, crate::child::spawn::spawn_uncommitted).map(|(child, wanted_kill_on_drop)| SuspendedChild {
+    spawn_frozen(cmd, |cmd| {
+        crate::child::spawn::spawn_uncommitted(cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
+    })
+    .map(|(child, wanted_kill_on_drop)| SuspendedChild {
         child,
         wanted_kill_on_drop,
     })

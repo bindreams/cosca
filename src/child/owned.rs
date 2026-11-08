@@ -189,6 +189,18 @@ impl OwnedChild {
         self.os.pid()
     }
 
+    /// A number that names this child's OS handle object and no other's, for as long as the child is
+    /// not moved out of its box: what a wait carried across an await is checked against.
+    pub(crate) fn handle_id(&self) -> usize {
+        std::ptr::from_ref::<dyn OsChild>(&*self.os).cast::<()>() as usize
+    }
+
+    /// The child as the process the OS names, to watch for its exit without reaping it.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn os_process(&self) -> &dyn crate::os_process::OsProcess {
+        &*self.os
+    }
+
     /// What a kill of the child may be refused for; see [`OsChild::kill_refusal`].
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn kill_refusal(&self) -> crate::os_process::child::KillRefusal {

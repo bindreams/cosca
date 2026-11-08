@@ -36,10 +36,6 @@ use macos as backend;
 #[cfg(windows)]
 use windows as backend;
 
-#[cfg(all(test, target_os = "linux"))]
-#[path = "exit_only/linux_tests.rs"]
-mod linux_tests;
-
 /// The second peek-and-consume every first reap on macOS is followed by; tests drive it directly.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use macos::second_reap;
@@ -135,37 +131,9 @@ pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Optio
     backend::peek_holder(target, false)
 }
 
-/// [`peek_verified`], and the holding tracer as [`peek_traced`] gives it. **macOS only.**
-#[cfg(target_os = "macos")]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only consumer is the tokio backend's reap")
-)]
-pub(crate) fn peek_verified_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
-    #[cfg(test)]
-    if let Some(forced) = seams::take_forced_peek() {
-        return forced.map(|peeked| (peeked, None));
-    }
-    backend::peek_holder(target, true)
-}
-
 /// [`peek`], then consume `target`'s exit record if it has one.
 pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     backend::try_reap(target)
-}
-
-/// Block until `target`'s exit record is visible to this process. **Linux only.** A zombie that
-/// another process traces is visible only to its tracer, so a pidfd that polls readable can still
-/// have nothing to peek at or reap; this blocks in `waitid(P_PIDFD, WEXITED | WNOWAIT)` until the
-/// tracer lets go. A stop cannot wake it: an invisible zombie means this process is not the
-/// tracer. Consumes nothing.
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only consumers are the tokio backend's")
-)]
-pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<PeekOutcome> {
-    linux::wait_visible_exit(target)
 }
 
 // The wait status of an `si_code` record =====

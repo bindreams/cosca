@@ -21,8 +21,6 @@ pub(crate) enum HolderStep {
 
 type StepHook = Box<dyn FnOnce()>;
 
-type PeekAnswer = fn() -> io::Result<PeekOutcome>;
-
 /// A registered step hook and the id its guard removes it by.
 struct RegisteredHook {
     id: u64,
@@ -32,15 +30,10 @@ struct RegisteredHook {
 
 thread_local! {
     static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<PeekOutcome>>> = const { RefCell::new(std::collections::VecDeque::new()) };
-    static FORCED_EVERY_PEEK: Cell<Option<PeekAnswer>> = const { Cell::new(None) };
     #[cfg(target_os = "macos")]
     static FORCED_EMPTY_REAP: Cell<bool> = const { Cell::new(false) };
     #[cfg(target_os = "macos")]
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
-    #[cfg(target_os = "linux")]
-    static FORCED_VISIBLE_NONE: Cell<bool> = const { Cell::new(false) };
-    #[cfg(target_os = "linux")]
-    static FORCED_VISIBLE_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
     static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
     static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
@@ -67,12 +60,6 @@ pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<PeekOutco
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
 
-#[cfg(feature = "tokio")]
-/// How many forced peeks of [`force_peeks`] this thread has not yet consumed.
-pub(crate) fn forced_peeks_left() -> usize {
-    FORCED_PEEK.with(|f| f.borrow().len())
-}
-
 /// Panics unless every peek forced on this thread was consumed: a test that counts on a specific
 /// number of looks asserts it, so a look that stopped happening fails by assertion.
 #[track_caller]
@@ -81,18 +68,8 @@ pub(crate) fn assert_peeks_exhausted() {
     assert_eq!(left, 0, "{left} forced peek(s) were never consumed");
 }
 
-/// Every peek on this thread answers `answer()`, after any of [`force_peeks`], until the guard drops:
-/// for a test that cannot count the looks a call takes.
-#[cfg(all(target_os = "macos", feature = "tokio"))]
-pub(crate) fn force_every_peek(answer: PeekAnswer) -> Forced {
-    FORCED_EVERY_PEEK.with(|f| f.set(Some(answer)));
-    Forced(|| FORCED_EVERY_PEEK.with(|f| f.set(None)))
-}
-
 pub(crate) fn take_forced_peek() -> Option<io::Result<PeekOutcome>> {
-    FORCED_PEEK
-        .with(|f| f.borrow_mut().pop_front())
-        .or_else(|| FORCED_EVERY_PEEK.with(Cell::get).map(|answer| answer()))
+    FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
 }
 
 /// The next consuming reap on this thread finds nothing to consume instead of calling the OS.
@@ -117,35 +94,6 @@ pub(crate) fn force_consuming_record_once(si_code: i32) -> Forced {
 #[cfg(target_os = "macos")]
 pub(crate) fn take_forced_si_code() -> Option<i32> {
     FORCED_SI_CODE.with(Cell::take)
-}
-
-/// The next blocking `waitid` in `wait_visible_exit` on this thread finds no record, which the
-/// kernel never answers.
-#[cfg(target_os = "linux")]
-pub(crate) fn force_visible_none_once() -> Forced {
-    FORCED_VISIBLE_NONE.with(|f| f.set(true));
-    Forced(|| FORCED_VISIBLE_NONE.with(|f| f.set(false)))
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn take_forced_visible_none() -> bool {
-    FORCED_VISIBLE_NONE.with(Cell::take)
-}
-
-/// The next blocking `waitid` in `wait_visible_exit` on this thread fails with `errno`.
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(all(feature = "tokio", debug_assertions)),
-    allow(dead_code, reason = "only the async child's debug-build tests force a failed wait")
-)]
-pub(crate) fn force_visible_errno_once(errno: i32) -> Forced {
-    FORCED_VISIBLE_ERRNO.with(|f| f.set(Some(errno)));
-    Forced(|| FORCED_VISIBLE_ERRNO.with(|f| f.set(None)))
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn take_forced_visible_errno() -> Option<i32> {
-    FORCED_VISIBLE_ERRNO.with(Cell::take)
 }
 
 /// Record that the holder is about to take `step`, and run the hook registered for it, if any.

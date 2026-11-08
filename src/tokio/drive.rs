@@ -1,7 +1,6 @@
 //! The asynchronous driver of the one wait loop, [`crate::os_process::drive`]'s: [`run`] loops "look;
 //! if not done, wait on the [`WaitFor`] the look returned, or pause for a recheck", and a wake is
-//! never the answer, the next look is. [`exited_held`] and [`exited_opening`] run it over a
-//! process's exit.
+//! never the answer, the next look is. [`exited_held`] runs it over a process's exit.
 //!
 //! The deadline differs per platform, as it does for the other async waits. Unix arms tokio's timer
 //! on [`tokio_now`]'s clock, and when the timer wins there is one final look. Windows has no
@@ -27,26 +26,11 @@ fn enter() -> Result<(), Error> {
     Ok(())
 }
 
-/// Wait until the process `open` yields has exited or `timeout` has passed, and say which.
-/// `Ok(true)` = exited, `Ok(false)` = still running after the deadline's final look; `open`
-/// yielding `None` (a process that is gone) has exited, with no wait. `None` = until exit;
+/// Wait until the open process `p` has exited or `timeout` has passed, and say which: `Ok(true)` =
+/// exited, `Ok(false)` = still running after the deadline's final look. `None` = until exit;
 /// `Some(ZERO)` = one look, no wait; a `Duration` too large for the clock is unbounded.
-/// Non-reaping. The watch-fault seam and the deadline come before `open` runs, so the timeout
-/// counts from the call and the seam holds for a gone process too.
-pub(crate) async fn exited_opening(
-    open: impl FnOnce() -> Result<Option<Box<dyn OsProcess>>, Error>,
-    timeout: Option<Duration>,
-) -> Result<bool, Error> {
-    enter()?;
-    let deadline = absolute(timeout);
-    match open()? {
-        None => Ok(true),
-        Some(process) => exited(&*process, deadline).await,
-    }
-}
-
-/// [`exited_opening`] for a process already open: `Ok(true)` = exited, `Ok(false)` = still running
-/// after the deadline's final look.
+/// Non-reaping. The watch-fault seam and the deadline come before the first look, so the timeout
+/// counts from the call.
 pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
     enter()?;
     exited(p, absolute(timeout)).await
