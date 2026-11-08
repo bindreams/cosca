@@ -119,7 +119,18 @@ impl Child {
         let crate::containment::Attached::Cgroup(leaf) = &self.attached else {
             return;
         };
-        _ = leaf.remove_else_kill();
+        // The leaf's drop makes this step again and reports what remains. A leaf that is occupied
+        // is the expected failure; one already gone is proof of a drain.
+        if let Err(e) = leaf.remove_else_kill() {
+            let occupied = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY));
+            debug_assert!(
+                occupied || crate::containment::cgroup::removed_after_drain(&e),
+                "the leaf's first rmdir failed for a reason other than an occupied leaf: {e}"
+            );
+            if !occupied {
+                log::debug!("child {}: its leaf's first rmdir failed ({e})", self.pid());
+            }
+        }
         if !self.attached.cgroup_kill_landed() {
             return;
         }

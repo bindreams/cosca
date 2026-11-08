@@ -203,10 +203,8 @@ filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]
-# `windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited`
-# (`src/tokio/child/graceful_tests.rs`) — backstops the test's own proof (the paused clock must
-# not move; see its doc). With correct code, and with the mutant that check catches, the test
-# resolves in well under a second either way, so this bound is pure headroom.
+# `windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited` backstops its own
+# paused-clock proof; this bound is headroom.
 # Under `profile.default` so `profile.ci` and local runs both inherit it — same reasoning as
 # `test_support_tests` below.
 filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited)'

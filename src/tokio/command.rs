@@ -208,7 +208,7 @@ impl Command {
     /// [`Error::Io`](crate::error::Error::Io). `spawn` itself does not need the IO driver: on a
     /// runtime built without it, the child starts, and on Unix its first wait panics if the child
     /// is still running (the wait registers it with the reactor: IO on Linux, signal on macOS), as
-    /// taking a pipe does on any platform. The child is still torn down by its drop. tokio exposes no way to preflight
+    /// taking a pipe does on any platform. tokio exposes no way to preflight
     /// the driver, so the panic cannot be turned into a typed error.
     /// `status`/`output`/`read` and the [`run`](crate::tokio::run)/[`run_line`](crate::tokio::run_line)
     /// free functions spawn eagerly, so the same applies to them.

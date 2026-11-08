@@ -107,8 +107,8 @@ async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
 }
 
 /// Linux 6.9+: the drop reads the reaped root's group through its pidfd, finds it empty and says
-/// nothing at warn. The same drop below 6.9 is `drop_after_terminate_tree_and_wait_still_warns`
-/// in `src/child/drop_reaped_tests.rs`, which refuses the flag: `tests/` cannot.
+/// nothing at warn. The library's own tests cover this, since they can refuse the flag and `tests/`
+/// cannot.
 #[cfg(feature = "tokio")]
 #[cfg(target_os = "linux")]
 #[skuld::test]

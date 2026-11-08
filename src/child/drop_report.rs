@@ -7,7 +7,6 @@
 use crate::child::owned::teardown::{Remains, TeardownOutcome};
 use crate::containment::dispatch::RootView;
 use crate::containment::DropView;
-use crate::error::Error;
 
 /// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
 /// event reported from something new.
@@ -29,8 +28,6 @@ pub(crate) enum PartKey {
 pub(crate) struct DropReport<'a> {
     /// The look at the root.
     pub(crate) view: &'a DropView,
-    /// The elevation front the event left running instead of signalling, and why.
-    pub(crate) front: Option<&'a Error>,
     /// What the drop did not do because the root's number is untrusted
     /// ([`TreeKillOutcome::left_undone`](crate::containment::dispatch::TreeKillOutcome::left_undone)).
     pub(crate) skipped: Option<String>,
@@ -46,7 +43,6 @@ impl<'a> DropReport<'a> {
     pub(crate) fn new(view: &'a DropView) -> DropReport<'a> {
         DropReport {
             view,
-            front: None,
             skipped: None,
             tree: None,
             drain: None,
@@ -91,7 +87,6 @@ impl<'a> DropReport<'a> {
 
     fn parts(&self) -> Vec<(PartKey, String)> {
         let pid = self.view.root_pid;
-        let reaped = matches!(self.view.root, RootView::Reaped);
         let mut parts: Vec<(PartKey, String)> = Vec::new();
 
         if let Some(mut state) = self.state_text(pid) {
@@ -115,16 +110,6 @@ impl<'a> DropReport<'a> {
                     "the root is already reaped, so {this} does not {action}, whose number may now belong to an \
                  unrelated process. Descendants that outlived the reaped root are not torn down by {this}; \
                  call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)"
-                ),
-            ));
-        }
-        if let Some(why) = self.front.filter(|_| !reaped) {
-            parts.push((
-                PartKey::Described,
-                format!(
-                    "{}: {why}; the front is killed through its cgroup if it is still in it; cosca does not wait for \
-                     it, and tokio reaps it once it exits",
-                    crate::elevation::front::front_named(Some(pid))
                 ),
             ));
         }

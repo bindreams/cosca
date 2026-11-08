@@ -351,9 +351,8 @@ async fn async_drop_tears_down_a_contained_tree() {
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
 // Windows Job Object. A cgroup does on Linux, and a process group on Linux 6.9+, through the root's
-// pidfd, and not below 6.9: both are the library's tests (`src/child/drop_reaped_tests.rs`,
-// `src/child/drop_group_exact_tests.rs`). This binary cannot reach the seams that release
-// the tree at the kill, and a drop that killed nothing waits for it for ever.
+// pidfd, and not below 6.9: both are the library's tests. This binary cannot reach the seams that
+// release the tree at the kill, and a drop that killed nothing waits for it for ever.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 #[skuld::test]

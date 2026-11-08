@@ -336,11 +336,7 @@ impl Child {
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
-    /// Every case of the sync [`Child::kill_tree`](crate::Child::kill_tree) is this call's: the
-    /// `TreeWalk` and fd-marker outcomes, the process-group and `hidepid` caveats, the
-    /// `cgroup.kill` fork-race fix (see [`Command::kill_on_drop`](crate::Command::kill_on_drop)), an
-    /// elevated child behind a front, a root reaped by something else, a root launchd holds or the
-    /// handle cannot vouch for, and a reap after the look. Both run the one policy.
+    /// Awaits nothing extra: the sync [`Child::kill_tree`](crate::Child::kill_tree), with every case it documents.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.inner.kill_tree()
     }
@@ -360,12 +356,7 @@ impl Child {
     /// descendant whose identity transiently fails to resolve is intentionally left
     /// unsignaled; [`kill_tree`](Child::kill_tree) is the guaranteed hard teardown.
     ///
-    /// Every case of the sync [`Child::terminate_tree`](crate::Child::terminate_tree) is this call's:
-    /// what `CTRL_BREAK` reaches on Windows and what its success does not prove, the console the
-    /// caller must hold, the refusals of live group members, the unconfirmed members of a cgroup
-    /// leaf, a root reaped by something else or one the handle cannot vouch for. The sync
-    /// [`Child`](crate::Child) and this one pin the root's pid for their whole life, so no case
-    /// differs after the root's exit has been observed.
+    /// The sync [`Child::terminate_tree`](crate::Child::terminate_tree), with every case it documents.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.inner.terminate_tree()
     }
@@ -466,7 +457,6 @@ mod child_pipe_conversion_tests;
 #[path = "child_wait_tree_tests.rs"]
 mod child_wait_tree_tests;
 
-/// Test seam: the one way a test opts in to the teardown's 1 s warn.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;

@@ -16,17 +16,12 @@ pub(crate) enum SpawnFailure {
     /// The program did not start, and cosca has proved it.
     NotStarted(Error),
     /// As [`NotStarted`](Self::NotStarted), after the spawn forked a child it held and dealt with:
-    /// `fate` is what became of it, so the leaf's abandonment, which runs after, can state it rather
-    /// than hedge.
+    /// `fate` is what became of it.
     #[cfg(target_os = "linux")]
     NotStartedWithChild {
         /// What failed.
         cause: Error,
         /// What the failed spawn did with the child it held.
-        #[cfg_attr(
-            not(feature = "tokio"),
-            allow(dead_code, reason = "only the tokio spawn's abandonment reads it")
-        )]
         fate: ChildFate,
     },
     /// The program may have started: the child reached `exec` (on Windows, `CreateProcess` or

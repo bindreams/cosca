@@ -493,8 +493,7 @@ impl Command {
     /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
     /// has a member left, and sends nothing and logs no skipped kill once it has none. A root whose
     /// handle cannot say whether it was reaped has its group killed the same way while the group has
-    /// a member. The rest of this paragraph is about other mechanisms, kernels before 6.9 and
-    /// macOS.
+    /// a member.
     ///
     /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
@@ -531,8 +530,7 @@ impl Command {
     /// principle 3 for the one early exception in a failed elevation).
     ///
     /// **Both handles block until the root is reaped and a cgroup leaf has drained**, and warn once
-    /// past 1 s. The sync [`Child`](crate::Child) does so as sync Rust normally does. The async
-    /// [`Child`](crate::tokio::Child) is the same policy, and does so on the dropping thread, which
+    /// past 1 s. The async [`Child`](crate::tokio::Child) does so on the dropping thread, which
     /// may be a tokio worker: a destructor cannot be awaited. Its root's kill bounds the wait, as
     /// does the tree's `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state)
     /// or a foreign tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows both
