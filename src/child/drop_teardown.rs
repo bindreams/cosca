@@ -106,27 +106,20 @@ impl Child {
         // The root is reaped and the event reported: what is left is the leaf's drain, which its kill
         // bounds. Dropped here, the leaf drops in place, which waits for it on this thread.
         #[cfg(target_os = "linux")]
-        self.await_leaf_drain().await;
+        self.step_leaf_and_await_drain().await;
         remains
     }
 
-    /// [`await_leaf_drain`](Self::await_leaf_drain) for a leaf whose teardown has not written its kill
-    /// yet: the write is made first.
+    /// The awaited teardown's part of the leaf's teardown: the leaf's first step, the one its drop
+    /// takes first ([`CgroupLeaf::remove_else_kill`](crate::containment::cgroup::CgroupLeaf::remove_else_kill)),
+    /// then the drain a landed kill bounds, so the leaf's drop finds it drained. A drain that cannot
+    /// be watched is left to the drop.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
-    async fn kill_leaf_and_await_drain(&self) {
-        if let crate::containment::Attached::Cgroup(leaf) = &self.attached {
-            leaf.kill_ahead_of_drop();
-        }
-        self.await_leaf_drain().await;
-    }
-
-    /// Awaits the drain of the cgroup leaf this handle holds, when a kill landed on it, so the leaf's
-    /// drop finds it drained. A drain that cannot be watched is left to the drop.
-    #[cfg(all(feature = "tokio", target_os = "linux"))]
-    async fn await_leaf_drain(&self) {
+    async fn step_leaf_and_await_drain(&self) {
         let crate::containment::Attached::Cgroup(leaf) = &self.attached else {
             return;
         };
+        _ = leaf.remove_else_kill();
         if !self.attached.cgroup_kill_landed() {
             return;
         }
@@ -313,29 +306,49 @@ impl Child {
 
     /// The second half of [`begin_leaf_and_front`](Self::begin_leaf_and_front): the leaf is dropped,
     /// which kills through it, waits for it to drain and removes it, and then the front is looked at
-    /// through [`begin_look_at_front`](OwnedChild::begin_look_at_front), which waits for it only if
-    /// its place says the kill reached it. A front is never killed through
-    /// [`tear_down`](OwnedChild::tear_down): that would orphan its program. The leaf's subtree is
-    /// captured while the leaf exists, since it places the front once the leaf is gone. How the look
-    /// went is worded by [`word_front`].
+    /// ([`look_at_front_after_leaf`](Self::look_at_front_after_leaf)).
     fn tear_leaf_down_then_look_at_front(&mut self) -> BeginOutcome<FrontLook, FrontWait> {
+        let reach = self.front_reach();
+        drop(std::mem::take(&mut self.attached));
+        self.look_at_front_after_leaf(reach)
+    }
+
+    /// The leaf's subtree, read while the leaf exists, since it places the front once the leaf is
+    /// gone. Read before the leaf's first step, which may remove it.
+    fn front_reach(&self) -> FrontReach {
+        #[cfg(target_os = "linux")]
+        {
+            match &self.attached {
+                crate::containment::Attached::Cgroup(leaf) => FrontReach(leaf.subtree().map(Some)),
+                _ => FrontReach(Ok(None)),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            FrontReach
+        }
+    }
+
+    /// The look at the front, once the leaf is gone, through
+    /// [`begin_look_at_front`](OwnedChild::begin_look_at_front), which waits for it only if its place
+    /// says the kill reached it. A front is never killed through [`tear_down`](OwnedChild::tear_down):
+    /// that would orphan its program. How the look went is worded by [`word_front`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup leaf has a subtree")
+    )]
+    fn look_at_front_after_leaf(&mut self, reach: FrontReach) -> BeginOutcome<FrontLook, FrontWait> {
         use crate::child::owned::teardown::Reach;
 
         #[cfg(target_os = "linux")]
-        let subtree = match &self.attached {
-            crate::containment::Attached::Cgroup(leaf) => leaf.subtree().map(Some),
-            _ => Ok(None),
-        };
-        drop(std::mem::take(&mut self.attached));
+        let subtree;
         #[cfg(target_os = "linux")]
-        let (subtree, unreadable) = match subtree {
-            Ok(subtree) => (subtree, None),
-            Err(e) => (None, Some(e)),
-        };
-        #[cfg(target_os = "linux")]
-        let reach = match unreadable {
-            Some(e) => Err(e),
-            None => Ok(subtree.as_ref().map(|subtree| subtree as &dyn Reach)),
+        let reach = match reach.0 {
+            Ok(read) => {
+                subtree = read;
+                Ok(subtree.as_ref().map(|subtree| subtree as &dyn Reach))
+            }
+            Err(e) => Err(e),
         };
         #[cfg(not(target_os = "linux"))]
         let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
@@ -343,6 +356,12 @@ impl Child {
             .begin_look_at_front(self.id, reach, self.policy.teardown_warn_after)
     }
 }
+
+/// What places a front once its leaf is gone: the leaf's subtree, or why it could not be read.
+#[cfg(target_os = "linux")]
+struct FrontReach(std::io::Result<Option<crate::containment::cgroup::Subtree>>);
+#[cfg(all(unix, not(target_os = "linux")))]
+struct FrontReach;
 
 /// What a teardown's report needs once its wait is over: the kill's outcome and the root's view.
 struct DropParts {
@@ -463,10 +482,13 @@ impl DropWait {
         #[cfg(unix)]
         if let RootWait::Leaf { why } = &self.wait {
             let why = why.clone();
-            // The leaf is killed through and its drain awaited, so dropping it waits for nothing.
+            // The subtree is read before the leaf's first step, which may remove it. The leaf is
+            // killed through and its drain awaited, so dropping it waits for nothing.
+            let reach = child.front_reach();
             #[cfg(target_os = "linux")]
-            child.kill_leaf_and_await_drain().await;
-            match child.tear_leaf_down_then_look_at_front() {
+            child.step_leaf_and_await_drain().await;
+            drop(std::mem::take(&mut child.attached));
+            match child.look_at_front_after_leaf(reach) {
                 BeginOutcome::Done(look) => return word_front(child.proc.pid(), &why, self.parts.disposition, look),
                 BeginOutcome::Wait(wait) => self.wait = RootWait::Front { wait, why },
             }

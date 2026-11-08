@@ -258,4 +258,22 @@ mod leaf_drain {
         assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "got {fate:?}");
         assert!(unreaped.is_some(), "a front left running is the caller's");
     }
+
+    /// A front behind a closed gate whose leaf is empty: the awaited teardown removes the leaf at
+    /// the leaf's first step and writes no kill, as the leaf's drop does.
+    ///
+    /// Mutant: the leaf's first step writes `cgroup.kill` before it tries the removal.
+    #[skuld::test]
+    async fn a_teardown_of_a_front_behind_a_closed_gate_removes_an_empty_leaf_and_writes_no_kill() {
+        crate::tokio::test_runtime::assert_current_thread();
+        let leaf = UndrainedLeaf::new("cosca-awaited-empty-leaf");
+        leaf.drain();
+        let (mut child, _stdin) = leaf.spawn();
+        child.inner.front = Some(Front::Sudo);
+
+        let (_fate, _unreaped) = child.tear_down_awaiting().await;
+
+        assert!(!leaf.fake.leaf.exists(), "the empty leaf is removed");
+        assert!(leaf.fake.kill_written().is_empty(), "an empty leaf is written no kill");
+    }
 }

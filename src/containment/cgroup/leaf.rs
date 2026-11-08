@@ -524,15 +524,20 @@ impl CgroupLeaf {
             .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()))
     }
 
-    /// The `cgroup.kill` write an armed [`Drop`] makes, made now: an awaited teardown makes it
-    /// before the drain it bounds is awaited, so the drop finds the leaf drained. A disarmed leaf,
-    /// and one its child never entered, is written nothing. A failed write is the teardown's answer,
-    /// which the drop then reports.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn kill_ahead_of_drop(&self) {
-        if self.armed.load(Ordering::Relaxed) && self.child_entered() {
-            _ = self.kill_unless_written();
+    /// The first step of the leaf's teardown, which [`Drop`] and an awaited teardown both take: the
+    /// first `rmdir`, and, if the leaf is occupied, the `cgroup.kill` write ([`kill_unless_written`])
+    /// when the child entered the leaf and it is armed. A leaf that is empty is removed and records
+    /// no kill. The awaited teardown awaits the drain this kill bounds before it drops the leaf, so
+    /// the drop finds it drained. `Err` is the `rmdir`'s failure; a failed write is the teardown's
+    /// answer, which the drop reports.
+    pub(crate) fn remove_else_kill(&self) -> io::Result<()> {
+        let first = self.rmdir_leaf();
+        if let Err(e) = &first {
+            if !removed_after_drain(e) && self.child_entered() && self.armed.load(Ordering::Relaxed) {
+                _ = self.kill_unless_written();
+            }
         }
+        first
     }
 
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
@@ -988,7 +993,7 @@ impl CgroupLeaf {
         // makes the drain wait for that process to exit, warned past 1 s. A migrant came from a
         // party that already controls the subtree (see `LeafDir::rmdir`), and the fork race is the
         // documented assumption of `Command::kill_on_drop`.
-        let Err(first) = self.rmdir_leaf() else {
+        let Err(first) = self.remove_else_kill() else {
             return;
         };
         // `Drop` kills only when the child entered the leaf and it is still armed:
