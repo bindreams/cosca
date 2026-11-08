@@ -408,7 +408,7 @@ impl Child {
         if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
             self.refuse_unpinned("kill", None)?;
         }
-        self.kill_sent_gated(gate)
+        self.kill_sent_gated("kill", gate)
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
@@ -428,9 +428,13 @@ impl Child {
     }
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's [`kill_gate`](Child::kill_gate)
-    /// read by the caller.
+    /// read by the caller. `op` names the call in the warns of a cgroup kill that left members.
     #[cfg(unix)]
-    pub(crate) fn kill_sent_gated(&self, gate: crate::elevation::front::Gate) -> Result<crate::signal::Sent, Error> {
+    pub(crate) fn kill_sent_gated(
+        &self,
+        op: &str,
+        gate: crate::elevation::front::Gate,
+    ) -> Result<crate::signal::Sent, Error> {
         use crate::elevation::front::Gate;
         match gate {
             Gate::Open => {}
@@ -449,7 +453,7 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_settled("kill", &self.tree_killed, &crate::containment::GroupRoot::none())
+                    .hard_kill_settled(op, &self.tree_killed, &crate::containment::GroupRoot::none())
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.pid(), e))?;
                 self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);

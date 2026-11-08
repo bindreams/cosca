@@ -23,6 +23,26 @@ fn take_forced_watch_error() -> Option<Error> {
     None
 }
 
+/// What `graceful_shutdown_tree`'s look at the root and cooperative signal decided: the sync
+/// twin's [`Graceful`](crate::child::Graceful) after the signal is sent.
+enum Cooperative {
+    /// The cooperative signal went out, or failed, with `result`; then the grace and the sweep, which
+    /// says `earlier` was sent before it.
+    Sent {
+        result: Result<(), Error>,
+        earlier: Option<&'static str>,
+    },
+    /// The call ends now, with this error.
+    #[cfg(unix)]
+    End(Error),
+    /// [`Graceful::RootThroughPidfd`](crate::child::Graceful::RootThroughPidfd).
+    #[cfg(target_os = "linux")]
+    RootThroughPidfd(String),
+    /// [`Graceful::HoldersOnly`](crate::child::Graceful::HoldersOnly).
+    #[cfg(target_os = "macos")]
+    HoldersOnly(String),
+}
+
 impl Child {
     /// Send the child its cooperative shutdown signal — a request to exit, not an order.
     /// Signal-only: does not wait or reap.
@@ -171,7 +191,7 @@ impl Child {
             {
                 self.inner.refuse_unpinned("kill", Some("the SIGTERM"))?;
                 let gate = self.inner.kill_gate();
-                self.inner.kill_sent_gated(gate)?;
+                self.inner.kill_sent_gated("graceful_shutdown", gate)?;
             }
             #[cfg(not(unix))]
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
@@ -330,50 +350,22 @@ impl Child {
             "graceful_shutdown_tree",
             None,
         );
-        // This handle's reaps are held off from the look until the `SIGTERM` is sent, as in the sync
-        // twin. The hold is a std lock: nothing in this block awaits, and the paths that send nothing
-        // by the root's number leave it before they wait the grace.
-        let (term_result, earlier) = {
+        #[cfg(unix)]
+        let decision = self.signal_tree_cooperatively(&call);
+        #[cfg(not(unix))]
+        let decision = self.signal_tree_cooperatively();
+        let (term_result, earlier) = match decision {
+            Cooperative::Sent { result, earlier } => (result, earlier),
             #[cfg(unix)]
-            let held = self.inner.proc.hold(self.pid());
-            #[cfg(unix)]
-            let group = held.group();
-            #[cfg(not(unix))]
-            let group = crate::containment::GroupRoot::none();
-            #[cfg(unix)]
-            let (decided, earlier) = match call.graceful(|| held.state(), &group) {
-                crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
-                crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
-                crate::child::Graceful::End(e) => return Err(e),
-                #[cfg(target_os = "linux")]
-                crate::child::Graceful::RootThroughPidfd(why) => {
-                    drop(held);
-                    return Err(self.shut_down_root_through_pidfd(&call, grace, &why).await);
-                }
-                #[cfg(target_os = "macos")]
-                crate::child::Graceful::HoldersOnly(why) => {
-                    drop(held);
-                    return Err(self.shut_down_holders_only(&call, grace, &why).await);
-                }
-            };
-            #[cfg(not(unix))]
-            let earlier = Some("the SIGTERM");
-            let term_signal = || {
-                #[cfg(unix)]
-                if let Some(result) = decided {
-                    return result;
-                }
-                self.inner.terminate_tree_unchecked(&group)
-            };
-
-            #[cfg(test)]
-            let term_result = match fault::take_force_terminate() {
-                fault::Forced::None => term_signal(),
-                kind => Err(fault::forced_terminate_error(kind)),
-            };
-            #[cfg(not(test))]
-            let term_result = term_signal();
-            (term_result, earlier)
+            Cooperative::End(e) => return Err(e),
+            #[cfg(target_os = "linux")]
+            Cooperative::RootThroughPidfd(why) => {
+                return Err(self.shut_down_root_through_pidfd(&call, grace, &why).await);
+            }
+            #[cfg(target_os = "macos")]
+            Cooperative::HoldersOnly(why) => {
+                return Err(self.shut_down_holders_only(&call, grace, &why).await);
+            }
         };
 
         // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
@@ -500,6 +492,48 @@ impl Child {
             );
         }
         Ok(status)
+    }
+
+    /// `graceful_shutdown_tree`'s look at the root and its cooperative signal, as the sync twin
+    /// makes them. This handle's reaps are held off from the look until the `SIGTERM` is sent. The
+    /// hold is a std lock, and the group borrows it, so neither lives in the future's state: this is
+    /// a plain `fn`, and the paths that send nothing by the root's number leave the hold here,
+    /// before the caller waits the grace.
+    fn signal_tree_cooperatively(&self, #[cfg(unix)] call: &crate::child::TreeCall<'_>) -> Cooperative {
+        #[cfg(unix)]
+        let held = self.inner.proc.hold(self.pid());
+        #[cfg(unix)]
+        let group = held.group();
+        #[cfg(not(unix))]
+        let group = crate::containment::GroupRoot::none();
+        #[cfg(unix)]
+        let (decided, earlier) = match call.graceful(|| held.state(), &group) {
+            crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
+            crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
+            crate::child::Graceful::End(e) => return Cooperative::End(e),
+            #[cfg(target_os = "linux")]
+            crate::child::Graceful::RootThroughPidfd(why) => return Cooperative::RootThroughPidfd(why),
+            #[cfg(target_os = "macos")]
+            crate::child::Graceful::HoldersOnly(why) => return Cooperative::HoldersOnly(why),
+        };
+        #[cfg(not(unix))]
+        let earlier = Some("the SIGTERM");
+        let term_signal = || {
+            #[cfg(unix)]
+            if let Some(result) = decided {
+                return result;
+            }
+            self.inner.terminate_tree_unchecked(&group)
+        };
+
+        #[cfg(test)]
+        let result = match fault::take_force_terminate() {
+            fault::Forced::None => term_signal(),
+            kind => Err(fault::forced_terminate_error(kind)),
+        };
+        #[cfg(not(test))]
+        let result = term_signal();
+        Cooperative::Sent { result, earlier }
     }
 
     /// [`Graceful::RootThroughPidfd`](crate::child::Graceful::RootThroughPidfd), `why` its reason.

@@ -27,6 +27,19 @@ fn run_to_completion_futures_are_send() {
     assert_send(cmd.read());
 }
 
+/// The graceful futures are `Send`, so a caller can `tokio::spawn` them: neither the look at the
+/// root's group nor the hold that keeps its reaps off is in the future's state.
+///
+/// Mutant: a std lock guard held across the future's awaits (fails to compile).
+#[skuld::test]
+async fn graceful_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    let grace = std::time::Duration::ZERO;
+    let (mut child, _stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    assert_send(child.graceful_shutdown(grace));
+    assert_send(child.graceful_shutdown_tree(grace));
+}
+
 #[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
     let mut c = crate::test_child::tokio_command(Console::Hidden);

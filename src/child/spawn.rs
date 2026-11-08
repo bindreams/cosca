@@ -193,7 +193,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 tree_failure.as_deref(),
             )),
             crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-            gate => child.kill_sent_gated(gate),
+            gate => child.kill_sent_gated("kill", gate),
         };
         match root {
             Ok(crate::signal::Sent::Gone) if exited_front => (
