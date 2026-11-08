@@ -753,13 +753,16 @@ impl TeardownWait {
     /// What the root teardown's `settlement`, of the wait on `child`, says of it: its fate and its
     /// clause, led by the subject.
     fn outcome(&self, child: &OwnedChild, settlement: &Settlement) -> TeardownOutcome {
+        debug_assert_eq!(
+            self.pending.handle,
+            child.handle_id(),
+            "a wait is worded for the child it was settled on"
+        );
         #[cfg(test)]
         if let Some(status) = settlement.status() {
             // An unknown pid records as 0.
             crate::child::spawn::fault::record_teardown_reap(child.pid().unwrap_or(0), status);
         }
-        #[cfg(not(test))]
-        let _ = child;
         TeardownOutcome::of_settlement(settlement, self.id, &self.subject, None, self.disposition)
     }
 }
