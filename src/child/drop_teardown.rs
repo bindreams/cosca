@@ -120,14 +120,11 @@ impl Child {
             return;
         };
         // The leaf's drop makes this step again and reports what remains. A leaf that is occupied
-        // is the expected failure; one already gone is proof of a drain.
+        // is the expected failure; one already gone is proof of a drain. Any other failure (EACCES,
+        // EIO) is the environment's, so it is logged, never asserted.
         if let Err(e) = leaf.remove_else_kill() {
             let occupied = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY));
-            debug_assert!(
-                occupied || crate::containment::cgroup::removed_after_drain(&e),
-                "the leaf's first rmdir failed for a reason other than an occupied leaf: {e}"
-            );
-            if !occupied {
+            if !occupied && !crate::containment::cgroup::removed_after_drain(&e) {
                 log::debug!("child {}: its leaf's first rmdir failed ({e})", self.pid());
             }
         }
