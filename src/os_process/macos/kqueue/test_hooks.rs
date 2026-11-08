@@ -11,7 +11,6 @@ type EveryRoundHook = Box<dyn FnMut(u32)>;
 thread_local! {
     static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
-    static BACKOFF_TIMERS: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
     static FORCE_ESRCH_REGISTRATION: Cell<bool> = const { Cell::new(false) };
     static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
@@ -38,17 +37,6 @@ pub(crate) fn record_event(filter: i16, fflags: u32) {
 /// Every event the `await_reapable` loop got back on this thread since the last call, in order.
 pub(crate) fn take_events() -> Vec<(i16, u32)> {
     AWAIT_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
-}
-
-/// Record the interval one `arm_backoff_timer` call armed.
-pub(crate) fn record_backoff_timer(interval: Duration) {
-    BACKOFF_TIMERS.with(|t| t.borrow_mut().push(interval));
-}
-
-/// The interval of each backoff timer armed on this thread since the last call, in order.
-#[cfg(feature = "tokio")]
-pub(crate) fn take_backoff_timers() -> Vec<Duration> {
-    BACKOFF_TIMERS.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
 /// The next `await_reapable` on this thread sees its `EVFILT_PROC` registration answered `ESRCH`

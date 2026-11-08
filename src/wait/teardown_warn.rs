@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 /// When a teardown's warn is due, and how long into the wait that is.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Due {
     pub(crate) until: Instant,
     pub(crate) after: Duration,
@@ -13,10 +13,6 @@ pub(crate) struct Due {
 
 impl Due {
     /// Due `after` from now, if there is a threshold.
-    #[cfg_attr(
-        not(any(test, feature = "tokio")),
-        allow(dead_code, reason = "only an async spawn's teardown has a threshold to start from")
-    )]
     pub(crate) fn in_(after: Option<Duration>) -> Option<Due> {
         after.map(|after| Due {
             until: crate::wait::now() + after,
@@ -40,41 +36,11 @@ pub(crate) fn wait_warning<S, R>(
     wait: impl FnOnce(S) -> R,
 ) -> R {
     if let Some(due) = due {
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("a teardown's warned wait");
         if !ended_by(&mut state, due.until) {
             warn(due.after);
         }
     }
     wait(state)
-}
-
-/// For [`wait_warning`]: whether the process `handle` names has exited (the handle is signalled) by
-/// `until`. Any answer but a timeout, an error included, is `true`, for the wait to find.
-#[cfg(all(windows, feature = "tokio"))]
-pub(crate) fn handle_signaled_by(handle: windows::Win32::Foundation::HANDLE, until: Instant) -> bool {
-    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::WaitForSingleObject;
-
-    let mut failed = None;
-    // SAFETY: the caller's live process handle, kept open across the call.
-    let waited = crate::wait::wait_until(Some(until), |ms| {
-        let waited = unsafe { WaitForSingleObject(handle, ms) };
-        if waited == WAIT_FAILED {
-            failed = Some(std::io::Error::last_os_error());
-        }
-        waited
-    });
-    #[cfg(test)]
-    let waited = if crate::child::spawn::fault::take_late_exit() {
-        WAIT_TIMEOUT
-    } else {
-        waited
-    };
-    if let Some(e) = failed {
-        log::debug!("a look at a killed child's exit failed ({e}); the wait that follows decides");
-    }
-    waited != WAIT_TIMEOUT
 }
 
 #[cfg(test)]

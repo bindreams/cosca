@@ -11,11 +11,13 @@ nextest-version = { required = "0.9.151" }
 filter = 'test(/(^|::)death_watch_/) | test(/unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
-# The pidfd handshake's tests, sync and tokio: a side that never sees EOF, or a verdict hold nobody
-# opens, hangs the spawn forever, so a regression must end as a timeout, not a stuck job. With
-# correct code each finishes in milliseconds; this bound is pure headroom for a loaded runner.
+# The pidfd handshake's tests, and the slow-teardown rows (the sync handshake's and the async
+# spawn's, under a foreign tracer): a side that never sees EOF, or a verdict hold nobody opens,
+# hangs the spawn forever, and a teardown that does not warn waits for a tracer that lets go only
+# after the warn, so a regression must end as a timeout, not a stuck job. With correct code each
+# finishes in milliseconds; this bound is pure headroom for a loaded runner.
 [[profile.default.overrides]]
-filter = 'test(/::pidfd_handshake_tests::/) | test(/tokio::spawn::pidfd_tests::/)'
+filter = 'test(/::pidfd_handshake_tests::/) | test(/::slow_teardown_tests::/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 # cosca-path's FIFO test: `same_file` that opens a FIFO blocks until a writer appears, so a regression
@@ -201,13 +203,11 @@ filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
 
 [[profile.default.overrides]]
-# `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`
-# (`src/tokio/child/graceful_tests.rs`) — backstops the test's own proof (see its doc for the
-# two checks and what each catches). With correct code, and with either mutant these checks
-# catch, the test resolves in well under a second either way, so this bound is pure headroom.
+# `windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited` backstops its own
+# paused-clock proof; this bound is headroom.
 # Under `profile.default` so `profile.ci` and local runs both inherit it — same reasoning as
 # `test_support_tests` below.
-filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited)'
 slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
@@ -262,9 +262,12 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
 # (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way, and
-# the hand-back tests hold the release of a child the call under test might wrongly wait for. Under
-# `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/)'
+# the hand-back tests hold the release of a child the call under test might wrongly wait for. The
+# `*_warns_past_*threshold` rows (the `owned_tests` ones, and the front and held-teardown ones that
+# live elsewhere) script a wait that blocks once, which the test ends; a teardown that is not given
+# its policy's threshold blocks once more and nothing wakes it, so the regression they guard is a
+# hang, not a failed assertion. Under `profile.default` so `profile.ci` and local runs inherit it.
+filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/) | test(/_warns_past_(its_(spawns|policys)|the)_threshold/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]

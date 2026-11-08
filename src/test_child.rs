@@ -37,7 +37,7 @@ pub(crate) mod foreign;
 #[cfg(unix)]
 pub(crate) mod reaped_elsewhere;
 
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tokio")))]
+#[cfg(target_os = "linux")]
 pub(crate) mod member;
 
 pub(crate) mod over_fake;
@@ -428,7 +428,7 @@ pub(crate) fn tear_down_held_holding<R>(
         id,
         subtree,
         disposition: crate::child::owned::teardown::Disposition::HandBack,
-        due: None,
+        policy: crate::child::spawn::policy::SpawnPolicy::SYNC,
     };
     let (error, fate, unreaped) = crate::child::spawn::held_teardown::tear_down_held(child, how, why, error);
     (error, fate, HandedBack::new(release, unreaped))
@@ -482,24 +482,6 @@ pub(crate) fn held_contained_blocker_without_cgroup_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     held_blocker_async(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup_async(cmd))
-}
-
-/// Async twin of [`held_treewalk_blocker`].
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-pub(crate) fn held_treewalk_blocker_async() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
-        cmd.contain_with(crate::ContainMode::TreeWalk);
-    })
-}
-
-/// Async twin of [`held_treewalk_blocker_leaving`].
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-pub(crate) fn held_treewalk_blocker_leaving_async(
-    left: crate::containment::treewalk::fault::LeftBehind,
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    let blocker = held_treewalk_blocker_async();
-    crate::containment::treewalk::fault::force_incomplete_once(left);
-    blocker
 }
 
 #[cfg(feature = "tokio")]
@@ -1753,9 +1735,9 @@ fn fixture_survives_group_signal() {
 
 /// The fully-qualified libtest path of [`fixture_registers_then_blocks`], for callers that
 /// re-exec this binary against it directly (`current_exe() --exact <this>`).
-// Gated with its consumers: the sync caller uses it only under `cfg(windows)`, the other two are
-// behind the `tokio` feature, so a default-feature Unix build has none and `-D warnings` rejects it.
-#[cfg(any(windows, feature = "tokio"))]
+// Gated with its consumers, which are Windows' `CTRL_BREAK` tests: a Unix build has none and
+// `-D warnings` rejects it.
+#[cfg(windows)]
 pub(crate) const FIXTURE_REGISTERS_THEN_BLOCKS_TEST: &str = "test_child::fixture_registers_then_blocks";
 
 /// The env var carrying the `127.0.0.1:<port>` address [`fixture_registers_then_blocks`] tags.
@@ -1765,7 +1747,7 @@ pub(crate) const FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV: &str = "COSCA_FIXTURE_R
 
 /// Bind a rendezvous listener for [`fixture_registers_then_blocks`]; returns it and its
 /// `127.0.0.1:<port>` address.
-#[cfg(any(windows, feature = "tokio"))]
+#[cfg(windows)]
 pub(crate) fn registration_rendezvous() -> (std::net::TcpListener, String) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
     let addr = listener.local_addr().expect("local_addr").to_string();

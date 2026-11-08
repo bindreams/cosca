@@ -21,8 +21,6 @@ use crate::os_process::child::{Foreign, PeekOutcome};
 use crate::os_process::fake::FakeProcess;
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
-#[cfg(feature = "tokio")]
-use crate::wait::exit_only::seams::{force_peek_once, Forced};
 use crate::ContainMode;
 
 fn blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
@@ -107,13 +105,6 @@ pub(crate) enum Untrusted {
 pub(crate) const BOTH: [Untrusted; 2] = [Untrusted::Unpinned, Untrusted::Unknown];
 
 impl Untrusted {
-    /// The next peek on this thread reads as this state: the async child's, which still answers
-    /// through the `exit_only` hook.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn peek(self) -> Forced {
-        force_peek_once(self.result())
-    }
-
     /// The next peek of `child`'s root reads as this state.
     pub(crate) fn script(self, child: &mut crate::Child) -> FakeProcess {
         child.proc.script_over(|f| f.peeks([self.result()]))
@@ -133,12 +124,6 @@ impl Untrusted {
             Untrusted::Unknown => "RootState::Unknown",
         }
     }
-}
-
-/// [`Untrusted::peek`] for [`Untrusted::Unpinned`].
-#[cfg(feature = "tokio")]
-pub(crate) fn orphaned() -> Forced {
-    Untrusted::Unpinned.peek()
 }
 
 /// [`Untrusted::script`] for [`Untrusted::Unpinned`].

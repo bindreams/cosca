@@ -145,3 +145,41 @@ fn child_kill_error_keeps_the_raw_errno() {
     );
     assert_eq!(fake.signal_calls(), [crate::signal::Sig::Kill]);
 }
+
+/// The parent's end of a piped stdout nobody took is closed by the time `drop` returns, for the
+/// sync `Child` and the async one it holds. Runs alone, so no other thread can take the descriptor
+/// number in between.
+///
+/// Mutant: the drop leaves the untaken pipe open (handed to a thread, or forgotten).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn drop_closes_the_childs_untaken_stdout() {
+    use std::os::fd::AsRawFd as _;
+
+    if !crate::containment::cgroup::test_support::alone(crate::test_child::fixture_path!(
+        drop_closes_the_childs_untaken_stdout
+    )) {
+        return;
+    }
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe_out()).expect("set stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(child.stdin().expect("piped stdin"));
+    let Some(crate::pipe::ParentEnd::Reader(stdout)) = child.pipes.get(&crate::stdio::Fd::STDOUT) else {
+        panic!("piped stdout");
+    };
+    let stdout = stdout.as_raw_fd();
+    // SAFETY: `fcntl(F_GETFD)` reads a flag and changes nothing.
+    assert_ne!(
+        unsafe { libc::fcntl(stdout, libc::F_GETFD) },
+        -1,
+        "open while the child lives"
+    );
+    drop(child);
+    // SAFETY: as above.
+    let after = unsafe { libc::fcntl(stdout, libc::F_GETFD) };
+    assert_eq!(after, -1, "the drop must close the child's untaken stdout");
+    teardown.assert_killed();
+}

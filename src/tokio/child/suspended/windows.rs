@@ -19,7 +19,7 @@ impl SuspendedChild {
     /// `false` if the child is not job-contained; panics if the job's limits cannot be queried.
     #[doc(hidden)]
     pub fn test_job_kills_on_close(&self) -> bool {
-        crate::containment::windows::job_kills_on_close(&self.child.os.attached)
+        crate::containment::windows::job_kills_on_close(&self.child.inner.attached)
     }
 
     /// The containment the child has (and keeps after `resume`).
@@ -38,12 +38,6 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
 }
 
 /// Resume the child's initial thread, which must have been suspended exactly once.
-///
-/// The backend holds the process handle until `resume`: nothing can poll or reap an unresumed
-/// child, so a missing handle is a broken invariant, not a runtime failure.
 pub(super) fn release(child: &Child) -> std::io::Result<()> {
-    let handle = child
-        .process_handle()
-        .expect("a frozen child's process handle is held until it is resumed");
-    resume_initial_threads(handle, SuspendCount::ExactlyOne)
+    resume_initial_threads(child.inner.process_handle(), SuspendCount::ExactlyOne)
 }

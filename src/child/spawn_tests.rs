@@ -8,6 +8,7 @@
 
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
+use super::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
@@ -280,16 +281,57 @@ fn attach_failure_reaps_the_spawned_child() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_child_whose_teardown_kill_is_refused_is_handed_back(#[fixture(setuid)] _group: &Group) {
+    let arms: [Arm; 2] = [
+        (fault::set_force_identity_vanished, false),
+        (fault::set_force_attach_failure, true),
+    ];
+    assert_a_refused_teardown_kill_is_handed_back(None, &arms);
+}
+
+/// As [`a_child_whose_teardown_kill_is_refused_is_handed_back`], for a child contained by a cgroup
+/// leaf that did not take it (its placement write is made to fail): the child is outside the leaf,
+/// so the leaf's kill cannot end it, and its process group's kill is refused too. Only the identity
+/// read arm is forced: it reads none, so the child is handed back with no identity.
+///
+/// Needs both groups: the delegated cgroup, and a caller that is not root (the setuid helper
+/// refuses a kill only from one), which only the CI step for the two groups gives.
+///
+/// Mutants: a refused kill of a child outside its leaf reports the child reaped, or leaves it
+/// running without handing it back.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_a_child_outside_its_leaf_whose_teardown_kill_is_refused_is_handed_back(
+    #[fixture(cgroup)] _cgroup: &Group,
+    #[fixture(setuid)] _setuid: &Group,
+) {
+    let arms: [Arm; 1] = [(fault::set_force_identity_vanished, false)];
+    assert_a_refused_teardown_kill_is_handed_back(Some(super::identity_group_tests::Container::LeafNotTaken), &arms);
+}
+
+/// A failure to force on a spawn, and whether the spawn read an identity before it.
+#[cfg(target_os = "linux")]
+type Arm = (fn(bool), bool);
+
+/// The body of the tests above: for each of `arms` (the failure to force, and whether the spawn
+/// read an identity before it), spawns the setuid-root helper contained by `container` (none: the
+/// command's default) and checks that the refused teardown kill hands the child back, running.
+#[cfg(target_os = "linux")]
+fn assert_a_refused_teardown_kill_is_handed_back(
+    container: Option<super::identity_group_tests::Container>,
+    arms: &[Arm],
+) {
     use crate::child::spawn::fault::SpawnPoint;
     use crate::test_child::expect_handed_back;
 
     crate::log_capture::install();
-    let arms: [(fn(bool), bool); 2] = [
-        (fault::set_force_identity_vanished, false),
-        (fault::set_force_attach_failure, true),
-    ];
-    for (force_arm, identified) in arms {
+    for &(force_arm, identified) in arms {
         let (mut cmd, writer, until_root) = crate::test_privilege::setuid_blocker_for_a_failing_spawn();
+        // Ends the forced placement failure, which only the forked child takes, when the spawn is done.
+        let _placement = container.map(|container| {
+            let (mode, placement) = container.arm();
+            cmd.contain_with(mode);
+            placement
+        });
         // Before the identity read, once the spawn has returned: the helper has become root.
         let _root = fault::set_at(SpawnPoint::BeforeIdentity, until_root);
         let mark = crate::log_capture::mark();
@@ -325,7 +367,7 @@ fn spawn_unelevated_runs_a_plain_child() {
     #[cfg(windows)]
     c.args(["cmd", "/C", "exit 0"]);
     let kill_on_drop = c.kill_on_drop_flag();
-    let child = super::spawn_unelevated(&mut c, kill_on_drop).expect("spawn");
+    let child = super::spawn_unelevated(&mut c, kill_on_drop, SpawnPolicy::SYNC).expect("spawn");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -641,7 +683,7 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         attach_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
-        let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+        let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
         if commit {
             child = child.commit_kill_on_drop().expect("commit");
         }
@@ -676,7 +718,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm().expect("disarm");
 
@@ -747,7 +789,7 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
 
     let mark = crate::log_capture::mark();
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -782,7 +824,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm().expect("disarm");
 
@@ -1061,7 +1103,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1097,7 +1139,7 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1137,7 +1179,7 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
     let mark = crate::log_capture::mark();
     let unsure = child

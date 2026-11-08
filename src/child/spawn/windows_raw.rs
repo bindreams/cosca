@@ -39,9 +39,6 @@
 //!   non-inheritable here, duplicates them into a helper process, and creates the child with
 //!   that helper as its parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
 //!
-//! `windows_raw` here is `crate::child::spawn::windows_raw`; the async backend
-//! `crate::tokio::spawn::windows_raw` has the same properties.
-//!
 //! [`CreateProcessW`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 //! [Handle Inheritance]: https://learn.microsoft.com/en-us/windows/win32/sysinfo/handle-inheritance
 //! [`UpdateProcThreadAttribute`]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
@@ -67,11 +64,6 @@ mod proc;
 
 // The exit-status reader, which `wait::exit_only` reads a signalled handle's code through too.
 pub(crate) use proc::exit_status;
-// Additional seams the async raw backend reuses: the cancellable handle wait + its
-// outcome. The sync path uses these only inside `proc`, so the re-export is tokio-only. (`create_process` is reached through the shared `spawn_step`, so it
-// needs no re-export.)
-#[cfg(feature = "tokio")]
-pub(crate) use proc::{wait_handle_or_cancel, WaitOutcome};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -89,6 +81,7 @@ use windows::Win32::System::Threading::{
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
     Diagnosis, ParentStd, SpawnFailure,
@@ -108,6 +101,7 @@ pub(crate) fn spawn_raw(
     cmd: &Command,
     fds: BTreeMap<Fd, ResolvedStdio>,
     kill_on_drop: bool,
+    policy: SpawnPolicy,
 ) -> Result<Child, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
@@ -227,7 +221,7 @@ pub(crate) fn spawn_raw(
                 None,
                 Past::Clean,
                 Disposition::HandBack,
-                None,
+                policy,
                 &mut Diagnosis::default(),
             );
             return Err(SpawnFailure::started(
@@ -246,14 +240,21 @@ pub(crate) fn spawn_raw(
                 id_read,
                 Past::Clean,
                 Disposition::HandBack,
-                None,
+                policy,
                 &mut Diagnosis::default(),
             );
             return Err(SpawnFailure::started(e, fate, unreaped));
         }
     };
 
-    Ok(Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment))
+    Ok(Child::from_parts(
+        owned,
+        id_read,
+        parent_ends,
+        kill_on_drop,
+        attachment,
+        policy,
+    ))
 }
 
 /// Reject a descriptor set whose dense MSVCRT fd-table would exceed the WORD-sized `cbReserved2`
@@ -474,7 +475,7 @@ pub(crate) fn target_with(
 ///
 /// It earns its place because the primary gate is an argument rather than a check: `program_token`
 /// yielding `Some` for every `CommandInput` arm that `raw_program_and_line` rejects is a
-/// *pairwise agreement* between two functions, duplicated across the sync and async backends, and
+/// *pairwise agreement* between two functions, and
 /// the `CommandLine` arm re-derives `first_token_wide` independently rather than reusing
 /// `program_token`. A fourth `CommandInput` variant, or a change to `first_token_wide`'s
 /// empty-input contract, would break that agreement — and this is what stops the break becoming

@@ -9,28 +9,32 @@
 
 use std::io::{ErrorKind, Read, Write};
 
-use crate::containment::Containment;
-use crate::identity::ProcessId;
+use crate::child::owned::OwnedChild;
+use crate::child::spawn::policy::SpawnPolicy;
+use crate::containment::{Attached, Attachment, Containment};
+use crate::os_process::fake::FakeProcess;
 use crate::pipe::ParentEnd;
 use crate::stdio::Fd;
 
-use super::{Child, OsResources};
+use super::Child;
 
-/// A `Child` with no process, built as a struct literal (not through `spawn`) so the tests need no
-/// child; its `Drop` returns at once (`kill_on_drop: false`, nothing attached).
+/// A `Child` over a process that is only a stated pid, built through `from_parts` (not through
+/// `spawn`) so the tests need no child; its `Drop` returns at once (`kill_on_drop: false`, nothing
+/// attached).
 fn a_child_without_a_process() -> Child {
-    Child {
-        os: OsResources::default(),
-        id: Some(ProcessId::from_parts_for_test(1, crate::identity::Key::for_test(0))),
-        kill_on_drop: false,
+    let attachment = Attachment {
         containment: Containment::None,
-        tree_killed: Default::default(),
+        attached: Attached::None,
         graceful: crate::graceful::GracefulMechanism::Process,
-        elevation: None,
-        front: None,
-        #[cfg(unix)]
-        reported: Vec::new(),
-    }
+    };
+    Child::from_sync(crate::Child::from_parts(
+        OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(1))),
+        None,
+        Default::default(),
+        false,
+        attachment,
+        SpawnPolicy::SYNC,
+    ))
 }
 
 /// What proves a refused end closed: run after the taker returned.
@@ -163,11 +167,11 @@ async fn fd_read_end_warns_returns_none_and_closes_the_end_on_a_failed_conversio
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_reader();
-    child.os.pipes.insert(Fd::from(91), end);
+    child.inner.pipes.insert(Fd::from(91), end);
     assert!(child.fd_read_end(91).is_none());
     assert_one_warn_starting_with(mark, "fd 91 read end dropped", "fd 91 read end dropped");
     assert!(
-        !child.os.pipes.contains_key(&Fd::from(91)),
+        !child.inner.pipes.contains_key(&Fd::from(91)),
         "the failed end must leave the map"
     );
     closed();
@@ -182,11 +186,11 @@ async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversi
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_writer();
-    child.os.pipes.insert(Fd::from(92), end);
+    child.inner.pipes.insert(Fd::from(92), end);
     assert!(child.fd_write_end(92).is_none());
     assert_one_warn_starting_with(mark, "fd 92 write end dropped", "fd 92 write end dropped");
     assert!(
-        !child.os.pipes.contains_key(&Fd::from(92)),
+        !child.inner.pipes.contains_key(&Fd::from(92)),
         "the failed end must leave the map"
     );
     closed();
@@ -201,11 +205,11 @@ async fn stdout_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_reader();
-    child.os.pipes.insert(Fd::STDOUT, end);
+    child.inner.pipes.insert(Fd::STDOUT, end);
     assert!(child.stdout().is_none());
     assert_one_warn_starting_with(mark, "stdout read end dropped", "stdout read end dropped");
     assert!(
-        !child.os.pipes.contains_key(&Fd::STDOUT),
+        !child.inner.pipes.contains_key(&Fd::STDOUT),
         "the failed end must leave the map"
     );
     closed();
@@ -223,7 +227,7 @@ async fn communicate_returns_the_error_of_a_stdin_the_reactor_refuses() {
     for input in [Some(b"x".to_vec()), None] {
         let mut child = a_child_without_a_process();
         let (end, closed) = refused_writer();
-        child.os.pipes.insert(Fd::STDIN, end);
+        child.inner.pipes.insert(Fd::STDIN, end);
         let error = child
             .communicate(input.clone())
             .await
@@ -232,6 +236,30 @@ async fn communicate_returns_the_error_of_a_stdin_the_reactor_refuses() {
             panic!("not an I/O error: {error:?}")
         };
         assert!(!error.to_string().contains("not piped"), "{error}");
+        closed();
+    }
+}
+
+/// `communicate` on a stdout or a stderr the reactor refuses fails with the registration's error,
+/// not with output that reads as empty. The refused end is closed.
+///
+/// Mutant: the refusal is logged and the end taken as absent, so `communicate` succeeds with empty
+/// output.
+#[skuld::test]
+async fn communicate_returns_the_error_of_an_output_the_reactor_refuses() {
+    crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
+    let _no_fork = crate::child::spawn::spawn_lock();
+    for fd in [Fd::STDOUT, Fd::STDERR] {
+        let mut child = a_child_without_a_process();
+        let (end, closed) = refused_reader();
+        child.inner.pipes.insert(fd, end);
+        let error = child.communicate(None).await.expect_err("the output is refused");
+        assert!(matches!(error, crate::error::Error::Io(_)), "{fd}: {error:?}");
+        assert!(
+            !child.inner.pipes.contains_key(&fd),
+            "{fd}: the refused end must leave the map"
+        );
         closed();
     }
 }
@@ -245,11 +273,11 @@ async fn stdin_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let mark = crate::log_capture::mark();
     let mut child = a_child_without_a_process();
     let (end, closed) = refused_writer();
-    child.os.pipes.insert(Fd::STDIN, end);
+    child.inner.pipes.insert(Fd::STDIN, end);
     assert!(child.stdin().is_none());
     assert_one_warn_starting_with(mark, "stdin write end dropped", "stdin write end dropped");
     assert!(
-        !child.os.pipes.contains_key(&Fd::STDIN),
+        !child.inner.pipes.contains_key(&Fd::STDIN),
         "the failed end must leave the map"
     );
     closed();

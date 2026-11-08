@@ -225,6 +225,7 @@ use windows::Win32::UI::Shell::{
 };
 
 use crate::child::owned::OwnedChild;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::{Classify, SpawnFailure};
 use crate::containment::Attachment;
@@ -605,10 +606,14 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     })
 }
 
-pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, SpawnFailure> {
+pub(crate) fn spawn_elevated(
+    cmd: &mut Command,
+    kill_on_drop: bool,
+    policy: SpawnPolicy,
+) -> Result<crate::child::Child, SpawnFailure> {
     match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
-            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;
+            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop, policy)?;
             child.set_elevation(Some(crate::elevation::already_elevated_report(
                 ElevatedStdio::Passthrough,
             )));
@@ -627,6 +632,7 @@ pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<cr
                 BTreeMap::new(),
                 kill_on_drop,
                 Attachment::uac_elevated(),
+                policy,
             );
             child.set_elevation(Some(report));
             Ok(child)

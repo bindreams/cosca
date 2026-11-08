@@ -73,13 +73,10 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
-use super::held_teardown::{tear_down_held, tear_down_pidfd, HeldTeardown};
+use super::held_teardown::tear_down_pidfd;
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{Disposition, Past, Remains};
-use crate::child::owned::OwnedChild;
+use crate::child::owned::teardown::{Past, Remains};
 use crate::error::{ChildFate, Error};
-use crate::os_process::linux::LinuxProcess;
-use crate::wait::teardown_warn::Due;
 
 const GO: u8 = 1;
 /// A report's tag: the child's pidfd is attached as `SCM_RIGHTS`; the value is 0.
@@ -100,52 +97,28 @@ pub(crate) struct Handshake {
     child_end: OwnedFd,
     done: OwnedFd,
     shared: Arc<Shared>,
-    /// The elevation front the spawn launches, if it does: a spawn that fails after its fork sends
-    /// it nothing (see [`Handshake::leaving_front`]).
-    front: LeftFront,
     /// How long a failed spawn's teardown waits for a child it killed before it warns that it is
     /// still waiting (see [`Handshake::warning_past`]).
     warn_after: Option<std::time::Duration>,
 }
 
 /// A spawned child, and the pidfd it sent while it was held before `exec`.
-pub(crate) struct Held<T> {
-    pub(crate) child: T,
+pub(crate) struct Held {
+    pub(crate) child: std::process::Child,
     pub(crate) pidfd: OwnedFd,
 }
 
-/// A child `spawn` returned, as the handshake disposes of it when the spawn fails anyway.
-pub(crate) trait Spawned {
-    /// Whether an `Err` from `spawn` proves that a child told to go never ran the program. std's
-    /// does: it fails only on a report from the child before `exec`, and collects that child. tokio's
-    /// does not: it can fail after std's spawn succeeded, so after `exec`.
-    const ERR_PROVES_NO_EXEC: bool;
-    /// Its pid, for logs.
-    fn pid(&self) -> Option<u32>;
-    /// Reap this child through `pidfd`: it never ran the program, and is dead or on its way out.
-    /// Says what became of it. With `warn_after`, the wait for its exit warns once it passes that
-    /// long, and goes on.
-    fn reap_unexecuted(self, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate;
-    /// Give up on this child: no pidfd reached this process, so there is none to reap it through.
-    /// `why` says what happened to the report.
-    fn abandon_unreported(self, why: &str);
+/// Reap `child`, which never ran the program, through `pidfd`: it is dead or on its way out. Says
+/// what became of it. With `warn_after`, the wait for its exit warns once it passes that long, and
+/// goes on. std's `Child` reaps nothing on drop: the pidfd is the only reaper.
+fn reap_unexecuted(child: std::process::Child, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
+    end_unexecuted(Some(child.id()), pidfd, warn_after)
 }
 
-impl Spawned for std::process::Child {
-    const ERR_PROVES_NO_EXEC: bool = true;
-
-    fn pid(&self) -> Option<u32> {
-        Some(self.id())
-    }
-
-    // std's `Child` reaps nothing on drop: the pidfd is the only reaper.
-    fn reap_unexecuted(self, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-        end_unexecuted(Some(self.id()), pidfd, warn_after)
-    }
-
-    fn abandon_unreported(self, why: &str) {
-        leave_unreaped(Some(self.id()), why);
-    }
+/// Give up on `child`: no pidfd reached this process, so there is none to reap it through. `why`
+/// says what happened to the report.
+fn abandon_unreported(child: std::process::Child, why: &str) {
+    leave_unreaped(Some(child.id()), why);
 }
 
 /// What the helper thread learned.
@@ -218,7 +191,6 @@ impl Pending {
             child_end,
             done,
             shared: self.shared,
-            front: LeftFront::NotAFront,
             warn_after: None,
         })
     }
@@ -275,84 +247,10 @@ impl Drop for ShutOnDrop<'_> {
     }
 }
 
-/// Where a child spawned for a cgroup leaf leaves the handshake's pidfd when its spawn fails after
-/// its fork: for the leaf's abandonment, which is the child's one owner from then on (see
-/// [`Handshake::leaving_front`]). It goes with the [`Past`] of a teardown through it, which the
-/// handshake knows and the leaf does not.
-pub(crate) type LeftPidfd = std::rc::Rc<std::cell::Cell<Option<(OwnedFd, Past)>>>;
-
-/// Who answers for a child whose spawn failed after its fork (see [`Handshake::leaving_front`]).
-enum LeftFront {
-    /// Not a front: torn down as any child.
-    NotAFront,
-    /// Not a front, and the process group the root leads is its containment (no cgroup leaf can have
-    /// taken it): the group is killed through the pidfd before the root is torn down
-    /// ([`killing_group`](Handshake::killing_group)).
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(
-            dead_code,
-            reason = "only tokio's spawn leaves a child unreaped, and names its group"
-        )
-    )]
-    GroupRoot,
-    /// A front, left here: sent nothing, reaped only if it has exited, its fate noted.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only tokio's spawn names a front")
-    )]
-    Here(crate::elevation::front::Front),
-    /// A child spawned for a cgroup leaf, front or not, left to the leaf's abandonment: the
-    /// handshake signals and waits on nothing, and leaves its pidfd here.
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(dead_code, reason = "only tokio's spawn leaves a child to a leaf")
-    )]
-    ToLeaf(LeftPidfd),
-}
-
 impl Handshake {
-    /// Names the elevation front this spawn launches. A spawn that fails after its fork then sends
-    /// the child nothing, a kill of which would orphan its elevated program (see
-    /// [`crate::elevation::front`]), and its error says what became of it. Only a spawn whose failed
-    /// `spawn()` leaves the child unreaped (tokio's) names one: std reaps the child of a spawn it
-    /// fails.
-    ///
-    /// A child spawned for a cgroup leaf (`leaf` names where its pidfd goes), front or not, is left
-    /// to the leaf, whose abandonment is its one owner from then on: it kills the child through the
-    /// leaf and through its pidfd, or looks at a front, and answers for it. The handshake neither
-    /// signals nor waits on it, nor notes its fate.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn leaving_front(
-        mut self,
-        front: Option<crate::elevation::front::Front>,
-        leaf: Option<LeftPidfd>,
-    ) -> Handshake {
-        self.front = match (front, leaf) {
-            (_, Some(leaf)) => LeftFront::ToLeaf(leaf),
-            (Some(front), None) => LeftFront::Here(front),
-            (None, None) => LeftFront::NotAFront,
-        };
-        self
-    }
-
-    /// Names the root's process group as its containment (`Prepared::leafless_group_is_containment`):
-    /// a spawn that fails after its fork sends the group `SIGKILL` through the child's pidfd while it
-    /// has a member (Linux 6.9+), before it tears the child down. The send is made to a child std
-    /// already collected too: its exec failed, so it never ran the program and left no group, and the
-    /// kernel answers `ESRCH`. Not for a front, which is sent nothing.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn killing_group(mut self, yes: bool) -> Handshake {
-        if yes && matches!(self.front, LeftFront::NotAFront) {
-            self.front = LeftFront::GroupRoot;
-        }
-        self
-    }
-
     /// Has a spawn that fails after its fork warn once, naming the child, if a wait of its teardown
     /// for a child it killed passes `after`; the wait goes on. Messaging only: no wait ends on it.
-    /// Set by the async spawn, whose teardown blocks a runtime thread (principle 2).
-    #[cfg(feature = "tokio")]
+    /// Set from the spawn's [`SpawnPolicy::teardown_warn_after`].
     pub(crate) fn warning_past(mut self, after: Option<std::time::Duration>) -> Handshake {
         self.warn_after = after;
         self
@@ -374,21 +272,18 @@ impl Handshake {
     ///   is reaped through the pidfd and the spawn fails. Otherwise GO is buffered, and the spawn
     ///   succeeds with a child that died. Either way the pidfd names it.
     /// - A spawn that fails after its fork: std collected the child (see residuals b and c in
-    ///   [`child_exited_before_the_helper_finished`]), or tokio dropped it neither
-    ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
-    ///   through it. If its group is named ([`killing_group`](Self::killing_group)), the group is
-    ///   killed first.
+    ///   [`child_exited_before_the_helper_finished`]), and the pidfd shows it, or ends a child still
+    ///   there.
     ///
-    /// The child runs the program only once told to go, so every failure but one proves the program
-    /// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does
-    /// not prove it (see [`Spawned::ERR_PROVES_NO_EXEC`]).
-    pub(crate) fn run<T: Spawned>(self, spawn: impl FnOnce() -> io::Result<T>) -> Result<Held<T>, SpawnFailure> {
+    /// The child runs the program only once told to go, so every failure proves the program did not
+    /// start: std's `spawn` fails only on a report from the child before `exec`, and collects that
+    /// child.
+    pub(crate) fn run(self, spawn: impl FnOnce() -> io::Result<std::process::Child>) -> Result<Held, SpawnFailure> {
         let Handshake {
             parent_end,
             child_end,
             done,
             shared,
-            front,
             warn_after,
         } = self;
         #[cfg(test)]
@@ -434,9 +329,9 @@ impl Handshake {
                 }
             };
 
-            // A panic on this thread from here on (a panicking logger, tokio's no-IO panic after
-            // the fork) unwinds into a join of the helper, which waits for EOF on the child's end:
-            // a forked copy of it would hold the join for as long as the copy lives.
+            // A panic on this thread from here on (a panicking logger) unwinds into a join of the
+            // helper, which waits for EOF on the child's end: a forked copy of it would hold the
+            // join for as long as the copy lives.
             let _eof_on_unwind = ForceEofOnUnwind(parent_end);
             #[cfg(test)]
             let _wait_over = fault::WaitOverOnDrop;
@@ -447,7 +342,7 @@ impl Handshake {
             let spawned = spawn();
             shared.withdraw();
             #[cfg(test)]
-            fault::spawn_returned(spawned.as_ref().ok().and_then(Spawned::pid));
+            fault::spawn_returned(spawned.as_ref().ok().map(std::process::Child::id));
             // This thread's copy goes first: the child, or a hook that failed, closing its own copy
             // then gives the helper EOF, with nothing left to wait for.
             drop(child_end);
@@ -457,7 +352,7 @@ impl Handshake {
             let finished = match &spawned {
                 // std collected the child (its by-pid wait, residuals b and c), or never forked.
                 Err(_) => true,
-                Ok(child) => match child_exited_before_the_helper_finished(child.pid(), done) {
+                Ok(child) => match child_exited_before_the_helper_finished(Some(child.id()), done) {
                     Watch::Running => false,
                     Watch::Exited => true,
                     // Not knowing is no reason to wait on a copy this process cannot see: with
@@ -481,7 +376,7 @@ impl Handshake {
             #[cfg(test)]
             ends.finish(parent_end);
             #[cfg(test)]
-            seams.release_verdict(spawned.as_ref().ok().and_then(Spawned::pid));
+            seams.release_verdict(spawned.as_ref().ok().map(std::process::Child::id));
             let outcome = join_helper(
                 helper,
                 #[cfg(test)]
@@ -491,7 +386,7 @@ impl Handshake {
                 (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
                 (outcome, _) => outcome,
             };
-            conclude(spawned, outcome, front, warn_after)
+            conclude(spawned, outcome, warn_after)
         })
     }
 }
@@ -850,88 +745,26 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 }
 
 /// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
-/// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
-/// tokio dropped it after it ran the program, so it is sent nothing. A child std already
-/// collected never ran the program (its exec failed): it is not a front. A child spawned for a
-/// cgroup leaf is the leaf's to answer for: its pidfd is left for the leaf, unused here, and the
-/// failure's fate is a placeholder (`Unknown`) that the leaf's abandonment replaces.
+/// `spawn()` is torn down through that pidfd. A child std already collected never ran the program
+/// (its exec failed).
 ///
-/// Only a child the helper told to go can run the program, so only the one arm with
-/// [`Outcome::Opened`] and a failed `spawn` may answer that it started. A failed tokio `spawn`
-/// with no pidfd held on the child drops a child that never ran the program, and nothing reaps
-/// it: that is [`SpawnFailure::NotStartedUnreaped`].
+/// Only a child the helper told to go can run the program, and std fails its `spawn` only on a
+/// report from the child before `exec`, so every failure answers that the program did not start.
 /// `warn_after`: see [`Handshake::warning_past`].
-fn conclude<T: Spawned>(
-    spawned: io::Result<T>,
+fn conclude(
+    spawned: io::Result<std::process::Child>,
     outcome: Outcome,
-    front: LeftFront,
     warn_after: Option<std::time::Duration>,
-) -> Result<Held<T>, SpawnFailure> {
-    let opened_teardown = |pidfd: OwnedFd, error: Error| {
-        use crate::os_process::child::PeekOutcome;
-        use crate::wait::exit_only::{peek, Target};
-        use std::os::fd::AsFd as _;
-        // A child std collected never ran the program. A peek that fails tells nothing, so the
-        // child is taken for a front still there, which is sent nothing; and a look on the pidfd
-        // having failed, a wait on it may fail too.
-        let (collected, past) = match peek(&Target::PidFd(pidfd.as_fd())) {
-            Ok(PeekOutcome::Foreign(_)) => (true, Past::Clean),
-            Ok(_) => (false, Past::Clean),
-            Err(e) => {
-                log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
-                (false, Past::WaitMayFail)
-            }
-        };
-        let teardown =
-            |pidfd: OwnedFd| end_through_pidfd(None, pidfd, past, warn_after, &mut super::Diagnosis::default());
-        match front {
-            LeftFront::ToLeaf(leaf) => {
-                leaf.set(Some((pidfd, past)));
-                (error, ChildFate::Unknown)
-            }
-            LeftFront::Here(front) if !collected => {
-                // No subtree, so the front is never waited for and no threshold applies. Tokio's own
-                // teardown runs here, so a front still running is left: nothing is handed back.
-                let child = OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
-                let how = HeldTeardown {
-                    front: Some(front),
-                    id: None,
-                    subtree: None,
-                    disposition: Disposition::Leave,
-                    due: None,
-                };
-                let (error, fate, _) = tear_down_held(child, how, &mut super::Diagnosis::default(), error);
-                (error, fate)
-            }
-            // The group first: it holds the root too.
-            LeftFront::GroupRoot => {
-                let mut why = super::Diagnosis::default();
-                if let Err(e) = crate::containment::kill_group_through_pidfd(pidfd.as_fd(), None) {
-                    super::note_refused_group_kill(None, e, collected, &mut why);
-                }
-                let child_fate = end_through_pidfd(None, pidfd, past, warn_after, &mut why).fate;
-                (error, child_fate)
-            }
-            LeftFront::Here(_) | LeftFront::NotAFront => (error, teardown(pidfd).fate),
-        }
-    };
-    // A failed spawn that dropped a child it never told to go, with nothing holding it. std's
-    // collected its own; tokio's `Err` leaves the child unreaped if it forked one.
-    let not_started_unreaped = |error| -> Result<Held<T>, SpawnFailure> {
-        Err(if T::ERR_PROVES_NO_EXEC {
-            SpawnFailure::NotStarted(error)
-        } else {
-            SpawnFailure::NotStartedUnreaped(error)
-        })
-    };
+) -> Result<Held, SpawnFailure> {
+    let not_started = |error| -> Result<Held, SpawnFailure> { Err(SpawnFailure::NotStarted(error)) };
     let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
         (Ok(child), Outcome::Gone(pidfd)) => {
-            let named = super::named(child.pid());
-            let fate = child.reap_unexecuted(pidfd, warn_after);
+            let named = super::named(Some(child.id()));
+            let fate = reap_unexecuted(child, pidfd, warn_after);
             with_child(
                 Error::Io(io::Error::other(format!(
                     "the spawned child ({named}) died before exec: the program never ran"
@@ -941,17 +774,17 @@ fn conclude<T: Spawned>(
         }
         // Not told to go, as in every arm below but the first with `Opened`.
         (Ok(child), Outcome::Failed(e, Some(pidfd))) => {
-            let fate = child.reap_unexecuted(pidfd, warn_after);
+            let fate = reap_unexecuted(child, pidfd, warn_after);
             with_child(e, fate)
         }
         // Not told to go either: it dies at its hook, if it has not yet, and is left to its reaper.
         (Ok(child), Outcome::Failed(e, None)) => {
-            child.abandon_unreported(&format!("its pidfd could not be used ({e})"));
+            abandon_unreported(child, &format!("its pidfd could not be used ({e})"));
             with_child(e, ChildFate::Killed)
         }
         (Ok(child), Outcome::NoReport) => {
-            let named = super::named(child.pid());
-            child.abandon_unreported("it died before it sent its pidfd");
+            let named = super::named(Some(child.id()));
+            abandon_unreported(child, "it died before it sent its pidfd");
             with_child(
                 Error::Io(io::Error::other(format!(
                     "the spawned child ({named}) died before it could send its pidfd"
@@ -959,15 +792,22 @@ fn conclude<T: Spawned>(
                 ChildFate::Killed,
             )
         }
-        // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
-        // fail one after std's succeeded, and drops that child neither killed nor reaped.
+        // The spawn failed after the fork, and std collected the child of a spawn it fails: the
+        // program never ran. A child still there is ended through the pidfd.
         (Err(e), Outcome::Opened(pidfd)) => {
-            let (error, fate) = opened_teardown(pidfd, Error::Io(e));
-            Err(if T::ERR_PROVES_NO_EXEC {
-                SpawnFailure::NotStarted(error)
-            } else {
-                SpawnFailure::started(error, fate, None)
-            })
+            use crate::wait::exit_only::{peek, Target};
+            use std::os::fd::AsFd as _;
+            // A peek that fails tells nothing, and a look on the pidfd having failed, a wait on it
+            // may fail too.
+            let past = match peek(&Target::PidFd(pidfd.as_fd())) {
+                Ok(_) => Past::Clean,
+                Err(e) => {
+                    log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
+                    Past::WaitMayFail
+                }
+            };
+            end_through_pidfd(None, pidfd, past, warn_after, &mut super::Diagnosis::default());
+            not_started(Error::Io(e))
         }
         // Not told to go, so it never ran the program.
         (Err(e), Outcome::Gone(pidfd)) => {
@@ -980,12 +820,12 @@ fn conclude<T: Spawned>(
                 let fate = end_unexecuted(None, pidfd, warn_after);
                 with_child(e, fate)
             }
-            None => not_started_unreaped(e),
+            None => not_started(e),
         },
         // The child reads EOF in place of its verdict, whenever it reaches its hook.
         (Ok(child), Outcome::Unwatched(cause)) => {
-            let named = super::named(child.pid());
-            child.abandon_unreported("it sent no pidfd, and its exit could not be watched");
+            let named = super::named(Some(child.id()));
+            abandon_unreported(child, "it sent no pidfd, and its exit could not be watched");
             with_child(
                 Error::Io(io::Error::other(format!(
                     "the spawned child ({named}) sent no pidfd, and its exit could not be watched ({cause})"
@@ -993,7 +833,7 @@ fn conclude<T: Spawned>(
                 ChildFate::Killed,
             )
         }
-        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started_unreaped(Error::Io(e)),
+        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started(Error::Io(e)),
     }
 }
 
@@ -1008,7 +848,7 @@ fn end_through_pidfd(
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> Remains {
-    tear_down_pidfd(pid, pidfd, None, past, Due::in_(warn_after)).say_as_failed_spawn(why)
+    tear_down_pidfd(pid, pidfd, None, past, warn_after).say_as_failed_spawn(why)
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program
@@ -1023,70 +863,6 @@ fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time
         &mut super::Diagnosis::default(),
     )
     .fate
-}
-
-/// Blocks until the child `pidfd` names has exited, without reaping it: a child that never ran
-/// the program, and is dead or on its way out. Killed first, in case it is not. Says whether the
-/// kill was delivered: `false` for a child already reaped.
-#[cfg(feature = "tokio")]
-pub(crate) fn await_unexecuted_exit(
-    pidfd: &OwnedFd,
-    pid: Option<u32>,
-    warn_after: Option<std::time::Duration>,
-) -> bool {
-    use std::os::fd::AsFd;
-
-    use crate::wait::exit_only::{wait_visible_exit, Target};
-
-    // It never execed, so it has this process's credentials: nothing but its being gone, which the
-    // helper answers `Ok`, can refuse.
-    let delivered = match crate::signal::via_pidfd(Some(pidfd.as_fd()), pid.unwrap_or(0), crate::signal::Sig::Kill) {
-        Ok(sent) => sent == crate::signal::Sent::Delivered,
-        Err(e) => {
-            log::warn!(
-                "{}: a spawned child that never ran could not be killed: {e}",
-                super::named(pid)
-            );
-            debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
-            false
-        }
-    };
-    #[cfg(test)]
-    super::fault::run_between_kill_and_wait();
-    #[cfg(test)]
-    let injected = fault::take_unexecuted_wait_failure();
-    #[cfg(not(test))]
-    let injected: Option<Errno> = None;
-    let waited = match injected {
-        Some(errno) => Err(io::Error::from(errno)),
-        None => crate::wait::teardown_warn::wait_warning(
-            pidfd.as_fd(),
-            crate::wait::teardown_warn::Due::in_(warn_after),
-            |pidfd, until| crate::wait::pidfd_exit_visible_by(*pidfd, until),
-            |after| super::warn_still_waiting(pid, after),
-            |pidfd| {
-                let seen = wait_visible_exit(&Target::PidFd(pidfd))?;
-                // tokio reaps it afterwards, so this is where a test sees how it ended.
-                #[cfg(test)]
-                if let crate::os_process::child::PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
-                    status,
-                )) = seen
-                {
-                    super::fault::record_teardown_reap(pid.unwrap_or(0), status);
-                }
-                let _ = seen;
-                Ok(())
-            },
-        ),
-    };
-    if let Err(e) = waited {
-        log::warn!(
-            "{}: a spawned child that never ran could not be waited on: {e}",
-            super::named(pid)
-        );
-        debug_assert!(injected.is_some(), "waitid on an unexecuted child's pidfd failed: {e}");
-    }
-    delivered
 }
 
 /// Warns that a child stays unreaped: without its pidfd its number cannot be trusted.
