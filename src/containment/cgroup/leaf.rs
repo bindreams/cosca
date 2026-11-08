@@ -216,6 +216,9 @@ pub(crate) struct CgroupLeaf {
     /// Where the watched front was when the leaf was last about to be removed, shared with the
     /// leaf's [`Subtree`]s.
     placed: super::PlacedAtRemoval,
+    /// Whether this leaf's own `rmdir` removed the directory. A later removal is a no-op: it would
+    /// read the place of a front in a leaf that is gone, and could clear what `placed` recorded.
+    removed: AtomicBool,
     /// This long into each of its waits for the leaf's drain, a teardown of the leaf (its [`Drop`],
     /// or its abandonment) warns once and keeps waiting (principle 2); `None`: it does not. The
     /// spawn's policy sets it when the leaf is created.
@@ -446,7 +449,11 @@ impl CgroupLeaf {
         }
     }
 
+    /// Removes the leaf's directory, once: after a removal that succeeded, `Ok` without touching it.
     fn rmdir_leaf(&self) -> io::Result<()> {
+        if self.removed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.record_watched_place();
         #[cfg(test)]
         fault::record_leaf_step(|| {
@@ -454,10 +461,16 @@ impl CgroupLeaf {
             format!("rmdir {}", events.lines().next().unwrap_or("(no cgroup.events)"))
         });
         #[cfg(test)]
-        if let Some(result) = fault::run_rmdir_hook(&self.leaf_path) {
-            return result;
+        let removed = match fault::run_rmdir_hook(&self.leaf_path) {
+            Some(result) => result,
+            None => self.dir.rmdir(),
+        };
+        #[cfg(not(test))]
+        let removed = self.dir.rmdir();
+        if removed.is_ok() {
+            self.removed.store(true, Ordering::Relaxed);
         }
-        self.dir.rmdir()
+        removed
     }
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
@@ -929,6 +942,7 @@ impl CgroupLeaf {
             kill: std::sync::Arc::default(),
             watched: None,
             placed: super::PlacedAtRemoval::default(),
+            removed: AtomicBool::new(false),
             teardown_warn_after,
         }
     }
@@ -1493,6 +1507,7 @@ pub(crate) fn create_leaf_under(
         kill: std::sync::Arc::default(),
         watched: None,
         placed: super::PlacedAtRemoval::default(),
+        removed: AtomicBool::new(false),
         teardown_warn_after,
     })
 }

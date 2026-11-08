@@ -197,11 +197,17 @@ fn async_spawn_on_io_disabled_runtime_panics_at_the_first_wait_on_unix() {
         .build()
         .expect("build an IO-disabled current-thread runtime");
     let pid = std::sync::atomic::AtomicU32::new(0);
+    // The blocker reads a pipe this test holds the write end of (cosca owns no stdin end, so `wait`
+    // closes none): it ends only by a kill, so the panic is the only way the wait can end.
+    let (reader, _held_open) = std::io::pipe().expect("stdin pipe");
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async {
             let mut cmd = common::tokio_command(common::Console::Hidden);
             cmd.args([common::stdin_blocker_program()]);
-            cmd.stdin(cosca::Stdio::pipe()).unwrap();
+            cmd.stdin(cosca::Stdio::from_file(std::fs::File::from(
+                std::os::fd::OwnedFd::from(reader),
+            )))
+            .unwrap();
             let mut child = cmd.spawn().expect("the spawn does not need the IO driver");
             pid.store(child.pid(), std::sync::atomic::Ordering::Relaxed);
             let _ = child.wait().await;

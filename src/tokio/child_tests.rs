@@ -236,7 +236,8 @@ mod leaf_drain {
     }
 
     /// A front behind a closed gate: the leaf is killed through and its drain awaited, then the front
-    /// is looked at.
+    /// is looked at. That the leaf's subtree is read before the leaf's first step is not pinned: a
+    /// fake leaf's id never reads, so the order shows nothing.
     ///
     /// Mutant: the closed-gate arm drops the leaf in the first half, which waits for the drain.
     #[skuld::test]
@@ -275,5 +276,29 @@ mod leaf_drain {
 
         assert!(!leaf.fake.leaf.exists(), "the empty leaf is removed");
         assert!(leaf.fake.kill_written().is_empty(), "an empty leaf is written no kill");
+    }
+
+    /// The leaf removed by the awaited teardown's first step is not removed again by its drop: a
+    /// second `rmdir` would read the removed leaf's place again, where the first read it live (a
+    /// zombie front's path then names the leaf ` (deleted)`, which clears the record the look at
+    /// the front is placed by).
+    ///
+    /// Mutant: the leaf's removal does not remember it succeeded.
+    #[skuld::test]
+    async fn a_teardown_of_a_front_behind_a_closed_gate_removes_its_leaf_once() {
+        crate::tokio::test_runtime::assert_current_thread();
+        let leaf = UndrainedLeaf::new("cosca-awaited-removed-once");
+        leaf.drain();
+        let (mut child, _stdin) = leaf.spawn();
+        child.inner.front = Some(Front::Sudo);
+        leaf_fault::record_leaf_steps();
+
+        let (_fate, _unreaped) = child.tear_down_awaiting().await;
+
+        let rmdirs = leaf_fault::take_leaf_steps()
+            .iter()
+            .filter(|step| step.starts_with("rmdir"))
+            .count();
+        assert_eq!(rmdirs, 1, "the leaf is removed once");
     }
 }

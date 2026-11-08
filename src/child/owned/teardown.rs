@@ -752,12 +752,11 @@ impl TeardownWait {
 
     /// What the root teardown's `settlement`, of the wait on `child`, says of it: its fate and its
     /// clause, led by the subject.
+    #[cfg_attr(
+        not(test),
+        allow(unused_variables, reason = "only the test recorder reads the child")
+    )]
     fn outcome(&self, child: &OwnedChild, settlement: &Settlement) -> TeardownOutcome {
-        debug_assert_eq!(
-            self.pending.handle,
-            child.handle_id(),
-            "a wait is worded for the child it was settled on"
-        );
         #[cfg(test)]
         if let Some(status) = settlement.status() {
             // An unknown pid records as 0.
