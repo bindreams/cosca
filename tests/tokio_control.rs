@@ -108,7 +108,7 @@ async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
 
 /// Linux 6.9+: the drop reads the reaped root's group through its pidfd, finds it empty and says
 /// nothing at warn. The same drop below 6.9 is `drop_after_terminate_tree_and_wait_still_warns`
-/// in `src/tokio/child_drop_reaped_tests.rs`, which refuses the flag: `tests/` cannot.
+/// in `src/child/drop_reaped_tests.rs`, which refuses the flag: `tests/` cannot.
 #[cfg(feature = "tokio")]
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -396,15 +396,9 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         "contained: the two mirrors disagree"
     );
     // The mechanism is only half of it: the two mirrors must also refuse for the same REASON.
-    // Reaped first — the async backend releases the Windows process handle there, which is
-    // exactly where a pid-scoped refusal that also swallowed the pid-INDEPENDENT ones would
-    // start answering something the sync side never answers. Uncontained on purpose: a contained
-    // child's two surfaces legitimately diverge after a reap (the sync handle still pins the pid
-    // and answers `Ok`; the async one no longer does and refuses), which
-    // `windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped` pins. Spawned through
-    // `args` alone rather than the `executable()` helper above, which is load-bearing: an
-    // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
-    // its whole life, so no released pin could be observed through it at all.
+    // Reaped first: that is where a pid-scoped refusal that also swallowed the pid-INDEPENDENT
+    // ones would start answering something the sync side never answers. Uncontained on purpose,
+    // as the contained pair is compared above.
     //
     // Each child blocks on a piped stdin this test holds and releases right after the `kill()`: a
     // `kill()` that did nothing exits 0 and fails `assert_killed`.

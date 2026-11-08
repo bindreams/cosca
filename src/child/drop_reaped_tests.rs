@@ -461,6 +461,35 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
     assert_skipped_at_debug(mark);
 }
 
+/// A `terminate_tree` is a request, not a kill, so a root reaped after it still leaves the drop
+/// unable to vouch for the group, and it warns (below Linux 6.9 and on macOS; on 6.9+ the pidfd
+/// finds the group empty, see `drop_group_exact_tests`). The `SIGTERM` is recorded, not sent, and
+/// the root exits by itself. Mutants: `terminate_tree` sets the tree-killed flag; `terminate_tree`
+/// sends nothing.
+#[skuld::test]
+fn drop_after_terminate_tree_and_wait_still_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::log_capture::install();
+    let termed = crate::containment::unix::fault::record_term_group();
+    let child = session(&["true"]).spawn().expect("spawn");
+    let pid = child.pid();
+    child.terminate_tree().expect("terminate_tree");
+    assert_eq!(
+        termed.termed(),
+        vec![pid as i32],
+        "terminate_tree signals the group once"
+    );
+    child.wait().expect("reap the root");
+
+    let mark = crate::log_capture::mark();
+    drop(child);
+
+    let records = drop_warns_since(mark);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, log::Level::Warn);
+}
+
 /// A failed elevated spawn's cleanup kills the tree, then kills and reaps the root, then drops the
 /// handle: an internal path with no call order for the user to change, and a handle the caller never
 /// received. It is disarmed, so the drop says nothing at all.
