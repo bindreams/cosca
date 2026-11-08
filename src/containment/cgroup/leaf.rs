@@ -524,6 +524,17 @@ impl CgroupLeaf {
             .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()))
     }
 
+    /// The `cgroup.kill` write an armed [`Drop`] makes, made now: an awaited teardown makes it
+    /// before the drain it bounds is awaited, so the drop finds the leaf drained. A disarmed leaf,
+    /// and one its child never entered, is written nothing. A failed write is the teardown's answer,
+    /// which the drop then reports.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn kill_ahead_of_drop(&self) {
+        if self.armed.load(Ordering::Relaxed) && self.child_entered() {
+            _ = self.kill_unless_written();
+        }
+    }
+
     /// Block until every process in the leaf has EXITED (not reaped) — `cgroup.events`'s
     /// `populated` reads 0, or the leaf is removed — or until `deadline` (see
     /// [`crate::wait::remaining`]). Reads the leaf first, and answers from that read if it has
