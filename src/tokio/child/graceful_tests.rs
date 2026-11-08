@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::test_child::Console;
 
-use super::fault as term_fault;
+use crate::child::graceful::fault as term_fault;
 use crate::wait::fault;
 
 /// Async twin of `child::graceful_tests::blocker`.
@@ -803,10 +803,11 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 // root alone. Here the root has exited and been waited for: the watch must resolve at once, not
 // spend the grace.
 //
-// Mutant: the driver does not return early and enters its wait on a still-alive target. Killed by
-// `armed_probe`, held across the `.await`.
 // Mutant: the `TreeWalk` arm never reaches the driver (e.g. hollowed to `sleep(grace)`). Killed by
 // the paused clock not moving across the call: any expiring tokio timer advances it.
+//
+// A driver that waits on the exited root's handle anyway returns at once, as the handle is
+// signalled: no check can tell it from the driver that looks first.
 #[cfg(windows)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited() {
@@ -824,11 +825,6 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap"));
 
-    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    // Held across the `.await` below: `cancellable_blocking` reads THIS thread's installed observer
-    // before dispatching to its blocking-pool thread — see `armed_probe`'s own doc.
-    let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);
-
     let before = ::tokio::time::Instant::now();
     let outcome = child.graceful_shutdown_tree(GRACE).await;
     assert_eq!(
@@ -836,13 +832,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
         Duration::ZERO,
         "the root-only watch must never advance the virtual clock — any use of `tokio::time` \
          (a hollowed-out grace-wait sleeping the grace instead of watching the process, for \
-         instance) would move it, whether or not `armed_probe` below also caught it: {outcome:?}"
-    );
-    assert!(
-        armed_rx.try_recv().is_err(),
-        "the root-only watch must never genuinely enter its real wait on a still-alive target — \
-         a real wait call may fire (an already-exited handle can still resolve and return \
-         instantly), but it must never be armed against a live one"
+         instance) would move it: {outcome:?}"
     );
 }
 

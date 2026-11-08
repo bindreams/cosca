@@ -39,7 +39,7 @@ pub use owned::unreaped::Unreaped;
 pub use suspended::SuspendedChild;
 
 #[path = "child/graceful.rs"]
-mod graceful;
+pub(crate) mod graceful;
 
 #[cfg(unix)]
 #[path = "child/tree_call.rs"]
