@@ -422,8 +422,9 @@ enum RootWait {
     Leaf {
         why: String,
     },
-    /// The look at the front is under way; `why` is why the front was not killed.
-    #[cfg(unix)]
+    /// The look at the front is under way, as an awaited teardown leaves it; `why` is why the front
+    /// was not killed.
+    #[cfg(all(unix, feature = "tokio"))]
     Front {
         wait: FrontWait,
         why: String,
@@ -444,7 +445,7 @@ impl DropWait {
                     word_front(child.proc.pid(), &why, parts.disposition, wait.settle(&child.proc))
                 }
             },
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "tokio"))]
             RootWait::Front { wait, why } => {
                 word_front(child.proc.pid(), &why, parts.disposition, wait.settle(&child.proc))
             }

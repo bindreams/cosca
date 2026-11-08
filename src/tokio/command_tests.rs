@@ -32,6 +32,7 @@ fn run_to_completion_futures_are_send() {
 ///
 /// Mutants: the refusal answers that the program may have started; the check is gone (the sync
 /// spawn then succeeds).
+#[cfg(unix)]
 #[skuld::test]
 fn a_spawn_outside_a_runtime_did_not_start_the_program() {
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
