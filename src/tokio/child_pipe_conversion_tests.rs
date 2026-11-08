@@ -211,6 +211,31 @@ async fn stdout_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     closed();
 }
 
+/// `communicate` on a stdin the reactor refuses fails with the registration's error, with or without
+/// input, not with the error for a stdin that is not piped.
+///
+/// Mutant: the refusal is taken as "no stdin", so input fails as `not piped` and no input succeeds.
+#[skuld::test]
+async fn communicate_returns_the_error_of_a_stdin_the_reactor_refuses() {
+    crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
+    let _no_fork = crate::child::spawn::spawn_lock();
+    for input in [Some(b"x".to_vec()), None] {
+        let mut child = a_child_without_a_process();
+        let (end, closed) = refused_writer();
+        child.os.pipes.insert(Fd::STDIN, end);
+        let error = child
+            .communicate(input.clone())
+            .await
+            .expect_err("the stdin is refused");
+        let crate::error::Error::Io(error) = error else {
+            panic!("not an I/O error: {error:?}")
+        };
+        assert!(!error.to_string().contains("not piped"), "{error}");
+        closed();
+    }
+}
+
 #[skuld::test]
 async fn stdin_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     crate::tokio::test_runtime::assert_current_thread();

@@ -1,6 +1,4 @@
-//! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread. No pipe can
-//! fill and stall the child, and nothing after the spawn needs a thread, so a caller under a task
-//! limit (`RLIMIT_NPROC`, a cgroup's `TasksMax`) cannot fail for want of one.
+//! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::AsFd;
@@ -8,119 +6,36 @@ use std::os::fd::AsFd;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 
-use crate::child::Child;
-use crate::error::Error;
+use super::{Drain, Pump, Slot, CHUNK};
 use crate::pipe::{PipeReader, PipeWriter};
-use crate::stdio::Fd;
 use crate::wait;
-use crate::Output;
 
-const CHUNK: usize = 64 * 1024;
-
-pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Output, Error> {
-    let stdin = child.take_stdin_writer();
-    let stdout = child.take_reader(Fd::STDOUT);
-    let stderr = child.take_reader(Fd::STDERR);
-    // Caller contract: input can only be delivered if stdin was piped; surface the misuse rather
-    // than silently dropping the bytes.
-    debug_assert!(
-        input.is_none() || stdin.is_some(),
-        "communicate given input but stdin was not piped"
-    );
-
-    let mut pump = Pump::new(stdin, input.unwrap_or(&[]), stdout, stderr);
-    let poll_error = pump.run().err();
-    // Every pipe end is closed from here on: the child sees EOF, or a broken pipe.
-    let Finished { stdin, stdout, stderr } = pump.finish();
-
-    let status = child.wait();
-    // The first failure is returned: the wait's, else `poll`'s, else a stream's. The others are
-    // logged, each with its stream named.
-    let mut failures: Vec<(&str, io::Error)> = Vec::new();
-    failures.extend(poll_error.map(|e| ("poll", e)));
-    let stdout = stdout.unwrap_or_else(|e| {
-        failures.push(("stdout", e));
-        Vec::new()
-    });
-    let stderr = stderr.unwrap_or_else(|e| {
-        failures.push(("stderr", e));
-        Vec::new()
-    });
-    failures.extend(stdin.err().map(|e| ("stdin", e)));
-    let mut failures = failures.into_iter();
-    let result = match status {
-        Err(e) => Err(e),
-        Ok(status) => match failures.next() {
-            Some((_, e)) => Err(Error::Io(e)),
-            None => Ok(status),
-        },
-    };
-    match result {
-        Ok(status) => Ok(Output { status, stdout, stderr }),
-        Err(first) => {
-            for (stream, e) in failures {
-                log::debug!("communicate: the {stream} error was not returned: {e}");
-            }
-            Err(first)
-        }
-    }
-}
-
-/// The three streams of one `communicate`, each present while it is still open.
-struct Pump<'a> {
-    feed: Option<Feed<'a>>,
-    stdin_error: Option<io::Error>,
-    stdout: Drain,
-    stderr: Drain,
-}
-
-/// Input not yet written, and the pipe it goes to.
-struct Feed<'a> {
-    pipe: PipeWriter,
-    rest: &'a [u8],
-}
-
-/// A pipe read to EOF, and what came out of it.
-struct Drain {
-    pipe: Option<PipeReader>,
-    bytes: Vec<u8>,
-    error: Option<io::Error>,
-}
-
-struct Finished {
-    stdin: io::Result<()>,
-    stdout: io::Result<Vec<u8>>,
-    stderr: io::Result<Vec<u8>>,
-}
-
-#[derive(Clone, Copy)]
-enum Slot {
-    Stdin,
-    Stdout,
-    Stderr,
-}
-
-impl<'a> Pump<'a> {
-    fn new(stdin: Option<PipeWriter>, input: &'a [u8], stdout: Option<PipeReader>, stderr: Option<PipeReader>) -> Self {
-        let mut stdin_error = None;
-        // With no input, closing the pipe at once is the child's EOF.
-        let feed = stdin.filter(|_| !input.is_empty()).and_then(|pipe| {
-            nonblocking(&pipe)
-                .and_then(|()| forbid_sigpipe(&pipe))
-                .map(|()| Feed { pipe, rest: input })
-                .map_err(|e| stdin_error = Some(e))
-                .ok()
-        });
-        Pump {
-            feed,
-            stdin_error,
-            stdout: Drain::new(stdout),
-            stderr: Drain::new(stderr),
-        }
+impl<'a> Pump<'a, PipeWriter, PipeReader> {
+    pub(super) fn new(
+        stdin: Option<PipeWriter>,
+        input: &'a [u8],
+        stdout: Option<PipeReader>,
+        stderr: Option<PipeReader>,
+    ) -> Self {
+        Pump::assemble(
+            stdin,
+            input,
+            stdout,
+            stderr,
+            |pipe| {
+                nonblocking(&pipe)?;
+                forbid_sigpipe(&pipe)?;
+                Ok(pipe)
+            },
+            |pipe| {
+                nonblocking(&pipe)?;
+                Ok(pipe)
+            },
+        )
     }
 
     /// Moves bytes until every stream is closed. Fails only when `poll` does.
-    fn run(&mut self) -> io::Result<()> {
+    pub(super) fn run(&mut self) -> io::Result<()> {
         let mut chunk = vec![0u8; CHUNK];
         loop {
             let mut slots = Vec::with_capacity(3);
@@ -163,57 +78,23 @@ impl<'a> Pump<'a> {
     fn write_some(&mut self) {
         let Some(feed) = &mut self.feed else { return };
         match write_without_sigpipe(&mut feed.pipe, feed.rest) {
-            Ok(n) => {
-                feed.rest = &feed.rest[n..];
-                if feed.rest.is_empty() {
-                    self.feed = None;
-                }
-            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
-            // The child stopped reading: end of input, as Python's `subprocess.communicate` treats it.
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => self.feed = None,
-            Err(e) => {
-                self.stdin_error = Some(e);
-                self.feed = None;
-            }
-        }
-    }
-
-    fn finish(self) -> Finished {
-        Finished {
-            stdin: self.stdin_error.map_or(Ok(()), Err),
-            stdout: self.stdout.finish(),
-            stderr: self.stderr.finish(),
+            written => self.wrote(written),
         }
     }
 }
 
-impl Drain {
-    fn new(pipe: Option<PipeReader>) -> Self {
-        let mut error = None;
-        let pipe = pipe.and_then(|pipe| nonblocking(&pipe).map(|()| pipe).map_err(|e| error = Some(e)).ok());
-        Drain {
-            pipe,
-            bytes: Vec::new(),
-            error,
-        }
-    }
-
+impl Drain<PipeReader> {
     fn read_some(&mut self, chunk: &mut [u8]) {
         let Some(pipe) = &mut self.pipe else { return };
         match pipe.read(chunk) {
-            Ok(0) => self.pipe = None,
-            Ok(n) => self.bytes.extend_from_slice(&chunk[..n]),
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
-            Err(e) => {
-                self.error = Some(e);
-                self.pipe = None;
+            read => {
+                if !self.collected.took(read, chunk) {
+                    self.pipe = None;
+                }
             }
         }
-    }
-
-    fn finish(self) -> io::Result<Vec<u8>> {
-        self.error.map_or(Ok(self.bytes), Err)
     }
 }
 

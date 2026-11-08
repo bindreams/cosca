@@ -10,6 +10,13 @@ use crate::Output;
 use super::child::Child;
 
 impl Child {
+    /// Writes `input` to stdin, then closes it, and reads stdout and stderr to EOF while waiting
+    /// for the child. The sync [`communicate`](crate::Child::communicate) has the details.
+    ///
+    /// `input` of `Some` for a child whose stdin is not piped, or was already taken, is an
+    /// [`Error::Io`] of kind `InvalidInput`; no pipe is taken then. A stdin the reactor refuses to
+    /// register fails with the reactor's error, with or without input; its end is closed, so the
+    /// child sees EOF, and stdout and stderr stay in place.
     pub async fn communicate(&mut self, input: Option<Vec<u8>>) -> Result<Output, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_pump_failure() {
@@ -18,15 +25,12 @@ impl Child {
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
         // `self.proc_mut()` (so the four-future join compiles). The inner wait closes no stdin; only
         // the write future, which owns it, does.
-        let mut stdin = self.stdin();
+        let mut stdin = self.stdin_or_error().map_err(Error::Io)?;
+        if input.is_some() && stdin.is_none() {
+            return Err(crate::child::pump::input_without_stdin());
+        }
         let mut stdout = self.stdout();
         let mut stderr = self.stderr();
-        // Caller contract: input can only be delivered if stdin was piped — surface the misuse
-        // rather than silently dropping the bytes.
-        debug_assert!(
-            input.is_none() || stdin.is_some(),
-            "communicate given input but stdin was not piped"
-        );
 
         let write = async {
             // A child that exits without consuming all input closes the pipe early; a BrokenPipe

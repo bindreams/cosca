@@ -85,6 +85,9 @@ pub mod test_stdio;
 #[cfg(windows)]
 #[path = "../../src/test_own_process_windows.rs"]
 pub mod test_own_process;
+// The byte stream tests send through a pipe, shared with the library's tests.
+#[path = "../../src/test_pattern.rs"]
+pub mod test_pattern;
 // Re-exec builder, shared with the library's tests.
 #[path = "../../src/test_reexec.rs"]
 pub mod test_reexec;
