@@ -259,18 +259,6 @@ impl TeardownOutcome {
         )
     }
 
-    /// What became of the child.
-    #[cfg(test)]
-    pub(crate) fn fate(&self) -> ChildFate {
-        self.fate
-    }
-
-    /// What the teardown said of the child, if it said anything.
-    #[cfg(test)]
-    pub(crate) fn said(&self) -> Option<&Wording> {
-        self.said.as_ref()
-    }
-
     /// Whether the teardown left the child uncollected.
     pub(crate) fn uncollected(&self) -> bool {
         matches!(self.said, Some(Wording::Uncollected(_)))
@@ -526,7 +514,7 @@ impl OwnedChild {
                 // The reap is recorded for good: asking again answers it, and blocks on nothing.
                 if self.is_reaped() {
                     let settlement = Settlement::new(self.wait(None), wait.pending.reached);
-                    return BeginOutcome::Done(wait.outcome(&settlement));
+                    return BeginOutcome::Done(wait.outcome(self, &settlement));
                 }
                 BeginOutcome::Wait(wait)
             }
@@ -564,19 +552,6 @@ impl OwnedChild {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
         TeardownWait::new(self, warn_after, true, id, subject, disposition)
-    }
-
-    /// [`begin_reap_after_tree_kill`](Self::begin_reap_after_tree_kill) settled, for the rows that
-    /// state the teardown's outcome.
-    #[cfg(test)]
-    pub(crate) fn reap_after_tree_kill(
-        &self,
-        subject: &str,
-        disposition: Disposition,
-        warn_after: Option<Duration>,
-    ) -> TeardownOutcome {
-        self.begin_reap_after_tree_kill(None, subject.to_owned(), disposition, warn_after)
-            .settle(self)
     }
 
     /// What the clause of a root teardown calls a plain child.
@@ -687,9 +662,6 @@ pub(crate) enum BeginOutcome<D, W> {
 /// The wait a teardown's first half left, whichever child and kill it was made on.
 #[derive(Debug)]
 struct Pending {
-    /// The child the first half was made on: its pid, for what a test records.
-    #[cfg(test)]
-    pid: Option<u32>,
     /// The child's handle ([`OwnedChild::handle_id`]), which a wait carried across an await is
     /// checked against: a pid may be absent or shared.
     handle: usize,
@@ -702,8 +674,6 @@ struct Pending {
 impl Pending {
     fn new(child: &OwnedChild, warn_after: Option<Duration>, reached: bool) -> Pending {
         Pending {
-            #[cfg(test)]
-            pid: child.pid(),
             handle: child.handle_id(),
             warn_after,
             reached,
@@ -769,7 +739,7 @@ impl TeardownWait {
     /// says what became of it. With a threshold, warns once past it.
     pub(crate) fn settle(self, child: &OwnedChild) -> TeardownOutcome {
         let settlement = self.pending.settle(child);
-        self.outcome(&settlement)
+        self.outcome(child, &settlement)
     }
 
     /// [`settle`](Self::settle) awaited, with no warn. By reference: a caller whose future is dropped
@@ -777,17 +747,19 @@ impl TeardownWait {
     #[cfg(feature = "tokio")]
     pub(crate) async fn settle_async(&self, child: &mut OwnedChild) -> TeardownOutcome {
         let settlement = self.pending.settle_async(child).await;
-        self.outcome(&settlement)
+        self.outcome(child, &settlement)
     }
 
-    /// What the root teardown's `settlement` says of the child: its fate and its clause, led by
-    /// the subject.
-    fn outcome(&self, settlement: &Settlement) -> TeardownOutcome {
+    /// What the root teardown's `settlement`, of the wait on `child`, says of it: its fate and its
+    /// clause, led by the subject.
+    fn outcome(&self, child: &OwnedChild, settlement: &Settlement) -> TeardownOutcome {
         #[cfg(test)]
         if let Some(status) = settlement.status() {
             // An unknown pid records as 0.
-            crate::child::spawn::fault::record_teardown_reap(self.pending.pid.unwrap_or(0), status);
+            crate::child::spawn::fault::record_teardown_reap(child.pid().unwrap_or(0), status);
         }
+        #[cfg(not(test))]
+        let _ = child;
         TeardownOutcome::of_settlement(settlement, self.id, &self.subject, None, self.disposition)
     }
 }
@@ -815,3 +787,7 @@ impl FrontWait {
         FrontLook::ended(self.pending.settle_async(child).await, self.id)
     }
 }
+
+#[cfg(test)]
+#[path = "teardown_tests.rs"]
+mod teardown_tests;
