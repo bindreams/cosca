@@ -184,26 +184,40 @@ fn async_spawn_outside_runtime_errors() {
     assert!(matches!(err, cosca::error::Error::Io(_)), "got {err:?}");
 }
 
-// The async child's waits and pipes register with the reactor, so on Unix the spawn panics, as
-// tokio does, before the program starts, on a runtime without the IO driver (see `Command::spawn`'s
-// Runtime docs).
+// The async child's waits register with the reactor, so on Unix the spawn succeeds on a runtime
+// without the IO driver and the child's first wait panics, as tokio does. The child is still torn
+// down by its drop (see `Command::spawn`'s Runtime docs).
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
-fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
-    // Build the runtime OUTSIDE the observed region, so only `cmd.spawn()`'s panic — not the
+fn async_spawn_on_io_disabled_runtime_panics_at_the_first_wait_on_unix() {
+    // Build the runtime OUTSIDE the observed region, so only the wait's panic — not the
     // runtime `.build().expect()` — can satisfy this test.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build an IO-disabled current-thread runtime");
+    let pid = std::sync::atomic::AtomicU32::new(0);
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async {
             let mut cmd = common::tokio_command(common::Console::Hidden);
-            cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
-            let _ = cmd.spawn();
+            cmd.args([common::stdin_blocker_program()]);
+            cmd.stdin(cosca::Stdio::pipe()).unwrap();
+            let mut child = cmd.spawn().expect("the spawn does not need the IO driver");
+            pid.store(child.pid(), std::sync::atomic::Ordering::Relaxed);
+            let _ = child.wait().await;
         })
     }))
-    .expect_err("spawning on an IO-disabled runtime must panic on Unix (child reaping needs the IO driver)");
+    .expect_err("the first wait on an IO-disabled runtime must panic on Unix (it needs the IO driver)");
+    let pid = pid.load(std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(pid, 0, "the spawn must have succeeded before the panic");
+    // Gone, not a zombie: the drop that ran as the panic unwound reaped the child. `kill(pid, 0)`
+    // sends nothing and answers `0` for a zombie too.
+    // SAFETY: signal 0 only checks that the pid exists.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert!(
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "the child must be torn down and reaped by its drop"
+    );
     // Pin tokio's specific driver-absent panic (IO driver on Linux, signal driver on macOS), not
     // merely "something, somewhere, panicked".
     let msg = payload
@@ -332,8 +346,8 @@ async fn async_drop_tears_down_a_contained_tree() {
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
 // Windows Job Object. A cgroup does on Linux, and a process group on Linux 6.9+, through the root's
-// pidfd, and not below 6.9: both are the library's tests (`src/tokio/child_drop_reaped_tests.rs`,
-// `src/tokio/child/drop_group_exact_tests.rs`). This binary cannot reach the seams that release
+// pidfd, and not below 6.9: both are the library's tests (`src/child/drop_reaped_tests.rs`,
+// `src/child/drop_group_exact_tests.rs`). This binary cannot reach the seams that release
 // the tree at the kill, and a drop that killed nothing waits for it for ever.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]

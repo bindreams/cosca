@@ -23,21 +23,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             "cosca::tokio::Command must be spawned from within a Tokio runtime",
         ))));
     }
-    #[cfg(unix)]
-    require_io_driver()?;
     crate::child::spawn::spawn_uncommitted(cmd, async_policy()).map(Child::from_sync)
-}
-
-/// Panics, before the program starts, on a runtime without the IO driver: the child's waits and
-/// pipes register with the reactor, and tokio panics at a registration on such a runtime, so a
-/// handle that could never wait is not made. A pipe's end stands for the registration, and is
-/// deregistered as it drops.
-#[cfg(unix)]
-fn require_io_driver() -> Result<(), SpawnFailure> {
-    let (probe, _write_end) = std::io::pipe().map_err(|e| SpawnFailure::NotStarted(Error::Io(e)))?;
-    // The panic is the answer; a registration that fails any other way is the wait's to report.
-    _ = ::tokio::io::unix::AsyncFd::new(probe);
-    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
