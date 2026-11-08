@@ -484,8 +484,8 @@ impl DropWait {
 }
 
 /// A teardown whose wait is being awaited. Dropped with the wait unfinished (its future was), it
-/// settles it as the drop would, blocking, with the policy's warn. While unwinding it leaves the
-/// child to its own drops.
+/// settles it as the drop would, blocking, with the policy's warn. While unwinding it gives the
+/// child up unreaped and warns with its pid, as an [`Unreaped`]'s drop does.
 #[cfg(feature = "tokio")]
 struct Settling<'a> {
     child: &'a mut Child,
@@ -496,7 +496,12 @@ struct Settling<'a> {
 impl Drop for Settling<'_> {
     fn drop(&mut self) {
         if let Some(wait) = self.wait.take() {
-            if !std::thread::panicking() {
+            if std::thread::panicking() {
+                log::warn!(
+                    "{} was given up unreaped: its teardown was dropped while the thread is panicking",
+                    crate::os_process::child_named(self.child.proc.pid())
+                );
+            } else {
                 _ = wait.settle(self.child);
             }
         }

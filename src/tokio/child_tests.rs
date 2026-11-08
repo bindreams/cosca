@@ -54,6 +54,34 @@ async fn a_teardown_future_dropped_at_its_wait_settles_as_a_drop_does() {
     assert_eq!(id.is_alive(), Liveness::Dead, "the dropped teardown reaped the root");
 }
 
+/// A teardown future dropped by an unwind (a sibling branch panicked) does not block on the root: it
+/// gives the child up, as an `Unreaped`'s drop does, and says so with the child's pid.
+///
+/// Mutant: the guard's drop gives the child up without a word.
+#[skuld::test]
+async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    let pid = child.pid();
+    child.inner.proc.script_over(|f| f.reaps([ReapAnswer::Running]));
+    let mut teardown = Box::pin(child.tear_down_awaiting());
+    let first = std::future::poll_fn(|cx| Poll::Ready(teardown.as_mut().poll(cx))).await;
+    assert!(first.is_pending(), "the teardown waits for the root");
+
+    let mark = crate::log_capture::mark();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _teardown = teardown;
+        panic!("a sibling branch panicked");
+    }));
+
+    assert!(unwound.is_err());
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "while the thread is panicking");
+    assert_eq!(warns.len(), 1, "one warn, got {warns:?}");
+    assert_eq!(warns[0].0, log::Level::Warn);
+    assert!(warns[0].1.contains(&format!("child {pid}")), "names the pid: {warns:?}");
+}
+
 /// The awaited teardown awaits its cgroup leaf's drain and never blocks the thread on it: a drain
 /// that is pending leaves the teardown pending. A fake leaf that no one empties holds the drain
 /// open. The rows fail only by hanging (a teardown that blocks on the drain never returns), so
