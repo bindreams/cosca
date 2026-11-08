@@ -164,15 +164,6 @@ pub(crate) fn blocker() -> std::process::Child {
     crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
 }
 
-/// [`blocker`], leading a process group of its own, so a kill of its group reaches nothing but it.
-#[cfg(feature = "tokio")]
-pub(crate) fn group_leading_blocker() -> std::process::Child {
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    allow_any_tracer(&mut cmd);
-    cmd.process_group(0);
-    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
-}
-
 /// Lets any process trace this one (`PR_SET_PTRACER`), which Yama's scope 1 requires of a tracer
 /// that is no ancestor. For a tracee that cannot take [`allow_any_tracer`], such as one spawned by
 /// `cosca::tokio::Command`, which has no `pre_exec`. Until it returns, [`spawn_helper`]'s seize
@@ -305,7 +296,7 @@ impl Tracer {
     }
 }
 
-/// What [`await_blocked_or_finished`] found.
+/// What [`await_blocked_warned_or_finished`] found.
 #[cfg(feature = "tokio")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Holder {
@@ -363,13 +354,6 @@ fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -
         std::thread::sleep(pause);
         pause = (pause * 2).min(std::time::Duration::from_millis(5));
     }
-}
-
-/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
-/// `WNOHANG`, or is gone (see [`thread_state`]).
-#[cfg(feature = "tokio")]
-pub(crate) fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
-    await_blocked_warned_or_finished(tid, || false)
 }
 
 /// Marks the [`tokio_tracee`] re-exec; the value is the driver's pid.

@@ -65,8 +65,8 @@ pub(crate) enum Waited {
 /// Slots in one `kevent` batch.
 const BATCH: usize = 8;
 
-pub(crate) const BACKOFF_START: Duration = Duration::from_millis(1);
-pub(crate) const BACKOFF_CAP: Duration = Duration::from_millis(50);
+const BACKOFF_START: Duration = Duration::from_millis(1);
+const BACKOFF_CAP: Duration = Duration::from_millis(50);
 
 fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
@@ -344,30 +344,6 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
             return Ok((reaped, exited));
         }
     }
-}
-
-/// Arm `kq`'s one-shot backoff timer: one `EVFILT_TIMER` event after `interval`, replacing a timer
-/// still pending.
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "the only consumer is the tokio backend's reap")
-)]
-pub(crate) fn arm_backoff_timer(kq: &Kqueue, interval: Duration) -> io::Result<()> {
-    #[cfg(test)]
-    test_hooks::record_backoff_timer(interval);
-    let timer = KEvent::new(
-        0,
-        EventFilter::EVFILT_TIMER,
-        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
-        FilterFlag::empty(),
-        interval.as_millis().max(1) as isize,
-        0,
-    );
-    let mut none: [KEvent; 0] = [];
-    kq.native()
-        .kevent(&[timer], &mut none, None)
-        .map(drop)
-        .map_err(io::Error::from)
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.

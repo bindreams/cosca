@@ -509,23 +509,6 @@ mod windows {
     }
 }
 
-/// Mutant: `exited_opening` takes the seam only after `open`, so a gone process never reaches it.
-#[skuld::test]
-async fn exited_opening_returns_a_forced_watch_error_for_a_gone_process() {
-    crate::tokio::test_runtime::assert_current_thread();
-    fault::set_force_watch_error(true);
-    let opened = || panic!("the seam comes before the open");
-    assert!(super::exited_opening(opened, None).await.is_err());
-    assert!(!fault::armed(), "the seam is consumed");
-}
-
-/// Mutant: `exited_opening` waits on, or errs for, a process that is gone.
-#[skuld::test]
-async fn exited_opening_resolves_at_once_for_a_gone_process() {
-    crate::tokio::test_runtime::assert_current_thread();
-    assert!(super::exited_opening(|| Ok(None), None).await.unwrap());
-}
-
 /// Mutant: `exited_held` skips the seam, or looks at a process the seam should have refused.
 #[skuld::test]
 async fn exited_held_takes_the_watch_fault_seam() {

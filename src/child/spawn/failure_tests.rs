@@ -297,25 +297,3 @@ fn each_fate_has_its_own_message() {
     };
     assert!(running.to_string().contains(&format!("pid {}", std::process::id())));
 }
-
-/// A look at a child cosca did not kill: `Gone` only for a child someone else reaped (`ECHILD`),
-/// `Running` only for one that has not exited, `Unknown` for any other failure.
-///
-/// A child still running is `Running` with the identity the caller knows, and none when it knows none.
-///
-/// Mutant: a failed look is `Running`, `ECHILD` is `Unknown`, or the identity is dropped or invented.
-#[cfg(all(unix, feature = "tokio"))]
-#[skuld::test]
-fn a_look_at_an_unkilled_child_tells_reaped_running_gone_and_unknown_apart() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    use super::super::fate_of_a_look;
-    let exited = std::process::ExitStatus::from_raw(0);
-    let id = Some(crate::identity::ProcessId::current());
-    assert_eq!(fate_of_a_look(Ok(Some(exited)), id), ChildFate::Reaped);
-    assert_eq!(fate_of_a_look(Ok(None), None), ChildFate::Running { id: None });
-    assert_eq!(fate_of_a_look(Ok(None), id), ChildFate::Running { id });
-    assert_eq!(fate_of_a_look(Err(Some(libc::ECHILD)), id), ChildFate::Gone);
-    assert_eq!(fate_of_a_look(Err(Some(libc::EIO)), id), ChildFate::Unknown);
-    assert_eq!(fate_of_a_look(Err(None), id), ChildFate::Unknown);
-}

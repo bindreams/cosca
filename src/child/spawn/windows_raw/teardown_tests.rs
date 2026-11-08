@@ -23,6 +23,7 @@ use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
 use crate::child::owned::teardown::{Disposition, Kill, Past};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::Diagnosis;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
@@ -30,7 +31,6 @@ use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::windows::{uac_access, WindowsProcess};
 use crate::test_spawn::console_flags::NO_WINDOW;
-use crate::wait::teardown_warn::Due;
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
 
@@ -162,7 +162,10 @@ fn after_a_failed_spawn(
         id,
         past,
         disposition,
-        Due::in_(warn_after),
+        SpawnPolicy {
+            teardown_warn_after: warn_after,
+            ..SpawnPolicy::SYNC
+        },
         &mut Diagnosis::default(),
     )
 }

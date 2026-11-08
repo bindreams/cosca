@@ -26,7 +26,7 @@ use crate::os_process::linux::open::probe_pidfd_support_with;
 use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
-use crate::test_groups::{namespaces, setuid, Group};
+use crate::test_groups::{namespaces, Group};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -1081,7 +1081,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let mark = crate::log_capture::mark();
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(ended_cat()), failed, super::LeftFront::NotAFront, None).err();
+    let err = super::conclude(Ok(ended_cat()), failed, None).err();
     assert_eq!(
         err.map(|e| e.expect_not_started().to_string()).as_deref(),
         Some("the report was cut short")
@@ -1093,7 +1093,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
     );
 
     let mark = crate::log_capture::mark();
-    super::conclude(Ok(ended_cat()), Outcome::NoReport, super::LeftFront::NotAFront, None).err();
+    super::conclude(Ok(ended_cat()), Outcome::NoReport, None).err();
     let why = said(mark);
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
@@ -1208,33 +1208,8 @@ fn a_failed_open_leaves_no_numbers_live() {
     assert_eq!(spawned.expect_err("never published").raw_os_error(), Some(libc::EBADF));
 }
 
-/// A child of a failed spawn, for `conclude`'s arms that never reach it. `TOKIO` stands for
-/// tokio's spawn, whose failure does not prove the program never ran, rather than std's.
-struct NoChild<const TOKIO: bool = true>;
-
-impl<const TOKIO: bool> super::Spawned for NoChild<TOKIO> {
-    const ERR_PROVES_NO_EXEC: bool = !TOKIO;
-
-    fn pid(&self) -> Option<u32> {
-        None
-    }
-    fn reap_unexecuted(self, _: OwnedFd, _: Option<std::time::Duration>) -> ChildFate {
-        panic!("no child was handed back");
-    }
-    fn abandon_unreported(self, _: &str) {
-        panic!("no child was handed back");
-    }
-}
-
-/// The front `sudo` leaves, left to the handshake.
-fn sudo_front() -> super::LeftFront {
-    super::LeftFront::Here(
-        crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
-            crate::elevation::Backend::Sudo,
-        )))
-        .expect("sudo leaves a front"),
-    )
-}
+/// The child of a failed spawn, for `conclude`'s arms that never reach it: std's `spawn` collected it.
+type NoChild = std::process::Child;
 
 /// A `cat` whose stdin this test holds, and a pidfd naming it.
 fn cat_with_pidfd() -> (std::process::Child, OwnedFd) {
@@ -1245,128 +1220,29 @@ fn cat_with_pidfd() -> (std::process::Child, OwnedFd) {
     (cat, pidfd)
 }
 
-/// [`cat_with_pidfd`], leading a process group of its own, so a kill of its group reaches nothing
-/// but it.
-fn group_leading_cat_with_pidfd() -> (std::process::Child, OwnedFd) {
-    use std::os::unix::process::CommandExt as _;
-
-    let cat = crate::test_spawn::spawn(
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn cat");
-    let pid = rustix::process::Pid::from_raw(cat.id() as i32).expect("a positive pid");
-    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
-    (cat, pidfd)
-}
-
-/// A child tokio dropped after it ran the program, whose kill is refused (as a setuid-root child
-/// refuses it), is left running and warned of, and the spawn's fate says it runs. The teardown is the
-/// caller's `Leave`: the handshake hands nothing back.
-///
-/// Mutant: a refused kill reports the child reaped, or drops the warn.
+/// A child that died before it was told to go never ran the program: it is reaped through its pidfd.
 #[skuld::test]
-fn a_dropped_child_whose_kill_is_refused_is_left_running_and_warned(#[fixture(setuid)] _group: &Group) {
-    crate::log_capture::install();
-    let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let pidfd = child
-        .proc
-        .pidfd()
-        .expect("a Linux child has a pidfd")
-        .try_clone_to_owned()
-        .expect("duplicate the pidfd");
-    let mark = crate::log_capture::mark();
-
-    let (_, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-
-    assert_eq!(fate, ChildFate::Running { id: None });
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "leaving it running");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    // The test's own child, still running: released, it exits on EOF.
-    drop(stdin);
-    assert!(child.wait().expect("wait").success());
-}
-
-/// A front tokio dropped after it ran the program is sent nothing and left, and the error says so.
-#[skuld::test]
-fn a_dropped_front_is_left_and_noted() {
-    let (mut cat, pidfd) = cat_with_pidfd();
-    let (err, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        sudo_front(),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    assert_eq!(
-        fate,
-        ChildFate::Running { id: None },
-        "a front is left running, its identity unread"
-    );
-    let text = err.to_string();
-    assert!(text.contains("the spawned child is what sudo left"), "{text}");
-    assert!(text.contains("; left unreaped"), "{text}");
-    drop(cat.stdin.take());
-    assert!(cat.wait().expect("wait").success(), "the front was signalled");
-}
-
-/// A front std already collected never ran the program: it is torn down, with no note.
-#[skuld::test]
-fn a_collected_front_is_no_front() {
-    let (mut cat, pidfd) = cat_with_pidfd();
-    drop(cat.stdin.take());
-    cat.wait().expect("collect the child");
-    let (err, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("exec failed")),
-        Outcome::Opened(pidfd),
-        sudo_front(),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    assert_eq!(fate, ChildFate::Gone, "std had collected it");
-    assert!(!err.to_string().contains("what sudo left"), "{err}");
-}
-
-/// A child that died before it was told to go never ran the program: it is reaped, with no note.
-#[skuld::test]
-fn a_front_gone_before_its_go_is_no_front() {
+fn a_child_gone_before_its_go_is_reaped_through_its_pidfd() {
     let (mut cat, pidfd) = cat_with_pidfd();
     let pid = cat.id();
     cat.kill().expect("kill the child");
     crate::test_child::wait_until_zombie(pid);
-    let err = super::conclude(
+    super::conclude(
         Err::<NoChild, _>(std::io::Error::other("killed on its way")),
         Outcome::Gone(pidfd),
-        sudo_front(),
         None,
     )
     .err()
     .expect("the spawn fails")
-    .expect_not_started();
-    assert!(!err.to_string().contains("what sudo left"), "{err}");
+    .expect_not_started_with_child();
     assert_eq!(crate::child::front_kill_tests::reap(pid), None, "the teardown reaps it");
 }
 
-/// A failure that ends a child the handshake held carries what became of it, so a leaf's abandonment
-/// afterwards says what happened; one that held no child carries none. The child never ran the
-/// program, so none of these answers that it may have started.
+/// A failure that ends a child the handshake held carries what became of it; one that held no child
+/// carries none. The child never ran the program, so none of these answers that it may have started.
 ///
-/// Mutant: an arm that tears the child down answers a plain `not started`, an arm that held none
-/// claims a fate, or a failed tokio spawn's child with no pidfd is answered as std's, which std
-/// collected.
+/// Mutant: an arm that tears the child down answers a plain `not started`, or an arm that held none
+/// claims a fate.
 #[skuld::test]
 fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     let io = |what: &str| std::io::Error::other(what.to_string());
@@ -1377,22 +1253,16 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         pidfd
     };
     // Told no go, spawn failed, child killed on its way: torn down through its pidfd.
-    let (_, fate) = super::conclude(
-        Err::<NoChild, _>(io("gone")),
-        Outcome::Gone(killed()),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started_with_child();
+    let (_, fate) = super::conclude(Err::<NoChild, _>(io("gone")), Outcome::Gone(killed()), None)
+        .err()
+        .expect("the spawn fails")
+        .expect_not_started_with_child();
     assert_eq!(fate, ChildFate::Reaped);
 
     // The helper failed after sending the pidfd.
     let (_, fate) = super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(Error::Io(io("helper")), Some(killed())),
-        super::LeftFront::NotAFront,
         None,
     )
     .err()
@@ -1400,30 +1270,15 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     .expect_not_started_with_child();
     assert_eq!(fate, ChildFate::Reaped);
 
-    // No pidfd, so no child was held. A child tokio dropped, never told to go, is left to nobody;
-    // one std failed was collected by std.
-    let outcomes = || {
-        [
-            Outcome::Failed(Error::Io(io("helper")), None),
-            Outcome::NoReport,
-            Outcome::Unwatched("cause".into()),
-        ]
-    };
-    for outcome in outcomes() {
-        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, super::LeftFront::NotAFront, None)
+    // No pidfd, so no child was held: std failed the spawn and collected the child.
+    for outcome in [
+        Outcome::Failed(Error::Io(io("helper")), None),
+        Outcome::NoReport,
+        Outcome::Unwatched("cause".into()),
+    ] {
+        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, None)
             .err()
             .expect("the spawn fails");
-        assert!(matches!(failure, SpawnFailure::NotStartedUnreaped(_)), "{failure:?}");
-    }
-    for outcome in outcomes() {
-        let failure = super::conclude(
-            Err::<NoChild<false>, _>(io("x")),
-            outcome,
-            super::LeftFront::NotAFront,
-            None,
-        )
-        .err()
-        .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
     }
 }
@@ -1437,7 +1292,7 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
     let (mut cat, pidfd) = cat_with_pidfd();
     drop(cat.stdin.take());
     cat.wait().expect("collect the child");
-    let (_, fate) = super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront, None)
+    let (_, fate) = super::conclude(Ok(cat), Outcome::Gone(pidfd), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started_with_child();
@@ -1448,7 +1303,6 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
     let (_, fate) = super::conclude(
         Ok(cat),
         Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(pidfd)),
-        super::LeftFront::NotAFront,
         None,
     )
     .err()
@@ -1472,7 +1326,7 @@ fn a_returned_child_with_no_pidfd_is_killed() {
         let (mut cat, _pidfd) = cat_with_pidfd();
         drop(cat.stdin.take());
         crate::test_child::wait_until_zombie(cat.id());
-        let (_, fate) = super::conclude(Ok(cat), outcome, super::LeftFront::NotAFront, None)
+        let (_, fate) = super::conclude(Ok(cat), outcome, None)
             .err()
             .expect("the spawn fails")
             .expect_not_started_with_child();
@@ -1480,127 +1334,53 @@ fn a_returned_child_with_no_pidfd_is_killed() {
     }
 }
 
-/// A group root torn down after tokio's failure carries its teardown's fate: one killed on its way
-/// is reaped through its pidfd, after its group's kill. Mutant: the group root's arm drops or
-/// replaces the teardown's fate.
+/// A failed spawn's child whose pidfd cannot be peeked is taken to be uncollected, and is still
+/// ended through its pidfd: the failure answers that the program did not start.
 #[skuld::test]
-fn a_group_roots_failure_carries_its_teardowns_fate() {
-    let (mut cat, pidfd) = group_leading_cat_with_pidfd();
-    cat.kill().expect("kill the child");
-    crate::test_child::wait_until_zombie(cat.id());
-    let (_, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        super::LeftFront::GroupRoot,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    assert_eq!(fate, ChildFate::Reaped);
-}
-
-/// A dropped front whose pidfd cannot be peeked is taken to be there still: sent nothing, and left.
-#[skuld::test]
-fn an_unpeekable_dropped_front_is_left_and_noted() {
-    let (mut cat, pidfd) = cat_with_pidfd();
-    let _unpeekable = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    let (err, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        sudo_front(),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
-    assert_eq!(
-        fate,
-        ChildFate::Running { id: None },
-        "a front that cannot be peeked is taken to be there"
-    );
-    assert!(err.to_string().contains("the spawned child is what sudo left"), "{err}");
-    drop(cat.stdin.take());
-    assert!(cat.wait().expect("wait").success(), "the front was signalled");
-}
-
-/// A child spawned for a cgroup leaf, a front or not, and dropped by tokio after its fork is the
-/// leaf's to answer for: the handshake stashes its pidfd for the leaf, signals and waits on nothing,
-/// and returns the error as it came, with no note of the child's fate. Mutants: "the arm tears the
-/// child down", "the arm notes the front", "the arm drops the pidfd".
-#[skuld::test]
-fn a_child_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
-    use std::os::fd::AsRawFd as _;
-
-    let (mut cat, pidfd) = cat_with_pidfd();
-    let raw = pidfd.as_raw_fd();
-    let left: super::LeftPidfd = Rc::new(Cell::new(None));
-    let (err, fate) = super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
-        Outcome::Opened(pidfd),
-        super::LeftFront::ToLeaf(Rc::clone(&left)),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_may_have_started_with();
-    assert_eq!(
-        err.to_string(),
-        Error::Io(std::io::Error::other("tokio failed")).to_string()
-    );
-    assert_eq!(
-        fate,
-        ChildFate::Unknown,
-        "the leaf's abandonment answers, not the handshake"
-    );
-    let (stashed, past) = left.take().expect("the pidfd is left for the leaf");
-    assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
-    // The peek of the running front succeeded, so a wait on its pidfd is expected to.
-    assert_eq!(past, crate::child::owned::teardown::Past::Clean);
-    // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
-    // reaped before this wait.
-    drop(cat.stdin.take());
-    assert!(cat.wait().expect("wait").success(), "the front was signalled");
-}
-
-/// Only a child told to go can run the program, so every arm of `conclude` but one answers that it
-/// did not start: a failed `spawn` after the child was told to go, from a spawn whose error does not
-/// prove that it failed before `exec` (tokio's). std's does, so its answer there is `not started`.
-/// `conclude_answers_every_remaining_pair` drives the pairs this leaves.
-///
-/// Mutant: any one arm's answer flipped, or the `Opened` arm's answer not taken from the spawn.
-#[skuld::test]
-fn conclude_answers_whether_the_program_could_have_started() {
-    let io = |what: &str| std::io::Error::other(what.to_string());
-    let failed = |what: &str| Error::Io(io(what));
-    let answered = |result: Result<super::Held<NoChild>, SpawnFailure>| result.err().expect("the spawn fails");
-
-    // Told to go, then the spawn failed: tokio's may have failed after `exec`, std's did not.
+fn a_failed_spawns_child_that_cannot_be_peeked_is_still_ended_through_its_pidfd() {
     let (mut cat, pidfd) = cat_with_pidfd();
     // Released after the kill: a kill that sent nothing exits 0.
     let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
-    let (_, fate) = answered(super::conclude(
-        Err::<NoChild, _>(io("tokio")),
-        Outcome::Opened(pidfd),
-        super::LeftFront::NotAFront,
-        None,
-    ))
-    .expect_may_have_started_with();
-    // A live child tokio dropped is killed and reaped through the pidfd.
-    assert_eq!(fate, crate::error::ChildFate::Reaped);
-    teardown.assert_killed();
-    drop(teardown);
-    let (_cat, pidfd) = cat_with_pidfd();
+    let _unpeekable = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::from_raw_os_error(libc::EIO)));
     super::conclude(
-        Err::<NoChild<false>, _>(io("std")),
+        Err::<NoChild, _>(std::io::Error::other("spawn failed")),
         Outcome::Opened(pidfd),
-        super::LeftFront::NotAFront,
         None,
     )
     .err()
     .expect("the spawn fails")
     .expect_not_started();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    teardown.assert_killed();
+    drop(teardown);
+    assert_no_child_of_this_thread("the cat is reaped through its pidfd");
+}
+
+/// Only a child told to go can run the program, and std fails its `spawn` only on a report from the
+/// child before `exec`, so every arm of `conclude` answers that the program did not start.
+/// `conclude_answers_every_remaining_pair` drives the pairs this leaves.
+///
+/// Mutant: any one arm's answer flipped, or the `Opened` arm answers that the program may have
+/// started.
+#[skuld::test]
+fn conclude_answers_whether_the_program_could_have_started() {
+    let io = |what: &str| std::io::Error::other(what.to_string());
+    let failed = |what: &str| Error::Io(io(what));
+    let answered = |result: Result<super::Held, SpawnFailure>| result.err().expect("the spawn fails");
+
+    // Told to go, then the spawn failed: std's did not run the program.
+    let (mut cat, pidfd) = cat_with_pidfd();
+    // Released after the kill: a kill that sent nothing exits 0.
+    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
+    answered(super::conclude(
+        Err::<NoChild, _>(io("std")),
+        Outcome::Opened(pidfd),
+        None,
+    ))
+    .expect_not_started();
+    // A live child is killed and reaped through the pidfd.
+    teardown.assert_killed();
+    drop(teardown);
 
     // Never told to go.
     let (mut cat, pidfd) = cat_with_pidfd();
@@ -1609,46 +1389,32 @@ fn conclude_answers_whether_the_program_could_have_started() {
     answered(super::conclude(
         Err::<NoChild, _>(io("gone")),
         Outcome::Gone(pidfd),
-        super::LeftFront::NotAFront,
         None,
     ))
     .expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(failed("helper"), None),
-        super::LeftFront::NotAFront,
         None,
     ))
     .expect_not_started();
-    answered(super::conclude(
-        Err::<NoChild, _>(io("x")),
-        Outcome::NoReport,
-        super::LeftFront::NotAFront,
-        None,
-    ))
-    .expect_not_started();
+    answered(super::conclude(Err::<NoChild, _>(io("x")), Outcome::NoReport, None)).expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
         Outcome::Unwatched("cause".into()),
-        super::LeftFront::NotAFront,
         None,
     ))
     .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
-    super::conclude(Ok(cat), Outcome::Gone(pidfd), super::LeftFront::NotAFront, None)
+    super::conclude(Ok(cat), Outcome::Gone(pidfd), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
-    super::conclude(
-        Ok(cat),
-        Outcome::Failed(failed("helper"), Some(pidfd)),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started();
+    super::conclude(Ok(cat), Outcome::Failed(failed("helper"), Some(pidfd)), None)
+        .err()
+        .expect("the spawn fails")
+        .expect_not_started();
     assert_no_child_of_this_thread("every cat is reaped through its pidfd");
 }
 
@@ -1673,25 +1439,19 @@ fn conclude_answers_every_remaining_pair() {
 
     // Told to go, and the spawn succeeded: it carries on.
     let (cat, pidfd) = ended_cat();
-    let held = super::conclude(Ok(cat), Outcome::Opened(pidfd), super::LeftFront::NotAFront, None)
-        .expect("a child told to go is held");
+    let held = super::conclude(Ok(cat), Outcome::Opened(pidfd), None).expect("a child told to go is held");
     let mut cat = held.child;
     cat.wait().expect("collect the child");
 
     // Never told to go, and the spawn succeeded anyway: the helper's error stands, not started.
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(
-        Ok(cat),
-        Outcome::Failed(failed("helper"), None),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started();
+    let error = super::conclude(Ok(cat), Outcome::Failed(failed("helper"), None), None)
+        .err()
+        .expect("the spawn fails")
+        .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::NoReport, super::LeftFront::NotAFront, None)
+    let error = super::conclude(Ok(cat), Outcome::NoReport, None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1700,15 +1460,10 @@ fn conclude_answers_every_remaining_pair() {
         "{error:?}"
     );
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(
-        Ok(cat),
-        Outcome::Unwatched("cause".into()),
-        super::LeftFront::NotAFront,
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started();
+    let error = super::conclude(Ok(cat), Outcome::Unwatched("cause".into()), None)
+        .err()
+        .expect("the spawn fails")
+        .expect_not_started();
     assert!(
         matches!(&error, Error::Io(e) if e.to_string().contains("its exit could not be watched (cause)")),
         "{error:?}"
@@ -1722,7 +1477,6 @@ fn conclude_answers_every_remaining_pair() {
     let error = super::conclude(
         Err::<NoChild, _>(io("spawn")),
         Outcome::Failed(failed("helper"), Some(pidfd)),
-        super::LeftFront::NotAFront,
         None,
     )
     .err()

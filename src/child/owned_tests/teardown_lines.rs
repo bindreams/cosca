@@ -227,7 +227,7 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
         let child = child_with_an_unreadable_exit();
         return match row.kill {
             // A kill sent elsewhere reached it: the reap that follows.
-            Kill::Delivered => child.reap_after_tree_kill(&child.teardown_subject(), disposition),
+            Kill::Delivered => child.reap_after_tree_kill(&child.teardown_subject(), disposition, None),
             Kill::Nothing => child.tear_down(Some(id()), kill, None),
             Kill::Refused => child.look_after_refused_kill(Some(id()), Error::Io(refused()), disposition),
         };
@@ -265,7 +265,7 @@ pub(crate) fn outcome_after_a_tree_kill(row: &Row, subject: &str, disposition: D
         Found::Unreadable => child_with_an_unreadable_exit(),
         found => OwnedChild::new(Box::new(fake().reaps([reap_answer(found)]))),
     };
-    child.reap_after_tree_kill(subject, disposition)
+    child.reap_after_tree_kill(subject, disposition, None)
 }
 
 /// What no clause says, whoever says it.

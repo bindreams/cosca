@@ -151,23 +151,6 @@ fn a_late_report_may_have_started_and_keeps_its_id() {
     );
 }
 
-/// Only the child's refusal and a report missing at EOF prove the program did not run.
-///
-/// Mutant: any one answer flipped.
-#[skuld::test]
-fn only_a_refusal_or_a_missing_report_proves_no_exec() {
-    use super::proves_no_exec;
-    assert!(proves_no_exec(&Report::ChildRefused(libc::EPERM)));
-    assert!(proves_no_exec(&Report::Missing));
-    assert!(!proves_no_exec(&Report::Id(1)));
-    assert!(!proves_no_exec(&Report::Late(1)));
-    assert!(!proves_no_exec(&Report::Unwritten));
-    assert!(!proves_no_exec(&Report::ReadFailed(std::io::Error::from_raw_os_error(
-        libc::EIO
-    ))));
-    assert!(!proves_no_exec(&Report::BadTag(9)));
-}
-
 /// Only the child's own refusal changes a failed spawn's error.
 ///
 /// Mutant: any report state maps to the refusal.

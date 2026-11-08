@@ -20,19 +20,11 @@ mod linux {
     use std::os::fd::{AsFd, OwnedFd};
 
     use super::*;
-    use crate::signal::via_pidfd;
+    use crate::signal::send_pidfd;
 
     fn pidfd_of(child: &Child) -> OwnedFd {
         let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("a child's pid");
         rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open")
-    }
-
-    /// Mutant: a missing pidfd is an error, or a signal sent by pid.
-    #[skuld::test]
-    fn no_pidfd_is_gone_and_sends_nothing() {
-        let log = Capture::start();
-        assert_eq!(via_pidfd(None, 4242, Sig::Kill).expect("gone is Ok"), Sent::Gone);
-        assert_eq!(log.entries(), []);
     }
 
     /// Mutant: the send is not recorded, or recorded under another address.
@@ -42,7 +34,7 @@ mod linux {
         let pidfd = pidfd_of(&child);
         let log = Capture::start();
         assert_eq!(
-            via_pidfd(Some(pidfd.as_fd()), child.id(), Sig::Kill).expect("send"),
+            send_pidfd(pidfd.as_fd(), Some(child.id()), Sig::Kill).expect("send"),
             Sent::Delivered
         );
         assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pidfd)]);
@@ -64,7 +56,7 @@ mod linux {
         child.wait().expect("reap");
         let log = Capture::start();
         assert_eq!(
-            via_pidfd(Some(pidfd.as_fd()), child.id(), Sig::Kill).expect("gone is Ok"),
+            send_pidfd(pidfd.as_fd(), Some(child.id()), Sig::Kill).expect("gone is Ok"),
             Sent::Gone
         );
         assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pidfd)]);

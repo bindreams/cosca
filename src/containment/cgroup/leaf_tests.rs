@@ -1,14 +1,10 @@
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd as _;
 
-#[cfg(target_os = "linux")]
-use crate::child::owned::teardown::Past;
 use crate::containment::cgroup::test_support::{
     block_on, childs_copy, entered_leaf_at, fork_running, handle_of, pidfd_of,
 };
 use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport, WithoutChild};
-#[cfg(target_os = "linux")]
-use crate::error::ChildFate;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
@@ -265,7 +261,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
+    let leaf = crate::containment::cgroup::try_create_leaf(None).unwrap_or_else(|e| {
         panic!(
             "the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created \
              ({e}) — is this process running inside a writable, delegated cgroup v2 slice with \
@@ -447,7 +443,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec(#[fixture(cgroup)] _group: &Group) {
-    let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
+    let leaf = crate::containment::cgroup::try_create_leaf(None).unwrap_or_else(|e| {
         panic!("the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created ({e})")
     });
     // SAFETY: `procs_fd` is open for as long as `leaf` lives.
@@ -492,7 +488,7 @@ fn create_leaf_under_reports_a_refused_mkdir() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parent = dir.path().join("no-such-slice");
 
-    let err = match crate::containment::cgroup::create_leaf_under(&parent) {
+    let err = match crate::containment::cgroup::create_leaf_under(&parent, None) {
         Err(e) => e,
         Ok(_) => panic!("creating a leaf under a nonexistent directory must fail"),
     };
@@ -512,7 +508,7 @@ fn create_leaf_under_reports_a_refused_mkdir() {
 #[skuld::test]
 fn create_leaf_under_reports_a_missing_cgroup_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -539,7 +535,7 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
     crate::containment::cgroup::fault::set_force_occupy_before_unwind(true);
 
     let mark = crate::log_capture::mark();
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -573,7 +569,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
     let parent = dir.path().to_path_buf();
     crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
-    let err = match crate::containment::cgroup::create_leaf_under(&parent) {
+    let err = match crate::containment::cgroup::create_leaf_under(&parent, None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
     };
@@ -1453,7 +1449,7 @@ fn entered_real_leaf_of(
 ) {
     use std::os::unix::process::CommandExt;
 
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let mut leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
@@ -1649,7 +1645,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf(#[f
 #[skuld::test]
 fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created(#[fixture(cgroup)] _group: &Group) {
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
-    let result = crate::containment::cgroup::try_create_leaf();
+    let result = crate::containment::cgroup::try_create_leaf(None);
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
 
     assert!(consumed, "the creation must have tried, and failed, to watch");
@@ -2041,7 +2037,7 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
 fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.procs to open; leaf creation must fail"),
     };
@@ -2074,7 +2070,7 @@ fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf()
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
     crate::containment::cgroup::fault::set_force_report_channel_failure(true);
-    let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("the report channel could not be opened; leaf creation must fail"),
     };
@@ -2457,7 +2453,7 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[fixture(cgroup)] _group: &Group) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
     // The occupant reports through a channel of its own, so the leaf's receives nothing.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
@@ -2491,230 +2487,6 @@ fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[
     occupant.kill().expect("kill the occupant");
     occupant.wait().expect("reap the occupant");
     std::fs::remove_dir(&leaf_path).expect("remove the emptied leaf");
-}
-
-/// An abandoned spawn's child is killed and reaped through the pidfd the handshake left, whatever
-/// `cgroup.kill` returns — it may have left the leaf. Here `cgroup.kill` is a directory, so the
-/// leaf's kill fails for real.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-kill-fails");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    let slot = leaf.placement_slot();
-    // Blocked on a piped stdin the test holds: only a real kill ends it, and a skipped one hangs
-    // the test.
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped()).process_group(0);
-    // SAFETY: the closure runs between fork and exec; /dev/null stands in for cgroup.procs.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pid = child.id();
-    let pidfd = pidfd_of(pid);
-    // SAFETY: the parent's own copy, closed once.
-    unsafe { libc::close(procs_fd) };
-    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
-    drop(child);
-
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
-    let abandoned = leaf.abandon_before_verdict(
-        false,
-        (pidfd_of(pid), Past::Clean),
-        &mut crate::containment::cgroup::NoWarn,
-    );
-
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)
-    );
-    assert_eq!(
-        reaps
-            .recorded()
-            .into_iter()
-            .map(|(_, status)| status.signal())
-            .collect::<Vec<_>>(),
-        [Some(libc::SIGKILL)],
-        "the child must be killed by its pidfd"
-    );
-    assert!(reaped(&pidfd), "and reaped");
-}
-
-/// Whether the child `pidfd` names has been reaped — a question a pidfd, unlike a pid, can answer
-/// after the reap, since it cannot come to name another process.
-#[cfg(target_os = "linux")]
-fn reaped(pidfd: &std::os::fd::OwnedFd) -> bool {
-    use std::os::fd::AsFd;
-
-    use rustix::process::{waitid, WaitId, WaitIdOptions};
-
-    matches!(
-        waitid(
-            WaitId::PidFd(pidfd.as_fd()),
-            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        ),
-        Err(rustix::io::Errno::CHILD)
-    )
-}
-
-/// An intent that names no pid (a negative one) beside the handshake's pidfd is a child that never
-/// named itself: it is killed and reaped through that pidfd, and the abandonment answers `Ended`.
-///
-/// Mutant: a pid-less intent with a pidfd is out of reach, or its child is left unreaped.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_pidless_intent_with_a_pidfd_is_killed_and_reaped_through_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-pidless-intent");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn a blocker");
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pidfd = pidfd_of(child.id());
-    // SAFETY: the leaf's channel is open.
-    unsafe {
-        leaf.placement_slot()
-            .send(crate::containment::cgroup::TAG_INTENT, -1)
-            .expect("send a pid-less intent");
-    }
-    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
-    drop(child);
-
-    let abandoned = leaf.abandon_before_verdict(
-        false,
-        (pidfd.try_clone().expect("duplicate the pidfd"), Past::Clean),
-        &mut crate::containment::cgroup::NoWarn,
-    );
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)
-    );
-    assert!(reaped(&pidfd), "the child must be reaped through the handshake's pidfd");
-}
-
-/// A child that wrote `cgroup.procs` but whose report the abandonment's read beat (so the leaf
-/// does not count it entered) is still in the leaf, and a running member blocks the leaf's `rmdir`
-/// as cgroupfs does. The leaf is removed only once the child is torn down, with no warn that it
-/// was left behind. Runs on a plain directory whose `rmdir` hook answers as cgroupfs does.
-///
-/// Mutant: the leaf is removed before the child is torn down.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_child_that_entered_unreported_is_gone_before_its_leaf_is_removed() {
-    use rustix::process::{waitid, WaitId, WaitIdOptions};
-
-    crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-unreported");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn a blocker");
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pid = child.id();
-    let pidfd = pidfd_of(pid);
-    // The intent arrived; the report did not.
-    // SAFETY: the leaf's channel is open.
-    unsafe {
-        leaf.placement_slot()
-            .send(crate::containment::cgroup::TAG_INTENT, pid as i32)
-            .expect("send the intent");
-    }
-    // No handle owns the child once its spawn is abandoned: the leaf reaps it.
-    drop(child);
-    let member = pidfd.try_clone().expect("duplicate the pidfd");
-    crate::containment::cgroup::fault::set_rmdir_hook(move |path| {
-        let running = matches!(
-            waitid(
-                WaitId::PidFd(member.as_fd()),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            ),
-            Ok(None)
-        );
-        if running {
-            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
-        }
-        std::fs::remove_dir(path)
-    });
-
-    let mark = crate::log_capture::mark();
-    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
-    crate::containment::cgroup::fault::take_rmdir_hook();
-
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)
-    );
-    let left = leaf_path.exists();
-    if left {
-        std::fs::remove_dir(&leaf_path).expect("remove the leaf the abandonment left");
-    }
-    assert!(!left, "the leaf must be removed");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "was not removed");
-    assert!(warns.is_empty(), "no leaf is left behind: {warns:?}");
-}
-
-/// An abandoned spawn's `cgroup.kill` is one write: when it fails, the failure is final. The write
-/// is not made again (the fault fails only the first, so a second would be recorded as a kill), the
-/// front the leaf's kill did not reach is reported left unreaped, and the leaf that still holds it is
-/// reported left behind, once, as a failed `cgroup.kill`. Runs on a plain directory whose `rmdir`
-/// answers `EBUSY`, as cgroupfs does for a leaf with a running member.
-///
-/// Mutants: the failed write is retried; the leaf's failure is not warned, or warned twice.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_spawns_failed_leaf_kill_is_one_write_and_warned_once() {
-    use crate::containment::cgroup::fault;
-
-    crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-kill-failed");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut child = spawn_placing(
-        &leaf,
-        &["/bin/cat"],
-        false,
-        std::process::Stdio::piped(),
-        std::process::Stdio::null(),
-    );
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pidfd = pidfd_of(child.id());
-    fault::record_leaf_steps();
-    fault::set_rmdir_hook(|_| Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
-    let _first_write_fails = fault::fail_next_kill_write();
-
-    let mark = crate::log_capture::mark();
-    let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
-
-    fault::take_rmdir_hook();
-    let steps = fault::take_leaf_steps();
-    // The leaf's kill reached nothing, so the child still runs.
-    child.kill().expect("kill the child");
-    child.wait().expect("reap the child");
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
-    );
-    assert!(
-        steps.iter().all(|step| step != "kill"),
-        "the failed write is not made again: {steps:?}"
-    );
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
-    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
 /// A leaf that is already gone answers its `cgroup.kill` write `Ok`, and that answer is the
@@ -2774,130 +2546,6 @@ fn an_abandoned_spawns_failed_leaf_kill_is_warned_when_the_removal_succeeds() {
     assert!(!leaf_path.exists(), "the leaf is removed");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
-}
-
-/// An abandoned elevation front's teardown warns (the leaf's failed kill did not reach it), and
-/// that one warn carries the failed kill, which is known when the kill is made. The `rmdir`
-/// succeeds.
-///
-/// Mutant: the failed kill is added after the teardown has warned, and is warned a second time.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_fronts_failed_leaf_kill_is_in_the_warn_of_its_teardown() {
-    crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-front-kill-failed-removed");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut child = spawn_placing(
-        &leaf,
-        &["/bin/cat"],
-        false,
-        std::process::Stdio::piped(),
-        std::process::Stdio::null(),
-    );
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pidfd = pidfd_of(child.id());
-    let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
-
-    let mark = crate::log_capture::mark();
-    let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
-
-    // The leaf's kill reached nothing, so the front still runs.
-    child.kill().expect("kill the front");
-    child.wait().expect("reap the front");
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
-    );
-    assert!(!leaf_path.exists(), "the leaf is removed");
-    let warns = crate::log_capture::warns_since(mark, "");
-    assert_eq!(warns.len(), 1, "one warn: {warns:?}");
-    assert!(
-        warns[0].contains("cgroup.kill failed"),
-        "it carries the failed kill: {warns:?}"
-    );
-}
-
-/// As above, on a real leaf: an abandoned elevation front whose `cgroup.kill` write fails is not
-/// reached by it. It is left unreaped and running in a leaf that is left behind, with the failed
-/// kill warned once; the leaf's kill is not made again, or the front would be reaped. The front
-/// blocks on a stdin this test holds, so only a kill through the leaf ends it.
-///
-/// Mutant: the failed write is retried before the front is looked at.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_an_abandoned_front_whose_leaf_kill_failed_is_left_unreaped_in_a_leaf_left_behind(
-    #[fixture(cgroup)] _group: &Group,
-) {
-    use std::os::unix::process::CommandExt;
-
-    crate::log_capture::install();
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
-    let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped()).process_group(0);
-    // SAFETY: the closure runs between fork and exec, and `leaf` outlives the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the front");
-    let _stdin = child.stdin.take().expect("piped stdin");
-    let pidfd = pidfd_of(child.id());
-    let leaf_path = leaf.path().to_path_buf();
-    let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
-
-    let mark = crate::log_capture::mark();
-    let abandoned = leaf.abandon_before_verdict(true, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
-
-    // The leaf's kill never wrote, so the front still runs in the leaf: end it, then the leaf.
-    child.kill().expect("kill the front");
-    child.wait().expect("reap the front");
-    let left = leaf_path.exists();
-    if left {
-        std::fs::remove_dir(&leaf_path).expect("remove the leaf the abandonment left");
-    }
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Front(crate::child::spawn::FrontFate::LeftUnreaped)
-    );
-    assert!(left, "the leaf that held the running front is left behind");
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
-    assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
-}
-
-/// Spawn `argv` as a child that leads its own group and places itself through `leaf`'s channel,
-/// reporting `Placed` (`/dev/null` stands in for `cgroup.procs`) or, with `fail`, the write's
-/// `EBADF`. `before` runs in the forked child first. Returns the child, never waited on here.
-#[cfg(target_os = "linux")]
-pub(super) fn spawn_placing(
-    leaf: &crate::containment::cgroup::CgroupLeaf,
-    argv: &[&str],
-    fail: bool,
-    stdin: std::process::Stdio,
-    stdout: std::process::Stdio,
-) -> std::process::Child {
-    use std::os::unix::process::CommandExt;
-
-    let procs_fd = if fail {
-        -1
-    } else {
-        let sink = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .expect("open /dev/null");
-        std::os::fd::IntoRawFd::into_raw_fd(sink)
-    };
-    let slot = leaf.placement_slot();
-    let mut cmd = std::process::Command::new(argv[0]);
-    cmd.args(&argv[1..]).stdin(stdin).stdout(stdout).process_group(0);
-    // SAFETY: the closure runs between fork and exec, and makes only async-signal-safe calls on
-    // descriptors this test and `leaf` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot)) };
-    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
-    if procs_fd >= 0 {
-        // SAFETY: the parent's own copy, closed once.
-        unsafe { libc::close(procs_fd) };
-    }
-    child
 }
 
 /// An intent names its child by a number alone, which `std` may have freed by reaping it. Given no
@@ -2989,88 +2637,6 @@ fn an_abandonment_without_a_child_repeated_is_a_breach() {
     );
 }
 
-/// A child that named itself always has its pidfd in the parent (the handshake's go-ahead comes
-/// only once the parent holds it), so a `Prepared` asked to answer for a named child with no
-/// handle is a breach of that contract, which debug builds assert.
-///
-/// Mutant: the answer is `Ended`, or given silently.
-#[cfg(all(target_os = "linux", feature = "tokio", debug_assertions))]
-#[skuld::test]
-#[should_panic(expected = "named itself")]
-fn abandoning_a_named_child_with_no_handle_is_a_breach() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-named-no-handle");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // SAFETY: the leaf's channel is open.
-    unsafe {
-        leaf.placement_slot()
-            .send(crate::containment::cgroup::TAG_INTENT, std::process::id() as i32)
-            .expect("send an intent");
-    }
-    let mut prepared = crate::containment::Prepared {
-        mode: Some(crate::containment::ContainMode::Strongest),
-        is_root: true,
-        cgroup_leaf: Some(leaf),
-        teardown_warn_after: None,
-    };
-
-    prepared.abandon_before_verdict(false, None);
-}
-
-/// An abandoned child whose placement failed is killed as the process group it leads: what it
-/// forked after `exec` is in that group, outside the leaf, so only the group kill can end the
-/// descendant, which holds the child's stdout: reading it to EOF proves both dead. The descendant
-/// is a `cat` blocked on a stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
-/// real signal. The shell is ended by its own pidfd kill either way, so only the group kill ends
-/// the `cat`: a byte written after the abandonment returns is not echoed if the group kill reached
-/// it.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_child_is_killed_with_the_group_it_leads() {
-    use std::io::{BufRead, Read};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-group");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut child = spawn_placing(
-        &leaf,
-        &["/bin/sh", "-c", "exec 3<&0; cat <&3 3<&- & echo forked; wait"],
-        true,
-        std::process::Stdio::piped(),
-        std::process::Stdio::piped(),
-    );
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    stdout.read_line(&mut line).expect("read the child's line");
-    assert_eq!(
-        line, "forked\n",
-        "the descendant must exist before the spawn is abandoned"
-    );
-    let pidfd = pidfd_of(child.id());
-    drop(child);
-
-    let abandoned = leaf.abandon_before_verdict(false, (pidfd, Past::Clean), &mut crate::containment::cgroup::NoWarn);
-    assert_eq!(
-        abandoned,
-        crate::containment::cgroup::Abandoned::Ended(ChildFate::Reaped)
-    );
-    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
-    drop(stdin);
-
-    let mut rest = Vec::new();
-    stdout
-        .read_to_end(&mut rest)
-        .expect("read to EOF: every process holding stdout is dead");
-    assert!(
-        rest.is_empty(),
-        "the descendant echoed a byte written after drop(leaf) — the group kill failed to reach \
-         it in time, got {rest:?}"
-    );
-}
-
 /// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
 /// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
 #[cfg(target_os = "linux")]
@@ -3101,7 +2667,7 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &Group) {
     // Placed: killed through, drained, swept. Nothing received: swept without a kill.
     for placed in [true, false] {
-        let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
+        let leaf = crate::containment::cgroup::try_create_leaf(None).expect("a delegated cgroup v2 leaf");
         let leaf_path = leaf.leaf_path.clone();
         std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
         if placed {
@@ -3355,7 +2921,7 @@ fn cgroup_terminate_warns_once_when_the_id_cannot_be_read_and_a_member_is_unsign
     #[fixture(cgroup)] _group: &Group,
 ) {
     crate::log_capture::install();
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let leaf_name = leaf_name_of(&leaf);
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
     let mark = crate::log_capture::mark();
@@ -3392,7 +2958,7 @@ fn real_leaf_with_members(
 ) {
     use std::os::unix::process::CommandExt;
 
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let members = (0..n)
         .map(|_| {
             // Each member reports through its own channel: the leaf's carries one report.
@@ -3471,7 +3037,7 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_reports_a_leaf_listing_only_pid_zero(#[fixture(cgroup)] _group: &Group) {
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let result = leaf.terminate_listed("0\n");
     drop(leaf);
     assert!(
@@ -3768,7 +3334,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
 #[skuld::test]
 fn cgroup_terminate_reports_a_listed_line_that_is_no_pid(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
+    let leaf = crate::containment::cgroup::try_create_leaf(None).expect("create a real leaf");
     let leaf_name = leaf_name_of(&leaf);
     let mark = crate::log_capture::mark();
     let result = leaf.terminate_listed("abc\n");

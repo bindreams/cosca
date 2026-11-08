@@ -5,9 +5,6 @@
 
 use std::io::Read as _;
 
-#[cfg(feature = "tokio")]
-use super::Console;
-
 /// A session root `sh` that leaves a member in its group, says `started`, and blocks holding neither
 /// the member's stdin nor stderr. The member reads stdin through fd 3 (`sh` points a background
 /// job's stdin at `/dev/null` otherwise) and, at its end of file, says `survived` on stderr. The
@@ -65,17 +62,6 @@ impl Member {
         crate::child::spawn::fault::release_when_a_teardown_waits(&self.root_release)
     }
 
-    /// Releases the member once a cgroup leaf's drain is about to block, so a leaf whose kill sent
-    /// nothing drains with the member saying `survived`, and the member assertion fails instead of
-    /// the drain hanging. A kill that reached the member is already pending, so it always beats
-    /// the release. A kill's delivery is not awaited, so the seam must not fail on its own: the
-    /// drain of a leaf the kill just emptied can reach it too. Keep the guard through the teardown.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn release_when_the_drain_blocks(&self) -> crate::oneshot_hook::Armed {
-        let stdin = std::rc::Rc::clone(&self.stdin);
-        crate::containment::cgroup::fault::set_before_drain_block(move || drop(stdin.take()))
-    }
-
     /// Closes the member's stdin and reads its stderr to the end. A member still running ends at that
     /// end of file and says `survived`; one already sent a fatal signal never runs again, and says
     /// nothing. Neither waits on a signal's delivery. The root's writer is released too, whatever
@@ -127,38 +113,4 @@ pub(crate) fn await_started(mut stdout: crate::PipeReader) {
     let mut started = [0u8; 8];
     stdout.read_exact(&mut started).expect("read `started`");
     assert_eq!(&started, b"started\n");
-}
-
-/// The sync `ROOT_WITH_A_MEMBER`, its root blocked on fd 4 instead of sleeping: it exits `0` once the
-/// writer of that pipe is dropped, which the member's stdin does not share.
-#[cfg(feature = "tokio")]
-const RELEASABLE_ROOT_WITH_A_MEMBER: [&str; 3] = [
-    "sh",
-    "-c",
-    "exec 3<&0; (cat <&3 3<&- >/dev/null && echo survived >&2) & echo started; exec cat <&4 4<&- 3<&- >/dev/null 2>/dev/null",
-];
-
-/// The sync `root_with_a_member`'s twin with the containment `contain` sets, and the writer whose drop
-/// ends its root with status `0`; drop it right after the kill.
-#[cfg(feature = "tokio")]
-pub(crate) fn releasable_root_with_a_member_contained(
-    contain: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, Member, crate::PipeWriter) {
-    let (stdio, started, member) = Member::pipes();
-    let child = {
-        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        cmd.args(RELEASABLE_ROOT_WITH_A_MEMBER);
-        cmd.fd(4, stdio.release).expect("set the root's release pipe");
-        contain(&mut cmd);
-        cmd.stdin(stdio.stdin).expect("set stdin");
-        cmd.stdout(stdio.stdout).expect("set stdout");
-        cmd.stderr(stdio.stderr).expect("set stderr");
-        cmd.spawn().expect("spawn")
-    };
-    await_started(started);
-    let release = member
-        .root_release
-        .take()
-        .expect("the root's release writer is still held");
-    (child, member, release)
 }

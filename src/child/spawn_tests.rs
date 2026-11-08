@@ -8,6 +8,7 @@
 
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
+use super::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
@@ -325,7 +326,7 @@ fn spawn_unelevated_runs_a_plain_child() {
     #[cfg(windows)]
     c.args(["cmd", "/C", "exit 0"]);
     let kill_on_drop = c.kill_on_drop_flag();
-    let child = super::spawn_unelevated(&mut c, kill_on_drop).expect("spawn");
+    let child = super::spawn_unelevated(&mut c, kill_on_drop, SpawnPolicy::SYNC).expect("spawn");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -641,7 +642,7 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         attach_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
-        let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+        let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
         if commit {
             child = child.commit_kill_on_drop().expect("commit");
         }
@@ -676,7 +677,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm().expect("disarm");
 
@@ -747,7 +748,7 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
 
     let mark = crate::log_capture::mark();
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -782,7 +783,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.attached.disarm().expect("disarm");
 
@@ -1061,7 +1062,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1097,7 +1098,7 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1137,7 +1138,7 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
     let pid = child.pid();
     let mark = crate::log_capture::mark();
     let unsure = child

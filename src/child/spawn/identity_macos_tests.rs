@@ -547,7 +547,7 @@ fn macos_fdmarker_attach_reads_nothing_by_pid() {
 /// [`teardown_after_attach_failure`](super::teardown_after_attach_failure) of `child`, as a spawn
 /// that read the current process's identity (a stand-in: the test cannot read a reaped child's).
 fn teardown(child: std::process::Child, unique: u64) -> crate::error::ChildFate {
-    super::teardown_after_attach_failure(child, unique, Some(crate::identity::ProcessId::current()))
+    super::teardown_after_attach_failure(child, unique, Some(crate::identity::ProcessId::current()), None)
 }
 
 /// A `std` blocker, its stdin writer, and its unique id.

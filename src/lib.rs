@@ -17,15 +17,16 @@
 //!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
 //!   [`Error::Io`](error::Error::Io) naming the syscall (an identity read that meets one is
 //!   unknown, and a member of a process group whose pidfd cannot be opened is not signalled).
-//!   `ProcessId::current` panics on either. `main` does not require a pidfd
-//!   at spawn yet ([#341](https://github.com/bindreams/cosca/issues/341)).
+//!   `ProcessId::current` panics on either. A spawn probes `pidfd_open` before it forks, and the
+//!   child then opens a pidfd on itself and hands it to the parent before it runs the program, so
+//!   no child exists without one.
 //! - On Linux 6.9 and newer pidfds have an inode of their own, one per process and never reused,
 //!   which is a process's identity: `pidfd_open` by pid, then `fstat`, with no `/proc`. Before 6.9
 //!   the identity is the `starttime` in `/proc/<pid>/stat`. cosca finds out which by asking the
 //!   pidfd's filesystem, and never parses a kernel version.
-//! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
-//!   leaf reaps that way; an owned child's waits and reaps still go by pid
-//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - `waitid(P_PIDFD)` needs 5.4, and is how an owned child is waited for and reaped, by its
+//!   pidfd and not its pid. The one by-pid wait is std's own, inside a spawn that fails after the
+//!   fork.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
 //!   checked `/proc` view uses it to read a process's start time and to list processes. Before
 //!   Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
@@ -154,8 +155,6 @@ mod os_process;
 #[cfg(unix)]
 mod above_stdio;
 
-#[cfg(feature = "tokio")]
-mod bounded;
 #[cfg(all(test, unix))]
 mod send_log;
 mod signal;

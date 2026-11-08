@@ -56,9 +56,9 @@ async fn macos_a_teardown_after_a_failed_attach_warns_once_past_its_threshold() 
     assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
 }
 
-/// The teardown after an identity read that found the child gone (`ProcSource::reap_now`).
+/// The teardown after an identity read that found the child gone.
 ///
-/// Mutant: `reap_now` waits with no warn.
+/// Mutant: the identity arm hands its teardown no threshold.
 #[skuld::test]
 async fn macos_a_teardown_after_a_vanished_identity_warns_once_past_its_threshold() {
     let (fate, warns) = teardown_with_forced_looks(SpawnPoint::BeforeIdentity, fault::set_force_identity_vanished);

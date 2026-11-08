@@ -5,6 +5,8 @@ use super::is_nested;
 use crate::test_child::Console;
 #[cfg(unix)]
 use crate::test_groups::setuid;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// Without the marker the process is the root (not nested).
 #[skuld::test]
@@ -155,8 +157,6 @@ fn nested_attach_is_delegated() {
             is_root: false, // nested member
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
-            #[cfg(all(target_os = "linux", feature = "tokio"))]
-            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1568,6 +1568,40 @@ fn attached_fd_marker_is_actionable() {
     assert!(Attached::FdMarker(marker).is_actionable());
 }
 
+/// The leaf `prepare` creates for a contained Linux root holds the warn threshold its spawn's
+/// policy gave it, for the waits of its own teardown (the cgroup lane: a leaf is a real directory).
+///
+/// Mutants: `prepare` hands `try_create_leaf` no threshold; `try_create_leaf` or `create_leaf_under`
+/// stores none.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn prepare_creates_the_leaf_with_its_spawns_warn_threshold(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::{ContainMode, ContainRequest, Nesting};
+
+    let threshold = std::time::Duration::from_millis(1234);
+    let mut cmd = std::process::Command::new("true");
+    let prepared = super::prepare(
+        &mut cmd,
+        &mut crate::child::spawn::in_child::InChild::default(),
+        &ContainRequest {
+            mode: Some(ContainMode::Strongest),
+            nesting: Nesting::Mark,
+        },
+        &crate::command::flags::FlagsRequest::default(),
+        &[],
+        false,
+        &[],
+        Some(threshold),
+    )
+    .expect("prepare is infallible off Windows");
+
+    let leaf = prepared
+        .cgroup_leaf
+        .as_ref()
+        .expect("a contained Linux root gets a leaf");
+    assert_eq!(leaf.warn().0, Some(threshold));
+}
+
 /// `prepare` must thread the caller's reserved child fds through to the placement, or a user
 /// fd mapping would dup2 over the marker in the child.
 #[cfg(target_os = "macos")]
@@ -1588,6 +1622,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
         &[3, 4, 5, 6, 7, 8, 9, 10],
         false,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
@@ -1623,6 +1658,7 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
         &[],
         false,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
@@ -1645,6 +1681,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
         &[],
         true,
         &[],
+        None,
     )
     .expect("prepare is infallible off Windows");
     assert!(
@@ -1809,8 +1846,6 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         mode: Some(crate::containment::ContainMode::Strongest),
         is_root: true,
         cgroup_leaf: Some(leaf),
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        teardown_warn_after: None,
     };
     super::attach_tree(
         std::process::id(),
