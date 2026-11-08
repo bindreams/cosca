@@ -44,6 +44,8 @@ async fn a_teardown_future_dropped_at_its_wait_settles_as_a_drop_does() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    #[cfg(unix)]
+    let pid = child.pid();
     child.inner.proc.script_over(|f| f.reaps([ReapAnswer::Running]));
     let mut teardown = Box::pin(child.tear_down_awaiting());
 
@@ -51,7 +53,55 @@ async fn a_teardown_future_dropped_at_its_wait_settles_as_a_drop_does() {
     assert!(first.is_pending(), "the teardown waits for the root");
     drop(teardown);
 
-    assert_eq!(id.is_alive(), Liveness::Dead, "the dropped teardown reaped the root");
+    assert_eq!(id.is_alive(), Liveness::Dead, "the dropped teardown ended the root");
+    // A killed root that nobody reaped reads as dead too: it is the reap that says it was settled.
+    #[cfg(unix)]
+    assert_eq!(
+        crate::child::front_kill_tests::reap(pid),
+        None,
+        "the dropped teardown reaped the root"
+    );
+}
+
+/// `wait` closes the untaken stdin before it waits, so a child that reads stdin to EOF can exit.
+///
+/// Mutant: `wait` leaves stdin open.
+#[skuld::test]
+async fn death_watch_wait_closes_the_untaken_stdin() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
+}
+
+/// The same when another slot merges into the stdin pipe: the merge is a copy of the child's end,
+/// so the parent's end is still the only writer and closes with the wait.
+///
+/// Mutant: the merge's resolution keeps a second parent end of the pipe open.
+#[skuld::test]
+async fn death_watch_wait_closes_an_untaken_stdin_another_slot_merges_into() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::merge(crate::Fd::STDIN)).expect("merge fd 3");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
+}
+
+/// The same beside a pipe at fd 3, which the Windows spawn carries in its own attribute list: the
+/// untaken stdin closes with the wait, beside the fd 3 pipe it leaves open.
+///
+/// Mutant: the pipes `wait` closes are not the ones the spawn made.
+#[cfg(windows)]
+#[skuld::test]
+async fn death_watch_wait_closes_the_untaken_stdin_beside_an_fd_3_pipe() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_out()).expect("fd 3 pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    child.wait().await.expect("the child ends on the EOF wait made");
 }
 
 /// A teardown future dropped by an unwind (a sibling branch panicked) does not block on the root: it
@@ -155,6 +205,34 @@ mod leaf_drain {
         assert_eq!(fate, crate::error::ChildFate::Reaped);
         assert!(unreaped.is_none());
         assert!(!leaf.fake.leaf.exists(), "the drained leaf is removed");
+    }
+
+    /// A drain that cannot be watched is left to the leaf's drop: the teardown ends, says at debug
+    /// that it did not wait, and the leaf's own drop reports the leaf left behind. The leaf's
+    /// `cgroup.events` is unreadable as a state, so neither wait for the drain can run.
+    ///
+    /// Mutant: the awaited drain's failure ends the teardown with an error, or is not said.
+    #[skuld::test]
+    async fn a_teardown_whose_leafs_drain_cannot_be_watched_leaves_it_to_the_drop() {
+        crate::tokio::test_runtime::assert_current_thread();
+        crate::log_capture::install();
+        let leaf = UndrainedLeaf::new("cosca-awaited-unwatchable");
+        // The leaf is never removed: nothing it holds drains.
+        leaf_fault::set_rmdir_hook(|_| Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
+        let (mut child, stdin) = leaf.spawn();
+        drop(stdin);
+        child.wait().await.expect("the blocker ends at EOF");
+        std::fs::write(&leaf.fake.events, "garbled\n").expect("garble cgroup.events");
+        let mark = crate::log_capture::mark();
+
+        let (fate, unreaped) = child.tear_down_awaiting().await;
+
+        assert_eq!(fate, crate::error::ChildFate::Reaped);
+        assert!(unreaped.is_none());
+        let said = crate::log_capture::records_since(mark, "its leaf's drain cannot be watched");
+        assert_eq!(said.len(), 1, "{said:?}");
+        let warned = crate::log_capture::records_since(mark, "its drain could not be watched");
+        assert_eq!(warned.len(), 1, "the leaf's drop reports it left behind: {warned:?}");
     }
 
     /// A front behind a closed gate: the leaf is killed through and its drain awaited, then the front

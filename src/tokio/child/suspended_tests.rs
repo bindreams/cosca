@@ -241,6 +241,31 @@ mod on_windows {
         }
     }
 
+    /// The frozen spawn is the async spawn: its child carries the async policy, as a plain async
+    /// spawn's does (`the_async_spawn_hands_its_child_the_async_policy`).
+    ///
+    /// Mutant: the frozen spawn hands `spawn_frozen` the sync policy.
+    #[skuld::test]
+    async fn a_frozen_child_carries_the_async_policy() {
+        use crate::child::owned::unreaped::DropKind;
+        use crate::child::spawn::policy::SpawnPolicy;
+
+        let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
+        for raw in BACKENDS {
+            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+
+            assert_eq!(
+                frozen.child.inner.policy,
+                SpawnPolicy {
+                    teardown_warn_after: Some(std::time::Duration::ZERO),
+                    unreaped_drop: DropKind::LetGo,
+                },
+                "raw={raw}"
+            );
+            end(frozen.resume().expect("resume")).await;
+        }
+    }
+
     #[skuld::test]
     async fn id_recorded_while_frozen_equals_the_resumed_childs_id() {
         for raw in BACKENDS {

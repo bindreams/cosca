@@ -799,6 +799,53 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     _ = child.kill_tree();
 }
 
+// `TreeWalk` has no drain edge to observe, so the grace-wait of `graceful_shutdown_tree` watches the
+// root alone. Here the root has exited and been waited for: the watch must resolve at once, not
+// spend the grace.
+//
+// Mutant: the driver does not return early and enters its wait on a still-alive target. Killed by
+// `armed_probe`, held across the `.await`.
+// Mutant: the `TreeWalk` arm never reaches the driver (e.g. hollowed to `sleep(grace)`). Killed by
+// the paused clock not moving across the call: any expiring tokio timer advances it.
+#[cfg(windows)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited() {
+    const GRACE: Duration = Duration::from_secs(30);
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+    });
+    assert_eq!(
+        child.containment(),
+        crate::Containment::TreeWalk,
+        "the subject must be the mechanism that has no drain edge to watch"
+    );
+    child.kill().expect("kill");
+    // Released only after the kill, so a no-op kill fails `assert_killed`.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap"));
+
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    // Held across the `.await` below: `cancellable_blocking` reads THIS thread's installed observer
+    // before dispatching to its blocking-pool thread — see `armed_probe`'s own doc.
+    let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);
+
+    let before = ::tokio::time::Instant::now();
+    let outcome = child.graceful_shutdown_tree(GRACE).await;
+    assert_eq!(
+        ::tokio::time::Instant::now() - before,
+        Duration::ZERO,
+        "the root-only watch must never advance the virtual clock — any use of `tokio::time` \
+         (a hollowed-out grace-wait sleeping the grace instead of watching the process, for \
+         instance) would move it, whether or not `armed_probe` below also caught it: {outcome:?}"
+    );
+    assert!(
+        armed_rx.try_recv().is_err(),
+        "the root-only watch must never genuinely enter its real wait on a still-alive target — \
+         a real wait call may fire (an already-exited handle can still resolve and return \
+         instantly), but it must never be armed against a live one"
+    );
+}
+
 // The pid guard must not swallow the refusals that never address a pid. An uncontained Windows
 // child records `GracefulMechanism::None` — permanent and pid-independent — so it must keep
 // answering `Unsupported` (what its own doc promises, and what the sync mirror returns for the

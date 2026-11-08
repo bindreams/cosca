@@ -247,6 +247,8 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
 /// Mutants: `wait_killed_elevated` waits with no warn; the cleanup's root kill sends nothing.
 #[skuld::test]
 async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
+    // The spawn reads the warn threshold into the child's policy, so it is set before the spawn.
+    let _warn = crate::tokio::warn_slow_teardowns();
     let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
     let pid = child.pid();
     let tracer = foreign_tracer::spawn_helper(pid);

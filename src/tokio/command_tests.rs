@@ -27,6 +27,22 @@ fn run_to_completion_futures_are_send() {
     assert_send(cmd.read());
 }
 
+/// Outside a runtime, a tokio spawn is refused before anything is made: the failure says the program
+/// did not start, and no child is made to be reaped.
+///
+/// Mutants: the refusal answers that the program may have started; the check is gone (the sync
+/// spawn then succeeds).
+#[skuld::test]
+fn a_spawn_outside_a_runtime_did_not_start_the_program() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    let refused = match crate::tokio::spawn::spawn(&mut cmd.inner) {
+        Ok(child) => panic!("no runtime, no spawn, got a child {}", child.pid()),
+        Err(refused) => refused,
+    };
+    assert!(matches!(refused.expect_not_started(), crate::error::Error::Io(_)));
+}
+
 /// The graceful futures are `Send`, so a caller can `tokio::spawn` them: neither the look at the
 /// root's group nor the hold that keeps its reaps off is in the future's state.
 ///
@@ -147,23 +163,22 @@ async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     drop(writer);
 }
 
-/// A teardown whose kill is refused hands the child back as an [`Unreaped`](crate::Unreaped), as the
-/// sync helpers do, and warns once in the words of a teardown, not of a drop. The refusal is stated
-/// to the child's process (`FakeProcess`) over the real one.
-///
-/// Mutants: the child is left, not handed back; the fate is not `Running`; the warn is prefixed
-/// `Child::drop`.
-#[cfg(unix)]
-#[skuld::test]
-async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_and_warns() {
+/// A child whose teardown after a failed run had its kills refused, handed back as the caller gets it,
+/// with the child's id, its stdin writer, and the log mark from before the teardown. The refusals are
+/// stated to the child's process (`FakeProcess`) over the real one: the teardown's kill, then the
+/// one a let-go drop makes.
+async fn handed_back_after_refused_kills() -> (
+    crate::Unreaped,
+    crate::identity::ProcessId,
+    crate::tokio::ChildStdin,
+    usize,
+) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut child, writer) = held_blocker(true);
+    let (mut child, writer) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
-    child
-        .inner
-        .proc
-        .script_over(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]));
+    let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    child.inner.proc.script_over(|f| f.signals([refused(), refused()]));
     let mark = crate::log_capture::mark();
 
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child).await;
@@ -177,6 +192,18 @@ async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_an
         panic!("expected a handed-back child, got {error:?}");
     };
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
+    (*unreaped, id, writer, mark)
+}
+
+/// A teardown whose kill is refused hands the child back as an [`Unreaped`](crate::Unreaped), as the
+/// sync helpers do, and warns once in the words of a teardown, not of a drop.
+///
+/// Mutants: the child is left, not handed back; the fate is not `Running`; the warn is prefixed
+/// `Child::drop`.
+#[skuld::test]
+async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_and_warns() {
+    let (unreaped, id, writer, mark) = handed_back_after_refused_kills().await;
+
     assert_eq!(unreaped.pid(), Some(id.pid()));
     let warns = crate::log_capture::records_since(mark, "handed back to the caller");
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -189,6 +216,26 @@ async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_an
     // The child exits once its stdin closes, and the caller settles what it was handed.
     drop(writer);
     unreaped.wait_async().await.expect("the child exits on EOF");
+}
+
+/// What the handed-back child is, when its caller drops it, is the async spawn's: it is let go, not
+/// waited for. The child's stdin closes first, so a drop that waited would end rather than hang; the
+/// line it logs says which it was.
+///
+/// Mutant: the hand-back builds its `Unreaped` with the sync drop kind.
+#[skuld::test]
+async fn the_child_a_failed_async_run_hands_back_is_let_go_when_dropped() {
+    let (unreaped, _id, writer, mark) = handed_back_after_refused_kills().await;
+    drop(writer);
+
+    drop(unreaped);
+
+    let said = crate::log_capture::records_since(mark, "dropped without wait or leak");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        !said[0].contains("waited for it"),
+        "a let-go drop does not wait for the child: {said:?}"
+    );
 }
 
 /// Async twin of the sync `a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend`.
