@@ -121,22 +121,6 @@ pub(crate) fn reuser_id(
     crate::identity::Resolved::Found(if same_tick { id } else { id.with_other_value() })
 }
 
-/// [`sigusr1_and_wait`] without consuming the exit: sends `SIGUSR1`, then waits on a pidfd until the
-/// reuser is a zombie, and peeks with `WNOWAIT`. Returns the signal it died of.
-#[cfg(feature = "tokio")]
-pub(crate) fn sigusr1_and_peek(reuser: &Child) -> Option<i32> {
-    let pidfd = pidfd_open(pid_of(reuser.id()), PidfdFlags::empty()).expect("pidfd_open the reuser");
-    signal_usr1(reuser);
-    wait_pollin(pidfd.as_fd());
-    let record = waitid(
-        WaitId::PidFd(pidfd.as_fd()),
-        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-    )
-    .expect("peek the reuser's exit")
-    .expect("the reuser has exited");
-    record.terminating_signal()
-}
-
 /// Sends `SIGUSR1` to `reuser` and returns the signal it died of. The first fatal signal fixes the
 /// status, so anything that signalled it earlier shows here.
 pub(crate) fn sigusr1_and_wait(mut reuser: Child) -> Option<i32> {

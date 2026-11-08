@@ -72,8 +72,6 @@ pub(crate) fn wait_process_or_cancel(
     deadline: Option<Instant>,
     cancel: &OwnedHandle,
 ) -> Result<bool, Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a process to exit or be cancelled");
     let handle = HANDLE(process.as_raw_handle());
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's

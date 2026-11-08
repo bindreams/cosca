@@ -107,8 +107,8 @@ async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
 }
 
 /// Linux 6.9+: the drop reads the reaped root's group through its pidfd, finds it empty and says
-/// nothing at warn. The same drop below 6.9 is `drop_after_terminate_tree_and_wait_still_warns`
-/// in `src/tokio/child_drop_reaped_tests.rs`, which refuses the flag: `tests/` cannot.
+/// nothing at warn. The library's own tests cover this, since they can refuse the flag and `tests/`
+/// cannot.
 #[cfg(feature = "tokio")]
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -357,18 +357,13 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 // The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
 
 #[cfg(feature = "tokio")]
-/// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`.
-///
-/// Unix-only, unlike its sync counterpart. The sync `Child` pins its pid for its whole life
-/// through `OwnedChild`, which is what makes the already-exited answer `Ok`. The async `Child`
-/// does not: `wait()` drops the guard holding the Windows process handle, so there the same call
-/// is refused rather than answered `Ok` — a pid this handle no longer pins is not one a console
-/// control event may be addressed to.
-#[cfg(unix)]
+/// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`. The async `Child` pins
+/// its pid for its whole life, as the sync one does, so the already-exited answer is `Ok` on
+/// Windows too.
 #[skuld::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
-    let (mut child, sock) = common::spawn_control_async("control-block", &["R"], true).await;
+    let (mut child, sock) = common::spawn_control_async_on_console("control-block", &["R"], true).await;
     // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
     common::kill_tree_release_reap_async(&mut child, sock).await;
     child.terminate().expect("already-dead must be Ok");
@@ -396,15 +391,9 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         "contained: the two mirrors disagree"
     );
     // The mechanism is only half of it: the two mirrors must also refuse for the same REASON.
-    // Reaped first — the async backend releases the Windows process handle there, which is
-    // exactly where a pid-scoped refusal that also swallowed the pid-INDEPENDENT ones would
-    // start answering something the sync side never answers. Uncontained on purpose: a contained
-    // child's two surfaces legitimately diverge after a reap (the sync handle still pins the pid
-    // and answers `Ok`; the async one no longer does and refuses), which
-    // `windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped` pins. Spawned through
-    // `args` alone rather than the `executable()` helper above, which is load-bearing: an
-    // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
-    // its whole life, so no released pin could be observed through it at all.
+    // Reaped first: that is where a pid-scoped refusal that also swallowed the pid-INDEPENDENT
+    // ones would start answering something the sync side never answers. Uncontained on purpose,
+    // as the contained pair is compared above.
     //
     // Each child blocks on a piped stdin this test holds and releases right after the `kill()`: a
     // `kill()` that did nothing exits 0 and fails `assert_killed`.

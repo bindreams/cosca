@@ -114,9 +114,9 @@ impl Command {
     /// Contain the child's tree with the strongest available mechanism. See
     /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
     ///
-    /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
-    /// reaped, without reporting its pid. On Linux the spawn's pidfd kills and reaps the root, and
-    /// a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
+    /// A spawn that fails after forking the child tears it down, as the sync
+    /// [`Command::spawn`](SyncCommand::spawn) does. On Linux the spawn's pidfd kills and reaps the
+    /// root, and a child contained in a cgroup leaf ([`Containment::CgroupV2`](crate::Containment::CgroupV2))
     /// is killed with its leaf. On Linux 6.9+ a process-group or session root's whole group is
     /// killed too, through the root's pidfd, while the group has a member, whoever reaped the root.
     /// Below 6.9 the root alone is killed, and a `warn` says the group's members may be left
@@ -202,13 +202,14 @@ impl Command {
     ///
     /// # Runtime
     ///
-    /// Must be called from within an IO-enabled Tokio runtime (the default `#[tokio::main]` /
-    /// `#[tokio::test]`, or a builder with `enable_io()`/`enable_all()`), which the async waits need.
-    /// Called outside any runtime, `spawn` returns [`Error::Io`](crate::error::Error::Io). On a
-    /// runtime built *without* it, tokio's behavior applies and is platform-specific — on Unix `spawn`
-    /// panics (child reaping needs the runtime driver: IO on Linux, signal on macOS), on Windows it
-    /// currently succeeds — and tokio exposes no way to preflight it, so neither can be turned into a
-    /// typed error.
+    /// Must be called from within a Tokio runtime, and one with the IO driver enabled (the default
+    /// `#[tokio::main]` / `#[tokio::test]`, or a builder with `enable_io()`/`enable_all()`) for the
+    /// child's waits and pipes. Called outside any runtime, `spawn` returns
+    /// [`Error::Io`](crate::error::Error::Io). `spawn` itself does not need the IO driver: on a
+    /// runtime built without it, the child starts, and on Unix its first wait panics if the child
+    /// is still running (the wait registers it with the reactor: IO on Linux, signal on macOS), as
+    /// taking a pipe does on any platform. tokio exposes no way to preflight
+    /// the driver, so the panic cannot be turned into a typed error.
     /// `status`/`output`/`read` and the [`run`](crate::tokio::run)/[`run_line`](crate::tokio::run_line)
     /// free functions spawn eagerly, so the same applies to them.
     ///
@@ -233,15 +234,14 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// Every error says whether the program could have started, as the sync
-    /// [`Command::spawn`](SyncCommand::spawn)'s does. Unlike it, a failed `exec` is
-    /// [`Error::MayHaveStarted`] here (see its list).
+    /// The errors are the sync [`Command::spawn`](SyncCommand::spawn)'s: this is the same spawn, and
+    /// every error says whether the program could have started.
     pub fn spawn(&mut self) -> Result<Child, Error> {
         Ok(super::spawn::spawn(&mut self.inner)?)
     }
 
     /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.inner.set_elevation_front(front);
     }
@@ -256,7 +256,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.wait().await {
             Ok(status) => Ok(status),
-            Err(e) => Err(after_the_spawn(e, &mut child).await),
+            Err(e) => Err(after_the_spawn(e, child).await),
         }
     }
 
@@ -270,7 +270,7 @@ impl Command {
         let mut child = self.spawn()?;
         match child.communicate(None).await {
             Ok(output) => Ok(output),
-            Err(e) => Err(after_the_spawn(e, &mut child).await),
+            Err(e) => Err(after_the_spawn(e, child).await),
         }
     }
 
@@ -283,7 +283,7 @@ impl Command {
         let mut child = self.spawn()?;
         let out = match child.communicate(None).await {
             Ok(out) => out,
-            Err(e) => return Err(after_the_spawn(e, &mut child).await),
+            Err(e) => return Err(after_the_spawn(e, child).await),
         };
         // `communicate` collected the exit.
         String::from_utf8(out.stdout).map_err(|e| {
@@ -295,29 +295,15 @@ impl Command {
             )
         })
     }
-
-    /// Test-only spawn variant that installs a per-instance wait observer on the resulting raw
-    /// child, so a cancellation test observes exactly THIS child's blocking wait (see the raw
-    /// backend's `WaitObserver`) rather than racing a parallel test. Routes through the normal
-    /// spawn, so the config must reach the raw backend (executable, uncontained, no fd >= 3).
-    #[cfg(all(test, windows))]
-    pub(crate) fn spawn_with_wait_observer(
-        &mut self,
-        started: ::tokio::sync::oneshot::Sender<()>,
-        outcome: ::tokio::sync::oneshot::Sender<crate::child::spawn::windows_raw::WaitOutcome>,
-    ) -> Result<Child, Error> {
-        let mut child = self.spawn()?;
-        child.install_wait_observer(started, outcome);
-        Ok(child)
-    }
 }
 
 /// The error of a run-to-completion helper that failed after its spawn: the program may have
 /// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
-/// The teardown says what became of the child.
-pub(super) async fn after_the_spawn(error: Error, child: &mut Child) -> Error {
-    let fate = child.tear_down_awaiting().await;
-    crate::child::spawn::after_the_spawn(error, fate, None, child.behind_wrapper())
+/// The teardown says what became of the child, and hands it back if it could not end it.
+pub(super) async fn after_the_spawn(error: Error, child: Child) -> Error {
+    let behind_wrapper = child.behind_wrapper();
+    let (fate, unreaped) = child.tear_down_awaiting().await;
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
 }
 
 #[cfg(test)]

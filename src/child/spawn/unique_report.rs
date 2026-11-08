@@ -551,22 +551,6 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     }
 }
 
-/// Whether `report` proves that the child of a spawn did not run the program: it refused its own
-/// id (its hook then fails before `exec`), or it died before it could report. Any other report
-/// leaves the program possibly started. Only the tokio spawn asks: std's own failed spawn proves it.
-#[cfg(any(test, feature = "tokio"))]
-pub(crate) fn proves_no_exec(report: &Report) -> bool {
-    match report {
-        Report::ChildRefused(_) | Report::Missing => true,
-        Report::Id(_)
-        | Report::Late(_)
-        | Report::Unwritten
-        | Report::ReadFailed(_)
-        | Report::WaitFailed(_)
-        | Report::BadTag(_) => false,
-    }
-}
-
 /// The error for a failed spawn: only the child's own refusal changes it, because only then did the
 /// hook fail the spawn. Any other report state keeps std's error, and is logged.
 pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {

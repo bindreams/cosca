@@ -29,12 +29,10 @@ thread_local! {
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
     static REFUSED_KILL_WRITES: Cell<u32> = const { Cell::new(0) };
     static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_PUMP_STARTS: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
     static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
@@ -153,29 +151,6 @@ pub(crate) fn kill_writes_fail() -> bool {
         REFUSED_KILL_WRITES.with(|n| n.set(n.get() + 1));
     }
     fails
-}
-
-/// A drain pump started on this thread fails to start, with `EAGAIN`, as a spawn at a thread limit
-/// does, until the guard drops.
-#[cfg(feature = "tokio")]
-pub(crate) fn fail_pump_starts() -> FailPumpStarts {
-    FAIL_PUMP_STARTS.with(|f| f.set(true));
-    FailPumpStarts(())
-}
-
-#[cfg(feature = "tokio")]
-#[must_use = "pumps start again as soon as the guard is dropped"]
-pub(crate) struct FailPumpStarts(());
-
-#[cfg(feature = "tokio")]
-impl Drop for FailPumpStarts {
-    fn drop(&mut self) {
-        FAIL_PUMP_STARTS.with(|f| f.set(false));
-    }
-}
-
-pub(crate) fn pump_starts_fail() -> bool {
-    FAIL_PUMP_STARTS.with(Cell::get)
 }
 
 /// The next `cgroup.kill` write on this thread fails with `EIO` and writes nothing; every write
@@ -963,45 +938,6 @@ pub(crate) fn set_before_state_read(hook: impl FnOnce() + 'static) -> crate::one
 }
 pub(crate) fn run_before_state_read() {
     crate::oneshot_hook::fire(&BEFORE_STATE_READ);
-}
-
-/// Where the next child forked from this thread kills itself (`SIGKILL`) in its placement hook,
-/// before it can run the program: `std`'s spawn then returns `Ok`, as for any child a signal ends
-/// before `exec`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildDeath {
-    /// Before it sends its intent: nothing names it to the leaf.
-    BeforeIntent,
-    /// After its intent, before its report.
-    BeforeReport,
-}
-
-/// While the guard lives, the next child forked from this thread — which inherits the flag — dies
-/// at `at` (see [`ChildDeath`]).
-#[cfg(feature = "tokio")]
-pub(crate) fn kill_child_at(at: ChildDeath) -> ChildDies {
-    CHILD_DIES.with(|c| c.set(Some(at)));
-    ChildDies(())
-}
-
-#[cfg(feature = "tokio")]
-#[must_use = "children live again as soon as the guard is dropped"]
-pub(crate) struct ChildDies(());
-
-#[cfg(feature = "tokio")]
-impl Drop for ChildDies {
-    fn drop(&mut self) {
-        CHILD_DIES.with(|c| c.set(None));
-    }
-}
-
-/// In a forked child: dies here if this is where it was told to (see [`kill_child_at`]).
-/// Async-signal-safe: a thread-local read, `getpid` and `kill`.
-pub(crate) fn die_if_at(at: ChildDeath) {
-    if CHILD_DIES.with(Cell::get) == Some(at) {
-        // SAFETY: `kill` and `getpid` are async-signal-safe; the child dies here.
-        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
-    }
 }
 
 /// While the guard lives, this thread reads every pidfd's cgroup id as `id`.

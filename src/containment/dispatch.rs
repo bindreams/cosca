@@ -13,11 +13,6 @@ pub(crate) struct Prepared {
     /// to the process-group mechanism.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
-    /// Set by a failed async spawn's teardown: this long into each of its waits for the leaf's
-    /// drain, a leaf dropped or abandoned here, before `attach` takes it, warns once and keeps
-    /// waiting (principle 2). The handle's armed drop warns for a leaf `attach` took.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub teardown_warn_after: Option<std::time::Duration>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
     /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
     /// process group).
@@ -100,14 +95,6 @@ impl Prepared {
         self.is_root && !taken_by_a_leaf && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
     }
 
-    /// [`group_is_containment`](Self::group_is_containment) for a spawn with no cgroup leaf, which
-    /// needs no verdict: a tokio spawn that fails after its fork has no handle on its child to take
-    /// one through. With a leaf the leaf's abandonment decides (see `kill_group_outside_leaf`).
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn leafless_group_is_containment(&self) -> bool {
-        self.cgroup_leaf.is_none() && self.group_is_containment()
-    }
-
     /// Linux 6.9+: `SIGKILL`, through `child`'s pidfd, the process group of a spawn that failed
     /// before its attach, while the group has a member. The pidfd names the group exactly, whoever
     /// reaped the root. Only a root whose group is its containment is sent it: a Session root, or a
@@ -124,65 +111,6 @@ impl Prepared {
         kill_group_through_pidfd(child.pidfd, Some(child.pid))
     }
 
-    /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
-    /// can drop one it forked — and say what became of that child. Without a leaf nothing can
-    /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
-    /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `child` is the pidfd its
-    /// handshake left for the leaf, with what the handshake expects of a teardown through it.
-    ///
-    /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
-    #[cfg_attr(
-        not(feature = "tokio"),
-        allow(
-            dead_code,
-            reason = "only the tokio spawn path can lose a handle before a verdict is settled"
-        )
-    )]
-    pub(crate) fn abandon_before_verdict(
-        &mut self,
-        front: bool,
-        #[cfg(target_os = "linux")] child: Option<(std::os::fd::OwnedFd, crate::child::owned::teardown::Past)>,
-    ) -> AbandonedChild {
-        #[cfg(target_os = "linux")]
-        if let Some(leaf) = self.cgroup_leaf.as_mut() {
-            use crate::containment::cgroup::Abandoned;
-            #[cfg(feature = "tokio")]
-            let mut warn = crate::containment::cgroup::WarnAfter(self.teardown_warn_after);
-            #[cfg(not(feature = "tokio"))]
-            let mut warn = crate::containment::cgroup::NoWarn;
-            let Some(child) = child else {
-                use crate::containment::cgroup::WithoutChild;
-                return match leaf.abandon_without_child(&mut warn) {
-                    WithoutChild::Unnamed => AbandonedChild::MaybeUnreaped,
-                    // A child that named itself has its pidfd in the handshake before it execs, so a
-                    // tokio spawn is never here with one (only a sync spawn, where `std` collected
-                    // the child, is). Not claimed ended: nothing says it was collected.
-                    WithoutChild::Named => {
-                        debug_assert!(false, "a child that named itself was abandoned with no handle");
-                        AbandonedChild::MaybeUnreachable
-                    }
-                    // A repeat is a breach too; nothing says what became of the child.
-                    WithoutChild::AlreadyAbandoned => {
-                        debug_assert!(false, "a spawn's abandonment was asked for twice");
-                        AbandonedChild::MaybeUnreachable
-                    }
-                };
-            };
-            return match leaf.abandon_before_verdict(front, child, &mut warn) {
-                Abandoned::Ended(fate) => AbandonedChild::Ended(fate),
-                Abandoned::Uncollected(clause) => AbandonedChild::Uncollected(clause),
-                Abandoned::Front(fate) => AbandonedChild::Front(fate),
-                Abandoned::Repeated => {
-                    debug_assert!(false, "a spawn's abandonment was asked for twice");
-                    AbandonedChild::MaybeUnreachable
-                }
-            };
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = front;
-        AbandonedChild::MaybeUnreachable
-    }
-
     /// Watch the elevation front `pid` this spawn forked: its cgroup leaf, if it has one, records
     /// the front's place before its removal (see `CgroupLeaf::watch_front`).
     pub(crate) fn watch_front(&mut self, pid: u32) {
@@ -193,42 +121,6 @@ impl Prepared {
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
     }
-}
-
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        if let Some(leaf) = self.cgroup_leaf.take() {
-            leaf.drop_warning(&mut crate::containment::cgroup::WarnAfter(self.teardown_warn_after));
-        }
-    }
-}
-
-/// What became of the child of a spawn that failed with no handle left on it (see
-/// [`Prepared::abandon_before_verdict`]). Only a Linux leaf tells more than `MaybeUnreachable`.
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "tokio")),
-    allow(
-        dead_code,
-        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
-    )
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AbandonedChild {
-    /// Nothing of it runs, and it is reaped or will be: its teardown collected it. Says what became
-    /// of it.
-    Ended(crate::error::ChildFate),
-    /// If it was forked, it exits before `exec`, but nothing holds its pid to reap it.
-    MaybeUnreaped,
-    /// If it was forked, it may be running where nothing can reach it.
-    MaybeUnreachable,
-    /// The handshake's pidfd reached it, but its teardown left it uncollected. Carries the
-    /// teardown's clause, for the one warn, and what its warn asserts. Only a Linux leaf produces
-    /// it.
-    Uncollected(crate::child::owned::teardown::Left),
-    /// It is an elevation front, which was sent no signal of its own, and this is what became of
-    /// it.
-    Front(crate::child::spawn::FrontFate),
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
@@ -286,14 +178,11 @@ pub(crate) enum TeardownCaller {
     /// A helper that owns the child and failed after its spawn (`Command::status`, `output`, `read`,
     /// `SuspendedChild::resume`).
     FailedRun,
-    /// A spawn's teardown of the child it holds, when its identity read or its attach fails (sync
-    /// or async), and the cleanup of a child the handshake abandons.
+    /// A spawn's teardown of the child it holds, when its identity read or its attach fails, and the
+    /// cleanup of a child the handshake abandons.
     #[cfg_attr(
-        not(any(target_os = "linux", windows, feature = "tokio")),
-        allow(
-            dead_code,
-            reason = "only the Linux and Windows spawns and the async spawn tear a child down"
-        )
+        not(any(target_os = "linux", windows)),
+        allow(dead_code, reason = "only the Linux and Windows spawns tear a child down")
     )]
     FailedSpawn,
     /// The cleanup of an elevated spawn that cannot finish.
@@ -1564,19 +1453,6 @@ impl Attached {
         }
     }
 
-    /// Give up the containment resource without waiting for anything: what an async
-    /// `Child::drop` that does not wait for the drain does with it, where a plain drop could
-    /// block. A cgroup leaf goes through `CgroupLeaf::release_without_waiting`; every other
-    /// mechanism drops in place, which is bounded.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn release_without_waiting(self) {
-        match self {
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.release_without_waiting(),
-            other => drop(other),
-        }
-    }
-
     /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
     /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
     /// checked against the concrete resource rather than the reported enum so the two can
@@ -1602,10 +1478,6 @@ impl Attached {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, Error> {
-        // Whatever the mechanism: a caller inside an async `Drop` is refused even where the
-        // mechanism has no drain edge to wait on.
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("waiting for the contained tree to drain");
         match self {
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.wait_drained(deadline),
@@ -1730,6 +1602,9 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup. On Unix, what the child
 /// does for itself between `fork` and `exec` goes into `steps`, which the caller registers.
 ///
+/// `teardown_warn_after` is the spawn policy's: the cgroup leaf made here warns once this long into
+/// each of its waits for its drain, whoever drops or abandons it (principle 2).
+///
 /// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
 /// Windows can honour.
@@ -1738,6 +1613,10 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
 /// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
 /// flags too.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each Unix platform reads its own subset of the arguments"
+)]
 pub(crate) fn prepare(
     std_cmd: &mut std::process::Command,
     #[cfg(unix)] steps: &mut crate::child::spawn::in_child::InChild,
@@ -1765,6 +1644,11 @@ pub(crate) fn prepare(
         allow(unused_variables, reason = "only the Windows path composes env ops into the request")
     )]
     env_ops: &[crate::command::EnvOp],
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup leaf waits for its drain")
+    )]
+    teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two
@@ -1803,8 +1687,6 @@ pub(crate) fn prepare(
             is_root: false,
             #[cfg(target_os = "linux")]
             cgroup_leaf: None,
-            #[cfg(all(target_os = "linux", feature = "tokio"))]
-            teardown_warn_after: None,
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
@@ -1845,8 +1727,6 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
-                        #[cfg(all(target_os = "linux", feature = "tokio"))]
-                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::None => {
@@ -1856,8 +1736,6 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
-                        #[cfg(all(target_os = "linux", feature = "tokio"))]
-                        teardown_warn_after: None,
                     });
                 }
                 UnixSetup::ProcessGroup => {
@@ -1869,7 +1747,7 @@ pub(crate) fn prepare(
             // A failed leaf creation degrades this spawn to the process group set above. The
             // decision is unchanged; only the silence is — `log_degrade` names the step that
             // failed and the kernel's reason for it.
-            let leaf = match crate::containment::cgroup::try_create_leaf() {
+            let leaf = match crate::containment::cgroup::try_create_leaf(teardown_warn_after) {
                 Ok(leaf) => Some(leaf),
                 Err(e) => {
                     crate::containment::cgroup::log_degrade(&e);
@@ -1889,16 +1767,12 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
-                #[cfg(all(target_os = "linux", feature = "tokio"))]
-                teardown_warn_after: None,
             });
         }
         return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
-            #[cfg(all(target_os = "linux", feature = "tokio"))]
-            teardown_warn_after: None,
         });
     }
 
@@ -1943,8 +1817,6 @@ pub(crate) fn prepare(
         is_root,
         #[cfg(target_os = "linux")]
         cgroup_leaf: None,
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        teardown_warn_after: None,
         #[cfg(target_os = "macos")]
         marker,
         #[cfg(windows)]
@@ -2030,7 +1902,9 @@ fn attach_tree(
                     // exited. Taking the verdict waits for that report — `spawn` returning does
                     // not mean the child has made it — then releases the leaf's fd and pipe.
                     match leaf.take_placement(child) {
-                        Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
+                        Ok(()) => {
+                            return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
+                        }
                         // Nothing of the child's is in the leaf: its final report is not Placed. The
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.

@@ -18,8 +18,7 @@ mod platform;
 ///
 /// Dropping it before `resume` kills the child, whatever
 /// [`kill_on_drop`](Command::kill_on_drop) says: a frozen child nobody can resume is a leak. That
-/// opt-out applies to the [`Child`] `resume` returns. The drop is the async [`Child`]'s: it signals
-/// and returns, and waits for nothing.
+/// opt-out applies to the [`Child`] `resume` returns. The drop is the async [`Child`]'s.
 ///
 /// If this process dies while the child is frozen, what happens to the child is what the child's
 /// containment gives (see [`Command::spawn_suspended`]).
@@ -76,7 +75,8 @@ impl SuspendedChild {
     /// `fate` says how. A child killed by something else *before* the call is this error too. On
     /// Windows the same error, with cause [`Error::Io`], is returned when the command had
     /// `kill_on_drop(false)` and the job refused the disarm. A child whose kill is refused is left
-    /// and warned, with `unreaped` `None`.
+    /// and warned, with `unreaped` `None` after a failed release, and handed back after the disarm's
+    /// refusal, as for the sync [`SuspendedChild::resume`](crate::SuspendedChild::resume).
     pub fn resume(self) -> Result<Child, Error> {
         let SuspendedChild {
             mut child,
@@ -84,18 +84,21 @@ impl SuspendedChild {
         } = self;
         match platform::release(&child) {
             Ok(()) => {
-                child.kill_on_drop = wanted_kill_on_drop;
+                child.inner.kill_on_drop = wanted_kill_on_drop;
                 child.commit_kill_on_drop().map_err(Error::from)
             }
             Err(e) => {
-                let fate = child.tear_down_now(crate::containment::dispatch::TeardownCaller::FailedRun);
+                let behind_wrapper = child.behind_wrapper();
+                let (fate, unreaped) = child
+                    .inner
+                    .tear_down_or_hand_back(crate::child::owned::teardown::Disposition::Leave);
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
                         detail: format!("could not resume the frozen child: {e}"),
                     },
                     fate,
-                    None,
-                    child.behind_wrapper(),
+                    unreaped,
+                    behind_wrapper,
                 ))
             }
         }

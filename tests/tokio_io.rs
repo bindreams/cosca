@@ -6,17 +6,6 @@ mod common;
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 use common::test_groups::{cgroup, Group};
 
-/// What a tokio spawn whose child failed before `exec` did with the child. On Linux the pidfd
-/// handshake found std had collected it; elsewhere nothing holds it, so it may be running.
-#[cfg(all(feature = "tokio", unix))]
-fn failed_exec_fate() -> cosca::error::ChildFate {
-    if cfg!(target_os = "linux") {
-        cosca::error::ChildFate::Gone
-    } else {
-        cosca::error::ChildFate::Running { id: None }
-    }
-}
-
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_spawn_status_reports_exit_code() {
@@ -28,8 +17,7 @@ async fn async_spawn_status_reports_exit_code() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_id_is_a_real_stable_identity() {
-    // id() returns the stored ProcessId — a real, resolvable identity that survives wait (tokio's
-    // own Child::id() would be None after reap).
+    // id() returns the stored ProcessId — a real, resolvable identity that survives wait.
     use std::io::Write as _;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     let id = child.id().expect("the spawn read the child's identity");
@@ -195,27 +183,46 @@ fn async_spawn_outside_runtime_errors() {
     assert!(matches!(err, cosca::error::Error::Io(_)), "got {err:?}");
 }
 
-// An IO-disabled runtime is tokio's business and platform-specific (we cannot preflight it, so we
-// pin the actual behavior — see `Command::spawn`'s Runtime docs).
+// The async child's waits register with the reactor, so on Unix the spawn succeeds on a runtime
+// without the IO driver and the child's first wait panics, as tokio does. The child is still torn
+// down by its drop (see `Command::spawn`'s Runtime docs).
 #[cfg(feature = "tokio")]
 #[cfg(unix)]
 #[skuld::test]
-fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
-    // Build the runtime OUTSIDE the observed region, so only `cmd.spawn()`'s panic — not the
+fn async_spawn_on_io_disabled_runtime_panics_at_the_first_wait_on_unix() {
+    // Build the runtime OUTSIDE the observed region, so only the wait's panic — not the
     // runtime `.build().expect()` — can satisfy this test.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build an IO-disabled current-thread runtime");
+    let pid = std::sync::atomic::AtomicU32::new(0);
+    // The blocker reads a pipe this test holds the write end of (cosca owns no stdin end, so `wait`
+    // closes none): it ends only by a kill, so the panic is the only way the wait can end.
+    let (reader, _held_open) = std::io::pipe().expect("stdin pipe");
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async {
             let mut cmd = common::tokio_command(common::Console::Hidden);
-            cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
-            // The child may already be running when the spawn panics; keep it off nextest's pipes.
-            common::silence_async(&mut cmd);
-            let _ = cmd.spawn();
+            cmd.args([common::stdin_blocker_program()]);
+            cmd.stdin(cosca::Stdio::from_file(std::fs::File::from(
+                std::os::fd::OwnedFd::from(reader),
+            )))
+            .unwrap();
+            let mut child = cmd.spawn().expect("the spawn does not need the IO driver");
+            pid.store(child.pid(), std::sync::atomic::Ordering::Relaxed);
+            let _ = child.wait().await;
         })
     }))
-    .expect_err("spawning on an IO-disabled runtime must panic on Unix (child reaping needs the IO driver)");
+    .expect_err("the first wait on an IO-disabled runtime must panic on Unix (it needs the IO driver)");
+    let pid = pid.load(std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(pid, 0, "the spawn must have succeeded before the panic");
+    // Gone, not a zombie: the drop that ran as the panic unwound reaped the child. `kill(pid, 0)`
+    // sends nothing and answers `0` for a zombie too.
+    // SAFETY: signal 0 only checks that the pid exists.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert!(
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "the child must be torn down and reaped by its drop"
+    );
     // Pin tokio's specific driver-absent panic (IO driver on Linux, signal driver on macOS), not
     // merely "something, somewhere, panicked".
     let msg = payload
@@ -344,9 +351,8 @@ async fn async_drop_tears_down_a_contained_tree() {
 
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
 // Windows Job Object. A cgroup does on Linux, and a process group on Linux 6.9+, through the root's
-// pidfd, and not below 6.9: both are the library's tests (`src/tokio/child_drop_reaped_tests.rs`,
-// `src/tokio/child/drop_group_exact_tests.rs`). This binary cannot reach the seams that release
-// the tree at the kill, and a drop that killed nothing waits for it for ever.
+// pidfd, and not below 6.9: both are the library's tests. This binary cannot reach the seams that
+// release the tree at the kill, and a drop that killed nothing waits for it for ever.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 #[skuld::test]
@@ -431,8 +437,8 @@ async fn async_detach_leaves_the_tree_running() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
-    // `kill_on_drop(false)` hits the async Drop early-return, so the teardown (hard_kill + the
-    // root's kill) must not run and the root stays alive. Proven by positive liveness on the
+    // `kill_on_drop(false)` disarms the drop, so the teardown (hard_kill + the root's kill) must
+    // not run and the root stays alive. Proven by positive liveness on the
     // never-signaled root (race-free, mirroring async_detach_leaves_the_tree_running).
     // UNCONTAINED on purpose: `Attached::None` isolates the early-return itself from the
     // containment resource's own drop, which
@@ -508,9 +514,9 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 
 #[cfg(feature = "tokio")]
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
-/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle never
-/// waits for a drain, so one that killed its tree removes the leaf only if the caller awaited the
-/// drain first.
+/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle that
+/// killed its tree waits for the drain on the dropping thread, so this pins the path that never
+/// blocks, where the caller awaited the drain first and the drop has nothing left to wait for.
 ///
 /// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
@@ -690,13 +696,8 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     let err = cmd
         .spawn()
         .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
-    // May have started: see `tokio::Command::spawn`'s # Errors.
-    let cosca::error::Error::MayHaveStarted { source, fate, .. } = err else {
-        panic!("expected MayHaveStarted, got {err:?}");
-    };
-    assert_eq!(fate, failed_exec_fate(), "what the failed spawn did with its child");
-    let cosca::error::Error::Io(io_err) = *source else {
-        panic!("expected an Io error (propagated via the child's error pipe), got {source:?}");
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
     };
     assert_eq!(
         io_err.raw_os_error(),
@@ -721,13 +722,8 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     let err = cmd
         .spawn()
         .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
-    // May have started: see `tokio::Command::spawn`'s # Errors.
-    let cosca::error::Error::MayHaveStarted { source, fate, .. } = err else {
-        panic!("expected MayHaveStarted, got {err:?}");
-    };
-    assert_eq!(fate, failed_exec_fate(), "what the failed spawn did with its child");
-    let cosca::error::Error::Io(io_err) = *source else {
-        panic!("expected an Io error (propagated via the child's error pipe), got {source:?}");
+    let cosca::error::Error::Io(io_err) = err else {
+        panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
     };
     assert_eq!(
         io_err.raw_os_error(),
@@ -821,15 +817,9 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     err_f.seek(SeekFrom::Start(0)).expect("seek stderr target");
     err_f.read_to_end(&mut buf).expect("read stderr target");
 
-    // May have started: see `tokio::Command::spawn`'s # Errors.
     assert!(
-        matches!(&err, cosca::error::Error::MayHaveStarted { source, .. } if matches!(**source, cosca::error::Error::Io(_))),
-        "expected an Io error inside MayHaveStarted, got {err:?}"
-    );
-    assert_eq!(
-        err.fate(),
-        Some(failed_exec_fate()),
-        "what the failed spawn did with its child"
+        matches!(err, cosca::error::Error::Io(_)),
+        "expected a plain Io error, got {err:?}"
     );
     assert!(
         buf.is_empty(),

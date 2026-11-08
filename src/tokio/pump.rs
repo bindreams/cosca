@@ -23,14 +23,15 @@ impl Child {
             return Err(error);
         }
         // Take the three streams into owned locals BEFORE the join: only `wait` then borrows
-        // `self.proc_mut()` (so the four-future join compiles). The inner wait closes no stdin; only
-        // the write future, which owns it, does.
+        // `self.inner` (so the four-future join compiles). The inner wait closes no stdin; only
+        // the write future, which owns it, does. A refusal of the reactor fails the call, whichever
+        // stream it was: an end it refused is closed, and a missing one would read as empty output.
         let mut stdin = self.stdin_or_error().map_err(Error::Io)?;
         if input.is_some() && stdin.is_none() {
             return Err(crate::child::pump::input_without_stdin());
         }
-        let mut stdout = self.stdout();
-        let mut stderr = self.stderr();
+        let mut stdout = self.stdout_or_error().map_err(Error::Io)?;
+        let mut stderr = self.stderr_or_error().map_err(Error::Io)?;
 
         let write = async {
             // A child that exits without consuming all input closes the pipe early; a BrokenPipe
@@ -70,7 +71,7 @@ impl Child {
         };
         // `wait` is the sole borrow of `self` here (already mapped to `Error`); the stream futures
         // own their taken locals, so the four-future join has no aliasing conflict.
-        let wait = async { self.proc_mut().wait().await };
+        let wait = self.inner.wait_async();
 
         let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait)?;
         Ok(Output {
