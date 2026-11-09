@@ -23,9 +23,10 @@ pub fn check_file(text: &str) -> Result<Vec<Finding>, syn::Error> {
             };
             let mut lint = Lint {
                 aliases: HashMap::new(),
+                qualified_only: true,
                 findings: Vec::new(),
             };
-            lint.scan(tokens);
+            lint.scan(tokens, " in a file read as tokens");
             return Ok(lint.findings);
         }
     };
@@ -33,6 +34,7 @@ pub fn check_file(text: &str) -> Result<Vec<Finding>, syn::Error> {
     collect.visit_file(&file);
     let mut lint = Lint {
         aliases: collect.names,
+        qualified_only: false,
         findings: Vec::new(),
     };
     lint.visit_file(&file);
@@ -103,6 +105,8 @@ impl<'ast> Visit<'ast> for Aliases {
 
 struct Lint {
     aliases: HashMap<String, Vec<String>>,
+    /// Set for a file read as tokens: its `use`s are not here, so a bare `test` may be skuld's and is not flagged.
+    qualified_only: bool,
     findings: Vec<Finding>,
 }
 
@@ -132,6 +136,9 @@ impl Lint {
     /// Whether `path` is a libtest test attribute. A first segment the file binds with `use` or `extern crate` means
     /// what it was bound to (`use skuld::test;` makes `#[test]` skuld's); an unbound one means what it says.
     fn is_libtest(&self, path: &[String]) -> bool {
+        if self.qualified_only && path.len() < 2 {
+            return false;
+        }
         match path.first() {
             Some(first) if self.aliases.contains_key(first) => is_libtest_attribute(&self.resolve(path)),
             _ => is_libtest_attribute(path),
@@ -165,12 +172,12 @@ impl Lint {
         }
     }
 
-    /// Rule 2: `#[...]` written in the tokens of a macro, which `syn` does not parse as attributes.
-    fn scan(&mut self, tokens: TokenStream) {
+    /// Rule 2: `#[...]` written in tokens `syn` does not parse as attributes. `site` says where they came from.
+    fn scan(&mut self, tokens: TokenStream, site: &str) {
         let tokens: Vec<TokenTree> = tokens.into_iter().collect();
         for (i, tree) in tokens.iter().enumerate() {
             match tree {
-                TokenTree::Group(g) => self.scan(g.stream()),
+                TokenTree::Group(g) => self.scan(g.stream(), site),
                 TokenTree::Punct(p) if p.as_char() == '#' => {
                     let mut next = i + 1;
                     if matches!(tokens.get(next), Some(TokenTree::Punct(bang)) if bang.as_char() == '!') {
@@ -179,7 +186,7 @@ impl Lint {
                     if let Some(TokenTree::Group(g)) = tokens.get(next) {
                         if g.delimiter() == Delimiter::Bracket {
                             let body: Vec<TokenTree> = g.stream().into_iter().collect();
-                            self.check_tokens(&body, " in macro tokens");
+                            self.check_tokens(&body, site);
                         }
                     }
                 }
@@ -228,7 +235,7 @@ macro_rules! scan_verbatim {
     ($($method:ident, $node:ident;)*) => {$(
         fn $method(&mut self, node: &'ast syn::$node) {
             if let syn::$node::Verbatim(tokens) = node {
-                self.scan(tokens.clone());
+                self.scan(tokens.clone(), " in a verbatim item");
             }
             visit::$method(self, node);
         }
@@ -253,7 +260,7 @@ impl<'ast> Visit<'ast> for Lint {
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        self.scan(mac.tokens.clone());
+        self.scan(mac.tokens.clone(), " in macro tokens");
         visit::visit_macro(self, mac);
     }
 

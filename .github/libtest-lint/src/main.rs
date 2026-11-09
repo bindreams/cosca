@@ -10,7 +10,8 @@
 //! libtest, or the tool could not run. Not covered: an attribute a third-party proc macro emits, one assembled with
 //! `concat!` or from a `$m:meta`, or an alias bound in one file (`pub use tokio as tk;`) and used in another. A syntax
 //! `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped. A file that is not a whole Rust file
-//! (an `include!` fragment) is lexed instead, and only its attributes are checked, without the file's `use`s.
+//! (an `include!` fragment) is lexed instead and read without the `use`s of the file that includes it, so a bare
+//! `#[test]` there may be skuld's: only `tokio::test` and the `core`/`std` prelude paths are flagged in a fragment.
 //!
 //! Run from inside the workspace; takes no arguments.
 
