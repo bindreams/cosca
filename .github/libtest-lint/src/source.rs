@@ -12,9 +12,11 @@ pub struct Finding {
     pub what: String,
 }
 
-/// Parses one file and returns what it finds. A file that is not a whole Rust file (an `include!` fragment) but still
-/// lexes is scanned as tokens, so only its attributes are seen; one that does not even lex is the parse error.
-pub fn check_file(text: &str) -> Result<Vec<Finding>, syn::Error> {
+/// Parses one file and returns what it finds. A fragment (a file another file pulls in with `include!`) is read in the
+/// includer's scope, so only its import-independent paths are flagged. A file that is not a whole Rust file but still
+/// lexes is scanned as tokens the same way, so only its attributes are seen; one that does not even lex is the parse
+/// error.
+pub fn check_file(text: &str, fragment: bool) -> Result<Vec<Finding>, syn::Error> {
     let file = match syn::parse_file(text) {
         Ok(file) => file,
         Err(e) => {
@@ -34,11 +36,67 @@ pub fn check_file(text: &str) -> Result<Vec<Finding>, syn::Error> {
     collect.visit_file(&file);
     let mut lint = Lint {
         aliases: collect.names,
-        qualified_only: false,
+        qualified_only: fragment,
         findings: Vec::new(),
     };
     lint.visit_file(&file);
     Ok(lint.findings)
+}
+
+/// The files `text` names with `include!("<literal>")`, as paths relative to the workspace root. `file` is the path of
+/// `text` relative to the root, `/`-separated; a literal is resolved against its directory, as rustc does. Other
+/// arguments (`concat!(env!(..), ..)`) cannot be resolved here and are skipped, as is a text that does not lex.
+pub fn includes(file: &str, text: &str) -> Vec<String> {
+    let Ok(tokens) = text.parse::<TokenStream>() else {
+        return Vec::new();
+    };
+    let dir = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let mut found = Vec::new();
+    collect_includes(tokens, dir, &mut found);
+    found
+}
+
+fn collect_includes(tokens: TokenStream, dir: &str, out: &mut Vec<String>) {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, tree) in tokens.iter().enumerate() {
+        let TokenTree::Group(g) = tree else { continue };
+        collect_includes(g.stream(), dir, out);
+        let named = i >= 2
+            && matches!(&tokens[i - 1], TokenTree::Punct(bang) if bang.as_char() == '!')
+            && matches!(&tokens[i - 2], TokenTree::Ident(id) if id == "include");
+        if !named {
+            continue;
+        }
+        let args: Vec<TokenTree> = g.stream().into_iter().collect();
+        let [TokenTree::Literal(lit)] = args.as_slice() else {
+            continue;
+        };
+        let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) else {
+            continue;
+        };
+        if let Some(path) = join(dir, &lit.value()) {
+            out.push(path);
+        }
+    }
+}
+
+/// `dir` and `rel` joined and normalised without touching the file system; `None` for an absolute path or one that
+/// climbs out of the root.
+fn join(dir: &str, rel: &str) -> Option<String> {
+    if rel.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// Whether `path` names a libtest test attribute: `test`, `bench`, `tokio::test`, or a prelude path.

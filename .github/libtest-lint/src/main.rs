@@ -9,9 +9,9 @@
 //! Exit 0: clean. 1: a libtest attribute, an unparsable file or a path that is not UTF-8. 2: a manifest target on
 //! libtest, or the tool could not run. Not covered: an attribute a third-party proc macro emits, one assembled with
 //! `concat!` or from a `$m:meta`, or an alias bound in one file (`pub use tokio as tk;`) and used in another. A syntax
-//! `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped. A file that is not a whole Rust file
-//! (an `include!` fragment) is lexed instead and read without the `use`s of the file that includes it, so a bare
-//! `#[test]` there may be skuld's: only `tokio::test` and the `core`/`std` prelude paths are flagged in a fragment.
+//! `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped. A file that another scanned file
+//! names with `include!("<literal>")`, or that is not a whole Rust file, is read without the `use`s of its includer, so
+//! a bare `#[test]` there may be skuld's: only `tokio::test` and the `core`/`std` prelude paths are flagged in it.
 //!
 //! Run from inside the workspace; takes no arguments.
 
@@ -57,13 +57,36 @@ fn run() -> Result<ExitCode, Failure> {
         .map(|d| d.trim_end_matches('/'))
         .collect();
 
-    let mut premise = 0;
-    for member in &members {
-        let mine: BTreeSet<String> = tracked
+    let files_of = |member: &Member| -> BTreeSet<String> {
+        tracked
             .iter()
             .filter(|f| belongs(f, &member.dir, &manifest_dirs) && !excluded.iter().any(|e| under(f, e)))
             .filter_map(|f| relative(f, &member.dir).map(str::to_string))
-            .collect();
+            .collect()
+    };
+    let in_root = |member: &Member, rel: &str| {
+        if member.dir.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{}/{rel}", member.dir)
+        }
+    };
+
+    // Every file an `include!("<literal>")` of a scanned file names is a fragment. A file that cannot be read is
+    // reported by the scan below.
+    let mut fragments = BTreeSet::new();
+    for member in &members {
+        for rel in files_of(member).iter().filter(|f| f.ends_with(".rs")) {
+            let path = in_root(member, rel);
+            if let Ok(text) = std::fs::read_to_string(root.join(&path)) {
+                fragments.extend(source::includes(&path, &text));
+            }
+        }
+    }
+
+    let mut premise = 0;
+    for member in &members {
+        let mine = files_of(member);
         let manifest_path = if member.dir.is_empty() {
             "Cargo.toml".to_string()
         } else {
@@ -75,11 +98,7 @@ fn run() -> Result<ExitCode, Failure> {
             premise += 1;
         }
         for rel in mine.iter().filter(|f| f.ends_with(".rs")) {
-            let path = if member.dir.is_empty() {
-                rel.clone()
-            } else {
-                format!("{}/{rel}", member.dir)
-            };
+            let path = in_root(member, rel);
             let text = match std::fs::read_to_string(root.join(&path)) {
                 Ok(text) => text,
                 // Tracked but deleted in the working tree.
@@ -90,7 +109,7 @@ fn run() -> Result<ExitCode, Failure> {
                     continue;
                 }
             };
-            match source::check_file(&text) {
+            match source::check_file(&text, fragments.contains(&path)) {
                 Ok(fs) => {
                     for f in fs {
                         println!("{path}:{}:{}: {} (write #[skuld::test])", f.line, f.col, f.what);
