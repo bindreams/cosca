@@ -142,7 +142,6 @@ mod leaf_drain {
 
     use crate::containment::cgroup::fault as leaf_fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
-    use crate::elevation::front::Front;
     use crate::test_child::{held_blocker_async, Console};
 
     /// A fake leaf `populated 1` until [`drain`](Self::drain), under an async child's spawn.
@@ -160,12 +159,26 @@ mod leaf_drain {
 
         /// The held blocker, spawned into the leaf.
         fn spawn(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+            self.spawn_reporting(None)
+        }
+
+        /// [`spawn`](Self::spawn) as a `sudo` front: the held blocker launched by `sudo`.
+        fn spawn_front(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+            self.spawn_reporting(crate::child::front_kill_tests::sudo_report())
+        }
+
+        fn spawn_reporting(
+            &self,
+            elevation: Option<crate::elevation::ElevationReport>,
+        ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
             crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
                 containment: crate::containment::Containment::CgroupV2,
                 attached: crate::containment::Attached::Cgroup(entered_leaf_at(self.fake.leaf.clone())),
                 graceful: crate::graceful::GracefulMechanism::Process,
             });
-            held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {})
+            held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
+                cmd.set_elevation_report(elevation)
+            })
         }
 
         fn drain(&self) {
@@ -244,9 +257,8 @@ mod leaf_drain {
     async fn death_watch_a_teardown_of_a_front_behind_a_closed_gate_awaits_the_leafs_drain() {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-closed-gate");
-        let (mut child, _stdin) = leaf.spawn();
         // The fake leaf holds no member, so the gate finds no cgroup kill that reaches the front.
-        child.inner.front = Some(Front::Sudo);
+        let (child, _stdin) = leaf.spawn_front();
         let mut teardown = Box::pin(child.tear_down_awaiting());
 
         let first = poll_once(&mut teardown).await;
@@ -269,8 +281,7 @@ mod leaf_drain {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-empty-leaf");
         leaf.drain();
-        let (mut child, _stdin) = leaf.spawn();
-        child.inner.front = Some(Front::Sudo);
+        let (child, _stdin) = leaf.spawn_front();
 
         let (_fate, _unreaped) = child.tear_down_awaiting().await;
 
@@ -289,8 +300,7 @@ mod leaf_drain {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-removed-once");
         leaf.drain();
-        let (mut child, _stdin) = leaf.spawn();
-        child.inner.front = Some(Front::Sudo);
+        let (child, _stdin) = leaf.spawn_front();
         leaf_fault::record_leaf_steps();
 
         let (_fate, _unreaped) = child.tear_down_awaiting().await;

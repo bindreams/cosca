@@ -243,11 +243,14 @@ fn macos_sync_spawn_identity_with_a_refused_reread_fails_a_contained_spawn_and_e
 /// Spawns a blocker contained by `mode`, launched by `front`, whose identity re-read finds the pid
 /// holding another unique id (a reap and a reuse), so the child is `Gone`: its pid, once ended, and
 /// the warns the spawn logged.
-fn foreign_reread_warns(mode: crate::ContainMode, front: Option<crate::elevation::front::Front>) -> (u32, Vec<String>) {
+fn foreign_reread_warns(
+    mode: crate::ContainMode,
+    elevation: Option<crate::elevation::ElevationReport>,
+) -> (u32, Vec<String>) {
     crate::log_capture::install();
     let (mut cmd, _writer) = sync_blocker();
     cmd.contain_with(mode);
-    cmd.set_elevation_front(front);
+    cmd.set_elevation_report(elevation);
     let pid = Rc::new(Cell::new(0));
     let armed: Rc<RefCell<Option<uniq_fault::Forced>>> = Rc::default();
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
@@ -320,10 +323,9 @@ fn macos_sync_spawn_identity_failure_of_a_nested_root_notes_no_group() {
 /// notes no group. Mutant: the front check before the note is dropped.
 #[skuld::test]
 fn macos_sync_spawn_identity_failure_of_a_front_notes_no_group() {
-    use crate::elevation::{Backend, ElevatedVia};
-    let front = crate::elevation::front::front(Some(&ElevatedVia::Wrapped(Backend::Sudo)));
-    assert!(front.is_some(), "sudo launches a front");
-    let (_, warns) = foreign_reread_warns(crate::ContainMode::Session, front);
+    let sudo = crate::child::front_kill_tests::sudo_report();
+    assert!(sudo.as_ref().and_then(|r| r.front()).is_some(), "sudo launches a front");
+    let (_, warns) = foreign_reread_warns(crate::ContainMode::Session, sudo);
     assert!(!notes_a_group(&warns), "{warns:?}");
 }
 

@@ -402,6 +402,37 @@ mod on_windows {
         teardown.assert_reaps_killed();
     }
 
+    /// The failed resume of a frozen child reported as a launch that leaves no front does not say it
+    /// is a front's.
+    ///
+    /// Mutants: `resume` sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+    #[skuld::test]
+    fn a_failed_resume_of_a_child_without_a_front_sets_no_wrapper_flag() {
+        use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+        for via in VIAS_WITHOUT_A_FRONT {
+            let (mut cmd, writer) = held_blocker(false);
+            cmd.set_elevation_report(Some(report(via.clone())));
+            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let teardown = release_at_teardown_kill(&frozen, writer);
+            let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+
+            let err = frozen.resume().expect_err("the resume was forced to fail");
+            drop(forced);
+
+            assert!(
+                matches!(
+                    err,
+                    Error::MayHaveStarted {
+                        wrapper_elevated: false,
+                        ..
+                    }
+                ),
+                "{via:?}: {err:?}"
+            );
+            teardown.assert_reaps_killed();
+        }
+    }
+
     /// A failed resume whose teardown cannot kill the frozen child leaves it, warned, and hands
     /// nothing back: a child whose initial thread may never run would block an `Unreaped` for ever.
     ///

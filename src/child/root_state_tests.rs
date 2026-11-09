@@ -41,11 +41,19 @@ mod linux {
     use crate::ContainMode;
 
     fn session_blocker() -> (crate::Child, crate::PipeWriter) {
+        session_blocker_reporting(None)
+    }
+
+    /// [`session_blocker`] whose spawn reports `elevation`: a child launched behind that backend.
+    fn session_blocker_reporting(
+        elevation: Option<crate::elevation::ElevationReport>,
+    ) -> (crate::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::Session);
+        cmd.set_elevation_report(elevation);
         (cmd.spawn().expect("spawn"), writer)
     }
 
@@ -178,8 +186,7 @@ mod linux {
     fn an_unknown_root_behind_a_closed_front_gate_warns_once() {
         crate::log_capture::install();
         let recorder = record_kill_group();
-        let (mut child, writer) = session_blocker();
-        child.set_front(Some(crate::elevation::front::Front::Sudo));
+        let (mut child, writer) = session_blocker_reporting(crate::child::front_kill_tests::sudo_report());
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The gate's two looks at the front see it run; the read after them sees the failed peek.
@@ -319,11 +326,19 @@ mod macos {
 
     /// A tree-walk child: the walk names no marker holder, so the only sends are the root's own.
     fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
+        walked_blocker_reporting(None)
+    }
+
+    /// [`walked_blocker`] whose spawn reports `elevation`: a child launched behind that backend.
+    fn walked_blocker_reporting(
+        elevation: Option<crate::elevation::ElevationReport>,
+    ) -> (crate::Child, crate::PipeWriter) {
         let (stdin, writer) = crate::test_child::held_writer_stdin();
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdin(stdin).expect("set stdin");
         cmd.contain_with(ContainMode::TreeWalk);
+        cmd.set_elevation_report(elevation);
         (cmd.spawn().expect("spawn"), writer)
     }
 
@@ -368,9 +383,8 @@ mod macos {
     #[skuld::test]
     fn an_orphaned_root_behind_a_closed_front_gate_warns_once() {
         crate::log_capture::install();
-        let (mut child, writer) = walked_blocker();
+        let (mut child, writer) = walked_blocker_reporting(crate::child::front_kill_tests::sudo_report());
         let pid = child.pid();
-        child.set_front(Some(crate::elevation::front::Front::Sudo));
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         // The gate's two looks at the front, which see it run, then the read.

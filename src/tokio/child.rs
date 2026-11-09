@@ -94,11 +94,6 @@ impl Child {
             .await
     }
 
-    /// Is this child an elevation backend, whose elevated program may outlive it?
-    pub(crate) fn behind_wrapper(&self) -> bool {
-        self.inner.behind_wrapper()
-    }
-
     /// The child's stable identity; see [`Child::id`](crate::Child::id).
     pub fn id(&self) -> Option<ProcessId> {
         self.inner.id()
