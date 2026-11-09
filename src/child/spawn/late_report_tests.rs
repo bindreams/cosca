@@ -294,11 +294,12 @@ fn macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete() {
 /// Mutants: the front is killed; the front's note is dropped; the warn is the torn-down sentence.
 #[skuld::test]
 fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
-    use crate::elevation::{front::front, ElevatedVia};
+    use crate::elevation::ElevatedVia;
     crate::log_capture::install();
-    let front = front(Some(&ElevatedVia::MacosOsascript));
     let (mut cmd, writer) = sync_blocker();
-    cmd.set_elevation_front(front);
+    cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(
+        ElevatedVia::MacosOsascript,
+    )));
     let sent = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
     let err = {

@@ -27,9 +27,9 @@ pub struct Command {
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
-    /// The front this command's spawn leaves the caller tracking, for an elevation-derived spawn
-    /// (see [`crate::elevation::front`]): its teardown after a failed spawn must not signal it.
-    elevation_front: Option<crate::elevation::front::Front>,
+    /// What an elevation-derived spawn achieved. A failed spawn's teardown reads its front from this
+    /// before a `Child` exists; the `Child` then keeps it.
+    elevation_report: Option<crate::elevation::ElevationReport>,
     flags: FlagsRequest,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
     /// `/proc/self/fd/N`.
@@ -82,7 +82,7 @@ impl Default for Command {
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
             fd_marker_suppressed: false,
-            elevation_front: None,
+            elevation_report: None,
             held: Vec::new(),
             flags: FlagsRequest::default(),
         }
@@ -836,45 +836,8 @@ impl Command {
         self
     }
 
-    // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
-    // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
-    // (hence the non-unix dead_code allows on the setters).
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
-        self.input = CommandInput::Argv(argv);
-        self.executable = None;
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
-        self.env_ops = ops;
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_contain(&mut self, req: ContainRequest) {
-        self.contain = req;
     }
 
     /// Suppress the macOS fd marker for this spawn. Set on a REAL wrapper-spawn command
@@ -897,19 +860,45 @@ impl Command {
         self.fd_marker_suppressed
     }
 
-    /// Name the front this command's spawn leaves the caller tracking (see
-    /// [`crate::elevation::front`]). Set by the unix elevation rewrite on its derived command.
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "set only by the unix elevation rewrite; dead off unix")
-    )]
-    pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
-        self.elevation_front = front;
+    /// Record what this command's elevated spawn achieved.
+    #[cfg(test)]
+    pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.elevation_report = report;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the unix spawn teardowns"))]
-    pub(crate) fn elevation_front(&self) -> Option<crate::elevation::front::Front> {
-        self.elevation_front
+    pub(crate) fn elevation_report(&self) -> Option<&crate::elevation::ElevationReport> {
+        self.elevation_report.as_ref()
+    }
+
+    /// The one construction of the command an elevated spawn runs in this one's place: this
+    /// command's argument source is replaced by `input` and its environment by `env_ops` (each
+    /// arm sets its own, and the POSIX arms sanitize theirs), and it carries `report`.
+    ///
+    /// It carries the stdio (moved out of this command: `ResolvedStdio::File` is not `Clone`), the
+    /// cwd, containment, kill-on-drop and the creation flags. It leaves the elevation request off,
+    /// so spawning it cannot elevate again, and the executable, the held files and the fd-marker
+    /// suppression at their defaults: an elevation refuses a caller's `executable`, and only a
+    /// wrapper's command is given the others.
+    pub(crate) fn derive_for_elevation(
+        &mut self,
+        input: CommandInput,
+        env_ops: Vec<EnvOp>,
+        report: crate::elevation::ElevationReport,
+    ) -> Command {
+        Command {
+            input,
+            executable: None,
+            fds: std::mem::take(&mut self.fds),
+            env_ops,
+            cwd: self.cwd.clone(),
+            kill_on_drop: self.kill_on_drop,
+            contain: self.contain,
+            elevation: crate::elevation::ElevationRequest::default(),
+            fd_marker_suppressed: false,
+            elevation_report: Some(report),
+            flags: self.flags,
+            held: Vec::new(),
+        }
     }
 
     // ---- crate-internal accessors for the spawn engine -------------
@@ -1000,7 +989,7 @@ impl Command {
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::error::ChildFate::Reaped,
                 None,
-                child.behind_wrapper(),
+                child.front().is_some(),
             )
         })
     }
@@ -1010,9 +999,9 @@ impl Command {
 /// started, and `child` is torn down now as its drop would. The error says what became of it, and
 /// carries it when its teardown could not end it.
 fn after_the_spawn(error: Error, child: crate::Child) -> Error {
-    let behind_wrapper = child.behind_wrapper();
+    let behind_front = child.front().is_some();
     let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
-    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_front)
 }
 
 #[cfg(test)]

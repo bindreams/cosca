@@ -140,10 +140,8 @@ pub struct Child {
     /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
     pub(crate) tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
+    /// What the spawn achieved; [`Child::front`] reads the front from it.
     elevation: Option<crate::elevation::ElevationReport>,
-    /// The elevation front this child is, if any, as its spawn found it (see
-    /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
-    pub(crate) front: Option<crate::elevation::front::Front>,
     /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
     /// and anything new at `warn`
     /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
@@ -160,6 +158,7 @@ impl Child {
         pipes: BTreeMap<Fd, ParentEnd>,
         kill_on_drop: bool,
         attachment: crate::containment::Attachment,
+        elevation: Option<crate::elevation::ElevationReport>,
         policy: SpawnPolicy,
     ) -> Child {
         debug_assert!(proc.pid().is_some(), "a child's process has the pid its spawn learned");
@@ -176,17 +175,11 @@ impl Child {
             attached: attachment.attached,
             tree_killed: Default::default(),
             graceful: attachment.graceful,
-            elevation: None,
-            front: None,
+            elevation,
             #[cfg(unix)]
             reported: Vec::new(),
             policy,
         }
-    }
-
-    /// Set by the spawn, from its command (see [`Child::front`](Self#structfield.front)).
-    pub(crate) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
-        self.front = front;
     }
 
     /// The process handle, borrowed from `self`.
@@ -207,19 +200,14 @@ impl Child {
         };
         // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
         self.kill_on_drop = true;
-        let behind_wrapper = self.behind_wrapper();
+        let behind_front = self.front().is_some();
         let (fate, unreaped) = self.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
         Err(crate::child::spawn::failed_after_the_spawn(
             Error::Io(refusal),
             fate,
             unreaped,
-            behind_wrapper,
+            behind_front,
         ))
-    }
-
-    // Set by the elevation spawn arms.
-    pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {
-        self.elevation = report;
     }
 
     /// The achieved elevation state, or `None` if elevation was not requested
@@ -313,24 +301,20 @@ impl Child {
         self.wait_root(Some(crate::wait::now()), lifecycle::Orphaned::Quiet)
     }
 
-    /// Is this child an elevation backend, whose elevated program may outlive it?
-    pub(crate) fn behind_wrapper(&self) -> bool {
-        #[cfg(test)]
-        if crate::child::spawn::failure::seams::wrapper() {
-            return true;
-        }
+    /// The elevation front this child is, if any (see [`crate::elevation::front`]). The kill and
+    /// `SIGTERM` gates read it.
+    pub(crate) fn front(&self) -> Option<crate::elevation::front::Front> {
         self.elevation
             .as_ref()
-            .is_some_and(|report| report.via.program_outlives_child())
+            .and_then(crate::elevation::ElevationReport::front)
     }
 
-    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
-    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
-    pub(crate) fn is_elevated_wrapper(&self) -> bool {
-        matches!(
-            self.elevation.as_ref().map(|r| &r.via),
-            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
-        )
+    /// Whether this child's tracked process may run as another user, so a refused signal to it is
+    /// `Unkillable` (see [`ElevationReport::may_run_as_another_user`](crate::elevation::ElevationReport::may_run_as_another_user)).
+    pub(crate) fn may_run_as_another_user(&self) -> bool {
+        self.elevation
+            .as_ref()
+            .is_some_and(crate::elevation::ElevationReport::may_run_as_another_user)
     }
 
     /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike
@@ -382,7 +366,7 @@ impl Child {
         {
             self.kill_root()
                 .map(drop)
-                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
         }
     }
 
@@ -449,13 +433,13 @@ impl Child {
                 }
             }
             // Nothing is signalled after the cgroup kill: it could only be refused.
-            Gate::CgroupOnly => {
+            Gate::CgroupOnly(front) => {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
                     .hard_kill_settled(op, &self.tree_killed, &crate::containment::GroupRoot::none())
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.pid(), e))?;
-                self.cgroup_kill_reached()?;
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
+                self.cgroup_kill_reached(front)?;
                 return Ok(crate::signal::Sent::Delivered);
             }
             Gate::Closed(unkillable) => return Err(unkillable),
@@ -463,7 +447,7 @@ impl Child {
         // A plain child returns Ok(()) once exited. EPERM on an elevated wrapper child becomes
         // the typed `Unkillable`.
         self.kill_root()
-            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -471,20 +455,20 @@ impl Child {
     pub(crate) fn kill_gate(&self) -> crate::elevation::front::Gate {
         let pid = self.pid();
         crate::elevation::front::kill_gate(
-            self.front,
+            self.front(),
             pid,
             || self.root_running(),
             || self.attached.kill_reaches_across_credentials(pid, self.proc.pidfd()),
         )
     }
 
-    /// Whether a cgroup kill just written reached this child's tracked process, a front (see
+    /// Whether a cgroup kill just written reached this child's tracked process, the `front` (see
     /// [`crate::elevation::front::cgroup_kill_reached`]).
     #[cfg(unix)]
-    fn cgroup_kill_reached(&self) -> Result<(), Error> {
+    fn cgroup_kill_reached(&self, front: crate::elevation::front::Front) -> Result<(), Error> {
         let pid = self.pid();
         crate::elevation::front::cgroup_kill_reached(
-            self.front,
+            front,
             pid,
             || self.root_running().map(|running| !running),
             || self.attached.cgroup_names(pid, self.proc.pidfd()),
@@ -494,7 +478,7 @@ impl Child {
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     pub(crate) fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.front, self.pid(), || self.root_running())
+        crate::elevation::front::terminate_gate(self.front(), self.pid(), || self.root_running())
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -625,8 +609,8 @@ impl Child {
         let front = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable.into()),
             crate::elevation::front::Gate::Open => None,
-            crate::elevation::front::Gate::Exited => Some(false),
-            crate::elevation::front::Gate::CgroupOnly => Some(true),
+            crate::elevation::front::Gate::Exited => Some(None),
+            crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
         };
         // One look at the root decides: one launchd holds, or one the handle cannot vouch for, is
         // signalled by identity alone, and so is a group named by the root's pid once that pid may
@@ -650,7 +634,7 @@ impl Child {
                     let sent = held
                         .signal(crate::signal::Sig::Kill)
                         .map_err(Error::into_io)
-                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
+                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()));
                     root_ended_by_handle.set(SweepFailure::killed_root(&sent));
                     sent
                 },
@@ -671,17 +655,14 @@ impl Child {
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            return match self
-                .attached
-                .settle_for_kill_tree(op, &self.tree_killed, group_result, false)
-            {
-                Ok(()) if in_cgroup => self.cgroup_kill_reached(),
-                Err(left) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
-                    self.front,
-                    self.pid(),
-                    left,
-                )),
-                other => other,
+            return match (
+                self.attached
+                    .settle_for_kill_tree(op, &self.tree_killed, group_result, false),
+                in_cgroup,
+            ) {
+                (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
+                (Err(left), Some(front)) => Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left)),
+                (other, None) => other,
             }
             .map_err(SweepFailure::from);
         }
@@ -699,7 +680,7 @@ impl Child {
         } else {
             SweepFailure::backstop_of(
                 self.kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
         SweepFailure::of(

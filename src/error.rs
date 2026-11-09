@@ -376,8 +376,8 @@ impl std::fmt::Display for ChildFate {
     }
 }
 
-/// What [`Error::MayHaveStarted`] appends to the fate of an elevation backend: the elevated program
-/// behind it may still run, whenever the fate says the backend is not running.
+/// What [`Error::MayHaveStarted`] appends to the fate of an elevation front: the elevated program
+/// behind it may still run, whenever the fate says the front is not running.
 fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
     match fate {
         ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone if wrapper_elevated => {

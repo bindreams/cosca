@@ -31,7 +31,7 @@ pub(crate) enum SpawnFailure {
         cause: Error,
         /// What the failed spawn did with the child.
         fate: ChildFate,
-        /// Whether the child is an elevation backend (see [`Error::MayHaveStarted`]).
+        /// Whether the child is an elevation front (see [`Error::MayHaveStarted`]).
         wrapper_elevated: bool,
         /// The child, when the spawn hands it to the caller (see [`Error::MayHaveStarted`]).
         unreaped: Option<Box<Unreaped>>,
@@ -40,7 +40,7 @@ pub(crate) enum SpawnFailure {
 
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
-    /// backend. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
+    /// front. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
     /// with its identity, or `Unknown` (the look at it failed), or `Killed` (the wait for it failed).
     pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
@@ -75,8 +75,8 @@ impl SpawnFailure {
     }
 
     /// This failure, if it says the program may have started, marked as that of an elevation
-    /// backend, whose elevated program may outlive its fate (see [`Error::MayHaveStarted`]).
-    pub(crate) fn behind_wrapper(self) -> SpawnFailure {
+    /// front, whose elevated program may outlive its fate (see [`Error::MayHaveStarted`]).
+    pub(crate) fn behind_front(self) -> SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted {
                 cause, fate, unreaped, ..
@@ -93,15 +93,10 @@ impl SpawnFailure {
 
 /// The error of a run-to-completion helper (`output`, `status`, `read`) that failed after its spawn
 /// succeeded: the program may have started, and `fate` says what became of its child.
-/// `unreaped` is the child its teardown could not end, handed back. `behind_wrapper` is whether the
-/// child is an elevation backend.
-pub(crate) fn after_the_spawn(
-    cause: Error,
-    fate: ChildFate,
-    unreaped: Option<Unreaped>,
-    behind_wrapper: bool,
-) -> Error {
-    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_wrapper))
+/// `unreaped` is the child its teardown could not end, handed back. `behind_front` is whether the
+/// child is an elevation front.
+pub(crate) fn after_the_spawn(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>, behind_front: bool) -> Error {
+    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_front))
 }
 
 /// [`after_the_spawn`], as the [`SpawnFailure`] a spawn returns.
@@ -109,11 +104,11 @@ pub(crate) fn failed_after_the_spawn(
     cause: Error,
     fate: ChildFate,
     unreaped: Option<Unreaped>,
-    behind_wrapper: bool,
+    behind_front: bool,
 ) -> SpawnFailure {
     let failure = SpawnFailure::started(cause, fate, unreaped);
-    if behind_wrapper {
-        failure.behind_wrapper()
+    if behind_front {
+        failure.behind_front()
     } else {
         failure
     }
@@ -308,7 +303,7 @@ impl<T, E: PlainError> Classify<T> for Result<T, E> {
 }
 
 /// Test seams that fail a run-to-completion helper (`output`, `status`, `read`) after its spawn
-/// succeeded, or make its child look like an elevation backend. Thread-local; the guard clears them.
+/// succeeded.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::Cell;
@@ -319,7 +314,6 @@ pub(crate) mod seams {
     thread_local! {
         static WAIT: Cell<bool> = const { Cell::new(false) };
         static PUMP: Cell<bool> = const { Cell::new(false) };
-        static WRAPPER: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The message of the error the seams fail with.
@@ -349,11 +343,6 @@ pub(crate) mod seams {
         arm(&PUMP)
     }
 
-    /// Every child on this thread looks like an elevation backend while the guard lives.
-    pub(crate) fn pretend_wrapper() -> Armed {
-        arm(&WRAPPER)
-    }
-
     fn take(flag: &'static LocalKey<Cell<bool>>) -> Option<Error> {
         flag.with(|f| f.replace(false))
             .then(|| Error::Io(std::io::Error::other(FAILURE)))
@@ -365,10 +354,6 @@ pub(crate) mod seams {
 
     pub(crate) fn take_pump_failure() -> Option<Error> {
         take(&PUMP)
-    }
-
-    pub(crate) fn wrapper() -> bool {
-        WRAPPER.with(Cell::get)
     }
 }
 

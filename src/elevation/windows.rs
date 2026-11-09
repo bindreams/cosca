@@ -612,32 +612,39 @@ pub(crate) fn spawn_elevated(
     policy: SpawnPolicy,
 ) -> Result<crate::child::Child, SpawnFailure> {
     match launch_runas(&*cmd)? {
-        RunasOutcome::AlreadyElevated => {
-            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop, policy)?;
-            child.set_elevation(Some(crate::elevation::already_elevated_report(
-                ElevatedStdio::Passthrough,
-            )));
-            Ok(child)
-        }
+        RunasOutcome::AlreadyElevated => spawn_already_elevated(cmd, kill_on_drop, policy),
         RunasOutcome::Launched {
             proc,
             granted,
             pid,
             id,
             report,
-        } => {
-            let mut child = crate::child::Child::from_parts(
-                OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
-                Some(id),
-                BTreeMap::new(),
-                kill_on_drop,
-                Attachment::uac_elevated(),
-                policy,
-            );
-            child.set_elevation(Some(report));
-            Ok(child)
-        }
+        } => Ok(crate::child::Child::from_parts(
+            OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
+            Some(id),
+            BTreeMap::new(),
+            kill_on_drop,
+            Attachment::uac_elevated(),
+            Some(report),
+            policy,
+        )),
     }
+}
+
+/// Spawn `cmd` as an ordinary child that reports itself already elevated, as the POSIX rewrite
+/// does: from a derived command, so `cmd` keeps no report.
+fn spawn_already_elevated(
+    cmd: &mut Command,
+    kill_on_drop: bool,
+    policy: SpawnPolicy,
+) -> Result<crate::child::Child, SpawnFailure> {
+    let (input, env_ops) = (cmd.input().clone(), cmd.env_ops().to_vec());
+    let mut derived = cmd.derive_for_elevation(
+        input,
+        env_ops,
+        crate::elevation::already_elevated_report(ElevatedStdio::Passthrough),
+    );
+    crate::child::spawn::spawn_unelevated(&mut derived, kill_on_drop, policy)
 }
 
 #[cfg(test)]

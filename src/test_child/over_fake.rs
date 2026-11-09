@@ -33,6 +33,7 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
                 GracefulMechanism::Process
             },
         },
+        None,
         SpawnPolicy::SYNC,
     )
 }

@@ -71,6 +71,33 @@ fn the_unreaped_a_child_hands_back_does_what_its_spawns_policy_says_on_drop() {
     assert_eq!(fake.signal_calls(), [Sig::Kill, Sig::Kill], "the drop's kill");
 }
 
+/// The `Unreaped` of a child reported as a launch that leaves no front is not a front's: its drop
+/// sends the one more kill.
+///
+/// Mutants: `into_unreaped` passes `Unreaped::new` the front from `report.is_some()` or from
+/// `may_run_as_another_user()`.
+#[skuld::test]
+fn the_unreaped_a_child_without_a_front_hands_back_is_sent_the_drops_kill() {
+    use crate::child::spawn::policy::SpawnPolicy;
+    use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+    use crate::signal::Sig;
+
+    for via in VIAS_WITHOUT_A_FRONT {
+        let (mut child, stdin) = held_uncontained_blocker(true);
+        child.policy = SpawnPolicy::LET_GO;
+        child.elevation = Some(report(via.clone()));
+        let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
+        let (_, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+        handed_back.unreaped();
+        assert_eq!(fake.signal_calls(), [Sig::Kill], "{via:?}: the teardown's own kill");
+
+        drop(handed_back);
+
+        assert_eq!(fake.signal_calls(), [Sig::Kill, Sig::Kill], "{via:?}: the drop's kill");
+    }
+}
+
 /// A caller that leaves a child whose kill is refused gets it left, warned, and no `Unreaped`.
 ///
 /// Mutant: the teardown hands the child back whatever the caller said.

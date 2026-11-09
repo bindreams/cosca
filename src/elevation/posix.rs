@@ -13,9 +13,9 @@ use super::pkexec::PkexecVersion;
 use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
 use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
-use crate::command::{Command, EnvOp};
+use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
-use crate::stdio::{Fd, Stdio};
+use crate::stdio::{Fd, ResolvedStdio};
 
 /// A valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`, ASCII only. A name
 /// with a comma / `=` / non-ASCII byte has no lossless place in `--preserve-env`'s
@@ -553,13 +553,11 @@ impl PendingPassword {
 }
 
 /// Outcome of a POSIX rewrite. `derived` is the command to spawn (the backend wrapper, or
-/// — when already elevated — the sanitized original). `report` is attached to the
-/// resulting `Child`. `password_write` is delivered after spawn. `backend_path` is the
-/// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when no
-/// backend wraps the child, i.e. already elevated).
+/// — when already elevated — the sanitized original). `password_write` is delivered after spawn.
+/// `backend_path` is the resolved argv[0] the spawn arm passes to `remap_derived_spawn_error`
+/// (`None` when no backend wraps the child, i.e. already elevated).
 pub(crate) struct PosixRewrite {
     pub derived: Command,
-    pub report: Option<ElevationReport>,
     pub password_write: Option<PendingPassword>,
     pub backend_path: Option<PathBuf>,
 }
@@ -656,19 +654,6 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
     Ok(())
 }
 
-/// Transfer the caller's cwd / containment / kill-on-drop onto the derived command.
-/// Does NOT suppress the fd marker — that is only correct for a real wrapper spawn
-/// (`ElevatePosix`), whose `closefrom` destroys it; `RunAsIs`'s derived command spawns the
-/// original program directly, with no wrapper to destroy anything, so its caller must
-/// suppress explicitly if that arm ever needs to.
-fn transfer_process_attrs(derived: &mut Command, cmd: &Command, cwd: Option<PathBuf>) {
-    if let Some(d) = cwd {
-        derived.current_dir(d);
-    }
-    derived.set_contain(cmd.contain_request());
-    derived.kill_on_drop(cmd.kill_on_drop_flag());
-}
-
 /// Detect-then-plan-then-rewrite. Thin wrapper over the pure form.
 // Consumed by the sync POSIX spawn arm (`crate::child::spawn::spawn`); the pure
 // `rewrite_with_host` is what the tests drive directly.
@@ -712,11 +697,10 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
         Transition::ElevateMacosGui { osascript, arg_max } => {
             let launch = super::macos::program_and_args(cmd)?;
-            let (mut derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
-            derived.set_elevation_front(super::front::front(Some(&report.via)));
+            let derived =
+                super::macos::build_rewrite(cmd, launch, &osascript, arg_max, super::macos::osascript_report())?;
             Ok(PosixRewrite {
                 derived,
-                report: Some(report),
                 password_write: None,
                 // The derived program IS osascript, so an exec failure remaps to
                 // BackendUnavailable exactly as it does for the POSIX backends.
@@ -730,20 +714,18 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             // derived command spawns as an unelevated one does.
             let (kept, stripped) = cmd.elevation_request().sanitizer.apply(explicit_set_env(cmd.env_ops()));
             let env_ops: Vec<EnvOp> = kept.iter().map(|(k, v)| EnvOp::Set(k.clone(), v.clone())).collect();
-            let mut derived = Command::new();
-            derived.set_input_argv(checked_argv(cmd)?.to_vec());
-            derived.set_env_ops(env_ops);
-            transfer_process_attrs(&mut derived, cmd, cmd.cwd().map(Path::to_path_buf));
-            for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
-                derived.fds_mut().insert(slot, resolved);
-            }
-            Ok(PosixRewrite {
-                derived,
-                report: Some(ElevationReport {
+            let input = CommandInput::Argv(checked_argv(cmd)?.to_vec());
+            let derived = cmd.derive_for_elevation(
+                input,
+                env_ops,
+                ElevationReport {
                     via: ElevatedVia::AlreadyElevated,
                     stripped_env: stripped,
                     stdio: ElevatedStdio::Passthrough,
-                }),
+                },
+            );
+            Ok(PosixRewrite {
+                derived,
                 password_write: None,
                 backend_path: None,
             })
@@ -782,7 +764,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 }
                 _ => None,
             };
-            let Launch { program, args, cwd } = program_and_args(cmd)?;
+            let Launch { program, args, .. } = program_and_args(cmd)?;
             let argv = build_argv(backend, path.as_os_str(), &auth, &program, &args, &kept)?;
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
@@ -798,8 +780,42 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             if let Auth::Askpass(p) = &auth {
                 new_ops.push(EnvOp::Set(OsString::from("SUDO_ASKPASS"), p.as_os_str().to_os_string()));
             }
-            let mut derived = Command::new();
-            derived.set_input_argv(argv);
+            // Auth::Stdin: a fresh pipe whose read end becomes the derived fd0; the password is
+            // written after spawn (the fd0 conflict was rejected in the structural gate). Made
+            // before the caller's stdio moves, so a failure leaves the caller's command intact.
+            let mut password_write = None;
+            let mut password_reader = None;
+            if let Auth::Stdin(secret) = &auth {
+                let (reader, writer) = {
+                    // macOS: `pipe()` then `FD_CLOEXEC`; a cosca fork between the two would inherit an end.
+                    #[cfg(target_os = "macos")]
+                    let _guard = crate::child::spawn::spawn_lock();
+                    crate::pipe::pair().map_err(Error::Io)?
+                };
+                password_reader = Some(File::from(OwnedFd::from(reader)));
+                password_write = Some(PendingPassword {
+                    writer,
+                    secret: secret.clone(),
+                });
+            }
+
+            let stdio = if matches!(auth, Auth::Stdin(_)) {
+                ElevatedStdio::StdinConsumed
+            } else {
+                ElevatedStdio::Passthrough
+            };
+            let mut derived = cmd.derive_for_elevation(
+                CommandInput::Argv(argv),
+                new_ops,
+                ElevationReport {
+                    via: ElevatedVia::Wrapped(backend),
+                    stripped_env: stripped,
+                    stdio,
+                },
+            );
+            if let Some(reader) = password_reader {
+                derived.fds_mut().insert(Fd::STDIN, ResolvedStdio::File(reader));
+            }
             // An exec failure is judged on the file exec'd: the pinned one, while `derived` holds it.
             let mut backend_path = path;
             if let Some(pin) = pinned {
@@ -808,55 +824,13 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 derived.set_executable_spec(Some(crate::command::ExecutableSpec::Exact(backend_path.clone())));
                 derived.hold(pin);
             }
-            derived.set_env_ops(new_ops);
-            transfer_process_attrs(&mut derived, cmd, cwd);
             // Only THIS arm's derived command is a real wrapper spawn (`sudo`/`doas`/`pkexec`
             // …): its `closefrom` destroys an installed marker, so the marker must not be
             // installed on it at all. `RunAsIs` spawns the original program with no wrapper —
-            // suppressing there would claim a false justification (see `transfer_process_attrs`).
+            // suppressing there would claim a false justification.
             derived.suppress_fd_marker();
-
-            // Auth::Stdin: wire the derived fd0 to a fresh pipe's read end; the password is
-            // written after spawn (the fd0 conflict was rejected in the structural gate).
-            let mut password_write = None;
-            if let Auth::Stdin(secret) = &auth {
-                let (reader, writer) = {
-                    // macOS: `pipe()` then `FD_CLOEXEC`; a cosca fork between the two would inherit an end.
-                    #[cfg(target_os = "macos")]
-                    let _guard = crate::child::spawn::spawn_lock();
-                    crate::pipe::pair().map_err(Error::Io)?
-                };
-                let reader_file = File::from(OwnedFd::from(reader));
-                derived.stdin(Stdio::from_file(reader_file))?;
-                password_write = Some(PendingPassword {
-                    writer,
-                    secret: secret.clone(),
-                });
-            }
-
-            // Move the caller's fd 0-2 stdio into the derived command (File is not Clone).
-            // Skip fd0 when Auth::Stdin already wired it to the pipe read end.
-            for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
-                if password_write.is_some() && slot == Fd::STDIN {
-                    continue;
-                }
-                derived.fds_mut().insert(slot, resolved);
-            }
-
-            let stdio = if matches!(auth, Auth::Stdin(_)) {
-                ElevatedStdio::StdinConsumed
-            } else {
-                ElevatedStdio::Passthrough
-            };
-            let via = ElevatedVia::Wrapped(backend);
-            derived.set_elevation_front(super::front::front(Some(&via)));
             Ok(PosixRewrite {
                 derived,
-                report: Some(ElevationReport {
-                    via,
-                    stripped_env: stripped,
-                    stdio,
-                }),
                 password_write,
                 backend_path: Some(backend_path),
             })

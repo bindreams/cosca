@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
+    sudo_report,
 };
 use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
 use crate::child::owned::seams::record_root_teardowns;
@@ -1074,7 +1075,7 @@ pub(crate) fn failed_held_front_spawns(
         let mut cmd = in_cgroup(cat());
         cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
             .expect("stdin");
-        cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+        cmd.set_elevation_report(sudo_report());
         // Releases the front: a teardown's wait on a front no kill reached ends it with status 0,
         // instead of hanging. The seam is one-shot, so each case gives this to the one guard that
         // arms it.
@@ -1687,7 +1688,7 @@ pub(crate) fn spawn_front_noting_fork<T>(
     spawn: impl FnOnce(&mut Command) -> Result<T, crate::error::Error>,
 ) -> (Result<T, crate::error::Error>, Option<u32>) {
     use crate::child::spawn::fault::{set_at, spawn_pid, SpawnPoint};
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+    cmd.set_elevation_report(sudo_report());
     let pid = std::rc::Rc::new(std::cell::Cell::new(None));
     let _seen = set_at(SpawnPoint::BeforeAttach, {
         let pid = std::rc::Rc::clone(&pid);
@@ -1799,7 +1800,7 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
     let mut cmd = in_cgroup(cat());
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+    cmd.set_elevation_report(sudo_report());
     crate::containment::cgroup::fault::set_force_placement_write_result(0);
     (cmd, writer.into())
 }

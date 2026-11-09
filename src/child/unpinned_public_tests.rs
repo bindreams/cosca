@@ -23,23 +23,31 @@ use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
 use crate::ContainMode;
 
-fn blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
+/// A blocker whose spawn reports `elevation`: a child launched behind that elevation backend.
+fn blocker(
+    mode: ContainMode,
+    elevation: Option<crate::elevation::ElevationReport>,
+) -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(mode);
+    cmd.set_elevation_report(elevation);
     (cmd.spawn().expect("spawn"), writer)
 }
 
 /// A blocker spawned with the marker's install made to fail, so the spawn degrades to the
 /// mechanism the marker takes priority over.
-fn degraded_blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
+fn degraded_blocker(
+    mode: ContainMode,
+    elevation: Option<crate::elevation::ElevationReport>,
+) -> (crate::Child, crate::PipeWriter) {
     use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
     // A failed install logs, and a sibling test scans the shared log for its own text.
     let _serialize = lock_for_log_assertion();
     set_fault(Some(Fault::Pipe));
-    let spawned = blocker(mode);
+    let spawned = blocker(mode, elevation);
     set_fault(None);
     spawned
 }
@@ -47,7 +55,12 @@ fn degraded_blocker(mode: ContainMode) -> (crate::Child, crate::PipeWriter) {
 /// A tree-walk child: its root is signalled by identity. (On macOS `TreeWalk` is only the
 /// mechanism when the marker cannot be installed, which is made to happen here.)
 pub(crate) fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
-    let (child, writer) = degraded_blocker(ContainMode::TreeWalk);
+    walked_blocker_reporting(None)
+}
+
+/// [`walked_blocker`] whose spawn reports `elevation`.
+fn walked_blocker_reporting(elevation: Option<crate::elevation::ElevationReport>) -> (crate::Child, crate::PipeWriter) {
+    let (child, writer) = degraded_blocker(ContainMode::TreeWalk, elevation);
     assert!(
         matches!(child.attached, crate::containment::Attached::TreeWalk(_)),
         "the test needs a tree walk"
@@ -57,7 +70,7 @@ pub(crate) fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
 
 /// A session (fd-marker) child: its group is signalled with `killpg`.
 pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
-    let (child, writer) = blocker(ContainMode::Session);
+    let (child, writer) = blocker(ContainMode::Session, None);
     assert!(
         matches!(child.attached, crate::containment::Attached::FdMarker(_)),
         "the test needs an fd marker"
@@ -67,7 +80,7 @@ pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
 
 /// A process-group child.
 pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
-    let (child, writer) = degraded_blocker(ContainMode::Session);
+    let (child, writer) = degraded_blocker(ContainMode::Session, None);
     assert!(
         matches!(child.attached, crate::containment::Attached::ProcessGroup(_)),
         "the test needs a process group"
@@ -681,15 +694,15 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
 /// Mutant: a path reads the root's state before the front's gate.
 #[skuld::test]
 fn a_closed_front_gate_outranks_an_unpinned_root() {
-    use crate::elevation::front::Front;
+    use crate::elevation::{Backend, ElevatedVia};
     for op in ["kill", "terminate", "kill_tree"] {
-        let (mut child, writer) = walked_blocker();
         // `sudo` relays a `SIGTERM`, so only `osascript` closes the terminate gate.
-        child.set_front(Some(if op == "terminate" {
-            Front::Osascript
-        } else {
-            Front::Sudo
-        }));
+        let (mut child, writer) =
+            walked_blocker_reporting(Some(crate::elevation::elevation_tests::report(if op == "terminate" {
+                ElevatedVia::MacosOsascript
+            } else {
+                ElevatedVia::Wrapped(Backend::Sudo)
+            })));
         // The gate looks at the front (twice for a kill, once for a terminate), and the state, read
         // wrongly first, would take the front's `Running` and let the gate see the `Orphaned`
         // one: an exited front, which is signalled.

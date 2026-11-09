@@ -82,6 +82,39 @@ async fn a_refused_disarm_fails_a_kill_on_drop_false_spawn_and_kills_the_child()
     assert_eq!(id.is_alive(), Liveness::Dead);
 }
 
+/// Async twin of the sync `a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag`.
+///
+/// Mutants: `commit_kill_on_drop` sets the flag from `report.is_some()` or from
+/// `may_run_as_another_user()`.
+#[skuld::test]
+async fn a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag() {
+    use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+    crate::tokio::test_runtime::assert_current_thread();
+    for via in VIAS_WITHOUT_A_FRONT {
+        let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
+            _ = cmd.kill_on_drop(false);
+            cmd.set_elevation_report(Some(report(via.clone())));
+        });
+        child.inner.attached = Attached::JobObject(JobHandle::create_without_set_access_for_test());
+
+        let error = Error::from(child.commit_kill_on_drop().expect_err("the disarm was refused"));
+
+        assert!(
+            matches!(
+                error,
+                Error::MayHaveStarted {
+                    wrapper_elevated: false,
+                    ..
+                }
+            ),
+            "{via:?}: {error:?}"
+        );
+        let (_, fate, handed_back) = expect_may_have_started_parts(error, ());
+        assert_eq!(fate, ChildFate::Reaped, "{via:?}");
+        assert!(handed_back.is_none(), "{via:?}: the teardown handed the child back");
+    }
+}
+
 /// A `kill_on_drop(true)` spawn has nothing to disarm, so a job that refuses it changes nothing.
 ///
 /// Mutant: the commit disarms whatever `kill_on_drop` says.
