@@ -588,6 +588,39 @@ mod on_windows {
         release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
     }
 
+    /// Async twin of the sync `a_failed_resume_of_a_child_without_a_front_sets_no_wrapper_flag`.
+    ///
+    /// Mutants: `resume` sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+    #[skuld::test]
+    async fn a_failed_resume_of_a_child_without_a_front_sets_no_wrapper_flag() {
+        use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+        crate::tokio::test_runtime::assert_current_thread();
+        for via in VIAS_WITHOUT_A_FRONT {
+            let mut cmd = blocker(false);
+            let writer = hold_stdin(&mut cmd);
+            cmd.set_elevation_report(Some(report(via.clone())));
+            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let remote = Remote::open(frozen.pid());
+            let thread = InitialThread::of(frozen.pid());
+            let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+
+            let err = frozen.resume().expect_err("the resume was forced to fail");
+            drop(forced);
+
+            assert!(
+                matches!(
+                    err,
+                    Error::MayHaveStarted {
+                        wrapper_elevated: false,
+                        ..
+                    }
+                ),
+                "{via:?}: {err:?}"
+            );
+            release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
+        }
+    }
+
     /// `resume` of a `kill_on_drop(false)` child whose job refuses the disarm fails with the
     /// refusal as its cause, and the child is dead: killed, not released (its stdin is held).
     ///

@@ -1,5 +1,5 @@
 //! Signals to a child behind an elevation front, on an ordinary `cat` this test owns and reports as
-//! launched by `sudo` or `osascript` (`set_elevation`). No forced kill may signal a live front, and
+//! launched by `sudo` or `osascript` (`set_elevation_report`). No forced kill may signal a live front, and
 //! no `SIGTERM` a live osascript. The cgroup lane's cases are in `front_cgroup_tests.rs`.
 //!
 //! Whether anything signalled the `cat` is read from how it ended: it exits 0 once the test closes
@@ -15,26 +15,23 @@ use std::time::Duration;
 
 use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
-use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
+use crate::elevation::elevation_tests::report;
+use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 use crate::os_process::fake::failed_signal;
 use crate::signal::Sig;
 use crate::{ContainMode, Containment, Stdio};
 
-pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
-    Some(ElevationReport {
-        via,
-        stripped_env: Vec::new(),
-        stdio: ElevatedStdio::Passthrough,
-    })
+/// The report of a child launched by `sudo`.
+pub(crate) fn sudo_report() -> Option<ElevationReport> {
+    Some(report(ElevatedVia::Wrapped(Backend::Sudo)))
 }
 
-/// Spawns `cmd` with a piped stdin, as the front `via` launches, and reported so.
+/// Spawns `cmd` with a piped stdin, as the backend `via` launches, and reported so.
 pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&via)));
+    cmd.set_elevation_report(Some(report(via)));
     let mut child = cmd.spawn().expect("spawn");
-    child.set_elevation(report(via));
     let stdin = child.stdin().expect("stdin pipe");
     (child, stdin)
 }
@@ -136,21 +133,6 @@ fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert!(warns.is_empty(), "{warns:?}");
     assert_eq!(reap(pid), None, "the drop reaps an exited front");
-}
-
-/// A front its spawn found is what the gates read, not the elevation report: a child with a report
-/// and no front is killed as any child.
-#[skuld::test]
-fn kill_reads_the_front_its_spawn_found_not_its_report() {
-    let mut cmd = cat();
-    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    let mut child = cmd.spawn().expect("spawn");
-    child.set_elevation(report(ElevatedVia::Wrapped(Backend::Sudo)));
-    let stdin = child.stdin().expect("stdin pipe");
-    child.kill().expect("a child with no front is killed as any child");
-    // Closed first: a child nothing killed then exits 0, and the assertion fails.
-    drop(stdin);
-    assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
 /// doas leaves this process tracking a front, as sudo does.
@@ -473,6 +455,37 @@ fn a_failed_password_write_hands_back_a_live_front_and_names_it() {
     assert!(status.success(), "the front was signalled: {status:?}");
 }
 
+/// The failed password write's error says whether the child is an elevation front: a sudo child is
+/// one, and a pkexec or an already-elevated child is not.
+///
+/// Mutants: `finish_elevated` marks every failure, or none, or marks by `report.is_some()`.
+#[skuld::test]
+fn a_failed_password_write_flags_a_front_and_no_other_child() {
+    let mut vias = vec![(ElevatedVia::Wrapped(Backend::Sudo), true)];
+    vias.extend(crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT.map(|via| (via, false)));
+    for (via, front) in vias {
+        let (child, stdin) = spawn_as(cat(), via.clone());
+        let error = Error::from(
+            crate::child::spawn::finish_elevated(
+                child,
+                Err(Error::Elevation {
+                    kind: ElevationErrorKind::AuthFailed,
+                    detail: "forced password-write failure".into(),
+                }),
+            )
+            .expect_err("a failed write fails the spawn"),
+        );
+        let Error::MayHaveStarted { wrapper_elevated, .. } = &error else {
+            panic!("{via:?}: expected MayHaveStarted, got {error:?}");
+        };
+        assert_eq!(*wrapper_elevated, front, "{via:?}: {error}");
+        let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(error, stdin);
+        if !handed_back.is_none() {
+            assert!(handed_back.wait().success(), "{via:?}: the front was signalled");
+        }
+    }
+}
+
 /// A live front, refused its kill, that exits and is reaped by someone else before the failure's
 /// look, is not running: the look finds no child (`ECHILD`), and says `Gone`.
 ///
@@ -622,9 +635,7 @@ pub(crate) fn failed_front_spawns(
         if let Some(mode) = contain {
             cmd.contain_with(mode);
         }
-        cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-            Backend::Sudo,
-        ))));
+        cmd.set_elevation_report(sudo_report());
         force_arm(true);
         let err = spawn(&mut cmd);
         force_arm(false);
@@ -703,6 +714,35 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
         // The failed spawn closed the front's stdin, so it exits by itself, unsignalled.
         let status = handed_back.wait();
         assert!(status.success(), "the teardown signalled the front: {status:?}");
+    }
+}
+
+/// A spawn that fails after its fork says whether the child is an elevation front: one reported as
+/// sudo's is, and one reported as pkexec's, UAC's or an already-elevated parent's is not.
+///
+/// Mutants: `spawn_unelevated` drops its `map_err(behind_front)`, inverts its test, or marks by
+/// `report.is_some()`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_spawn_that_fails_after_its_fork_flags_a_front_and_no_other_child() {
+    let mut vias = vec![(ElevatedVia::Wrapped(Backend::Sudo), true)];
+    vias.extend(crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT.map(|via| (via, false)));
+    for (via, front) in vias {
+        let mut cmd = cat();
+        cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+        cmd.set_elevation_report(Some(report(via.clone())));
+        crate::child::spawn::fault::set_force_attach_failure(true);
+        let error = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+        crate::child::spawn::fault::set_force_attach_failure(false);
+        let Error::MayHaveStarted { wrapper_elevated, .. } = &error else {
+            panic!("{via:?}: expected MayHaveStarted, got {error:?}");
+        };
+        assert_eq!(*wrapper_elevated, front, "{via:?}: {error}");
+        // The failed spawn closed the `cat`'s stdin, so a front it handed back exits by itself.
+        let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
+        if !handed_back.is_none() {
+            assert!(handed_back.wait().success(), "{via:?}: the front was signalled");
+        }
     }
 }
 
@@ -930,9 +970,7 @@ pub(crate) fn fail_a_front_spawn<G>(
     let mut cmd = cat();
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-        Backend::Sudo,
-    ))));
+    cmd.set_elevation_report(sudo_report());
     configure(&mut cmd);
     let err = {
         let _forced = force();

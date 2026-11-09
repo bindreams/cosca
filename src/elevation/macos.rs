@@ -22,7 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use super::{ElevatedStdio, ElevatedVia, ElevationReport, Launch};
-use crate::command::Command;
+use crate::command::{Command, CommandInput};
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -301,21 +301,31 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
     Ok(())
 }
 
-/// Build the DERIVED command (`osascript -e <script>`) plus the report to attach to
-/// the resulting child. The caller's `Command` keeps its `input`/`env_ops`; its fd
-/// 0-2 stdio is MOVED (`ResolvedStdio::File` is not `Clone`), matching the POSIX
-/// rewrite's contract.
+/// What a graphically elevated child reports.
+pub(crate) fn osascript_report() -> ElevationReport {
+    ElevationReport {
+        via: ElevatedVia::MacosOsascript,
+        // Nothing is forwarded (env ops are rejected outright), so the sanitizer has
+        // nothing to strip. Reporting an empty list is the truth, not a stub.
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::OsascriptRelay,
+    }
+}
+
+/// Build the DERIVED command (`osascript -e <script>`) carrying `report`. The caller's `Command`
+/// keeps its `input`/`env_ops`; its fd 0-2 stdio is MOVED (`ResolvedStdio::File` is not `Clone`),
+/// as [`Command::derive_for_elevation`] does for every arm.
 ///
 /// Precondition: [`reject_structural_gui_config`] passed and `launch` is [`program_and_args`]'s,
 /// so the program and cwd are absolute, and there are no env ops and no containment. `kill_on_drop`
-/// is NOT gated (see that function), so it is transferred like the POSIX rewrite
-/// transfers it.
+/// is NOT gated (see that function), so the derived command carries it.
 pub(crate) fn build_rewrite(
     cmd: &mut Command,
     launch: Launch,
     osascript: &Path,
     arg_max: Option<usize>,
-) -> Result<(Command, ElevationReport), Error> {
+    report: ElevationReport,
+) -> Result<Command, Error> {
     // Contracts the upstream gate owns, mirroring `build_shell_command`'s own
     // precondition asserts. Zero-cost in release; a loud failure in debug if a
     // second call site ever reaches here without passing the gate.
@@ -335,26 +345,22 @@ pub(crate) fn build_rewrite(
     let shell_command = build_shell_command(&program, &args, cwd.as_deref())?;
     let script = wrap_do_shell_script(&shell_command, arg_max)?;
 
-    let mut derived = Command::new();
-    derived.set_input_argv(vec![
-        osascript.as_os_str().to_os_string(),
-        OsString::from("-e"),
-        OsString::from(script),
-    ]);
-    // The cwd is set on osascript AS WELL AS stated in the script: setting it here
-    // turns a bogus directory into a precise spawn-time `Io` error instead of an
-    // opaque non-zero exit, and the script's `cd -P --` makes the payload's cwd
-    // deterministic either way. The two name the same directory by construction.
-    if let Some(d) = cwd {
-        derived.current_dir(d);
-    }
-    // kill_on_drop MUST be carried, exactly as `posix::transfer_process_attrs`
-    // carries it: the async spawn recurses with `spawn(&mut derived)` and re-reads
-    // the flag off the DERIVED command, so leaving it at `Command::default()`'s
-    // `true` would silently discard a caller's `.kill_on_drop(false)` on the tokio
-    // path while honoring it on the sync one.
-    derived.kill_on_drop(cmd.kill_on_drop_flag());
-    // …and when it is set, SAY SO — the default must not be silent (see
+    // The derived command carries the cwd AS WELL AS the script stating it: a bogus
+    // directory becomes a precise spawn-time `Io` error instead of an opaque non-zero
+    // exit, and the script's `cd -P --` makes the payload's cwd deterministic either
+    // way. The two name the same directory by construction. It carries kill_on_drop too:
+    // the async spawn recurses with `spawn(&mut derived)` and re-reads the flag off the
+    // DERIVED command, so a caller's `.kill_on_drop(false)` must reach it.
+    let derived = cmd.derive_for_elevation(
+        CommandInput::Argv(vec![
+            osascript.as_os_str().to_os_string(),
+            OsString::from("-e"),
+            OsString::from(script),
+        ]),
+        Vec::new(),
+        report,
+    );
+    // When kill_on_drop is set, SAY SO — the default must not be silent (see
     // `ElevatedVia::MacosOsascript` for why nothing can kill the payload). The program is
     // named so a test can assert on its OWN record in the process-global capture buffer.
     if cmd.kill_on_drop_flag() {
@@ -365,19 +371,7 @@ pub(crate) fn build_rewrite(
              matters."
         );
     }
-    // Containment IS rejected by the structural gate, so there is nothing else to carry.
-    for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
-        derived.fds_mut().insert(slot, resolved);
-    }
-
-    let report = ElevationReport {
-        via: ElevatedVia::MacosOsascript,
-        // Nothing is forwarded (env ops are rejected outright), so the sanitizer has
-        // nothing to strip. Reporting an empty list is the truth, not a stub.
-        stripped_env: Vec::new(),
-        stdio: ElevatedStdio::OsascriptRelay,
-    };
-    Ok((derived, report))
+    Ok(derived)
 }
 
 #[cfg(test)]

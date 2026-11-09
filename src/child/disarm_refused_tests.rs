@@ -88,6 +88,36 @@ fn a_refused_disarm_fails_a_kill_on_drop_false_spawn_and_kills_the_child() {
     assert_eq!(id.is_alive(), Liveness::Dead);
 }
 
+/// The failed commit of a child reported as a launch that leaves no front does not say it is a
+/// front's.
+///
+/// Mutants: `commit_kill_on_drop` sets the flag from `report.is_some()` or from
+/// `may_run_as_another_user()`.
+#[skuld::test]
+fn a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag() {
+    use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+    for via in VIAS_WITHOUT_A_FRONT {
+        let (mut child, stdin, _id) = refusing_child(false);
+        child.elevation = Some(report(via.clone()));
+
+        let error = Error::from(child.commit_kill_on_drop().expect_err("the disarm was refused"));
+
+        assert!(
+            matches!(
+                error,
+                Error::MayHaveStarted {
+                    wrapper_elevated: false,
+                    ..
+                }
+            ),
+            "{via:?}: {error:?}"
+        );
+        let (_, fate, handed_back) = expect_may_have_started_parts(error, stdin);
+        assert_eq!(fate, ChildFate::Reaped, "{via:?}");
+        assert!(handed_back.is_none(), "{via:?}: the teardown handed the child back");
+    }
+}
+
 /// A `kill_on_drop(true)` spawn has nothing to disarm, so a job that refuses it changes nothing.
 ///
 /// Mutant: the commit disarms whatever `kill_on_drop` says.

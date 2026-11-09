@@ -88,7 +88,7 @@ impl SuspendedChild {
                 child.commit_kill_on_drop().map_err(Error::from)
             }
             Err(e) => {
-                let behind_wrapper = child.behind_wrapper();
+                let behind_front = child.inner.front().is_some();
                 let (fate, unreaped) = child
                     .inner
                     .tear_down_or_hand_back(crate::child::owned::teardown::Disposition::Leave);
@@ -98,7 +98,7 @@ impl SuspendedChild {
                     },
                     fate,
                     unreaped,
-                    behind_wrapper,
+                    behind_front,
                 ))
             }
         }

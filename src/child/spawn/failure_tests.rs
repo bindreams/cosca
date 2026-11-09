@@ -65,13 +65,13 @@ fn a_cause_that_is_itself_may_have_started_asserts() {
     drop(Error::from(SpawnFailure::started(once, ChildFate::Unknown, None)));
 }
 
-/// `behind_wrapper` only sets the flag: the cause and fate stand, and a not-started failure is
+/// `behind_front` only sets the flag: the cause and fate stand, and a not-started failure is
 /// unchanged.
 ///
-/// Mutant: `behind_wrapper` drops the flag, changes the fate, or marks a not-started failure.
+/// Mutant: `behind_front` drops the flag, changes the fate, or marks a not-started failure.
 #[skuld::test]
-fn behind_wrapper_sets_the_flag_alone() {
-    let marked = Error::from(SpawnFailure::started(io("attach"), ChildFate::Killed, None).behind_wrapper());
+fn behind_front_sets_the_flag_alone() {
+    let marked = Error::from(SpawnFailure::started(io("attach"), ChildFate::Killed, None).behind_front());
     let Error::MayHaveStarted {
         fate,
         wrapper_elevated,
@@ -98,7 +98,7 @@ fn behind_wrapper_sets_the_flag_alone() {
         ),
         "{plain:?}"
     );
-    let not = Error::from(SpawnFailure::NotStarted(io("exec")).behind_wrapper());
+    let not = Error::from(SpawnFailure::NotStarted(io("exec")).behind_front());
     assert!(matches!(not, Error::Io(_)), "{not:?}");
 }
 
@@ -152,19 +152,19 @@ fn after_the_spawn_with_a_child_carries_it_with_a_running_fate() {
     }
 }
 
-/// A failure that carries a child keeps it through `map`, `behind_wrapper` and the conversion to
+/// A failure that carries a child keeps it through `map`, `behind_front` and the conversion to
 /// an `Error`; a failure built by `started` carries none.
 ///
 /// Mutants: any of the three drops `unreaped`; `started` invents one.
 #[skuld::test]
-fn a_failure_carries_its_unreaped_child_through_map_behind_wrapper_and_from() {
+fn a_failure_carries_its_unreaped_child_through_map_behind_front_and_from() {
     let id = crate::identity::ProcessId::current();
     let failure = SpawnFailure::started(
         io("attach"),
         ChildFate::Running { id: Some(id) },
         Some(*exited_unreaped(id)),
     );
-    let error = Error::from(failure.map(|_| io("mapped")).behind_wrapper());
+    let error = Error::from(failure.map(|_| io("mapped")).behind_front());
     let Error::MayHaveStarted {
         unreaped: Some(child),
         wrapper_elevated: true,
@@ -234,7 +234,7 @@ fn classify_names_not_started() {
 #[skuld::test]
 fn map_keeps_the_answer_the_fate_and_the_flag() {
     let mapped = SpawnFailure::started(io("a"), ChildFate::Killed, None)
-        .behind_wrapper()
+        .behind_front()
         .map(|_| io("b"));
     assert!(
         matches!(

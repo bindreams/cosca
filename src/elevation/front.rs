@@ -26,7 +26,6 @@
 
 use std::io;
 
-use super::{Backend, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error};
 
 /// How a message names the elevation front `pid` (`None`: not known).
@@ -48,7 +47,7 @@ pub(crate) enum Gate {
     /// have left its program running.
     Exited,
     /// A live front in a cgroup: kill the cgroup, and signal nothing after it.
-    CgroupOnly,
+    CgroupOnly(Front),
     /// A live front that nothing reaches past: send nothing, and answer this `Unkillable`.
     Closed(Error),
 }
@@ -81,17 +80,6 @@ impl Front {
     }
 }
 
-/// The front `via` leaves this process tracking, if it does.
-pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
-    match via? {
-        ElevatedVia::Wrapped(Backend::Sudo) => Some(Front::Sudo),
-        ElevatedVia::Wrapped(Backend::Doas) => Some(Front::Doas),
-        ElevatedVia::MacosOsascript => Some(Front::Osascript),
-        // pkexec execs the program, and a report never names `Auto`.
-        ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
-    }
-}
-
 /// The gate for a forced kill of the child `pid`, the `front` its spawn launched (if any).
 /// `running` reads, without reaping, whether the tracked process still runs; `in_cgroup` whether it
 /// is in a cgroup whose kill reaches it. Both are asked only about a front, and `in_cgroup` only
@@ -121,7 +109,7 @@ pub(crate) fn kill_gate(
         return Gate::Exited;
     }
     match placed {
-        Ok(true) => Gate::CgroupOnly,
+        Ok(true) => Gate::CgroupOnly(front),
         Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, unread)),
         Err(e) => {
             let why = format!("whether its cgroup kill reaches it could not be read: {e}");
@@ -146,17 +134,11 @@ pub(crate) fn kill_gate(
 /// is one whose place cannot be read: nothing shows the kill reached it. A front killed and then
 /// moved before it exited reads the same (see [`Command::contain`](crate::Command::contain)).
 pub(crate) fn cgroup_kill_reached(
-    front: Option<Front>,
+    front: Front,
     pid: u32,
     exited: impl Fn() -> io::Result<bool>,
     under_leaf: impl FnOnce() -> io::Result<bool>,
 ) -> Result<(), Error> {
-    let Some(front) = front else {
-        debug_assert!(false, "only a front's cgroup kill is checked");
-        return Err(Error::Containment {
-            detail: format!("pid {pid}'s cgroup kill is not shown to have reached it: it is no front"),
-        });
-    };
     let exited = || {
         #[cfg(test)]
         if seams::reach_reads_running() {
@@ -194,26 +176,8 @@ pub(crate) fn cgroup_kill_reached(
 
 /// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
 /// sent, since a kill of the front itself would orphan its elevated program.
-pub(crate) fn cgroup_kill_failed(front: Option<Front>, pid: u32, error: Error) -> Error {
-    let Some(front) = front else {
-        debug_assert!(false, "only a front's cgroup kill is refused so");
-        return error;
-    };
+pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error {
     cgroup_not_killed(front, pid, Some(&error.to_string()))
-}
-
-/// [`cgroup_not_killed`] for the child `pid`, whose gate found it a front in a cgroup.
-pub(crate) fn cgroup_not_killed_of(front: Option<Front>, pid: u32, failure: Option<&str>) -> Error {
-    let Some(front) = front else {
-        debug_assert!(false, "only a front's gate is CgroupOnly");
-        return Error::Containment {
-            detail: format!(
-                "pid {pid}'s cgroup was not killed{}",
-                failure.map_or(String::new(), |f| format!(": {f}"))
-            ),
-        };
-    };
-    cgroup_not_killed(front, pid, failure)
 }
 
 /// The refusal of a kill of the front `pid` whose cgroup no kill reached: its kill failed with

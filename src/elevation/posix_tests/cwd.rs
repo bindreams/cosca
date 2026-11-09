@@ -205,7 +205,10 @@ fn an_already_root_pkexec_request_runs_whatever_the_version() {
     };
     let mut c = under(argv0("/opt/tool"), Backend::Pkexec);
     let rw = rewrite_with_host(&mut c, &host).expect("rewrite");
-    assert_eq!(rw.report.expect("report").via, ElevatedVia::AlreadyElevated);
+    assert_eq!(
+        rw.derived.elevation_report().expect("report").via,
+        ElevatedVia::AlreadyElevated
+    );
 }
 
 /// argv[0] reaches the wrapper as written, after its `--`, and the child runs in `current_dir`.

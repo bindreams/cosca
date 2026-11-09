@@ -179,7 +179,7 @@ impl Child {
             },
             crate::elevation::front::Gate::Open => self.kill_root().map(drop).map_err(Error::Io)?,
             // A live front in its cgroup: killed through it, and nothing signalled after it.
-            crate::elevation::front::Gate::CgroupOnly => {
+            crate::elevation::front::Gate::CgroupOnly(front) => {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
@@ -188,8 +188,8 @@ impl Child {
                         &self.tree_killed,
                         &crate::containment::GroupRoot::none(),
                     )
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.pid(), e))?;
-                self.cgroup_kill_reached()?;
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
+                self.cgroup_kill_reached(front)?;
             }
         }
         #[cfg(not(unix))]
@@ -534,7 +534,7 @@ impl Child {
             || self.kill_gate(),
             || {
                 self.kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
             },
         )
     }

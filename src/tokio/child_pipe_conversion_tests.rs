@@ -33,6 +33,7 @@ fn a_child_without_a_process() -> Child {
         Default::default(),
         false,
         attachment,
+        None,
         SpawnPolicy::SYNC,
     ))
 }
