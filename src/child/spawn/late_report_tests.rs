@@ -297,7 +297,9 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
     use crate::elevation::ElevatedVia;
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
-    cmd.set_elevation_report(crate::child::front_kill_tests::report(ElevatedVia::MacosOsascript));
+    cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(
+        ElevatedVia::MacosOsascript,
+    )));
     let sent = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
     let err = {

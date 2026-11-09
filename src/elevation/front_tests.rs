@@ -2,33 +2,21 @@ use std::cell::Cell;
 use std::io;
 
 use super::{kill_gate, terminate_gate, Front, Gate};
-use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
+use crate::elevation::elevation_tests::report;
+use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 
 const PID: u32 = 4242;
-
-fn report(via: ElevatedVia) -> ElevationReport {
-    ElevationReport {
-        via,
-        stripped_env: Vec::new(),
-        stdio: ElevatedStdio::Passthrough,
-    }
-}
-
-/// The front a child launched as `via` is (`None`: not elevated), as its report says.
-fn front(via: Option<&ElevatedVia>) -> Option<Front> {
-    via.and_then(|via| report(via.clone()).front())
-}
 
 /// The fronts a report names, and no other: pkexec execs the program, and UAC and an already-elevated
 /// parent track it. Mutant: a backend's arm of `ElevationReport::front` answers another's.
 #[skuld::test]
 fn a_report_names_the_front_its_via_leaves_tracked() {
     for (via, name) in FRONTS {
-        assert_eq!(front(Some(&via)).map(Front::name), Some(name), "{via:?}");
+        assert_eq!(report(via.clone()).front().map(Front::name), Some(name), "{via:?}");
     }
     for via in NOT_FRONTS.iter().flatten() {
-        assert_eq!(front(Some(via)), None, "{via:?}");
+        assert_eq!(report(via.clone()).front(), None, "{via:?}");
     }
 }
 
@@ -75,16 +63,16 @@ fn in_turn(answers: Vec<io::Result<bool>>) -> impl Fn() -> io::Result<bool> {
 
 /// What a gate asked, in order: `r` for `running`, `c` for `in_cgroup`.
 fn kill_gate_asking(
-    via: Option<&ElevatedVia>,
+    report: Option<ElevationReport>,
     running: io::Result<bool>,
     in_cgroup: io::Result<bool>,
 ) -> (Gate, String) {
-    kill_gate_asking_in_turn(via, vec![running], in_cgroup)
+    kill_gate_asking_in_turn(report, vec![running], in_cgroup)
 }
 
 /// [`kill_gate_asking`], with `running` answering in turn.
 fn kill_gate_asking_in_turn(
-    via: Option<&ElevatedVia>,
+    report: Option<ElevationReport>,
     running: Vec<io::Result<bool>>,
     in_cgroup: io::Result<bool>,
 ) -> (Gate, String) {
@@ -96,7 +84,7 @@ fn kill_gate_asking_in_turn(
     };
     let running = in_turn(running);
     let g = kill_gate(
-        front(via),
+        report.and_then(|report| report.front()),
         PID,
         || {
             note('r');
@@ -123,7 +111,7 @@ fn refusal_detail(g: Gate) -> String {
 #[skuld::test]
 fn a_live_front_outside_a_cgroup_is_closed_with_unkillable_naming_it() {
     for (via, name) in FRONTS {
-        let (g, asked) = kill_gate_asking(Some(&via), Ok(true), Ok(false));
+        let (g, asked) = kill_gate_asking(Some(report(via.clone())), Ok(true), Ok(false));
         assert_eq!(asked, "rcr", "{via:?}");
         let detail = refusal_detail(g);
         assert!(detail.contains(&format!("pid {PID} is")), "{detail}");
@@ -140,7 +128,7 @@ fn a_live_front_outside_a_cgroup_is_closed_with_unkillable_naming_it() {
 /// A front that has left its cgroup (pam_systemd moving sudo into a session scope) is outside it.
 #[skuld::test]
 fn a_live_front_that_left_its_cgroup_is_closed() {
-    let (g, _) = kill_gate_asking(Some(&ElevatedVia::Wrapped(Backend::Sudo)), Ok(true), Ok(false));
+    let (g, _) = kill_gate_asking(Some(report(ElevatedVia::Wrapped(Backend::Sudo))), Ok(true), Ok(false));
     refusal_detail(g);
 }
 
@@ -148,7 +136,7 @@ fn a_live_front_that_left_its_cgroup_is_closed() {
 #[skuld::test]
 fn an_exited_front_is_exited() {
     for (via, _) in FRONTS {
-        let (g, asked) = kill_gate_asking(Some(&via), Ok(false), Ok(true));
+        let (g, asked) = kill_gate_asking(Some(report(via.clone())), Ok(false), Ok(true));
         assert_eq!(asked, "r", "{via:?}");
         assert!(matches!(g, Gate::Exited), "{via:?}: {g:?}");
     }
@@ -160,10 +148,10 @@ fn an_exited_front_is_exited() {
 fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
     for (via, _) in FRONTS {
         for running in [Ok(true), Err(io::Error::other("peek refused"))] {
-            let (g, asked) = kill_gate_asking(Some(&via), running, Ok(true));
+            let (g, asked) = kill_gate_asking(Some(report(via.clone())), running, Ok(true));
             assert_eq!(asked, "rc", "{via:?}");
             assert!(
-                matches!(&g, Gate::CgroupOnly(f) if Some(*f) == front(Some(&via))),
+                matches!(&g, Gate::CgroupOnly(f) if Some(*f) == report(via.clone()).front()),
                 "{via:?}: {g:?}"
             );
         }
@@ -174,9 +162,13 @@ fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
 #[skuld::test]
 fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
     let sudo = ElevatedVia::Wrapped(Backend::Sudo);
-    let (g, _) = kill_gate_asking(Some(&sudo), Err(io::Error::other("peek refused")), Ok(false));
+    let (g, _) = kill_gate_asking(
+        Some(report(sudo.clone())),
+        Err(io::Error::other("peek refused")),
+        Ok(false),
+    );
     assert!(refusal_detail(g).contains("could not be read: peek refused"));
-    let (g, _) = kill_gate_asking(Some(&sudo), Ok(true), Err(io::Error::other("procs refused")));
+    let (g, _) = kill_gate_asking(Some(report(sudo)), Ok(true), Err(io::Error::other("procs refused")));
     assert!(refusal_detail(g).contains("could not be read: procs refused"));
 }
 
@@ -186,10 +178,13 @@ fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
 fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
     for via in &NOT_FRONTS {
         for in_cgroup in [false, true] {
-            let (g, asked) = kill_gate_asking(via.as_ref(), Ok(true), Ok(in_cgroup));
+            let reported = via.clone().map(report);
+            let (g, asked) = kill_gate_asking(reported.clone(), Ok(true), Ok(in_cgroup));
             assert_eq!(asked, "", "{via:?}");
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
-            let g = terminate_gate(front(via.as_ref()), PID, || panic!("not asked"));
+            let g = terminate_gate(reported.and_then(|reported| reported.front()), PID, || {
+                panic!("not asked")
+            });
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
         }
     }
@@ -199,7 +194,7 @@ fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
 #[skuld::test]
 fn a_sigterm_to_a_relaying_front_is_open() {
     for via in [ElevatedVia::Wrapped(Backend::Sudo), ElevatedVia::Wrapped(Backend::Doas)] {
-        let g = terminate_gate(front(Some(&via)), PID, || panic!("not asked"));
+        let g = terminate_gate(report(via.clone()).front(), PID, || panic!("not asked"));
         assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
     }
 }
@@ -208,18 +203,13 @@ fn a_sigterm_to_a_relaying_front_is_open() {
 /// it has exited.
 #[skuld::test]
 fn a_sigterm_to_a_live_osascript_is_closed() {
-    let osascript = ElevatedVia::MacosOsascript;
-    let detail = refusal_detail(terminate_gate(front(Some(&osascript)), PID, || Ok(true)));
+    let osascript = report(ElevatedVia::MacosOsascript).front();
+    let detail = refusal_detail(terminate_gate(osascript, PID, || Ok(true)));
     assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
     assert!(detail.contains("no SIGTERM was sent"), "{detail}");
-    let detail = refusal_detail(terminate_gate(front(Some(&osascript)), PID, || {
-        Err(io::Error::other("peek refused"))
-    }));
+    let detail = refusal_detail(terminate_gate(osascript, PID, || Err(io::Error::other("peek refused"))));
     assert!(detail.contains("peek refused"), "{detail}");
-    assert!(matches!(
-        terminate_gate(front(Some(&osascript)), PID, || Ok(false)),
-        Gate::Open
-    ));
+    assert!(matches!(terminate_gate(osascript, PID, || Ok(false)), Gate::Open));
 }
 
 /// What `cgroup_kill_reached` asked, in order (`e`xited, `u`nder the leaf), and its answer.
@@ -286,10 +276,10 @@ fn a_front_whose_place_after_the_kill_cannot_be_read_is_refused() {
 fn a_front_reaped_between_the_gates_reads_has_exited() {
     let sudo = ElevatedVia::Wrapped(Backend::Sudo);
     let reaped = || Err(io::Error::other("ESRCH: reaped"));
-    let (g, asked) = kill_gate_asking_in_turn(Some(&sudo), vec![Ok(true), Ok(false)], reaped());
+    let (g, asked) = kill_gate_asking_in_turn(Some(report(sudo.clone())), vec![Ok(true), Ok(false)], reaped());
     assert!(matches!(g, Gate::Exited), "{g:?}");
     assert_eq!(asked, "rcr");
-    let (g, _) = kill_gate_asking_in_turn(Some(&sudo), vec![Ok(true), Ok(true)], reaped());
+    let (g, _) = kill_gate_asking_in_turn(Some(report(sudo)), vec![Ok(true), Ok(true)], reaped());
     refusal_detail(g);
 }
 

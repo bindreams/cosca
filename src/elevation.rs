@@ -489,4 +489,4 @@ impl Drop for Secret {
 
 #[cfg(test)]
 #[path = "elevation_tests.rs"]
-mod elevation_tests;
+pub(crate) mod elevation_tests;

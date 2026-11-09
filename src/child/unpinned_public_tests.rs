@@ -698,11 +698,11 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
     for op in ["kill", "terminate", "kill_tree"] {
         // `sudo` relays a `SIGTERM`, so only `osascript` closes the terminate gate.
         let (mut child, writer) =
-            walked_blocker_reporting(crate::child::front_kill_tests::report(if op == "terminate" {
+            walked_blocker_reporting(Some(crate::elevation::elevation_tests::report(if op == "terminate" {
                 ElevatedVia::MacosOsascript
             } else {
                 ElevatedVia::Wrapped(Backend::Sudo)
-            }));
+            })));
         // The gate looks at the front (twice for a kill, once for a terminate), and the state, read
         // wrongly first, would take the front's `Running` and let the gate see the `Orphaned`
         // one: an exited front, which is signalled.

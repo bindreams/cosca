@@ -16,6 +16,15 @@ fn secret_exposes_bytes_for_the_effect_layer() {
 
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 
+/// The report of a child launched as `via`: nothing stripped, stdio passed through.
+pub(crate) fn report(via: ElevatedVia) -> ElevationReport {
+    ElevationReport {
+        via,
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::Passthrough,
+    }
+}
+
 #[skuld::test]
 fn backend_defaults_to_auto() {
     assert_eq!(Backend::default(), Backend::Auto);
@@ -40,9 +49,8 @@ fn elevated_via_distinguishes_windows_uac_from_wrapped() {
 #[skuld::test]
 fn elevation_report_holds_achieved_state() {
     let r = ElevationReport {
-        via: ElevatedVia::Wrapped(Backend::Sudo),
         stripped_env: vec!["LD_PRELOAD".into()],
-        stdio: ElevatedStdio::Passthrough,
+        ..report(ElevatedVia::Wrapped(Backend::Sudo))
     };
     assert_eq!(r.via, ElevatedVia::Wrapped(Backend::Sudo));
     assert_eq!(r.stripped_env, vec![std::ffi::OsString::from("LD_PRELOAD")]);

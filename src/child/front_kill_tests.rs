@@ -15,29 +15,22 @@ use std::time::Duration;
 
 use crate::child::owned::seams::record_root_teardowns;
 use crate::command::Command;
-use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
+use crate::elevation::elevation_tests::report;
+use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 use crate::os_process::fake::failed_signal;
 use crate::signal::Sig;
 use crate::{ContainMode, Containment, Stdio};
 
-pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
-    Some(ElevationReport {
-        via,
-        stripped_env: Vec::new(),
-        stdio: ElevatedStdio::Passthrough,
-    })
-}
-
 /// The report of a child launched by `sudo`.
 pub(crate) fn sudo_report() -> Option<ElevationReport> {
-    report(ElevatedVia::Wrapped(Backend::Sudo))
+    Some(report(ElevatedVia::Wrapped(Backend::Sudo)))
 }
 
 /// Spawns `cmd` with a piped stdin, as the backend `via` launches, and reported so.
 pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.set_elevation_report(report(via));
+    cmd.set_elevation_report(Some(report(via)));
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
     (child, stdin)
