@@ -3,9 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
-use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
-use syn::{Attribute, ItemExternCrate, ItemUse, Macro, Meta, Token, UseTree};
+use syn::{Attribute, ItemExternCrate, ItemUse, Macro, Meta, UseTree};
 
 pub struct Finding {
     pub line: usize,
@@ -13,9 +12,23 @@ pub struct Finding {
     pub what: String,
 }
 
-/// Parses one file and returns what it finds, or the parse error.
+/// Parses one file and returns what it finds. A file that is not a whole Rust file (an `include!` fragment) but still
+/// lexes is scanned as tokens, so only its attributes are seen; one that does not even lex is the parse error.
 pub fn check_file(text: &str) -> Result<Vec<Finding>, syn::Error> {
-    let file = syn::parse_file(text)?;
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(e) => {
+            let Ok(tokens) = text.parse::<TokenStream>() else {
+                return Err(e);
+            };
+            let mut lint = Lint {
+                aliases: HashMap::new(),
+                findings: Vec::new(),
+            };
+            lint.scan(tokens);
+            return Ok(lint.findings);
+        }
+    };
     let mut collect = Aliases::default();
     collect.visit_file(&file);
     let mut lint = Lint {
@@ -116,9 +129,13 @@ impl Lint {
         path
     }
 
-    /// Whether `path` is a libtest test attribute as written or through a `use` or `extern crate` name.
+    /// Whether `path` is a libtest test attribute. A first segment the file binds with `use` or `extern crate` means
+    /// what it was bound to (`use skuld::test;` makes `#[test]` skuld's); an unbound one means what it says.
     fn is_libtest(&self, path: &[String]) -> bool {
-        is_libtest_attribute(path) || is_libtest_attribute(&self.resolve(path))
+        match path.first() {
+            Some(first) if self.aliases.contains_key(first) => is_libtest_attribute(&self.resolve(path)),
+            _ => is_libtest_attribute(path),
+        }
     }
 
     fn check_meta(&mut self, meta: &Meta) {
@@ -129,16 +146,22 @@ impl Lint {
                 format!("libtest attribute `#[{}]`", path.join("::")),
             );
         } else if path == ["cfg_attr"] {
+            // Read as tokens: `syn` takes the predicate as a `Meta`, which rejects `cfg_attr(true, ..)`.
             if let Meta::List(list) = meta {
-                match list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
-                    // The first argument is the predicate; the rest are the attributes it applies.
-                    Ok(args) => args.iter().skip(1).for_each(|m| self.check_meta(m)),
-                    Err(e) => self.report(
-                        list.path.segments[0].ident.span(),
-                        format!("cannot parse cfg_attr: {e}"),
-                    ),
-                }
+                let args: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
+                self.check_cfg_attr(&args, "");
             }
+        }
+    }
+
+    /// The arguments of a `cfg_attr`: a predicate, then the attributes it applies. Only top-level commas split them:
+    /// commas inside a group are inside its `Group` token.
+    fn check_cfg_attr(&mut self, args: &[TokenTree], site: &str) {
+        for part in args
+            .split(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
+            .skip(1)
+        {
+            self.check_tokens(part, site);
         }
     }
 
@@ -156,7 +179,7 @@ impl Lint {
                     if let Some(TokenTree::Group(g)) = tokens.get(next) {
                         if g.delimiter() == Delimiter::Bracket {
                             let body: Vec<TokenTree> = g.stream().into_iter().collect();
-                            self.check_tokens(&body);
+                            self.check_tokens(&body, " in macro tokens");
                         }
                     }
                 }
@@ -165,8 +188,8 @@ impl Lint {
         }
     }
 
-    /// The inside of one `[...]`: a path, then nothing or an argument group.
-    fn check_tokens(&mut self, body: &[TokenTree]) {
+    /// The inside of one `[...]`: a path, then nothing or an argument group. `site` ends the message of a finding.
+    fn check_tokens(&mut self, body: &[TokenTree], site: &str) {
         let mut at = 0;
         let mut path = Vec::new();
         let mut first = None;
@@ -191,24 +214,39 @@ impl Lint {
             Some(_) => return,
         };
         if self.is_libtest(&path) {
-            self.report(
-                span,
-                format!("libtest attribute `#[{}]` in macro tokens", path.join("::")),
-            );
+            self.report(span, format!("libtest attribute `#[{}]`{site}", path.join("::")));
         } else if let (true, Some(g)) = (path == ["cfg_attr"], args) {
             let inner: Vec<TokenTree> = g.stream().into_iter().collect();
-            // Top-level commas only: commas inside a group are inside its `Group` token. The first part is the predicate.
-            for part in inner
-                .split(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
-                .skip(1)
-            {
-                self.check_tokens(part);
-            }
+            self.check_cfg_attr(&inner, site);
         }
     }
 }
 
+/// `visit_*` overrides for the node kinds with a `Verbatim` variant: the tokens `syn` could not parse, attributes
+/// included, which no other visitor reaches.
+macro_rules! scan_verbatim {
+    ($($method:ident, $node:ident;)*) => {$(
+        fn $method(&mut self, node: &'ast syn::$node) {
+            if let syn::$node::Verbatim(tokens) = node {
+                self.scan(tokens.clone());
+            }
+            visit::$method(self, node);
+        }
+    )*};
+}
+
 impl<'ast> Visit<'ast> for Lint {
+    scan_verbatim! {
+        visit_item, Item;
+        visit_foreign_item, ForeignItem;
+        visit_impl_item, ImplItem;
+        visit_trait_item, TraitItem;
+        visit_expr, Expr;
+        visit_pat, Pat;
+        visit_type, Type;
+        visit_type_param_bound, TypeParamBound;
+    }
+
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         self.check_meta(&attr.meta);
         visit::visit_attribute(self, attr);

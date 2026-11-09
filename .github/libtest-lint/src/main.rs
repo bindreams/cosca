@@ -6,9 +6,11 @@
 //! bodies and invocations, imported by `use`, or reached through a `use` or `extern crate` name. It also checks the
 //! premise: each member's manifest has no target that runs on libtest.
 //!
-//! Exit 0: clean. 1: a libtest attribute or an unparsable file. 2: a manifest target on libtest, or the tool could not
-//! run. Not covered: an attribute a third-party proc macro emits, or one assembled with `concat!` or from a `$m:meta`.
-//! A syntax `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped.
+//! Exit 0: clean. 1: a libtest attribute, an unparsable file or a path that is not UTF-8. 2: a manifest target on
+//! libtest, or the tool could not run. Not covered: an attribute a third-party proc macro emits, one assembled with
+//! `concat!` or from a `$m:meta`, or an alias bound in one file (`pub use tokio as tk;`) and used in another. A syntax
+//! `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped. A file that is not a whole Rust file
+//! (an `include!` fragment) is lexed instead, and only its attributes are checked, without the file's `use`s.
 //!
 //! Run from inside the workspace; takes no arguments.
 
@@ -40,7 +42,11 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode, Failure> {
     let (root, members) = members()?;
     let excluded = excluded(&root)?;
-    let tracked = tracked(&root)?;
+    let (tracked, invalid) = tracked(&root)?;
+    let mut findings = invalid.len();
+    for path in &invalid {
+        println!("{path}: path is not UTF-8");
+    }
     let manifest_dirs: BTreeSet<&str> = tracked
         .iter()
         .filter_map(|f| {
@@ -50,7 +56,7 @@ fn run() -> Result<ExitCode, Failure> {
         .map(|d| d.trim_end_matches('/'))
         .collect();
 
-    let (mut findings, mut premise) = (0, 0);
+    let mut premise = 0;
     for member in &members {
         let mine: BTreeSet<String> = tracked
             .iter()
@@ -153,8 +159,9 @@ fn excluded(root: &Path) -> Result<Vec<String>, Failure> {
         .collect())
 }
 
-/// Tracked `.rs` files and `Cargo.toml`s, relative to the workspace root. Only tracked files: never untracked scratch.
-fn tracked(root: &Path) -> Result<BTreeSet<String>, Failure> {
+/// Tracked `.rs` files and `Cargo.toml`s, relative to the workspace root, and the lossy names of those whose path is
+/// not UTF-8. Only tracked files: never untracked scratch.
+fn tracked(root: &Path) -> Result<(BTreeSet<String>, Vec<String>), Failure> {
     let out = Command::new("git")
         .current_dir(root)
         .args(["ls-files", "-z", "--", "*.rs", "*Cargo.toml"])
@@ -162,12 +169,19 @@ fn tracked(root: &Path) -> Result<BTreeSet<String>, Failure> {
     if !out.status.success() {
         return Err(format!("git ls-files failed: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
-    let list = String::from_utf8(out.stdout)?;
-    let files = list.split('\0').filter(|f| !f.is_empty());
-    Ok(files
-        .filter(|f| f.ends_with(".rs") || f.rsplit('/').next() == Some("Cargo.toml"))
-        .map(str::to_string)
-        .collect())
+    let (mut files, mut invalid) = (BTreeSet::new(), Vec::new());
+    for name in out.stdout.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+        if !(name.ends_with(b".rs") || name.rsplit(|&b| b == b'/').next() == Some(b"Cargo.toml".as_slice())) {
+            continue;
+        }
+        match std::str::from_utf8(name) {
+            Ok(name) => {
+                files.insert(name.to_string());
+            }
+            Err(_) => invalid.push(String::from_utf8_lossy(name).into_owned()),
+        }
+    }
+    Ok((files, invalid))
 }
 
 fn under(file: &str, dir: &str) -> bool {

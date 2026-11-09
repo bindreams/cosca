@@ -4,10 +4,11 @@ use std::collections::BTreeSet;
 
 use toml::{Table, Value};
 
-/// One kind of cargo target: its table key, whether `cargo test` runs it by default, and the files cargo
-/// finds without a table entry.
+/// One kind of cargo target: its table key, the package key that turns discovery off, whether it counts as a libtest
+/// target unless `test = false`, and the files cargo finds without a table entry.
 struct Kind {
     key: &'static str,
+    auto: &'static str,
     tests_by_default: bool,
     discovered: fn(&str) -> Option<Option<String>>,
 }
@@ -34,6 +35,10 @@ fn discovered_in(dir: &str, path: &str) -> Option<Option<String>> {
     }
 }
 
+fn bench_file(path: &str) -> Option<Option<String>> {
+    discovered_in("benches/", path)
+}
+
 fn no_file(_: &str) -> Option<Option<String>> {
     None
 }
@@ -41,21 +46,26 @@ fn no_file(_: &str) -> Option<Option<String>> {
 const KINDS: [Kind; 4] = [
     Kind {
         key: "bin",
+        auto: "autobins",
         tests_by_default: true,
         discovered: bin_file,
     },
     Kind {
         key: "test",
+        auto: "autotests",
         tests_by_default: true,
         discovered: test_file,
     },
+    // `cargo test --benches` and `--all-targets` run a default-harness bench in test mode.
     Kind {
         key: "bench",
-        tests_by_default: false,
-        discovered: no_file,
+        auto: "autobenches",
+        tests_by_default: true,
+        discovered: bench_file,
     },
     Kind {
         key: "example",
+        auto: "autoexamples",
         tests_by_default: false,
         discovered: no_file,
     },
@@ -102,9 +112,9 @@ pub fn check(manifest_path: &str, text: &str, tracked: &BTreeSet<String>) -> Res
                 problem(kind.key, entry.get("name").and_then(Value::as_str).unwrap_or("?"));
             }
         }
-        // `autobins` / `autotests` default to true; a discovered file an entry names (by path or name) is that entry's.
+        // Discovery defaults to on; a discovered file an entry names (by path or name) is that entry's.
         let auto = package
-            .and_then(|p| p.get(&format!("auto{}s", kind.key)))
+            .and_then(|p| p.get(kind.auto))
             .and_then(Value::as_bool)
             .unwrap_or(true);
         if !auto || !kind.tests_by_default {
