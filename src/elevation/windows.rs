@@ -612,12 +612,7 @@ pub(crate) fn spawn_elevated(
     policy: SpawnPolicy,
 ) -> Result<crate::child::Child, SpawnFailure> {
     match launch_runas(&*cmd)? {
-        RunasOutcome::AlreadyElevated => {
-            cmd.set_elevation_report(Some(crate::elevation::already_elevated_report(
-                ElevatedStdio::Passthrough,
-            )));
-            crate::child::spawn::spawn_unelevated(cmd, kill_on_drop, policy)
-        }
+        RunasOutcome::AlreadyElevated => spawn_already_elevated(cmd, kill_on_drop, policy),
         RunasOutcome::Launched {
             proc,
             granted,
@@ -634,6 +629,17 @@ pub(crate) fn spawn_elevated(
             policy,
         )),
     }
+}
+
+/// Spawn `cmd` as an ordinary child that reports itself already elevated, as the POSIX rewrite
+/// does: from a derived command, so `cmd` keeps no report.
+fn spawn_already_elevated(
+    cmd: &mut Command,
+    kill_on_drop: bool,
+    policy: SpawnPolicy,
+) -> Result<crate::child::Child, SpawnFailure> {
+    let mut derived = cmd.derive_reported(crate::elevation::already_elevated_report(ElevatedStdio::Passthrough));
+    crate::child::spawn::spawn_unelevated(&mut derived, kill_on_drop, policy)
 }
 
 #[cfg(test)]

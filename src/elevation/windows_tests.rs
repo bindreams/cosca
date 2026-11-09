@@ -1116,3 +1116,21 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     assert!(detail.contains("pid could not be read ("), "{detail}");
     assert!(detail.ends_with("it was terminated"), "{detail}");
 }
+
+/// A spawn that finds the parent already elevated gives its child the `AlreadyElevated` report and
+/// leaves the caller's command with none, which would stay on the builder after the spawn.
+///
+/// Mutants: the report is written to the caller's command; the child carries none.
+#[skuld::test]
+fn an_already_elevated_spawn_leaves_the_callers_command_without_a_report() {
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(["cmd", "/c", "exit", "0"]);
+    let child = super::spawn_already_elevated(&mut cmd, true, crate::child::spawn::policy::SpawnPolicy::SYNC)
+        .expect("an ordinary spawn");
+    assert!(cmd.elevation_report().is_none(), "{:?}", cmd.elevation_report());
+    assert_eq!(
+        child.elevation().map(|report| report.via),
+        Some(super::ElevatedVia::AlreadyElevated)
+    );
+    assert!(child.wait().expect("the child exits").success());
+}

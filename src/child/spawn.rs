@@ -53,7 +53,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
                 backend_path,
             } = crate::elevation::posix::rewrite(cmd).not_started()?;
             // From here the child is the backend: its elevated program may outlive what happens to it.
-            let wrapper = derived
+            let behind_front = derived
                 .elevation_report()
                 .and_then(crate::elevation::ElevationReport::front)
                 .is_some();
@@ -63,17 +63,16 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
                 // yields the same kind and stays a plain Io). An already-elevated derived
                 // (sanitized original) has no backend path, so it is never remapped.
                 let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
-                // The child carries the derived command's report, so the cleanup kill() of a failed
-                // deferred password write sees the elevated state: an EPERM maps to the typed
-                // Unkillable rather than leaking a raw Io.
                 let child = match backend_path.as_deref() {
                     Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
                     None => r?,
                 };
                 let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+                // The child already carries the report, so a failed password write's cleanup kill()
+                // maps EPERM to `Unkillable`.
                 finish_elevated(child, written)
             })();
-            return spawned.map_err(|failure| if wrapper { failure.behind_wrapper() } else { failure });
+            return spawned.map_err(|failure| if behind_front { failure.behind_front() } else { failure });
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -499,8 +498,7 @@ pub(crate) fn spawn_unelevated(
     #[cfg(windows)]
     let to_raw_backend = routes_to_raw_backend(cmd);
     let fds = std::mem::take(cmd.fds_mut());
-    // The child's only front-ness, read before a `Child` exists (a failed spawn's teardown) and kept
-    // by the `Child` it becomes.
+    // Read now: a failed spawn's teardown needs the front before a `Child` exists.
     let elevation = cmd.elevation_report().cloned();
     let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
 

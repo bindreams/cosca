@@ -571,6 +571,38 @@ fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     );
 }
 
+/// A child reported as an elevation that leaves no front (pkexec execs the program; UAC and an
+/// already-elevated parent track it) fails after its spawn without the wrapper flag, and its error
+/// has no note that an elevated program may still run.
+///
+/// Mutants: a helper sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+#[skuld::test]
+fn a_failure_after_the_spawn_of_a_child_reported_without_a_front_sets_no_wrapper_flag() {
+    use crate::child::spawn::failure::seams;
+    use crate::elevation::{Backend, ElevatedVia};
+    use crate::error::ChildFate;
+    let note = "an elevated program behind it may still run";
+    for via in [
+        ElevatedVia::Wrapped(Backend::Pkexec),
+        ElevatedVia::AlreadyElevated,
+        ElevatedVia::WindowsUac,
+    ] {
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(via.clone())));
+        let _pump = seams::fail_the_next_pump();
+        let output = cmd.output().expect_err("a failed pump fails `output`");
+        let _pump = seams::fail_the_next_pump();
+        let read = cmd.read().expect_err("a failed pump fails `read`");
+        let _wait = seams::fail_the_next_wait();
+        let status = cmd.status().expect_err("a failed wait fails `status`");
+        for error in [output, read, status] {
+            assert!(!error.to_string().contains(note), "{via:?}: {error}");
+            assert_failed_after_the_spawn(error, ChildFate::Reaped, false);
+        }
+    }
+}
+
 /// A live `sudo` front, which `output`, `status` and `read` leave running when their pump or wait
 /// fails after the spawn: the teardown sends it no kill and hands it back running, and the error
 /// carries the wrapper flag. The root reads fd 4, which the helpers leave alone, so only the test's
@@ -622,18 +654,26 @@ fn output_status_and_read_hand_a_live_front_back_after_the_spawn() {
 }
 
 /// `read`'s invalid UTF-8 of a child behind a front keeps the wrapper flag, as the pump's and
-/// wait's failures do. The front, `printf` reported as launched by `sudo`, ends by itself, and
-/// `read` collects its exit before it fails.
+/// wait's failures do, and one reported as pkexec or already elevated has none. The front, `printf`
+/// reported as launched by `sudo`, ends by itself, and `read` collects its exit before it fails.
 ///
-/// Mutant: `read` builds the invalid-UTF-8 error without the child's wrapper flag.
+/// Mutants: `read` builds the invalid-UTF-8 error without the child's wrapper flag, or sets it
+/// from `report.is_some()`.
 #[cfg(unix)]
 #[skuld::test]
 fn read_of_invalid_utf8_behind_a_front_keeps_the_wrapper_flag() {
-    for wrapper in [false, true] {
+    use crate::elevation::{Backend, ElevatedVia};
+    let reports = [
+        (None, false),
+        (Some(ElevatedVia::Wrapped(Backend::Pkexec)), false),
+        (Some(ElevatedVia::AlreadyElevated), false),
+        (Some(ElevatedVia::Wrapped(Backend::Sudo)), true),
+    ];
+    for (via, wrapper) in reports {
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(["printf", "\\377"]);
-        if wrapper {
-            cmd.set_elevation_report(crate::child::front_kill_tests::sudo_report());
+        if let Some(via) = via {
+            cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(via)));
         }
         let error = cmd.read().expect_err("invalid UTF-8 fails `read`");
         let crate::error::Error::MayHaveStarted {

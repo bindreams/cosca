@@ -240,8 +240,8 @@ impl Command {
         Ok(super::spawn::spawn(&mut self.inner)?)
     }
 
-    /// The sync [`Command`](SyncCommand)'s `set_elevation_report`, for tests.
-    #[cfg(all(test, unix))]
+    /// Forwards to the sync command's `set_elevation_report`.
+    #[cfg(test)]
     pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.inner.set_elevation_report(report);
     }
@@ -291,7 +291,7 @@ impl Command {
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::error::ChildFate::Reaped,
                 None,
-                child.behind_wrapper(),
+                child.inner.front().is_some(),
             )
         })
     }
@@ -301,9 +301,9 @@ impl Command {
 /// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
 /// The teardown says what became of the child, and hands it back if it could not end it.
 pub(super) async fn after_the_spawn(error: Error, child: Child) -> Error {
-    let behind_wrapper = child.behind_wrapper();
+    let behind_front = child.inner.front().is_some();
     let (fate, unreaped) = child.tear_down_awaiting().await;
-    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_front)
 }
 
 #[cfg(test)]

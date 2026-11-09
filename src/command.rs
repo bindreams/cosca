@@ -27,9 +27,8 @@ pub struct Command {
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
-    /// What an elevation-derived spawn achieved: the one source of its child's front-ness (see
-    /// [`ElevationReport::front`](crate::elevation::ElevationReport::front)), which the spawn's
-    /// teardown after a failure reads before a `Child` exists, and the `Child` it makes keeps.
+    /// What an elevation-derived spawn achieved. A failed spawn's teardown reads its front from this
+    /// before a `Child` exists; the `Child` then keeps it.
     elevation_report: Option<crate::elevation::ElevationReport>,
     flags: FlagsRequest,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
@@ -898,14 +897,34 @@ impl Command {
         self.fd_marker_suppressed
     }
 
-    /// Record what this command's elevated spawn achieved. Set by the elevation rewrite on its derived
-    /// command, and by the Windows spawn that finds the parent already elevated.
+    /// Record what this command's elevated spawn achieved.
+    #[cfg(any(test, unix))]
     pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation_report = report;
     }
 
     pub(crate) fn elevation_report(&self) -> Option<&crate::elevation::ElevationReport> {
         self.elevation_report.as_ref()
+    }
+
+    /// A command that spawns what this one describes, unelevated, carrying `report`. Its stdio is
+    /// moved out of this command (`ResolvedStdio::File` is not `Clone`), as a spawn takes it.
+    #[cfg(windows)]
+    pub(crate) fn derive_reported(&mut self, report: crate::elevation::ElevationReport) -> Command {
+        Command {
+            input: self.input.clone(),
+            executable: self.executable.clone(),
+            fds: std::mem::take(&mut self.fds),
+            env_ops: self.env_ops.clone(),
+            cwd: self.cwd.clone(),
+            kill_on_drop: self.kill_on_drop,
+            contain: self.contain,
+            elevation: crate::elevation::ElevationRequest::default(),
+            fd_marker_suppressed: self.fd_marker_suppressed,
+            elevation_report: Some(report),
+            flags: self.flags,
+            held: self.held.clone(),
+        }
     }
 
     // ---- crate-internal accessors for the spawn engine -------------
@@ -996,7 +1015,7 @@ impl Command {
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::error::ChildFate::Reaped,
                 None,
-                child.behind_wrapper(),
+                child.front().is_some(),
             )
         })
     }
@@ -1006,9 +1025,9 @@ impl Command {
 /// started, and `child` is torn down now as its drop would. The error says what became of it, and
 /// carries it when its teardown could not end it.
 fn after_the_spawn(error: Error, child: crate::Child) -> Error {
-    let behind_wrapper = child.behind_wrapper();
+    let behind_front = child.front().is_some();
     let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
-    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_wrapper)
+    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_front)
 }
 
 #[cfg(test)]

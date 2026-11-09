@@ -320,15 +320,19 @@ pub struct ElevationReport {
 }
 
 impl ElevationReport {
-    /// The front this child is, if any: what the spawn leaves this process tracking when it
-    /// outlives the elevated program. pkexec execs the program, so it is none.
+    /// The front the spawn leaves this process tracking, if any: a backend whose elevated program
+    /// outlives it. pkexec execs the program, and UAC and an already-elevated parent track it, so
+    /// none.
     pub(crate) fn front(&self) -> Option<front::Front> {
         match self.via {
             ElevatedVia::Wrapped(Backend::Sudo) => Some(front::Front::Sudo),
             ElevatedVia::Wrapped(Backend::Doas) => Some(front::Front::Doas),
             ElevatedVia::MacosOsascript => Some(front::Front::Osascript),
-            // A report never names `Auto`.
-            ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
+            ElevatedVia::Wrapped(Backend::Pkexec) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
+            ElevatedVia::Wrapped(Backend::Auto) => {
+                debug_assert!(false, "a report never names Auto");
+                None
+            }
         }
     }
 

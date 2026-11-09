@@ -553,10 +553,9 @@ impl PendingPassword {
 }
 
 /// Outcome of a POSIX rewrite. `derived` is the command to spawn (the backend wrapper, or
-/// — when already elevated — the sanitized original), which carries the [`ElevationReport`] the
-/// resulting `Child` keeps. `password_write` is delivered after spawn. `backend_path` is the
-/// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when no
-/// backend wraps the child, i.e. already elevated).
+/// — when already elevated — the sanitized original). `password_write` is delivered after spawn.
+/// `backend_path` is the resolved argv[0] the spawn arm passes to `remap_derived_spawn_error`
+/// (`None` when no backend wraps the child, i.e. already elevated).
 pub(crate) struct PosixRewrite {
     pub derived: Command,
     pub password_write: Option<PendingPassword>,

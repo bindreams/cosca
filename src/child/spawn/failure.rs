@@ -75,8 +75,8 @@ impl SpawnFailure {
     }
 
     /// This failure, if it says the program may have started, marked as that of an elevation
-    /// backend, whose elevated program may outlive its fate (see [`Error::MayHaveStarted`]).
-    pub(crate) fn behind_wrapper(self) -> SpawnFailure {
+    /// front, whose elevated program may outlive its fate (see [`Error::MayHaveStarted`]).
+    pub(crate) fn behind_front(self) -> SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted {
                 cause, fate, unreaped, ..
@@ -93,15 +93,10 @@ impl SpawnFailure {
 
 /// The error of a run-to-completion helper (`output`, `status`, `read`) that failed after its spawn
 /// succeeded: the program may have started, and `fate` says what became of its child.
-/// `unreaped` is the child its teardown could not end, handed back. `behind_wrapper` is whether the
-/// child is an elevation backend.
-pub(crate) fn after_the_spawn(
-    cause: Error,
-    fate: ChildFate,
-    unreaped: Option<Unreaped>,
-    behind_wrapper: bool,
-) -> Error {
-    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_wrapper))
+/// `unreaped` is the child its teardown could not end, handed back. `behind_front` is whether the
+/// child is an elevation front.
+pub(crate) fn after_the_spawn(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>, behind_front: bool) -> Error {
+    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_front))
 }
 
 /// [`after_the_spawn`], as the [`SpawnFailure`] a spawn returns.
@@ -109,11 +104,11 @@ pub(crate) fn failed_after_the_spawn(
     cause: Error,
     fate: ChildFate,
     unreaped: Option<Unreaped>,
-    behind_wrapper: bool,
+    behind_front: bool,
 ) -> SpawnFailure {
     let failure = SpawnFailure::started(cause, fate, unreaped);
-    if behind_wrapper {
-        failure.behind_wrapper()
+    if behind_front {
+        failure.behind_front()
     } else {
         failure
     }
@@ -308,7 +303,7 @@ impl<T, E: PlainError> Classify<T> for Result<T, E> {
 }
 
 /// Test seams that fail a run-to-completion helper (`output`, `status`, `read`) after its spawn
-/// succeeded. Thread-local; the guard clears them.
+/// succeeded.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::Cell;

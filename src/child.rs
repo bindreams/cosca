@@ -140,7 +140,7 @@ pub struct Child {
     /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
     pub(crate) tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
-    /// What the spawn achieved, the one source of this child's front-ness ([`Child::front`]).
+    /// What the spawn achieved; [`Child::front`] reads the front from it.
     elevation: Option<crate::elevation::ElevationReport>,
     /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
     /// and anything new at `warn`
@@ -200,13 +200,13 @@ impl Child {
         };
         // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
         self.kill_on_drop = true;
-        let behind_wrapper = self.behind_wrapper();
+        let behind_front = self.front().is_some();
         let (fate, unreaped) = self.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
         Err(crate::child::spawn::failed_after_the_spawn(
             Error::Io(refusal),
             fate,
             unreaped,
-            behind_wrapper,
+            behind_front,
         ))
     }
 
@@ -301,17 +301,12 @@ impl Child {
         self.wait_root(Some(crate::wait::now()), lifecycle::Orphaned::Quiet)
     }
 
-    /// The elevation front this child is, if any, read from its report (see
-    /// [`crate::elevation::front`]). What the kill and `SIGTERM` gates read.
+    /// The elevation front this child is, if any (see [`crate::elevation::front`]). The kill and
+    /// `SIGTERM` gates read it.
     pub(crate) fn front(&self) -> Option<crate::elevation::front::Front> {
         self.elevation
             .as_ref()
             .and_then(crate::elevation::ElevationReport::front)
-    }
-
-    /// Is this child an elevation front, whose elevated program may outlive it?
-    pub(crate) fn behind_wrapper(&self) -> bool {
-        self.front().is_some()
     }
 
     /// Whether this child's tracked process may run as another user, so a refused signal to it is
