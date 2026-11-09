@@ -32,11 +32,9 @@ startup instead of selecting nothing (or, negated, everything). Labels are decla
 only skuld binaries honour it: libtest binaries ignore it and would run whole.
 
 Libtest's `#[test]` never runs in a `harness = false` target, so
-[`.github/scripts/libtest_guard.py`](.github/scripts/libtest_guard.py) fails on any such test and
-on any `test = true` target left on the default harness. It compiles each target with `cfg(test)`
-on, so code hiding a test from it (`#[cfg_attr(not(test), test)]`) escapes. It runs as a prek hook
-and as one CI step per lane (target triple), covering every cargo target, both profiles and the
-feature powerset.
+[`.github/libtest-lint`](.github/libtest-lint/src/main.rs) fails on any such attribute in a tracked
+source file, whatever its `cfg`, and on any target left on the default harness. It parses source
+and needs no build of the crate, so it runs in about a second as a prek hook and in CI's Lint job.
 
 ### Doc tests
 
@@ -123,7 +121,7 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 
 ## Linting
 
-`prek` runs `.github/scripts/clippy.sh` and the libtest guard (`.github/scripts/libtest_guard.py`), a `uv` script: install [uv](https://docs.astral.sh/uv/). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
+`prek` runs `.github/scripts/clippy.sh` and the libtest lint (`.github/libtest-lint`, a small Rust tool that `cargo` builds on first use). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
 
 ## License
 
