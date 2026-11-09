@@ -104,9 +104,7 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
             let mut cmd = foreign_tracer::tokio_tracee_command();
             if front {
                 cmd.contain_with(crate::ContainMode::Strongest);
-                cmd.set_elevation_front(crate::elevation::front::front(Some(
-                    &crate::elevation::ElevatedVia::Wrapped(crate::elevation::Backend::Sudo),
-                )));
+                cmd.set_elevation_report(crate::child::front_kill_tests::sudo_report());
             }
             cmd.stdin(stdin).expect("set stdin");
             let out = std::fs::File::from(std::os::fd::OwnedFd::from(out_writer));

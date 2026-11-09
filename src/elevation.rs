@@ -298,14 +298,6 @@ pub enum ElevatedVia {
     AlreadyElevated,
 }
 
-impl ElevatedVia {
-    /// Whether the child cosca spawns is an elevation front, whose elevated program may outlive it:
-    /// the fronts [`front::front`] names, and no other (pkexec execs the program).
-    pub(crate) fn program_outlives_child(&self) -> bool {
-        front::front(Some(self)).is_some()
-    }
-}
-
 /// The planner's privilege target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -325,6 +317,26 @@ pub struct ElevationReport {
     /// filter or override a forwarded var, which the crate cannot observe.
     pub stripped_env: Vec<OsString>,
     pub stdio: ElevatedStdio,
+}
+
+impl ElevationReport {
+    /// The front this child is, if any: what the spawn leaves this process tracking when it
+    /// outlives the elevated program. pkexec execs the program, so it is none.
+    pub(crate) fn front(&self) -> Option<front::Front> {
+        match self.via {
+            ElevatedVia::Wrapped(Backend::Sudo) => Some(front::Front::Sudo),
+            ElevatedVia::Wrapped(Backend::Doas) => Some(front::Front::Doas),
+            ElevatedVia::MacosOsascript => Some(front::Front::Osascript),
+            // A report never names `Auto`.
+            ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
+        }
+    }
+
+    /// Whether the tracked process may run as another user, so that a refused signal to it is
+    /// `Unkillable`. `AlreadyElevated` is an ordinary child of an already-root parent: killable.
+    pub(crate) fn may_run_as_another_user(&self) -> bool {
+        matches!(self.via, ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac)
+    }
 }
 
 /// The resolved elevation request carried on a [`crate::Command`] (crate-internal),

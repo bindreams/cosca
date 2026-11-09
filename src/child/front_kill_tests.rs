@@ -1,5 +1,5 @@
 //! Signals to a child behind an elevation front, on an ordinary `cat` this test owns and reports as
-//! launched by `sudo` or `osascript` (`set_elevation`). No forced kill may signal a live front, and
+//! launched by `sudo` or `osascript` (`set_elevation_report`). No forced kill may signal a live front, and
 //! no `SIGTERM` a live osascript. The cgroup lane's cases are in `front_cgroup_tests.rs`.
 //!
 //! Whether anything signalled the `cat` is read from how it ended: it exits 0 once the test closes
@@ -29,12 +29,16 @@ pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
     })
 }
 
-/// Spawns `cmd` with a piped stdin, as the front `via` launches, and reported so.
+/// The report of a child launched by `sudo`.
+pub(crate) fn sudo_report() -> Option<ElevationReport> {
+    report(ElevatedVia::Wrapped(Backend::Sudo))
+}
+
+/// Spawns `cmd` with a piped stdin, as the backend `via` launches, and reported so.
 pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&via)));
+    cmd.set_elevation_report(report(via));
     let mut child = cmd.spawn().expect("spawn");
-    child.set_elevation(report(via));
     let stdin = child.stdin().expect("stdin pipe");
     (child, stdin)
 }
@@ -136,21 +140,6 @@ fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
     let warns = crate::log_capture::warns_since(mark, "Child::drop");
     assert!(warns.is_empty(), "{warns:?}");
     assert_eq!(reap(pid), None, "the drop reaps an exited front");
-}
-
-/// A front its spawn found is what the gates read, not the elevation report: a child with a report
-/// and no front is killed as any child.
-#[skuld::test]
-fn kill_reads_the_front_its_spawn_found_not_its_report() {
-    let mut cmd = cat();
-    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    let mut child = cmd.spawn().expect("spawn");
-    child.set_elevation(report(ElevatedVia::Wrapped(Backend::Sudo)));
-    let stdin = child.stdin().expect("stdin pipe");
-    child.kill().expect("a child with no front is killed as any child");
-    // Closed first: a child nothing killed then exits 0, and the assertion fails.
-    drop(stdin);
-    assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
 /// doas leaves this process tracking a front, as sudo does.
@@ -622,9 +611,7 @@ pub(crate) fn failed_front_spawns(
         if let Some(mode) = contain {
             cmd.contain_with(mode);
         }
-        cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-            Backend::Sudo,
-        ))));
+        cmd.set_elevation_report(sudo_report());
         force_arm(true);
         let err = spawn(&mut cmd);
         force_arm(false);
@@ -930,9 +917,7 @@ pub(crate) fn fail_a_front_spawn<G>(
     let mut cmd = cat();
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-        Backend::Sudo,
-    ))));
+    cmd.set_elevation_report(sudo_report());
     configure(&mut cmd);
     let err = {
         let _forced = force();

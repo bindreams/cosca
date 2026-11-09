@@ -63,7 +63,7 @@ impl Child {
     pub(super) fn into_unreaped(mut self) -> Unreaped {
         debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
         let root = self.proc.take().expect("a child handed back still holds its root");
-        Unreaped::new(root, self.id, self.front.is_some(), self.policy.unreaped_drop)
+        Unreaped::new(root, self.id, self.behind_wrapper(), self.policy.unreaped_drop)
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
@@ -218,7 +218,8 @@ impl Child {
                 };
                 return self.begin_leaf_and_front(unkillable.to_string(), parts);
             }
-            gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
+            crate::elevation::front::Gate::CgroupOnly(front) => Some(front),
+            _ => None,
         };
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
@@ -248,9 +249,9 @@ impl Child {
             };
             return BeginOutcome::Done(parts.finish(self, torn));
         }
-        if cgroup_only {
+        if let Some(front) = cgroup_only {
             let not_reached = match kill.incomplete() {
-                None => self.cgroup_kill_reached().err().map(|e| e.to_string()),
+                None => self.cgroup_kill_reached(front).err().map(|e| e.to_string()),
                 failure => failure,
             };
             let parts = DropParts {

@@ -107,11 +107,21 @@ fn tokio_raw_executable_records_an_exact_spec() {
 /// A live blocker whose stdin this test holds, and that writer.
 #[cfg(unix)]
 fn held_blocker(kill_on_drop: bool) -> (super::Child, crate::PipeWriter) {
+    held_blocker_reporting(kill_on_drop, None)
+}
+
+/// [`held_blocker`] whose spawn reports `elevation`: a child launched behind that backend.
+#[cfg(unix)]
+fn held_blocker_reporting(
+    kill_on_drop: bool,
+    elevation: Option<crate::elevation::ElevationReport>,
+) -> (super::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
+    cmd.set_elevation_report(elevation);
     (cmd.spawn().expect("spawn"), writer)
 }
 
@@ -239,25 +249,40 @@ async fn the_child_a_failed_async_run_hands_back_is_let_go_when_dropped() {
     );
 }
 
-/// Async twin of the sync `a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend`.
+/// Async twin of the sync `a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_front`:
+/// an ended front is reaped with the note, a running one is sent no kill and handed back running.
 #[cfg(unix)]
 #[skuld::test]
-async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() {
-    use crate::elevation::{Backend, ElevatedVia};
+async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_front() {
     let note = "an elevated program behind it may still run";
     let (plain, w1) = held_blocker(true);
     let plain = after_a_pump_failure(plain, w1).await;
     assert!(!plain.to_string().contains(note), "{plain}");
 
-    let (mut wrapped, w2) = held_blocker(true);
-    wrapped
-        .inner
-        .set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
-            Backend::Sudo,
-        )));
-    let wrapped = after_a_pump_failure(wrapped, w2).await;
-    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
-    assert!(wrapped.to_string().contains(note), "{wrapped}");
+    let (ended, writer) = held_blocker_reporting(true, crate::child::front_kill_tests::sudo_report());
+    drop(writer);
+    crate::test_child::wait_until_zombie(ended.pid());
+    let ended = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), ended).await;
+    assert!(ended.to_string().contains(note), "{ended}");
+    assert_eq!(ended.fate(), Some(crate::error::ChildFate::Reaped), "{ended}");
+
+    let (front, writer) = held_blocker_reporting(true, crate::child::front_kill_tests::sudo_report());
+    let id = front.id().expect(crate::test_child::IDENTITY_READ);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), front).await;
+    assert!(!error.to_string().contains(note), "{error}");
+    let crate::error::Error::MayHaveStarted {
+        fate,
+        unreaped: Some(unreaped),
+        ..
+    } = error
+    else {
+        panic!("expected a handed-back front, got {error:?}");
+    };
+    assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
+    // The front exits on its own once its stdin closes: nothing signalled it.
+    drop(writer);
+    let status = unreaped.wait_async().await.expect("the front exits on EOF");
+    assert!(status.success(), "a front is sent no kill: {status:?}");
 }
 
 // A run-to-completion helper that fails after its spawn =====
@@ -318,60 +343,109 @@ impl Released {
 /// teardown kills and reaps the child, which the test checks on Unix (the root is `SIGKILL`ed, not
 /// ended by its release).
 ///
-/// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag; the teardown's
-/// kill sends nothing.
+/// Mutants: a helper returns the cause bare; drops the fate; the teardown's kill sends nothing.
 #[skuld::test]
 async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
     use crate::child::spawn::failure::seams;
     use crate::error::ChildFate;
     crate::tokio::test_runtime::assert_current_thread();
     let torn_down = ChildFate::Reaped;
-    for wrapper in [false, true] {
-        let _wrapper = wrapper.then(seams::pretend_wrapper);
-        {
-            let (mut cmd, killed) = releasable_root();
-            let _pump = seams::fail_the_next_pump();
-            assert_failed_after_the_spawn(
-                cmd.output().await.expect_err("a failed pump fails `output`"),
-                torn_down,
-                wrapper,
-            );
-            killed.assert_killed();
-        }
-        {
-            let (mut cmd, killed) = releasable_root();
-            let _pump = seams::fail_the_next_pump();
-            assert_failed_after_the_spawn(
-                cmd.read().await.expect_err("a failed pump fails `read`"),
-                torn_down,
-                wrapper,
-            );
-            killed.assert_killed();
-        }
-        {
-            let (mut cmd, killed) = releasable_root();
-            let _wait = seams::fail_the_next_wait();
-            assert_failed_after_the_spawn(
-                cmd.status().await.expect_err("a failed wait fails `status`"),
-                torn_down,
-                wrapper,
-            );
-            killed.assert_killed();
-        }
+    {
+        let (mut cmd, killed) = releasable_root();
+        let _pump = seams::fail_the_next_pump();
+        assert_failed_after_the_spawn(
+            cmd.output().await.expect_err("a failed pump fails `output`"),
+            torn_down,
+            false,
+        );
+        killed.assert_killed();
+    }
+    {
+        let (mut cmd, killed) = releasable_root();
+        let _pump = seams::fail_the_next_pump();
+        assert_failed_after_the_spawn(
+            cmd.read().await.expect_err("a failed pump fails `read`"),
+            torn_down,
+            false,
+        );
+        killed.assert_killed();
+    }
+    {
+        let (mut cmd, killed) = releasable_root();
+        let _wait = seams::fail_the_next_wait();
+        assert_failed_after_the_spawn(
+            cmd.status().await.expect_err("a failed wait fails `status`"),
+            torn_down,
+            false,
+        );
+        killed.assert_killed();
     }
 }
 
-/// Async twin of the sync `read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag`.
+/// Async twin of the sync `output_status_and_read_hand_a_live_front_back_after_the_spawn`: a live
+/// `sudo` front is sent no kill, handed back running, and the error carries the wrapper flag.
+///
+/// Mutants: a helper drops the wrapper flag of a front; the teardown kills the front.
+#[cfg(unix)]
+#[skuld::test]
+async fn output_status_and_read_hand_a_live_front_back_after_the_spawn() {
+    use crate::child::spawn::failure::seams;
+    crate::tokio::test_runtime::assert_current_thread();
+    // The root reads fd 4, which the helpers leave alone, so only the test's release ends it.
+    let front = || {
+        let (gate, release) = crate::test_child::held_writer_stdin();
+        let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+        cmd.args(["sh", "-c", "exec cat <&4 4<&-"]);
+        cmd.fd(4, gate).expect("set the front's release pipe");
+        cmd.set_elevation_report(crate::child::front_kill_tests::sudo_report());
+        (cmd, release)
+    };
+    for name in ["output", "read", "status"] {
+        let (mut cmd, release) = front();
+        let _armed = if name == "status" {
+            seams::fail_the_next_wait()
+        } else {
+            seams::fail_the_next_pump()
+        };
+        let error = match name {
+            "output" => cmd.output().await.map(drop),
+            "read" => cmd.read().await.map(drop),
+            _ => cmd.status().await.map(drop),
+        }
+        .expect_err("the armed failure fails the helper");
+        let crate::error::Error::MayHaveStarted {
+            fate,
+            wrapper_elevated,
+            unreaped: Some(unreaped),
+            ..
+        } = error
+        else {
+            panic!("{name}: expected a handed-back front, got {error:?}");
+        };
+        assert!(wrapper_elevated, "{name}");
+        assert!(
+            matches!(fate, crate::error::ChildFate::Running { .. }),
+            "{name}: a front is left running: {fate:?}"
+        );
+        drop(release);
+        let status = unreaped.wait_async().await.expect("the front exits once released");
+        assert!(status.success(), "{name}: a front is sent no kill: {status:?}");
+    }
+}
+
+/// Async twin of the sync `read_of_invalid_utf8_behind_a_front_keeps_the_wrapper_flag`.
 ///
 /// Mutant: `read` builds the invalid-UTF-8 error without the child's wrapper flag.
 #[cfg(unix)]
 #[skuld::test]
-async fn read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag() {
+async fn read_of_invalid_utf8_behind_a_front_keeps_the_wrapper_flag() {
     crate::tokio::test_runtime::assert_current_thread();
     for wrapper in [false, true] {
-        let _wrapper = wrapper.then(crate::child::spawn::failure::seams::pretend_wrapper);
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(["printf", "\\377"]);
+        if wrapper {
+            cmd.set_elevation_report(crate::child::front_kill_tests::sudo_report());
+        }
         let error = cmd.read().await.expect_err("invalid UTF-8 fails `read`");
         let crate::error::Error::MayHaveStarted {
             fate,

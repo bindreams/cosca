@@ -240,10 +240,10 @@ impl Command {
         Ok(super::spawn::spawn(&mut self.inner)?)
     }
 
-    /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
-        self.inner.set_elevation_front(front);
+    /// The sync [`Command`](SyncCommand)'s `set_elevation_report`, for tests.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.inner.set_elevation_report(report);
     }
 
     /// Run to completion with inherited stdio, returning the exit status.

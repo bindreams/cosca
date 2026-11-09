@@ -49,26 +49,27 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
         {
             let crate::elevation::posix::PosixRewrite {
                 mut derived,
-                report,
                 password_write,
                 backend_path,
             } = crate::elevation::posix::rewrite(cmd).not_started()?;
             // From here the child is the backend: its elevated program may outlive what happens to it.
-            let wrapper = report.as_ref().is_some_and(|r| r.via.program_outlives_child());
+            let wrapper = derived
+                .elevation_report()
+                .and_then(crate::elevation::ElevationReport::front)
+                .is_some();
             let spawned = (|| {
                 // The derived program IS the backend; remap an exec failure to
                 // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
                 // yields the same kind and stays a plain Io). An already-elevated derived
                 // (sanitized original) has no backend path, so it is never remapped.
                 let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
-                let mut child = match backend_path.as_deref() {
+                // The child carries the derived command's report, so the cleanup kill() of a failed
+                // deferred password write sees the elevated state: an EPERM maps to the typed
+                // Unkillable rather than leaking a raw Io.
+                let child = match backend_path.as_deref() {
                     Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
                     None => r?,
                 };
-                // Set the elevation report BEFORE handling the deferred password: a cleanup
-                // kill() in the write-failure path must see the elevated state so an EPERM maps
-                // to the typed Unkillable rather than leaking a raw Io.
-                child.set_elevation(report);
                 let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
                 finish_elevated(child, written)
             })();
@@ -183,12 +184,16 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             // Not asked again after the kill: a killed front can read as neither exited nor in its
             // cgroup, between leaving the cgroup's member list and becoming a zombie. The kill's own
             // outcome says it landed; the handle's state is settled by `settle`, below.
-            crate::elevation::front::Gate::CgroupOnly if tree.as_ref().is_some_and(TreeKillOutcome::completed) => {
-                child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
+            crate::elevation::front::Gate::CgroupOnly(front)
+                if tree.as_ref().is_some_and(TreeKillOutcome::completed) =>
+            {
+                child
+                    .cgroup_kill_reached(front)
+                    .map(|()| crate::signal::Sent::Delivered)
             }
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
-            crate::elevation::front::Gate::CgroupOnly => Err(crate::elevation::front::cgroup_not_killed_of(
-                child.front,
+            crate::elevation::front::Gate::CgroupOnly(front) => Err(crate::elevation::front::cgroup_not_killed(
+                front,
                 child.pid(),
                 tree_failure.as_deref(),
             )),
@@ -494,6 +499,10 @@ pub(crate) fn spawn_unelevated(
     #[cfg(windows)]
     let to_raw_backend = routes_to_raw_backend(cmd);
     let fds = std::mem::take(cmd.fds_mut());
+    // The child's only front-ness, read before a `Child` exists (a failed spawn's teardown) and kept
+    // by the `Child` it becomes.
+    let elevation = cmd.elevation_report().cloned();
+    let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
 
     // Windows routing. The raw `CreateProcessW` backend owns the cases std cannot
     // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors
@@ -583,11 +592,7 @@ pub(crate) fn spawn_unelevated(
         )
         .not_started()?;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
-        if let Some(leaf) = prepared
-            .cgroup_leaf
-            .as_ref()
-            .filter(|_| cmd.elevation_front().is_some())
-        {
+        if let Some(leaf) = prepared.cgroup_leaf.as_ref().filter(|_| front.is_some()) {
             crate::containment::cgroup::front_placement(&crate::identity::HostKernel, || leaf.id()).not_started()?;
         }
 
@@ -670,7 +675,6 @@ pub(crate) fn spawn_unelevated(
     };
     #[cfg(target_os = "macos")]
     let pid = child.id();
-    let front = cmd.elevation_front();
     // macOS has no handle: the unique id the child reported before `exec` is what the identity is
     // checked against and the shared child is adopted with. The report decides first: a child that
     // died before `exec` is that, whatever an attach would find of its pid.
@@ -881,9 +885,15 @@ pub(crate) fn spawn_unelevated(
             ));
         }
     };
-    let mut child = Child::from_parts(owned, id_read, parent_ends, kill_on_drop, attachment, policy);
-    child.set_front(cmd.elevation_front());
-    Ok(child)
+    Ok(Child::from_parts(
+        owned,
+        id_read,
+        parent_ends,
+        kill_on_drop,
+        attachment,
+        elevation,
+        policy,
+    ))
 }
 
 /// macOS: an attach given a verified identity reads nothing, so it cannot fail.

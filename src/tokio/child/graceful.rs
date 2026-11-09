@@ -466,7 +466,7 @@ impl Child {
             || {
                 self.inner
                     .kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.inner.is_elevated_wrapper()))
+                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.inner.may_run_as_another_user()))
             },
         )
     }

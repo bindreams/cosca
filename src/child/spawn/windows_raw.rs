@@ -253,6 +253,7 @@ pub(crate) fn spawn_raw(
         parent_ends,
         kill_on_drop,
         attachment,
+        cmd.elevation_report().cloned(),
         policy,
     ))
 }

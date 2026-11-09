@@ -613,11 +613,10 @@ pub(crate) fn spawn_elevated(
 ) -> Result<crate::child::Child, SpawnFailure> {
     match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
-            let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop, policy)?;
-            child.set_elevation(Some(crate::elevation::already_elevated_report(
+            cmd.set_elevation_report(Some(crate::elevation::already_elevated_report(
                 ElevatedStdio::Passthrough,
             )));
-            Ok(child)
+            crate::child::spawn::spawn_unelevated(cmd, kill_on_drop, policy)
         }
         RunasOutcome::Launched {
             proc,
@@ -625,18 +624,15 @@ pub(crate) fn spawn_elevated(
             pid,
             id,
             report,
-        } => {
-            let mut child = crate::child::Child::from_parts(
-                OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
-                Some(id),
-                BTreeMap::new(),
-                kill_on_drop,
-                Attachment::uac_elevated(),
-                policy,
-            );
-            child.set_elevation(Some(report));
-            Ok(child)
-        }
+        } => Ok(crate::child::Child::from_parts(
+            OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid, granted))),
+            Some(id),
+            BTreeMap::new(),
+            kill_on_drop,
+            Attachment::uac_elevated(),
+            Some(report),
+            policy,
+        )),
     }
 }
 

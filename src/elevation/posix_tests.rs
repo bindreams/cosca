@@ -348,7 +348,7 @@ mod rewrite_tests {
             .elevation_backend(Backend::Sudo)
             .elevation_auth(Auth::NonInteractive);
         let rw = rewrite_with_host(&mut c, &sudo_host()).expect("rewrite");
-        let report = rw.report.as_ref().expect("report");
+        let report = rw.derived.elevation_report().expect("report");
         assert_eq!(report.via, ElevatedVia::Wrapped(Backend::Sudo));
         assert_eq!(report.stripped_env, vec![OsString::from("LD_PRELOAD")]);
         assert_eq!(report.stdio, ElevatedStdio::Passthrough);
@@ -476,7 +476,10 @@ mod rewrite_tests {
             "the password write is deferred to after spawn"
         );
         // fd0 is the password channel, not the caller's stdin — reported honestly.
-        assert_eq!(rw.report.as_ref().unwrap().stdio, ElevatedStdio::StdinConsumed);
+        assert_eq!(
+            rw.derived.elevation_report().unwrap().stdio,
+            ElevatedStdio::StdinConsumed
+        );
     }
 
     #[skuld::test]
@@ -539,7 +542,7 @@ mod rewrite_tests {
         let derived = rw.derived;
         assert!(rw.backend_path.is_none());
         assert!(rw.password_write.is_none());
-        let report = rw.report.as_ref().unwrap();
+        let report = derived.elevation_report().unwrap();
         assert_eq!(report.via, ElevatedVia::AlreadyElevated);
         assert_eq!(report.stripped_env, vec![OsString::from("LD_PRELOAD")]);
         // The derived program is the ORIGINAL command, not a backend.
@@ -701,7 +704,7 @@ mod rewrite_tests {
         assert!(argv[2].to_str().unwrap().contains("with administrator privileges"));
         assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/osascript")));
         assert!(rw.password_write.is_none());
-        let report = rw.report.expect("a report");
+        let report = derived.elevation_report().expect("a report");
         assert_eq!(report.via, ElevatedVia::MacosOsascript);
         assert_eq!(report.stdio, ElevatedStdio::OsascriptRelay);
     }
@@ -744,7 +747,10 @@ mod rewrite_tests {
         let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
         let rw = rewrite_with_host(&mut c, &macos_gui_host(true)).expect("already-root rewrite");
-        assert_eq!(rw.report.expect("a report").via, ElevatedVia::AlreadyElevated);
+        assert_eq!(
+            rw.derived.elevation_report().expect("a report").via,
+            ElevatedVia::AlreadyElevated
+        );
         assert!(rw.backend_path.is_none(), "no wrapper runs when already elevated");
     }
 

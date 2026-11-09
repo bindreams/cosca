@@ -1,11 +1,50 @@
 use std::cell::Cell;
 use std::io;
 
-use super::{front, kill_gate, terminate_gate, Gate};
-use crate::elevation::{Backend, ElevatedVia};
+use super::{kill_gate, terminate_gate, Front, Gate};
+use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 
 const PID: u32 = 4242;
+
+fn report(via: ElevatedVia) -> ElevationReport {
+    ElevationReport {
+        via,
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::Passthrough,
+    }
+}
+
+/// The front a child launched as `via` is (`None`: not elevated), as its report says.
+fn front(via: Option<&ElevatedVia>) -> Option<Front> {
+    via.and_then(|via| report(via.clone()).front())
+}
+
+/// The fronts a report names, and no other: pkexec execs the program, and UAC and an already-elevated
+/// parent track it. Mutant: a backend's arm of `ElevationReport::front` answers another's.
+#[skuld::test]
+fn a_report_names_the_front_its_via_leaves_tracked() {
+    for (via, name) in FRONTS {
+        assert_eq!(front(Some(&via)).map(Front::name), Some(name), "{via:?}");
+    }
+    for via in NOT_FRONTS.iter().flatten() {
+        assert_eq!(front(Some(via)), None, "{via:?}");
+    }
+}
+
+/// Sudo, doas, pkexec and UAC may run the tracked process as another user; osascript's front runs
+/// as this user, and an already-elevated child is the caller's own. Mutant: an arm of
+/// `ElevationReport::may_run_as_another_user` flips.
+#[skuld::test]
+fn a_report_says_whether_the_tracked_process_may_run_as_another_user() {
+    let runs_as_another_user = |via: ElevatedVia| report(via).may_run_as_another_user();
+    for backend in [Backend::Sudo, Backend::Doas, Backend::Pkexec] {
+        assert!(runs_as_another_user(ElevatedVia::Wrapped(backend)), "{backend:?}");
+    }
+    assert!(runs_as_another_user(ElevatedVia::WindowsUac));
+    assert!(!runs_as_another_user(ElevatedVia::MacosOsascript));
+    assert!(!runs_as_another_user(ElevatedVia::AlreadyElevated));
+}
 
 const FRONTS: [(ElevatedVia, &str); 3] = [
     (ElevatedVia::Wrapped(Backend::Sudo), "sudo"),
@@ -123,7 +162,10 @@ fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
         for running in [Ok(true), Err(io::Error::other("peek refused"))] {
             let (g, asked) = kill_gate_asking(Some(&via), running, Ok(true));
             assert_eq!(asked, "rc", "{via:?}");
-            assert!(matches!(g, Gate::CgroupOnly), "{via:?}: {g:?}");
+            assert!(
+                matches!(&g, Gate::CgroupOnly(f) if Some(*f) == front(Some(&via))),
+                "{via:?}: {g:?}"
+            );
         }
     }
 }
@@ -195,7 +237,7 @@ fn reached_asking_in_turn(exited: Vec<io::Result<bool>>, under_leaf: io::Result<
     };
     let exited = in_turn(exited);
     let r = super::cgroup_kill_reached(
-        front(Some(&ElevatedVia::Wrapped(Backend::Sudo))),
+        Front::Sudo,
         PID,
         || {
             note('e');
@@ -261,25 +303,4 @@ fn a_front_reaped_before_its_cgroup_is_read_was_reached() {
     assert_eq!(asked, "eue");
     let (r, _) = reached_asking_in_turn(vec![Ok(false), Ok(false)], reaped());
     r.expect_err("still running, unplaced");
-}
-
-/// A reach check of a child that is no front is a contract violation. Mutant: "debug_assert
-/// removed".
-#[cfg(debug_assertions)]
-#[skuld::test]
-#[should_panic(expected = "only a front's cgroup kill is checked")]
-fn a_reach_check_with_no_front_asserts() {
-    drop(super::cgroup_kill_reached(None, PID, || Ok(true), || Ok(true)));
-}
-
-/// In release the same check fails closed, like its siblings: nothing shows the kill reached a
-/// front it does not know. Mutant: "`None` answers `Ok(())`".
-#[cfg(not(debug_assertions))]
-#[skuld::test]
-fn a_reach_check_with_no_front_fails_closed_in_release() {
-    let r = super::cgroup_kill_reached(None, PID, || Ok(true), || Ok(true));
-    let Err(Error::Containment { detail }) = r else {
-        panic!("expected a refusal, got {r:?}");
-    };
-    assert!(detail.contains(&format!("pid {PID}")), "{detail}");
 }

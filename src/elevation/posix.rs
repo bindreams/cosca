@@ -553,13 +553,12 @@ impl PendingPassword {
 }
 
 /// Outcome of a POSIX rewrite. `derived` is the command to spawn (the backend wrapper, or
-/// — when already elevated — the sanitized original). `report` is attached to the
-/// resulting `Child`. `password_write` is delivered after spawn. `backend_path` is the
+/// — when already elevated — the sanitized original), which carries the [`ElevationReport`] the
+/// resulting `Child` keeps. `password_write` is delivered after spawn. `backend_path` is the
 /// resolved argv[0] the spawn arm passes to `remap_derived_spawn_error` (`None` when no
 /// backend wraps the child, i.e. already elevated).
 pub(crate) struct PosixRewrite {
     pub derived: Command,
-    pub report: Option<ElevationReport>,
     pub password_write: Option<PendingPassword>,
     pub backend_path: Option<PathBuf>,
 }
@@ -713,10 +712,9 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
         Transition::ElevateMacosGui { osascript, arg_max } => {
             let launch = super::macos::program_and_args(cmd)?;
             let (mut derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
-            derived.set_elevation_front(super::front::front(Some(&report.via)));
+            derived.set_elevation_report(Some(report));
             Ok(PosixRewrite {
                 derived,
-                report: Some(report),
                 password_write: None,
                 // The derived program IS osascript, so an exec failure remaps to
                 // BackendUnavailable exactly as it does for the POSIX backends.
@@ -737,13 +735,13 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             for (slot, resolved) in std::mem::take(cmd.fds_mut()) {
                 derived.fds_mut().insert(slot, resolved);
             }
+            derived.set_elevation_report(Some(ElevationReport {
+                via: ElevatedVia::AlreadyElevated,
+                stripped_env: stripped,
+                stdio: ElevatedStdio::Passthrough,
+            }));
             Ok(PosixRewrite {
                 derived,
-                report: Some(ElevationReport {
-                    via: ElevatedVia::AlreadyElevated,
-                    stripped_env: stripped,
-                    stdio: ElevatedStdio::Passthrough,
-                }),
                 password_write: None,
                 backend_path: None,
             })
@@ -849,14 +847,13 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                 ElevatedStdio::Passthrough
             };
             let via = ElevatedVia::Wrapped(backend);
-            derived.set_elevation_front(super::front::front(Some(&via)));
+            derived.set_elevation_report(Some(ElevationReport {
+                via,
+                stripped_env: stripped,
+                stdio,
+            }));
             Ok(PosixRewrite {
                 derived,
-                report: Some(ElevationReport {
-                    via,
-                    stripped_env: stripped,
-                    stdio,
-                }),
                 password_write,
                 backend_path: Some(backend_path),
             })

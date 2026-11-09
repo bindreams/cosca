@@ -27,9 +27,10 @@ pub struct Command {
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
-    /// The front this command's spawn leaves the caller tracking, for an elevation-derived spawn
-    /// (see [`crate::elevation::front`]): its teardown after a failed spawn must not signal it.
-    elevation_front: Option<crate::elevation::front::Front>,
+    /// What an elevation-derived spawn achieved: the one source of its child's front-ness (see
+    /// [`ElevationReport::front`](crate::elevation::ElevationReport::front)), which the spawn's
+    /// teardown after a failure reads before a `Child` exists, and the `Child` it makes keeps.
+    elevation_report: Option<crate::elevation::ElevationReport>,
     flags: FlagsRequest,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
     /// `/proc/self/fd/N`.
@@ -82,7 +83,7 @@ impl Default for Command {
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
             fd_marker_suppressed: false,
-            elevation_front: None,
+            elevation_report: None,
             held: Vec::new(),
             flags: FlagsRequest::default(),
         }
@@ -897,19 +898,14 @@ impl Command {
         self.fd_marker_suppressed
     }
 
-    /// Name the front this command's spawn leaves the caller tracking (see
-    /// [`crate::elevation::front`]). Set by the unix elevation rewrite on its derived command.
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "set only by the unix elevation rewrite; dead off unix")
-    )]
-    pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
-        self.elevation_front = front;
+    /// Record what this command's elevated spawn achieved. Set by the elevation rewrite on its derived
+    /// command, and by the Windows spawn that finds the parent already elevated.
+    pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
+        self.elevation_report = report;
     }
 
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the unix spawn teardowns"))]
-    pub(crate) fn elevation_front(&self) -> Option<crate::elevation::front::Front> {
-        self.elevation_front
+    pub(crate) fn elevation_report(&self) -> Option<&crate::elevation::ElevationReport> {
+        self.elevation_report.as_ref()
     }
 
     // ---- crate-internal accessors for the spawn engine -------------

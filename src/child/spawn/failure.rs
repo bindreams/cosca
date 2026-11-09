@@ -308,7 +308,7 @@ impl<T, E: PlainError> Classify<T> for Result<T, E> {
 }
 
 /// Test seams that fail a run-to-completion helper (`output`, `status`, `read`) after its spawn
-/// succeeded, or make its child look like an elevation backend. Thread-local; the guard clears them.
+/// succeeded. Thread-local; the guard clears them.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::Cell;
@@ -319,7 +319,6 @@ pub(crate) mod seams {
     thread_local! {
         static WAIT: Cell<bool> = const { Cell::new(false) };
         static PUMP: Cell<bool> = const { Cell::new(false) };
-        static WRAPPER: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The message of the error the seams fail with.
@@ -349,11 +348,6 @@ pub(crate) mod seams {
         arm(&PUMP)
     }
 
-    /// Every child on this thread looks like an elevation backend while the guard lives.
-    pub(crate) fn pretend_wrapper() -> Armed {
-        arm(&WRAPPER)
-    }
-
     fn take(flag: &'static LocalKey<Cell<bool>>) -> Option<Error> {
         flag.with(|f| f.replace(false))
             .then(|| Error::Io(std::io::Error::other(FAILURE)))
@@ -365,10 +359,6 @@ pub(crate) mod seams {
 
     pub(crate) fn take_pump_failure() -> Option<Error> {
         take(&PUMP)
-    }
-
-    pub(crate) fn wrapper() -> bool {
-        WRAPPER.with(Cell::get)
     }
 }
 
