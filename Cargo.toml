@@ -18,7 +18,7 @@ exclude = [".github/fixtures"]
 
 # One version for both crates: they release together.
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Anna Zhukova"]
 license = "Apache-2.0"
