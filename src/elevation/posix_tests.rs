@@ -814,7 +814,7 @@ mod rewrite_tests {
         let derived = &rw.derived;
         assert!(
             derived.fd_marker_suppressed(),
-            "transfer_process_attrs must suppress the fd marker on the derived sudo command, or \
+            "the sudo arm must suppress the fd marker on the derived command, or \
              an elevated contained spawn would claim a guarantee sudo's closefrom destroys"
         );
         assert_eq!(

@@ -579,14 +579,10 @@ fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
 #[skuld::test]
 fn a_failure_after_the_spawn_of_a_child_reported_without_a_front_sets_no_wrapper_flag() {
     use crate::child::spawn::failure::seams;
-    use crate::elevation::{Backend, ElevatedVia};
+    use crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT;
     use crate::error::ChildFate;
     let note = "an elevated program behind it may still run";
-    for via in [
-        ElevatedVia::Wrapped(Backend::Pkexec),
-        ElevatedVia::AlreadyElevated,
-        ElevatedVia::WindowsUac,
-    ] {
+    for via in VIAS_WITHOUT_A_FRONT {
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(via.clone())));
@@ -692,4 +688,63 @@ fn read_of_invalid_utf8_behind_a_front_keeps_the_wrapper_flag() {
             "{source:?}"
         );
     }
+}
+
+/// The command an elevated spawn runs in the caller's place carries the caller's stdio (moved out),
+/// cwd, containment, kill-on-drop and creation flags and the report it is given, and starts with no
+/// elevation request, executable or fd-marker suppression. Its argument source and environment are
+/// the ones passed in, not the caller's.
+///
+/// Mutants: the construction drops or defaults any one of those fields, or carries the caller's
+/// elevation request, executable or fd-marker suppression.
+#[skuld::test]
+fn a_command_derived_for_elevation_carries_the_spawn_settings_and_nothing_else() {
+    use crate::elevation::{Backend, ElevatedVia};
+    let mut cmd = Command::new();
+    cmd.args(["caller-program"]).env("CALLER", "1");
+    cmd.executable("caller-exe");
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    cmd.current_dir("some-dir");
+    cmd.contain_with(ContainMode::Strongest).nesting(Nesting::Opaque);
+    cmd.kill_on_drop(false);
+    cmd.no_window();
+    #[cfg(windows)]
+    cmd.detached().creation_flags(0x1);
+    cmd.elevate();
+    cmd.suppress_fd_marker();
+
+    let derived = cmd.derive_for_elevation(
+        CommandInput::Argv(vec![OsString::from("derived-program")]),
+        Vec::new(),
+        crate::elevation::elevation_tests::report(ElevatedVia::Wrapped(Backend::Pkexec)),
+    );
+
+    assert_eq!(argv(&derived), ["derived-program"]);
+    assert!(derived.env_ops().is_empty(), "the environment is the one passed in");
+    assert!(
+        matches!(
+            derived.fds().get(&Fd::STDOUT),
+            Some(ResolvedStdio::Pipe(Direction::Out))
+        ),
+        "the stdio moves to the derived command"
+    );
+    assert!(cmd.fds().is_empty(), "and leaves the caller's");
+    assert_eq!(derived.cwd(), Some(Path::new("some-dir")));
+    assert_eq!(derived.contain_request(), cmd.contain_request());
+    assert_eq!(derived.contain_request().mode, Some(ContainMode::Strongest));
+    assert_eq!(derived.contain_request().nesting, Nesting::Opaque);
+    assert!(!derived.kill_on_drop_flag());
+    assert_eq!(derived.flags_request(), cmd.flags_request());
+    assert!(derived.flags_request().no_window);
+    assert!(matches!(
+        derived.elevation_report().map(|r| &r.via),
+        Some(ElevatedVia::Wrapped(Backend::Pkexec))
+    ));
+    assert!(!derived.elevation_request().enabled, "it cannot elevate again");
+    assert!(derived.executable_path().is_none());
+    assert!(!derived.fd_marker_suppressed());
+    assert!(
+        cmd.elevation_report().is_none(),
+        "the caller's command is left unreported"
+    );
 }

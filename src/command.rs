@@ -836,45 +836,8 @@ impl Command {
         self
     }
 
-    // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
-    // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
-    // (hence the non-unix dead_code allows on the setters).
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_input_argv(&mut self, argv: Vec<OsString>) {
-        self.input = CommandInput::Argv(argv);
-        self.executable = None;
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_env_ops(&mut self, ops: Vec<EnvOp>) {
-        self.env_ops = ops;
-    }
-
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "a setter for the POSIX derived command, built only by the unix elevation rewrite; dead off unix"
-        )
-    )]
-    pub(crate) fn set_contain(&mut self, req: ContainRequest) {
-        self.contain = req;
     }
 
     /// Suppress the macOS fd marker for this spawn. Set on a REAL wrapper-spawn command
@@ -898,7 +861,7 @@ impl Command {
     }
 
     /// Record what this command's elevated spawn achieved.
-    #[cfg(any(test, unix))]
+    #[cfg(test)]
     pub(crate) fn set_elevation_report(&mut self, report: Option<crate::elevation::ElevationReport>) {
         self.elevation_report = report;
     }
@@ -907,23 +870,34 @@ impl Command {
         self.elevation_report.as_ref()
     }
 
-    /// A command that spawns what this one describes, unelevated, carrying `report`. Its stdio is
-    /// moved out of this command (`ResolvedStdio::File` is not `Clone`), as a spawn takes it.
-    #[cfg(windows)]
-    pub(crate) fn derive_reported(&mut self, report: crate::elevation::ElevationReport) -> Command {
+    /// The one construction of the command an elevated spawn runs in this one's place: this
+    /// command's argument source is replaced by `input` and its environment by `env_ops` (each
+    /// arm sets its own, and the POSIX arms sanitize theirs), and it carries `report`.
+    ///
+    /// It carries the stdio (moved out of this command: `ResolvedStdio::File` is not `Clone`), the
+    /// cwd, containment, kill-on-drop and the creation flags. It leaves the elevation request off,
+    /// so spawning it cannot elevate again, and the executable, the held files and the fd-marker
+    /// suppression at their defaults: an elevation refuses a caller's `executable`, and only a
+    /// wrapper's command is given the others.
+    pub(crate) fn derive_for_elevation(
+        &mut self,
+        input: CommandInput,
+        env_ops: Vec<EnvOp>,
+        report: crate::elevation::ElevationReport,
+    ) -> Command {
         Command {
-            input: self.input.clone(),
-            executable: self.executable.clone(),
+            input,
+            executable: None,
             fds: std::mem::take(&mut self.fds),
-            env_ops: self.env_ops.clone(),
+            env_ops,
             cwd: self.cwd.clone(),
             kill_on_drop: self.kill_on_drop,
             contain: self.contain,
             elevation: crate::elevation::ElevationRequest::default(),
-            fd_marker_suppressed: self.fd_marker_suppressed,
+            fd_marker_suppressed: false,
             elevation_report: Some(report),
             flags: self.flags,
-            held: self.held.clone(),
+            held: Vec::new(),
         }
     }
 

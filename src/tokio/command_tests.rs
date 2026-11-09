@@ -389,15 +389,11 @@ async fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
 #[skuld::test]
 async fn a_failure_after_the_spawn_of_a_child_reported_without_a_front_sets_no_wrapper_flag() {
     use crate::child::spawn::failure::seams;
-    use crate::elevation::{Backend, ElevatedVia};
+    use crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT;
     use crate::error::ChildFate;
     crate::tokio::test_runtime::assert_current_thread();
     let note = "an elevated program behind it may still run";
-    for via in [
-        ElevatedVia::Wrapped(Backend::Pkexec),
-        ElevatedVia::AlreadyElevated,
-        ElevatedVia::WindowsUac,
-    ] {
+    for via in VIAS_WITHOUT_A_FRONT {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.set_elevation_report(Some(crate::elevation::elevation_tests::report(via.clone())));

@@ -31,7 +31,7 @@ pub(crate) enum SpawnFailure {
         cause: Error,
         /// What the failed spawn did with the child.
         fate: ChildFate,
-        /// Whether the child is an elevation backend (see [`Error::MayHaveStarted`]).
+        /// Whether the child is an elevation front (see [`Error::MayHaveStarted`]).
         wrapper_elevated: bool,
         /// The child, when the spawn hands it to the caller (see [`Error::MayHaveStarted`]).
         unreaped: Option<Box<Unreaped>>,
@@ -40,7 +40,7 @@ pub(crate) enum SpawnFailure {
 
 impl SpawnFailure {
     /// A failure after which the program may have started, of a child that is not an elevation
-    /// backend. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
+    /// front. `unreaped` is the child the spawn hands back, if it does; then `fate` is `Running`
     /// with its identity, or `Unknown` (the look at it failed), or `Killed` (the wait for it failed).
     pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {

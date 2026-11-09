@@ -638,7 +638,12 @@ fn spawn_already_elevated(
     kill_on_drop: bool,
     policy: SpawnPolicy,
 ) -> Result<crate::child::Child, SpawnFailure> {
-    let mut derived = cmd.derive_reported(crate::elevation::already_elevated_report(ElevatedStdio::Passthrough));
+    let (input, env_ops) = (cmd.input().clone(), cmd.env_ops().to_vec());
+    let mut derived = cmd.derive_for_elevation(
+        input,
+        env_ops,
+        crate::elevation::already_elevated_report(ElevatedStdio::Passthrough),
+    );
     crate::child::spawn::spawn_unelevated(&mut derived, kill_on_drop, policy)
 }
 

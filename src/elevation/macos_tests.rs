@@ -26,9 +26,15 @@ fn gate(c: &Command) -> Result<(), Error> {
 }
 
 /// [`build_rewrite`] alone, bypassing the gate.
-fn build(c: &mut Command, arg_max: Option<usize>) -> Result<(Command, crate::elevation::ElevationReport), Error> {
+fn build(c: &mut Command, arg_max: Option<usize>) -> Result<Command, Error> {
     let launch = super::program_and_args(c)?;
-    build_rewrite(c, launch, Path::new("/usr/bin/osascript"), arg_max)
+    build_rewrite(
+        c,
+        launch,
+        Path::new("/usr/bin/osascript"),
+        arg_max,
+        super::osascript_report(),
+    )
 }
 
 fn gui_cmd() -> Command {
@@ -360,7 +366,7 @@ fn argv0_yields_that_program_and_the_remaining_args() {
 #[skuld::test]
 fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
     let mut c = gui_cmd();
-    let (derived, report) = build(&mut c, None).unwrap();
+    let derived = build(&mut c, None).unwrap();
     let CommandInput::Argv(argv) = derived.input() else {
         panic!("derived command must be an argv");
     };
@@ -374,6 +380,9 @@ fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
              with administrator privileges without altering line endings"
         )
     );
+    let report = derived
+        .elevation_report()
+        .expect("the derived command carries its report");
     assert_eq!(report.via, ElevatedVia::MacosOsascript);
     assert_eq!(report.stdio, ElevatedStdio::OsascriptRelay);
     assert!(report.stripped_env.is_empty(), "no env crosses, so none is stripped");
@@ -383,7 +392,7 @@ fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
 fn the_derived_command_carries_no_elevation_request() {
     // Otherwise spawning the derived command would re-enter the elevation branch.
     let mut c = gui_cmd();
-    let (derived, _) = build(&mut c, None).unwrap();
+    let derived = build(&mut c, None).unwrap();
     assert!(!derived.elevation_request().enabled);
 }
 
@@ -394,7 +403,7 @@ fn kill_on_drop_reaches_the_derived_command() {
     for requested in [true, false] {
         let mut c = gui_cmd();
         c.kill_on_drop(requested);
-        let (derived, _) = build(&mut c, None).unwrap();
+        let derived = build(&mut c, None).unwrap();
         assert_eq!(derived.kill_on_drop_flag(), requested);
     }
 }
@@ -436,7 +445,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
 fn the_cwd_reaches_both_osascript_and_the_payload() {
     let mut c = gui_cmd();
     c.current_dir("/tmp");
-    let (derived, _) = build(&mut c, None).unwrap();
+    let derived = build(&mut c, None).unwrap();
     // Set on osascript so a bogus directory fails at spawn with a precise Io error…
     assert_eq!(derived.cwd(), Some(Path::new("/tmp")));
     let CommandInput::Argv(argv) = derived.input() else {
@@ -475,7 +484,7 @@ fn the_rewrite_preserves_the_callers_argv_and_moves_its_fds() {
     let mut c = gui_cmd();
     c.stdout(crate::Stdio::pipe()).unwrap();
     let before = format!("{:?}", c.input());
-    let (derived, _) = build(&mut c, None).unwrap();
+    let derived = build(&mut c, None).unwrap();
     assert_eq!(format!("{:?}", c.input()), before, "argv must survive the rewrite");
     assert!(c.env_ops().is_empty());
     assert!(c.fds().is_empty(), "the caller's fds are moved, not copied");

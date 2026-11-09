@@ -52,27 +52,21 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
                 password_write,
                 backend_path,
             } = crate::elevation::posix::rewrite(cmd).not_started()?;
-            // From here the child is the backend: its elevated program may outlive what happens to it.
-            let behind_front = derived
-                .elevation_report()
-                .and_then(crate::elevation::ElevationReport::front)
-                .is_some();
-            let spawned = (|| {
-                // The derived program IS the backend; remap an exec failure to
-                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
-                // yields the same kind and stays a plain Io). An already-elevated derived
-                // (sanitized original) has no backend path, so it is never remapped.
-                let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
-                let child = match backend_path.as_deref() {
-                    Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
-                    None => r?,
-                };
-                let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
-                // The child already carries the report, so a failed password write's cleanup kill()
-                // maps EPERM to `Unkillable`.
-                finish_elevated(child, written)
-            })();
-            return spawned.map_err(|failure| if behind_front { failure.behind_front() } else { failure });
+            // A failure from here is marked as a front's by `spawn_unelevated` and `finish_elevated`,
+            // each from the report the child carries.
+            // The derived program IS the backend; remap an exec failure to
+            // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+            // yields the same kind and stays a plain Io). An already-elevated derived
+            // (sanitized original) has no backend path, so it is never remapped.
+            let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
+            let child = match backend_path.as_deref() {
+                Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
+                None => r?,
+            };
+            let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+            // The child already carries the report, so a failed password write's cleanup kill()
+            // maps EPERM to `Unkillable`.
+            return finish_elevated(child, written);
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -321,14 +315,16 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     }
     // The drop, armed or not, need not warn of what the cleanup warned of again.
     child.reported = warned;
+    let behind_front = child.front().is_some();
     let unreaped = hands_back.then(|| child.into_unreaped());
-    Err(SpawnFailure::started(
+    Err(failed_after_the_spawn(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: format!("{write_err}; {root_note}{tree_note}"),
         },
         fate,
         unreaped,
+        behind_front,
     ))
 }
 
@@ -482,11 +478,32 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
 /// already-elevated / derived-command continuations (which must spawn without
 /// re-entering the elevation branch).
 ///
-/// Every failure says whether the program could have started; see [`SpawnFailure`].
+/// Every failure says whether the program could have started; see [`SpawnFailure`]. One that
+/// says so is marked as a front's when the command's report names one.
 pub(crate) fn spawn_unelevated(
     cmd: &mut Command,
     kill_on_drop: bool,
     policy: SpawnPolicy,
+) -> Result<Child, SpawnFailure> {
+    // Read now: a failed spawn's teardown needs the front before a `Child` exists.
+    let elevation = cmd.elevation_report().cloned();
+    let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
+    spawn_reported(cmd, kill_on_drop, policy, elevation, front).map_err(|failure| {
+        if front.is_some() {
+            failure.behind_front()
+        } else {
+            failure
+        }
+    })
+}
+
+/// [`spawn_unelevated`] for the report `elevation` the command carries and the `front` it names.
+fn spawn_reported(
+    cmd: &mut Command,
+    kill_on_drop: bool,
+    policy: SpawnPolicy,
+    elevation: Option<crate::elevation::ElevationReport>,
+    front: Option<crate::elevation::front::Front>,
 ) -> Result<Child, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
@@ -498,9 +515,6 @@ pub(crate) fn spawn_unelevated(
     #[cfg(windows)]
     let to_raw_backend = routes_to_raw_backend(cmd);
     let fds = std::mem::take(cmd.fds_mut());
-    // Read now: a failed spawn's teardown needs the front before a `Child` exists.
-    let elevation = cmd.elevation_report().cloned();
-    let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
 
     // Windows routing. The raw `CreateProcessW` backend owns the cases std cannot
     // express: an `executable()` loaded independently of argv[0], and arbitrary descriptors

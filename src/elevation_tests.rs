@@ -25,6 +25,14 @@ pub(crate) fn report(via: ElevatedVia) -> ElevationReport {
     }
 }
 
+/// The launches that leave no front: pkexec execs the program, and UAC and an already-elevated
+/// parent track it. A child reported as one fails or hands back as a plain child, never as a front.
+pub(crate) const VIAS_WITHOUT_A_FRONT: [ElevatedVia; 3] = [
+    ElevatedVia::Wrapped(Backend::Pkexec),
+    ElevatedVia::AlreadyElevated,
+    ElevatedVia::WindowsUac,
+];
+
 #[skuld::test]
 fn backend_defaults_to_auto() {
     assert_eq!(Backend::default(), Backend::Auto);
