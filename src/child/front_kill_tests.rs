@@ -455,6 +455,37 @@ fn a_failed_password_write_hands_back_a_live_front_and_names_it() {
     assert!(status.success(), "the front was signalled: {status:?}");
 }
 
+/// The failed password write's error says whether the child is an elevation front: a sudo child is
+/// one, and a pkexec or an already-elevated child is not.
+///
+/// Mutants: `finish_elevated` marks every failure, or none, or marks by `report.is_some()`.
+#[skuld::test]
+fn a_failed_password_write_flags_a_front_and_no_other_child() {
+    let mut vias = vec![(ElevatedVia::Wrapped(Backend::Sudo), true)];
+    vias.extend(crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT.map(|via| (via, false)));
+    for (via, front) in vias {
+        let (child, stdin) = spawn_as(cat(), via.clone());
+        let error = Error::from(
+            crate::child::spawn::finish_elevated(
+                child,
+                Err(Error::Elevation {
+                    kind: ElevationErrorKind::AuthFailed,
+                    detail: "forced password-write failure".into(),
+                }),
+            )
+            .expect_err("a failed write fails the spawn"),
+        );
+        let Error::MayHaveStarted { wrapper_elevated, .. } = &error else {
+            panic!("{via:?}: expected MayHaveStarted, got {error:?}");
+        };
+        assert_eq!(*wrapper_elevated, front, "{via:?}: {error}");
+        let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(error, stdin);
+        if !handed_back.is_none() {
+            assert!(handed_back.wait().success(), "{via:?}: the front was signalled");
+        }
+    }
+}
+
 /// A live front, refused its kill, that exits and is reaped by someone else before the failure's
 /// look, is not running: the look finds no child (`ECHILD`), and says `Gone`.
 ///
@@ -683,6 +714,35 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
         // The failed spawn closed the front's stdin, so it exits by itself, unsignalled.
         let status = handed_back.wait();
         assert!(status.success(), "the teardown signalled the front: {status:?}");
+    }
+}
+
+/// A spawn that fails after its fork says whether the child is an elevation front: one reported as
+/// sudo's is, and one reported as pkexec's, UAC's or an already-elevated parent's is not.
+///
+/// Mutants: `spawn_unelevated` drops its `map_err(behind_front)`, inverts its test, or marks by
+/// `report.is_some()`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_spawn_that_fails_after_its_fork_flags_a_front_and_no_other_child() {
+    let mut vias = vec![(ElevatedVia::Wrapped(Backend::Sudo), true)];
+    vias.extend(crate::elevation::elevation_tests::VIAS_WITHOUT_A_FRONT.map(|via| (via, false)));
+    for (via, front) in vias {
+        let mut cmd = cat();
+        cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+        cmd.set_elevation_report(Some(report(via.clone())));
+        crate::child::spawn::fault::set_force_attach_failure(true);
+        let error = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+        crate::child::spawn::fault::set_force_attach_failure(false);
+        let Error::MayHaveStarted { wrapper_elevated, .. } = &error else {
+            panic!("{via:?}: expected MayHaveStarted, got {error:?}");
+        };
+        assert_eq!(*wrapper_elevated, front, "{via:?}: {error}");
+        // The failed spawn closed the `cat`'s stdin, so a front it handed back exits by itself.
+        let (_, _, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
+        if !handed_back.is_none() {
+            assert!(handed_back.wait().success(), "{via:?}: the front was signalled");
+        }
     }
 }
 

@@ -52,8 +52,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
                 password_write,
                 backend_path,
             } = crate::elevation::posix::rewrite(cmd).not_started()?;
-            // A failure from here is marked as a front's by `spawn_unelevated` and `finish_elevated`,
-            // each from the report the child carries.
+            // A failure from here is marked as a front's by `spawn_unelevated`, from the report the
+            // derived command carries, and by `finish_elevated`, from the report the child carries.
             // The derived program IS the backend; remap an exec failure to
             // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
             // yields the same kind and stays a plain Io). An already-elevated derived
