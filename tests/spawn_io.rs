@@ -768,6 +768,43 @@ fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(c
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
+// A failed exec =====
+
+/// A program no `PATH` holds fails the spawn before it could start: the error says so and carries
+/// the OS's own. #964.
+#[skuld::test]
+fn a_spawn_of_a_missing_program_reports_that_nothing_started() {
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.args(["cosca-no-such-program-964"]);
+    let err = cmd.spawn().expect_err("a missing program fails the spawn");
+    assert_eq!(err.fate(), None, "the program never ran: {err:?}");
+    let cosca::error::Error::Io(io_err) = &err else {
+        panic!("expected the OS's own error, got {err:?}");
+    };
+    assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound, "{io_err:?}");
+    #[cfg(unix)]
+    assert_eq!(io_err.raw_os_error(), Some(libc::ENOENT), "{io_err:?}");
+}
+
+/// A file without the execute bit fails the spawn before it could start, with `EACCES`. #964.
+#[cfg(unix)]
+#[skuld::test]
+fn a_spawn_of_a_non_executable_file_reports_that_nothing_started() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("scratch directory");
+    let file = dir.path().join("not-executable");
+    std::fs::write(&file, b"not a program").expect("write the file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("drop the execute bits");
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.executable(&file).args(["not-executable"]);
+    let err = cmd.spawn().expect_err("a file without the execute bit fails the spawn");
+    assert_eq!(err.fate(), None, "the program never ran: {err:?}");
+    let cosca::error::Error::Io(io_err) = &err else {
+        panic!("expected the OS's own error, got {err:?}");
+    };
+    assert_eq!(io_err.raw_os_error(), Some(libc::EACCES), "{io_err:?}");
+}
+
 #[skuld::test]
 fn run_free_fn_builds_command_from_args() {
     let s = cosca::run([testbin(), "echo-argv", "world"])
