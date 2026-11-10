@@ -78,7 +78,10 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
             if let Err(e) = leaf.take_placement(child) {
-                log::debug!("cgroup v2: a failed spawn's child is not placed in its leaf: {e}");
+                log::debug!(
+                    "cgroup v2: a failed spawn's child is not placed in its leaf: {report}",
+                    report = crate::error::Report(&e)
+                );
             }
         }
     }
@@ -252,7 +255,8 @@ impl DropView {
             // The number shows the reap where the handle could not say; say so in the log.
             match &state {
                 RootState::Unknown(e) => log::debug!(
-                    "{label}: the root's own handle could not say whether it was reaped ({e}), but its number shows it reaped"
+                    "{label}: the root's own handle could not say whether it was reaped ({report}), but its number shows it reaped",
+                    report = crate::error::Report(e)
                 ),
                 RootState::Unpinned => log::debug!(
                     "{label}: the root is not pinned by this process, but its number shows it reaped"
@@ -546,9 +550,19 @@ impl Unsettled {
     /// `warn`, led by `caller`, for each of the others.
     pub(crate) fn report(self, caller: &str) -> Error {
         for other in &self.others {
-            log::warn!("{caller}: {other}");
+            log::warn!("{caller}: {report}", report = crate::error::Report(other));
         }
         self.first
+    }
+
+    /// The text of a log line: every member, the first and then the others after `; `, each with its
+    /// whole chain. A returned text uses [`Display`](std::fmt::Display), which has no chains.
+    pub(crate) fn log_text(&self) -> String {
+        std::iter::once(&self.first)
+            .chain(&self.others)
+            .map(|member| crate::error::Report(member).to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
@@ -719,21 +733,32 @@ impl TreeKillOutcome {
 
     /// Why the kill did not leave the tree killed, or `None` when it [`completed`](Self::completed):
     /// the first member a kill left, or what a skip left undone. For the text of a gate that reads it.
+    /// Its error is worded by its Display.
     #[cfg(unix)]
     pub(crate) fn incomplete(&self) -> Option<String> {
+        self.incomplete_by(|error| error.to_string())
+    }
+
+    /// [`incomplete`](Self::incomplete) for a text that only reaches a log line: its error is worded
+    /// as the whole chain, through [`Report`](crate::error::Report).
+    #[cfg(unix)]
+    pub(crate) fn incomplete_for_log(&self) -> Option<String> {
+        self.incomplete_by(|error| crate::error::Report(error).to_string())
+    }
+
+    #[cfg(unix)]
+    fn incomplete_by(&self, word: impl Fn(&Error) -> String) -> Option<String> {
         if self.completed() {
             return None;
         }
         Some(match self {
-            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Skipped { holders: Err(left), .. } => {
-                left.first().to_string()
-            }
+            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Skipped { holders: Err(left), .. } => word(left.first()),
             TreeKillOutcome::Skipped {
                 action,
                 holders: Ok(()),
             } => format!("the kill was skipped, and would {action}"),
-            TreeKillOutcome::Unwalked(error) => error.to_string(),
-            TreeKillOutcome::NoRoot => Self::no_root_error().to_string(),
+            TreeKillOutcome::Unwalked(error) => word(error),
+            TreeKillOutcome::NoRoot => word(&Self::no_root_error()),
             TreeKillOutcome::Ran(Ok(())) => unreachable!("a completed kill has nothing left"),
         })
     }
@@ -813,7 +838,11 @@ impl SweepFailure {
         let walk = attached.settle_for_kill_tree(op, killed, walk, root_ended);
         if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
             // The backstop's error is dropped: the walk's names the member left.
-            log::debug!("{op} handle backstop also failed ({backstop}); surfacing the walk's error: {walk}");
+            log::debug!(
+                "{op} handle backstop also failed ({backstop_report}); surfacing the walk's error: {walk_report}",
+                backstop_report = crate::error::Report(backstop),
+                walk_report = crate::error::Report(walk)
+            );
         }
         walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
     }
@@ -1093,7 +1122,7 @@ impl Attached {
             TreeKillOutcome::Ran(_) | TreeKillOutcome::NoRoot | TreeKillOutcome::Skipped { .. } => "",
         };
         let left = match self.settle(killed, outcome, root_ended) {
-            Err(left) => left.to_string(),
+            Err(left) => left.log_text(),
             Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
         };

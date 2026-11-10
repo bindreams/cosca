@@ -182,7 +182,10 @@ impl DrainWatch {
             None => self.populated().map(|populated| !populated),
         });
         looked.unwrap_or_else(|e| {
-            log::debug!("a look at a killed leaf's drain failed ({e}); the wait that follows decides");
+            log::debug!(
+                "a look at a killed leaf's drain failed ({report}); the wait that follows decides",
+                report = crate::error::Report(&e)
+            );
             true
         })
     }

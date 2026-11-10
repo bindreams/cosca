@@ -136,8 +136,9 @@ impl Child {
         if !matches!(watch, Ok(true)) {
             if let Err(e) = &watch {
                 log::debug!(
-                    "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {e}",
-                    id = self.pid()
+                    "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {report}",
+                    id = self.pid(),
+                    report = crate::error::Report(e)
                 );
             }
             #[cfg(test)]
@@ -318,8 +319,9 @@ impl Child {
             Ok(()) => Ok(()),
             Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
                 log::debug!(
-                    "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {e}",
-                    id = self.pid()
+                    "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {report}",
+                    id = self.pid(),
+                    report = crate::error::Report(&e)
                 );
                 Err(e)
             }
@@ -373,8 +375,9 @@ impl Child {
         };
         if let Some(e) = &watch_err {
             log::debug!(
-                "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {e}",
-                id = self.pid()
+                "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {report}",
+                id = self.pid(),
+                report = crate::error::Report(e)
             );
         }
         // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
@@ -402,8 +405,9 @@ impl Child {
                     // and a silent one here would obscure a second, independent failure mode.
                     if let Err(e) = self.wait().await {
                         log::debug!(
-                            "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {e}",
-                            id = self.pid()
+                            "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {report}",
+                            id = self.pid(),
+                            report = crate::error::Report(&e)
                         );
                     }
                 }
@@ -430,8 +434,9 @@ impl Child {
         // disproved it.
         if let Err(e) = &term {
             log::debug!(
-                "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {e}",
-                id = self.pid()
+                "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {report}",
+                id = self.pid(),
+                report = crate::error::Report(e)
             );
         }
         Ok(status)

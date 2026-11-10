@@ -54,7 +54,7 @@ mod pidfd_shutdown {
     fn run(
         gate: Gate,
         term: Result<Sent, Error>,
-        exited: Option<Result<bool, &'static str>>,
+        exited: Option<Result<bool, std::io::Error>>,
         kill_gate: Gate,
         kill: Result<Sent, Error>,
     ) -> (Error, Vec<&'static str>, Vec<String>) {
@@ -115,7 +115,7 @@ mod pidfd_shutdown {
         let (err, sent, warns) = run(
             Gate::Open,
             Ok(Sent::Delivered),
-            Some(Err("forced wait failure")),
+            Some(Err(std::io::Error::other("forced wait failure"))),
             Gate::Open,
             Ok(Sent::Delivered),
         );
@@ -154,23 +154,19 @@ mod pidfd_shutdown {
     /// Mutant: the grace waited, or the kill sent, after a failed `SIGTERM`.
     #[skuld::test]
     fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
-        let (err, sent, warns) = run(
-            Gate::Open,
-            Err(Error::Io(std::io::Error::other("forced term failure"))),
-            None,
-            Gate::Open,
-            Ok(Sent::Delivered),
-        );
+        let forced = || Error::Io(std::io::Error::other("forced term failure"));
+        let (err, sent, warns) = run(Gate::Open, Err(forced()), None, Gate::Open, Ok(Sent::Delivered));
         assert!(
             matches!(&err, Error::Io(e) if e.to_string() == "forced term failure"),
             "{err:?}"
         );
         assert_eq!(sent, ["term"]);
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(
-            warns[0].contains("sent nothing: the SIGTERM to the root through its pidfd failed (forced term failure)"),
-            "{warns:?}"
+        let said = format!(
+            "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
+            crate::error::Report(&forced())
         );
+        assert!(warns[0].contains(&said), "{warns:?}");
     }
 
     /// A `SIGTERM` that finds the root gone, or a handle that no longer reaches it (a tokio backend

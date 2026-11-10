@@ -561,7 +561,10 @@ pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {
                 !matches!(other, Report::BadTag(_)),
                 "a unique-id report is malformed: {other:?}"
             );
-            log::debug!("the spawn failed ({error}); the child's unique-id report was {other:?}");
+            log::debug!(
+                "the spawn failed ({report}); the child's unique-id report was {other:?}",
+                report = crate::error::Report(&error)
+            );
             error
         }
     }

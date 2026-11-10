@@ -282,7 +282,11 @@ impl Kqueue {
                 // The events already taken are out of the queue for good; a lasting failure
                 // comes back on the next call.
                 Err(e) => {
-                    log::warn!("kqueue: a read after {} events failed: {e}", events.len());
+                    log::warn!(
+                        "kqueue: a read after {} events failed: {report}",
+                        events.len(),
+                        report = crate::error::Report(&e)
+                    );
                     return Ok(events);
                 }
             };
@@ -330,7 +334,11 @@ impl Kqueue {
                 match self.poll() {
                     Ok(rest) => events.extend(rest),
                     Err(e) if events.is_empty() => return Err(e),
-                    Err(e) => log::warn!("kqueue: reading the rest after {} events failed: {e}", events.len()),
+                    Err(e) => log::warn!(
+                        "kqueue: reading the rest after {} events failed: {report}",
+                        events.len(),
+                        report = crate::error::Report(&e)
+                    ),
                 }
             }
             if !events.is_empty() {

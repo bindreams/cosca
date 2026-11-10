@@ -445,12 +445,18 @@ fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
     let flags = match rustix::fs::fcntl_getfl(writer) {
         Ok(flags) => flags,
         Err(e) => {
-            log::warn!("could not read the password channel's flags (F_GETFL): {e}; leaving it blocking");
+            log::warn!(
+                "could not read the password channel's flags (F_GETFL): {report}; leaving it blocking",
+                report = crate::error::Report(&e)
+            );
             return;
         }
     };
     if let Err(e) = rustix::fs::fcntl_setfl(writer, flags | rustix::fs::OFlags::NONBLOCK) {
-        log::warn!("could not set the password channel non-blocking (F_SETFL): {e}; leaving it blocking");
+        log::warn!(
+            "could not set the password channel non-blocking (F_SETFL): {report}; leaving it blocking",
+            report = crate::error::Report(&e)
+        );
     }
 }
 
@@ -503,7 +509,10 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Resul
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if written == 0 {
-                    log::debug!("elevation backend did not consume the password (fd0 would block, no read): {e}");
+                    log::debug!(
+                        "elevation backend did not consume the password (fd0 would block, no read): {report}",
+                        report = crate::error::Report(&e)
+                    );
                     return Ok(());
                 }
                 match wait_writable(writer) {
@@ -522,7 +531,10 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Resul
             }
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 if written == 0 {
-                    log::debug!("elevation backend did not consume the password (fd0 closed / EPIPE): {e}");
+                    log::debug!(
+                        "elevation backend did not consume the password (fd0 closed / EPIPE): {report}",
+                        report = crate::error::Report(&e)
+                    );
                     return Ok(());
                 }
                 return Err(auth_failed(format!(

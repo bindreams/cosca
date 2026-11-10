@@ -94,8 +94,10 @@ impl LeafDir {
                 // is held.
                 if let Err(rm) = rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR) {
                     log::warn!(
-                        "cgroup leaf {name} was not removed: rmdir failed ({rm}) after it could not be opened \
-                         ({e}); it stays on this host until a cgroup manager reaps it"
+                        "cgroup leaf {name} was not removed: rmdir failed ({rm_report}) after it could not be opened \
+                         ({report}); it stays on this host until a cgroup manager reaps it",
+                        rm_report = crate::error::Report(&rm),
+                        report = crate::error::Report(&e)
                     );
                 }
                 return Err(e);
@@ -553,7 +555,11 @@ fn named(errno: rustix::io::Errno, tree: &Tree, node: usize) -> io::Error {
 
 /// `e`, as it is, so that its `errno` still classifies it; where it happened is said at debug.
 fn at_cgroup(e: io::Error, tree: &Tree, node: usize) -> io::Error {
-    log::debug!("cgroup v2: {}: {e}", tree.path(node).display());
+    log::debug!(
+        "cgroup v2: {}: {report}",
+        tree.path(node).display(),
+        report = crate::error::Report(&e)
+    );
     e
 }
 
@@ -689,8 +695,9 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
             Err(e) if gone_io(&e) => return Ok(Visit::Skip),
             Err(e) => {
                 log::debug!(
-                    "cgroup v2: the id of child cgroup {} cannot be read ({e}); it is removed unrecorded",
-                    tree.name(node).to_string_lossy()
+                    "cgroup v2: the id of child cgroup {} cannot be read ({report}); it is removed unrecorded",
+                    tree.name(node).to_string_lossy(),
+                    report = crate::error::Report(&e)
                 );
                 None
             }
@@ -711,8 +718,9 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
             Err(e) if gone(e) => continue,
             Err(e @ rustix::io::Errno::XDEV) => {
                 log::debug!(
-                    "cgroup v2: {} is under a mount, so it is not removed ({e})",
-                    tree.path(node).display()
+                    "cgroup v2: {} is under a mount, so it is not removed ({report})",
+                    tree.path(node).display(),
+                    report = crate::error::Report(&e)
                 );
                 continue;
             }
@@ -730,7 +738,11 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
             }
             Err(e) if gone(e) => {}
             Err(e @ rustix::io::Errno::BUSY) => {
-                log::debug!("cgroup v2: {} is busy, so it is left ({e})", tree.path(node).display());
+                log::debug!(
+                    "cgroup v2: {} is busy, so it is left ({report})",
+                    tree.path(node).display(),
+                    report = crate::error::Report(&e)
+                );
             }
             Err(e) => return Err(e.into()),
         }

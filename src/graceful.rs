@@ -138,7 +138,10 @@ pub(crate) fn after_grace(watch: Result<bool, Error>, kill: impl FnOnce() -> Res
         return Ok(());
     }
     if let Err(ref e) = watch {
-        log::debug!("graceful_shutdown watch error before kill escalation (subsumed): {e}");
+        log::debug!(
+            "graceful_shutdown watch error before kill escalation (subsumed): {report}",
+            report = crate::error::Report(e)
+        );
     }
     kill()?;
     watch.map(|_| ())
@@ -152,7 +155,10 @@ pub(crate) fn after_tree_grace(
     sweep: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
     if let Err(ref e) = watch {
-        log::debug!("graceful_shutdown_tree watch error before the sweep (may be subsumed): {e}");
+        log::debug!(
+            "graceful_shutdown_tree watch error before the sweep (may be subsumed): {report}",
+            report = crate::error::Report(e)
+        );
     }
     sweep()?;
     watch.map(|_| ())

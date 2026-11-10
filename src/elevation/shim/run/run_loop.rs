@@ -69,8 +69,9 @@ fn drain_status(fd: BorrowedFd<'_>, log: &Log) -> Status {
             Err(Errno::AGAIN) => Status::Nothing,
             Err(e) => {
                 log.warn(format_args!(
-                    "reading the status pipe: errno {} ({e})",
-                    e.raw_os_error()
+                    "reading the status pipe: errno {} ({})",
+                    e.raw_os_error(),
+                    crate::error::Report(&e)
                 ));
                 Status::Nothing
             }
@@ -100,7 +101,11 @@ fn drain_control(conn: BorrowedFd<'_>, log: &Log) -> Vec<Control> {
             }
             // The connection is unusable, which ends it as well, but not silently.
             Err(e) => {
-                log.warn(format_args!("recv from cosca: errno {} ({e})", e.raw_os_error()));
+                log.warn(format_args!(
+                    "recv from cosca: errno {} ({})",
+                    e.raw_os_error(),
+                    crate::error::Report(&e)
+                ));
                 debug_assert!(
                     !matches!(e, Errno::BADF | Errno::INVAL),
                     "recv on the shim's own connection: {e}"
@@ -130,7 +135,7 @@ impl Loop<'_> {
             let [_, child_ready, _, owner_ready, failure_ready, status_ready] = match polled {
                 Ok(ready) => ready,
                 Err(e) => {
-                    self.log.warn(format_args!("poll failed: {e}"));
+                    self.log.warn(format_args!("poll failed: {}", crate::error::Report(&e)));
                     break self.kill_and_reap();
                 }
             };
@@ -179,7 +184,10 @@ impl Loop<'_> {
                 if let Some(done) = self.host_reap_done {
                     // Blocks until the host thread's reap is done: the child is exiting, so it ends.
                     if let Err(e) = wait_readable([Some(done)]) {
-                        self.log.warn(format_args!("waiting for the host thread's reap: {e}"));
+                        self.log.warn(format_args!(
+                            "waiting for the host thread's reap: {}",
+                            crate::error::Report(&e)
+                        ));
                     }
                 }
                 let status = self.child.reap(true, self.log);
@@ -233,8 +241,9 @@ impl Loop<'_> {
                 Err(Errno::INTR) => {}
                 Err(e) => {
                     self.log.warn(format_args!(
-                        "reading the signal pipe: errno {} ({e})",
-                        e.raw_os_error()
+                        "reading the signal pipe: errno {} ({})",
+                        e.raw_os_error(),
+                        crate::error::Report(&e)
                     ));
                     return any;
                 }

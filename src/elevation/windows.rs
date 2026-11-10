@@ -16,7 +16,10 @@ impl Drop for OwnedToken {
         if !self.0.is_invalid() {
             // SAFETY: a token handle owned by this guard, closed exactly once.
             if let Err(e) = unsafe { windows::Win32::Foundation::CloseHandle(self.0) } {
-                log::warn!("CloseHandle of an owned token failed: {e}");
+                log::warn!(
+                    "CloseHandle of an owned token failed: {report}",
+                    report = crate::error::Report(&e)
+                );
                 debug_assert!(false, "CloseHandle of an owned token should not fail: {e}");
             }
         }
@@ -81,7 +84,10 @@ pub(super) fn integrity_level() -> Option<u32> {
             cap,
             &mut ret,
         ) {
-            log::debug!("TokenIntegrityLevel query failed: {e:?}; integrity unknown");
+            log::debug!(
+                "TokenIntegrityLevel query failed: {report}; integrity unknown",
+                report = crate::error::Report(&e)
+            );
             return None;
         }
         let label_ptr = buf.as_ptr() as *const TOKEN_MANDATORY_LABEL;

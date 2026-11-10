@@ -1062,7 +1062,10 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
                 }
                 // An ordinary spawn goes on, so one unreadable `PATH` directory does not break
                 // every search, as `CreateProcessW`'s own does not.
-                Err(e) => log::warn!("skipping {joined:?}, whose existence could not be determined: {e}"),
+                Err(e) => log::warn!(
+                    "skipping {joined:?}, whose existence could not be determined: {report}",
+                    report = crate::error::Report(&e)
+                ),
             }
         }
     }

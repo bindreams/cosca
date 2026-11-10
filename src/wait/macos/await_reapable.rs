@@ -332,7 +332,10 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
         let n = match kevent_round(kq, &mut events, Block::Poll) {
             Ok(n) => n,
             Err(e) if reaped || exited => {
-                log::warn!("wait: reading pid {pid}'s kqueue failed after its exit was read: {e}");
+                log::warn!(
+                    "wait: reading pid {pid}'s kqueue failed after its exit was read: {report}",
+                    report = crate::error::Report(&e)
+                );
                 return Ok((reaped, exited));
             }
             Err(e) => return Err(e),

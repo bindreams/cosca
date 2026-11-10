@@ -250,7 +250,11 @@ impl PrivateDir {
                 }
                 Err(e) => {
                     if let Err(rm) = unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
-                        log::warn!("cannot remove the private directory {}: {rm}", path.display());
+                        log::warn!(
+                            "cannot remove the private directory {}: {report}",
+                            path.display(),
+                            report = crate::error::Report(&rm)
+                        );
                     }
                     return Err(PrivateDirError::Create {
                         path,
@@ -332,7 +336,10 @@ impl PrivateDir {
             Removal::Gone => log::debug!("the private directory {path} was already gone"),
             Removal::NotOurs => log::warn!("{path} is no longer the private directory cosca made; left alone"),
             Removal::NotEmpty => log::warn!("the private directory {path} is not empty; left in place"),
-            Removal::Failed(e) => log::warn!("cannot remove the private directory {path}: {e}"),
+            Removal::Failed(e) => log::warn!(
+                "cannot remove the private directory {path}: {report}",
+                report = crate::error::Report(e)
+            ),
         }
         removal
     }

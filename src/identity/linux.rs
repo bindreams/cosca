@@ -72,7 +72,10 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
             resolve_unreadable(
                 kernel,
                 pid,
-                format_args!("the /proc view could not be established: {why}"),
+                format_args!(
+                    "the /proc view could not be established: {report}",
+                    report = crate::error::Report(&why)
+                ),
             ),
             Some(why),
         ),
@@ -85,7 +88,7 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
 fn stat_by_pid(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
     match pid_stat::read_stat_file(kernel, proc_dir, pid) {
         Ok(bytes) => Resolved::Found(bytes),
-        Err(e) => resolve_unreadable(kernel, pid, e),
+        Err(e) => resolve_unreadable(kernel, pid, crate::error::Report(&e)),
     }
 }
 
@@ -419,13 +422,20 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness
                 Ok(true) => Liveness::Dead,
                 Ok(false) => Liveness::Alive,
                 Err(e) => {
-                    log::debug!("the pidfd of pid {pid} could not be polled: {e}");
+                    log::debug!(
+                        "the pidfd of pid {pid} could not be polled: {report}",
+                        report = crate::error::Report(&e)
+                    );
                     Liveness::Unknown
                 }
             },
             Proof::Lost => Liveness::Dead,
             Proof::Unknown(call) => {
-                log::debug!("the pidfd of pid {pid} could not be opened or proved: {call:?}");
+                log::debug!(
+                    "the pidfd of pid {pid} could not be opened or proved ({name}): {report}",
+                    name = call.name(),
+                    report = crate::error::Report(&std::io::Error::from(call.errno()))
+                );
                 Liveness::Unknown
             }
         },

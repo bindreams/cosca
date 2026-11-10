@@ -77,7 +77,10 @@ fn merge(
         Ok(status) => Ok(Output { status, stdout, stderr }),
         Err(first) => {
             for (stream, e) in failures {
-                log::debug!("communicate: the {stream} error was not returned: {e}");
+                log::debug!(
+                    "communicate: the {stream} error was not returned: {report}",
+                    report = crate::error::Report(&e)
+                );
             }
             Err(first)
         }

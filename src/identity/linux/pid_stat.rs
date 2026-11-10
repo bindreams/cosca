@@ -60,6 +60,12 @@ impl std::fmt::Display for Unreadable {
     }
 }
 
+impl std::error::Error for Unreadable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// `pid`'s `stat` through `dir`: [`PidStat::Skipped`] for the errnos that mean the pid is not
 /// there for us, [`Unreadable`] for every other. Never asks `kill(pid, 0)`.
 pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {

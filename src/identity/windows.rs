@@ -65,7 +65,10 @@ pub(crate) fn open_classified(pid: RawPid, mask: PROCESS_ACCESS_RIGHTS) -> Opene
         // means; this line is the per-call detail — which pid, which mask — that those
         // messages cannot carry.
         Err(e) => {
-            log::debug!("OpenProcess({pid}, {mask:?}) failed: {e} — reporting Unknown, not absence");
+            log::debug!(
+                "OpenProcess({pid}, {mask:?}) failed: {report} — reporting Unknown, not absence",
+                report = crate::error::Report(&e)
+            );
             Opened::Denied(e)
         }
     }
@@ -102,7 +105,10 @@ pub(crate) fn open_dropping_refused(
 pub(crate) fn close(handle: HANDLE) {
     // SAFETY: `handle` is an owned process handle.
     if let Err(e) = unsafe { CloseHandle(handle) } {
-        log::warn!("CloseHandle of an owned process handle failed: {e}");
+        log::warn!(
+            "CloseHandle of an owned process handle failed: {report}",
+            report = crate::error::Report(&e)
+        );
         debug_assert!(false, "CloseHandle of an owned process handle should not fail: {e}");
     }
 }
@@ -148,7 +154,10 @@ pub(crate) fn terminate_held(handle: HANDLE, granted: PROCESS_ACCESS_RIGHTS) -> 
         Ok(Look::Exited) => Termination::Exited,
         Ok(Look::Running) => Termination::Failed(refusal),
         Err(e) => {
-            log::debug!("terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {e}");
+            log::debug!(
+                "terminate_held: a handle without PROCESS_TERMINATE could not prove an exit: {report}",
+                report = crate::error::Report(&e)
+            );
             Termination::Failed(refusal)
         }
     }
@@ -416,7 +425,10 @@ fn combine(
             (Resolved::Unknown, UnknownCause::of_sequence_status(status))
         }
         (Err(e), sequence) => {
-            log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
+            log::debug!(
+                "GetProcessTimes failed on an opened handle for pid {pid}: {report}",
+                report = crate::error::Report(&e)
+            );
             let cause = sequence
                 .err()
                 .map_or_else(UnknownCause::default, UnknownCause::of_sequence_status);
@@ -467,7 +479,10 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
         // evidence of absence — and it is reachable when the process exits mid-query, so it
         // must not be an assertion.
         Err(e) => {
-            log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
+            log::debug!(
+                "GetProcessTimes failed on an opened handle for pid {pid}: {report}",
+                report = crate::error::Report(&e)
+            );
             Resolved::Unknown
         }
     }
@@ -497,14 +512,20 @@ pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
             Ok(Look::Exited) => Liveness::Dead,
             // A look that never reported on the process: we learned nothing.
             Err(e) => {
-                log::debug!("exit look at pid {pid} failed: {e}");
+                log::debug!(
+                    "exit look at pid {pid} failed: {report}",
+                    report = crate::error::Report(&e)
+                );
                 Liveness::Unknown
             }
         },
         Ok(_) => Liveness::Dead, // reused PID: a different process holds it now
         Err(e) => {
             // Opened but unreadable: never claim Dead.
-            log::debug!("GetProcessTimes failed on an opened handle for pid {pid}: {e}");
+            log::debug!(
+                "GetProcessTimes failed on an opened handle for pid {pid}: {report}",
+                report = crate::error::Report(&e)
+            );
             Liveness::Unknown
         }
     };

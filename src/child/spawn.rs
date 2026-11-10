@@ -160,6 +160,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         kill
     });
     let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
+    let tree_failure_warned = tree.as_ref().and_then(TreeKillOutcome::incomplete_for_log);
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let pid = child.pid();
     let (root_note, torn) = if view.unpinned_root() {
@@ -277,7 +278,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
-                report.tree = tree_failure.as_ref().map(|first| {
+                report.tree = tree_failure_warned.as_ref().map(|first| {
                     format!(
                         "tree teardown after a failed password write needed the drop's tree kill, made early \
                          ({subject}): the cleanup's kill failed: {first}"
@@ -287,19 +288,21 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
             // The early tree kill is the cleanup's last word on the tree: unvouched, it is reported
             // as such.
-            Ok(outcome @ SettleOutcome::Unvouched { kind }) => Some((
-                format!("; on the drop's tree kill, made early, {}", kind.unvouched_text()),
-                Ok(outcome),
-            )),
+            Ok(outcome @ SettleOutcome::Unvouched { kind }) => {
+                let added = format!("; on the drop's tree kill, made early, {}", kind.unvouched_text());
+                Some((added.clone(), added, Ok(outcome)))
+            }
+            // The note is returned (Display); the warn is only logged (every member's chain).
             Err(again) => Some((
                 format!("; the drop's tree kill, made early, failed too ({again})"),
+                format!("; the drop's tree kill, made early, failed too ({})", again.log_text()),
                 Err(again),
             )),
         };
-        if let Some((added, again)) = more {
+        if let Some((added, added_warned, again)) = more {
             tree_note.push_str(&added);
             match report.tree.as_mut() {
-                Some(warn) => warn.push_str(&added),
+                Some(warn) => warn.push_str(&added_warned),
                 None => report.tree = report_tree_teardown(Some(again), &subject).1,
             }
         }
@@ -422,7 +425,7 @@ pub(crate) fn report_tree_teardown(
     match tree {
         Some(Err(e)) => (
             format!("; its contained tree could not be killed ({subject}: {e})"),
-            Some(tree_teardown_warn(subject, &e)),
+            Some(tree_teardown_warn(subject, &e.log_text())),
         ),
         Some(Ok(SettleOutcome::Unvouched { kind })) => {
             let text = kind.unvouched_text();
@@ -810,7 +813,7 @@ fn spawn_reported(
     ) {
         Ok(v) => v,
         Err(error) => {
-            log::debug!("attach failed: {error}");
+            log::debug!("attach failed: {report}", report = crate::error::Report(&error));
             // macOS: a front is left running and unreaped, sent nothing; any other child is killed
             // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
@@ -912,9 +915,13 @@ fn spawn_reported(
 #[cfg(target_os = "macos")]
 pub(crate) fn assert_attach_cannot_fail(error: &Error) {
     #[cfg(test)]
-    debug_assert!(fault::force_attach_failure(), "a macOS attach cannot fail: {error}");
+    debug_assert!(
+        fault::force_attach_failure(),
+        "a macOS attach cannot fail: {}",
+        crate::error::Report(error)
+    );
     #[cfg(not(test))]
-    debug_assert!(false, "a macOS attach cannot fail: {error}");
+    debug_assert!(false, "a macOS attach cannot fail: {}", crate::error::Report(error));
     let _ = error;
 }
 
@@ -1127,7 +1134,8 @@ impl LateTree {
                     Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
                     Err(e) => {
                         assert_attach_cannot_fail(&e);
-                        tree.notes.push(format!("its tree was not killed: {e}"));
+                        tree.notes
+                            .push(format!("its tree was not killed: {}", crate::error::Report(&e)));
                     }
                 }
                 return tree;
@@ -1173,8 +1181,10 @@ impl LateTree {
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
                 if let Err(e) = m.hard_kill_holders_only(m.root()) {
-                    self.notes
-                        .push(format!("its marker's holders were not all killed after its kill: {e}"));
+                    self.notes.push(format!(
+                        "its marker's holders were not all killed after its kill: {}",
+                        crate::error::Report(&e)
+                    ));
                 }
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
@@ -1196,7 +1206,7 @@ impl LateTree {
         let mut succeeded_after = false;
         for sweep in self.sweeps.drain(..) {
             match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {
-                (Err(left), None) => failed = Some(left.to_string()),
+                (Err(left), None) => failed = Some(left.log_text()),
                 (Err(_), Some(_)) => succeeded_after = false,
                 (Ok(()), failed) => succeeded_after = failed.is_some(),
             }
@@ -1326,7 +1336,8 @@ fn kill_and_reap_noting(
                 // Nothing reaps it after this: the std `Child` reaps nothing.
                 Err(e) => {
                     notes.push(format!(
-                        "could not be waited for ({e}), so it is left unreaped: it stays a zombie once it exits"
+                        "could not be waited for ({}), so it is left unreaped: it stays a zombie once it exits",
+                        crate::error::Report(&e)
                     ));
                     ChildFate::Killed
                 }
@@ -1346,7 +1357,7 @@ fn kill_and_reap_noting(
         Err(kill) => {
             after_kill(false);
             let fate = reap_verified(pid, &target, id, false, notes, breach);
-            (fate, KillOutcome::Refused(kill.to_string()))
+            (fate, KillOutcome::Refused(crate::error::Report(&kill).to_string()))
         }
     }
 }
@@ -1424,7 +1435,7 @@ fn reap_verified(
     };
     match peek_verified(target) {
         Err(e) => {
-            notes.push(unverifiable(&e));
+            notes.push(unverifiable(&crate::error::Report(&e)));
             return ChildFate::Unknown;
         }
         Ok(PeekOutcome::Foreign(why)) => return foreign(why, notes),
@@ -1450,7 +1461,7 @@ fn reap_verified(
         }
         Ok(Reap::Foreign(why)) => foreign(why, notes),
         Err(e) => {
-            notes.push(format!("could not be reaped: {e}"));
+            notes.push(format!("could not be reaped: {}", crate::error::Report(&e)));
             ChildFate::Unknown
         }
     }
@@ -2265,7 +2276,8 @@ pub(crate) fn resolve_identity(
                 cause,
                 Diagnosis::of_failed_check(
                     format!(
-                        "child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours"
+                        "child {pid}: its identity could not be checked against its handle ({}); it is not shown to be ours",
+                        crate::error::Report(&e)
                     ),
                     e,
                 ),
@@ -2368,14 +2380,23 @@ impl Drop for Diagnosis {
 /// source), and the read's `cause` otherwise. The keep is logged at `debug`. The failed check then
 /// warns only if a failed attach's teardown folds it in; a note added after the keep warns as usual.
 pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCause, why: &mut Diagnosis) -> Error {
-    let error = match why.failed_check.take() {
-        Some(source) => Error::Unassessable {
-            detail: "the spawned child's identity could not be checked against its handle".into(),
-            source: Some(source),
-        },
-        None => spawn_identity_error(crate::identity::Resolved::Unknown, cause),
+    let (error, said) = match why.failed_check.take() {
+        // `kept_check` logs the check's error once; this line says only its own layer.
+        Some(source) => {
+            let error = Error::Unassessable {
+                detail: "the spawned child's identity could not be checked against its handle".into(),
+                source: Some(source),
+            };
+            let said = error.to_string();
+            (error, said)
+        }
+        None => {
+            let error = spawn_identity_error(crate::identity::Resolved::Unknown, cause);
+            let said = crate::error::Report(&error).to_string();
+            (error, said)
+        }
     };
-    log::debug!("child {pid}: {error}; the child is kept without an identity");
+    log::debug!("child {pid}: {said}; the child is kept without an identity");
     why.kept_check = why.owed.take();
     error
 }
@@ -2649,8 +2670,9 @@ pub(crate) fn note_refused_group_kill(pid: Option<u32>, refusal: nix::errno::Err
              group, whose number may name another group{reaped}"
         )),
         e => why.add(format!(
-            "spawn teardown could not kill the process group of {named} through its pidfd ({e}); its \
-             members may be left running{reaped}"
+            "spawn teardown could not kill the process group of {named} through its pidfd ({}); its \
+             members may be left running{reaped}",
+            crate::error::Report(&e)
         )),
     }
 }
@@ -2678,7 +2700,10 @@ pub(crate) fn front_subtree(
     match leaf?.subtree() {
         Ok(subtree) => Some(subtree),
         Err(e) => {
-            log::debug!("spawn: an elevation front's leaf subtree cannot be read ({e}); its teardown cannot place it");
+            log::debug!(
+                "spawn: an elevation front's leaf subtree cannot be read ({report}); its teardown cannot place it",
+                report = crate::error::Report(&e)
+            );
             None
         }
     }

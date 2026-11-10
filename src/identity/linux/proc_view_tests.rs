@@ -503,6 +503,18 @@ fn collect_pids_propagates_a_listing_error() {
     assert_eq!(err.raw_os_error(), Some(libc::EIO));
 }
 
+/// The OS error behind an unusable view is its `source()`; a view with none has no source.
+#[skuld::test]
+fn an_unusable_view_has_its_os_error_as_its_source() {
+    let with = ViewUnreadable::new("boom", Some(io::Error::from_raw_os_error(libc::EIO)));
+    let source = std::error::Error::source(&with).expect("a view with an OS error has a source");
+    assert_eq!(
+        source.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error),
+        Some(libc::EIO)
+    );
+    assert!(std::error::Error::source(&ViewUnreadable::new("boom", None)).is_none());
+}
+
 /// `into_dir` yields the directory of a `Same` view and names the cause of any other.
 #[skuld::test]
 fn into_dir_names_why_a_view_is_not_usable() {

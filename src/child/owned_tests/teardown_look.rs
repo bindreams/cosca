@@ -466,7 +466,7 @@ mod worded {
         let worded = |disposition: Disposition| {
             format!(
                 "elevation front pid 4242: the wait failed: {}{}",
-                cause(),
+                crate::child::owned::owned_tests::teardown_lines::wait_error(),
                 handed_back(disposition)
             )
         };

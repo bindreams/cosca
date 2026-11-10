@@ -152,10 +152,15 @@ impl Settlement {
             Ok(ChildWaitOutcome::Foreign(_)) => {
                 Wording::Collected(log::Level::Debug, format!("{subject}: reaped by someone else"))
             }
-            Err(e) => Wording::Uncollected(format!(
-                "{subject}: the wait failed: {e}{}",
-                disposition.map_or("", |disposition| disposition.suffix(true))
-            )),
+            // A logged text gets the whole chain; `None` returns it in an error, so Display.
+            Err(e) => Wording::Uncollected(match disposition {
+                Some(disposition) => format!(
+                    "{subject}: the wait failed: {}{}",
+                    crate::error::Report(e),
+                    disposition.suffix(true)
+                ),
+                None => format!("{subject}: the wait failed: {e}"),
+            }),
             Ok(ChildWaitOutcome::DeadlinePassed) => Wording::Uncollected(
                 running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),
             ),

@@ -487,7 +487,10 @@ pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Opti
         Err(nix::errno::Errno::ESRCH) => Some(false),
         Err(nix::errno::Errno::EINVAL) => None,
         Err(e) => {
-            log::debug!("containment::unix: a signal-0 send to a process group through its root's pidfd answered {e}");
+            log::debug!(
+                "containment::unix: a signal-0 send to a process group through its root's pidfd answered {report}",
+                report = crate::error::Report(&e)
+            );
             None
         }
     }
@@ -623,7 +626,10 @@ fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<(
     match sent {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(e) => {
-            log::debug!("containment::unix::signal_direct: kill({pid}, {signal}) failed: {e}");
+            log::debug!(
+                "containment::unix::signal_direct: kill({pid}, {signal}) failed: {report}",
+                report = crate::error::Report(&e)
+            );
             Err(io::Error::from(e))
         }
     }

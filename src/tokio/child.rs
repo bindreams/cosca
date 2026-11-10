@@ -51,7 +51,10 @@ fn try_take_writer(ends: &mut FdPipes, fd: Fd) -> std::io::Result<Option<super::
 /// and `consequence` for the child, and the end, which was closed, is `None`.
 fn logged<T>(taken: std::io::Result<Option<T>>, fd: Fd, what: &str, consequence: &str) -> Option<T> {
     taken.unwrap_or_else(|e| {
-        log::warn!("{fd} {what} dropped: tokio conversion failed ({e}); {consequence}");
+        log::warn!(
+            "{fd} {what} dropped: tokio conversion failed ({report}); {consequence}",
+            report = crate::error::Report(&e)
+        );
         None
     })
 }

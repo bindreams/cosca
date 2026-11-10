@@ -555,13 +555,15 @@ mod settlement {
 
     /// A failed wait is a warn that says where the uncollected child goes: nothing for a caller that
     /// says so itself, "left unreaped" for one that leaves it, handed back for one that hands it back.
+    /// The no-disposition caller returns the text (Display); the others log it (chain).
     #[track_caller]
     fn assert_failed_wait_worded(settlement: &Settlement) {
-        let said = "S: the wait failed: cosca-wait-e5a1";
-        for (disposition, goes) in [
-            (None, ""),
-            (Some(Disposition::Leave), LEFT),
-            (Some(Disposition::HandBack), HANDED_BACK),
+        let returned = "S: the wait failed: cosca-wait-e5a1";
+        let logged = "S: the wait failed: cosca-wait-e5a1: cosca-wait-e5a1";
+        for (disposition, said, goes) in [
+            (None, returned, ""),
+            (Some(Disposition::Leave), logged, LEFT),
+            (Some(Disposition::HandBack), logged, HANDED_BACK),
         ] {
             assert_eq!(
                 worded(settlement, disposition),
@@ -668,7 +670,7 @@ mod settlement {
         let (warn, remains) = outcome(failed()).take_warn("lead");
         assert_eq!(
             warn.as_deref(),
-            Some(format!("S: the wait failed: cosca-wait-e5a1{LEFT}").as_str())
+            Some(format!("S: the wait failed: cosca-wait-e5a1: cosca-wait-e5a1{LEFT}").as_str())
         );
         assert!(remains.uncollected);
         assert_eq!(

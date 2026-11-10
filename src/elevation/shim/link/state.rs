@@ -113,7 +113,11 @@ impl Shared {
             Err(Errno::NOENT) => {
                 log::debug!("the socket {} was already gone", self.sock_path.display());
             }
-            Err(e) => log::warn!("cannot remove the socket {}: {e}", self.sock_path.display()),
+            Err(e) => log::warn!(
+                "cannot remove the socket {}: {report}",
+                self.sock_path.display(),
+                report = crate::error::Report(&e)
+            ),
         }
     }
 
@@ -151,7 +155,7 @@ impl Shared {
         match inner.start {
             StartState::Pending | StartState::Refused => {
                 log::error!(
-                    "the acceptor for {} failed ({failure:?}); the start is refused",
+                    "the acceptor for {} failed ({failure}); the start is refused",
                     self.sock_path.display()
                 );
                 inner.failure.get_or_insert(failure);
@@ -159,7 +163,7 @@ impl Shared {
             }
             StartState::Live => {
                 log::warn!(
-                    "the acceptor for {} stopped ({failure:?}); the running shim is unaffected",
+                    "the acceptor for {} stopped ({failure}); the running shim is unaffected",
                     self.sock_path.display()
                 );
                 self.unlink(&mut inner);
@@ -182,7 +186,10 @@ impl Shared {
                     self.probe.event(|| LinkEvent::Answered(Command::Allow));
                 }
                 Err(e) => {
-                    log::debug!("cannot answer the shim at {path}: {e}; the start is refused");
+                    log::debug!(
+                        "cannot answer the shim at {path}: {report}; the start is refused",
+                        report = crate::error::Report(&e)
+                    );
                     self.refuse_pending(&mut inner);
                     self.probe.event(|| LinkEvent::Dropped(DropReason::AnswerFailed));
                 }
@@ -200,7 +207,11 @@ impl Shared {
     /// Answers `N`; a failed send is only logged.
     pub(super) fn deny(&self, conn: &UnixStream) {
         if let Err(e) = sys::send_answer(conn.as_fd(), Command::Deny.encode()) {
-            log::debug!("cannot answer N at {}: {e}", self.sock_path.display());
+            log::debug!(
+                "cannot answer N at {}: {report}",
+                self.sock_path.display(),
+                report = crate::error::Report(&e)
+            );
         }
         self.probe.event(|| LinkEvent::Answered(Command::Deny));
     }
@@ -232,8 +243,9 @@ impl Shared {
             if e != Errno::AGAIN {
                 debug_assert!(false, "writing the settled byte failed: {e}");
                 log::warn!(
-                    "cannot signal the outcome of the shim at {}: {e}",
-                    self.sock_path.display()
+                    "cannot signal the outcome of the shim at {}: {report}",
+                    self.sock_path.display(),
+                    report = crate::error::Report(&e)
                 );
             }
         }
@@ -254,7 +266,11 @@ impl Shared {
                 Read::Eof => (classify(&inner.frame[..len], true), false),
                 Read::Empty => (None, false),
                 Read::Failed(e) => {
-                    log::warn!("reading from the shim at {}: {e}", self.sock_path.display());
+                    log::warn!(
+                        "reading from the shim at {}: {report}",
+                        self.sock_path.display(),
+                        report = crate::error::Report(&e)
+                    );
                     (Some(LinkOutcome::ShimLost), false)
                 }
             };
@@ -311,7 +327,11 @@ impl Shared {
                 None => sys::wait_for_frame_or_outcome(conn.as_fd(), &self.settled.0, armed),
             };
             if let Err(e) = waited {
-                log::warn!("waiting for the shim at {}: {e}", self.sock_path.display());
+                log::warn!(
+                    "waiting for the shim at {}: {report}",
+                    self.sock_path.display(),
+                    report = crate::error::Report(&e)
+                );
                 return Err(e);
             }
         }
@@ -374,7 +394,11 @@ impl Shared {
             }
             Err(Errno::AGAIN | Errno::NOBUFS) => Err(KillError::Unkillable),
             Err(e) => {
-                log::warn!("sending K to the shim at {}: {e}", self.sock_path.display());
+                log::warn!(
+                    "sending K to the shim at {}: {report}",
+                    self.sock_path.display(),
+                    report = crate::error::Report(&e)
+                );
                 Err(KillError::Io(e.into()))
             }
         }

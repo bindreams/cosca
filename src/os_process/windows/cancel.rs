@@ -54,7 +54,10 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
         // RELEASE unwind (a debug build already aborted above — visibility over grace,
         // the shipped policy): cannot assert while a panic is in flight, so leave the
         // loudest trace we can for the possible unbounded park.
-        log::error!("SetEvent failed during unwind ({e}); a parked watcher may not release");
+        log::error!(
+            "SetEvent failed during unwind ({report}); a parked watcher may not release",
+            report = crate::error::Report(e)
+        );
     }
 }
 

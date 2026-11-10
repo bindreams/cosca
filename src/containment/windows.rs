@@ -123,7 +123,10 @@ impl JobHandle {
         unsafe {
             let terminated = TerminateJobObject(job, 1).map_err(win32_io_error);
             if let Err(e) = CloseHandle(job) {
-                log::warn!("CloseHandle on the job failed ({e}); the handle is leaked");
+                log::warn!(
+                    "CloseHandle on the job failed ({report}); the handle is leaked",
+                    report = crate::error::Report(&e)
+                );
             }
             terminated
         }
@@ -226,7 +229,10 @@ impl Drop for JobHandle {
                     // The close IS the teardown here: with KILL_ON_JOB_CLOSE still set, a
                     // failed close means the tree was never reaped and the handle leaked.
                     // Drop cannot report that, so it must at least be visible.
-                    log::warn!("closing the job handle failed ({e}); the tree may still be running");
+                    log::warn!(
+                        "closing the job handle failed ({report}); the tree may still be running",
+                        report = crate::error::Report(&e)
+                    );
                 }
             }
         }
@@ -376,7 +382,10 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
     }
     if err.raw_os_error() == Some(no_console) {
         if let Err(probe) = &console {
-            log::warn!("CTRL_BREAK to group {pid}: the console probe failed ({probe}); cannot classify");
+            log::warn!(
+                "CTRL_BREAK to group {pid}: the console probe failed ({report}); cannot classify",
+                report = crate::error::Report(probe)
+            );
             return crate::error::Error::Io(err);
         }
         return crate::error::Error::NoConsole {
@@ -393,7 +402,10 @@ pub(crate) fn classify_ctrl_event_failure(pid: u32, err: io::Error, console: io:
     // independent OS failure and the arms above log theirs — say so here too rather than
     // dropping it silently.
     if let Err(probe) = &console {
-        log::warn!("CTRL_BREAK to group {pid} failed, and the console probe also failed ({probe})");
+        log::warn!(
+            "CTRL_BREAK to group {pid} failed, and the console probe also failed ({report})",
+            report = crate::error::Report(probe)
+        );
     }
     crate::error::Error::Io(err)
 }
@@ -1113,7 +1125,10 @@ pub(crate) fn wait_drained_raw(
             if let Some(e) = denied {
                 // A persistent, actionable open failure (not a benign exit-race): looping
                 // back here without ever holding a real handle to block on would busy-spin.
-                log::warn!("wait_tree: could not open any live job member to watch for its exit ({e})");
+                log::warn!(
+                    "wait_tree: could not open any live job member to watch for its exit ({report})",
+                    report = crate::error::Report(&e)
+                );
                 return Err(Error::Unassessable {
                     detail: "could not open a handle to any live member of the contained tree \
                                  to observe its exit"
@@ -1142,7 +1157,8 @@ pub(crate) fn wait_drained_raw(
             // though it isn't (yet) fatal to this round's wait.
             log::debug!(
                 "wait_tree: could not open one live job member to watch for its exit, but \
-                 other members are still trackable this round: {e}"
+                 other members are still trackable this round: {report}",
+                report = crate::error::Report(e)
             );
         }
 
@@ -1278,7 +1294,7 @@ impl Walk {
     fn fail_win32(&mut self, call: &str, tid: u32, process_pid: u32, cause: windows::core::Error) -> Visit {
         let context = format!("{call} failed for thread {tid} of pid {process_pid}");
         let err = io_context(context, win32_io_error(cause));
-        log::warn!("resume_initial_threads: {err}");
+        log::warn!("resume_initial_threads: {report}", report = crate::error::Report(&err));
         self.last_err.get_or_insert(err);
         Visit::Failed
     }
@@ -1593,7 +1609,8 @@ fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
     if let Some(e) = last_err {
         log::warn!(
             "resume_initial_threads: failed to resume one or more of this child's initial threads \
-             ({resumed} resumed successfully before the failure): {e}"
+             ({resumed} resumed successfully before the failure): {report}",
+            report = crate::error::Report(&e)
         );
         return Err(e);
     }
@@ -1694,7 +1711,10 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
             // resume failure is what gets reported; a kill failure on top of it cannot change
             // that outcome, so it is logged here rather than swallowed.
             if let Err(e) = job.hard_kill() {
-                log::warn!("job kill after a failed resume also failed ({e}); the tree may still be running");
+                log::warn!(
+                    "job kill after a failed resume also failed ({report}); the tree may still be running",
+                    report = crate::error::Report(&e)
+                );
             }
         }
         return Err(resume_err);
