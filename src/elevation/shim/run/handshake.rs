@@ -44,8 +44,8 @@ enum Stop {
 /// What a failed `stat` of `fd_path`, a path under `/proc`, says: only `ENOENT` means `/proc` is not there.
 fn proc_probe_failure(fd_path: &str, errno: Errno) -> String {
     match errno {
-        Errno::NOENT => format!("/proc must be mounted: {fd_path}: {errno}"),
-        _ => format!("cannot reach {fd_path}: {errno}"),
+        Errno::NOENT => format!("/proc must be mounted: {fd_path}: {}", crate::error::Report(&errno)),
+        _ => format!("cannot reach {fd_path}: {}", crate::error::Report(&errno)),
     }
 }
 
@@ -59,16 +59,24 @@ impl Shim {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| unreachable(self, format!("could not open {}: {e}", args.dir.display())))?;
+        .map_err(|e| {
+            unreachable(
+                self,
+                format!("could not open {}: {}", args.dir.display(), crate::error::Report(&e)),
+            )
+        })?;
         let socket = socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)
-            .map_err(|e| unreachable(self, format!("could not make a socket: {e}")))?;
-        set_passcred(socket.as_fd()).map_err(|e| unreachable(self, format!("SO_PASSCRED: {e}")))?;
+            .map_err(|e| unreachable(self, format!("could not make a socket: {}", crate::error::Report(&e))))?;
+        set_passcred(socket.as_fd())
+            .map_err(|e| unreachable(self, format!("SO_PASSCRED: {}", crate::error::Report(&e))))?;
         // The probe comes first: without `/proc`, the connect below fails with a bare `ENOENT`.
         let fd_path = format!("/proc/thread-self/fd/{}", dir.as_raw_fd());
         stat(&fd_path).map_err(|e| unreachable(self, proc_probe_failure(&fd_path, e)))?;
         let path = format!("{fd_path}/{SOCKET_NAME}");
-        let address = SocketAddrUnix::new(&path).map_err(|e| unreachable(self, format!("{path}: {e}")))?;
-        connect(&socket, &address).map_err(|e| unreachable(self, format!("could not reach cosca: {e}")))?;
+        let address = SocketAddrUnix::new(&path)
+            .map_err(|e| unreachable(self, format!("{path}: {}", crate::error::Report(&e))))?;
+        connect(&socket, &address)
+            .map_err(|e| unreachable(self, format!("could not reach cosca: {}", crate::error::Report(&e))))?;
         self.conn = Some(socket);
         Ok(())
     }
@@ -78,7 +86,7 @@ impl Shim {
         let creds = peer_credentials(self.conn().as_fd()).map_err(|e| {
             self.refuse(
                 codes::NOT_COSCA,
-                &format!("cannot read the listener's credentials: {e}"),
+                &format!("cannot read the listener's credentials: {}", crate::error::Report(&e)),
             )
         })?;
         if creds.pid != args.cosca_pid as i32 || creds.uid != args.cosca_euid {
@@ -119,8 +127,12 @@ impl Shim {
     }
 
     pub(super) fn say_hello(&mut self) -> Result<(), Exit> {
-        send_all(self.conn().as_fd(), &Frame::Hello.encode())
-            .map_err(|e| self.refuse(codes::NO_ANSWER, &format!("could not say hello: {e}")))?;
+        send_all(self.conn().as_fd(), &Frame::Hello.encode()).map_err(|e| {
+            self.refuse(
+                codes::NO_ANSWER,
+                &format!("could not say hello: {}", crate::error::Report(&e)),
+            )
+        })?;
         self.hello_sent = true;
         self.log.line(format_args!("hello sent; awaiting the answer"));
         Ok(())
@@ -131,7 +143,7 @@ impl Shim {
     pub(super) fn await_answer(&mut self, args: &ShimArgs, owner: &OwnedFd) -> Result<(), Exit> {
         let wake = self.wake().rx.as_fd();
         let ready = wait_readable([Some(owner.as_fd()), Some(wake), Some(self.conn().as_fd())])
-            .map_err(|e| self.refuse_with(Refusal::NoAnswer, &format!("poll failed: {e}")))?;
+            .map_err(|e| self.refuse_with(Refusal::NoAnswer, &format!("poll failed: {}", crate::error::Report(&e))))?;
         if ready[0] {
             return Err(self.refuse_with(Refusal::CoscaGone, "cosca exited before the start"));
         }
@@ -140,8 +152,12 @@ impl Shim {
                 .line(format_args!("a signal reached the shim before the answer"));
             return Err(self.refuse_with(Refusal::NoAnswer, "a signal reached the shim before cosca's answer"));
         }
-        let received = recv_with_credentials(self.conn().as_fd())
-            .map_err(|e| self.refuse_with(Refusal::NoAnswer, &format!("no answer from cosca: {e}")))?;
+        let received = recv_with_credentials(self.conn().as_fd()).map_err(|e| {
+            self.refuse_with(
+                Refusal::NoAnswer,
+                &format!("no answer from cosca: {}", crate::error::Report(&e)),
+            )
+        })?;
         let Received::Byte(byte, creds) = received else {
             self.log.line(format_args!("first byte: EOF"));
             return Err(self.refuse_with(Refusal::NoAnswer, "no answer from cosca"));

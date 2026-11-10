@@ -41,7 +41,10 @@ fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
             // Expected misses: gone/zombie (ESRCH) or an unprivileged cross-user query
             // (EPERM) — the sysctl fallback covers both.
             Some(libc::ESRCH) | Some(libc::EPERM) => {}
-            _ => contract_violation(format_args!("proc_pidinfo({pid}) failed: {e}")),
+            _ => contract_violation(format_args!(
+                "proc_pidinfo({pid}) failed: {report}",
+                report = crate::error::Report(&e)
+            )),
         }
         return None;
     }

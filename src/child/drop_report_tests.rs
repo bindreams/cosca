@@ -585,10 +585,15 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_roo
 
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(handed_back.is_none());
+    // The warn goes through `Report`; the cause is returned, so it keeps Display.
     let clause = format!("could not be terminated ({}): not ours to reap (launchd", refusal());
+    let reported = format!(
+        "could not be terminated ({0}: {0}): not ours to reap (launchd",
+        refusal()
+    );
     let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].contains(&clause), "{warns:?}");
+    assert!(warns[0].contains(&reported), "{warns:?}");
     let cause = cause.to_string();
     assert!(cause.contains(&clause), "{cause}");
 }
@@ -866,12 +871,20 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
         .iter()
         .find(|warn| warn.contains(&leaf_path.display().to_string()))
         .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
-    for text in [warn.as_str(), cause.to_string().as_str()] {
-        assert!(
-            text.contains(&first) && text.contains(&format!("the drop's tree kill, made early, failed too ({early})")),
-            "both failures, first then the early kill's: {text}"
-        );
-    }
+    // Warn uses `Report`, the cause uses `Display`; both start with the early kill's text.
+    let cause = cause.to_string();
+    assert!(cause.contains(&first), "the first failure: {cause}");
+    assert!(
+        cause.contains(&format!("the drop's tree kill, made early, failed too ({early})")),
+        "the early kill's Display: {cause}"
+    );
+    assert!(warn.contains(&first), "the first failure: {warn}");
+    assert!(
+        warn.contains(&format!(
+            "the drop's tree kill, made early, failed too ({early}: {early})"
+        )),
+        "the early kill's Report: {warn}"
+    );
     handed_back.wait();
 }
 

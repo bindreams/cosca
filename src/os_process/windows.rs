@@ -89,11 +89,14 @@ pub(crate) fn uac_access(handle: HANDLE) -> PROCESS_ACCESS_RIGHTS {
 /// `SYNCHRONIZE`: a look and a wait on it depend on that, so one that does not breaks the contract.
 /// One whose access cannot be read is taken to hold `SYNCHRONIZE` and no more, so a refused kill of
 /// it is a refusal of permission ([`KillRefusal::Permission`]).
-pub(crate) fn access_of_uac_read(read: Result<u32, impl std::fmt::Display>) -> PROCESS_ACCESS_RIGHTS {
+pub(crate) fn access_of_uac_read(read: Result<u32, impl std::error::Error + 'static>) -> PROCESS_ACCESS_RIGHTS {
     let granted = match read {
         Ok(access) => PROCESS_ACCESS_RIGHTS(access),
         Err(e) => {
-            log::debug!("uac_access: the access granted to an elevated child's handle could not be read ({e})");
+            log::debug!(
+                "uac_access: the access granted to an elevated child's handle could not be read ({report})",
+                report = crate::error::Report(&e)
+            );
             PROCESS_SYNCHRONIZE
         }
     };
@@ -123,8 +126,9 @@ fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
         }
         HandleIdentity::Unreadable(e) => {
             log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({e})",
-                id.pid()
+                "wait: pid {} opened but its identity could not be verified ({report})",
+                id.pid(),
+                report = crate::error::Report(&e)
             );
             close(handle);
             Err(Error::Unassessable {
@@ -152,8 +156,9 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
                 Liveness::Dead => Ok(None),
                 Liveness::Alive | Liveness::Unknown => {
                     log::warn!(
-                        "wait: pid {} could not be opened ({e}) - reporting an error, not an exit or a kill",
-                        id.pid()
+                        "wait: pid {} could not be opened ({report}) - reporting an error, not an exit or a kill",
+                        id.pid(),
+                        report = crate::error::Report(&e)
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened", id.pid()),
@@ -179,7 +184,11 @@ impl OsProcess for WindowsProcess {
                 Termination::Exited => Ok(Sent::Gone),
                 // The caller that goes on to report the refusal warns of it: a refusal warns once.
                 Termination::Failed(e) => {
-                    log::debug!("wait: TerminateProcess(pid {}) failed ({e})", self.pid);
+                    log::debug!(
+                        "wait: TerminateProcess(pid {}) failed ({report})",
+                        self.pid,
+                        report = crate::error::Report(&e)
+                    );
                     Err(Error::Io(win32_io_error(e)))
                 }
             },

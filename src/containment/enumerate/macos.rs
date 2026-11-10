@@ -294,8 +294,9 @@ fn try_all_pids() -> std::io::Result<Vec<libc::c_int>> {
 fn all_pids_or_empty(pids: std::io::Result<Vec<libc::c_int>>) -> Vec<libc::c_int> {
     pids.unwrap_or_else(|e| {
         log::warn!(
-            "enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table, \
-             so a tree walk over it finds no descendants"
+            "enumerate: pid snapshot failed ({report}) - callers see an EMPTY process table, \
+             so a tree walk over it finds no descendants",
+            report = crate::error::Report(&e)
         );
         Vec::new()
     })
@@ -434,7 +435,10 @@ pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
         Err(e) => {
             // Blind, like a failed `proc_listallpids`: the fd-marker sweep reads an empty pid
             // list as an incomplete pass.
-            log::warn!("enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table");
+            log::warn!(
+                "enumerate: pid snapshot failed ({report}) - callers see an EMPTY process table",
+                report = crate::error::Report(&e)
+            );
             return (Vec::new(), Vec::new(), 0);
         }
     };

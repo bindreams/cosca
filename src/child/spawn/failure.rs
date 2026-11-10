@@ -236,7 +236,8 @@ impl From<SpawnFailure> for Error {
             SpawnFailure::NotStarted(error) => {
                 debug_assert!(
                     !matches!(error, Error::MayHaveStarted { .. }),
-                    "a spawn answered both `not started` and `may have started`: {error}"
+                    "a spawn answered both `not started` and `may have started`: {}",
+                    crate::error::Report(&error)
                 );
                 error
             }
@@ -244,7 +245,8 @@ impl From<SpawnFailure> for Error {
             SpawnFailure::NotStartedWithChild { cause: error, .. } => {
                 debug_assert!(
                     !matches!(error, Error::MayHaveStarted { .. }),
-                    "a spawn answered both `not started` and `may have started`: {error}"
+                    "a spawn answered both `not started` and `may have started`: {}",
+                    crate::error::Report(&error)
                 );
                 error
             }
@@ -256,7 +258,8 @@ impl From<SpawnFailure> for Error {
             } => {
                 debug_assert!(
                     !matches!(cause, Error::MayHaveStarted { .. }),
-                    "a `may have started` failure's cause is itself `may have started`: {cause}"
+                    "a `may have started` failure's cause is itself `may have started`: {}",
+                    crate::error::Report(&cause)
                 );
                 debug_assert!(
                     unreaped.as_ref().is_none_or(|child| match fate {

@@ -390,8 +390,9 @@ pub(crate) fn pipe_fds_of(pid: RawPid) -> PipeQuery {
                 // `holders()`) rather than propagated as a hard error: one pid with an
                 // unenumerable fd table must not abort a whole-host sweep.
                 log::warn!(
-                    "fd marker: pid {pid}'s open-fd count cannot be enumerated ({e}); treating \
-                     as denied for this pass"
+                    "fd marker: pid {pid}'s open-fd count cannot be enumerated ({report}); treating \
+                     as denied for this pass",
+                    report = crate::error::Report(&e)
                 );
                 return PipeQuery::Denied;
             }
@@ -548,7 +549,8 @@ pub(crate) fn install(
         Ok(p) => p,
         Err(e) => {
             log::warn!(
-                "fd marker: pipe() failed ({e}); falling back to the pre-existing containment channel for this mode"
+                "fd marker: pipe() failed ({report}); falling back to the pre-existing containment channel for this mode",
+                report = crate::error::Report(&e)
             );
             return None;
         }
@@ -563,7 +565,10 @@ pub(crate) fn install(
     let write: OwnedFd = match place_write_end(write, want) {
         Ok(fd) => fd,
         Err(e) => {
-            log::warn!("fd marker: could not place the marker descriptor ({e}); falling back to the pre-existing containment channel for this mode");
+            log::warn!(
+                "fd marker: could not place the marker descriptor ({report}); falling back to the pre-existing containment channel for this mode",
+                report = crate::error::Report(&e)
+            );
             return None;
         }
     };
@@ -1402,9 +1407,10 @@ impl Marker {
                     // is skipped and the sweep reports `incomplete`.
                     Err(e) => {
                         log::warn!(
-                            "fd marker {:#x}: the root's descendants could not be walked ({e}) \
+                            "fd marker {:#x}: the root's descendants could not be walked ({report}) \
                              - the ppid-walk channel is blind this pass",
-                            self.handle
+                            self.handle,
+                            report = crate::error::Report(&e)
                         );
                         *incomplete = true;
                     }

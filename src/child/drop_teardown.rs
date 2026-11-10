@@ -125,7 +125,11 @@ impl Child {
         if let Err(e) = leaf.remove_else_kill() {
             let occupied = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY));
             if !occupied && !crate::containment::cgroup::removed_after_drain(&e) {
-                log::debug!("child {}: its leaf's first rmdir failed ({e})", self.pid());
+                log::debug!(
+                    "child {}: its leaf's first rmdir failed ({report})",
+                    self.pid(),
+                    report = crate::error::Report(&e)
+                );
             }
         }
         if !self.attached.cgroup_kill_landed() {
@@ -133,8 +137,9 @@ impl Child {
         }
         if let Err(e) = crate::tokio::wait::cgroup_wait_tree_drained(leaf, None).await {
             log::debug!(
-                "child {}: its leaf's drain cannot be watched ({e}); the teardown waits for it on this thread, blocking",
-                self.pid()
+                "child {}: its leaf's drain cannot be watched ({report}); the teardown waits for it on this thread, blocking",
+                self.pid(),
+                report = crate::error::Report(&e)
             );
         }
     }
@@ -216,7 +221,7 @@ impl Child {
                     tree: None,
                     disposition,
                 };
-                return self.begin_leaf_and_front(unkillable.to_string(), parts);
+                return self.begin_leaf_and_front(crate::error::Report(&unkillable).to_string(), parts);
             }
             crate::elevation::front::Gate::CgroupOnly(front) => Some(front),
             _ => None,
@@ -250,8 +255,11 @@ impl Child {
             return BeginOutcome::Done(parts.finish(self, torn));
         }
         if let Some(front) = cgroup_only {
-            let not_reached = match kill.incomplete() {
-                None => self.cgroup_kill_reached(front).err().map(|e| e.to_string()),
+            let not_reached = match kill.incomplete_for_log() {
+                None => self
+                    .cgroup_kill_reached(front)
+                    .err()
+                    .map(|e| crate::error::Report(&e).to_string()),
                 failure => failure,
             };
             let parts = DropParts {
@@ -584,7 +592,13 @@ pub(super) fn word_front(
                 Disposition::HandBack.suffix(true)
             ),
         }),
-        LookOutcome::PlaceUnreadable(e) => left(unreadable(format!("where it is cannot be read ({e})"))),
-        LookOutcome::SubtreeUnreadable(e) => left(unreadable(format!("its leaf's subtree cannot be read ({e})"))),
+        LookOutcome::PlaceUnreadable(e) => left(unreadable(format!(
+            "where it is cannot be read ({})",
+            crate::error::Report(&e)
+        ))),
+        LookOutcome::SubtreeUnreadable(e) => left(unreadable(format!(
+            "its leaf's subtree cannot be read ({})",
+            crate::error::Report(&e)
+        ))),
     }
 }

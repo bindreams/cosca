@@ -115,6 +115,21 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
     }
 }
 
+/// The warn of a snapshot a failed `stat` read ended carries the OS error.
+#[skuld::test]
+fn the_warn_of_a_failed_stat_read_says_the_os_error() {
+    let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EIO);
+    let (got, records) = snapshot_with(&kernel);
+    assert!(got.is_err(), "{got:?}");
+    let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+    assert!(
+        records
+            .iter()
+            .any(|(level, line)| *level == log::Level::Warn && line.contains(&os_error)),
+        "{records:?}"
+    );
+}
+
 /// `EPERM` is `hidepid`'s answer and also a seccomp filter's for an `openat2` installed mid-scan;
 /// only the checked directory still answering tells them apart. Mutant: "skip `EPERM` without the
 /// re-check".

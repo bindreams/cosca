@@ -13,6 +13,15 @@ pub(crate) enum AcceptorFailure {
     Panicked,
 }
 
+impl std::fmt::Display for AcceptorFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptorFailure::Errno(errno) => write!(f, "{}", io::Error::from_raw_os_error(*errno)),
+            AcceptorFailure::Panicked => f.write_str("it panicked"),
+        }
+    }
+}
+
 /// Why the program never ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotStartedCause {

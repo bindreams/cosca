@@ -571,7 +571,11 @@ impl OwnedChild {
         // A child reaped elsewhere is read from the typed outcome, so it is `Gone` on every OS.
         let settlement = Settlement::new(self.wait(Some(crate::wait::now())), false);
         let refused_kind = refusal_kind(&refused);
-        let subject = format!("{} {}", child_named(self.pid()), kill_refused(&refused));
+        let subject = format!(
+            "{} {}",
+            child_named(self.pid()),
+            kill_refused(&crate::error::Report(&refused))
+        );
         // Still running: the caller that leaves it says so, and that nothing reaps it.
         let running = match disposition {
             Disposition::Leave => format!("{subject}{LEAVING_RUNNING}"),

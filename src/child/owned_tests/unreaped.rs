@@ -462,7 +462,7 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
         ),
         (
             || Some(Err(Error::Io(std::io::Error::other("denied")))),
-            "could not be terminated (denied)",
+            "could not be terminated (denied: denied)",
             &["killed it"],
             vec![LEAVING_RUNNING],
             &["killed it"],

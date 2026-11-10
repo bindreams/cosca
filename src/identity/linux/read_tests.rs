@@ -43,6 +43,22 @@ fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
     }
 }
 
+/// The debug line of a read left `Unknown` by a `/proc` that cannot be opened carries the OS error.
+#[skuld::test]
+fn the_line_of_an_unavailable_view_says_the_os_error() {
+    crate::log_capture::install();
+    let pid = std::process::id();
+    let kernel = ticks_host(pid).open_proc_fails(Errno::MFILE);
+    let mark = crate::log_capture::mark();
+
+    let (got, _) = ProcessId::of_with(&kernel, pid);
+
+    assert!(matches!(got, Resolved::Unknown), "{got:?}");
+    let records = crate::log_capture::records_since_on_current_thread(mark, &format!("/proc/{pid}/stat not read"));
+    let os_error = std::io::Error::from(Errno::MFILE).to_string();
+    assert!(records.iter().any(|(_, line)| line.contains(&os_error)), "{records:?}");
+}
+
 /// `kill(pid, 0)` answering `ESRCH` resolves the pid in this process's own namespace, so it is
 /// `Gone` whatever `/proc` shows. Mutant: "an unavailable view is always Unknown".
 #[skuld::test]

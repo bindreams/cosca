@@ -381,12 +381,18 @@ impl TreeCall<'_> {
         };
         let sent = match (&holders, &root) {
             (Some(Ok(())), _) => "signalled only the marker holders".to_owned(),
-            (Some(Err(e)), _) => format!("signalled only the marker holders, which failed ({e})"),
+            (Some(Err(e)), _) => format!(
+                "signalled only the marker holders, which failed ({})",
+                crate::error::Report(e)
+            ),
             (None, None) => "sent nothing".to_owned(),
             (None, Some(Ok(Sent::Delivered))) => sent_root.to_owned(),
             (None, Some(Ok(Sent::Gone))) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
             (None, Some(Ok(_))) => "sent nothing: the root's handle no longer reaches it".to_owned(),
-            (None, Some(Err(e))) => format!("sent nothing: {failed_root} through its pidfd failed ({e})"),
+            (None, Some(Err(e))) => format!(
+                "sent nothing: {failed_root} through its pidfd failed ({})",
+                crate::error::Report(e)
+            ),
         };
         let detail = self.skipped_detail(why, &sent);
         log::warn!("{detail}");
@@ -433,9 +439,10 @@ impl TreeCall<'_> {
     #[cfg(target_os = "macos")]
     pub(crate) fn holders_grace_failed(&self, e: &Error) {
         log::debug!(
-            "{}({}): the marker holders' grace wait failed, so they are killed now: {e}",
+            "{}({}): the marker holders' grace wait failed, so they are killed now: {report}",
             self.op,
-            self.pid
+            self.pid,
+            report = crate::error::Report(e)
         );
     }
 
@@ -451,7 +458,7 @@ impl TreeCall<'_> {
         };
         let kill_failed = match &kill {
             Ok(()) => String::new(),
-            Err(e) => format!(", which failed ({e})"),
+            Err(e) => format!(", which failed ({})", crate::error::Report(e)),
         };
         let sent = format!(
             "sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}"
@@ -502,7 +509,7 @@ impl PidfdShutdown {
         self,
         call: &TreeCall<'_>,
         why: &str,
-        exited: Option<Result<bool, impl std::fmt::Display>>,
+        exited: Option<Result<bool, impl std::error::Error + 'static>>,
         kill_gate: impl FnOnce() -> crate::elevation::front::Gate,
         kill: impl FnOnce() -> Result<Sent, Error>,
     ) -> Error {
@@ -512,9 +519,10 @@ impl PidfdShutdown {
             Some(outcome) => {
                 if let Err(e) = outcome {
                     log::debug!(
-                        "{}({}): the root's grace wait failed, so it is killed now: {e}",
+                        "{}({}): the root's grace wait failed, so it is killed now: {report}",
                         call.op,
-                        call.pid
+                        call.pid,
+                        report = crate::error::Report(&e)
                     );
                 }
                 Some(match kill_gate() {
@@ -525,13 +533,19 @@ impl PidfdShutdown {
         };
         let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";
         let sent = match (&self.term, &kill) {
-            (Err(e), _) => format!("sent nothing: the SIGTERM to the root through its pidfd failed ({e})"),
+            (Err(e), _) => format!(
+                "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
+                crate::error::Report(e)
+            ),
             (Ok(Sent::Delivered), None) => format!("{termed}, and it exited within the grace; sent nothing else"),
             (Ok(Sent::Delivered), Some(Ok(Sent::Delivered))) => {
                 format!("{termed}, then killed the root through its pidfd after the grace, and sent nothing else")
             }
             (Ok(Sent::Delivered), Some(Err(e))) => {
-                format!("{termed}, then the kill of the root through its pidfd failed ({e})")
+                format!(
+                    "{termed}, then the kill of the root through its pidfd failed ({})",
+                    crate::error::Report(e)
+                )
             }
             (Ok(Sent::Delivered), Some(Ok(_))) => {
                 format!("{termed}, and its pidfd showed it gone after the grace; sent nothing else")

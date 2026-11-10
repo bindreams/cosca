@@ -259,13 +259,17 @@ impl Subtree {
                 Err(e) => {
                     log::debug!(
                         "the cgroups under a leaf were all walked without finding cgroup {id}, but its cgroup.stat \
-                         cannot be read ({e}), so it is not shown to be outside"
+                         cannot be read ({report}), so it is not shown to be outside",
+                        report = crate::error::Report(&e)
                     );
                     None
                 }
             },
             super::Walked::Unknown(e) => {
-                log::debug!("the cgroups under a leaf could not all be walked ({e})");
+                log::debug!(
+                    "the cgroups under a leaf could not all be walked ({report})",
+                    report = crate::error::Report(&e)
+                );
                 None
             }
         }
@@ -437,8 +441,9 @@ impl Drop for Probe {
         };
         if let Err(e) = kill_and_reap(self.pid, &self.hold, channel) {
             log::warn!(
-                "containment::cgroup: the placement probe's child {} could not be reaped ({e})",
-                self.pid
+                "containment::cgroup: the placement probe's child {} could not be reaped ({report})",
+                self.pid,
+                report = crate::error::Report(&e)
             );
         }
     }
@@ -477,7 +482,8 @@ fn fork_probe(proc: &crate::identity::ProcDir, parent: libc::pid_t, dumpable: bo
         Err(Unpinned::Gone(e)) => return Err(e),
         Err(Unpinned::Failed(e)) => {
             log::warn!(
-                "containment::cgroup: no pidfd pins the placement probe's child {pid} ({e}), so it is killed and reaped by its number"
+                "containment::cgroup: no pidfd pins the placement probe's child {pid} ({report}), so it is killed and reaped by its number",
+                report = crate::error::Report(&e)
             );
             Hold::Number
         }
@@ -748,7 +754,8 @@ fn kill_and_reap(pid: libc::pid_t, hold: &Hold, channel: std::os::unix::net::Uni
             "containment::cgroup: the placement probe's child {pid} had already exited, or was reaped by another reaper in this process, when it was to be killed"
         ),
         Err(e) => log::warn!(
-            "containment::cgroup: the kill of the placement probe's child {pid} failed ({e}); it is released to exit by itself"
+            "containment::cgroup: the kill of the placement probe's child {pid} failed ({report}); it is released to exit by itself",
+            report = crate::error::Report(&e)
         ),
     }
     release_probe(pid, channel);
@@ -810,7 +817,8 @@ fn release_probe(pid: libc::pid_t, channel: std::os::unix::net::UnixStream) {
     match sent {
         Ok(_) | Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => {}
         Err(e) => log::warn!(
-            "containment::cgroup: the placement probe's child {pid} could not be released ({e}); it exits once every copy of its socket closes"
+            "containment::cgroup: the placement probe's child {pid} could not be released ({report}); it exits once every copy of its socket closes",
+            report = crate::error::Report(&e)
         ),
     }
 }

@@ -2514,6 +2514,26 @@ fn a_gone_leafs_kill_is_the_teardowns_one_write() {
     assert!(warns.is_empty(), "the removal wrote again: {warns:?}");
 }
 
+/// The teardown that makes the `cgroup.kill` write and the one that finds it made word its failure
+/// the same.
+///
+/// Mutant: the writing path answers with the failure's whole chain, the recorded one with its text.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_leaf_kill_is_worded_the_same_by_the_writer_and_by_a_later_teardown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-kill-wording");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let _write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+
+    let written = leaf.kill_unless_written();
+    let found = leaf.kill_unless_written();
+
+    assert_eq!(written, Err(std::io::Error::from_raw_os_error(libc::EIO).to_string()));
+    assert_eq!(found, written);
+}
+
 /// A failed `cgroup.kill` of an abandoned spawn is warned once when the `rmdir` then succeeds: the
 /// removal reports nothing, so the abandonment's one warn carries it.
 ///

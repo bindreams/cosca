@@ -32,7 +32,10 @@ impl Spawned {
             Ok(()) => {}
             Err(Errno::SRCH) => log::debug!("the program's process is already gone"),
             Err(e) => {
-                log.warn(format_args!("cannot kill the program's process: {e}"));
+                log.warn(format_args!(
+                    "cannot kill the program's process: {}",
+                    crate::error::Report(&e)
+                ));
                 debug_assert!(false, "pidfd_send_signal(SIGKILL): {e}");
             }
         }
@@ -87,7 +90,10 @@ fn wait_on(child: &Spawned, options: WaitIdOptions, log: &Log) -> Wait {
             // Someone else collected the status.
             Err(Errno::CHILD) => Wait::Gone,
             Err(e) => {
-                log.warn(format_args!("waitid on the program's pidfd: {e}"));
+                log.warn(format_args!(
+                    "waitid on the program's pidfd: {}",
+                    crate::error::Report(&e)
+                ));
                 debug_assert!(false, "waitid on the program's pidfd: {e}");
                 Wait::Gone
             }

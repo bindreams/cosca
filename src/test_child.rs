@@ -1233,7 +1233,12 @@ impl Drop for RestoreMode {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode)) {
-            log::warn!("could not restore mode {:o} on {:?}: {e}", self.mode, self.path);
+            log::warn!(
+                "could not restore mode {:o} on {:?}: {}",
+                self.mode,
+                self.path,
+                crate::error::Report(&e)
+            );
         }
     }
 }

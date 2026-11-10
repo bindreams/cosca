@@ -8,6 +8,27 @@ use crate::test_groups::setuid;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
+/// A log line has every member left, each with its whole chain; the returned text has no chains.
+#[skuld::test]
+fn unsettled_logs_every_member_with_its_chain() {
+    use crate::error::Error;
+    let member = |text: &str| Error::MemberNotKilled {
+        pid: 1,
+        source: Box::new(Error::Containment { detail: text.into() }),
+        note: None,
+    };
+    let unsettled = super::Unsettled {
+        first: member("one"),
+        others: vec![member("two"), member("three")],
+    };
+    assert_eq!(
+        unsettled.log_text(),
+        "pid 1 was not killed: process containment failed: one: process containment failed: one; \
+         pid 1 was not killed: process containment failed: two: process containment failed: two; \
+         pid 1 was not killed: process containment failed: three: process containment failed: three"
+    );
+}
+
 /// Without the marker the process is the root (not nested).
 #[skuld::test]
 fn is_nested_without_marker_is_false() {
