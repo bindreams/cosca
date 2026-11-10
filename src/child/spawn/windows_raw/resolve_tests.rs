@@ -658,7 +658,7 @@ fn a_drive_relative_name_is_refused_without_querying_system_dirs() {
 
 /// [`query_wide_dir`] wraps the Win32 failure through [`crate::error::io_context`] rather than a
 /// hand-rolled message, specifically so the original `std::io::Error` — and its `raw_os_error()` —
-/// stays reachable one hop down via `.source()`, exactly as
+/// stays reachable down the `Error::Io`'s `source()` chain, where `Error::raw_os_error` finds it, as
 /// `crate::error_tests::io_context_keeps_the_os_error_as_its_source` pins for `io_context` itself.
 /// This test pins that the SAME guarantee survives all the way through `get_system_directory_via`,
 /// not just through `io_context` in isolation: a caller catching a specific OS error code (e.g. to
@@ -670,14 +670,8 @@ fn get_system_directory_via_keeps_the_os_error_reachable() {
     // SAFETY: `SetLastError` only writes the calling thread's last-error slot.
     unsafe { windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(code)) };
     let err = get_system_directory_via(|_buf| 0).unwrap_err();
-    let io_err = match err {
-        Error::Io(e) => e,
-        other => panic!("expected Io, got {other:?}"),
-    };
-    let source = std::error::Error::source(io_err.get_ref().expect("a custom error"))
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .expect("the OS error is the source");
-    assert_eq!(source.raw_os_error(), Some(code as i32), "{source:?}");
+    assert!(matches!(err, Error::Io(_)), "expected Io, got {err:?}");
+    assert_eq!(err.raw_os_error(), Some(code as i32), "{err:?}");
 }
 
 /// A copy of this test binary planted directly in the app directory
