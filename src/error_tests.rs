@@ -226,8 +226,6 @@ fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
     );
 }
 
-/// The walk starts at any variant: the OS code is the first one down its `source()` chain, whichever
-/// variant holds the boxed cause.
 #[skuld::test]
 fn raw_os_error_walks_the_chain_of_any_variant() {
     let code = if cfg!(windows) { 5 } else { 13 };
@@ -327,8 +325,6 @@ fn a_note_on_a_context_error_io_has_the_code_under_both_wrappers() {
     assert_eq!(codes_down(&e), [None, None, Some(code)]);
 }
 
-/// `io_errors` lists every `io::Error` in the chain of any variant, outermost first; a variant with
-/// no cause lists none.
 #[skuld::test]
 fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
     let code = if cfg!(windows) { 5 } else { 13 };

@@ -526,14 +526,14 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
             Unadoptable::Unverified,
             Error::Unassessable {
                 detail: format!("pid {pid}: its unique-id report could not be read ({e}); the child was not adopted"),
-                source: Some(Box::new(Error::Io(e))),
+                source: Some(Error::io_cause(e)),
             },
         ),
         Report::WaitFailed(e) => not(
             Unadoptable::Unverified,
             Error::Unassessable {
                 detail: format!("pid {pid}: the wait for its unique-id report failed ({e}); the child was not adopted"),
-                source: Some(Box::new(Error::Io(e))),
+                source: Some(Error::io_cause(e)),
             },
         ),
         Report::BadTag(tag) => {
@@ -577,7 +577,7 @@ pub(crate) fn refused_error(errno: i32) -> Error {
         detail: format!(
             "the spawned child could not read its own unique id (errno {errno}); it was stopped before exec, so the program did not start"
         ),
-        source: Some(Box::new(Error::Io(io::Error::from_raw_os_error(errno)))),
+        source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
     }
 }
 

@@ -583,7 +583,7 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
         }),
         group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
             detail,
-            source: source.map(|e| Box::new(Error::Io(e))),
+            source: source.map(Error::io_cause),
         }),
     }
 }

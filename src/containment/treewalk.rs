@@ -376,7 +376,7 @@ pub(crate) fn walk_from(
 fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
     KillOutcome::NotAttempted(Error::Unassessable {
         detail,
-        source: source.map(|e| Box::new(Error::Io(e))),
+        source: source.map(Error::io_cause),
     })
 }
 

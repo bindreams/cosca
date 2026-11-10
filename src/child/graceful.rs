@@ -656,9 +656,9 @@ pub(crate) mod fault {
             },
             Forced::UnassessableMechanism => crate::error::Error::Unassessable {
                 detail: "forced listing-mechanism failure (test seam) — group::state's shape".into(),
-                source: Some(Box::new(crate::error::Error::Io(std::io::Error::other(
+                source: Some(crate::error::Error::io_cause(std::io::Error::other(
                     "forced (test seam)",
-                )))),
+                ))),
             },
             Forced::Unsupported => crate::error::Error::Unsupported {
                 op: "terminate_tree".into(),

@@ -74,6 +74,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
                 op: "elevation".into(),
                 platform: std::env::consts::OS,
                 detail: "no elevation backend on this platform".into(),
+                source: None,
             }));
         }
     }
@@ -2390,7 +2391,7 @@ pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCau
         Some(source) => {
             let error = Error::Unassessable {
                 detail: "the spawned child's identity could not be checked against its handle".into(),
-                source: Some(Box::new(Error::Io(source))),
+                source: Some(Error::io_cause(source)),
             };
             let said = error.to_string();
             (error, said)

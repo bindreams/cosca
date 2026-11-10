@@ -133,7 +133,7 @@ fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
             close(handle);
             Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
-                source: Some(Box::new(Error::Io(win32_io_error(e)))),
+                source: Some(Error::io_cause(win32_io_error(e))),
             })
         }
     }
@@ -162,7 +162,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
                     );
                     Err(Error::Unassessable {
                         detail: format!("pid {} could not be opened", id.pid()),
-                        source: Some(Box::new(Error::Io(win32_io_error(e)))),
+                        source: Some(Error::io_cause(win32_io_error(e))),
                     })
                 }
             }

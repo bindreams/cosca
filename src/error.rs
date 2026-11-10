@@ -131,9 +131,9 @@ pub enum RecordErrorKind {
 ///
 /// # The OS code
 ///
-/// The OS code of a failure may sit on an `io::Error` further down the chain, under context cosca
-/// added, and in the `source` of any variant that has one: walk `source()` from the `Error` and
-/// take the first `io::Error` whose `raw_os_error()` is `Some`.
+/// The OS code of a failure may sit on an `io::Error` down the `source()` chain of any variant,
+/// below context cosca added: walk `source()` and take the first `io::Error` whose
+/// `raw_os_error()` is `Some`.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -256,8 +256,8 @@ pub enum Error {
     },
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
-    /// Not "gone": the thread is running. `source` is the OS error that refused it; compare
-    /// [`raw_os_error`](std::io::Error::raw_os_error) down its chain, not the message.
+    /// Not "gone": the thread is running. `source` is the refusal, an [`Error::Io`]; compare its OS
+    /// code (`raw_os_error` down the chain), not the message.
     #[error("pid {pid} names a live thread, not a thread-group leader; {detail}")]
     NotThreadGroupLeader {
         pid: u32,
@@ -489,6 +489,11 @@ impl Error {
                 .into(),
             source: None,
         }
+    }
+
+    /// `e` as the `source` of an error it caused.
+    pub(crate) fn io_cause(e: std::io::Error) -> Box<Error> {
+        Box::new(Error::Io(e))
     }
 
     /// What a failed spawn did with its child, for an error that says the program may have started

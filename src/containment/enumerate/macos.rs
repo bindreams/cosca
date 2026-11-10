@@ -384,7 +384,7 @@ pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPi
         log::warn!("enumerate::process_parents: {detail}");
         Error::Unassessable {
             detail,
-            source: Some(Box::new(Error::Io(e))),
+            source: Some(Error::io_cause(e)),
         }
     })?;
     let (edges, denied, sample) = join_edges(&raw).map_err(|e| {
@@ -392,7 +392,7 @@ pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPi
         log::warn!("enumerate::process_parents: {detail}");
         Error::Unassessable {
             detail,
-            source: Some(Box::new(Error::Io(e))),
+            source: Some(Error::io_cause(e)),
         }
     })?;
     if denied > 0 {

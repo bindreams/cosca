@@ -61,7 +61,6 @@ fn open_pid_of_a_live_non_leader_tid_is_an_error() {
     match cosca::Process::open_pid(tid) {
         Err(error @ cosca::error::Error::NotThreadGroupLeader { pid, .. }) => {
             assert_eq!(pid, tid);
-            // The OS code is the first one down the `source()` chain.
             let code = std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| e.source())
                 .filter_map(|e| e.downcast_ref::<std::io::Error>())
                 .find_map(std::io::Error::raw_os_error);

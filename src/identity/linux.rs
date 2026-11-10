@@ -508,7 +508,7 @@ pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
                 call.name(),
                 call.errno()
             ),
-            source: Some(Box::new(Error::Io(std::io::Error::from(call.errno())))),
+            source: Some(Error::io_cause(std::io::Error::from(call.errno()))),
         },
     }
 }
@@ -520,7 +520,7 @@ fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>
     }
     Error::Unassessable {
         detail,
-        source: source.map(|e| Box::new(Error::Io(e))),
+        source: source.map(Error::io_cause),
     }
 }
 
