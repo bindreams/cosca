@@ -282,15 +282,6 @@ fn a_candidate_is_accepted_when_fully_qualified() {
     }
 }
 
-/// The raw OS error [`crate::error::io_context`] wrapped: it keeps the original error as `source()`
-/// so the code survives, and several codes share one [`std::io::ErrorKind`].
-#[cfg(unix)]
-fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
-    std::error::Error::source(e)
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .and_then(std::io::Error::raw_os_error)
-}
-
 /// Joins two directories into the `PATH` value [`search_tool`]'s `windows: true` parses. Not
 /// `std::env::join_paths`, which uses the host's `:`. Each entry is quoted, which
 /// [`split_path_var_windows`] copies through literally, so a `;` in an ambient `TMPDIR` cannot split
@@ -480,7 +471,7 @@ fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
     let (_root, _open, path) = loop_then_open();
     match search_tool(&path, true) {
-        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::ELOOP), "{e}"),
+        Err(e @ Error::Io(_)) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
@@ -505,7 +496,7 @@ fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
     }
     let (_root, _locked, _open, path) = locked_then_open();
     match search_tool(&path, true) {
-        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
+        Err(e @ Error::Io(_)) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }

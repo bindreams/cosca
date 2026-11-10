@@ -157,16 +157,11 @@ fn a_refused_inode_read_is_io_not_unsupported() {
             .on_pidfd_open(PID, Ok(fd))
             .on_pidfs_ino(PID, Err(errno));
         let result = open_verified_error_with(&kernel, id(100));
-        let Err(Error::Io(e)) = &result else {
+        let Err(e @ Error::Io(_)) = &result else {
             panic!("{errno}: {result:?}");
         };
-        let raw = e
-            .get_ref()
-            .and_then(|context| context.source())
-            .and_then(|source| source.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::raw_os_error);
         assert!(e.to_string().starts_with("pidfs_ino: "), "{errno}: {e}");
-        assert_eq!(raw, Some(errno.raw_os_error()), "{errno}");
+        assert_eq!(e.raw_os_error(), Some(errno.raw_os_error()), "{errno}");
     }
 }
 

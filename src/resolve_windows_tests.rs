@@ -86,16 +86,6 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
     })
 }
 
-/// Reads the raw OS error [`crate::error::io_context`] wrapped: it keeps the original
-/// [`std::io::Error`] as `source()` precisely so the code survives being wrapped (several codes
-/// share one [`std::io::ErrorKind`]), and this is what pins the exact code rather than the
-/// coarser kind.
-fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
-    std::error::Error::source(e)
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .and_then(std::io::Error::raw_os_error)
-}
-
 /// [`OpenProcessToken`] wrapped to return the handle by value instead of through an out-param,
 /// so its caller can hand the result straight to [`Owned::new`] without an intermediate
 /// `HANDLE::default()` binding of its own.
@@ -590,9 +580,11 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
     let fixture = locked_then_open();
 
     match search_tool(&fixture.path, true) {
-        Err(Error::Io(e)) => {
-            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
-            assert_eq!(wrapped_raw_os_error(&e), Some(5), "{e}");
+        Err(e @ Error::Io(_)) => {
+            // The first `io::Error` is `Error::Io`'s own: its kind is the error's kind.
+            let kind = e.io_errors().next().map(std::io::Error::kind);
+            assert_eq!(kind, Some(std::io::ErrorKind::PermissionDenied), "{e}");
+            assert_eq!(e.raw_os_error(), Some(5), "{e}");
         }
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
