@@ -95,16 +95,11 @@ fn open_pid_of_a_pid_whose_pidfd_call_failed_is_the_opens_error() {
         .on_pidfd_open(PID, Ok(stand_in.into()))
         .on_pidfs_ino(PID, Err(Errno::BADF));
     let result = Process::open_pid_with(&unreadable, PID);
-    let Err(Error::Io(e)) = &result else {
+    let Err(e @ Error::Io(_)) = &result else {
         panic!("a failed inode read: expected Io, got {result:?}");
     };
     assert!(e.to_string().starts_with("pidfs_ino: "), "{e}");
-    let raw = e
-        .get_ref()
-        .and_then(std::error::Error::source)
-        .and_then(|source| source.downcast_ref::<std::io::Error>())
-        .and_then(std::io::Error::raw_os_error);
-    assert_eq!(raw, Some(Errno::BADF.raw_os_error()));
+    assert_eq!(e.raw_os_error(), Some(Errno::BADF.raw_os_error()));
 }
 
 #[cfg(windows)]
