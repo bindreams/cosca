@@ -771,7 +771,7 @@ fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(c
 // A failed exec =====
 
 /// A program no `PATH` holds fails the spawn before it could start: the error says so and carries
-/// the OS's own. #964.
+/// the OS's own.
 #[skuld::test]
 fn a_spawn_of_a_missing_program_reports_that_nothing_started() {
     let mut cmd = common::command(common::Console::Hidden);
@@ -786,7 +786,7 @@ fn a_spawn_of_a_missing_program_reports_that_nothing_started() {
     assert_eq!(io_err.raw_os_error(), Some(libc::ENOENT), "{io_err:?}");
 }
 
-/// A file without the execute bit fails the spawn before it could start, with `EACCES`. #964.
+/// A file without the execute bit fails the spawn before it could start, with `EACCES`.
 #[cfg(unix)]
 #[skuld::test]
 fn a_spawn_of_a_non_executable_file_reports_that_nothing_started() {
