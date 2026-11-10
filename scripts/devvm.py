@@ -36,16 +36,6 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-# Sibling-module import, working whether this script runs directly as `__main__`
-# (`uv run scripts/devvm.py ...` / `./scripts/devvm.py ...` puts scripts/ itself on sys.path
-# automatically) or is loaded as `scripts.devvm` (devvm_test.py's `python -m unittest
-# scripts.devvm_test` puts REPO_ROOT on sys.path instead, not scripts/ — scripts/ has no
-# __init__.py and is a namespace package). Without this, the second mode's bare `import
-# devvm_common` would fail with ModuleNotFoundError.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-
 from devvm_common import (  # noqa: E402
     REPO_ROOT,
     STATE_DIR,

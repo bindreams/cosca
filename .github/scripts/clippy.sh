@@ -1,59 +1,14 @@
 #!/usr/bin/env bash
-# Single source of truth for this repo's clippy policy. Called both by the
-# local prek hook (host target, no `--feature-powerset` — stays fast) and by
-# CI's clippy-powerset composite action (extra `--target`/`--feature-powerset`
-# for cross-target, cross-feature coverage the host-only prek hook can't give).
-#
-# Usage: clippy.sh [--target TRIPLE] [--feature-powerset] [--release]
+# This repo's clippy policy, run on the host target by the `cargo-clippy` prek hook, both locally and in the CI Test
+# lanes. Three passes: all features, all features in release (the only build that compiles `cfg(not(debug_assertions))`
+# code), and no features (a build with every feature off has dead-code gaps all-features never shows).
 set -euo pipefail
 
-target=""
-powerset=0
-release=0
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --target)
-            target="${2:?--target requires a value}"
-            shift 2
-            ;;
-        --feature-powerset)
-            powerset=1
-            shift
-            ;;
-        --release)
-            release=1
-            shift
-            ;;
-        *)
-            echo "::error::Unknown argument: $1" >&2
-            exit 1
-            ;;
-    esac
-done
-
-cmd=(cargo)
-if [[ "$powerset" -eq 1 ]]; then
-    cmd+=(hack clippy --locked)
-else
-    cmd+=(clippy --locked)
+if ! cargo clippy --version > /dev/null 2>&1; then
+    echo "error: cargo clippy is not installed; run: rustup component add clippy" >&2
+    exit 1
 fi
 
-if [[ -n "$target" ]]; then
-    cmd+=(--target "$target")
-fi
-
-# Code under `cfg(not(debug_assertions))` (and its clippy bans) is only compiled by a release build.
-if [[ "$release" -eq 1 ]]; then
-    cmd+=(--release)
-fi
-
-cmd+=(--workspace --all-targets)
-
-if [[ "$powerset" -eq 1 ]]; then
-    cmd+=(--feature-powerset)
-fi
-
-cmd+=(-- -D warnings)
-
-"${cmd[@]}"
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features --release -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings

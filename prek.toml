@@ -5,7 +5,9 @@
 # `.tmp/` is agent scratch — not source to be linted/reformatted, same rationale as
 # `target/`. Both are gitignored; excluding them too guards against a stray force-add.
 exclude = "^(target|\\.tmp)/"
-default_install_hook_types = ["pre-commit", "commit-msg"]
+default_install_hook_types = ["pre-commit", "pre-push"]
+# A hook runs at commit unless it names its own stages (`cargo-clippy` runs at push).
+default_stages = ["pre-commit"]
 
 # Local hooks ==========================================================================================================
 
@@ -20,23 +22,59 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+# Platform-dependent hooks check the host target: the Lint job SKIPs them; every Test lane runs `cargo-doc` after its
+# tests, and the `matrix.lint` lanes run `cargo-clippy` last (ci.yaml). A new one goes in both places.
 [[repos.hooks]]
 id = "cargo-clippy"
 name = "cargo clippy"
-# .github/scripts/clippy.sh is the single source of truth for this repo's
-# clippy policy; CI's clippy-powerset composite action calls the same script
-# with extra --target/--feature-powerset flags. Called with neither here, so
-# this hook stays a fast, host-only check.
+# Three passes (see the script): a pre-push hook, not a pre-commit one. `prek run` selects it only with
+# `--hook-stage pre-push`.
 entry = "bash .github/scripts/clippy.sh"
 language = "system"
-types = ["rust"]
+stages = ["pre-push"]
+files = '\.rs$|(^|/)(Cargo\.(toml|lock)|clippy\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-doc"
+name = "cargo doc"
+entry = "bash .github/scripts/doc.sh"
+language = "system"
+files = '\.rs$|(^|/)Cargo\.(toml|lock)$'
+pass_filenames = false
+
+# Platform-independent hooks: the Lint job runs them. =====================================================================
+
+[[repos.hooks]]
+id = "musl-check"
+name = "library builds for musl"
+entry = "bash .github/scripts/musl-check.sh"
+language = "system"
+files = '\.rs$|(^|/)Cargo\.(toml|lock)$'
+pass_filenames = false
+
+# The two standalone tool crates, which the root workspace's cargo-fmt and cargo-clippy do not reach.
+[[repos.hooks]]
+id = "tools-fmt"
+name = "tools fmt"
+entry = "bash .github/scripts/tools.sh fmt"
+language = "system"
+files = '^(\.github/libtest-lint|scripts/skuld-rewrite)/.*(\.rs|Cargo\.(toml|lock))$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "tools-clippy"
+name = "tools clippy"
+entry = "bash .github/scripts/tools.sh clippy"
+language = "system"
+files = '^(\.github/libtest-lint|scripts/skuld-rewrite)/.*(\.rs|Cargo\.(toml|lock)|clippy\.toml)$'
 pass_filenames = false
 
 [[repos.hooks]]
 id = "libtest-lint"
 name = "libtest lint"
-# Every target runs on skuld, so a libtest `#[test]` never runs. Parses all tracked sources and manifests of the
-# workspace once; see .github/libtest-lint/src/main.rs for what it covers.
+# Every target runs on skuld, so a libtest `#[test]` never runs. See .github/libtest-lint/src/main.rs for what it
+# covers.
 entry = "cargo run --quiet --release --locked --manifest-path .github/libtest-lint/Cargo.toml"
 language = "system"
 # The lint's inputs: sources, manifests and itself.

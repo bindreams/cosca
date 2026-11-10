@@ -169,20 +169,6 @@
     },
     {
       "customType": "regex",
-      "description": "cargo-hack installed by taiki-e/install-action",
-      "managerFilePatterns": [
-        "/^\\.github/.+\\.ya?ml$/"
-      ],
-      "matchStrings": [
-        "tool: cargo-hack@(?<currentValue>\\S+)"
-      ],
-      "depNameTemplate": "cargo-hack",
-      "datasourceTemplate": "crate",
-      "depTypeTemplate": "ci-tool",
-      "versioningTemplate": "semver"
-    },
-    {
-      "customType": "regex",
       "description": "sccache installed by mozilla-actions/sccache-action",
       "managerFilePatterns": [
         "/^\\.github/.+\\.ya?ml$/"

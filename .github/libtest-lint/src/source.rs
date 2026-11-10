@@ -1,10 +1,10 @@
-//! Rules 1-3: libtest test attributes in parsed source, in every form the grammar has.
+//! Libtest test attributes in parsed source, in every form the grammar has.
 
 use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
-use syn::{Attribute, ItemExternCrate, ItemUse, Macro, Meta, UseTree};
+use syn::{Attribute, ItemExternCrate, ItemFn, ItemMacro, ItemMod, ItemUse, Macro, Meta, UseTree};
 
 pub struct Finding {
     pub line: usize,
@@ -25,6 +25,7 @@ pub fn check_file(text: &str, fragment: bool) -> Result<Vec<Finding>, syn::Error
             };
             let mut lint = Lint {
                 aliases: HashMap::new(),
+                defined: HashSet::new(),
                 qualified_only: true,
                 findings: Vec::new(),
             };
@@ -36,6 +37,7 @@ pub fn check_file(text: &str, fragment: bool) -> Result<Vec<Finding>, syn::Error
     collect.visit_file(&file);
     let mut lint = Lint {
         aliases: collect.names,
+        defined: collect.defined,
         qualified_only: fragment,
         findings: Vec::new(),
     };
@@ -112,10 +114,12 @@ fn is_libtest_attribute(path: &[String]) -> bool {
 
 // Aliases -----------------------------------------------------------------------------------------------------------
 
-/// Every name a `use` or `extern crate` of the file binds, with the path it stands for.
+/// Every name a `use` or `extern crate` of the file binds, with the path it stands for, and the names of the macros,
+/// functions and modules the file defines.
 #[derive(Default)]
 struct Aliases {
     names: HashMap<String, Vec<String>>,
+    defined: HashSet<String>,
 }
 
 impl Aliases {
@@ -157,12 +161,31 @@ impl<'ast> Visit<'ast> for Aliases {
         let name = item.rename.as_ref().map_or(&item.ident, |(_, n)| n);
         self.bind(name.to_string(), vec![item.ident.to_string()]);
     }
+
+    fn visit_item_macro(&mut self, item: &'ast ItemMacro) {
+        if let Some(ident) = &item.ident {
+            self.defined.insert(ident.to_string());
+        }
+        visit::visit_item_macro(self, item);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+        self.defined.insert(item.sig.ident.to_string());
+        visit::visit_item_fn(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast ItemMod) {
+        self.defined.insert(item.ident.to_string());
+        visit::visit_item_mod(self, item);
+    }
 }
 
 // Lint --------------------------------------------------------------------------------------------------------------
 
 struct Lint {
     aliases: HashMap<String, Vec<String>>,
+    /// Macros, functions and modules the file defines: a one-segment `use` of one is that item, not libtest's.
+    defined: HashSet<String>,
     /// Set for a file read as tokens: its `use`s are not here, so a bare `test` may be skuld's and is not flagged.
     qualified_only: bool,
     findings: Vec<Finding>,
@@ -230,7 +253,7 @@ impl Lint {
         }
     }
 
-    /// Rule 2: `#[...]` written in tokens `syn` does not parse as attributes. `site` says where they came from.
+    /// `#[...]` written in tokens `syn` does not parse as attributes. `site` says where they came from.
     fn scan(&mut self, tokens: TokenStream, site: &str) {
         let tokens: Vec<TokenTree> = tokens.into_iter().collect();
         for (i, tree) in tokens.iter().enumerate() {
@@ -326,6 +349,9 @@ impl<'ast> Visit<'ast> for Lint {
         let mut found = Vec::new();
         collect_leaves(&item.tree, &mut Vec::new(), &mut found);
         for (path, span) in found {
+            if path.len() == 1 && self.defined.contains(&path[0]) {
+                continue;
+            }
             if self.is_libtest(&path) {
                 self.report(
                     span,

@@ -7,11 +7,12 @@
 //! premise: each member's manifest has no target that runs on libtest.
 //!
 //! Exit 0: clean. 1: a libtest attribute, an unparsable file or a path that is not UTF-8. 2: a manifest target on
-//! libtest, or the tool could not run. Not covered: an attribute a third-party proc macro emits, one assembled with
-//! `concat!` or from a `$m:meta`, or an alias bound in one file (`pub use tokio as tk;`) and used in another. A syntax
-//! `syn` cannot parse yet is reported as an unparsable file until `syn` is bumped. A file that another scanned file
-//! names with `include!("<literal>")`, or that is not a whole Rust file, is read without the `use`s of its includer, so
-//! a bare `#[test]` there may be skuld's: only `tokio::test` and the `core`/`std` prelude paths are flagged in it.
+//! libtest, or the tool could not run. Not covered, by decision (it guards against accidents, not malice): an attribute
+//! a third-party proc macro emits, one built with `concat!` or from a `$m:meta`, and an alias bound in one file
+//! (`pub use tokio as tk;`) and used in another. A syntax `syn` cannot parse yet is reported as an unparsable file
+//! until `syn` is bumped. A file that another scanned file names with `include!("<literal>")`, or that is not a whole
+//! Rust file, is read without the `use`s of its includer, so a bare `#[test]` there may be skuld's: only `tokio::test`
+//! and the `core`/`std` prelude paths are flagged in it.
 //!
 //! Run from inside the workspace; takes no arguments.
 

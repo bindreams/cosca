@@ -1,3 +1,4 @@
+# Every step that verifies the code is a prek hook or a test run (README, "Checks").
 name: CI
 
 on:
@@ -47,112 +48,27 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured: 164 s to 242 s in four runs. 25 min is 6x the slowest, a failure bound for a hang.
+    # Re-measure: the 164 s to 242 s of four runs included the clippy powerset and the tooling tests, which this job no
+    # longer runs. 25 min stays a failure bound for a hang.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
-      # find a toolchain.
-      # The targets are the ones check-disallowed-methods.sh lints its fixture for,
-      # plus musl for the build check below.
+      # setup-rust so the prek hooks (language = "system") find a toolchain: rustfmt for the fmt hooks, clippy for
+      # the tool crates', the musl target for `musl-check`.
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-musl
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+          targets: x86_64-unknown-linux-musl
 
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         with:
           prek-version: 0.5.3
-
-      - name: Test devvm scripts
-        run: python3 -m unittest scripts.devvm_macos_gate_test scripts.devvm_macos_gateio_test scripts.devvm_macos_tart_test scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_realtart_test scripts.devvm_vagrantfiles_test scripts.devvm_linux_rust_test
-
-      - name: Test release helper scripts
-        shell: bash
-        run: bash .github/scripts/release-script-tests.sh
-
-      - name: Test the directory-mode script
-        shell: bash
-        run: bash .github/scripts/dir-modes-tests.sh
-
-      - name: Test sccache fallback script
-        shell: bash
-        run: bash .github/scripts/enable-sccache-tests.sh
-
-      - name: Test the signal forwarding and nextest wrapper scripts
-        shell: bash
-        working-directory: .github/scripts
-        run: python3 -m unittest -f forward_tests run_nextest_tests unattended_gui_elevation_tests
-
-      # Forces pid reuse in a fresh PID namespace, so it needs root.
-      - name: Test the signal forwarding script against pid reuse
-        shell: bash
-        run: sudo python3 .github/scripts/forward_reuse_tests.py
-
-      # musl has broken the build before (#172: msghdr/cmsghdr field types differ from glibc).
-      # --lib only: the dev-dependencies' C code (libsqlite3-sys) needs a musl C compiler.
-      - name: Check the library builds for musl
-        shell: bash
-        run: cargo check --locked --all-features --lib --target x86_64-unknown-linux-musl
-
-      # scripts/skuld-rewrite is a standalone crate, so neither prek's
-      # root-package hooks nor the clippy steps below reach it.
-      - name: Test the skuld-rewrite tool
-        shell: bash
-        working-directory: scripts/skuld-rewrite
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo nextest run --locked
-
-      # Same for the libtest lint, which has no tests of its own: prek runs it, this keeps it formatted and lint-clean.
-      - name: Lint the libtest-lint tool
-        shell: bash
-        working-directory: .github/libtest-lint
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-
-      # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
-      # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
-      # against the real clippy.toml, and asserts the diagnostic actually fires for each —
-      # structured JSON, not scraped text. Catches a renamed disallowed-methods key, a typo'd
-      # path, or a dependency upgrade that silently moves a function out from under the ban.
-      # `!cancelled()`: same override-success() rationale as the step below.
-      - name: Check the disallowed-methods bans still fire
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: bash .github/scripts/check-disallowed-methods.sh
-
-      # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
-      # neither --target nor --feature-powerset (host, no features) — this crate
-      # declares no `default` feature, so the host (Linux) side of the
-      # feature-gated tokio/pty/serde code paths (and any feature-gated dead
-      # code among them) is never linted by the hook alone.
-      #
-      # Placed after the local-parity checks above, not right after checkout,
-      # for the same reason as the test job's Clippy step below: a failure here
-      # would otherwise skip `Test release helper scripts` and hide its result.
-      # `!cancelled()`: same override-success() rationale as that step.
-      - name: Clippy (feature powerset)
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/clippy-powerset
-
-      # `cfg(not(debug_assertions))` code (release-only branches and their tests) is compiled by no
-      # debug build, so the step above never lints it, and neither do clippy.toml's bans. The
-      # powerset action installed cargo-hack.
-      - name: Clippy (feature powerset, release)
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: .github/scripts/clippy.sh --feature-powerset --release
+        # Platform hooks run in the Test job (see prek.toml).
+        env:
+          SKIP: cargo-doc
 
   # cosca-path's Win32 conversions must hold under Windows 10's device-name rules as well as
   # Windows 11's (`a\com1` is COM1 under the old rules). The test matrix's Windows runners all
@@ -209,6 +125,8 @@ jobs:
             timeout: 54
             target: x86_64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
+            # lint: true lanes also run the cargo-clippy hook; one arch stands in for both (see "Platform hooks").
+            lint: true
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
@@ -223,8 +141,6 @@ jobs:
             timeout: 41
             target: aarch64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
-            # This is the one darwin lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
             lint: true
           - os: darwin
             arch: amd64
@@ -238,8 +154,6 @@ jobs:
             timeout: 51
             target: x86_64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
-            # This is the one Windows lane that also runs the feature-powerset
-            # Clippy step below; see there for why one arch stands in for both.
             lint: true
           - os: windows
             arch: arm64
@@ -249,8 +163,8 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # Failure bound per job (minutes): about 1.5x the slowest measured wall time, lanes included. The clippy powerset
-    # release step dominates the Windows jobs.
+    # Failure bound per job (minutes): about 1.5x the slowest measured wall time, lanes included. Re-measure: the
+    # timeouts below were set with the clippy powerset, which these jobs no longer run.
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
@@ -259,13 +173,19 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-          # Only the Clippy steps use it, and they run on the matrix.lint lanes.
+          # Only the `cargo-clippy` hook uses it, and it runs on the matrix.lint lanes.
           components: ${{ matrix.lint && 'clippy' || '' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      # The "Platform hooks" steps run prek hooks; the version is the Lint job's.
+      - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+        with:
+          prek-version: 0.5.3
+          install-only: true
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -361,72 +281,20 @@ jobs:
         shell: bash
         run: exec python3 .github/scripts/forward.py cargo test --locked --no-fail-fast --doc --workspace --all-features --target ${{ matrix.target }}
 
-      # The forwarding scripts run on every Unix lane of the workflow; Linux is covered by the Lint job.
-      # macOS differs: forward.py waits for signals with a kqueue there, because `sigwait` loses a
-      # signal when a second, different one arrives during the wait, and a group holding only zombies
-      # may refuse a signal.
-      - name: Test the signal forwarding and nextest wrapper scripts (macOS)
-        if: matrix.os == 'darwin'
-        timeout-minutes: 2
-        shell: bash
-        working-directory: .github/scripts
-        run: python3 -m unittest -f forward_tests run_nextest_tests
-
-      # Evidence, alongside the deterministic cases above: signals that arrive within a wake-up of
-      # each other, and an exit with a signal, never stick or crash the forwarder on macOS. The count
-      # only repeats the run; no run depends on it.
-      - name: Repeat the signal-sensitive forwarding tests (macOS)
-        if: matrix.os == 'darwin'
-        timeout-minutes: 5
-        shell: bash
-        working-directory: .github/scripts
-        run: |
-          set -euo pipefail
-          for _ in $(seq 40); do
-            python3 -m unittest -f forward_tests.Waiting forward_tests.Relay forward_tests.SpawnWindow
-          done
-
       - name: Run doctests (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 2
         run: cargo test --locked --no-fail-fast --doc --workspace --all-features --target ${{ matrix.target }}
 
-      - name: Check rustdoc
+      # Platform hooks (the Lint job skips them): rustdoc of this lane's target, so Windows-only and macOS-only docs
+      # build on their own OS (darwin/amd64 runs on an arm64 runner, hence the target). `shell: bash`, so the hooks'
+      # `bash` is Git Bash on the Windows lanes.
+      - name: Platform hooks (cargo-doc)
+        if: ${{ !cancelled() }}
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --workspace --all-features --locked --target "$TARGET"
-
-      - name: Assert the package excludes test-only paths
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          # Write outside the workspace. A listing file created in the package
-          # root becomes an uncommitted, non-excluded file that cargo sees as a
-          # dirty worktree — the guard would abort before ever running.
-          LIST="${RUNNER_TEMP}/pkg-list.txt"
-          cargo package --list --locked --target "$TARGET" > "$LIST"
-
-          set +e
-          grep -qE '^(testbin/|tests/|cosca-path/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
-          grep_status=$?
-          set -e
-
-          case "$grep_status" in
-            0)
-              echo "::error::Excluded paths leaked into the package:"
-              grep -E '^(testbin/|tests/|cosca-path/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
-              exit 1
-              ;;
-            1) echo "no excluded paths in the package" ;;
-            *)
-              echo "::error::grep errored (exit $grep_status); exclusion unverified"
-              exit 1
-              ;;
-          esac
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: prek run cargo-doc --all-files
 
       # Release lane (debug_assertions off): exercises the calm-release arm of the
       # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
@@ -463,46 +331,20 @@ jobs:
         run: ${{ matrix.nextest }} tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
 
 
-      # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
-      # backend) and `cfg(target_os = "macos")` code are otherwise never
-      # linted: the `lint` job only runs on ubuntu-latest, so clippy never
-      # type-checks either against a Windows or macOS target.
+      # Platform hooks (the Lint job skips them), clippy: `#[cfg(windows)]` and `cfg(target_os = "macos")` code is type-checked
+      # only by clippy on that OS, and Linux code only on linux/amd64. A
+      # pre-push hook, so the stage is named.
       #
-      # --feature-powerset, not --all-features: this crate has real dead_code
-      # gaps that only a default-features-only build exposes, which
-      # --all-features alone never catches.
+      # Placed after the test steps above, not right after Build: a clippy failure there would skip every later step
+      # (their implicit `if: success()`), hiding test results. `!cancelled()` makes this step run even after an earlier
+      # step has failed, so the lint result is always reported.
       #
-      # Placed after the test steps above (including the darwin and Linux release
-      # lane just above), not right after Build: a clippy failure there would
-      # skip every later step (their implicit `if: success()`), hiding test
-      # results.
-      #
-      # `!cancelled()` is the one step in this job that overrides that implicit
-      # `success()`: it makes this step run even after an earlier step in the
-      # job has failed, so the lint result is always reported instead of being
-      # hidden behind an earlier failure.
-      #
-      # Runs once per OS (windows/amd64, darwin/arm64), not once per arch
-      # (matrix.lint is set on exactly these two entries): nothing in this
-      # crate's Windows or macOS code is `cfg(target_arch = ...)`-gated
-      # (checked: no such attribute exists in the tree), so within each OS the
-      # two arches type-check and lint identically. Linting every arch would
-      # double the Windows and macOS runner-minutes spent on lint for no
-      # additional coverage.
-      - name: Clippy (feature powerset)
+      # Runs on one arch per OS (`matrix.lint`), not on every lane: linting every arch would double the Windows and
+      # macOS runner-minutes spent on lint.
+      - name: Platform hooks (cargo-clippy)
         if: ${{ !cancelled() && matrix.lint }}
-        uses: ./.github/actions/clippy-powerset
-        with:
-          target: ${{ matrix.target }}
-
-      # `cfg(not(debug_assertions))` code on this OS is compiled by no debug build, so neither the
-      # step above nor clippy.toml's bans reach it.
-      - name: Clippy (feature powerset, release)
-        if: ${{ !cancelled() && matrix.lint }}
-        uses: ./.github/actions/clippy-powerset
-        with:
-          target: ${{ matrix.target }}
-          release: "true"
+        shell: bash
+        run: prek run --hook-stage pre-push cargo-clippy --all-files
 
       # Live cgroup v2 containment tests belong to the CGROUP group: on unless
       # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need

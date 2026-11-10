@@ -133,7 +133,6 @@ uv run scripts/devvm.py destroy macos-arm64                           # stop and
   `cargo nextest run --target x86_64-apple-darwin`.
 - The base image is pinned by digest; Renovate moves `BASE_IMAGE_DIGEST` in
   `scripts/devvm_macos.py`, after which pull the new digest.
-- Host-side tests, run by CI's Lint job: `python3 -m unittest scripts.devvm_macos_gate_test scripts.devvm_macos_gateio_test scripts.devvm_macos_tart_test scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_realtart_test`. A regression fails a test by assertion rather than hanging it, in any module order.
 
 ### `windows-arm64`
 

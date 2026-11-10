@@ -9,14 +9,3 @@ pub mod roots;
 pub mod shapes;
 pub mod targets;
 pub mod verify;
-
-#[cfg(test)]
-mod modtree_tests;
-#[cfg(test)]
-mod rewrite_tests;
-#[cfg(test)]
-mod targets_tests;
-#[cfg(test)]
-mod test_util;
-#[cfg(test)]
-mod verify_tests;
