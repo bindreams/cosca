@@ -276,7 +276,10 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                 // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
                 // not a contract violation - `debug`, like every other per-pid probe.
                 Some(libc::EPERM) | Some(libc::EACCES) => {
-                    log::debug!("sysctl(KERN_PROC selector {selector}, {pid}) refused: {e}");
+                    log::debug!(
+                        "sysctl(KERN_PROC selector {selector}, {pid}) refused: {report}",
+                        report = crate::error::Report(&e)
+                    );
                     Resolved::Unknown
                 }
                 // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
@@ -285,7 +288,10 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                 // is ever reached, and the compile-time size assert cannot fire because the
                 // Rust definition is what stayed still. Keep it loud.
                 _ => {
-                    super::contract_violation(format_args!("sysctl(KERN_PROC selector {selector}, {pid}) failed: {e}"));
+                    super::contract_violation(format_args!(
+                        "sysctl(KERN_PROC selector {selector}, {pid}) failed: {report}",
+                        report = crate::error::Report(&e)
+                    ));
                     Resolved::Unknown
                 }
             };

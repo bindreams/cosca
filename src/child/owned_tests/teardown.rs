@@ -497,7 +497,7 @@ fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_at_debug() {
         said_of(&torn),
         Some((
             log::Level::Debug,
-            format!("child 4242 could not be terminated ({refusal}): reaped it")
+            format!("child 4242 could not be terminated ({refusal}: {refusal}): reaped it")
         ))
     );
     assert_eq!(fake.looks(), 1);
@@ -541,7 +541,7 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_at_debug() 
         said_of(&torn),
         Some((
             log::Level::Debug,
-            format!("child 4242 could not be terminated ({refusal}): reaped by someone else")
+            format!("child 4242 could not be terminated ({refusal}: {refusal}): reaped by someone else")
         ))
     );
     assert_eq!(fake.looks(), 1);
@@ -565,7 +565,7 @@ fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_returns_th
         warn_of(&torn),
         Some(
             format!(
-                "child 4242 could not be terminated ({refusal}): not ours to reap (launchd holds its zombie, because \
+                "child 4242 could not be terminated ({refusal}: {refusal}): not ours to reap (launchd holds its zombie, because \
                  its tracer died)"
             )
             .as_str()

@@ -83,7 +83,10 @@ fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::C
     let exited = |when: &str| match crate::os_process::poll::is_readable(pidfd) {
         Ok(exited) => Some(exited),
         Err(e) => {
-            log::debug!("cgroup leaf: whether pid {pid} had exited {when} its state was read is unknown: {e}");
+            log::debug!(
+                "cgroup leaf: whether pid {pid} had exited {when} its state was read is unknown: {report}",
+                report = crate::error::Report(&e)
+            );
             None
         }
     };
@@ -103,7 +106,10 @@ fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::C
         }
         Ok(state) => Some(state),
         Err(why) => {
-            log::debug!("cgroup leaf: pid {pid}'s state is unknown: {why}");
+            log::debug!(
+                "cgroup leaf: pid {pid}'s state is unknown: {report}",
+                report = crate::error::Report(&why)
+            );
             None
         }
     }
@@ -128,6 +134,17 @@ impl std::fmt::Display for StateUnknown {
             Self::View(why) => write!(f, "the /proc view cannot be relied on: {why}"),
             Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
             Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for StateUnknown {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::View(why) => Some(why),
+            Self::Unreadable(e) => Some(e),
+            Self::Unparsable(_) => None,
         }
     }
 }
@@ -441,8 +458,9 @@ impl CgroupLeaf {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(
-                    "cgroup v2: {}'s place before its leaf's removal cannot be read ({e})",
-                    crate::elevation::front::front_named(Some(pid))
+                    "cgroup v2: {}'s place before its leaf's removal cannot be read ({report})",
+                    crate::elevation::front::front_named(Some(pid)),
+                    report = crate::error::Report(&e)
                 );
                 self.placed.clear();
             }
@@ -748,8 +766,9 @@ impl CgroupLeaf {
             Ok(id) => Some(id),
             Err(e) => {
                 log::debug!(
-                    "cgroup terminate: leaf {}'s cgroup id cannot be read ({e}); its members are placed through /proc",
-                    self.leaf_path.display()
+                    "cgroup terminate: leaf {}'s cgroup id cannot be read ({report}); its members are placed through /proc",
+                    self.leaf_path.display(),
+                    report = crate::error::Report(&e)
                 );
                 None
             }
@@ -816,7 +835,10 @@ impl CgroupLeaf {
             // (`ENOENT` from `/proc`, `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells it apart.
             Err(e) => match member_exited(pidfd.as_fd()) {
                 Ok(true) => {
-                    log::debug!("cgroup terminate: pid {pid} exited before it was placed ({e}); not signalled");
+                    log::debug!(
+                        "cgroup terminate: pid {pid} exited before it was placed ({report}); not signalled",
+                        report = crate::error::Report(&e)
+                    );
                     return Ok(());
                 }
                 Ok(false) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
@@ -1192,14 +1214,20 @@ impl CgroupLeaf {
         if let Err(e) = self.wait_drained_then_warn(warn) {
             warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed {context}; its drain could not be watched ({e})"),
+                format_args!(
+                    "rmdir failed {context}; its drain could not be watched ({})",
+                    crate::error::Report(&e)
+                ),
             );
             return;
         }
         if let Err(e) = self.dir.remove_children() {
             warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
+                format_args!(
+                    "rmdir failed {context}; a child cgroup could not be removed ({})",
+                    crate::error::Report(&e)
+                ),
             );
             return;
         }
@@ -1208,9 +1236,15 @@ impl CgroupLeaf {
             Err(e) if removed_after_drain(&e) => {}
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed ({e}) {context}, after its kill, drain and sweep: {LEFT_BEHIND_CAUSES}"),
+                format_args!(
+                    "rmdir failed ({}) {context}, after its kill, drain and sweep: {LEFT_BEHIND_CAUSES}",
+                    crate::error::Report(&e)
+                ),
             ),
-            Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
+            Err(e) => warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({}) {context}", crate::error::Report(&e)),
+            ),
         }
     }
 
@@ -1223,7 +1257,10 @@ impl CgroupLeaf {
         if let Err(e) = self.dir.remove_children() {
             return warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed {context}; a child cgroup could not be removed ({e})"),
+                format_args!(
+                    "rmdir failed {context}; a child cgroup could not be removed ({})",
+                    crate::error::Report(&e)
+                ),
             );
         }
         match self.rmdir_leaf() {
@@ -1231,9 +1268,15 @@ impl CgroupLeaf {
             Err(e) if removed_after_drain(&e) => {}
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed ({e}) {context}, after its sweep: {LEFT_BEHIND_CAUSES}"),
+                format_args!(
+                    "rmdir failed ({}) {context}, after its sweep: {LEFT_BEHIND_CAUSES}",
+                    crate::error::Report(&e)
+                ),
             ),
-            Err(e) => warn_leaf_left_behind(&self.leaf_path, format_args!("rmdir failed ({e}) {context}")),
+            Err(e) => warn_leaf_left_behind(
+                &self.leaf_path,
+                format_args!("rmdir failed ({}) {context}", crate::error::Report(&e)),
+            ),
         }
     }
 
@@ -1253,22 +1296,29 @@ impl CgroupLeaf {
         if !entered {
             return warn_leaf_left_behind(
                 &self.leaf_path,
-                format_args!("rmdir failed ({first}); cgroup.kill not written: nothing of the child's is in it"),
+                format_args!(
+                    "rmdir failed ({}); cgroup.kill not written: nothing of the child's is in it",
+                    crate::error::Report(first)
+                ),
             );
         }
-        let unread = unread.map_or(String::new(), |e| format!("; its drain could not be read ({e})"));
+        let unread = unread.map_or(String::new(), |e| {
+            format!("; its drain could not be read ({})", crate::error::Report(e))
+        });
         if self.kill.failure().is_some() {
             warn_leaf_left_behind(
                 &self.leaf_path,
                 format_args!(
-                    "rmdir failed ({first}); its cgroup.kill failed, so the tree that opted out of \
-                     Drop's own teardown is still running{unread}"
+                    "rmdir failed ({}); its cgroup.kill failed, so the tree that opted out of \
+                     Drop's own teardown is still running{unread}",
+                    crate::error::Report(first)
                 ),
             );
         } else {
             log::debug!(
-                "cgroup leaf {} is left behind for a tree that opted out of teardown ({first}){unread}",
-                self.leaf_path.display()
+                "cgroup leaf {} is left behind for a tree that opted out of teardown ({}){unread}",
+                self.leaf_path.display(),
+                crate::error::Report(first)
             );
         }
     }
@@ -1285,14 +1335,20 @@ impl CgroupLeaf {
             Ok(removed) if removed > 0 => match self.rmdir_leaf() {
                 Ok(()) => return,
                 Err(e) if removed_after_drain(&e) => return,
-                Err(e) => format!("its child cgroups were removed, but rmdir failed again ({e})"),
+                Err(e) => format!(
+                    "its child cgroups were removed, but rmdir failed again ({})",
+                    crate::error::Report(&e)
+                ),
             },
             Ok(_) => "cgroup.kill not written: nothing of the child's is in it".to_string(),
-            Err(e) => format!("a child cgroup could not be removed ({e})"),
+            Err(e) => format!("a child cgroup could not be removed ({})", crate::error::Report(&e)),
         };
         warn_leaf_left_behind(
             &self.leaf_path,
-            format_args!("rmdir failed ({first}) after its spawn was abandoned; {why}"),
+            format_args!(
+                "rmdir failed ({}) after its spawn was abandoned; {why}",
+                crate::error::Report(&first)
+            ),
         );
     }
 }
@@ -1391,7 +1447,11 @@ pub(crate) fn create_leaf_under(
             if !removed_after_drain(&e) {
                 warn_leaf_left_behind(
                     leaf_path,
-                    format_args!("rmdir failed ({e}) after its creation failed ({err})"),
+                    format_args!(
+                        "rmdir failed ({}) after its creation failed ({})",
+                        crate::error::Report(&e),
+                        crate::error::Report(&err)
+                    ),
                 );
             }
         }

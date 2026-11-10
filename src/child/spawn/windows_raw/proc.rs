@@ -80,7 +80,7 @@ pub(crate) fn create_process(
     // SAFETY: `hThread` is owned and unneeded; close it. This runs under the spawn lock, so a
     // panic here (debug_assert) would poison the lock and cascade to every future spawn — log only.
     if let Err(e) = unsafe { CloseHandle(pi.hThread) } {
-        log::debug!("CloseHandle(hThread): {e:?}");
+        log::debug!("CloseHandle(hThread): {report}", report = crate::error::Report(&e));
     }
     Ok((proc, pi.dwProcessId))
 }

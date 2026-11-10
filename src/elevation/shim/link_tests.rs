@@ -25,6 +25,16 @@ fn connect_error(rig: &Rig) -> std::io::ErrorKind {
         .kind()
 }
 
+/// A log line says an acceptor's errno in the OS's words, not as `Errno(24)`.
+#[skuld::test]
+fn an_acceptor_failure_is_said_in_the_os_words() {
+    assert_eq!(
+        AcceptorFailure::Errno(libc::EMFILE).to_string(),
+        std::io::Error::from_raw_os_error(libc::EMFILE).to_string()
+    );
+    assert_eq!(AcceptorFailure::Panicked.to_string(), "it panicked");
+}
+
 #[skuld::test]
 fn acceptor_answers_without_caller_action() {
     let rig = Rig::new();

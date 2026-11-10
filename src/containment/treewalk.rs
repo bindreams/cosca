@@ -108,7 +108,11 @@ pub(crate) enum KillOutcome {
 #[cfg(unix)]
 pub(crate) fn warn_if_not_attempted(id: ProcessId, signal: Signal, outcome: &KillOutcome) {
     if let KillOutcome::NotAttempted(why) = outcome {
-        log::warn!("treewalk: pid {} was sent no {signal}: {why}", id.pid());
+        log::warn!(
+            "treewalk: pid {} was sent no {signal}: {report}",
+            id.pid(),
+            report = crate::error::Report(why)
+        );
     }
 }
 
@@ -164,7 +168,10 @@ fn cause_text(why: &Error) -> String {
 #[cfg(unix)]
 pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Error)]) {
     for (pid, why) in unassessed {
-        log::warn!("treewalk: pid {pid} dropped from the walk ({})", cause_text(why));
+        log::warn!(
+            "treewalk: pid {pid} dropped from the walk ({report})",
+            report = crate::error::Report(why)
+        );
     }
 }
 

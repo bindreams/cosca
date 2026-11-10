@@ -142,7 +142,7 @@ fn a_uac_handle_whose_access_cannot_be_read_is_refused_for_permission() {
     use crate::os_process::child::{KillRefusal, OsChild as _};
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
 
-    let granted = super::access_of_uac_read(Err::<u32, _>("unreadable"));
+    let granted = super::access_of_uac_read(Err::<u32, _>(std::io::Error::other("unreadable")));
     assert_eq!(granted, PROCESS_SYNCHRONIZE);
     let event = super::cancel::new_cancel_event().expect("create an event handle");
     let p = super::WindowsProcess::for_uac(event, std::process::id(), granted);
@@ -158,7 +158,7 @@ fn a_uac_handle_whose_access_cannot_be_read_is_refused_for_permission() {
 #[should_panic(expected = "holds SYNCHRONIZE")]
 fn a_uac_handle_read_without_synchronize_breaks_the_contract() {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
-    super::access_of_uac_read(Ok::<_, &str>(PROCESS_TERMINATE.0));
+    super::access_of_uac_read(Ok::<_, std::io::Error>(PROCESS_TERMINATE.0));
 }
 
 /// A UAC handle read as holding `SYNCHRONIZE` keeps the access it was read as.
@@ -166,7 +166,7 @@ fn a_uac_handle_read_without_synchronize_breaks_the_contract() {
 fn a_uac_handle_keeps_the_access_it_was_read_as() {
     use windows::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
     let read = PROCESS_SYNCHRONIZE.0 | PROCESS_TERMINATE.0;
-    assert_eq!(super::access_of_uac_read(Ok::<_, &str>(read)).0, read);
+    assert_eq!(super::access_of_uac_read(Ok::<_, std::io::Error>(read)).0, read);
 }
 
 /// A kill of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the

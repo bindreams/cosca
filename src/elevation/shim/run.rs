@@ -81,7 +81,12 @@ impl Shim {
     /// told it is there: a signal then stops the program instead.
     fn catch_signals(&mut self) -> Result<(), Exit> {
         let inherited = Inherited::read();
-        let wake = Wake::new().map_err(|e| self.refuse(codes::NO_ANSWER, &format!("cannot create a pipe: {e}")))?;
+        let wake = Wake::new().map_err(|e| {
+            self.refuse(
+                codes::NO_ANSWER,
+                &format!("cannot create a pipe: {}", crate::error::Report(&e)),
+            )
+        })?;
         signals::install(&inherited, std::os::fd::AsRawFd::as_raw_fd(&wake.tx));
         self.inherited = Some(inherited);
         self.wake = Some(wake);
@@ -146,10 +151,11 @@ impl Shim {
 
     /// Reports a failure before the program could run: `F` to cosca, the stderr line and the seam log.
     fn not_executed(&self, report: NotExecuted, what: &str, e: &std::io::Error) -> Exit {
+        let said = crate::error::Report(e);
         self.log
-            .line(format_args!("refused {}: {what}: {e}", codes::NOT_EXECUTED));
+            .line(format_args!("refused {}: {what}: {said}", codes::NOT_EXECUTED));
         super::stderr::line(format_args!(
-            "{what}: {e}; the program was not started (exit {})",
+            "{what}: {said}; the program was not started (exit {})",
             codes::NOT_EXECUTED
         ));
         self.send(Frame::NotExecuted(report));

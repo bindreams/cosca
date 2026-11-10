@@ -166,6 +166,25 @@ fn placement_unreadable_names_the_io_error() {
     assert!(rendered.contains(&std::io::Error::from_raw_os_error(13).to_string()));
 }
 
+/// The `io::Error` of an unreadable `cgroup.procs` is the error's `source()`, so a report of the
+/// chain keeps the OS error whatever the Display says.
+#[skuld::test]
+fn placement_unreadable_has_the_io_error_as_its_source() {
+    let unreadable = NotPlaced::Unreadable {
+        pid: 4242,
+        path: PathBuf::from("/cg/cgroup.procs"),
+        source: std::io::Error::from_raw_os_error(13),
+        report: NotEntered::WriteFailed(16),
+    };
+    let source = std::error::Error::source(&unreadable).expect("an unreadable placement has a source");
+    assert_eq!(
+        source
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error),
+        Some(13)
+    );
+}
+
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading
 /// CI output needs to tell WHICH step failed from the bare fact that containment degraded.
 #[skuld::test]
@@ -184,6 +203,25 @@ fn degrade_logs_the_reason_at_warn() {
     assert!(
         records.iter().all(|record| record.contains("process group")),
         "the degrade log must say what containment degraded TO: {records:?}"
+    );
+}
+
+/// The warn of an unreadable `cgroup.procs` carries the OS error.
+#[skuld::test]
+fn the_degrade_warn_of_an_unreadable_placement_says_the_os_error() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    log_degrade(&NotPlaced::Unreadable {
+        pid: 4242,
+        path: PathBuf::from("/cg/cosca-unreadable-probe-3d9e/cgroup.procs"),
+        source: std::io::Error::from_raw_os_error(13),
+        report: NotEntered::WriteFailed(16),
+    });
+    let records = crate::log_capture::records_since(mark, "cosca-unreadable-probe-3d9e");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(
+        records[0].contains(&std::io::Error::from_raw_os_error(13).to_string()),
+        "{records:?}"
     );
 }
 

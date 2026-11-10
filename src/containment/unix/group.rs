@@ -181,7 +181,10 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
             // `Child::kill_tree`.
             Ok(crate::identity::pid_stat::PidStat::Skipped(e)) => {
-                log::debug!("containment::unix::group::members: /proc/{pid}/stat unreadable ({e}); excluding it");
+                log::debug!(
+                    "containment::unix::group::members: /proc/{pid}/stat unreadable ({report}); excluding it",
+                    report = crate::error::Report(&e)
+                );
                 continue;
             }
             // Excluding it could clear a live group.
@@ -447,7 +450,10 @@ fn check_or_signal(
             // Neither EPERM nor ESRCH: genuinely anomalous. Not evidence of a refusal, and
             // not evidence the tree came down either — the conservative "we don't know"
             // answer, not a guess in either direction.
-            log::warn!("containment::unix::group: kill({pid}, {signal:?}) answered {e}, neither EPERM nor ESRCH");
+            log::warn!(
+                "containment::unix::group: kill({pid}, {signal:?}) answered {report}, neither EPERM nor ESRCH",
+                report = crate::error::Report(&e)
+            );
             Reached::Unknown
         }
     }
@@ -538,8 +544,9 @@ fn check_or_signal_linux_sigkill(
                 }
                 Err(e) => {
                     log::warn!(
-                        "containment::unix::group: pidfd_send_signal({}, KILL) answered {e}, neither EPERM nor ESRCH",
-                        id.pid()
+                        "containment::unix::group: pidfd_send_signal({}, KILL) answered {report}, neither EPERM nor ESRCH",
+                        id.pid(),
+                        report = crate::error::Report(&e)
                     );
                     Reached::Unknown
                 }
@@ -548,8 +555,9 @@ fn check_or_signal_linux_sigkill(
         Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
                 "containment::unix::group: pid {} is a live thread, not a thread-group leader, so it \
-                 is not signalled: {e}",
-                id.pid()
+                 is not signalled: {report}",
+                id.pid(),
+                report = crate::error::Report(&e)
             );
             Reached::Unknown
         }
@@ -557,8 +565,9 @@ fn check_or_signal_linux_sigkill(
         // no kill(2) fallback resolves. Conservative, not a guess.
         Err(e) => {
             log::warn!(
-                "containment::unix::group: open_verified_error_with for pid {}: {e}",
-                id.pid()
+                "containment::unix::group: open_verified_error_with for pid {}: {report}",
+                id.pid(),
+                report = crate::error::Report(&e)
             );
             Reached::Unknown
         }

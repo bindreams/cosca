@@ -245,7 +245,11 @@ impl Drop for RestrictedChild {
         for (h, what) in [(self.thread, "thread"), (self.handle, "process"), (self.job, "job")] {
             // SAFETY: all three handles are ours and still open.
             if let Err(e) = unsafe { CloseHandle(h) } {
-                log::error!("fixture teardown: CloseHandle({what}) for pid {} failed: {e}", self.pid);
+                log::error!(
+                    "fixture teardown: CloseHandle({what}) for pid {} failed: {report}",
+                    self.pid,
+                    report = crate::error::Report(&e)
+                );
             }
         }
         if let Some(what) = failure {

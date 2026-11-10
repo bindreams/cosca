@@ -200,7 +200,10 @@ impl Pending {
 fn shut(fd: &OwnedFd) {
     // An `AF_UNIX` socketpair end is always connected: `shutdown` has nothing to refuse.
     if let Err(e) = rustix::net::shutdown(fd, Shutdown::Both) {
-        log::warn!("pidfd handshake: shutdown of the channel failed: {e}");
+        log::warn!(
+            "pidfd handshake: shutdown of the channel failed: {report}",
+            report = crate::error::Report(&e)
+        );
         debug_assert!(false, "shutdown of a socketpair end failed: {e}");
     }
 }
@@ -210,7 +213,10 @@ fn shut(fd: &OwnedFd) {
 fn force_eof(parent_end: &OwnedFd) {
     // An `AF_UNIX` socketpair end is always connected: `shutdown` has nothing to refuse.
     if let Err(e) = rustix::net::shutdown(parent_end, Shutdown::Read) {
-        log::warn!("pidfd handshake: shutdown of the parent's end failed: {e}");
+        log::warn!(
+            "pidfd handshake: shutdown of the parent's end failed: {report}",
+            report = crate::error::Report(&e)
+        );
         debug_assert!(false, "shutdown of a socketpair end failed: {e}");
     }
 }
@@ -241,7 +247,10 @@ impl Drop for ShutOnDrop<'_> {
         self.seams.record_parent_end_shut(self.parent_end);
         // An eventfd counter never fills at one write per spawn.
         if let Err(e) = rustix::io::write(self.done, &1u64.to_ne_bytes()) {
-            log::warn!("pidfd handshake: the helper could not say it is done: {e}");
+            log::warn!(
+                "pidfd handshake: the helper could not say it is done: {report}",
+                report = crate::error::Report(&e)
+            );
             debug_assert!(false, "write to the handshake's eventfd failed: {e}");
         }
     }
@@ -414,13 +423,13 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     use crate::wait::exit_only::{peek, Target};
     use crate::wait::{any_ready_now, poll_ready};
 
-    let unwatchable = |what: &str, e: &dyn std::fmt::Display| {
-        let cause = format!("{what}: {e}");
+    let unwatchable = |what: &str, e: &(dyn std::error::Error + 'static)| {
         log::warn!(
-            "{}: the spawned child's exit cannot be watched ({cause}); the wait for its report is ended",
-            super::named(pid)
+            "{}: the spawned child's exit cannot be watched ({what}: {report}); the wait for its report is ended",
+            super::named(pid),
+            report = crate::error::Report(e)
         );
-        Watch::Unwatchable(cause)
+        Watch::Unwatchable(format!("{what}: {e}"))
     };
     // Normally the child reported and execed: the helper is done, and nothing needs watching.
     let mut fds = [PollFd::new(done, PollFlags::IN)];
@@ -779,7 +788,10 @@ fn conclude(
         }
         // Not told to go either: it dies at its hook, if it has not yet, and is left to its reaper.
         (Ok(child), Outcome::Failed(e, None)) => {
-            abandon_unreported(child, &format!("its pidfd could not be used ({e})"));
+            abandon_unreported(
+                child,
+                &format!("its pidfd could not be used ({})", crate::error::Report(&e)),
+            );
             with_child(e, ChildFate::Killed)
         }
         (Ok(child), Outcome::NoReport) => {
@@ -802,7 +814,10 @@ fn conclude(
             let past = match peek(&Target::PidFd(pidfd.as_fd())) {
                 Ok(_) => Past::Clean,
                 Err(e) => {
-                    log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
+                    log::debug!(
+                        "a failed spawn's child cannot be peeked ({report}); taken to be uncollected",
+                        report = crate::error::Report(&e)
+                    );
                     Past::WaitMayFail
                 }
             };

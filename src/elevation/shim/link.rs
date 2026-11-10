@@ -99,7 +99,11 @@ impl ShimLink {
         let fail = |dir: PrivateDir, error: BindError| {
             match sys::unlink_socket(dir.dir_fd(), SOCKET_NAME) {
                 Err(e) if e != Errno::NOENT => {
-                    log::warn!("cannot remove the socket {}: {e}", sock_path.display());
+                    log::warn!(
+                        "cannot remove the socket {}: {report}",
+                        sock_path.display(),
+                        report = crate::error::Report(&e)
+                    );
                 }
                 _ => {}
             }
@@ -284,8 +288,9 @@ impl ShimLink {
         if let Err(e) = self.write_stop() {
             // The stop cannot be delivered, so joining would hang: leak as an unknown origin does.
             log::error!(
-                "cannot stop the acceptor for {}: {e}; leaking its thread handle and the directory",
-                self.shared.sock_path.display()
+                "cannot stop the acceptor for {}: {report}; leaking its thread handle and the directory",
+                self.shared.sock_path.display(),
+                report = crate::error::Report(&e)
             );
             std::mem::forget(self.acceptor.take());
             debug_assert!(false, "writing the stop byte failed: {e}");

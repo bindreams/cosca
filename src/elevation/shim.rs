@@ -67,7 +67,8 @@ fn install(hooks: Option<&'static dyn ShimTestHooks>) {
         Ok(Some(args)) => std::process::exit(run_shim(&args, hooks)),
         Err(e) => {
             stderr::line(format_args!(
-                "{e}; the program was not started (exit {})",
+                "{}; the program was not started (exit {})",
+                crate::error::Report(&e),
                 codes::INVOCATION
             ));
             std::process::exit(codes::INVOCATION);

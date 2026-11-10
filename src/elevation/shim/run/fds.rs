@@ -50,11 +50,12 @@ pub(super) fn replace_stdio(log: &Log) {
     let null = match open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) {
         Ok(null) => null,
         Err(e) => {
+            let report = crate::error::Report(&e);
             log.warn(format_args!(
-                "cannot open /dev/null: {e}; the shim keeps its standard descriptors"
+                "cannot open /dev/null: {report}; the shim keeps its standard descriptors"
             ));
             crate::elevation::shim::stderr::line(format_args!(
-                "cannot open /dev/null: {e}; the shim keeps its standard descriptors"
+                "cannot open /dev/null: {report}; the shim keeps its standard descriptors"
             ));
             return;
         }
@@ -65,7 +66,10 @@ pub(super) fn replace_stdio(log: &Log) {
         ("stderr", rustix::stdio::dup2_stderr(&null)),
     ] {
         if let Err(e) = replaced {
-            log.warn(format_args!("cannot replace {name} with /dev/null: {e}"));
+            log.warn(format_args!(
+                "cannot replace {name} with /dev/null: {}",
+                crate::error::Report(&e)
+            ));
             debug_assert!(false, "dup2 of /dev/null onto {name}: {e}");
         }
     }

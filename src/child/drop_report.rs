@@ -128,7 +128,8 @@ impl<'a> DropReport<'a> {
                 crate::signal::UNPINNED_WHY
             )),
             RootView::Unknown(e) => Some(format!(
-                "RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({e})"
+                "RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({})",
+                crate::error::Report(e)
             )),
             RootView::Reaped | RootView::Trusted => None,
         }

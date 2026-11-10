@@ -126,6 +126,12 @@ impl std::fmt::Display for ViewUnreadable {
     }
 }
 
+impl std::error::Error for ViewUnreadable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| e as _)
+    }
+}
+
 /// A `/proc` directory fd proven to be procfs's root, and the only way to read `/proc`: every
 /// read is an `openat2` beneath it that cannot cross a mount, so nothing mounted over `/proc`
 /// or below it after the check is ever read. Needs `openat2` (Linux 5.6, and not filtered by

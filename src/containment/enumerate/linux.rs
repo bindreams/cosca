@@ -15,7 +15,10 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
     let dir = crate::identity::proc_view_with(kernel).into_dir().map_err(|why| {
         match why.unsupported("listing the process table") {
             Some(unsupported) => {
-                log::warn!("enumerate::process_parents: {unsupported}");
+                log::warn!(
+                    "enumerate::process_parents: {report}",
+                    report = crate::error::Report(&unsupported)
+                );
                 unsupported
             }
             None => unassessable(&why.reason, why.source),
@@ -29,7 +32,10 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
             Ok(PidStat::Read(stat)) => stat,
             // The process exited between the listing and the read, or `hidepid` hides it.
             Ok(PidStat::Skipped(e)) => {
-                log::debug!("enumerate::process_parents: {pid}/stat unreadable ({e}); omitting it");
+                log::debug!(
+                    "enumerate::process_parents: {pid}/stat unreadable ({report}); omitting it",
+                    report = crate::error::Report(&e)
+                );
                 continue;
             }
             Err(unreadable) => return Err(stat_unreadable(unreadable)),
@@ -37,7 +43,11 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
         match ppid_of_stat(pid, &stat) {
             Ok(ppid) => out.push((pid, ppid)),
             Err(e) => {
-                debug_assert!(false, "the kernel printed an unparseable stat: {e}");
+                debug_assert!(
+                    false,
+                    "the kernel printed an unparseable stat: {}",
+                    crate::error::Report(&e)
+                );
                 return Err(e);
             }
         }

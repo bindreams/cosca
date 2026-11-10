@@ -74,7 +74,10 @@ impl Acceptor<'_> {
             if woken && !stop {
                 let mut byte = [0u8];
                 if let Err(e) = rustix::io::read(&wake.reader, &mut byte) {
-                    log::debug!("consuming a stray wake byte: {e}");
+                    log::debug!(
+                        "consuming a stray wake byte: {report}",
+                        report = crate::error::Report(&e)
+                    );
                 }
             }
 
@@ -90,7 +93,7 @@ impl Acceptor<'_> {
                 self.drain();
                 if let Err(failure) = accepted {
                     log::warn!(
-                        "accept on {} failed during teardown ({failure:?}); the backlog may be closed unanswered",
+                        "accept on {} failed during teardown ({failure}); the backlog may be closed unanswered",
                         self.shared.sock_path.display()
                     );
                 }
@@ -112,7 +115,11 @@ impl Acceptor<'_> {
                 Ok(Some(conn)) => self.admit(conn),
                 Ok(None) => return Ok(()),
                 Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::ECONNABORTED)) => {
-                    log::debug!("accept on {} was interrupted: {e}", self.shared.sock_path.display());
+                    log::debug!(
+                        "accept on {} was interrupted: {report}",
+                        self.shared.sock_path.display(),
+                        report = crate::error::Report(&e)
+                    );
                 }
                 Err(e) => return Err(AcceptorFailure::Errno(e.raw_os_error().unwrap_or(libc::EIO))),
             }
@@ -128,7 +135,10 @@ impl Acceptor<'_> {
         };
         match peer {
             Err(e) => {
-                log::debug!("cannot read the credentials of a peer at {path}: {e}");
+                log::debug!(
+                    "cannot read the credentials of a peer at {path}: {report}",
+                    report = crate::error::Report(&e)
+                );
                 self.shared.probe.event(|| LinkEvent::Dropped(DropReason::Unreadable));
             }
             Ok(uid) if uid != self.shared.peer_euid => {

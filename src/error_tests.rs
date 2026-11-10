@@ -1,4 +1,4 @@
-use crate::error::{ChildFate, Error, QuoteError, QuoteErrorKind};
+use crate::error::{chain, ChildFate, Error, QuoteError, QuoteErrorKind, Report};
 use crate::test_child::over_fake::exited_unreaped;
 
 #[skuld::test]
@@ -250,6 +250,34 @@ fn a_note_on_a_context_error_io_has_the_code_under_both_wrappers() {
     assert_eq!(codes_down(&e), [None, None, Some(code)]);
 }
 
+/// Only an `Error::Io` has `io_errors`: another variant's chain may hold an `io::Error`, and it is
+/// not listed.
+#[skuld::test]
+fn io_errors_of_a_variant_other_than_io_is_empty_though_its_chain_holds_one() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || std::io::Error::from_raw_os_error(code);
+    let leader = Error::NotThreadGroupLeader {
+        pid: 1,
+        detail: "d".into(),
+        source: os(),
+    };
+    assert!(
+        chain(&leader).any(|layer| layer.is::<std::io::Error>()),
+        "the chain holds an io::Error"
+    );
+    assert_eq!(codes_down(&leader), []);
+    let member = Error::MemberNotKilled {
+        pid: 1,
+        source: Box::new(Error::Io(os())),
+        note: None,
+    };
+    assert!(
+        chain(&member).any(|layer| layer.is::<std::io::Error>()),
+        "the chain holds an io::Error"
+    );
+    assert_eq!(codes_down(&member), []);
+}
+
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
 /// An I/O error keeps its kind, and its OS code as the note's `source`.
 #[cfg(unix)]
@@ -465,4 +493,58 @@ fn io_error_displays_the_wrapped_message_unchanged() {
 /// The `raw_os_error()` of each of `e`'s [`Error::io_errors`].
 fn codes_down(e: &Error) -> Vec<Option<i32>> {
     e.io_errors().map(std::io::Error::raw_os_error).collect()
+}
+
+/// A test error that says one layer and has a cause.
+#[derive(Debug)]
+struct Layer(&'static str, Option<Box<Layer>>);
+
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Layer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.1.as_deref().map(|l| l as _)
+    }
+}
+
+#[skuld::test]
+fn report_joins_every_layer_with_a_colon() {
+    let e = Layer(
+        "outer",
+        Some(Box::new(Layer("middle", Some(Box::new(Layer("inner", None)))))),
+    );
+    assert_eq!(Report(&e).to_string(), "outer: middle: inner");
+}
+
+/// A layer that says nothing still takes its place: the joins around it stay.
+#[skuld::test]
+fn report_keeps_a_layer_whose_display_is_empty() {
+    let e = Layer("outer", Some(Box::new(Layer("", Some(Box::new(Layer("inner", None)))))));
+    assert_eq!(Report(&e).to_string(), "outer: : inner");
+}
+
+#[skuld::test]
+fn report_of_a_leaf_is_its_display() {
+    let leaf = Error::Containment { detail: "d".into() };
+    assert_eq!(Report(&leaf).to_string(), leaf.to_string());
+}
+
+#[skuld::test]
+fn report_of_an_io_error_with_context_prints_the_context_and_the_os_error() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = std::io::Error::from_raw_os_error(code);
+    let os_text = os.to_string();
+    let e = Error::Io(crate::error::io_context("pidfd_open", os));
+    let report = Report(&e).to_string();
+    assert!(report.starts_with("pidfd_open: "), "{report}");
+    assert!(report.ends_with(&os_text), "{report}");
+    assert_eq!(
+        chain(&e).last().map(ToString::to_string),
+        Some(os_text),
+        "the last layer is the OS error"
+    );
 }

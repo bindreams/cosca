@@ -278,7 +278,11 @@ impl Child {
     /// answer there is not "dead".
     pub fn is_alive(&self) -> crate::identity::Liveness {
         self.proc.liveness().unwrap_or_else(|e| {
-            log::debug!("child {}: its liveness could not be read ({e})", self.pid());
+            log::debug!(
+                "child {}: its liveness could not be read ({report})",
+                self.pid(),
+                report = crate::error::Report(&e)
+            );
             crate::identity::Liveness::Unknown
         })
     }
@@ -426,7 +430,11 @@ impl Child {
             Gate::Exited => {
                 return match self.kill_root() {
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        log::debug!("the kill of exited front pid {} was refused ({e})", self.pid());
+                        log::debug!(
+                            "the kill of exited front pid {} was refused ({report})",
+                            self.pid(),
+                            report = crate::error::Report(&e)
+                        );
                         Ok(crate::signal::Sent::Delivered)
                     }
                     other => other.map_err(Error::Io),

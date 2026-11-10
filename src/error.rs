@@ -421,6 +421,30 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> std::io::Error {
     }
 }
 
+/// `error`, then each of its [`source`](std::error::Error::source)s, outermost first.
+pub(crate) fn chain<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |e| e.source())
+}
+
+/// An error as one line: every layer of its [`chain`], each layer's `Display` joined with `": "`.
+/// The one-line form of std's unstable `std::error::Report`; every cosca log line that prints an
+/// error uses it.
+pub(crate) struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for Report<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, layer) in chain(self.0).enumerate() {
+            if i > 0 {
+                f.write_str(": ")?;
+            }
+            write!(f, "{layer}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct IoContext {
     context: String,
@@ -506,11 +530,14 @@ impl Error {
     /// OS error comes below it.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
-        let start = match self {
-            Error::Io(_) => std::error::Error::source(self),
+        let io_chain = match self {
+            Error::Io(_) => Some(chain(self)),
             _ => None,
         };
-        std::iter::successors(start, |s| s.source()).filter_map(|s| s.downcast_ref::<std::io::Error>())
+        io_chain
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.downcast_ref::<std::io::Error>())
     }
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
@@ -579,7 +606,8 @@ impl Error {
             Error::Quote(e) => {
                 debug_assert!(
                     false,
-                    "a note is added only to a spawn's error, never a quoting one: {e}"
+                    "a note is added only to a spawn's error, never a quoting one: {}",
+                    Report(&e)
                 );
                 Error::Quote(e)
             }

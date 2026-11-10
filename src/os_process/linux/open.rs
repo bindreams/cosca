@@ -260,7 +260,11 @@ fn verify_pidfd_target(
 fn view_unreadable(id: ProcessId, why: ViewUnreadable, pidfd_errno: Option<rustix::io::Errno>) -> Error {
     match why.unsupported(OP_NAME) {
         Some(unsupported) => {
-            log::warn!("wait: pid {} {OP_NAME}: {unsupported}", id.pid());
+            log::warn!(
+                "wait: pid {} {OP_NAME}: {report}",
+                id.pid(),
+                report = crate::error::Report(&unsupported)
+            );
             unsupported
         }
         None => unassessable(id, &why.reason, why.source, pidfd_errno),

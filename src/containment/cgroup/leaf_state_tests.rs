@@ -61,6 +61,40 @@ fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
 }
 
+/// An unreadable stat's `io::Error`, and an unusable view, are `StateUnknown`'s `source()`.
+#[skuld::test]
+fn an_unknown_state_has_what_it_wraps_as_its_source() {
+    let unreadable = StateUnknown::Unreadable(std::io::Error::from_raw_os_error(libc::EIO));
+    let source = std::error::Error::source(&unreadable).expect("an unreadable stat has a source");
+    assert_eq!(
+        source
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::EIO)
+    );
+    let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO));
+    let source = std::error::Error::source(&view).expect("an unusable view has a source");
+    assert!(
+        source.downcast_ref::<crate::identity::ViewUnreadable>().is_some(),
+        "{source}"
+    );
+}
+
+/// The debug line of an unknown state carries the OS error of the view that could not be used.
+#[skuld::test]
+fn the_line_of_an_unknown_state_says_the_os_error() {
+    crate::log_capture::install();
+    let me = std::process::id();
+    let kernel = FakeKernel::over(&HostKernel).open_proc_fails(rustix::io::Errno::MFILE);
+    let mark = crate::log_capture::mark();
+
+    assert_eq!(proc_state(&kernel, handle_of(me, &pidfd_of(me))), None);
+
+    let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {me}'s state is unknown"));
+    let os_error = std::io::Error::from(rustix::io::Errno::MFILE).to_string();
+    assert!(records.iter().any(|(_, line)| line.contains(&os_error)), "{records:?}");
+}
+
 #[skuld::test]
 fn an_unparsable_stat_is_named() {
     assert!(matches!(

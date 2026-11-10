@@ -97,7 +97,11 @@ impl Process {
             Ok(Exit::Exited) => Liveness::Dead,
             Ok(Exit::Running(_)) => Liveness::Alive,
             Err(e) => {
-                log::debug!("is_alive: reading the exit state of pid {} failed: {e}", self.id.pid());
+                log::debug!(
+                    "is_alive: reading the exit state of pid {} failed: {report}",
+                    self.id.pid(),
+                    report = crate::error::Report(&e)
+                );
                 Liveness::Unknown
             }
         }

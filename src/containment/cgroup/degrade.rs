@@ -228,6 +228,15 @@ impl fmt::Display for NotPlaced {
     }
 }
 
+impl std::error::Error for NotPlaced {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NotPlaced::Absent { .. } => None,
+            NotPlaced::Unreadable { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Record that this spawn is not getting the containment it asked for, and why.
 ///
 /// One function for every degrade site so the wording is composed once: whichever step failed,
@@ -242,8 +251,11 @@ impl fmt::Display for NotPlaced {
         reason = "dispatch.rs's only call sites are behind cgroup::try_create_leaf/CgroupLeaf::take_placement, both linux-gated"
     )
 )]
-pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
-    log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
+pub(crate) fn log_degrade(reason: &(dyn std::error::Error + 'static)) {
+    log::warn!(
+        "cgroup v2 containment: degrading to a process group — {report}",
+        report = crate::error::Report(reason)
+    );
 }
 
 #[cfg(test)]

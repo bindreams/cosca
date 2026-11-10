@@ -780,7 +780,12 @@ pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u3
         Sys::Pidfd(pidfd, _) => {
             let pid = ProcDir::open()
                 .and_then(|dir| pidfd_pid_in(&HostKernel, &dir, pidfd))
-                .map_err(|why| log::debug!("record_member_term: the pidfd's pid was not read: {why}"))
+                .map_err(|why| {
+                    log::debug!(
+                        "record_member_term: the pidfd's pid was not read: {report}",
+                        report = crate::error::Report(&why)
+                    );
+                })
                 .ok()
                 .and_then(|target| match target {
                     PidfdTarget::Pid(pid) if pid > 0 => Some(pid),

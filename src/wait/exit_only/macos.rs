@@ -220,7 +220,10 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
             return;
         }
         Err(e) => {
-            log::warn!("second reap of pid {pid}: peek failed ({e}); a zombie may be left");
+            log::warn!(
+                "second reap of pid {pid}: peek failed ({report}); a zombie may be left",
+                report = crate::error::Report(&e)
+            );
             return;
         }
     }
@@ -243,6 +246,9 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
     match consume(pid) {
         Ok(_) => {}
         Err(e) if is_echild(&e) => log::debug!("second reap of pid {pid}: already reaped elsewhere"),
-        Err(e) => log::warn!("second reap of pid {pid} failed ({e}); a zombie may be left"),
+        Err(e) => log::warn!(
+            "second reap of pid {pid} failed ({report}); a zombie may be left",
+            report = crate::error::Report(&e)
+        ),
     }
 }
