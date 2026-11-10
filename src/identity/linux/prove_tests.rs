@@ -75,9 +75,11 @@ fn a_pid_that_cannot_be_opened_for_want_of_descriptors_is_unknown_with_the_errno
         assert_eq!(id(100).is_alive_with(&refusing(errno)), Liveness::Unknown, "{errno}");
         let err = cause.into_error("pid 4242").expect("the errno is the cause");
         assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-        let source = err.source().expect("the errno is the source");
-        let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
-        assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
+        assert_eq!(
+            err.raw_os_error(),
+            Some(errno.raw_os_error()),
+            "the errno is in the chain"
+        );
     }
 }
 
@@ -115,9 +117,11 @@ fn only_a_failed_pidfd_open_is_a_refusal() {
         for (call, cause) in causes {
             let err = cause.into_error("pid 4242").expect("the call is the cause");
             assert!(matches!(err, Error::Unassessable { .. }), "{call} {errno}: {err:?}");
-            let source = err.source().expect("the errno is the source");
-            let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
-            assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()), "{call} {errno}");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(errno.raw_os_error()),
+                "{call} {errno}: the errno is in the chain"
+            );
         }
     }
 }

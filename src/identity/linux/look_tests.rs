@@ -109,9 +109,11 @@ fn assert_unknown_with(errno: Errno, row: &str, (name, got, cause): (&str, Resol
     assert!(row.ends_with(call), "{row}, {name}: the call that failed was {call}");
     let err = cause.into_error("pid 4242").expect("the errno is the cause");
     assert!(matches!(err, Error::Unassessable { .. }), "{row}, {name}: {err:?}");
-    let source = err.source().expect("the errno is the source");
-    let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
-    assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()), "{row}, {name}");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(errno.raw_os_error()),
+        "{row}, {name}: the errno is in the chain"
+    );
 }
 
 /// Mutant: "any open errno is `Gone`", or "is retried with `PIDFD_THREAD`" (the row for it is absent,
