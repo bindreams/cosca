@@ -164,7 +164,7 @@ jobs:
       - name: Dry-run publish
         # On all three hosts: the verification build only compiles for the host,
         # while `ci` builds the repository rather than the tarball, so nothing
-        # else would catch an `exclude` that breaks a non-Linux build.
+        # else would catch an `include` that leaves out a file a non-Linux build needs.
         #
         # Cargo verifies the dependent against the dependency's just-built
         # package, so `--no-verify` is not needed while the dependency is

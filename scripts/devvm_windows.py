@@ -8,9 +8,8 @@ run_vagrant, ...) from devvm_common.py rather than from devvm.py itself, so devv
 import this module without an import cycle.
 
 Most of this module shells out to vagrant/WinRM and is only testable inside a real guest; see
-devvm_test.py's module docstring and scripts/README.md. The handful of functions pulled out as
-pure logic (should_wait_for_session, parse_reboot_required_marker) are the exception and have
-their own unit tests in devvm_test.py.
+scripts/README.md. The handful of functions pulled out as pure logic (should_wait_for_session,
+parse_reboot_required_marker) are the exception.
 """
 
 from __future__ import annotations
@@ -19,16 +18,6 @@ import sys
 import time
 from enum import Enum
 from pathlib import Path
-
-# Sibling-module import, working whether devvm.py (the only importer of this module) is
-# running directly as `__main__` (`uv run scripts/devvm.py ...` puts scripts/ itself on
-# sys.path) or loaded as `scripts.devvm` (devvm_test.py's `python -m unittest
-# scripts.devvm_test` puts REPO_ROOT on sys.path instead, not scripts/). Inserted
-# defensively here too, not just in devvm.py, so this module also imports cleanly if
-# something ever imports it before devvm.py has run its own copy of this same snippet.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
 
 from devvm_common import (  # noqa: E402
     Guest,
@@ -518,8 +507,8 @@ def parse_reboot_required_marker(account_output: str) -> bool | None:
     marker's own claim; None means neither marker string appeared at all — a bug in the
     provisioner script, not something to silently proceed past. If both somehow appear, True
     wins, matching this function's caller checking REBOOT_MARKER_TRUE first. Pulled out as its
-    own pure function, mirroring should_wait_for_session below, so this parsing has a unit test
-    independent of a live guest.
+    own pure function, mirroring should_wait_for_session below, so this parsing is independent of
+    a live guest.
     """
     if REBOOT_MARKER_TRUE in account_output:
         return True
@@ -533,7 +522,7 @@ def should_wait_for_session(*, started_guest: bool, rebooted: bool) -> bool:
     should wait for a real interactive (autologon) session before returning — see that
     function's session-wait comment for the full reasoning (AutoAdminLogon only fires a fresh
     logon at boot; merely "autologon is configured" is not itself such an event). Pulled out as
-    its own pure function so this decision has a unit test independent of a live guest.
+    its own pure function so this decision is independent of a live guest.
     """
     return started_guest or rebooted
 

@@ -6,8 +6,7 @@ cmd_sync, cmd_run) call into devvm_windows.py, and devvm_windows.py needs the sa
 guest/vagrant primitives devvm.py itself uses (Guest, run_vagrant, ...). Both import from
 here instead; devvm_windows.py never imports devvm.py.
 
-Not meaningfully testable or interesting on its own — see devvm_test.py and
-scripts/README.md for what's actually covered and why.
+Not meaningfully testable or interesting on its own — see scripts/README.md.
 """
 
 from __future__ import annotations

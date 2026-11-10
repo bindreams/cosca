@@ -1,4 +1,4 @@
-//! Rule 5: no target of a package runs on libtest, because a libtest attribute only works where one does.
+//! No target of a package runs on libtest, because a libtest attribute only works where one does.
 
 use std::collections::BTreeSet;
 
