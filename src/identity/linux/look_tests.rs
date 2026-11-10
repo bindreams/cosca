@@ -2,7 +2,6 @@
 //! answers. The rows state the answers; a `FakeKernel::new()` panics on a `/proc` read it has no row
 //! for, so a row that must not read `/proc` fails when it does.
 
-use std::error::Error as _;
 use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
