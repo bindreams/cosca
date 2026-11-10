@@ -317,6 +317,7 @@ fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail,
+            ..
         } => {
             assert!(detail.contains("/opt/bin/pkexec"), "{detail}");
             assert!(detail.contains("Too many levels of symbolic links"), "{detail}");

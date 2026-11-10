@@ -128,16 +128,18 @@ pub enum RecordErrorKind {
 ///
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
 /// wildcard arm rather than have each new variant break them.
+///
+/// # The OS code
+///
+/// The OS code of a failure may sit on an `io::Error` further down the chain, under context cosca
+/// added, and in the `source` of any variant that has one: walk `source()` from the `Error` and
+/// take the first `io::Error` whose `raw_os_error()` is `Some`.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("argument parsing failed: {0}")]
     Quote(#[from] QuoteError),
     /// An I/O error.
-    ///
-    /// The OS code may sit on an `io::Error` further down the chain, under context cosca added:
-    /// walk `source()` from this `Error` and take the first `io::Error` whose `raw_os_error()` is
-    /// `Some`.
     #[error("{0}")]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
@@ -177,10 +179,16 @@ pub enum Error {
         op: String,
         platform: &'static str,
         detail: String,
+        #[source]
+        source: Option<Box<Error>>,
     },
     /// A containment mechanism could not be established or torn down.
     #[error("process containment failed: {detail}")]
-    Containment { detail: String },
+    Containment {
+        detail: String,
+        #[source]
+        source: Option<Box<Error>>,
+    },
     /// The calling process has no attached console, so Windows' console-group graceful
     /// signal (`CTRL_BREAK`) cannot be delivered — the caller is a GUI-subsystem binary,
     /// a service, or was spawned detached. Every graceful op that reaches a console group is
@@ -190,7 +198,12 @@ pub enum Error {
     NoConsole { detail: String },
     /// Privilege elevation could not be completed at runtime.
     #[error("elevation failed ({kind}): {detail}")]
-    Elevation { kind: ElevationErrorKind, detail: String },
+    Elevation {
+        kind: ElevationErrorKind,
+        detail: String,
+        #[source]
+        source: Option<Box<Error>>,
+    },
     /// The OS refused to establish whether the target process exists or is running, so the
     /// operation was not performed. Distinct from a failure of the operation: nothing is
     /// known to have gone wrong with the target — the caller was not allowed to look.
@@ -211,7 +224,7 @@ pub enum Error {
     Unassessable {
         detail: String,
         #[source]
-        source: Option<std::io::Error>,
+        source: Option<Box<Error>>,
     },
     /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
     /// it left behind, was not. `source` says why: the member's identity could not be read, at the
@@ -244,13 +257,13 @@ pub enum Error {
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
     /// Not "gone": the thread is running. `source` is the OS error that refused it; compare
-    /// [`raw_os_error`](std::io::Error::raw_os_error), not the message.
+    /// [`raw_os_error`](std::io::Error::raw_os_error) down its chain, not the message.
     #[error("pid {pid} names a live thread, not a thread-group leader; {detail}")]
     NotThreadGroupLeader {
         pid: u32,
         detail: String,
         #[source]
-        source: std::io::Error,
+        source: Box<Error>,
     },
     /// A persisted process identity could not be produced or restored — see
     /// [`RecordErrorKind`] for why. `source` carries the OS error when the failure was a
@@ -260,7 +273,7 @@ pub enum Error {
         kind: RecordErrorKind,
         detail: String,
         #[source]
-        source: Option<std::io::Error>,
+        source: Option<Box<Error>>,
     },
     /// A spawn failed, and the program may have started: retrying it may run it twice. `source` is
     /// what failed, and `fate` is what the failed spawn did with its child.
@@ -474,6 +487,7 @@ impl Error {
             detail: "Windows has no per-process graceful-termination signal; for a contained \
                      child use graceful_shutdown_tree (CTRL_BREAK to the group)"
                 .into(),
+            source: None,
         }
     }
 
@@ -517,33 +531,25 @@ impl Error {
         }
     }
 
-    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it: the
-    /// first of [`io_errors`](Error::io_errors) that has one. `None` for any other variant.
+    /// The OS error code of a failure, for a look whose failure is told apart by it: the first of
+    /// [`io_errors`](Error::io_errors) that has one. `None` when the chain holds none.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
         self.io_errors().find_map(std::io::Error::raw_os_error)
     }
 
-    /// The `io::Error`s down an [`Error::Io`]'s `source()` chain, outermost first; none for any
-    /// other variant. The first is the wrapped `io::Error` itself (its `source()`); under
-    /// [`io_context`] and [`with_note`](Error::with_note) that one is a code-less wrapper and the
-    /// OS error comes below it.
+    /// The `io::Error`s down this error's `source()` chain, outermost first. Under [`io_context`]
+    /// and [`with_note`](Error::with_note) the first of them is a code-less wrapper and the OS error
+    /// comes below it.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
-        let io_chain = match self {
-            Error::Io(_) => Some(chain(self)),
-            _ => None,
-        };
-        io_chain
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.downcast_ref::<std::io::Error>())
+        chain(self).filter_map(|s| s.downcast_ref::<std::io::Error>())
     }
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
     /// original error as the [`source`](std::error::Error::source), so the OS code stays where
-    /// `Error::raw_os_error`, the walk described on [`Error::Io`], finds it. An
+    /// `Error::raw_os_error`, the walk described on [`Error`], finds it. An
     /// [`Error::MemberNotKilled`] takes the note in its own `note`, so its `source` (and the OS error
     /// that is part of its contract) is untouched.
     pub(crate) fn with_note(self, note: &str) -> Error {
@@ -556,16 +562,26 @@ impl Error {
                     source,
                 },
             )),
-            Error::Unsupported { op, platform, detail } => Error::Unsupported {
+            Error::Unsupported {
+                op,
+                platform,
+                detail,
+                source,
+            } => Error::Unsupported {
                 op,
                 platform,
                 detail: append(detail),
+                source,
             },
-            Error::Containment { detail } => Error::Containment { detail: append(detail) },
+            Error::Containment { detail, source } => Error::Containment {
+                detail: append(detail),
+                source,
+            },
             Error::NoConsole { detail } => Error::NoConsole { detail: append(detail) },
-            Error::Elevation { kind, detail } => Error::Elevation {
+            Error::Elevation { kind, detail, source } => Error::Elevation {
                 kind,
                 detail: append(detail),
+                source,
             },
             Error::Unassessable { detail, source } => Error::Unassessable {
                 detail: append(detail),

@@ -328,7 +328,9 @@ fn assert_setter_refused(setter: &str, set: fn(&mut Command, &str), programs: &[
                 c.elevate();
                 let at = format!("elevated={elevated}, {setter}({program:?}), {what}");
                 match super::plan_runas(&c, &win_host(elevated)) {
-                    Err(Error::Unsupported { op, platform, detail }) => {
+                    Err(Error::Unsupported {
+                        op, platform, detail, ..
+                    }) => {
                         assert_eq!(platform, "windows", "{at}");
                         assert_eq!(op, format!("elevation of a program set by {setter}()"), "{at}");
                         assert_eq!(detail, words.setter, "{at}");

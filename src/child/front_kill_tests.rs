@@ -55,6 +55,7 @@ pub(crate) fn assert_refused_by<T: std::fmt::Debug>(r: Result<T, Error>, names: 
         Err(Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
             detail,
+            ..
         }) => assert!(detail.contains(names), "{detail}"),
         other => panic!("expected Unkillable naming {names:?}, got {other:?}"),
     }
@@ -208,6 +209,7 @@ pub(crate) fn failed_password_write_detail<R>(
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn")
@@ -394,6 +396,7 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn")
@@ -434,6 +437,7 @@ fn failed_password_write_fate<R>(
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn")
@@ -471,6 +475,7 @@ fn a_failed_password_write_flags_a_front_and_no_other_child() {
                 Err(Error::Elevation {
                     kind: ElevationErrorKind::AuthFailed,
                     detail: "forced password-write failure".into(),
+                    source: None,
                 }),
             )
             .expect_err("a failed write fails the spawn"),
@@ -525,6 +530,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn")
@@ -560,6 +566,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
         Err(Error::Elevation {
             kind: ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn")

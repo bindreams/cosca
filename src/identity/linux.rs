@@ -508,7 +508,7 @@ pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
                 call.name(),
                 call.errno()
             ),
-            source: Some(std::io::Error::from(call.errno())),
+            source: Some(Box::new(Error::Io(std::io::Error::from(call.errno())))),
         },
     }
 }
@@ -518,7 +518,10 @@ fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>
     if let Some(source) = &source {
         detail.push_str(&format!(": {source}"));
     }
-    Error::Unassessable { detail, source }
+    Error::Unassessable {
+        detail,
+        source: source.map(|e| Box::new(Error::Io(e))),
+    }
 }
 
 pub(super) fn created_at(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Option<SystemTime> {

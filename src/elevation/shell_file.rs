@@ -72,6 +72,7 @@ fn unsupported(program: &Path, detail: &str) -> Error {
         op: format!("elevating {}", program.display()),
         platform: "windows",
         detail: detail.into(),
+        source: None,
     }
 }
 

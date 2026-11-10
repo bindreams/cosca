@@ -233,6 +233,7 @@ impl Host {
                     detail: "Auth::Interactive requires a controlling terminal; use \
                              Auth::NonInteractive / Askpass / Stdin, or run from a TTY"
                         .into(),
+                    source: None,
                 },
             };
         }
@@ -276,6 +277,7 @@ fn reject_backend_unavailable(detail: &str) -> Transition {
         error: Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail: detail.into(),
+            source: None,
         },
     }
 }
@@ -295,6 +297,7 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSe
             op,
             platform,
             detail: detail.into(),
+            source: None,
         })
     };
     // polkit is a Linux stack. Saying "not on PATH" on macOS reads as a
@@ -387,6 +390,7 @@ fn structural_windows(backend: Backend, auth: &Auth) -> Option<Error> {
             op: format!("elevation backend {backend:?}"),
             platform: "windows",
             detail: "POSIX elevation backends do not exist on Windows; use Backend::Auto (ShellExecuteEx runas)".into(),
+            source: None,
         });
     }
     if matches!(auth, Auth::NonInteractive | Auth::Askpass(_) | Auth::Stdin(_)) {
@@ -396,6 +400,7 @@ fn structural_windows(backend: Backend, auth: &Auth) -> Option<Error> {
             detail: "ShellExecuteEx(runas) has no non-interactive, askpass, or stdin-credential mechanism; \
                      use Auth::Interactive or Auth::Gui (both map to the UAC consent gate)"
                 .into(),
+            source: None,
         });
     }
     None

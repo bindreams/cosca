@@ -87,6 +87,9 @@ fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
     else {
         panic!("expected Unassessable with a source, got {result:?}");
     };
+    let Error::Io(source) = &*source else {
+        panic!("expected an Io source, got {source:?}");
+    };
     assert_eq!(
         source.raw_os_error(),
         Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),

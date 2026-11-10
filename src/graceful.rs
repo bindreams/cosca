@@ -106,6 +106,7 @@ pub(crate) fn signal(
                 op: "graceful terminate".into(),
                 platform: std::env::consts::OS,
                 detail: "internal invariant: a console-group mechanism reached signal off Windows".into(),
+                source: None,
             })
         }
         GracefulMechanism::Unknown => Err(crate::error::Error::Unsupported {
@@ -116,6 +117,7 @@ pub(crate) fn signal(
                      event addressed to its pid would reach its leader's whole group instead. \
                      Use kill() for a hard teardown."
                 .into(),
+            source: None,
         }),
         GracefulMechanism::None => Err(crate::error::Error::Unsupported {
             op: "graceful terminate".into(),
@@ -125,6 +127,7 @@ pub(crate) fn signal(
                      creation. Spawn it with contain() to give it one, or use kill() for a hard \
                      teardown."
                 .into(),
+            source: None,
         }),
     }
 }

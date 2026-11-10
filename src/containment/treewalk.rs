@@ -374,7 +374,10 @@ pub(crate) fn walk_from(
 /// message reads after the pid, which the error of a walk that left it behind names.
 #[cfg(any(all(unix, not(target_os = "linux")), windows))]
 fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
-    KillOutcome::NotAttempted(Error::Unassessable { detail, source })
+    KillOutcome::NotAttempted(Error::Unassessable {
+        detail,
+        source: source.map(|e| Box::new(Error::Io(e))),
+    })
 }
 
 /// A kill the OS refused: the error carries the OS error, as `Process::kill` does.
@@ -432,7 +435,7 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
 fn unproved(pid: RawPid, error: Error) -> Error {
     Error::Unassessable {
         detail: format!("pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {error}"),
-        source: Some(std::io::Error::other(error)),
+        source: Some(Box::new(error)),
     }
 }
 
@@ -577,6 +580,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome
                 pid,
                 Error::Containment {
                     detail: "the walk was forced incomplete".into(),
+                    source: None,
                 },
             )
         };

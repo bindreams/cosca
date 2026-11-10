@@ -17,6 +17,7 @@ pub(crate) fn spawn_frozen<T>(
                  before it runs without a gate in the child before exec, which std's blocking spawn \
                  does not allow"
             .into(),
+        source: None,
     })
 }
 

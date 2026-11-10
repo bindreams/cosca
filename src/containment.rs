@@ -189,6 +189,7 @@ pub(crate) fn require_contained(containment: Containment, attached: &Attached) -
                      or a nested member of an ancestor's containment group). Use kill() for a \
                      lone process, or tear down the tree via the outermost .contain()ed handle."
                 .into(),
+            source: None,
         });
     }
     Ok(())
@@ -214,6 +215,7 @@ pub(crate) fn require_drainable(containment: Containment, attached: &Attached) -
                  tree drain — only cgroup v2, a Windows job object, and the macOS fd marker do. \
                  Use kill_tree()/terminate_tree() for teardown, or wait() to watch the root alone."
             ),
+            source: None,
         });
     }
     Ok(())

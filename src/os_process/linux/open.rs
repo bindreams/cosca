@@ -109,7 +109,7 @@ fn open_proved(kernel: &dyn Kernel, id: ProcessId, ino: u64) -> Result<Option<ru
             Ok(false) => Err(OpenFailure::Finished(Error::NotThreadGroupLeader {
                 pid: id.pid(),
                 detail: OPEN_CONSEQUENCE.into(),
-                source: std::io::Error::from(errno),
+                source: Box::new(Error::Io(std::io::Error::from(errno))),
             })),
             Err(PollFailure::Call(errno)) => Err(OpenFailure::Call(FailedCall::poll(errno))),
             // `POLLERR` and `POLLNVAL` carry no errno.
@@ -145,6 +145,7 @@ pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
         detail: format!(
             "cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: pidfd_open answered {errno_name}"
         ),
+        source: None,
     }
 }
 
@@ -196,7 +197,7 @@ fn verify_without_pidfd(
                 Liveness::Alive => Err(Error::NotThreadGroupLeader {
                     pid: id.pid(),
                     detail: OPEN_CONSEQUENCE.into(),
-                    source: std::io::Error::from(errno),
+                    source: Box::new(Error::Io(std::io::Error::from(errno))),
                 }),
                 Liveness::Unknown => Err(unassessable(id, "the OS refused the liveness query", None, Some(errno))),
             },
@@ -291,7 +292,9 @@ fn unassessable(
     log::warn!("wait: {detail}");
     Error::Unassessable {
         detail,
-        source: source.or_else(|| pidfd_errno.map(std::io::Error::from)),
+        source: source
+            .or_else(|| pidfd_errno.map(std::io::Error::from))
+            .map(|e| Box::new(Error::Io(e))),
     }
 }
 

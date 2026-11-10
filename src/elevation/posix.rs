@@ -35,6 +35,7 @@ fn unsupported_env_name(k: &OsStr) -> Error {
         op: "forwarding an env var with an unusual name across elevation".into(),
         platform: "unix",
         detail: format!("env var name {k:?} is not [A-Za-z_][A-Za-z0-9_]*; it cannot be forwarded losslessly"),
+        source: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn refuse_polkit_exe(shim_exe: &OsStr, argv: &[OsString]) -> Result<(), Error> {
         op: "pkexec with this shim executable".into(),
         platform: "unix",
         detail: format!("polkit cannot show {shim_exe:?}: {why}; choose a shim path that is plain ASCII"),
+        source: None,
     };
     let Some(exe) = shim_exe.to_str() else {
         return Err(refuse("it is not valid UTF-8"));
@@ -482,6 +484,7 @@ fn auth_failed(detail: String) -> Error {
     Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,
         detail,
+        source: None,
     }
 }
 
@@ -630,6 +633,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             detail: "pkexec cannot parse a `--` terminator, so a program starting with `-` would be taken \
                      as a pkexec option; use sudo/doas, or a path such as ./-x"
                 .into(),
+            source: None,
         });
     }
     if cmd.fds().keys().any(|f| f.raw() >= 3) {
@@ -637,6 +641,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             op: "fd >= 3 on an elevated POSIX child".into(),
             platform: "unix",
             detail: "sudo/pkexec closefrom drops fds > 2; fd >= 3 needs the (deferred) broker".into(),
+            source: None,
         });
     }
     let ops = cmd.env_ops();
@@ -646,6 +651,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             platform: "unix",
             detail: "the backend builds the elevated base environment; the crate can add but not subtract from it"
                 .into(),
+            source: None,
         });
     }
     if ops.iter().any(|o| matches!(o, EnvOp::Set(..))) && matches!(backend, Backend::Doas | Backend::Pkexec) {
@@ -654,6 +660,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             platform: "unix",
             detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them"
                 .into(),
+            source: None,
         });
     }
     if matches!(auth, Auth::Stdin(_)) && cmd.fds().contains_key(&Fd::STDIN) {
@@ -661,6 +668,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             op: "Auth::Stdin with a caller-configured stdin".into(),
             platform: "unix",
             detail: "Auth::Stdin consumes fd0 to feed sudo -S the password; do not also configure stdin".into(),
+            source: None,
         });
     }
     Ok(())
@@ -753,6 +761,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                     detail:
                         "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them"
                             .into(),
+                    source: None,
                 });
             }
             if backend == Backend::Pkexec {
@@ -772,6 +781,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                     return Err(Error::Elevation {
                         kind: ElevationErrorKind::BackendUnavailable,
                         detail: "pkexec was not opened at detection".into(),
+                        source: None,
                     });
                 }
                 _ => None,

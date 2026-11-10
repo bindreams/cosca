@@ -324,6 +324,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: format!("{write_err}; {root_note}{tree_note}"),
+            source: None,
         },
         fate,
         unreaped,
@@ -1913,6 +1914,7 @@ pub(crate) fn resolve_stdio(
                     detail: "chained merges (merge-to-merge) are not supported; \
                              redirect to a concrete slot (pipe/file/null/inherit)"
                         .into(),
+                    source: None,
                 });
             }
         }
@@ -1945,6 +1947,7 @@ pub(crate) fn resolve_stdio(
                 op: format!("merge {slot} -> {target}"),
                 platform: std::env::consts::OS,
                 detail: "merge target descriptor is not configured".into(),
+                source: None,
             })?;
             child_ends.insert(slot, dup(src)?);
         }
@@ -2085,6 +2088,7 @@ fn inherit_end(slot: Fd, parent_std: ParentStd) -> Result<ChildEnd, Error> {
                     detail: "inherit on fd >= 3 has no defined parent stream; \
                              use pipe/file/null instead"
                         .into(),
+                    source: None,
                 })
             }
         };
@@ -2119,6 +2123,7 @@ fn inherit_end(slot: Fd, parent_std: ParentStd) -> Result<ChildEnd, Error> {
                     detail: "inherit on fd >= 3 has no defined parent stream; \
                              use pipe/file/null instead"
                         .into(),
+                    source: None,
                 })
             }
         };
@@ -2385,7 +2390,7 @@ pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCau
         Some(source) => {
             let error = Error::Unassessable {
                 detail: "the spawned child's identity could not be checked against its handle".into(),
-                source: Some(source),
+                source: Some(Box::new(Error::Io(source))),
             };
             let said = error.to_string();
             (error, said)
@@ -2463,6 +2468,7 @@ pub(crate) fn attach_or_fault(
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {
             detail: "forced attach failure (test seam)".into(),
+            source: None,
         });
     }
     #[cfg(all(test, target_os = "linux"))]

@@ -241,7 +241,9 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
         });
         for (call, result) in results {
             match result {
-                Err(cosca::error::Error::Unsupported { op, platform, detail }) => {
+                Err(cosca::error::Error::Unsupported {
+                    op, platform, detail, ..
+                }) => {
                     assert_eq!(platform, "linux", "{call} under {name}");
                     assert_eq!(op, format!("listing process group {pgid}"), "{call} under {name}");
                     assert_eq!(

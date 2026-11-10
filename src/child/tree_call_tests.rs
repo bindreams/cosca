@@ -46,6 +46,7 @@ mod pidfd_shutdown {
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::Unkillable,
             detail: what.into(),
+            source: None,
         }
     }
 

@@ -391,11 +391,8 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
         panic!("expected Unassessable, got {why:?}");
     };
     assert!(detail.contains("pidfd_open"), "{detail}");
-    assert_eq!(
-        source.as_ref().and_then(std::io::Error::raw_os_error),
-        Some(libc::EMFILE),
-        "{why:?}"
-    );
+    assert!(source.is_some(), "{why:?}");
+    assert_eq!(why.raw_os_error(), Some(libc::EMFILE), "{why:?}");
     let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
     let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
@@ -755,11 +752,9 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
         assert_eq!(format!("{kill:?}"), format!("{walk:?}"), "{row}");
         match (errno, &kill) {
             (None, Error::Unsupported { .. }) => {}
-            (Some(errno), Error::Unassessable { source, .. }) => assert_eq!(
-                source.as_ref().and_then(std::io::Error::raw_os_error),
-                Some(errno.raw_os_error()),
-                "{row}"
-            ),
+            (Some(errno), Error::Unassessable { .. }) => {
+                assert_eq!(kill.raw_os_error(), Some(errno.raw_os_error()), "{row}")
+            }
             (_, other) => panic!("{row}: wrong shape: {other:?}"),
         }
     }

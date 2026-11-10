@@ -951,7 +951,7 @@ fn combine_group_errors(first: Error, latest: Error) -> Error {
     if is_teardown_mechanism_failure(&first) || is_teardown_mechanism_failure(&latest) {
         Error::Io(io::Error::other(detail))
     } else {
-        Error::Containment { detail }
+        Error::Containment { detail, source: None }
     }
 }
 

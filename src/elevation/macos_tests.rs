@@ -193,7 +193,7 @@ fn the_length_guard_accepts_exactly_arg_max_and_rejects_one_more() {
     match wrap_do_shell_script(&cmd, Some(exact - 1)) {
         // Elevation, NOT Unsupported: the same command succeeds on a host with a
         // larger kern.argmax, so this can never be a permanent platform verdict.
-        Err(Error::Elevation { kind, detail }) => {
+        Err(Error::Elevation { kind, detail, .. }) => {
             assert_eq!(kind, ElevationErrorKind::CommandTooLong);
             assert!(detail.contains(&exact.to_string()), "{detail}");
             assert!(detail.contains(&(exact - 1).to_string()), "{detail}");

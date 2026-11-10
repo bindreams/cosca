@@ -95,6 +95,7 @@ impl Process {
                          shares no addressable process group with us; use kill_tree for a hard \
                          identity-walk sweep"
                     .into(),
+                source: None,
             })
         }
         #[cfg(not(any(unix, windows)))]

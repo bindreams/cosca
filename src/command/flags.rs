@@ -184,6 +184,7 @@ pub(crate) fn windows_spawn(
             op: "creation_flags".into(),
             platform: "windows",
             detail: format!("creation flags cosca manages itself cannot be set through the raw hatch: {named}"),
+            source: None,
         });
     }
 
@@ -201,6 +202,7 @@ pub(crate) fn windows_spawn(
                      teardown it reports to be true, and a nested contained spawn's containment IS \
                      inheriting the ancestor's job. Drop one of the two."
                 .into(),
+            source: None,
         });
     }
 
@@ -283,6 +285,7 @@ pub(crate) fn classify_spawn_denial(
                  contain(), the job is cosca's own, which sets neither limit and whose limits a \
                  member process cannot relax."
             .into(),
+        source: None,
     }
 }
 

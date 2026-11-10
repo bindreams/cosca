@@ -139,6 +139,7 @@ impl Stdio {
                         op: format!("ambiguous pipe direction on {other}"),
                         platform: std::env::consts::OS,
                         detail: "use Stdio::pipe_in()/pipe_out() for descriptors >= 3".into(),
+                        source: None,
                     })
                 }
             },
@@ -148,6 +149,7 @@ impl Stdio {
                     op: format!("pty on {slot}"),
                     platform: std::env::consts::OS,
                     detail: "PTY support is not wired yet".into(),
+                    source: None,
                 })
             }
         })

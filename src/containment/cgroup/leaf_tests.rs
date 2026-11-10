@@ -3330,7 +3330,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
     drop(leaf);
     assert_eq!(noted, []);
     let detail = match result {
-        Err(crate::error::Error::Containment { detail }) => detail,
+        Err(crate::error::Error::Containment { detail, .. }) => detail,
         other => panic!("a failed send makes the call Containment, got {other:?}"),
     };
     for needle in [

@@ -159,6 +159,7 @@ pub(super) fn reject_batch_path_on(prog: &std::path::Path, win32: bool) -> Resul
             op: format!("running {}", prog.display()),
             platform: "windows",
             detail: BATCH.into(),
+            source: None,
         }),
         // Refused on its shape before any search, so `InvalidInput`, as `crate::resolve` refuses a
         // name that names no file.

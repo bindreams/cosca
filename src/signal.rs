@@ -219,7 +219,7 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
         detail: format!("pid {pid}: its identity could not be read (errno {errno}); the child was not adopted"),
-        source: Some(io::Error::from_raw_os_error(errno)),
+        source: Some(Box::new(crate::error::Error::Io(io::Error::from_raw_os_error(errno)))),
     }
 }
 
