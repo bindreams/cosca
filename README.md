@@ -119,9 +119,9 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
   processes, and this project's own rule is that system-affecting tests run in a container or VM,
   never against this machine's own services.
 
-## Linting
+## Checks
 
-`prek` runs `.github/scripts/clippy.sh` and the libtest lint (`.github/libtest-lint`, a small Rust tool that `cargo` builds on first use). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
+CI verifies the code in two ways only: prek hooks and tests. The Lint job runs `prek run --all-files`, minus the platform-dependent hooks (`cargo-clippy`, `cargo-doc`: they check the host target); every Test lane runs `cargo-doc` for its own platform after its tests, and the three lanes marked `lint` in the matrix run `cargo-clippy` last. A new check is therefore a hook in `prek.toml` or a test, and runs on a developer's machine as it does in CI, so each hook has to be fast enough for that. `cargo-clippy` is a pre-push hook (`prek run --hook-stage pre-push cargo-clippy`); the rest run on commit. The `musl-check` hook needs `rustup target add x86_64-unknown-linux-musl`.
 
 ## License
 

@@ -9,12 +9,12 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["subprocess", "process", "spawn", "elevation", "cross-platform"]
 categories = ["os", "development-tools", "asynchronous"]
-exclude = ["/build.rs", "/testbin", "/tests", "/.github", "/.claude", "/.config", "/prek.toml", "/clippy.toml"]
+# What ships (Cargo.toml and Cargo.lock are always added). A list of what ships, not of what does not, so a new
+# top-level file stays out of the crate until it is named here.
+include = ["/src", "/README.md", "/LICENSE"]
 
 [workspace]
 members = ["cosca-path"]
-# Standalone fixture crates the CI scripts build on their own.
-exclude = [".github/fixtures"]
 
 # One version for both crates: they release together.
 [workspace.package]
