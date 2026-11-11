@@ -29,13 +29,6 @@ const ROOT_LEAVING_A_CAT_THAT_SAYS_EOF: &str = "exec 3<&0; { cat <&3 3<&- && ech
 /// Every record of the drop's warn starts with this.
 const WARN: &str = "Child::drop: the root is already reaped";
 
-/// What `ContainMode::Session` resolves to here: macOS puts every mode but `TreeWalk` behind an fd
-/// marker that also carries the group; elsewhere it is a bare process group.
-#[cfg(target_os = "macos")]
-const SESSION_CONTAINMENT: Containment = Containment::FdMarker;
-#[cfg(not(target_os = "macos"))]
-const SESSION_CONTAINMENT: Containment = Containment::Session;
-
 /// A command in its own session: a process group off macOS, an fd marker on it.
 fn session(argv: &[&str]) -> Command {
     let mut cmd = crate::test_child::command(Console::Hidden);
@@ -92,7 +85,7 @@ struct CatPipes {
 /// exited by then).
 fn spawn_cat_tree() -> (crate::Child, CatPipes) {
     let mut child = root_that_leaves_a_cat().spawn().expect("spawn");
-    assert_eq!(child.containment(), SESSION_CONTAINMENT);
+    assert_eq!(child.containment(), crate::test_child::session_gives());
     let mut stdout = child.stdout().expect("stdout pipe");
     let mut started = [0u8; 8];
     stdout.read_exact(&mut started).expect("read `started`");

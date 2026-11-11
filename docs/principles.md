@@ -296,7 +296,12 @@ fails on whatever an environment without support produces: a failed support chec
 a skip.
 
 A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
-delegated cgroup with `unshare` permitted.
+delegated cgroup with `unshare` permitted. A test whose verdict depends on the mechanism a contained
+child got asks for that mechanism and asserts it. The ways to ask: `contain_without_cgroup` (a session
+on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `cgroup` fixture
+(`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests` (`ProcessGroup`,
+in-crate tests only). The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
+promotes every contained request to `FdMarker`.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row

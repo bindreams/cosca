@@ -164,10 +164,10 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
 
     for (code, name) in REFUSALS {
         let (child, control) = common::spawn_control("control-block", &["R"], true);
-        assert!(
-            !child.containment().can_observe_drain(),
-            "{name}: the fixture must watch the root only, got {:?}",
-            child.containment()
+        assert_eq!(
+            child.containment(),
+            common::contain_without_cgroup_gives(),
+            "{name}: the fixture must watch the root only"
         );
         let result = std::thread::scope(|scope| {
             scope
@@ -303,10 +303,10 @@ fn the_async_graceful_shutdown_needs_no_pidfd_open() {
 fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_naming_the_refusal() {
     for (code, name) in REFUSALS {
         let (result, _status) = async_act_under_refusal(code, true, |runtime, child| {
-            assert!(
-                !child.containment().can_observe_drain(),
-                "{name}: the fixture must watch the root only, got {:?}",
-                child.containment()
+            assert_eq!(
+                child.containment(),
+                common::contain_without_cgroup_gives(),
+                "{name}: the fixture must watch the root only"
             );
             runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
         });
