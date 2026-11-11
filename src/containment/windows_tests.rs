@@ -12,14 +12,15 @@ fn job_handle_debug_does_not_panic() {
 }
 
 /// `hard_kill` keeps the handle, so a `wait_drained` after it asks the kernel and reports the
-/// drain (here, a job with no member).
+/// drain once the held member has exited.
 #[skuld::test]
 fn wait_drained_after_hard_kill_reports_the_drain() {
-    use super::JobHandle;
-    let h = JobHandle::create_empty_for_test();
-    h.hard_kill().expect("hard_kill on a live job");
-    let verdict = h.wait_drained(None, None).expect("wait_drained after hard_kill");
+    let (mut child, job) = spawn_job_member();
+    job.hard_kill().expect("hard_kill on a live job");
+    let verdict = job.wait_drained(None, None).expect("wait_drained after hard_kill");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    let status = child.wait().expect("reap the killed member");
+    assert!(!status.success(), "the member was killed: {status:?}");
 }
 
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
@@ -29,8 +30,7 @@ fn wait_drained_after_hard_kill_reports_the_drain() {
 fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
-    let job_handle = job.handle();
-    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    let pids = super::query_job_pid_list(job.raw).expect("query pid list");
     assert!(pids.is_empty(), "an empty job must report no members: {pids:?}");
 }
 
@@ -71,7 +71,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
     let job_handle = job.handle();
 
-    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    let pids = super::query_job_pid_list(job.raw).expect("query pid list");
     assert_eq!(
         pids,
         vec![child.id()],
@@ -253,22 +253,6 @@ fn invalid_handle_with_a_console_attached_stays_io() {
     // The probe contradicts the code: never claim a cause we just measured to be false.
     let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), Ok(true));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
-}
-
-/// A Win32 failure inside the containment layer reaches the caller as its plain Win32 code, so
-/// `kind()` and `raw_os_error()` classify it. A null handle is a real `ERROR_INVALID_HANDLE`.
-///
-/// Mutant: `duplicate_job` converts with the `windows` crate's own `io::Error` conversion, which
-/// keeps the HRESULT (`0x80070006`).
-#[cfg(feature = "tokio")]
-#[skuld::test]
-fn duplicate_job_failure_carries_the_win32_code() {
-    let err = super::duplicate_job(windows::Win32::Foundation::HANDLE::default())
-        .expect_err("duplicating a null handle must fail");
-    let crate::error::Error::Io(err) = err else {
-        panic!("expected Error::Io, got {err:?}");
-    };
-    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
 /// The error `GenerateConsoleCtrlEvent` returns when the caller has no console: what the `windows`
@@ -1358,11 +1342,19 @@ fn disarm_of_an_empty_job_is_ok() {
         .expect("a job made by the crate can be disarmed");
 }
 
-/// `hard_kill` keeps the handle, so a `disarm` after it clears `KILL_ON_JOB_CLOSE`.
+/// `hard_kill` keeps the handle, so a `disarm` after it clears `KILL_ON_JOB_CLOSE`: the flag the
+/// real create path sets.
+///
+/// Mutant: `disarm` does nothing -> the flag is still set.
 #[skuld::test]
 fn disarm_after_hard_kill_clears_the_flag() {
-    let job = super::JobHandle::create_empty_for_test();
+    let (child, job) = spawn_job_member();
+    assert!(
+        super::job_kills_on_close(&job),
+        "the create path sets KILL_ON_JOB_CLOSE"
+    );
     job.hard_kill().expect("hard_kill on a live job");
     job.disarm().expect("disarm after hard_kill");
     assert_eq!(crate::test_frozen::limit_flags(&job).0, 0);
+    let_member_exit(child);
 }

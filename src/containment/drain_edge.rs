@@ -7,6 +7,10 @@ use std::time::Instant;
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
+#[cfg(all(feature = "tokio", windows))]
+#[path = "drain_edge/job_dup.rs"]
+mod job_dup;
+
 /// A tree's own kernel edge for "every member has exited", borrowed from the tree that owns the
 /// resource it watches for the child's whole life (a marker's read end must, to keep its pipe's
 /// identity from being reissued). Both waits report the [`TreeDrain`] verdict.
@@ -269,6 +273,9 @@ pub(crate) async fn cgroup_wait_tree_drained(
     }
 }
 
+#[cfg(all(feature = "tokio", windows))]
+use job_dup::OwnedJobDup;
+
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
 /// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
 /// arm, awaiting its leaf's pump — this hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
@@ -283,7 +290,7 @@ async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
 ) -> Result<TreeDrain, Error> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::HANDLE;
 
     // The kernel wait runs on the real clock, not tokio's.
     let deadline = crate::tokio::wait::to_real_clock(deadline);
@@ -292,20 +299,7 @@ async fn job_wait_tree_drained(
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }
-    /// The duplicate the blocking task owns. Closing a job handle only fires `KILL_ON_JOB_CLOSE` if
-    /// it is the LAST open handle to that job (Win32 semantics); `JobHandle`'s own is unaffected.
-    struct OwnedJobDup(HANDLE);
-    impl Drop for OwnedJobDup {
-        fn drop(&mut self) {
-            // SAFETY: `self.0` is this struct's own `DuplicateHandle`-created handle, never
-            // shared or aliased anywhere else.
-            unsafe {
-                _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    let job_dup = OwnedJobDup(crate::containment::windows::duplicate_job(job.handle())?);
+    let job_dup = OwnedJobDup::new(job.handle())?;
 
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// releases promptly instead of parking out the deadline, and `Runtime::drop` — which
@@ -339,7 +333,8 @@ async fn job_wait_tree_drained(
 
     let joined = ::tokio::task::spawn_blocking(move || {
         let handles = handles;
-        let result = crate::containment::windows::wait_drained_raw(handles.job.0, deadline, Some(handles.cancel));
+        let result =
+            crate::containment::windows::wait_drained_raw(handles.job.handle(), deadline, Some(handles.cancel));
         drop(cancel_for_blocking); // keep the handle alive for the full blocking call, explicitly
         result
         // `handles.job` (`OwnedJobDup`) drops here on every path, including an early return

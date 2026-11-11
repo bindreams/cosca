@@ -12,6 +12,7 @@
 
 use std::io;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
 
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0,
@@ -63,9 +64,10 @@ impl JobHandle {
         JobHandle { raw: handle }
     }
 
-    /// The live job handle, valid for as long as `self` is borrowed.
-    pub(crate) fn handle(&self) -> HANDLE {
-        self.raw
+    /// The job handle, open for as long as `self` is borrowed.
+    pub(crate) fn handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: `self.raw` is open until `Drop`, which needs `&mut self`.
+        unsafe { BorrowedHandle::borrow_raw(self.raw.0) }
     }
 
     /// Terminate every process in the job. The handle stays open, so the job can still be
@@ -128,7 +130,7 @@ impl JobHandle {
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                full.handle(),
+                full.raw,
                 GetCurrentProcess(),
                 &mut weak,
                 JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE,
@@ -144,8 +146,11 @@ impl JobHandle {
 impl Drop for JobHandle {
     fn drop(&mut self) {
         // If `disarm` did not clear the flag, KILL_ON_JOB_CLOSE fires here when we close the
-        // handle, tearing down the tree — the drop backstop for `kill_on_drop=true` semantics,
-        // and for a member that joined after `hard_kill`.
+        // handle, tearing down the tree — the drop backstop for `kill_on_drop=true` semantics.
+        // `hard_kill` already terminates every member, including a child created during it
+        // (measured on Windows 10.0.26100: 0 of 1500 survived). The job still accepts an explicit
+        // assignment after its kill, and closing the handle would kill that process; cosca
+        // assigns only before it hands the job out, so it never makes one.
         // SAFETY: `self.raw` is a valid handle we own, closed only here.
         unsafe {
             if let Err(e) = CloseHandle(self.raw) {
@@ -867,33 +872,8 @@ impl JobHandle {
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         // `&self` keeps the handle open for the whole wait: only `Drop` closes it.
-        wait_drained_raw(self.raw, deadline, cancel)
+        wait_drained_raw(self.handle(), deadline, cancel)
     }
-}
-
-/// Duplicate a job handle, for the one wait that outlives its borrow of the `JobHandle`: the
-/// async drain's blocking thread, which `spawn_blocking` does not join when its future is dropped.
-#[cfg(feature = "tokio")]
-pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Error> {
-    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    let mut dup = HANDLE::default();
-    // SAFETY: `handle` is live for the duration of this call (the caller borrows its
-    // `JobHandle`); `dup` is an out-parameter DuplicateHandle initializes.
-    unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            handle,
-            GetCurrentProcess(),
-            &mut dup,
-            0,
-            false,
-            DUPLICATE_SAME_ACCESS,
-        )
-    }
-    .map_err(win32_io_error)?;
-    Ok(dup)
 }
 
 /// Whether the process `OpenProcess` returned as `opened` is a member of `job`: its handle to wait
@@ -977,17 +957,18 @@ fn thread_entries_closing(
     walked
 }
 
-/// The loop body of [`JobHandle::wait_drained`], taking a raw handle rather than borrowing
-/// `&JobHandle`: the async drain hands in its own duplicate (see [`duplicate_job`]), because its
-/// blocking thread outlives the borrow. The handle must stay open for the whole call.
+/// The loop body of [`JobHandle::wait_drained`], taking a borrowed handle rather than `&JobHandle`:
+/// the async drain hands in its own duplicate (see `OwnedJobDup`), because its blocking thread
+/// outlives the borrow.
 pub(crate) fn wait_drained_raw(
-    job: HANDLE,
+    job: BorrowedHandle<'_>,
     deadline: Option<std::time::Instant>,
     cancel: Option<HANDLE>,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::TreeDrain;
     use crate::error::Error;
 
+    let job = HANDLE(job.as_raw_handle());
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
         // Cancellation is checked BEFORE any work this round, including the very first — a
@@ -1670,7 +1651,7 @@ pub(crate) fn job_contains_pid(job: &JobHandle, pid: u32) -> bool {
 
     let mut in_job = windows::core::BOOL(0);
     // SAFETY: both handles are valid for the duration of the call.
-    let queried = unsafe { IsProcessInJob(process_handle, Some(job.handle()), &mut in_job) };
+    let queried = unsafe { IsProcessInJob(process_handle, Some(job.raw), &mut in_job) };
     // SAFETY: `process_handle` was opened above and must be closed.
     unsafe {
         _ = CloseHandle(process_handle);
@@ -1688,7 +1669,7 @@ pub(crate) fn job_limit_flags(
     // SAFETY: the handle is live for the call, and `info` is a correctly sized out-parameter.
     unsafe {
         QueryInformationJobObject(
-            Some(job.handle()),
+            Some(job.raw),
             JobObjectBasicLimitInformation,
             std::ptr::addr_of_mut!(info).cast(),
             size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,

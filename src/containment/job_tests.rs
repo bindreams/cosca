@@ -3,12 +3,7 @@
 //! `tests/windows_job_object.rs`). These use a plain, already-running `cmd /C more` — mirroring
 //! `windows_tests.rs`'s `wait_drained_raw_tracks_a_real_member_through_exit`.
 
-use std::mem::size_of;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
-
-use windows::Win32::System::JobObjects::{
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-};
 
 use super::Job;
 
@@ -47,25 +42,12 @@ fn disarm_clears_kill_on_job_close() {
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
-    let handle = job.0.handle();
 
     job.disarm().expect("disarm");
 
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    let mut returned = 0u32;
-    // SAFETY: `handle` is live; `info` is sized for the class being queried.
-    unsafe {
-        QueryInformationJobObject(
-            Some(handle),
-            JobObjectExtendedLimitInformation,
-            std::ptr::addr_of_mut!(info).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            Some(&mut returned),
-        )
-    }
-    .expect("QueryInformationJobObject after disarm");
     assert_eq!(
-        info.BasicLimitInformation.LimitFlags.0, 0,
+        crate::test_frozen::limit_flags(&job.0).0,
+        0,
         "disarm() must clear every limit flag, including KILL_ON_JOB_CLOSE"
     );
 

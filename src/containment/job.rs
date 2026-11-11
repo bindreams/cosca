@@ -37,7 +37,7 @@ use crate::error::Error;
 ///
 /// # Dropping a `Job`
 ///
-/// Dropping a live `Job` closes the underlying job handle, which — because
+/// Dropping a `Job` closes the underlying job handle, which — because
 /// `KILL_ON_JOB_CLOSE` is set — **terminates every process still in it**, exactly like
 /// [`kill_tree`](Job::kill_tree). Call [`disarm`](Job::disarm) first to opt out.
 #[derive(Debug)]
@@ -68,8 +68,10 @@ impl Job {
     /// The kernel documents that termination of every member is initiated before
     /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
     /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits for the members
-    /// to exit. The handle closes when the `Job` drops, which terminates any process that joined
-    /// the job after this call unless [`disarm`](Job::disarm) cleared `KILL_ON_JOB_CLOSE`.
+    /// to exit. The kill terminates every member, including a child created while it runs
+    /// (measured on Windows 10.0.26100). A job accepts an explicit assignment after its kill, and
+    /// dropping the `Job` terminates such a process unless [`disarm`](Job::disarm) cleared
+    /// `KILL_ON_JOB_CLOSE`; cosca never makes one.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.0.hard_kill().map_err(Error::Io)
     }
@@ -78,13 +80,13 @@ impl Job {
     /// its tree running.
     ///
     /// This is the "session ended normally, leave background processes alone" teardown path —
-    /// the opposite of [`kill_tree`](Job::kill_tree)'s "peer disconnected, reap everything".
+    /// the opposite of [`kill_tree`](Job::kill_tree)'s "peer disconnected, reap everything". It
+    /// also clears the flag after [`kill_tree`](Job::kill_tree).
     ///
     /// # Errors
     ///
     /// [`Error::Io`] with the Win32 code when the OS refuses to clear the flag. The job is then
-    /// still armed: dropping this `Job` kills the tree, as it did before the call. Also clears the
-    /// flag after [`kill_tree`](Job::kill_tree).
+    /// still armed: dropping this `Job` kills the tree, as it did before the call.
     pub fn disarm(&self) -> Result<(), Error> {
         self.0.disarm().map_err(Error::Io)
     }

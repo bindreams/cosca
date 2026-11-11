@@ -552,12 +552,13 @@ pub(crate) fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Re
 /// this ran. Kills the whole job, then waits (unboundedly, on a real kernel outcome — not a clock
 /// race) with `wait_tree`, which `kill_tree` leaves usable, so the whole tree is confirmed gone.
 /// If `kill_tree` itself fails, it terminates the immediate child directly and waits on the
-/// CHILD'S OWN process handle instead; only the immediate child is then confirmed gone. The
-/// returned message says what happened at every step, including a `TerminateProcess` failure,
-/// rather than only ever blaming the original wait.
+/// CHILD'S OWN process handle instead; only the immediate child is then confirmed gone. If
+/// `wait_tree` fails after a successful `kill_tree`, it waits on the child's handle too, with the
+/// same result. The returned message says what happened at every step, including a
+/// `TerminateProcess` failure, rather than only ever blaming the original wait.
 ///
-/// Every `Err` this returns when `kill_tree` failed leaves the REST of the tree — any grandchild —
-/// in an unconfirmed state. A caller that turns this `Err` into a `panic!` and unwinds through a
+/// Every `Err` this returns whose message says "only the immediate child" leaves the REST of the
+/// tree — any grandchild — in an unconfirmed state. A caller that turns this `Err` into a `panic!` and unwinds through a
 /// `TempDir` or a scratch account it owns is racing whatever of the tree could not be confirmed
 /// gone against that resource's removal; each such panic site says so itself.
 fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<u32, WaitFailure> {
@@ -592,10 +593,23 @@ fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<
         )
     } else {
         // `kill_tree` keeps the job handle, so the whole tree can be waited on.
-        format!("wait_tree={:?}", job.wait_tree())
+        match job.wait_tree() {
+            Ok(drain) => format!("wait_tree={drain:?}"),
+            Err(wait_err) => {
+                // The tree could not be confirmed, so fall back to the immediate child, which the
+                // kill was delivered to.
+                // SAFETY: `pi.hProcess` is still a valid, open handle to the child; `kill_tree`
+                // succeeded, so waiting observes a real kernel outcome, not a clock race.
+                let waited = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+                format!(
+                    "wait_tree failed ({wait_err}); wait_after_kill={waited:?}. This confirms only the immediate \
+                     child is gone, never the rest of the tree"
+                )
+            }
+        }
     };
-    // SAFETY: the wait above means the immediate child is confirmed gone (or the wait itself
-    // failed, which `confirmed` reports); both handles are closed exactly once.
+    // SAFETY: both handles are closed exactly once, after the wait above; `confirmed` says what
+    // that wait confirmed.
     unsafe {
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
