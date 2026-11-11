@@ -112,7 +112,9 @@ fn drop_walk_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
-fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -155,7 +157,9 @@ fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_p
 ///
 /// Mutant: the shared text says "this drop", or the label is `Child::drop`.
 #[skuld::test]
-fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call_itself_a_drop() {
+fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call_itself_a_drop(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -372,7 +376,9 @@ fn waited_on_blocker_root() -> (u32, crate::Child) {
 /// process on the number would be needed to provoke a real `Unknown`, so the seam forces the read.
 /// Mutants: the own-reap flag is ignored; `wait()` does not set it.
 #[skuld::test]
-fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -420,7 +426,7 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
 
 /// A root reaped by someone else is seen through its number. Mutant: the identity read dropped.
 #[skuld::test]
-fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -451,7 +457,7 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 /// The skip is quiet once this handle has already hard-killed the tree: the warn's own remedy
 /// (`kill_tree()` then `wait()`) must not draw it. Mutant: the tree-killed flag is ignored.
 #[skuld::test]
-fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -475,7 +481,7 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// The root's stdin is released via `release_at` after `terminate_tree` returns; a `terminate_tree`
 /// that sent nothing yields status 0 and fails the status assertion.
 #[skuld::test]
-fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn(#[fixture(stray_signal)] _stray: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
@@ -506,7 +512,7 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 /// the root exits by itself. Mutants: `terminate_tree` sets the tree-killed flag; `terminate_tree`
 /// sends nothing.
 #[skuld::test]
-fn drop_after_terminate_tree_and_wait_still_warns() {
+fn drop_after_terminate_tree_and_wait_still_warns(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -564,7 +570,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
-fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+fn drop_after_a_failed_kill_tree_and_wait_still_warns(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();

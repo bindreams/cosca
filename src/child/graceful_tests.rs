@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::cgroup;
+#[cfg(unix)]
+use crate::test_groups::{stray_signal, Group};
 
 use super::fault as term_fault;
 use crate::wait::fault;
@@ -726,7 +728,9 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(#
 /// A reaped root's group is not signalled by its number.
 #[cfg(unix)]
 #[skuld::test]
-fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
+fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
         assert_eq!(child.containment(), crate::test_child::session_gives());
         // Below Linux 6.9 a group is signalled by its number alone.

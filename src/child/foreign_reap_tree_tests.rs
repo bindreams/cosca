@@ -11,12 +11,11 @@ use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, kill_own_child,
     session_cat,
 };
-#[cfg(target_os = "macos")]
 use crate::test_groups::{stray_signal, Group};
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
 #[skuld::test]
-fn kill_tree_after_a_foreign_reap_sends_no_killpg() {
+fn kill_tree_after_a_foreign_reap_sends_no_killpg(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -39,7 +38,7 @@ fn kill_tree_after_a_foreign_reap_sends_no_killpg() {
 
 /// The twin of [`kill_tree_after_a_foreign_reap_sends_no_killpg`]. Same mutants.
 #[skuld::test]
-fn terminate_tree_after_a_foreign_reap_sends_no_signal() {
+fn terminate_tree_after_a_foreign_reap_sends_no_signal(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -65,7 +64,7 @@ fn terminate_tree_after_a_foreign_reap_sends_no_signal() {
 ///
 /// Mutant: an unreadable pid after our own reap is taken as free, and `killpg` is sent.
 #[skuld::test]
-fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
+fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -94,7 +93,7 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 /// its group has no member: `kill_tree` sends no `killpg`, and answers `Unassessable` with how to end
 /// the descendants.
 #[skuld::test]
-fn kill_tree_after_own_wait_whose_pid_names_no_process_sends_no_killpg() {
+fn kill_tree_after_own_wait_whose_pid_names_no_process_sends_no_killpg(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -335,7 +334,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
 ///
 /// Mutant: the `Unassessable` falls through to the grace and the sweep.
 #[skuld::test]
-fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
+fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -375,7 +374,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends() {
 ///
 /// Mutant: the sweep is told that "the SIGTERM" went out whatever the shutdown sent.
 #[skuld::test]
-fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
+fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::child::fault::force_next_root_read;
