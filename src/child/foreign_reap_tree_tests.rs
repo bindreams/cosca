@@ -91,8 +91,6 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
 /// After this handle's own reap, a pid that names no process may be taken by another process once
 /// its group has no member: `kill_tree` sends no `killpg`, and answers `Unassessable` with how to end
 /// the descendants.
-///
-/// Mutants: the group killed by a pid that names no process; the remedy left out of the error.
 #[skuld::test]
 fn kill_tree_after_own_wait_whose_pid_names_no_process_sends_no_killpg() {
     #[cfg(target_os = "linux")]
@@ -472,11 +470,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
 }
 
 /// After this handle's own reap, with the pid naming nothing, an fd marker with a group (the default
-/// containment) sends no `killpg` and walks nothing from the pid, but still kills its holders. The
-/// call is `Unassessable`, its text says how to end the descendants, and the group counts as
-/// not killed, so the drop warns of it.
-///
-/// Mutants: the group killed by the pid that names nothing; no holders sweep; `Ok` answered.
+/// containment) still kills its holders.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
@@ -526,9 +520,6 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
 /// get the `SIGTERM`, then the kill, and nothing goes out by the pid. The holder ignores the
 /// `SIGTERM`, so only the kill ends it. The call is `Unassessable`, its text says how to end the
 /// descendants, and the drop warns that the group was not killed.
-///
-/// Mutants: the group signalled by the pid that names nothing; the `SIGTERM` or the kill of the
-/// holders skipped; the collected status answered.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_the_holders() {

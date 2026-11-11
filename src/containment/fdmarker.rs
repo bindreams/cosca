@@ -1386,8 +1386,8 @@ impl Marker {
     /// same class of check-then-act window `src/containment/unix.rs` already documents for
     /// `ProcessGroup`'s own one-shot `killpg` — narrowed here to "immediately after a live
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
-    /// that. Each pass's `killpg` also checks the root right before it (`group_root`, see
-    /// [`check_number`](crate::containment::check_number)), on every pass, not once for the sweep.
+    /// that. Each pass's `killpg` is preceded by its own root check
+    /// ([`check_number`](crate::containment::check_number)).
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,
@@ -1443,7 +1443,7 @@ impl Marker {
         // skipped when blind, since there is nothing to walk). The walk keeps a process whose
         // ppid, read after the root was proved, names it.
         //
-        // Skipped outside `Scope::Full`: the root's pid names no one reliably any more.
+        // Outside `Scope::Full` the root's pid is not trusted.
         let mut new_walk: Vec<ProcessId> = Vec::new();
         debug_assert!(
             !walk || self.root.is_some(),

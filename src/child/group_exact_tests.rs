@@ -97,7 +97,6 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
 /// Below 6.9, after this handle's own reap, a root pid that names no process may be taken once the
 /// group has no member, so `kill_tree` sends nothing by it, answers `Unassessable` with how to end
 /// the descendants, and the group's member lives on.
-/// Mutant: "after this handle's own reap, a pid that names nothing passes the check".
 #[skuld::test]
 fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() {
     let (child, member) = root_with_a_member();
