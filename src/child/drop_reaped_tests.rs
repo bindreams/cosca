@@ -617,7 +617,9 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns(#[fixture(stray_
 /// Mutant: a walk that finds less settles the tree as killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_mark_the_tree() {
+fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_mark_the_tree(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
     let first = child.kill_tree().expect_err("the walk left a member");
@@ -641,7 +643,7 @@ fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_m
 /// Mutant: the drop's walk settles the tree as killed and warns nothing.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
+fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it(#[fixture(stray_signal)] _stray: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -818,7 +820,9 @@ fn a_drop_whose_walk_leaves_only_the_root_warns_it_could_not_vouch_for_the_tree(
 /// Mutant: the walk warns of every member it left, the root included, before the root's kill.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone() {
+fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
@@ -841,7 +845,9 @@ fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descenda
 /// drop: one report, of the descendant.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone() {
+fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
