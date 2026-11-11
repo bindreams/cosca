@@ -70,7 +70,7 @@ jobs:
       # locally as git hooks. prek-action runs `prek run --all-files`.
       - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         with:
-          prek-version: 0.5.9
+          prek-version: 0.5.10
 
       - name: Test devvm scripts
         run: python3 -m unittest scripts.devvm_macos_gate_test scripts.devvm_macos_gateio_test scripts.devvm_macos_tart_test scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_realtart_test scripts.devvm_vagrantfiles_test scripts.devvm_linux_rust_test
