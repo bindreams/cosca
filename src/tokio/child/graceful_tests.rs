@@ -673,11 +673,21 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
-    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
-    // real sweep now (the seam is consumed) kills it.
-    child.kill_tree().expect("cleanup sweep");
-    // The cleanup is not under test, so the descendant's stdin is released before the drain wait:
-    // it ends by itself even if the sweep sent nothing, and the wait cannot be left unbounded.
+    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
+    // call above reaped the root. A cgroup leaf is swept by its own handle. A group the pid no
+    // longer names is not signalled by that number (pidfd group signal refused: Linux below 6.9),
+    // so the cleanup is `Unassessable`.
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let swept = child.kill_tree();
+    if child.containment() == crate::containment::Containment::CgroupV2 {
+        swept.expect("the leaf is swept by its own handle");
+    } else {
+        let err = swept.expect_err("a reaped root's group is not signalled by its number");
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+    }
+    // The descendant's stdin is released before the drain wait: it ends by itself when the sweep
+    // sent nothing, and the wait cannot be left unbounded.
     drop(stdin);
     // Drain and remove the leaf here: the drop is not under test, and would leave a `cosca-*` leaf.
     if drainable {

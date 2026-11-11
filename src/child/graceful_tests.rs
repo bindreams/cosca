@@ -640,7 +640,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
     // Held for the test's whole body: dropping it delivers EOF to the backgrounded `cat`.
-    let _stdin = child.stdin().expect("piped stdin");
+    let stdin = child.stdin().expect("piped stdin");
     let mut exit_gate = child.fd_write_end(4.into()).expect("exit-gate write end");
     let mut readiness = [0u8; 1];
     child
@@ -682,9 +682,20 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
-    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
-    // real sweep now (the seam is consumed) kills it.
-    child.kill_tree().expect("cleanup sweep");
+    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
+    // call above reaped the root. A cgroup leaf is swept by its own handle. A group the pid no
+    // longer names is not signalled by that number (pidfd group signal refused: Linux below 6.9),
+    // so the cleanup is `Unassessable` and the descendant ends by its stdin closing.
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let swept = child.kill_tree();
+    if child.containment() == crate::containment::Containment::CgroupV2 {
+        swept.expect("the leaf is swept by its own handle");
+    } else {
+        let err = swept.expect_err("a reaped root's group is not signalled by its number");
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+    }
+    drop(stdin);
 }
 
 /// A sweep that left a descendant behind but whose backstop killed the root has killed the root: it

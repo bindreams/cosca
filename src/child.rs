@@ -582,10 +582,10 @@ impl Child {
     /// the pid, and the call is `Ok` once every marker holder was reached. A pid that cannot be read
     /// is `Unassessable` as above, and so is a pid that names no process: once the group has no
     /// member, another process may take the number, and lead a group by it, first. Where the root's
-    /// pidfd does not name the group (Linux below 6.9, macOS), nothing is sent by the pid, and the
-    /// call returns `Unassessable` (or a marker holders' error) with a `warn`. Descendants that
-    /// outlived the reaped root are then not ended: call `kill_tree` before [`wait`](Child::wait) to
-    /// end them. On Linux 6.9+ the root's pidfd shows exactly whether the group still has a member,
+    /// pidfd does not name the group (Linux without a pidfd group signal: below 6.9, or no pidfd;
+    /// macOS), nothing is sent by the pid, and the call returns `Unassessable` (or a marker holders'
+    /// error) with a `warn`. Descendants that outlived the reaped root are then not ended: call
+    /// `kill_tree` before [`wait`](Child::wait) to end them. On Linux 6.9+ the root's pidfd shows exactly whether the group still has a member,
     /// so the group is killed through it while it has one, and no send by number reaches a group that
     /// took the number.
     ///
