@@ -73,6 +73,7 @@ impl Contains for FakeContains {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn subject(&self) -> String {
         format!("{:?}", self.kind)
     }

@@ -1800,9 +1800,8 @@ fn wait_drained_is_unsupported_without_a_marker() {
     use crate::containment::Tree;
     for tree in [Tree::none(), Tree::delegated()] {
         let err = tree
-            .drain_edge()
-            .err()
-            .expect("a mechanism with no drain edge must be Unsupported");
+            .wait_drained(None)
+            .expect_err("a mechanism with no drain edge must be Unsupported");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
 }

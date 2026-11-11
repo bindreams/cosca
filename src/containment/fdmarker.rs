@@ -1299,8 +1299,8 @@ impl Marker {
     /// severity; it is checked in EVERY build, and a violation refuses to sweep at all rather
     /// than proceeding on a handle that may no longer mean what `self` claims.
     ///
-    /// `pub(crate)`: also called from the async dispatch path (`crate::tokio::wait`) before it
-    /// reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
+    /// `pub(crate)`: also called from `DrainEdge::wait_async` (`containment/drain_edge.rs`) before
+    /// it reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
     /// falsely report `EV_EOF` just as readily as it would here.
     pub(crate) fn check_read_end_still_valid(&self) -> Result<(), Error> {
         let read_still_valid = matches!(

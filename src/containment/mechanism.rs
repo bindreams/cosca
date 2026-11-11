@@ -43,13 +43,7 @@ pub(crate) trait Contains: fmt::Debug {
 
     /// What names the tree in a message about its teardown: a cgroup leaf its path (a kill returns
     /// the kernel's error unwrapped, so the error does not name it), every other mechanism what it is.
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "only a Unix teardown words its subject; the tests state every kind's"
-        )
-    )]
+    #[cfg(unix)]
     fn subject(&self) -> String;
 
     /// Neutralize the resource's own kill on drop (`detach`, `kill_on_drop(false)`): a Job Object's
@@ -174,13 +168,11 @@ impl Contains for Mechanism {
         }
     }
 
+    #[cfg(unix)]
     fn subject(&self) -> String {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.subject(),
-            #[cfg(windows)]
-            Mechanism::Job(m) => m.subject(),
-            #[cfg(unix)]
             Mechanism::Group(m) => m.subject(),
             #[cfg(target_os = "macos")]
             Mechanism::Marker(m) => m.subject(),
@@ -330,27 +322,7 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            // The leaf's drop makes this step again and reports what remains. A leaf that is occupied
-            // is the expected failure; one already gone is proof of a drain. Any other failure
-            // (EACCES, EIO) is the environment's, so it is logged, never asserted.
-            if let Err(e) = leaf.remove_else_kill() {
-                let occupied = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY));
-                if !occupied && !crate::containment::cgroup::removed_after_drain(&e) {
-                    log::debug!(
-                        "child {child}: its leaf's first rmdir failed ({report})",
-                        report = crate::error::Report(&e)
-                    );
-                }
-            }
-            if !leaf.kill_landed() {
-                return;
-            }
-            if let Err(e) = DrainEdge::Cgroup(leaf).wait_async(None).await {
-                log::debug!(
-                    "child {child}: its leaf's drain cannot be watched ({report}); the teardown waits for it on this thread, blocking",
-                    report = crate::error::Report(&e)
-                );
-            }
+            leaf.step_and_await_drain(child).await;
         }
     }
 }

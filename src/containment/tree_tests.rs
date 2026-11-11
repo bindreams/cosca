@@ -58,7 +58,8 @@ fn a_consumer_drives_a_tree_only_through_what_its_mechanism_answers() {
     tree.require_contained().expect("a contained tree is actionable");
     assert!(matches!(tree.kill(None), TreeKillOutcome::Ran(Ok(()))));
     assert_eq!(*sends.lock().unwrap(), ["kill"]);
-    let err = tree.drain_edge().err().expect("the fake states no drain edge");
+    assert!(tree.drain_edge().is_none(), "the fake states no drain edge");
+    let err = tree.wait_drained(None).expect_err("no edge to wait on");
     assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
     #[cfg(unix)]
     assert!(tree.would_reach(1, None).expect("stated"));
@@ -68,10 +69,11 @@ fn a_consumer_drives_a_tree_only_through_what_its_mechanism_answers() {
 }
 
 /// What names a tree in a message about its teardown is the text it always had, for each kind of
-/// tree this platform has.
+/// tree this platform has. Only a Unix teardown words its tree.
 ///
 /// Mutant: a kind words itself as its `Debug` (`Group { pgid: 123, session: false }`); a cgroup leaf
 /// words itself without its path.
+#[cfg(unix)]
 #[skuld::test]
 fn a_teardown_names_its_tree_as_it_always_did() {
     assert_eq!(Tree::none().teardown_subject(), "None");
@@ -79,7 +81,6 @@ fn a_teardown_names_its_tree_as_it_always_did() {
     let id = crate::identity::ProcessId::current();
     let walk = Tree::contained(Mechanism::Walk(Walker::new(id)));
     assert_eq!(walk.teardown_subject(), format!("TreeWalk({id:?})"));
-    #[cfg(unix)]
     {
         use crate::containment::unix::Group;
         let group = Tree::contained(Mechanism::Group(Group::process_group(123)));
@@ -93,12 +94,6 @@ fn a_teardown_names_its_tree_as_it_always_did() {
         let path = leaf.path().display().to_string();
         let leaf = Tree::contained(Mechanism::Cgroup(leaf));
         assert_eq!(leaf.teardown_subject(), format!("cgroup leaf {path}"));
-    }
-    #[cfg(windows)]
-    {
-        let job = crate::containment::windows::JobHandle::create_empty_for_test();
-        let subject = Tree::contained(Mechanism::Job(job)).teardown_subject();
-        assert!(subject.starts_with("JobObject(JobHandle {"), "{subject}");
     }
 }
 
@@ -118,34 +113,40 @@ fn a_released_tree_keeps_what_its_kills_settled() {
     tree.release().wait();
 
     assert!(tree.is_killed(), "the release reset the settlement");
-    assert_eq!(tree.containment(), Containment::None, "nothing holds the tree");
 }
 
-/// A kill is reached by what a mechanism says, and by nothing for a tree no mechanism holds.
+/// A tree released still is what it was: it reports its containment, and a settle after the release
+/// is a walk's when the tree was a walk's (its held members and its root left are the walk's own).
 ///
-/// Mutant: a tree that holds nothing answers what a mechanism states.
+/// Mutant: `release` leaves a tree that reports `None` and settles as a tree that is not a walk's.
 #[cfg(unix)]
 #[skuld::test]
-fn a_tree_reaches_the_child_only_as_its_mechanism_says() {
-    use crate::child::owned::teardown::Reach;
-    use crate::os_process::fake::FakeProcess;
-    use crate::test_child::over_fake::child_over;
+fn a_released_tree_keeps_its_kind() {
+    use crate::containment::dispatch::Unkilled;
 
-    let child = child_over(&FakeProcess::new([]));
-    for (reaches, tree) in [
-        (
-            true,
-            Tree::contained(Mechanism::Fake(FakeContains::new(Containment::ProcessGroup, true).0)),
-        ),
-        (
-            false,
-            Tree::contained(Mechanism::Fake(FakeContains::new(Containment::ProcessGroup, false).0)),
-        ),
-        (false, Tree::none()),
-        (false, Tree::delegated()),
-    ] {
-        assert_eq!(tree.reached(&child.proc).expect("stated"), reaches, "{tree:?}");
-    }
+    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
+    let mut group = Tree::contained(Mechanism::Fake(fake));
+    group.release().wait();
+    assert_eq!(group.containment(), Containment::ProcessGroup);
+
+    let mut walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    walk.release().wait();
+    assert_eq!(walk.containment(), Containment::TreeWalk);
+    // Only a walk leaves the root: a settle that is not a walk's asserts against it.
+    let root_left = TreeKillOutcome::Ran(Err(Unkilled {
+        members: Vec::new(),
+        root: Some(Error::MemberNotKilled {
+            pid: 1,
+            source: Box::new(Error::Unassessable {
+                detail: "its identity could not be read".into(),
+                source: None,
+            }),
+            note: None,
+        }),
+        resolved: Vec::new(),
+    }));
+    walk.settle(root_left, true)
+        .expect("a root the walk left is not left once it has ended");
 }
 
 /// A child over a mechanism of stated answers: what it reports and what its tree calls do come from

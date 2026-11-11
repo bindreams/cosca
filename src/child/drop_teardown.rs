@@ -106,14 +106,10 @@ impl Child {
             }
         };
         // The root is reaped and the event reported: what is left is the leaf's drain, which its kill
-        // bounds. The awaited steps are taken here; the release then drops the leaf in place, which
-        // finds nothing left to wait for. Every other mechanism drops with the handle.
+        // bounds. The awaited steps are taken here, and the leaf then drops with the handle in place,
+        // which finds nothing left to wait for. Every other mechanism drops with the handle.
         #[cfg(target_os = "linux")]
-        {
-            let released = self.tree.release();
-            released.wait_async(self.pid()).await;
-            released.wait();
-        }
+        self.tree.step_leaf_and_await_drain(self.pid()).await;
         remains
     }
 

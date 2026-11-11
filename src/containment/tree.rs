@@ -21,6 +21,9 @@ use crate::error::Error;
 pub(crate) struct Tree {
     holder: Holder,
     killed: TreeKilled,
+    /// What the tree was when its mechanism was released, which no longer holds it: the tree still
+    /// reports and settles as it was. `None` for a tree never released.
+    released_as: Option<Containment>,
 }
 
 /// What holds the tree.
@@ -51,7 +54,7 @@ impl Tree {
     pub(crate) fn delegated() -> Tree {
         Tree {
             holder: Holder::Delegated,
-            killed: TreeKilled::default(),
+            ..Tree::default()
         }
     }
 
@@ -59,15 +62,15 @@ impl Tree {
     pub(crate) fn contained(mechanism: Mechanism) -> Tree {
         Tree {
             holder: Holder::Contained(mechanism),
-            killed: TreeKilled::default(),
+            ..Tree::default()
         }
     }
 
     /// The teardown mechanism this tree achieved (queried via `Child::containment()`): the one source
-    /// of it.
+    /// of it, and the same after the mechanism's [`release`](Self::release).
     pub(crate) fn containment(&self) -> Containment {
         match &self.holder {
-            Holder::None => Containment::None,
+            Holder::None => self.released_as.unwrap_or(Containment::None),
             Holder::Delegated => Containment::Delegated,
             Holder::Contained(mechanism) => mechanism.kind(),
         }
@@ -90,17 +93,20 @@ impl Tree {
         })
     }
 
-    /// The tree's own drain edge, for `wait_tree`/`wait_tree_timeout` (single-sourced with the async
-    /// `Child`): only a mechanism with a real kernel edge can answer "has the whole tree exited"
-    /// without polling. Everything else (an uncontained child, a nested `Delegated` member, or a
-    /// teardown-only mechanism like a process group or a walk) is `Unsupported`.
-    pub(crate) fn drain_edge(&self) -> Result<DrainEdge<'_>, Error> {
-        if let Holder::Contained(mechanism) = &self.holder {
-            if let Some(edge) = mechanism.drain_edge() {
-                return Ok(edge);
-            }
+    /// The tree's own drain edge, for `wait_tree`/`wait_tree_timeout` and a graceful shutdown's grace
+    /// (single-sourced with the async `Child`): only a mechanism with a real kernel edge can answer
+    /// "has the whole tree exited" without polling. `None` for everything else (an uncontained child,
+    /// a nested `Delegated` member, or a teardown-only mechanism like a process group or a walk).
+    pub(crate) fn drain_edge(&self) -> Option<DrainEdge<'_>> {
+        match &self.holder {
+            Holder::Contained(mechanism) => mechanism.drain_edge(),
+            Holder::None | Holder::Delegated => None,
         }
-        Err(Error::Unsupported {
+    }
+
+    /// What a call that needs the tree's drain edge answers when it has none.
+    fn no_drain_edge(&self) -> Error {
+        Error::Unsupported {
             op: "wait for the contained tree to drain (wait_tree / wait_tree_timeout)".into(),
             platform: std::env::consts::OS,
             detail: format!(
@@ -110,7 +116,7 @@ impl Tree {
                 containment = self.containment()
             ),
             source: None,
-        })
+        }
     }
 
     /// Block until every member has exited, or until `deadline`, through the tree's drain edge
@@ -119,7 +125,7 @@ impl Tree {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, Error> {
-        self.drain_edge()?.wait(deadline)
+        self.drain_edge().ok_or_else(|| self.no_drain_edge())?.wait(deadline)
     }
 
     /// [`wait_drained`](Self::wait_drained), awaited ([`DrainEdge::wait_async`]).
@@ -128,7 +134,10 @@ impl Tree {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, Error> {
-        self.drain_edge()?.wait_async(deadline).await
+        self.drain_edge()
+            .ok_or_else(|| self.no_drain_edge())?
+            .wait_async(deadline)
+            .await
     }
 
     /// Hard-kill the contained tree (best-effort; a member that is already gone is success), as the
@@ -222,24 +231,31 @@ impl Tree {
 
     /// The end of the tree's resource (see [`Contains::release`]): the mechanism leaves the tree and
     /// its [`Release`] owns it until its wait. What the kills left stays the tree's ([`TreeKilled`]),
-    /// so a settle after the release is over the real state, with nothing held.
+    /// and so does what it was ([`containment`](Self::containment)), so a settle after the release is
+    /// over the real state, with nothing held.
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
     pub(crate) fn release(&mut self) -> Release {
+        self.released_as = Some(self.containment());
         match std::mem::take(&mut self.holder) {
             Holder::None | Holder::Delegated => Release::nothing(),
             Holder::Contained(mechanism) => mechanism.release(),
         }
     }
 
+    /// The awaited steps of a cgroup leaf's drop
+    /// ([`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)),
+    /// taken with the leaf left in the tree, for the awaited teardown of a child whose handle then
+    /// drops it. Any other tree has no leaf, so nothing to await.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    pub(crate) async fn step_leaf_and_await_drain(&self, child: u32) {
+        if let Holder::Contained(Mechanism::Cgroup(leaf)) = &self.holder {
+            leaf.step_and_await_drain(child).await;
+        }
+    }
+
     /// What names this mechanism's tree in a message about its teardown (see [`Contains::subject`]).
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "only a Unix teardown words its subject; the tests state every kind's"
-        )
-    )]
+    #[cfg(unix)]
     pub(crate) fn teardown_subject(&self) -> String {
         match &self.holder {
             Holder::None => "None".to_owned(),

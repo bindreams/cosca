@@ -386,7 +386,7 @@ impl Child {
         // sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
-        } else if let Ok(edge) = self.tree.drain_edge() {
+        } else if let Some(edge) = self.tree.drain_edge() {
             match edge.wait(crate::wait::deadline_from(grace)) {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back

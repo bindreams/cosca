@@ -137,6 +137,7 @@ impl Contains for Walker {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn subject(&self) -> String {
         format!("TreeWalk({:?})", self.root)
     }

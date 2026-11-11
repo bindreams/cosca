@@ -272,10 +272,6 @@ impl crate::containment::Contains for JobHandle {
         crate::containment::Containment::JobObject
     }
 
-    fn subject(&self) -> String {
-        format!("JobObject({self:?})")
-    }
-
     /// Clears `KILL_ON_JOB_CLOSE` (see [`disarm`](JobHandle::disarm)).
     fn disarm(&self) -> io::Result<()> {
         JobHandle::disarm(self)

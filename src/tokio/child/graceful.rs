@@ -314,7 +314,7 @@ impl Child {
         // best-effort reap is safe after a sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
-        } else if let Ok(edge) = self.inner.tree.drain_edge() {
+        } else if let Some(edge) = self.inner.tree.drain_edge() {
             match edge.wait_async(crate::tokio::wait::deadline_from(grace)).await {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
