@@ -78,12 +78,14 @@ pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
     (child, writer)
 }
 
-/// A process-group child.
+/// A child whose group is its containment: a session leader's, the mechanism [`ContainMode::Session`]
+/// degrades to without the marker (it reports [`Containment::Session`](crate::containment::Containment::Session),
+/// not `ProcessGroup`).
 pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = degraded_blocker(ContainMode::Session, None);
     assert!(
-        child.containment() == crate::containment::Containment::ProcessGroup,
-        "the test needs a process group"
+        child.containment() == crate::containment::Containment::Session,
+        "the test needs a session's process group"
     );
     (child, writer)
 }
