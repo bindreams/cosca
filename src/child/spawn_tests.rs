@@ -657,19 +657,20 @@ fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
 // The containment resource is disarmed when `spawn` hands the handle over, never before: a spawn
 // that fails after its `Child` exists (the POSIX password write) still owns the tree it started.
 
-/// An occupied temp leaf whose child entered it, attached to the next spawn on this thread.
+/// An occupied temp leaf whose child entered it, which [`put_in_leaf`] gives a spawned child.
 #[cfg(target_os = "linux")]
-fn attach_entered_leaf(leaf_path: &std::path::Path) {
+fn make_entered_leaf(leaf_path: &std::path::Path) {
     std::fs::create_dir(leaf_path).expect("create the leaf");
     std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
     std::fs::write(leaf_path.join("cgroup.kill"), b"").expect("create cgroup.kill");
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.to_path_buf(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
+}
+
+/// `child`'s tree in the leaf `leaf_path`, which the child entered.
+#[cfg(target_os = "linux")]
+fn put_in_leaf(child: &mut crate::Child, leaf_path: &std::path::Path) {
+    child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
+        crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.to_path_buf()),
+    ));
 }
 
 /// Until the spawn commits, a `kill_on_drop(false)` handle's leaf still kills on drop; once
@@ -680,10 +681,11 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     for commit in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-commit-leaf");
-        attach_entered_leaf(&leaf_path);
+        make_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
         let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+        put_in_leaf(&mut child, &leaf_path);
         if commit {
             child = child.commit_kill_on_drop().expect("commit");
         }
@@ -715,12 +717,13 @@ fn a_failed_password_write_kills_the_contained_tree() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-password-leaf");
-    attach_entered_leaf(&leaf_path);
+    make_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    put_in_leaf(&mut child, &leaf_path);
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
-    child.attached.disarm().expect("disarm");
+    child.tree.disarm().expect("disarm");
 
     let written = Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
@@ -783,14 +786,12 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
             FakeLeaf::set_populated(&members, false);
         }
     });
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(entered_leaf_at(fake.leaf.clone())),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(entered_leaf_at(
+        fake.leaf.clone(),
+    )));
 
     let mark = crate::log_capture::mark();
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -822,12 +823,13 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-password-kill-fail-leaf");
-    attach_entered_leaf(&leaf_path);
+    make_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    put_in_leaf(&mut child, &leaf_path);
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
-    child.attached.disarm().expect("disarm");
+    child.tree.disarm().expect("disarm");
 
     // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
     // directory fails EISDIR.
@@ -1098,14 +1100,10 @@ fn failed_write() -> Result<(), Error> {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::Delegated,
-        attached: crate::containment::Attached::Delegated,
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    child.tree = crate::containment::Tree::delegated();
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1132,16 +1130,10 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would.
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.clone(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    put_in_leaf(&mut child, &leaf_path);
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())
@@ -1172,16 +1164,10 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would.
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
-    fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.clone(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    put_in_leaf(&mut child, &leaf_path);
     let pid = child.pid();
     let mark = crate::log_capture::mark();
     let unsure = child
@@ -1391,7 +1377,7 @@ fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
     cmd.contain_with(crate::containment::ContainMode::Session);
     let child = cmd.spawn().expect("spawn");
     assert!(
-        child.attached.signals_a_group(),
+        child.tree.signals_a_group_for_test(),
         "the test needs a group named by the root's pid, which ContainMode::Session makes"
     );
     foreign_reap(&child, writer);

@@ -1128,7 +1128,7 @@ fn windows_detach_leaves_the_tree_running() {
 }
 
 /// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does (see
-/// `Attached::honor_kill_on_drop`).
+/// `Tree::honor_kill_on_drop`).
 #[cfg(windows)]
 #[skuld::test]
 fn windows_kill_on_drop_false_leaves_the_tree_running() {

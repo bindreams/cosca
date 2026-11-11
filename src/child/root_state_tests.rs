@@ -67,7 +67,7 @@ mod linux {
         let recorder = record_kill_group();
         let (child, writer) = session_blocker();
         assert!(
-            child.attached.signals_a_group(),
+            child.tree.signals_a_group_for_test(),
             "the test needs a group named by the root's pid, which ContainMode::Session makes"
         );
         let root = child.id().expect(crate::test_child::IDENTITY_READ);
@@ -252,7 +252,6 @@ mod linux {
     fn a_failed_root_peek_does_not_mark_the_tree_killed() {
         let recorder = record_kill_group();
         let (mut child, _writer) = session_blocker();
-        let killed = crate::containment::TreeKilled::default();
         let fake = child
             .proc
             .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
@@ -261,7 +260,7 @@ mod linux {
             child.pid(),
             child.id,
             || child.proc.state(),
-            &child.tree_killed,
+            &child.tree,
         );
         fake.assert_peeks_exhausted();
         assert!(matches!(view.root, RootState::Unknown(_)), "{:?}", view.root);
@@ -269,14 +268,11 @@ mod linux {
         let unsure = crate::test_support::stated_root::StatedRoot::with_state(child.pid(), || {
             crate::signal::RootState::Unknown(std::io::Error::other("forced peek failure"))
         });
-        let kill = child.attached.hard_kill(Some(&unsure));
+        let kill = child.tree.kill(Some(&unsure));
         assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
-        child
-            .attached
-            .settle(&killed, kill, true)
-            .expect("a skip is not an error");
+        child.tree.settle(kill, true).expect("a skip is not an error");
 
-        assert!(!killed.is_set(), "a skipped kill must not mark the tree killed");
+        assert!(!child.tree.is_killed(), "a skipped kill must not mark the tree killed");
         assert_eq!(recorder.killed(), Vec::<i32>::new());
     }
 
@@ -440,7 +436,7 @@ mod macos {
         cmd.contain_with(ContainMode::Session);
         let child = cmd.spawn().expect("spawn");
         assert!(
-            matches!(child.attached, crate::containment::Attached::FdMarker(_)),
+            child.containment() == crate::containment::Containment::FdMarker,
             "the test needs an fd marker"
         );
         (child, writer)

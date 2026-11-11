@@ -115,7 +115,7 @@ in_fresh_pid_ns!(
 
 // Tree signals after a reap and a reuse =====
 
-/// A blocker in its own session (`Attached::ProcessGroup`), which exits once `writer` is dropped.
+/// A blocker in its own session (a process group), which exits once `writer` is dropped.
 fn spawn_group_blocker() -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);

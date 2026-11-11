@@ -137,6 +137,10 @@ mod leaf;
 #[cfg(target_os = "linux")]
 pub(crate) use leaf::*;
 
+#[cfg(target_os = "linux")]
+#[path = "cgroup/contains.rs"]
+mod contains;
+
 /// Test-only fault seams for the leaf-creation steps a temp directory cannot reach.
 ///
 /// Thread-local with take semantics — arm and call on one thread, then assert the flag was

@@ -201,7 +201,7 @@ pub(crate) struct CgroupLeaf {
     dir: LeafDir,
     /// The leaf's drain watch, held from creation so that no wait on it ever lacks one. Read by
     /// the pump this watcher owns, which broadcasts each change to every wait.
-    /// Boxed: its pump would make every `Attached` as large as a leaf.
+    /// Boxed: its pump would make every `Mechanism` as large as a leaf.
     watch: Box<Watcher>,
     /// Pre-opened `cgroup.procs` fd for the `pre_exec` write. Close-on-exec: the write happens
     /// between `fork` and `exec`, and no program this process starts may inherit it. Numbered
@@ -368,18 +368,6 @@ impl CgroupLeaf {
         })
     }
 
-    /// Whether `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup under it,
-    /// for a kill through it.
-    pub(crate) fn holds_member(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
-        self.names(pid, pidfd)
-    }
-
-    /// Whether the task `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup
-    /// under it (see [`Subtree::holds`]).
-    pub(crate) fn names(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
-        self.subtree()?.holds(pid, pidfd)
-    }
-
     /// The leaf's cgroup id (see [`cgroup_id`](super::cgroup_id)).
     pub(crate) fn id(&self) -> io::Result<u64> {
         #[cfg(test)]
@@ -500,7 +488,7 @@ impl CgroupLeaf {
     /// Every other errno means the atomic kill did NOT happen — the tree may still be running
     /// (a delegated subtree whose `cgroup.kill` stopped being writable after a privilege drop,
     /// or a cgroupfs remounted `ro`). That is a teardown-mechanism failure and is returned, the
-    /// same way every sibling mechanism's is (`Attached::hard_kill`): a caller that reads
+    /// same way every sibling mechanism's is ([`Contains::send_kill`](crate::containment::Contains::send_kill)): a caller that reads
     /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
     ///
     /// The kill is complete only on kernels with the `cgroup.kill` fork-race fix (`b69bb476dee9`);

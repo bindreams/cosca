@@ -1,7 +1,7 @@
 //! Which cooperative shutdown signal a spawned child can be sent, and how far it reaches.
 //!
 //! Tree ownership and cooperative-signal mechanism are independent axes.
-//! [`Containment`](crate::containment::Containment) / `Attached` answer "who tears this tree
+//! [`Containment`](crate::containment::Containment) / `Tree` answer "who tears this tree
 //! down"; [`GracefulMechanism`] answers "what cooperative signal `terminate()` sends to this
 //! child, and how far it goes". On Windows the two are correlated only because containment is
 //! currently the only thing that sets `CREATE_NEW_PROCESS_GROUP` — a coincidence deliberately

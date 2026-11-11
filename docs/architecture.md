@@ -72,7 +72,7 @@ In order:
    `OwnedChild` over a per-OS `OsChild`, and the holder's waits for the root process (its `try_reap`
    loop and `exited_by`) run through `drive::run`. A waiter that is not the holder blocks on the
    handle's `Condvar`, and the waits for the tree to drain (`wait_tree`, the graceful drains) in
-   `Attached::wait_drained`.
+   `DrainEdge::wait`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
@@ -125,8 +125,16 @@ In order:
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.
-3. **Containment mechanisms:** today an enum whose callers ask which mechanism they hold. It
-   becomes operations on the tree, taking the root as an `OwnedChild`.
+3. **Containment mechanisms:** a `Child` holds a `Tree`: none, delegated, or contained by one
+   `Mechanism` (a cgroup leaf, a Job Object, a process group, an fd marker, a tree walk), which a
+   caller drives through the `Contains` trait (send a kill or a terminate, its drain edge, disarm,
+   would a kill reach a pid, did it reach the child, release) and never asks which it is, but for
+   three askers, all moved by slice 2: `Tree::settling` asks whether the mechanism is a walk, for the
+   settlement of its held members (into the walk's kill outcome), and the Linux awaited teardown's
+   `Tree::step_leaf_and_await_drain` and `Release::wait_async` ask whether it is a cgroup leaf (both
+   reach the leaf's awaited steps). The per-OS async drivers of the drain waits live in the drain edge
+   (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
+   async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
    `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`). What is
    left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a

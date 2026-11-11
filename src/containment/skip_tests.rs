@@ -1,6 +1,6 @@
 use super::{Skip, Why};
 use crate::containment::dispatch::TreeKillOutcome;
-use crate::containment::{Attached, Refusal, TreeKilled};
+use crate::containment::{Refusal, Tree};
 
 const PID: u32 = 999_999;
 
@@ -13,16 +13,15 @@ fn skip(why: Why) -> Skip {
     }
 }
 
-/// A `TreeKilled` a completed kill settled, and a fresh one.
-fn killed(settled: bool) -> TreeKilled {
-    let killed = TreeKilled::default();
+/// A tree a completed kill settled, and a fresh one.
+fn killed(settled: bool) -> Tree {
+    let tree = Tree::none();
     if settled {
-        Attached::None
-            .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
+        tree.settle(TreeKillOutcome::Ran(Ok(())), true)
             .expect("a kill that left nothing");
     }
-    assert_eq!(killed.is_set(), settled);
-    killed
+    assert_eq!(tree.is_killed(), settled);
+    tree
 }
 
 /// A skip is moot only over a tree this handle killed, and only because its own reap left the pid

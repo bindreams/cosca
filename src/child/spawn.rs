@@ -145,7 +145,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         child.pid(),
         child.id,
         || child.proc.state(),
-        &child.tree_killed,
+        &child.tree,
     );
     let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
@@ -155,7 +155,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let held = child.proc.hold(child.pid());
         let kill = {
             let seen = crate::containment::Seen::new(&held, view.look());
-            child.attached.hard_kill(Some(&seen))
+            child.tree.kill(Some(&seen))
         };
         drop(held);
         kill.log_skip(&view);
@@ -257,7 +257,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
     // After the root's kill, which settles a walk that left only the root.
-    let tree = tree.map(|kill| child.attached.settle(&child.tree_killed, kill, fate.not_running()));
+    let tree = tree.map(|kill| child.tree.settle(kill, fate.not_running()));
     // The tree is settled when no kill of it is left to try, or it was deliberately left alone because
     // the root is reaped or unpinned.
     let tree_settled = !tree_needs_another_kill(&tree) || (skipped.is_some() && view.leaves_root_alone());
@@ -268,7 +268,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         !unvouched || hands_back || fate.not_running(),
         "an unvouched tree leaves the handle disarmed only over a root that ended or went to the caller: {fate:?}"
     );
-    let subject = child.attached.teardown_subject();
+    let subject = child.tree.teardown_subject();
     let (mut tree_note, tree_warn) = report_tree_teardown(tree, &subject);
     report.tree = tree_warn;
     if let Some(note) = skipped {
@@ -280,7 +280,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let early = kill_tree();
         // What the early tree kill adds to the first attempt's report, and the outcome that report is
         // built from.
-        let more = match child.attached.settle(&child.tree_killed, early, fate.not_running()) {
+        let more = match child.tree.settle(early, fate.not_running()) {
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
@@ -418,7 +418,7 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// Report a failed password write's tree teardown, for both `finish_elevated` variants: the note
 /// for the error's `detail`, and the text the cleanup's one `warn` carries (the tree and the root
 /// are one event). `subject` names the tree, because the teardown error itself may not (see
-/// `Attached::teardown_subject`).
+/// `Tree::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
 /// tree was killed. `Some(Ok(Skipped))`: a kill that killed nothing; its skip note says so (the
@@ -666,7 +666,7 @@ fn spawn_reported(
         (prepared, c, parent_ends)
     };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
-    // `prepared` is consumed here: Linux cgroup leaf ownership moves to Attached::Cgroup.
+    // `prepared` is consumed here: Linux cgroup leaf ownership moves to the tree's cgroup mechanism.
     // Linux holds the child through the pidfd it sent: nothing there kills or reaps by pid. std's
     // `Child` holds no stdio (it all went to the child; the parent ends are in `parent_ends`), so
     // dropping it neither kills nor reaps. Every arm below tears down, or adopts, this one handle.
@@ -1110,7 +1110,7 @@ struct LateTree {
     /// root is not shown ours, only its marker without the root, whose holders the kernel names by
     /// the marker pipe. `None`: no tree of its own (uncontained, or a nested member of another
     /// root's).
-    attached: Option<crate::containment::Attached>,
+    tree: Option<crate::containment::Tree>,
     /// The sweep being run: what the root reports.
     sweep: Sweep,
     /// The root's pid and the unique id it must still have for a send by its number.
@@ -1133,7 +1133,7 @@ impl LateTree {
     fn attach(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> LateTree {
         use crate::identity::Resolved;
         let mut tree = LateTree {
-            attached: None,
+            tree: None,
             sweep: Sweep::RootAlive,
             pid,
             unique,
@@ -1153,7 +1153,7 @@ impl LateTree {
             Resolved::Found(id) => {
                 tree.id = Some(id);
                 match attach_or_fault(pid, Ok(id), prepared) {
-                    Ok(attachment) => tree.attached = Some(attachment.attached),
+                    Ok(attachment) => tree.tree = Some(attachment.tree),
                     Err(e) => {
                         assert_attach_cannot_fail(&e);
                         tree.notes
@@ -1171,8 +1171,8 @@ impl LateTree {
                     "{unshown}, so its tree is reached only through its marker's holders, not its process group \
                      or the processes its pid parents"
                 )));
-                tree.attached = Some(crate::containment::Attached::FdMarker(
-                    crate::containment::fdmarker::Marker::without_root(marker),
+                tree.tree = Some(crate::containment::Tree::contained(
+                    crate::containment::Mechanism::Marker(crate::containment::fdmarker::Marker::without_root(marker)),
                 ));
             }
             None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
@@ -1184,13 +1184,13 @@ impl LateTree {
     fn kill(&mut self, sweep: Sweep) {
         use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
         self.sweep = sweep;
-        let Some(attached) = &self.attached else {
+        let Some(tree) = &self.tree else {
             return;
         };
         // The mechanism looks at the root, which reports this sweep ([`Root::state`]): a root this
         // process's unreaped child is shown by a verified peek right before each send by its pid; one
         // not shown ours any more is skipped, its marker's holders alone swept, and never the root.
-        match attached.hard_kill(Some(&*self)) {
+        match tree.kill(Some(&*self)) {
             TreeKillOutcome::Skipped(skip) if matches!(sweep, Sweep::RootKilled { zombie: false }) => {
                 if let Some(Err(e)) = &skip.holders {
                     self.notes.push(format!(
@@ -1218,7 +1218,7 @@ impl LateTree {
     /// The `warn`'s note for the sweeps that failed, once the root's kill is known: `root_ended` says
     /// whether it ended the root, which settles a walk that left only the root
     /// ([`Unkilled::unsettled`](crate::containment::dispatch::Unkilled::unsettled), as
-    /// [`Attached::settle`](crate::containment::Attached::settle) does). The first failure stands: a
+    /// [`Tree::settle`](crate::containment::Tree::settle) does). The first failure stands: a
     /// later sweep is not shown to reach what it missed.
     fn failure_note(&mut self, root_ended: bool) -> Option<String> {
         let mut failed = None;
@@ -2489,15 +2489,6 @@ pub(crate) fn attach_or_fault(
             source: None,
         });
     }
-    #[cfg(all(test, target_os = "linux"))]
-    if let Some(attachment) = fault::take_attachment_override() {
-        let mut prepared = prepared;
-        prepared.settle_verdict(
-            #[cfg(target_os = "linux")]
-            child,
-        );
-        return Ok(attachment);
-    }
     crate::containment::attach(
         #[cfg(unix)]
         pid,
@@ -2757,9 +2748,6 @@ pub(crate) mod fault {
         #[cfg(target_os = "macos")]
         static BEFORE_LATE_ROOT_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
-        #[cfg(target_os = "linux")]
-        static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
-            const { std::cell::RefCell::new(None) };
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {
@@ -2779,18 +2767,6 @@ pub(crate) mod fault {
     pub(crate) fn set_force_attach_failure(on: bool) {
         FORCE_ATTACH_FAIL.with(|f| f.set(on));
     }
-    /// Hand the NEXT spawn on this thread `attachment` in place of the one `attach` would build,
-    /// so a test can give a real child a leaf it shapes itself. TAKE semantics.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn set_attachment_override(attachment: crate::containment::Attachment) {
-        ATTACHMENT_OVERRIDE.with(|f| *f.borrow_mut() = Some(attachment));
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn take_attachment_override() -> Option<crate::containment::Attachment> {
-        ATTACHMENT_OVERRIDE.with(|f| f.borrow_mut().take())
-    }
-
     pub(crate) fn force_attach_failure() -> bool {
         FORCE_ATTACH_FAIL.with(|f| f.get())
     }

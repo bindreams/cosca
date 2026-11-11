@@ -62,7 +62,7 @@ pub(crate) fn walked_blocker() -> (crate::Child, crate::PipeWriter) {
 fn walked_blocker_reporting(elevation: Option<crate::elevation::ElevationReport>) -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = degraded_blocker(ContainMode::TreeWalk, elevation);
     assert!(
-        matches!(child.attached, crate::containment::Attached::TreeWalk(_)),
+        child.containment() == crate::containment::Containment::TreeWalk,
         "the test needs a tree walk"
     );
     (child, writer)
@@ -72,7 +72,7 @@ fn walked_blocker_reporting(elevation: Option<crate::elevation::ElevationReport>
 pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = blocker(ContainMode::Session, None);
     assert!(
-        matches!(child.attached, crate::containment::Attached::FdMarker(_)),
+        child.containment() == crate::containment::Containment::FdMarker,
         "the test needs an fd marker"
     );
     (child, writer)
@@ -82,7 +82,7 @@ pub(crate) fn session_blocker() -> (crate::Child, crate::PipeWriter) {
 pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
     let (child, writer) = degraded_blocker(ContainMode::Session, None);
     assert!(
-        matches!(child.attached, crate::containment::Attached::ProcessGroup(_)),
+        child.containment() == crate::containment::Containment::ProcessGroup,
         "the test needs a process group"
     );
     (child, writer)

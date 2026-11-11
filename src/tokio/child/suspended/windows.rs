@@ -19,7 +19,7 @@ impl SuspendedChild {
     /// `false` if the child is not job-contained; panics if the job's limits cannot be queried.
     #[doc(hidden)]
     pub fn test_job_kills_on_close(&self) -> bool {
-        crate::containment::windows::job_kills_on_close(&self.child.inner.attached)
+        self.child.inner.tree.job_kills_on_close_for_test()
     }
 
     /// The containment the child has (and keeps after `resume`).

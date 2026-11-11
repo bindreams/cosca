@@ -27,13 +27,13 @@ use crate::test_groups::{cgroup, Group};
 /// What a tree is contained by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mechanism {
-    /// `Attached::ProcessGroup`: `ContainMode::Session`, with the fd marker suppressed on macOS.
+    /// A process group: `ContainMode::Session`, with the fd marker suppressed on macOS.
     Group,
     #[cfg(target_os = "macos")]
     MarkerWithGroup,
     #[cfg(target_os = "macos")]
     MarkerWalk,
-    /// `Attached::TreeWalk`: `ContainMode::TreeWalk`, with the fd marker suppressed on macOS.
+    /// A tree walk: `ContainMode::TreeWalk`, with the fd marker suppressed on macOS.
     TreeWalk,
     #[cfg(target_os = "linux")]
     Cgroup,

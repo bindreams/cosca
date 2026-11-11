@@ -384,7 +384,7 @@ fn a_detached_contained_root_gets_a_false_success() {
     });
 }
 
-/// A distinct route into the same call site: on Windows `Attached::TreeWalk` reaches
+/// A distinct route into the same call site: on Windows a tree walk reaches
 /// `containment::windows::terminate` through `treewalk::terminate`, so a change made in one arm
 /// only would miss it.
 #[skuld::test]

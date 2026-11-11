@@ -833,8 +833,10 @@ pub(crate) mod fault {
 use std::io;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
-use crate::containment::{Root, Skip, TerminateOutcome, Why};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
@@ -879,6 +881,48 @@ impl std::fmt::Debug for Marker {
             .field("handle", &format_args!("{:#x}", self.handle))
             .field("pgid", &self.pgid)
             .finish_non_exhaustive()
+    }
+}
+
+impl Contains for Marker {
+    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+        self.kill_tree(root)
+    }
+
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
+        self.terminate_tree(root)
+    }
+
+    /// The marker pipe's EOF, advisory: see [`TreeDrain`](crate::containment::TreeDrain).
+    fn drain_edge(&self) -> Option<DrainEdge<'_>> {
+        Some(DrainEdge::Marker(self))
+    }
+
+    fn kind(&self) -> Containment {
+        Containment::FdMarker
+    }
+
+    /// Dropping the read end kills nothing.
+    fn disarm(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn subject(&self) -> String {
+        format!("FdMarker({self:?})")
+    }
+
+    /// A signal to a marker's holders is subject to the kernel's permission check, as the child's own
+    /// kill is.
+    fn would_reach(&self, _pid: u32, _pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn release(self) -> Release {
+        Release::nothing()
     }
 }
 
@@ -1255,8 +1299,8 @@ impl Marker {
     /// severity; it is checked in EVERY build, and a violation refuses to sweep at all rather
     /// than proceeding on a handle that may no longer mean what `self` claims.
     ///
-    /// `pub(crate)`: also called from the async dispatch path (`crate::tokio::wait`) before it
-    /// reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
+    /// `pub(crate)`: also called from `DrainEdge::wait_async` (`containment/drain_edge.rs`) before
+    /// it reads `self.read`'s raw fd directly, for the same reason — a reissued fd there would
     /// falsely report `EV_EOF` just as readily as it would here.
     pub(crate) fn check_read_end_still_valid(&self) -> Result<(), Error> {
         let read_still_valid = matches!(
