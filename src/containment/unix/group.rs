@@ -15,7 +15,7 @@
 
 use nix::sys::signal::Signal;
 
-use crate::containment::GroupRoot;
+use crate::containment::{check_number, Root};
 use crate::identity::{ProcessId, RawPid};
 
 /// One process-group member as the listing found it, carrying the identity (built from the
@@ -374,7 +374,7 @@ fn check_or_signal(
     pid: RawPid,
     id: crate::identity::ProcessId,
     signal: Option<Signal>,
-    root: &GroupRoot<'_>,
+    root: Option<&dyn Root>,
 ) -> Reached {
     // Contract (repo-wide policy): this module's whole design rests on
     // `SIGTERM` never being resent for real (the double-signal-escalation avoidance —
@@ -460,12 +460,12 @@ fn check_or_signal(
 }
 
 /// The root's check before the resend of `signal` (`None`: the probe) to the listed `pid`
-/// ([`GroupRoot::check`]). `Err` is the member's answer when nothing may go out: a group with no
+/// ([`check_number`]). `Err` is the member's answer when nothing may go out: a group with no
 /// member left holds no listed process, so that process is not a survivor; any other failed check
 /// leaves it unassessable.
-fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
+fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
     let send = signal.map_or_else(|| "probed".to_owned(), |signal| format!("resent {signal}"));
-    match root.check() {
+    match check_number(root) {
         Ok(()) => Ok(()),
         Err(why @ crate::containment::NotItsGroup::Empty) => {
             log::debug!("containment::unix::group: {why}, so pid {pid} is in another group, and is not {send}");
@@ -525,7 +525,7 @@ fn root_check_before_send(root: &GroupRoot<'_>, pid: RawPid, signal: Option<Sign
 fn check_or_signal_linux_sigkill(
     kernel: &dyn crate::identity::Kernel,
     id: crate::identity::ProcessId,
-    root: &GroupRoot<'_>,
+    root: Option<&dyn Root>,
 ) -> Reached {
     use std::os::fd::AsFd as _;
     match crate::os_process::linux::open::open_verified_error_with(kernel, id) {
@@ -638,9 +638,9 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 ///
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
-/// that exactly, and elsewhere the root's state stands in for it (unreaped). Each
-/// `SIGKILL` resend and each `SIGTERM` probe therefore has its own check of the root
-/// ([`GroupRoot::check`]), which shows the listing named the root's group. On Linux a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
+/// that exactly, and elsewhere the root's state stands in for it (unreaped). Each `SIGKILL` resend and each `SIGTERM`
+/// probe therefore has its own check of the root ([`check_number`]), which shows the listing named the root's group. On
+/// Linux a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
 /// checks the root, then sends through that pidfd; a Linux member whose pidfd cannot be opened is
 /// unassessable and not signalled. A `SIGTERM` probe, and a resend by the member's pid (on macOS),
 /// checks the root, then the member's identity right before the send. A member whose root check
@@ -652,7 +652,7 @@ pub(crate) fn converge(
     kernel: &dyn crate::identity::Kernel,
     pgid: i32,
     signal: Signal,
-    root: &GroupRoot<'_>,
+    root: Option<&dyn Root>,
 ) -> std::io::Result<GroupState> {
     #[cfg(test)]
     let listing_pgid = fault::listed(pgid);
@@ -751,7 +751,7 @@ fn decide(pgid: i32, signal: Signal, refused: Vec<RawPid>, unassessable: Vec<Raw
 /// contract (never called with an unaddressable group id) rather than pretending to be a
 /// safety net for a dangerous syscall — the REAL guard, which runs before `killpg` is ever
 /// called, is in `unix.rs`'s `signal_group` (this module's only production caller).
-pub(crate) fn state(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> GroupState {
+pub(crate) fn state(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> GroupState {
     debug_assert!(
         pgid > 0,
         "group::state called with a non-positive pgid ({pgid}); the real guard belongs in the \

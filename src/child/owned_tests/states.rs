@@ -882,24 +882,26 @@ fn the_state_is_an_own_reap_only_once_a_look_returns_the_record() {
 #[cfg(unix)]
 #[skuld::test]
 fn a_hold_checks_the_roots_group_by_its_own_state() {
-    use crate::containment::RootCheck as _;
+    use crate::containment::check_number;
     use crate::identity::Resolved;
     let fake = FakeProcess::new([]).peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
     let child = OwnedChild::new(Box::new(fake));
-    assert_eq!(child.hold(UNREAD_PID).check(), Ok(()));
-    let refused = child.hold(UNREAD_PID).check().expect_err("reaped elsewhere");
+    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
+    assert_eq!(check(), Ok(()));
+    let refused = check().expect_err("reaped elsewhere");
     assert!(refused.contains("reaped elsewhere"), "{refused}");
 
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
     let child = OwnedChild::new(Box::new(fake));
     status(child.wait(None));
+    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
     {
         let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-        let refused = child.hold(UNREAD_PID).check().expect_err("the pid names no process");
+        let refused = check().expect_err("the pid names no process");
         assert!(refused.contains("names no process"), "{refused}");
     }
     let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
-    let refused = child.hold(UNREAD_PID).check().expect_err("the pid could not be read");
+    let refused = check().expect_err("the pid could not be read");
     assert!(refused.contains("this handle reaped the root"), "{refused}");
 }
 

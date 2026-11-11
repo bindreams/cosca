@@ -3,7 +3,7 @@
 // (`unix_kill_tree_reaps_the_grandchild` in `tests/spawn_io.rs`).
 
 use super::{kill_group, term_group};
-use crate::containment::GroupRoot;
+use crate::test_support::stated_root::StatedRoot;
 
 // This file deliberately has NO "absent group" test that calls kill_group/term_group on a
 // scanned-forward or freshly-reaped pgid. Once these functions unconditionally verify (this
@@ -51,13 +51,13 @@ fn await_zombie(pid: u32) {
 fn kill_group_and_term_group_reject_non_positive_pgid() {
     for pgid in [0, -1, i32::MIN] {
         let kill_err =
-            kill_group(pgid, &GroupRoot::trusted_for_test()).expect_err("kill_group(non-positive) must be Err");
+            kill_group(pgid, Some(&StatedRoot::unreaped())).expect_err("kill_group(non-positive) must be Err");
         assert!(
             matches!(kill_err, crate::error::Error::Unassessable { .. }),
             "got {kill_err:?}"
         );
         let term_err =
-            term_group(pgid, &GroupRoot::trusted_for_test()).expect_err("term_group(non-positive) must be Err");
+            term_group(pgid, Some(&StatedRoot::unreaped())).expect_err("term_group(non-positive) must be Err");
         assert!(
             matches!(term_err, crate::error::Error::Unassessable { .. }),
             "got {term_err:?}"
@@ -82,7 +82,7 @@ fn kill_group_on_owned_group_succeeds() {
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(
-        kill_group(pgid, &GroupRoot::trusted_for_test()).is_ok(),
+        kill_group(pgid, Some(&StatedRoot::unreaped())).is_ok(),
         "kill_group on owned group must succeed"
     );
     drop(stdin);
@@ -134,7 +134,7 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
         stdout.read_line(&mut line).expect("read to a line or EOF");
         *record.borrow_mut() = Some(line);
     });
-    kill_group(pgid, &GroupRoot::trusted_for_test()).expect("kill_group on an owned group");
+    kill_group(pgid, Some(&StatedRoot::unreaped())).expect("kill_group on an owned group");
 
     let status = child.wait().expect("reap the leader");
     let line = seen.borrow_mut().take().expect("the hook ran in converge");
@@ -172,7 +172,7 @@ fn term_group_on_owned_group_succeeds() {
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(
-        term_group(pgid, &GroupRoot::trusted_for_test()).is_ok(),
+        term_group(pgid, Some(&StatedRoot::unreaped())).is_ok(),
         "term_group on owned group must succeed"
     );
     drop(stdin);
@@ -206,7 +206,7 @@ fn kill_group_on_an_all_zombie_group_is_ok() {
     );
 
     assert!(
-        kill_group(pid as i32, &GroupRoot::trusted_for_test()).is_ok(),
+        kill_group(pid as i32, Some(&StatedRoot::unreaped())).is_ok(),
         "a group holding only a zombie is already down"
     );
     let mut child = child;
@@ -246,7 +246,7 @@ fn term_group_on_an_all_zombie_group_is_ok() {
     );
 
     assert!(
-        term_group(pid as i32, &GroupRoot::trusted_for_test()).is_ok(),
+        term_group(pid as i32, Some(&StatedRoot::unreaped())).is_ok(),
         "a group holding only a zombie is already down"
     );
     let mut child = child;

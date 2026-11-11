@@ -333,8 +333,8 @@ pub(crate) mod treewalk;
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
 
-#[path = "containment/group_root.rs"]
-mod group_root;
+#[path = "containment/root.rs"]
+mod root;
 #[cfg(target_os = "linux")]
 pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]
@@ -344,11 +344,11 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
-pub(crate) use group_root::GroupRoot;
+#[cfg(target_os = "linux")]
+pub(crate) use root::group_has_member;
+pub(crate) use root::Root;
 #[cfg(unix)]
-pub(crate) use group_root::NotItsGroup;
-#[cfg(unix)]
-pub(crate) use group_root::RootCheck;
+pub(crate) use root::{check_number, reaped_pid_names_no_process, NotItsGroup};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

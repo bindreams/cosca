@@ -374,58 +374,6 @@ fn root_number_answers_an_unpinned_root_untrusted() {
     }
 }
 
-// group_number_holds -----
-
-/// A send by the group's number is allowed only while the root is unreaped. Mutant: "a root reaped
-/// elsewhere, one its handle cannot answer for, or one this handle reaped passes the check".
-#[skuld::test]
-fn group_number_holds_only_for_an_unreaped_root() {
-    use super::group_number_holds;
-    let own = std::process::id();
-    assert_eq!(group_number_holds(own, RootState::Unreaped), Ok(()));
-    let refused = [
-        (RootState::Reaped { own: false }, "reaped elsewhere"),
-        (
-            RootState::Unknown(std::io::Error::other("a failed peek")),
-            "a failed peek",
-        ),
-        (RootState::Unpinned, "not pinned"),
-        // This process holds its own pid, so the number names another process than the root.
-        (RootState::Reaped { own: true }, "another process holds"),
-    ];
-    for (state, why) in refused {
-        let label = format!("{state:?}");
-        let err = group_number_holds(own, state).expect_err(&label);
-        assert!(err.contains(why), "{label}: {err}");
-    }
-}
-
-/// `group_number_holds` reads `own` from the state: a reap by someone else refuses whatever the
-/// pid's identity read says, and an own reap is refused whatever that read says. Mutant: "`own` is
-/// ignored", or "an own reap whose pid names no process passes".
-#[skuld::test]
-fn group_number_holds_reads_own_from_the_state() {
-    use super::group_number_holds;
-    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
-    let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
-    for read in reads() {
-        let _read = crate::child::fault::force_root_reads(read);
-        let err = group_number_holds(PGID as u32, RootState::Reaped { own: false }).expect_err("reaped elsewhere");
-        assert!(err.contains("reaped elsewhere"), "{err}");
-    }
-    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("names no process");
-    assert!(err.contains("names no process"), "{err}");
-    drop(_gone);
-    let _found = crate::child::fault::force_root_reads(Resolved::Found(other()));
-    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("another process holds");
-    assert!(err.contains("another process holds"), "{err}");
-    drop(_found);
-    let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
-    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
-    assert!(err.contains("could not be read"), "{err}");
-}
-
 // through_the_pidfd -----
 
 /// Linux 6.9+: a reaped root's group with no member left has no tree to signal, but a root its
@@ -439,8 +387,7 @@ fn through_the_pidfd_keeps_a_root_its_handle_cannot_answer_for(#[fixture(pidfd_g
     let mut lone = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn");
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(lone.id());
     lone.wait().expect("reap it");
-    let passes = || Ok(());
-    let group = crate::containment::GroupRoot::new(Some(pidfd.as_fd()), &passes);
+    let root = crate::test_support::stated_root::StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let attached = Attached::ProcessGroup(PGID);
     let decide = |exact_root| {
         super::through_the_pidfd(
@@ -449,7 +396,7 @@ fn through_the_pidfd_keeps_a_root_its_handle_cannot_answer_for(#[fixture(pidfd_g
                 why: "forced".to_owned(),
                 exact_root,
             },
-            &group,
+            Some(&root),
         )
     };
     assert!(matches!(decide(false), RootNumber::GroupGone));

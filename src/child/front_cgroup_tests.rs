@@ -1434,11 +1434,7 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
     let pid = child.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    child
-        .attached
-        .hard_kill(&crate::containment::GroupRoot::none())
-        .into_result()
-        .expect("cgroup.kill");
+    child.attached.hard_kill(None).into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
@@ -1458,11 +1454,7 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
     let pid = killed.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    killed
-        .attached
-        .hard_kill(&crate::containment::GroupRoot::none())
-        .into_result()
-        .expect("cgroup.kill");
+    killed.attached.hard_kill(None).into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     assert!(leaf_of(&killed)

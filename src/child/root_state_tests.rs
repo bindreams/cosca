@@ -272,7 +272,7 @@ mod linux {
 
         let kill = child
             .attached
-            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
+            .hard_kill_for_drop(&view, Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
         assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
         child
             .attached

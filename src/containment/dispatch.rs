@@ -955,12 +955,12 @@ impl Attached {
     ///   running is an [`Error::MemberNotKilled`].
     ///
     /// `root` is the root a send to a group named by its pid needs (see
-    /// [`GroupRoot`](crate::containment::GroupRoot)); every other mechanism ignores it.
+    /// [`Root`](crate::containment::Root)); every other mechanism ignores it.
     #[cfg_attr(
         not(unix),
         allow(unused_variables, reason = "only Unix names a group by the root's pid")
     )]
-    pub(crate) fn hard_kill(&self, root: &crate::containment::GroupRoot<'_>) -> TreeKillOutcome {
+    pub(crate) fn hard_kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
         let ran = |result: Result<(), Error>| TreeKillOutcome::Ran(result.map_err(Unkilled::from));
         match self {
             Attached::None | Attached::Delegated => TreeKillOutcome::Ran(Ok(())),
@@ -984,7 +984,7 @@ impl Attached {
         &self,
         caller: &str,
         killed: &TreeKilled,
-        root: &crate::containment::GroupRoot<'_>,
+        root: Option<&dyn crate::containment::Root>,
     ) -> Result<(), Error> {
         self.settle_for_kill_tree(caller, killed, self.hard_kill(root), false)
     }
@@ -1134,7 +1134,7 @@ impl Attached {
         not(unix),
         allow(unused_variables, reason = "only Unix names a group by the root's pid")
     )]
-    pub(crate) fn terminate(&self, _child_pid: u32, root: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
+    pub(crate) fn terminate(&self, _child_pid: u32, root: Option<&dyn crate::containment::Root>) -> Result<(), Error> {
         match self {
             Attached::None | Attached::Delegated => {
                 debug_assert!(
@@ -1289,7 +1289,7 @@ impl Attached {
     pub(crate) fn hard_kill_for_drop(
         &self,
         view: &DropView,
-        root: &crate::containment::GroupRoot<'_>,
+        root: Option<&dyn crate::containment::Root>,
     ) -> TreeKillOutcome {
         let action = match self.drop_reach(view, root) {
             DropReach::Kill => return self.hard_kill(root),
@@ -1326,7 +1326,7 @@ impl Attached {
     /// has a member, whoever reaped the root, and gone once a reaped root's group has none.
     /// Otherwise, and below 6.9 and on macOS, what names the tree by the root's number is skipped.
     #[cfg(unix)]
-    fn drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+    fn drop_reach(&self, view: &DropView, root: Option<&dyn crate::containment::Root>) -> DropReach {
         let reach = self.decide_drop_reach(view, root);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
@@ -1336,7 +1336,7 @@ impl Attached {
     /// [`drop_reach`](Self::drop_reach)'s decision.
     #[cfg(unix)]
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
-    fn decide_drop_reach(&self, view: &DropView, root: &crate::containment::GroupRoot<'_>) -> DropReach {
+    fn decide_drop_reach(&self, view: &DropView, root: Option<&dyn crate::containment::Root>) -> DropReach {
         let Some(skipped) = view.skipped_action(self) else {
             return DropReach::Kill;
         };

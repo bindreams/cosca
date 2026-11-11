@@ -188,11 +188,7 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_settled(
-                        "graceful_shutdown",
-                        &self.tree_killed,
-                        &crate::containment::GroupRoot::none(),
-                    )
+                    .hard_kill_settled("graceful_shutdown", &self.tree_killed, None)
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
                 self.cgroup_kill_reached(front)?;
             }
@@ -481,7 +477,7 @@ impl Child {
 
     /// `graceful_shutdown_tree`'s look at the root and its cooperative signal, for the sync and the
     /// async call alike. This handle's reaps are held off from the look until the `SIGTERM` is sent.
-    /// The hold is a std lock, and the group borrows it, so neither may live in an async caller's
+    /// The hold is a std lock, and the root borrows it, so neither may live in an async caller's
     /// state: this is a plain `fn`, and the paths that send nothing by the root's number leave the
     /// hold here, before the caller waits the grace.
     pub(crate) fn signal_tree_cooperatively(
@@ -491,11 +487,11 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
         #[cfg(unix)]
-        let group = held.group();
+        let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
-        let group = crate::containment::GroupRoot::none();
+        let root: Option<&dyn crate::containment::Root> = None;
         #[cfg(unix)]
-        let (decided, earlier) = match call.graceful(|| held.state(), &group) {
+        let (decided, earlier) = match call.graceful(|| held.state(), root) {
             crate::child::Graceful::Signal => (None, Some("the SIGTERM")),
             crate::child::Graceful::Sent { result, earlier } => (Some(result), earlier),
             crate::child::Graceful::End(e) => return SignalTreeCooperativelyOutcome::End(e),
@@ -513,7 +509,7 @@ impl Child {
             if let Some(result) = decided {
                 return result;
             }
-            self.terminate_tree_unchecked(&group)
+            self.terminate_tree_unchecked(root)
         };
 
         #[cfg(test)]

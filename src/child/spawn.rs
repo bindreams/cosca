@@ -153,7 +153,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.pid());
-        child.attached.hard_kill_for_drop(&view, &held.group())
+        child.attached.hard_kill_for_drop(&view, Some(&held))
     };
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         let kill = kill_tree();
@@ -1090,6 +1090,20 @@ enum Reach {
     Holders(crate::containment::fdmarker::Marker),
 }
 
+/// The late child's root, for a send by its pid: the state is a verified peek, read afresh right
+/// before each send. There is no pidfd on macOS.
+#[cfg(target_os = "macos")]
+impl crate::containment::Root for LateTree {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn state(&self) -> crate::signal::RootState {
+        let target = crate::wait::exit_only::Target::pid(self.pid, Some(self.unique));
+        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
+    }
+}
+
 /// The tree of a child whose report came late, and the notes its sweeps owe the teardown's `warn`.
 #[cfg(target_os = "macos")]
 struct LateTree {
@@ -1164,21 +1178,12 @@ impl LateTree {
         match (&self.reach, sweep) {
             (Reach::None, _) => {}
             (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
-                let (pid, unique) = (self.pid, self.unique);
                 // The root is this process's unreaped child, shown by a verified peek right before each
                 // send by its pid.
                 #[cfg(test)]
                 crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
-                let check = || {
-                    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-                    let state = crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target));
-                    crate::child::tree_call::group_number_holds(pid, state)
-                };
-                self.sweeps.push(
-                    attached
-                        .hard_kill(&crate::containment::GroupRoot::new(None, &check))
-                        .into_result(),
-                );
+                let sweep = attached.hard_kill(Some(&*self)).into_result();
+                self.sweeps.push(sweep);
             }
             // The root is not shown ours any more: only the holders, and never the root.
             (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {

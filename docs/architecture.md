@@ -78,7 +78,7 @@ In order:
    - Spawn (the spawn-time slice): `exit_only::Target` and `exit_only::Reap`, which spawn
      identity, `kill_and_reap_*` and `unique_report` still take by handle or number;
      `await_reapable` and its kqueue round hooks (macOS), which spawn teardown still waits
-     through; `GroupRoot::new` at the failed-spawn identity check (`spawn.rs`); the
+     through; `LateTree`'s `Root` at the failed-spawn identity check (`spawn.rs`); the
      `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, split at its one wait (`begin_tear_down` returns the
      teardown's end or a pending wait, which `settle` blocks on and `settle_async` awaits), and

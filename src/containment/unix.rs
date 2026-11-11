@@ -38,7 +38,7 @@
 //! Once the leader is reaped its PID/PGID may be reissued, and `killpg` would then signal that
 //! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
 //! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
-//! that, and the leader's signal) runs right after its own check of the root ([`GroupRoot::check`]:
+//! that, and the leader's signal) runs right after its own check of the root ([`check_number`]:
 //! on 6.9+ whether the pidfd's group still has a member). On Linux a member's `SIGKILL` resend pins
 //! the member by a pidfd its identity check vouches for, then checks the root, then sends through
 //! that pidfd. A member's `SIGTERM` probe, and a resend by the member's pid, checks the root, then
@@ -50,7 +50,7 @@ use std::io;
 
 use nix::sys::signal::Signal;
 
-use crate::containment::GroupRoot;
+use crate::containment::{check_number, Root};
 use crate::error::Error;
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).
@@ -81,7 +81,7 @@ pub(crate) fn set_session(steps: &mut crate::child::spawn::in_child::InChild) {
 /// only an adversarial fork-bomb) is never seen, never signalled, and does not affect the
 /// verdict. `Attached::Cgroup` (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
-pub(crate) fn kill_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
+pub(crate) fn kill_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
     #[cfg(test)]
     if let Some(outcome) = fault::intercept_kill_group(pgid) {
         return outcome;
@@ -285,7 +285,7 @@ pub(crate) mod fault {
 
 /// Send the graceful signal to the whole process group, then confirm no live
 /// member refused it. See [`signal_group`].
-pub(crate) fn term_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
+pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
         return Ok(());
@@ -301,7 +301,7 @@ pub(crate) fn term_group(pgid: i32, root: &GroupRoot<'_>) -> Result<(), Error> {
 /// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
 /// the broadcast/double-negation hazard this file's Background measures. A check placed after
 /// the dangerous syscall it claims to guard is not a guard.
-fn signal_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> {
+fn signal_group(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Error> {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
@@ -345,10 +345,10 @@ fn signal_group(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), E
 pub(crate) fn send_to_group(
     pgid: i32,
     signal: Signal,
-    root: &GroupRoot<'_>,
+    root: Option<&dyn Root>,
 ) -> Result<Result<(), nix::errno::Errno>, Error> {
     #[cfg(target_os = "linux")]
-    if let Some(pidfd) = root.pidfd() {
+    if let Some(pidfd) = root.and_then(Root::pidfd) {
         match pidfd_signal(pidfd, signal, Through::Group) {
             Err(nix::errno::Errno::EINVAL) => log::debug!(
                 "containment::unix: the kernel refused PIDFD_SIGNAL_PROCESS_GROUP (expected below Linux 6.9), so process group {pgid} is signalled by its number"
@@ -356,7 +356,7 @@ pub(crate) fn send_to_group(
             sent => return Ok(sent),
         }
     }
-    root.check().map_err(|why| Error::Unassessable {
+    check_number(root).map_err(|why| Error::Unassessable {
         detail: format!(
             "process group {pgid}: {why}, so its number may name another group, and {signal} was not sent by it"
         ),
@@ -549,7 +549,7 @@ fn pidfd_send_syscall(
 /// Turn the group's actual membership into a contract answer — the single source of truth
 /// regardless of what `killpg` reported. See `group`'s module docs for the listing and
 /// signal-delivery design (one pass; `SIGKILL` resends for real, `SIGTERM` only probes).
-fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> {
+fn verify(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Error> {
     match group::state(pgid, signal, root) {
         group::GroupState::Cleared => Ok(()),
         group::GroupState::Refused { refused, unassessable } => {
@@ -612,15 +612,17 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
 ///
 /// On Linux it goes through the root's pidfd when it has one, which names the leader exactly;
 /// otherwise by `pid`, right after the root's own check, and not at all if that fails.
-fn signal_direct(pid: i32, signal: Signal, root: &GroupRoot<'_>) -> io::Result<()> {
+fn signal_direct(pid: i32, signal: Signal, root: Option<&dyn Root>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    let sent = root.pidfd().map(|pidfd| pidfd_signal(pidfd, signal, Through::Leader));
+    let sent = root
+        .and_then(Root::pidfd)
+        .map(|pidfd| pidfd_signal(pidfd, signal, Through::Leader));
     #[cfg(not(target_os = "linux"))]
     let sent = None;
     let sent = match sent {
         Some(sent) => sent,
         None => {
-            if let Err(why) = root.check() {
+            if let Err(why) = check_number(root) {
                 log::debug!("containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}");
                 return Err(io::Error::other(why.to_string()));
             }
