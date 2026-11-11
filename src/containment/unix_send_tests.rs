@@ -4,7 +4,7 @@
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::kill_group;
-use crate::send_log::{GroupStep, Route};
+use crate::send_log::{GroupStep, OrderedStep, Route};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
@@ -57,10 +57,30 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
     }
 }
 
+/// Every send by the group's number, and every `SIGKILL` resend to a listed member through its own
+/// handle, is right after its own check of the root. `steps` merges the two logs in the order the
+/// sends were made.
+#[track_caller]
+fn assert_each_send_follows_its_check(steps: &[OrderedStep]) {
+    for (i, step) in steps.iter().enumerate() {
+        let needs_check = matches!(
+            step,
+            OrderedStep::Group(GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _))
+                | OrderedStep::Identity(_, libc::SIGKILL)
+        );
+        if needs_check {
+            assert!(
+                i > 0 && steps[i - 1] == OrderedStep::Group(GroupStep::Check),
+                "step {i} ({step:?}) is not right after a check of the root: {steps:?}"
+            );
+        }
+    }
+}
+
 /// With the group's own send refused, the leader's signal and two members' resends follow it, and
-/// each send by the group's number has a check of its own right before it. Mutants: "check once
-/// before the `killpg` and send the rest on its strength", "no check before the leader's signal",
-/// "check once before the members' resends".
+/// each send by the group's number and each resend has a check of its own right before it. Mutants:
+/// "check once before the `killpg` and send the rest on its strength", "no check before the
+/// leader's signal", "check once before the members' resends".
 #[skuld::test]
 fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     let (mut child, stdin, members) = group_of_three();
@@ -71,9 +91,10 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     kill_group(pgid, Some(&root)).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
+    let ordered = capture.ordered_steps();
     drop(stdin);
 
-    assert_each_send_by_number_follows_its_check(&steps);
+    assert_each_send_follows_its_check(&ordered);
     assert!(
         steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _)))
             && steps.iter().any(|s| matches!(s, GroupStep::Leader(..))),
@@ -87,22 +108,6 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
         .filter(|&(_, signo)| signo == libc::SIGKILL)
         .map(|(pid, _)| pid)
         .collect();
-    // The handle's sends are noted apart from the steps, so their own checks are counted.
-    let by_number = steps
-        .iter()
-        .filter(|s| {
-            matches!(
-                s,
-                GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _)
-            )
-        })
-        .count();
-    let checks = steps.iter().filter(|s| matches!(s, GroupStep::Check)).count();
-    assert!(
-        checks >= by_number + resent.len(),
-        "each send has a check of its own: {checks} checks for {by_number} sends by number and {} resends: {steps:?}",
-        resent.len()
-    );
     for member in members {
         assert_eq!(
             resent.iter().filter(|&&pid| pid == member).count(),
