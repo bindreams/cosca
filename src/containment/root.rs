@@ -1,17 +1,25 @@
 //! The root of a tree whose mechanism sends by the root's pid (a process group, a macOS fd marker's
 //! group), and what such a mechanism does about the number from one look at it.
 
+use crate::error::Error;
 use crate::identity::RawPid;
 #[cfg(unix)]
 use crate::signal::RootState;
+use crate::signal::{Sent, Sig};
 
 /// The root of a tree, asked right before each send by its pid: the answer serves that send alone,
 /// so no checked pid outlives the send it was checked for. Every call that takes one takes
-/// `Option<&dyn Root>`; `None` for a caller whose mechanism names no group, which never sends by
-/// the root's pid. A tree call and a drop alike get the same answer for the same root.
+/// `Option<&dyn Root>`; `None` for a caller whose mechanism names neither a group nor a walk, which
+/// never sends by the root's pid or to the root itself. A tree call and a drop alike get the same
+/// answer for the same root.
 pub(crate) trait Root {
     #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends by the root's pid"))]
     fn pid(&self) -> u32;
+
+    /// Send `sig` to the root through the handle that holds it, the one route a walk sends the root
+    /// its own signal by, with no second open of its identity. [`Sent::Gone`] when the root is no
+    /// longer the process held.
+    fn signal(&self, sig: Sig) -> Result<Sent, Error>;
 
     /// What the root's own handle shows now ([`RootState`]), read live: right before each send by
     /// the root's pid.
@@ -52,6 +60,10 @@ impl<'a> Seen<'a> {
 impl Root for Seen<'_> {
     fn pid(&self) -> u32 {
         self.root.pid()
+    }
+
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        self.root.signal(sig)
     }
 
     fn state(&self) -> RootState {

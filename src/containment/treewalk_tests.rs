@@ -551,7 +551,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         children.iter().any(|id| id.pid() == held),
         "{held} not among {children:?}"
     );
-    super::hard_kill(&HostKernel, root)
+    super::hard_kill(&HostKernel, root, &super::root_by_identity(&HostKernel, root))
         .into_result()
         .expect("an exited root whose handle is held is walked completely");
 
@@ -619,12 +619,13 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
 }
 
 /// A root the walk may read but not terminate is left running, and `hard_kill` is an error naming it
-/// and why. Mutant: `hard_kill` drops a `NotAttempted` outcome.
+/// and why: the open succeeds with the rights the process grants, and the kill is refused. Mutant:
+/// `hard_kill` drops a `NotAttempted` outcome.
 #[cfg(windows)]
 #[skuld::test]
-fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
+fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
     let Some(done) = crate::test_own_process::own_process(
-        crate::test_own_process::test_path!(hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it),
+        crate::test_own_process::test_path!(hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it),
         crate::test_spawn::spawn,
     ) else {
         return;
@@ -634,7 +635,8 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    match super::hard_kill(&crate::identity::HostKernel, id).into_result() {
+    let kernel = crate::identity::HostKernel;
+    match super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id)).into_result() {
         Err(super::Unkilled {
             members,
             root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
@@ -655,7 +657,7 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
         }
         other => panic!("expected MemberNotKilled for the root, got {other:?}"),
     }
-    assert!(child.is_running(), "a denied open must leave the process running");
+    assert!(child.is_running(), "a refused kill must leave the process running");
 }
 
 /// A member the OS refuses the signal is left running, and `hard_kill`'s error carries the refusal's
@@ -667,12 +669,11 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
-    let left = super::hard_kill(
-        &crate::identity::HostKernel,
-        child.id().expect(crate::test_child::IDENTITY_READ),
-    )
-    .into_result()
-    .expect_err("the kill is refused");
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let kernel = crate::identity::HostKernel;
+    let left = super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id))
+        .into_result()
+        .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
     let err = left.root.expect("the root was left");
     // The message reads once: the pid, then the OS's own words.
@@ -705,12 +706,11 @@ fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_
 ) {
     let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
 
-    let left = super::hard_kill(
-        &crate::identity::HostKernel,
-        child.id().expect(crate::test_child::IDENTITY_READ),
-    )
-    .into_result()
-    .expect_err("the helper refuses the kill");
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let kernel = crate::identity::HostKernel;
+    let left = super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id))
+        .into_result()
+        .expect_err("the helper refuses the kill");
 
     assert!(left.root.is_none(), "the root was killed: {:?}", left.root);
     assert_eq!(left.members.len(), 1, "{:?}", left.members);
@@ -798,11 +798,9 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |_| {});
     let mark = crate::log_capture::mark();
 
-    super::terminate(
-        &crate::identity::HostKernel,
-        child.id().expect(crate::test_child::IDENTITY_READ),
-    )
-    .expect("best effort");
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let kernel = crate::identity::HostKernel;
+    super::terminate(&kernel, id, &super::root_by_identity(&kernel, id)).expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     let warned = crate::log_capture::warns_since(mark, "was sent no SIGTERM");
@@ -825,8 +823,8 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         return;
     };
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
-    // The ACE must grant QUERY_LIMITED as well as TERMINATE: kill_by_identity opens for
-    // both, and a combined-mask OpenProcess fails entirely if ANY requested bit is ungranted.
+    // The ACE must grant QUERY_LIMITED: the open needs it to verify the identity, and drops each of
+    // SYNCHRONIZE and TERMINATE that the process refuses.
     let (child, stdin) =
         crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())

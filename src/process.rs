@@ -4,7 +4,7 @@
 //! never a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
 //! `graceful_shutdown_tree`) walk by identity and signal each member, through a handle opened by
 //! its identity: a pidfd proved to name it on Linux, a process handle on Windows, an audit token on
-//! macOS. `kill_tree` signals the root through this handle instead of a second open of it.
+//! macOS. The tree acts signal the root through this handle instead of a second open of it.
 //! `wait()` is a death-watch yielding no `ExitStatus` (the kernel
 //! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
@@ -22,8 +22,8 @@ mod graceful;
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
 /// `graceful_shutdown_tree`) signal each member through a handle opened by its identity (a pidfd
-/// proved to name it on Linux, a process handle on Windows, an audit token on macOS); `kill_tree`
-/// signals the root through this handle. Not `Clone`: open the [`ProcessId`] again.
+/// proved to name it on Linux, a process handle on Windows, an audit token on macOS); each signals
+/// the root through this handle. Not `Clone`: open the [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,
@@ -51,7 +51,9 @@ impl Process {
 
     /// [`open`](Self::open), re-verifying `id` through `kernel`.
     pub(crate) fn open_with(kernel: &dyn crate::identity::Kernel, id: ProcessId) -> Result<Option<Process>, Error> {
-        Ok(crate::os_process::open_with(kernel, id)?.map(|os| Process { id, os }))
+        Ok(crate::os_process::open_with(kernel, id)
+            .map_err(crate::os_process::OpenFailure::into_open_error)?
+            .map(|os| Process { id, os }))
     }
 
     /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid;

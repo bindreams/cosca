@@ -615,14 +615,11 @@ impl Child {
             crate::elevation::front::Gate::Exited => Some(None),
             crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
         };
-        // The mechanism looks at the root right before it sends by the root's number. This handle's
-        // reaps are held off from the look to the end of the sweep's sends.
-        #[cfg(unix)]
+        // The mechanism looks at the root right before it sends by the root's number, and sends the
+        // root its own signal through this handle. On Unix, this handle's reaps are held off from the
+        // look to the end of the sweep's sends.
         let held = self.proc.hold(self.pid());
-        #[cfg(unix)]
         let root: Option<&dyn crate::containment::Root> = Some(&held);
-        #[cfg(not(unix))]
-        let root: Option<&dyn crate::containment::Root> = None;
         let group_result = self.tree.kill(root);
         #[cfg(unix)]
         let group_result = match group_result {
@@ -667,8 +664,8 @@ impl Child {
             }
             .map_err(SweepFailure::from);
         }
-        // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
-        // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
+        // Backstop for the TreeWalk mechanism: its hard_kill sends the root's kill through this handle,
+        // but kills nothing if the walk finds no root or cannot read the process table — this
         // handle-based kill covers that, so its failure is contract-relevant.
         // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
         // launchd holds, so there is nothing left for the backstop to kill.
@@ -679,9 +676,14 @@ impl Child {
             );
             (Ok(()), true)
         } else {
+            let sent = self.kill_root();
+            // Where a test tells this send from the walk's own kill of the root through the same handle.
+            #[cfg(all(test, unix))]
+            if !matches!(sent, Ok(crate::signal::Sent::Gone)) {
+                crate::send_log::record(self.pid(), crate::signal::Sig::Kill, crate::send_log::Via::Handle);
+            }
             SweepFailure::backstop_of(
-                self.kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
+                sent.map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
         SweepFailure::of(op, &self.tree, group_result, backstop, root_ended)
@@ -764,14 +766,10 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // The mechanism looks at the root as for `kill_tree`, and this handle's reaps are held off
-        // until the signal is sent.
-        #[cfg(unix)]
+        // The mechanism looks at the root as for `kill_tree`, and on Unix this handle's reaps are held
+        // off until the signal is sent.
         let held = self.proc.hold(self.pid());
-        #[cfg(unix)]
         let root: Option<&dyn crate::containment::Root> = Some(&held);
-        #[cfg(not(unix))]
-        let root: Option<&dyn crate::containment::Root> = None;
         let outcome = self.tree.terminate(self.pid(), root);
         #[cfg(unix)]
         {

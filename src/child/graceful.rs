@@ -479,12 +479,8 @@ impl Child {
     /// root borrowing it must not live in an async caller's state, so paths that send nothing release
     /// the hold here, before the grace.
     pub(crate) fn signal_tree_cooperatively(&self) -> SignalTreeCooperativelyOutcome {
-        #[cfg(unix)]
         let held = self.proc.hold(self.pid());
-        #[cfg(unix)]
         let root: Option<&dyn crate::containment::Root> = Some(&held);
-        #[cfg(not(unix))]
-        let root: Option<&dyn crate::containment::Root> = None;
         #[cfg(test)]
         if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
             return forced;

@@ -456,6 +456,10 @@ impl crate::containment::Root for ReapHold<'_> {
         self.pid
     }
 
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        ReapHold::signal(self, sig)
+    }
+
     fn state(&self) -> crate::signal::RootState {
         ReapHold::state(self)
     }
@@ -463,6 +467,32 @@ impl crate::containment::Root for ReapHold<'_> {
     #[cfg(target_os = "linux")]
     fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.child.pidfd()
+    }
+}
+
+/// [`OwnedChild::hold`] where nothing is sent by the root's pid (Windows): there is no reap to hold
+/// off, and the root is what a tree call sends the root's own signal through.
+#[cfg(not(unix))]
+pub(crate) struct ReapHold<'a> {
+    child: &'a OwnedChild,
+    pid: u32,
+}
+
+#[cfg(not(unix))]
+impl OwnedChild {
+    pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {
+        ReapHold { child: self, pid }
+    }
+}
+
+#[cfg(not(unix))]
+impl crate::containment::Root for ReapHold<'_> {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        self.child.signal(sig)
     }
 }
 

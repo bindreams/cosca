@@ -485,8 +485,9 @@ fn resend_sigkill(
     id: crate::identity::ProcessId,
     root: Option<&dyn Root>,
 ) -> Reached {
-    use crate::signal::{Sent, Sig};
-    match crate::os_process::open_with(kernel, id) {
+    use crate::containment::treewalk::KillOutcome;
+    use crate::signal::Sig;
+    match crate::os_process::open_with(kernel, id).map_err(crate::os_process::OpenFailure::into_open_error) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(os)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
@@ -498,24 +499,21 @@ fn resend_sigkill(
                     if cfg!(target_os = "linux") {
                         crate::send_log::Route::Pidfd
                     } else {
-                        crate::send_log::Route::Number
+                        crate::send_log::Route::AuditToken
                     },
                     id.pid(),
                     libc::SIGKILL,
                 ));
-                match sent {
-                    Ok(Sent::Delivered) => Reached::Yes,
-                    // Exited between the open and the send.
-                    Ok(Sent::Gone) => Reached::Yes,
-                    Ok(Sent::Unverified) => {
-                        debug_assert!(false, "a member opened by identity cannot be unverified");
-                        Reached::Unknown
-                    }
-                    Err(crate::error::Error::Io(refused)) if refused.raw_os_error() == Some(libc::EPERM) => {
+                match KillOutcome::of(sent) {
+                    // Exited between the open and the send, or delivered.
+                    KillOutcome::Terminated | KillOutcome::AlreadyGone => Reached::Yes,
+                    KillOutcome::NotAttempted(crate::error::Error::Io(refused))
+                        if refused.raw_os_error() == Some(libc::EPERM) =>
+                    {
                         log::debug!("containment::unix::group: SIGKILL to pid {} refused: EPERM", id.pid());
                         Reached::No
                     }
-                    Err(e) => {
+                    KillOutcome::NotAttempted(e) => {
                         log::warn!(
                             "containment::unix::group: SIGKILL to pid {} answered {report}, neither EPERM nor ESRCH",
                             id.pid(),

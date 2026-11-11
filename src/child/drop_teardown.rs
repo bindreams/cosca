@@ -134,7 +134,7 @@ impl Child {
         }
         #[cfg(not(unix))]
         {
-            let tree = self.tree.kill(None);
+            let tree = self.tree.kill(Some(&self.proc.hold(self.pid())));
             let parts = DropParts {
                 caller,
                 tree: Some(tree),

@@ -80,19 +80,22 @@ type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
 fn id_walks() -> [(&'static str, Walk); 2] {
     [
         ("hard_kill", |k, id| {
-            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
+            super::hard_kill(k, id, &super::root_by_identity(k, id))
+                .into_result()
+                .map_err(Unkilled::into_error)
         }),
-        ("terminate", |k, id| super::terminate(k, id)),
+        ("terminate", |k, id| {
+            super::terminate(k, id, &super::root_by_identity(k, id))
+        }),
     ]
 }
 
 /// Every walk, `Process`'s included, over an open handle on the live `id`.
 fn walks() -> [(&'static str, Walk); 4] {
+    let [hard_kill, terminate] = id_walks();
     [
-        ("hard_kill", |k, id| {
-            super::hard_kill(k, id).into_result().map_err(Unkilled::into_error)
-        }),
-        ("terminate", |k, id| super::terminate(k, id)),
+        hard_kill,
+        terminate,
         ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
         ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
     ]
@@ -244,7 +247,9 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
         let pids: Vec<u32> = members.iter().map(ProcessId::pid).collect();
         assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
-    super::hard_kill(&kernel, root).into_result().expect("the walk ran");
+    super::hard_kill(&kernel, root, &super::root_by_identity(&kernel, root))
+        .into_result()
+        .expect("the walk ran");
     // Both were killed: the root by its signal, the descendant before it could print.
     let mut printed = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut printed).expect("read to EOF");
@@ -403,9 +408,14 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
 /// re-verify, which finds another start time. Nothing is signalled. The root's own pidfd passes the
 /// proof's fdinfo check, so the `stat` is what the row is about. Mutants: "the walk's kill
 /// re-verifies through `HostKernel`"; "the kill ignores a start time that differs".
+///
+/// Only the walks that open their root by identity have a kill-time re-verify to test: a root killed
+/// through a held handle (`Process::kill_tree`, `terminate_tree`) needs none, as the handle names it.
+/// A descendant's re-verify is pinned by
+/// `every_id_walk_re_verifies_a_descendants_kill_through_its_kernel`, through the same loop.
 #[skuld::test]
 fn every_walk_re_verifies_its_kill_through_its_kernel() {
-    for (name, walk) in walks() {
+    for (name, walk) in id_walks() {
         let (child, id) = live_member();
         // The `/proc` path, as above.
         let id = ticks_id(id.pid());
@@ -537,7 +547,7 @@ fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, Proc
 fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_and_leaves_terminate_ok() {
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let cause = format!("pid {} identity could not be read", descendant.pid());
-    let left = super::hard_kill(&kernel, root)
+    let left = super::hard_kill(&kernel, root, &super::root_by_identity(&kernel, root))
         .into_result()
         .expect_err("a descendant was left");
     assert!(!left.members.is_empty(), "a descendant was left, not only the root");
@@ -550,7 +560,7 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
     release_with_a_signalled_root("kill_tree", child, libc::SIGKILL);
 
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
-    super::terminate(&kernel, root).expect("best effort");
+    super::terminate(&kernel, root, &super::root_by_identity(&kernel, root)).expect("best effort");
     release_with_a_signalled_root("terminate", child, libc::SIGTERM);
 }
 
@@ -567,7 +577,7 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let mark = crate::log_capture::mark();
-    super::hard_kill(&kernel, root)
+    super::hard_kill(&kernel, root, &super::root_by_identity(&kernel, root))
         .into_result()
         .expect_err("a descendant was left");
     assert_eq!(
@@ -590,7 +600,7 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let mark = crate::log_capture::mark();
-    super::terminate(&kernel, root).expect("best effort");
+    super::terminate(&kernel, root, &super::root_by_identity(&kernel, root)).expect("best effort");
     let warned = warns_naming(mark, descendant);
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(
@@ -613,7 +623,7 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     let second = root.pid().wrapping_add(1);
     let mark = crate::log_capture::mark();
     fault::force_incomplete_once(LeftBehind::Descendant);
-    let left = super::hard_kill(&kernel, root)
+    let left = super::hard_kill(&kernel, root, &super::root_by_identity(&kernel, root))
         .into_result()
         .expect_err("two members were left");
     let warned = crate::log_capture::warns_since(mark, "treewalk:");

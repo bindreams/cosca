@@ -20,6 +20,8 @@ use crate::signal::Sig;
 pub(crate) enum Via {
     Pidfd,
     Pid,
+    /// `Child::kill_tree`'s backstop, the root's kill through the child's own handle after the
+    /// sweep: written by the caller, beside the send's own record.
     Handle,
     Identity,
 }
@@ -70,9 +72,15 @@ pub(crate) fn assert_group_signalled_first_through_the_pidfd(steps: &[GroupStep]
 /// How a [`GroupStep`] send named its target.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "only Linux sends through a pidfd")]
+#[allow(
+    dead_code,
+    reason = "only Linux sends through a pidfd, and only macOS through an audit token"
+)]
 pub(crate) enum Route {
     Pidfd,
+    /// macOS: a send to a held process through an audit token, which the kernel checks against the
+    /// process's `p_idversion`.
+    AuditToken,
     Number,
 }
 

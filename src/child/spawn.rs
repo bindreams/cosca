@@ -1094,6 +1094,22 @@ impl crate::containment::Root for LateTree {
         self.pid
     }
 
+    /// The late child holds no handle on its root: it is opened by its identity for the one send.
+    fn signal(&self, sig: crate::signal::Sig) -> Result<crate::signal::Sent, crate::error::Error> {
+        let Some(id) = self.id else {
+            return Err(crate::error::Error::Unassessable {
+                detail: format!("the late child (pid {}) has no identity to open it by", self.pid),
+                source: None,
+            });
+        };
+        match crate::os_process::open_with(&crate::identity::HostKernel, id)
+            .map_err(crate::os_process::OpenFailure::into_open_error)?
+        {
+            Some(os) => os.signal(sig),
+            None => Ok(crate::signal::Sent::Gone),
+        }
+    }
+
     fn state(&self) -> crate::signal::RootState {
         if matches!(self.sweep, Sweep::RootKilled { zombie: false }) {
             return crate::signal::RootState::Unpinned;

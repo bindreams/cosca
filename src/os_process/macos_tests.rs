@@ -210,10 +210,23 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
     child.wait().unwrap();
 }
 
-/// Mutant: `open` ignores the second unique-id read, so a pid taken between the first read and
-/// the arming of the watch is watched as the original.
+/// Mutant: the open arms the watch, so it costs a descriptor and a send can fail for want of one.
 #[skuld::test]
-fn open_is_none_when_another_process_holds_the_pid_after_arming() {
+fn an_open_and_a_send_arm_no_watch_and_the_first_look_arms_it() {
+    let (mut child, id) = blocker();
+    let p = MacProcess::open(id).unwrap().expect("a live process opens");
+    assert!(p.watch.get().is_none(), "an open arms nothing");
+    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+    assert!(p.watch.get().is_none(), "a send arms nothing");
+    assert!(exited_held(&p, None).unwrap());
+    assert!(p.watch.get().is_some(), "the first look arms the watch");
+    child.wait().unwrap();
+}
+
+/// Mutant: the arming ignores its unique-id read, so a pid taken between the open and the first look
+/// is watched as the original.
+#[skuld::test]
+fn a_watch_armed_while_another_process_holds_the_pid_reads_exited() {
     use crate::identity::uniq_fault::force_uniq_read_once;
     use crate::identity::UniqInfo;
 
@@ -221,7 +234,7 @@ fn open_is_none_when_another_process_holds_the_pid_after_arming() {
     let UniqRead::Found(real) = uniq_info(id.pid(), ReadPurpose::Kill) else {
         panic!("the blocker's unique id must be readable");
     };
-    let _first = force_uniq_read_once(ReadPurpose::Open, UniqRead::Found(real));
+    let p = open(id).unwrap().expect("a live process opens");
     let _second = force_uniq_read_once(
         ReadPurpose::Open,
         UniqRead::Found(UniqInfo {
@@ -229,7 +242,25 @@ fn open_is_none_when_another_process_holds_the_pid_after_arming() {
             ..real
         }),
     );
-    assert!(open(id).unwrap().is_none());
+    assert!(
+        matches!(p.exited().unwrap(), Exit::Exited),
+        "the process that was opened is not the one holding the pid"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Mutant: a refused read at the arming is read as an exit, or loses the errno.
+#[skuld::test]
+fn a_refused_read_at_the_arming_is_unassessable_with_the_errno() {
+    use crate::identity::uniq_fault::force_uniq_read_once;
+
+    let (mut child, id) = blocker();
+    let p = open(id).unwrap().expect("a live process opens");
+    let _refused = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
+    let err = p.exited().expect_err("a refused read is an error");
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -258,7 +289,7 @@ fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
     use crate::identity::uniq_fault::force_uniq_read_once;
 
     let _forced = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
-    let err = super::read_for_open(77, "wait", "it was not opened").expect_err("refused");
+    let err = super::read_for_open(77, "it was not opened").expect_err("refused");
     match &err {
         Error::Unassessable { detail, .. } => {
             assert_eq!(detail, "pid 77 identity could not be read; it was not opened");
@@ -288,7 +319,7 @@ fn pid_zero_is_refused_unassessable() {
         id: ProcessId::from_parts_for_test(0, crate::identity::Key::for_test(1)),
         unique: 1,
         idversion: std::sync::atomic::AtomicI32::new(1),
-        watch: ExitWatch::new(super::kqueue::Kqueue::new().unwrap()),
+        watch: std::sync::OnceLock::new(),
     };
     let sends = crate::send_log::Capture::start();
     let err = p.signal(Sig::Kill).expect_err("pid 0 is no target");

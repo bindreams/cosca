@@ -21,11 +21,15 @@ type Walk = fn(&crate::Process) -> Result<(), Error>;
 fn walks() -> [(&'static str, Walk); 4] {
     [
         ("hard_kill", |p| {
-            super::hard_kill(&crate::identity::HostKernel, p.id())
+            let hk = &crate::identity::HostKernel;
+            super::hard_kill(hk, p.id(), &super::root_by_identity(hk, p.id()))
                 .into_result()
                 .map_err(crate::containment::dispatch::Unkilled::into_error)
         }),
-        ("terminate", |p| super::terminate(&crate::identity::HostKernel, p.id())),
+        ("terminate", |p| {
+            let hk = &crate::identity::HostKernel;
+            super::terminate(hk, p.id(), &super::root_by_identity(hk, p.id()))
+        }),
         ("kill_tree", |p| p.kill_tree()),
         ("terminate_tree", |p| p.terminate_tree()),
     ]
@@ -135,14 +139,15 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
     let stale = me.with_other_value();
 
     let (child, _) = live_member();
-    let result = super::hard_kill(&crate::identity::HostKernel, stale)
+    let kernel = crate::identity::HostKernel;
+    let result = super::hard_kill(&kernel, stale, &super::root_by_identity(&kernel, stale))
         .into_result()
         .map_err(crate::containment::dispatch::Unkilled::into_error);
     assert_unassessable_naming(result, "no walk ran");
     release(child);
 
     let (child, _) = live_member();
-    let result = super::terminate(&crate::identity::HostKernel, stale);
+    let result = super::terminate(&kernel, stale, &super::root_by_identity(&kernel, stale));
     assert!(result.is_ok(), "terminate: {result:?}");
     release(child);
 }

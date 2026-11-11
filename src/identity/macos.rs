@@ -81,7 +81,7 @@ pub(crate) enum ReadPurpose {
     Adopt,
     /// The re-read just before a signal.
     Kill,
-    /// The reads that bracket the arming of an exit watch in `os_process::open`.
+    /// The read of `os_process::open`, and the one that follows the arming of its exit watch.
     Open,
     /// A peek that found an exit record, just before its consume.
     Peek,

@@ -84,7 +84,64 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
 /// tests' entry; the library opens through [`open_with`].
 #[cfg(test)]
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    open_with(&crate::identity::HostKernel, id)
+    open_with(&crate::identity::HostKernel, id).map_err(OpenFailure::into_open_error)
+}
+
+/// Why an [`open_with`] opened nothing and found nothing gone. It logs nothing: the caller that
+/// returns the error passes it on, and one that drops it warns.
+#[derive(Debug)]
+pub(crate) enum OpenFailure {
+    /// Linux: a pidfd call failed for a reason that says nothing about the target. The call and its
+    /// errno are for a consumer to build its own error from ([`into_open_error`](Self::into_open_error),
+    /// [`into_member_error`](Self::into_member_error)).
+    #[cfg(target_os = "linux")]
+    Call(crate::identity::FailedCall),
+    /// An error already in its final form: every other failure, on every platform.
+    Finished(Error),
+}
+
+impl From<Error> for OpenFailure {
+    fn from(error: Error) -> Self {
+        OpenFailure::Finished(error)
+    }
+}
+
+impl OpenFailure {
+    /// The error [`Process::open`](crate::Process::open) documents: a failed call is
+    /// [`open_error`](linux::open::open_error), the rest as they are.
+    pub(crate) fn into_open_error(self) -> Error {
+        match self {
+            #[cfg(target_os = "linux")]
+            OpenFailure::Call(call) => linux::open::open_error(call),
+            OpenFailure::Finished(error) => error,
+        }
+    }
+
+    /// The error a walk gives a member of `pid` that cannot be opened by identity, which leaves
+    /// nothing to send to: the error the walk gives the same pid when it cannot read it
+    /// ([`unqueryable`](crate::identity::unqueryable)). Linux names a failed call by it, and an
+    /// error that is no refusal of a signal (a live thread that leads no group, a `poll` that
+    /// reported `POLLERR`) is [`Error::Unassessable`] with it as its source.
+    pub(crate) fn into_member_error(self, pid: crate::identity::RawPid) -> Error {
+        match self {
+            #[cfg(target_os = "linux")]
+            OpenFailure::Call(call) => crate::identity::call_error(&format!("pid {pid}"), call),
+            #[cfg(target_os = "linux")]
+            OpenFailure::Finished(error @ (Error::Unassessable { .. } | Error::Unsupported { .. })) => error,
+            #[cfg(target_os = "linux")]
+            OpenFailure::Finished(other) => Error::Unassessable {
+                detail: format!(
+                    "pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {other}"
+                ),
+                source: Some(Box::new(other)),
+            },
+            #[cfg(not(target_os = "linux"))]
+            OpenFailure::Finished(error) => {
+                let _ = pid;
+                error
+            }
+        }
+    }
 }
 
 /// [`open`] through `kernel`: the one entry to the open, on every platform. Only Linux's
@@ -92,10 +149,10 @@ pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
 pub(crate) fn open_with(
     kernel: &dyn crate::identity::Kernel,
     id: ProcessId,
-) -> Result<Option<Box<dyn OsProcess>>, Error> {
+) -> Result<Option<Box<dyn OsProcess>>, OpenFailure> {
     #[cfg(target_os = "linux")]
     {
-        Ok(linux::open::open_verified_error_with(kernel, id)?
+        Ok(linux::open::open_verified_with(kernel, id)?
             .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>))
     }
     #[cfg(windows)]

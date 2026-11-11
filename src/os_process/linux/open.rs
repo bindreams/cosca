@@ -4,7 +4,7 @@
 //! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
 //! classification is documented once, on [`Error::Unsupported`]. [`open_verified_with`] keeps a
 //! failed pidfd call apart from the errors it has finished ([`OpenFailure`]), so each consumer builds
-//! its error from the call and its errno.
+//! its error from the call and its errno. No open logs: the caller that drops its error warns.
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
@@ -23,32 +23,10 @@ use crate::identity::{
     Existence, FailedCall, Kernel, Liveness, PidfdTarget, ProcView, ProcessId, Proof, ViewUnreadable,
 };
 use crate::os_process::poll::{look_readable, PollFailure};
-use crate::os_process::OPEN_CONSEQUENCE;
+use crate::os_process::{OpenFailure, OPEN_CONSEQUENCE};
 
 /// The operation an `Unsupported` open names.
 const OP_NAME: &str = "process open";
-
-/// Why [`open_verified_with`] opened nothing and found nothing gone.
-#[derive(Debug)]
-pub(crate) enum OpenFailure {
-    /// A pidfd call failed for a reason that says nothing about the target. The call and its errno are
-    /// for a consumer to build its own error from: a refused `pidfd_open` is [`Error::Unsupported`]
-    /// and anything else a failure carrying the raw errno.
-    Call(FailedCall),
-    /// An error already in its final form.
-    Finished(Error),
-}
-
-impl OpenFailure {
-    /// The error [`Process::open`](crate::Process::open) documents: a failed call is
-    /// [`open_error`], the rest as they are.
-    pub(crate) fn into_open_error(self) -> Error {
-        match self {
-            OpenFailure::Call(call) => open_error(call),
-            OpenFailure::Finished(error) => error,
-        }
-    }
-}
 
 /// [`open_verified_with`] with its failure as the error [`Process::open`](crate::Process::open)
 /// documents.
@@ -260,19 +238,12 @@ fn verify_pidfd_target(
 /// [`Error::Unsupported`] naming `openat2` when that is missing, else [`unassessable`].
 fn view_unreadable(id: ProcessId, why: ViewUnreadable, pidfd_errno: Option<rustix::io::Errno>) -> Error {
     match why.unsupported(OP_NAME) {
-        Some(unsupported) => {
-            log::warn!(
-                "wait: pid {} {OP_NAME}: {report}",
-                id.pid(),
-                report = crate::error::Report(&unsupported)
-            );
-            unsupported
-        }
+        Some(unsupported) => unsupported,
         None => unassessable(id, &why.reason, why.source, pidfd_errno),
     }
 }
 
-/// [`Error::Unassessable`] for `id`, logged at `warn`. `source()` is the OS error behind `why`,
+/// [`Error::Unassessable`] for `id`. `source()` is the OS error behind `why`,
 /// else the `pidfd_open` errno. When both exist, the message names the errno's call.
 fn unassessable(
     id: ProcessId,
@@ -285,14 +256,12 @@ fn unassessable(
         detail.push_str(&format!(" (pidfd_open: {errno})"));
     }
     detail.push_str(&format!("; {OPEN_CONSEQUENCE}"));
-    let error = Error::Unassessable {
+    Error::Unassessable {
         detail,
         source: source
             .or_else(|| pidfd_errno.map(|errno| crate::error::io_context("pidfd_open", std::io::Error::from(errno))))
             .map(Error::io_cause),
-    };
-    log::warn!("wait: {}", crate::error::Report(&error));
-    error
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 //! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process
 //! the crate does not own (no stdio, no reap). Lone ops are identity-bound and surface real
-//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). `kill_tree`
-//! kills the root through the held handle; `terminate_tree` signals it by identity, through a
-//! second open of it.
+//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). A tree op
+//! sends the root its signal through the held handle, with no second open of it.
 
 use std::time::Duration;
 
@@ -60,15 +59,14 @@ impl Process {
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         // No handle backstop: the root is left as any member is, and the first member left is the
         // error. This call's one report of the others.
-        crate::containment::treewalk::Walker::new(self.id)
-            .kill_through(kernel, &*self.os)
+        crate::containment::treewalk::hard_kill(kernel, self.id, &|sig| self.os.signal(sig))
             .into_result()
             .or_else(|left| left.unsettled(false))
             .map_err(|left| left.report("Process::kill_tree"))
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
-    /// then descendants). Signal-only. Unix only: on Windows this rests on
+    /// then descendants; the root through this handle). Signal-only. Unix only: on Windows this rests on
     /// [`terminate`](Process::terminate), whose absence — no way to learn whether a foreign
     /// pid leads a group — applies here too, so it returns `Unsupported`
     /// (use [`kill_tree`](Process::kill_tree) for a hard sweep).
@@ -85,7 +83,7 @@ impl Process {
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            crate::containment::treewalk::terminate(kernel, self.id)
+            crate::containment::treewalk::terminate(kernel, self.id, &|sig| self.os.signal(sig))
         }
         #[cfg(windows)]
         {
