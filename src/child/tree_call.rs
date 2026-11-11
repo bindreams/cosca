@@ -3,7 +3,7 @@
 
 use crate::child::drop_report::END_THEM_BEFORE_WAIT;
 use crate::containment::dispatch::{TreeKillOutcome, TreeSignal, Unkilled};
-use crate::containment::{Attached, GroupRoot, TreeKilled};
+use crate::containment::{reaped_pid_names_no_process, Attached, Root, TreeKilled};
 use crate::error::Error;
 use crate::identity::RawPid;
 use crate::signal::{RootState, Sent};
@@ -78,54 +78,24 @@ pub(crate) fn root_number(attached: &Attached, pid: RawPid, state: impl FnOnce()
     RootNumber::MayNameAnother { why, exact_root }
 }
 
-/// Why a send by the root's pid is skipped after this handle's own reap, while the pid names no
-/// process: it may be taken once the root's group has no member.
-fn reaped_pid_names_no_process(pid: RawPid) -> String {
-    format!("this handle reaped the root, and its pid ({pid}) names no process")
-}
-
-/// Whether the root's pid, `pid`, still names its process group, from `state`: the root's own
-/// handle's answer, read for a send by that number
-/// ([`GroupRoot::check`], as [`Child::kill_tree`](crate::Child::kill_tree) says). `Ok` only while
-/// the root is unreaped, as [`root_number`] decides. `Err` says why not.
-pub(crate) fn group_number_holds(pid: RawPid, state: RootState) -> Result<(), String> {
-    use crate::identity::Resolved;
-    match state {
-        RootState::Unreaped => Ok(()),
-        RootState::Reaped { own: true } => match crate::child::root_identity_now(pid) {
-            Resolved::Gone => Err(reaped_pid_names_no_process(pid)),
-            Resolved::Found(_) => Err(format!(
-                "this handle reaped the root, and another process holds its pid ({pid})"
-            )),
-            Resolved::Unknown => Err(format!(
-                "this handle reaped the root, and its pid ({pid}) could not be read"
-            )),
-        },
-        RootState::Reaped { own: false } => Err(format!("the root (pid {pid}) was reaped elsewhere")),
-        RootState::Unknown(e) => Err(format!(
-            "the root's own handle could not say whether it (pid {pid}) was reaped ({e})"
-        )),
-        RootState::Unpinned => Err(format!("the root (pid {pid}) is not pinned by this process")),
-    }
-}
-
 /// Linux 6.9+: `number` for a process group whose root's pid may name another process, decided again
-/// by the root's pidfd (`group`), which names the group exactly whoever reaped the root. While the
+/// by the root's pidfd (`root`), which names the group exactly whoever reaped the root. While the
 /// group has a member it is signalled as usual: the group's own signal goes through the pidfd, and
-/// each send by its number is checked the same way ([`GroupRoot::check`]). A reaped root's group with
-/// no member left is [`RootNumber::GroupGone`]. A root its handle cannot answer for, whose group has
-/// no member, may have left the group alive, so it keeps `number`; so does a kernel that cannot say.
+/// each send by its number is checked the same way ([`check_number`](crate::containment::check_number)).
+/// A reaped root's group with no member left is [`RootNumber::GroupGone`]. A root its handle cannot
+/// answer for, whose group has no member, may have left the group alive, so it keeps `number`; so
+/// does a kernel that cannot say.
 /// A drop and a failed elevated spawn's cleanup take the same decision
 /// ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)).
 #[cfg(target_os = "linux")]
-pub(crate) fn through_the_pidfd(attached: &Attached, number: RootNumber, group: &GroupRoot<'_>) -> RootNumber {
+pub(crate) fn through_the_pidfd(attached: &Attached, number: RootNumber, root: Option<&dyn Root>) -> RootNumber {
     let RootNumber::MayNameAnother { why, exact_root } = &number else {
         return number;
     };
     if !matches!(attached, Attached::ProcessGroup(_)) {
         return number;
     }
-    match group.has_member() {
+    match crate::containment::group_has_member(root) {
         Some(true) => {
             log::debug!(
                 "{why}, but its pidfd names its process group exactly, which still has a member: it is signalled"
@@ -174,12 +144,12 @@ pub(crate) enum Graceful {
 
 impl TreeCall<'_> {
     /// The call's one look at the root ([`root_number`]), and on Linux 6.9+ at its group through
-    /// `group`'s pidfd (`through_the_pidfd`).
+    /// `root`'s pidfd (`through_the_pidfd`).
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, reason = "only Linux has a pidfd"))]
-    pub(crate) fn root_number(&self, state: impl FnOnce() -> RootState, group: &GroupRoot<'_>) -> RootNumber {
+    pub(crate) fn root_number(&self, state: impl FnOnce() -> RootState, root: Option<&dyn Root>) -> RootNumber {
         let number = root_number(self.attached, self.pid, state);
         #[cfg(target_os = "linux")]
-        let number = through_the_pidfd(self.attached, number, group);
+        let number = through_the_pidfd(self.attached, number, root);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
         number
@@ -204,15 +174,15 @@ impl TreeCall<'_> {
     /// - `MayNameAnother`: [`number_skipped`](Self::number_skipped), after `signal_root` when the
     ///   handle still names the root exactly.
     ///
-    /// `signal_root` sends the call's own signal to the root through its handle. `group` is the root
+    /// `signal_root` sends the call's own signal to the root through its handle. `root` is the root
     /// a send to its group needs.
     pub(crate) fn root_checked(
         &self,
         state: impl FnOnce() -> RootState,
         signal_root: impl FnOnce() -> Result<Sent, Error>,
-        group: &GroupRoot<'_>,
+        root: Option<&dyn Root>,
     ) -> Option<Result<(), Error>> {
-        match self.root_number(state, group) {
+        match self.root_number(state, root) {
             RootNumber::Trusted => None,
             #[cfg(target_os = "macos")]
             RootNumber::Untrusted(root) => self.untrusted(&root),
@@ -229,8 +199,8 @@ impl TreeCall<'_> {
     /// `graceful_shutdown_tree`'s decision on its one look at the root, for its `SIGTERM`: what
     /// [`root_checked`](Self::root_checked) decides, except that a root whose number may name
     /// another process is shut down through what still names it exactly, if anything does.
-    pub(crate) fn graceful(&self, state: impl FnOnce() -> RootState, group: &GroupRoot<'_>) -> Graceful {
-        match self.root_number(state, group) {
+    pub(crate) fn graceful(&self, state: impl FnOnce() -> RootState, root: Option<&dyn Root>) -> Graceful {
+        match self.root_number(state, root) {
             RootNumber::Trusted => Graceful::Signal,
             // By identity alone. With no channel by identity there is nothing to signal, wait for or
             // sweep, so the call ends here with nothing sent.

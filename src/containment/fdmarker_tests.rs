@@ -701,7 +701,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     // The root is inert: sh is reaped, so ONLY the marker channel can reach the orphan.
     let marker = super::Marker::new(prepared, inert_root(), None);
     marker
-        .hard_kill(&crate::containment::GroupRoot::trusted_for_test())
+        .hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()))
         .expect("hard_kill");
 
     // If `hard_kill()` missed the orphan, the live `cat` echoes this byte and then exits on the
@@ -764,7 +764,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
 
     let marker = super::Marker::new(prepared, inert_root(), None);
     marker
-        .hard_kill(&crate::containment::GroupRoot::trusted_for_test())
+        .hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()))
         .expect("hard_kill");
 
     // Alive, proven positively: a line in, the same line back — the sweep must not have
@@ -900,7 +900,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         true,
-        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
     drop(pass1_marker); // its scratch handle has no further use.
 
@@ -955,7 +955,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         false,
-        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
     // Keyed on THIS marker's handle, per the module docs' rule: the bare sentence is emitted by
@@ -1046,7 +1046,7 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let marker = super::Marker::new(prepared, inert_root(), None);
 
     crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
-    let result = marker.hard_kill(&crate::containment::GroupRoot::trusted_for_test());
+    let result = marker.hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
 
     assert!(
         result.is_err(),
@@ -1082,7 +1082,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
         &mut group_result,
         &mut incomplete,
         true,
-        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
     assert!(incomplete, "an unreadable root is not a complete walk");
@@ -1151,7 +1151,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
         &mut group_result,
         &mut incomplete,
         true,
-        super::Scope::Full(&crate::containment::GroupRoot::trusted_for_test()),
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
     assert!(incomplete, "a child the walk could not read is not a complete walk");
@@ -1230,7 +1230,7 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     };
     let skipped = |marker| {
         let kill = crate::containment::Attached::FdMarker(marker)
-            .hard_kill_for_drop(&view, &crate::containment::GroupRoot::trusted_for_test());
+            .hard_kill_for_drop(&view, Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
         let skipped = kill
             .skipped()
             .expect("the reaped root's kill by its number is skipped")
