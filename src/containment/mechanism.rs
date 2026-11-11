@@ -89,11 +89,13 @@ pub(crate) trait Contains: fmt::Debug {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool>;
 
     /// The end of the resource it owns, which the caller's wait over the [`Release`] completes: a cgroup
-    /// leaf is killed through, drained and removed. The mechanisms that own nothing a wait ends have
-    /// nothing to wait on. A Job Object is not released: it closes as its `Child` drops.
+    /// leaf is killed through, drained and removed, and its release owns the leaf (`None`). A mechanism
+    /// that owns nothing a wait ends has nothing to wait on and is given back (`Some(self)`), so the
+    /// tree that held it still asks it, as a walk's settlement does. A Job Object is not released: it
+    /// closes as its `Child` drops.
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
-    fn release(self) -> Release
+    fn release(self) -> (Release, Option<Self>)
     where
         Self: Sized;
 
@@ -291,16 +293,31 @@ impl Contains for Mechanism {
     }
 
     #[cfg(unix)]
-    fn release(self) -> Release {
+    fn release(self) -> (Release, Option<Mechanism>) {
         match self {
             #[cfg(target_os = "linux")]
-            Mechanism::Cgroup(m) => m.release(),
-            Mechanism::Group(m) => m.release(),
+            Mechanism::Cgroup(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Cgroup))
+            }
+            Mechanism::Group(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Group))
+            }
             #[cfg(target_os = "macos")]
-            Mechanism::Marker(m) => m.release(),
-            Mechanism::Walk(m) => m.release(),
+            Mechanism::Marker(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Marker))
+            }
+            Mechanism::Walk(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Walk))
+            }
             #[cfg(test)]
-            Mechanism::Fake(m) => m.release(),
+            Mechanism::Fake(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Fake))
+            }
         }
     }
 

@@ -96,9 +96,9 @@ impl Contains for CgroupLeaf {
         self.subtree()?.reached(child)
     }
 
-    /// The leaf is killed through if it is armed and occupied, drained and removed.
-    fn release(self) -> Release {
-        Release::leaf(self)
+    /// The leaf is killed through if it is armed and occupied, drained and removed: the release owns it.
+    fn release(self) -> (Release, Option<CgroupLeaf>) {
+        (Release::leaf(self), None)
     }
 
     /// The first step of the leaf's release and its drain, with the leaf left in place.

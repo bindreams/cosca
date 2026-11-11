@@ -166,13 +166,13 @@ fn a_released_tree_keeps_what_its_kills_settled() {
 }
 
 /// A tree released still is what it was: it reports its containment, and a settle after the release
-/// is the real settle of a tree whose mechanism is gone. A walk is never released (its settle still
-/// needs the identities it holds).
+/// is the real settle of the tree: a walk's still re-kills the members it holds.
 ///
-/// Mutant: `release` leaves a tree that reports `None`.
+/// Mutant: `release` leaves a tree that reports `None`, or one a walk's settle no longer reaches.
 #[cfg(unix)]
 #[skuld::test]
 fn a_released_tree_keeps_its_kind() {
+    use crate::containment::dispatch::Unkilled;
     use crate::containment::unix::Group;
 
     let (fake, _) = FakeContains::new(Containment::Session, false);
@@ -189,6 +189,27 @@ fn a_released_tree_keeps_its_kind() {
         tree.settle(TreeKillOutcome::Ran(Ok(())), true)
             .expect("a kill that left nothing");
     }
+
+    let mut walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    let left_running = || {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![Error::MemberNotKilled {
+                pid: 8,
+                source: Box::new(Error::Unassessable {
+                    detail: "its identity could not be read".into(),
+                    source: None,
+                }),
+                note: None,
+            }],
+            root: None,
+            resolved: Vec::new(),
+        }))
+    };
+    walk.settle(left_running(), true).expect_err("a member is running");
+    walk.release().wait();
+    assert_eq!(walk.containment(), Containment::TreeWalk);
+    walk.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .expect_err("the walk still holds the member it left running");
 }
 
 /// A child over a mechanism of stated answers: what it reports and what its tree calls do come from

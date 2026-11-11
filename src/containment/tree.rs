@@ -19,8 +19,8 @@ use crate::error::Error;
 pub(crate) struct Tree {
     holder: Holder,
     killed: TreeKilled,
-    /// What the tree was when its mechanism was released, which no longer holds it: the tree still
-    /// reports and settles as it was. `None` for a tree never released.
+    /// What the tree was when its mechanism's release took the resource (a cgroup leaf), which no
+    /// longer holds it: the tree still reports as it was. `None` for a tree whose mechanism stays.
     released_as: Option<Containment>,
 }
 
@@ -31,7 +31,7 @@ pub(crate) struct Tree {
     reason = "one per child, held inline: a leaf is the largest mechanism, and boxing it would add an allocation to every contained spawn"
 )]
 enum Holder {
-    /// Uncontained: lone-process semantics. Also what a released tree holds.
+    /// Uncontained: lone-process semantics. Also what a tree holds once its leaf is released.
     #[default]
     None,
     /// A nested containment member: it joined an ancestor's group/job and owns no teardown mechanism
@@ -249,24 +249,28 @@ impl Tree {
         }
     }
 
-    /// The end of the tree's resource (see [`Contains::release`]): the mechanism leaves the tree and
-    /// its [`Release`] owns it until its wait. What the kills left stays the tree's ([`TreeKilled`]),
-    /// and so does what it was ([`containment`](Self::containment)), so a settle after the release is
-    /// over the real state, with nothing held.
-    ///
-    /// A tree walk is never released: it holds the identities its settle still needs, and a released
-    /// tree has no mechanism to ask for them. Releasing one trips a `debug_assert`.
+    /// The end of the tree's resource (see [`Contains::release`]): a mechanism whose release owns it
+    /// (a cgroup leaf) leaves the tree and its [`Release`] holds it until its wait; any other stays,
+    /// so the tree is asked as before (a walk's settlement still re-kills its held members). What
+    /// the kills left stays the tree's ([`TreeKilled`]), and so does what a released leaf was
+    /// ([`containment`](Self::containment)).
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
     pub(crate) fn release(&mut self) -> Release {
-        debug_assert!(
-            !matches!(&self.holder, Holder::Contained(mechanism) if mechanism.kind() == Containment::TreeWalk),
-            "a tree walk holds identities its settle still needs: it is never released"
-        );
-        self.released_as = Some(self.containment());
         match std::mem::take(&mut self.holder) {
-            Holder::None | Holder::Delegated => Release::nothing(),
-            Holder::Contained(mechanism) => mechanism.release(),
+            Holder::Contained(mechanism) => {
+                let kind = mechanism.kind();
+                let (release, kept) = mechanism.release();
+                match kept {
+                    Some(mechanism) => self.holder = Holder::Contained(mechanism),
+                    None => self.released_as = Some(kind),
+                }
+                release
+            }
+            unowned @ (Holder::None | Holder::Delegated) => {
+                self.holder = unowned;
+                Release::nothing()
+            }
         }
     }
 
@@ -296,7 +300,7 @@ impl Tree {
     }
 
     /// What names the tree, for its settlement ([`TreeKilled`]) to ask: `None` for a tree that is
-    /// none, delegated or released (a released tree is never a walk's).
+    /// none or delegated, or whose leaf was released.
     fn named_by(&self) -> Option<&Mechanism> {
         match &self.holder {
             Holder::Contained(mechanism) => Some(mechanism),

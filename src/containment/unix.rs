@@ -118,8 +118,8 @@ impl Contains for Group {
         Ok(false)
     }
 
-    fn release(self) -> Release {
-        Release::nothing()
+    fn release(self) -> (Release, Option<Group>) {
+        (Release::nothing(), Some(self))
     }
 
     /// A group owns nothing a release ends.

@@ -166,8 +166,8 @@ impl Contains for Walker {
     }
 
     #[cfg(unix)]
-    fn release(self) -> Release {
-        Release::nothing()
+    fn release(self) -> (Release, Option<Walker>) {
+        (Release::nothing(), Some(self))
     }
 
     /// A walk owns nothing a release ends.

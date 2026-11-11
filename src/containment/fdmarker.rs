@@ -921,8 +921,8 @@ impl Contains for Marker {
         Ok(false)
     }
 
-    fn release(self) -> Release {
-        Release::nothing()
+    fn release(self) -> (Release, Option<Marker>) {
+        (Release::nothing(), Some(self))
     }
 }
 

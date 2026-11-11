@@ -91,9 +91,9 @@ impl Contains for FakeContains {
     }
 
     #[cfg(unix)]
-    fn release(self) -> Release {
+    fn release(self) -> (Release, Option<FakeContains>) {
         self.record("release");
-        Release::nothing()
+        (Release::nothing(), Some(self))
     }
 
     #[cfg(all(feature = "tokio", target_os = "linux"))]
