@@ -834,8 +834,9 @@ use std::io;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::mechanism::{Contains, Release};
+use crate::containment::mechanism::{nothing_held, Contains, Release};
 use crate::containment::root::NumberLook;
+use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -887,6 +888,10 @@ impl std::fmt::Debug for Marker {
 impl Contains for Marker {
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         self.kill_tree(root)
+    }
+
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        nothing_held(result)
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {

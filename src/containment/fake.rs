@@ -4,11 +4,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::containment::dispatch::TreeKillOutcome;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::mechanism::Contains;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
+use crate::containment::mechanism::{nothing_held, Contains};
+use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome};
 
 /// The sends a [`FakeContains`] was asked for, in order: `"kill"`, `"terminate"`, `"disarm"` and
@@ -51,6 +52,10 @@ impl Contains for FakeContains {
     fn send_kill(&self, _root: Option<&dyn Root>) -> TreeKillOutcome {
         self.record("kill");
         TreeKillOutcome::Ran(Ok(()))
+    }
+
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        nothing_held(result)
     }
 
     fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {

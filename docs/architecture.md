@@ -129,9 +129,10 @@ In order:
    `Mechanism` (a cgroup leaf, a Job Object, a process group, an fd marker, a tree walk), which a
    caller drives through the `Contains` trait (send a kill or a terminate, its drain edge, disarm,
    would a kill reach a pid, did it reach the child, release) and never asks which it is: no code
-   in `Tree` or the drop teardown asks which mechanism it holds. A walk's held members are the
-   `Walker`'s own state, killed again and answered in its kill's outcome, so the settlement
-   (`TreeKilled`) holds no walk-only data; the Linux awaited teardown takes the leaf's steps through
+   in `Tree` or the drop teardown asks which mechanism it holds. The members a walk
+   left stay in the settlement (`TreeKilled`, one lock), which asks the mechanism for them
+   (`Contains::kill_left`: a walk kills them again, every other mechanism hands the result back);
+   the Linux awaited teardown takes the leaf's steps through
    `Contains::awaitable_release`, which every mechanism answers and only the cgroup leaf does with
    steps. The two `debug_assert`s on the `CgroupOnly` gate (`kill_sent_gated`, `graceful_shutdown`)
    state a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge

@@ -4,9 +4,21 @@
 
 use std::fmt;
 
-use crate::containment::dispatch::TreeKillOutcome;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
+use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome};
+
+/// [`Contains::kill_left`] of every mechanism but a tree walk: `result` as it is, with nothing held.
+/// Only a tree walk leaves the root alone (the root's own death then settles it), so a result with
+/// the root left is a walk's.
+pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> (Result<(), Unkilled>, Vec<Left>) {
+    debug_assert!(
+        !matches!(&result, Err(left) if left.root.is_some()),
+        "only a tree walk leaves the root alone"
+    );
+    (result, Vec::new())
+}
 
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
@@ -28,6 +40,14 @@ pub(crate) trait Contains: fmt::Debug {
     ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
     ///   running is an [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled).
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome;
+
+    /// What a kill's `result` comes to once the members an earlier kill left (`left`, which only a
+    /// tree walk holds) are answered, and the members it leaves now: the tree's settlement calls it
+    /// for every kill, under its one lock ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
+    /// A tree walk's root death reparents a member out of every later walk, so it kills again the
+    /// members whose identity it read ([`with_earlier`](crate::containment::treewalk::with_earlier)).
+    /// Every other mechanism hands `result` back, with nothing held ([`nothing_held`]).
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>);
 
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
     /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only.
@@ -142,6 +162,22 @@ impl Contains for Mechanism {
             Mechanism::Walk(m) => m.send_kill(root),
             #[cfg(test)]
             Mechanism::Fake(m) => m.send_kill(root),
+        }
+    }
+
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.kill_left(result, left),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.kill_left(result, left),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.kill_left(result, left),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.kill_left(result, left),
+            Mechanism::Walk(m) => m.kill_left(result, left),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.kill_left(result, left),
         }
     }
 
@@ -355,9 +391,7 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            if let Some(steps) = leaf.awaitable_release() {
-                steps.wait(child).await;
-            }
+            leaf.step_and_await_drain(child).await;
         }
     }
 }

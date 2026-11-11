@@ -266,7 +266,7 @@ impl Tree {
     /// The awaitable steps of the mechanism's release ([`Contains::awaitable_release`]) with the
     /// resource left in the tree; a no-op for a tree whose mechanism has none.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
-    pub(crate) async fn step_leaf_and_await_drain(&self, child: u32) {
+    pub(crate) async fn await_release_steps(&self, child: u32) {
         let steps = match &self.holder {
             Holder::Contained(mechanism) => mechanism.awaitable_release(),
             Holder::None | Holder::Delegated => None,
@@ -292,10 +292,13 @@ impl Tree {
         self.killed.is_set()
     }
 
-    /// The tree's settlement ([`TreeKilled`]) and whether the tree is a walk's, whose held members
-    /// are the walk's own state, for `f`.
-    fn settling<R>(&self, f: impl FnOnce(&TreeKilled, bool) -> R) -> R {
-        f(&self.killed, self.containment() == Containment::TreeWalk)
+    /// What names the tree, for its settlement ([`TreeKilled`]) to ask: `None` for a tree that is
+    /// none or delegated.
+    fn named_by(&self) -> Option<&Mechanism> {
+        match &self.holder {
+            Holder::Contained(mechanism) => Some(mechanism),
+            Holder::None | Holder::Delegated => None,
+        }
     }
 
     /// What a tree kill's `outcome` comes to once the root's own handle has had its say
@@ -306,7 +309,7 @@ impl Tree {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<SettleOutcome, Unsettled> {
-        self.settling(|killed, walk| killed.settle(walk, outcome, root_ended))
+        self.killed.settle(self.named_by(), outcome, root_ended)
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
@@ -317,7 +320,8 @@ impl Tree {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<(), Error> {
-        self.settling(|killed, walk| killed.settle_for_kill_tree(caller, walk, outcome, root_ended))
+        self.killed
+            .settle_for_kill_tree(caller, self.named_by(), outcome, root_ended)
     }
 
     /// `outcome` for a `kill_tree` that goes on to the root's backstop (see
@@ -327,13 +331,13 @@ impl Tree {
         caller: &str,
         outcome: TreeKillOutcome,
     ) -> Result<TreeKillOutcome, SweepFailure> {
-        self.settling(|killed, walk| killed.unless_unwalked(caller, walk, outcome))
+        self.killed.unless_unwalked(caller, self.named_by(), outcome)
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
     /// here and only when it will be logged.
     pub(crate) fn settle_for_drop(&self, outcome: impl Into<TreeKillOutcome>, root_ended: bool) -> Option<String> {
-        self.settling(|killed, walk| killed.settle_for_drop(walk, outcome, root_ended))
+        self.killed.settle_for_drop(self.named_by(), outcome, root_ended)
     }
 }
 

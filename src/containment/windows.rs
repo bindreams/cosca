@@ -251,6 +251,17 @@ impl crate::containment::Contains for JobHandle {
         )
     }
 
+    fn kill_left(
+        &self,
+        result: Result<(), crate::containment::dispatch::Unkilled>,
+        _left: Vec<crate::containment::treewalk::Left>,
+    ) -> (
+        Result<(), crate::containment::dispatch::Unkilled>,
+        Vec<crate::containment::treewalk::Left>,
+    ) {
+        crate::containment::mechanism::nothing_held(result)
+    }
+
     /// `CTRL_BREAK` to the root's console group `pid`: a nested contained descendant leads its own
     /// group and never receives it.
     fn send_terminate(
