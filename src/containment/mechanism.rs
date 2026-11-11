@@ -73,6 +73,32 @@ pub(crate) trait Contains: fmt::Debug {
     fn release(self) -> Release
     where
         Self: Sized;
+
+    /// The steps of [`release`](Self::release) that a caller can await instead of block on, taken with
+    /// the resource left where it is: only a cgroup leaf has any. `None` for every other mechanism.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<AwaitableRelease<'_>>;
+}
+
+/// The awaitable steps of a mechanism's release ([`Contains::awaitable_release`]): a cgroup leaf's
+/// first step and its drain (see
+/// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)).
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+pub(crate) struct AwaitableRelease<'a> {
+    leaf: &'a crate::containment::cgroup::CgroupLeaf,
+}
+
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+impl<'a> AwaitableRelease<'a> {
+    pub(crate) fn of_leaf(leaf: &'a crate::containment::cgroup::CgroupLeaf) -> AwaitableRelease<'a> {
+        AwaitableRelease { leaf }
+    }
+
+    /// Take the steps. A future dropped mid-await leaves the rest to the resource's release. `child`
+    /// names it in debug lines.
+    pub(crate) async fn wait(&self, child: u32) {
+        self.leaf.step_and_await_drain(child).await;
+    }
 }
 
 /// The closed set of mechanisms a [`Tree`](crate::containment::Tree) is contained by, each variant
@@ -238,6 +264,17 @@ impl Contains for Mechanism {
             Mechanism::Fake(m) => m.release(),
         }
     }
+
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<AwaitableRelease<'_>> {
+        match self {
+            Mechanism::Cgroup(m) => m.awaitable_release(),
+            Mechanism::Group(m) => m.awaitable_release(),
+            Mechanism::Walk(m) => m.awaitable_release(),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.awaitable_release(),
+        }
+    }
 }
 
 /// What places an elevation front once its leaf is gone: the leaf's subtree, or why it could not be
@@ -318,7 +355,9 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            leaf.step_and_await_drain(child).await;
+            if let Some(steps) = leaf.awaitable_release() {
+                steps.wait(child).await;
+            }
         }
     }
 }

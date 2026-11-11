@@ -263,12 +263,16 @@ impl Tree {
         }
     }
 
-    /// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)
-    /// with the leaf left in the tree; a no-op for any other tree.
+    /// The awaitable steps of the mechanism's release ([`Contains::awaitable_release`]) with the
+    /// resource left in the tree; a no-op for a tree whose mechanism has none.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) async fn step_leaf_and_await_drain(&self, child: u32) {
-        if let Holder::Contained(Mechanism::Cgroup(leaf)) = &self.holder {
-            leaf.step_and_await_drain(child).await;
+        let steps = match &self.holder {
+            Holder::Contained(mechanism) => mechanism.awaitable_release(),
+            Holder::None | Holder::Delegated => None,
+        };
+        if let Some(steps) = steps {
+            steps.wait(child).await;
         }
     }
 

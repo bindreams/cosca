@@ -6,6 +6,8 @@ use super::CgroupLeaf;
 use crate::child::owned::teardown::Reach;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
+#[cfg(feature = "tokio")]
+use crate::containment::mechanism::AwaitableRelease;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::{Containment, Root, TerminateOutcome};
 
@@ -97,5 +99,11 @@ impl Contains for CgroupLeaf {
     /// The leaf is killed through if it is armed and occupied, drained and removed.
     fn release(self) -> Release {
         Release::leaf(self)
+    }
+
+    /// The first step of the leaf's release and its drain, with the leaf left in place.
+    #[cfg(feature = "tokio")]
+    fn awaitable_release(&self) -> Option<AwaitableRelease<'_>> {
+        Some(AwaitableRelease::of_leaf(self))
     }
 }

@@ -195,6 +195,12 @@ impl Contains for Walker {
     fn release(self) -> Release {
         Release::nothing()
     }
+
+    /// A walk owns nothing a release ends.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
+        None
+    }
 }
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are

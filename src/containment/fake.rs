@@ -95,4 +95,9 @@ impl Contains for FakeContains {
         self.record("release");
         Release::nothing()
     }
+
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
+        None
+    }
 }

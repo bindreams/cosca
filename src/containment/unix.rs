@@ -121,6 +121,12 @@ impl Contains for Group {
     fn release(self) -> Release {
         Release::nothing()
     }
+
+    /// A group owns nothing a release ends.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
+        None
+    }
 }
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).

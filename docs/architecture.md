@@ -128,11 +128,13 @@ In order:
 3. **Containment mechanisms:** a `Child` holds a `Tree`: none, delegated, or contained by one
    `Mechanism` (a cgroup leaf, a Job Object, a process group, an fd marker, a tree walk), which a
    caller drives through the `Contains` trait (send a kill or a terminate, its drain edge, disarm,
-   would a kill reach a pid, did it reach the child, release) and never asks which it is, but for
-   three askers, all moved by slice 2: `Tree::settling` asks whether the mechanism is a walk, for the
-   settlement of its held members (into the walk's kill outcome), and the Linux awaited teardown's
-   `Tree::step_leaf_and_await_drain` and `Release::wait_async` ask whether it is a cgroup leaf (both
-   reach the leaf's awaited steps). The per-OS async drivers of the drain waits live in the drain edge
+   would a kill reach a pid, did it reach the child, release) and never asks which it is: no code
+   in `Tree` or the drop teardown asks which mechanism it holds. A walk's held members are the
+   `Walker`'s own state, killed again and answered in its kill's outcome, so the settlement
+   (`TreeKilled`) holds no walk-only data; the Linux awaited teardown takes the leaf's steps through
+   `Contains::awaitable_release`, which every mechanism answers and only the cgroup leaf does with
+   steps. The two `debug_assert`s on the `CgroupOnly` gate (`kill_sent_gated`, `graceful_shutdown`)
+   state a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge
    (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async

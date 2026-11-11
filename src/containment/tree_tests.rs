@@ -43,6 +43,28 @@ fn a_tree_reports_the_containment_of_what_holds_it() {
     }
 }
 
+/// Only a cgroup leaf has awaitable release steps: the awaited teardown asks every mechanism the same
+/// question and takes the steps of the one that answers.
+///
+/// Mutant: a mechanism other than the leaf answers `Some`; the leaf answers `None`.
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+#[skuld::test]
+fn only_a_cgroup_leaf_has_awaitable_release_steps() {
+    use crate::containment::mechanism::Contains;
+    use crate::containment::unix::Group;
+    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
+    let others = [
+        Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())),
+        Mechanism::Group(Group::process_group(1)),
+        Mechanism::Fake(fake),
+    ];
+    for other in &others {
+        assert!(other.awaitable_release().is_none(), "{other:?}");
+    }
+    let leaf = Mechanism::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test());
+    assert!(leaf.awaitable_release().is_some());
+}
+
 /// A tree is driven only through what a mechanism answers: its kind, its sends, its drain edge, its
 /// reach and its release are the fake's stated ones, and the fake is sent every call the tree makes.
 ///
