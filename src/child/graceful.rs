@@ -36,11 +36,10 @@ pub(crate) enum SignalTreeCooperativelyOutcome {
     /// The call ends now, with this error.
     #[cfg(unix)]
     End(Error),
-    /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd);
-    /// Linux.
-    #[cfg(unix)]
+    /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd)
+    #[cfg(target_os = "linux")]
     RootThroughPidfd(Skip),
-    /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly); macOS.
+    /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly)
     #[cfg(unix)]
     HoldersOnly(Skip),
 }
@@ -321,7 +320,7 @@ impl Child {
             SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
             #[cfg(unix)]
             SignalTreeCooperativelyOutcome::End(e) => return Err(e),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
                 return Err(self.shut_down_root_through_pidfd(&skip, grace));
             }
@@ -472,10 +471,9 @@ impl Child {
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
     /// mechanism's own, decided on its look at the root ([`Attached::terminate`]). This handle's reaps
-    /// are held off from the look until the `SIGTERM` is sent. The hold is a std lock, and the root
-    /// borrows it, so neither may live in an async caller's state: this is a plain `fn`, and the
-    /// paths that send nothing by the root's number leave the hold here, before the caller waits the
-    /// grace.
+    /// are held off from the look until the `SIGTERM` is sent. A plain `fn`: the std-lock hold and the
+    /// root borrowing it must not live in an async caller's state, so paths that send nothing release
+    /// the hold here, before the grace.
     pub(crate) fn signal_tree_cooperatively(&self) -> SignalTreeCooperativelyOutcome {
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
@@ -506,18 +504,21 @@ impl Child {
                     },
                 }
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             TerminateOutcome::RootThroughPidfd(skip) => SignalTreeCooperativelyOutcome::RootThroughPidfd(skip),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            TerminateOutcome::RootThroughPidfd(_) => unreachable!("only a Linux pidfd names the root exactly"),
             // A tree this handle already killed leaves nothing for the grace and the kill of the holders
             // to do: the sweep that follows answers as the tree calls do.
             #[cfg(unix)]
-            TerminateOutcome::HoldersOnly(skip) if skip.is_moot(&self.tree_killed) => {
+            TerminateOutcome::HoldersOnly(mut skip) if skip.is_moot(&self.tree_killed) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): this handle already killed the tree, so the holders' grace is skipped",
                     self.pid()
                 );
+                // The holders' SIGTERM was sent: a failure of it is the call's.
                 SignalTreeCooperativelyOutcome::Sent {
-                    result: Ok(()),
+                    result: skip.holders.take().unwrap_or(Ok(())),
                     earlier: None,
                 }
             }
@@ -533,7 +534,7 @@ impl Child {
     /// [`TerminateOutcome::RootThroughPidfd`], `skip` what it skipped: the `SIGTERM` through the
     /// root's handle, the grace, then a kill through it if the root outlived it. Nothing goes out by
     /// the number. A front that may not be signalled is refused, as for the tree paths.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn shut_down_root_through_pidfd(&self, skip: &Skip, grace: Duration) -> Error {
         let call = self.skip_call(
             "graceful_shutdown_tree",
@@ -595,12 +596,12 @@ impl Child {
 ///
 /// The caller [`start`](Self::start)s it, waits the grace when [`needs_grace`](Self::needs_grace),
 /// and [`finish`](Self::finish)es it with the wait's outcome.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) struct PidfdShutdown {
     term: Result<crate::signal::Sent, Error>,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl PidfdShutdown {
     /// The `SIGTERM`, sent by `term` unless `gate` refuses it; a refusal is the call's error.
     pub(crate) fn start(
@@ -742,7 +743,7 @@ pub(crate) mod fault {
 
     /// The armed forced failure, in place of the mechanism's own cooperative signal, which is then
     /// not sent. The root's state is still read once on Unix, as the look the signal would have
-    /// decided on, so a test that scripts the root's reads counts the same.
+    /// decided on.
     pub(crate) fn forced_in_place_of_the_signal(
         root: Option<&dyn crate::containment::Root>,
     ) -> Option<super::SignalTreeCooperativelyOutcome> {

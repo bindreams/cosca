@@ -43,9 +43,8 @@ fn zombie_group_root() -> Arc<crate::Child> {
 /// returns what that wait did first, and the wait. The look's hook does not return until the wait
 /// has either reaped or blocked on the handle's lock: both are events, so nothing waits on time.
 ///
-/// With `reaped_before_the_sweep`, a wait that blocked on the look's hold is also waited for, at the
-/// call's `AfterTerminate`, to reap the root before the call goes on: the handle's lock is not
-/// fair, so otherwise the call's next hold may take it before the wait does.
+/// With `reaped_before_the_sweep`, the wait is also waited for at `AfterTerminate`, since the lock is
+/// unfair.
 fn run_with_a_wait_after_the_look(
     child: &Arc<crate::Child>,
     reaped_before_the_sweep: bool,

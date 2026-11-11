@@ -16,7 +16,7 @@ pub(crate) struct Skip {
     pub(crate) action: String,
     pub(crate) why: Why,
     /// Linux: the root's handle still reaches the root exactly, so the caller sends the call's signal
-    /// to the root alone, through its hold. The mechanism has no handle and never sends it.
+    /// to the root alone, through its hold.
     pub(crate) root_alone: bool,
     /// macOS: the sweep by identity a fd marker still makes of its holders, which no reuse of a pid
     /// redirects. `None`: the mechanism has none.
@@ -58,13 +58,12 @@ pub(crate) enum Why {
 )]
 pub(crate) enum TerminateOutcome {
     /// The signal went out, as usual or to what names the tree by identity, with `result`. `earlier`
-    /// names what a later sweep's error says was sent before it. Every OS.
+    /// names what a later sweep's error says was sent before it.
     Sent {
         result: Result<(), Error>,
         earlier: Option<&'static str>,
     },
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
-    /// Linux and macOS.
     End(Skip),
     /// Linux: the root's number may name another process, but its handle names it exactly: the caller
     /// shuts the root alone down through the handle, and the call ends.
@@ -78,6 +77,10 @@ pub(crate) enum TerminateOutcome {
     )]
     HoldersOnly(Skip),
 }
+
+#[cfg(all(test, unix))]
+#[path = "skip_tests.rs"]
+mod skip_tests;
 
 #[cfg(unix)]
 pub(crate) use call::SkipCall;

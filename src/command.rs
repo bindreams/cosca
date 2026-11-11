@@ -509,10 +509,7 @@ impl Command {
     /// killed nor waited for by its number either. The evidence is the child's own handle (on Linux
     /// its pidfd), or the number no longer reading as the root. If the handle cannot say (a failed
     /// peek), the same kills are skipped and a warning says so; the root itself is still killed
-    /// through its handle, and a tree walk walks as usual. This is decided on one look at the root,
-    /// as is the cleanup of an elevated spawn whose password could not be written. Each send by the
-    /// group's number after that look checks the root again, as for
-    /// [`kill_tree`](crate::Child::kill_tree).
+    /// through its handle, and a tree walk walks as usual.
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`

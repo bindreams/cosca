@@ -23,6 +23,11 @@ struct Reaped {
 /// [`Reaped`] over a tree the handle `killed` before the reap, or whose root died of the test's own
 /// signal.
 fn reaped(kill_tree_first: bool) -> Reaped {
+    reaped_reading(kill_tree_first, Resolved::Gone)
+}
+
+/// [`reaped`], with the root's pid reading as `read`.
+fn reaped_reading(kill_tree_first: bool, read: Resolved<crate::identity::ProcessId>) -> Reaped {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -38,7 +43,7 @@ fn reaped(kill_tree_first: bool) -> Reaped {
     Reaped {
         child,
         killed,
-        _gone: crate::child::fault::force_root_reads(Resolved::Gone),
+        _gone: crate::child::fault::force_root_reads(read),
         #[cfg(target_os = "linux")]
         _old_kernel,
     }
@@ -58,6 +63,47 @@ fn kill_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
         sent_before,
         "nothing is sent by the number"
     );
+}
+
+/// A pid that cannot be read after the own reap is skipped like one that names no process, so a tree
+/// the handle killed has nothing left for the skip to leave undone.
+#[skuld::test]
+fn kill_tree_after_a_kill_tree_and_the_own_reap_with_an_unreadable_pid_is_ok_and_warns_nothing() {
+    let setup = reaped_reading(true, Resolved::Unknown);
+    let sent_before = setup.killed.killed().len();
+    let mark = crate::log_capture::mark();
+
+    setup.child.kill_tree().expect("the tree is already killed");
+
+    assert_eq!(warns_since(mark, ""), Vec::<String>::new());
+    assert_eq!(
+        setup.killed.killed().len(),
+        sent_before,
+        "nothing is sent by the number"
+    );
+}
+
+/// A root some other reaper reaped after this handle killed the tree is not the own reap: its skip
+/// is no moot one, so the call fails and warns.
+///
+/// Mutant: a skip is moot whatever reaped the root.
+#[skuld::test]
+fn kill_tree_after_a_kill_tree_and_a_foreign_reap_still_skips_and_warns() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::log_capture::install();
+    let _killed = record_kill_group();
+    let child = session_sleep().spawn().expect("spawn");
+    // The recorder takes the group's kill; the handle backstop ends the root.
+    child.kill_tree().expect("kill the tree");
+    crate::test_child::reaped_elsewhere::reap_behind(child.pid());
+    let mark = crate::log_capture::mark();
+
+    child
+        .kill_tree()
+        .expect_err("a root reaped elsewhere is not the handle's own reap");
+
+    assert_eq!(warns_since(mark, "").len(), 1);
 }
 
 #[skuld::test]

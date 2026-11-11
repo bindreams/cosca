@@ -326,6 +326,34 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     blocker.assert_killed();
 }
 
+/// Linux: a `TreeWalk` root whose handle cannot say whether it is reaped is walked and killed by the
+/// drop all the same: the walk proves its root itself, so the unanswered state skips nothing. Mutant:
+/// the walk is skipped on `Unknown` (off macOS), as the group mechanisms skip a number they cannot
+/// trust.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn dropping_a_tree_walk_child_whose_handle_cannot_say_still_walks_from_its_pid() {
+    crate::log_capture::install();
+    let walks = record_walks();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.contain_with(ContainMode::TreeWalk);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let blocker = release_at_drop_kill(child.stdin().expect("stdin pipe"));
+    let pid = child.pid();
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+
+    drop(child);
+
+    fake.assert_peeks_exhausted();
+    let walked = walks.walked();
+    assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
+    blocker.assert_killed();
+}
+
 /// A blocker root, killed and then waited for, so that only `wait()` sets the own-reap flag.
 fn waited_on_blocker_root() -> (u32, crate::Child) {
     let (child, stdin) = session_blocker();

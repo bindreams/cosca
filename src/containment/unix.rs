@@ -324,7 +324,7 @@ fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
     }
 }
 
-/// The nothing a group's kill or terminate sends once its group is empty, for `look`.
+/// What a group sends once empty: nothing.
 fn log_empty_group(pgid: i32, look: &NumberLook) {
     match look {
         NumberLook::GroupGone => log::debug!(
@@ -336,11 +336,11 @@ fn log_empty_group(pgid: i32, look: &NumberLook) {
     }
 }
 
-/// [`kill_group`] as a tree call decides it, for every caller: on one look at `root`, the group is
-/// killed as usual while the root's number names it; sent nothing when it is empty
-/// ([`TreeKillOutcome::Answered`]); and skipped, nothing sent by the number, when the number may name
-/// another process ([`TreeKillOutcome::Skipped`]: on Linux the caller kills the root alone through
-/// its handle when [`Skip::root_alone`]). A group kill is given its `root`, as [`check_number`] needs it.
+/// [`kill_group`], decided on one look at `root`: the group is killed as usual while the root's number
+/// names it; sent nothing when it is empty ([`TreeKillOutcome::Answered`]); and skipped, nothing sent
+/// by the number, when the number may name another process ([`TreeKillOutcome::Skipped`]: on Linux the
+/// caller kills the root alone through its handle when [`Skip::root_alone`]). A group kill is given
+/// its `root`, as [`check_number`] needs it.
 pub(crate) fn kill_group_tree(pgid: i32, root: Option<&dyn Root>) -> TreeKillOutcome {
     let ran = |sent: Result<(), Error>| TreeKillOutcome::Ran(sent.map_err(Unkilled::from));
     let Some(root) = root else {

@@ -4,6 +4,8 @@
 use std::time::Duration;
 
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 use super::fault as term_fault;
 use crate::wait::fault;
@@ -623,9 +625,11 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 //
 // The `exec 3<&0; cat <&3 3<&- &` idiom is explained at `test_child::BLOCKER_ARGV`. Without a
 // kernel drain edge, the fixture still exercises the root-only watch, asserted below.
+//
+// `mode` is the mechanism the root runs under, and `swept` asserts what a `kill_tree` says once the
+// call has reaped the root.
 #[cfg(unix)]
-#[skuld::test(labels = [crate::test_harness::CGROUP])]
-fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+fn members_remain_still_reaps_an_already_exited_root(mode: crate::ContainMode, swept: impl FnOnce(&crate::Child)) {
     use std::io::{Read, Write};
 
     let mut cmd = crate::test_child::command(Console::Hidden);
@@ -637,7 +641,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
-    cmd.contain();
+    cmd.contain_with(mode);
     let mut child = cmd.spawn().expect("spawn");
     // Held for the test's whole body: dropping it delivers EOF to the backgrounded `cat`.
     let stdin = child.stdin().expect("piped stdin");
@@ -683,9 +687,34 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         }
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
-    // call above reaped the root: a group the pid no longer names is not signalled by that number,
-    // so no sweep is made here. The descendant ends by its stdin closing.
+    // call above reaped the root.
+    swept(&child);
     drop(stdin);
+}
+
+/// The leaf is swept by its own handle.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(#[fixture(cgroup)] _group: &Group) {
+    members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Strongest, |child| {
+        assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
+        child.kill_tree().expect("the leaf is swept by its own handle");
+    });
+}
+
+/// A reaped root's group is not signalled by its number.
+#[cfg(unix)]
+#[skuld::test]
+fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
+    members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
+        // Below Linux 6.9 a group is signalled by its number alone.
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+        let err = child
+            .kill_tree()
+            .expect_err("a reaped root's group is not signalled by its number");
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+    });
 }
 
 /// A sweep that left a descendant behind but whose backstop killed the root has killed the root: it

@@ -266,7 +266,7 @@ impl Child {
             SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
             #[cfg(unix)]
             SignalTreeCooperativelyOutcome::End(e) => return Err(e),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
                 return Err(self.shut_down_root_through_pidfd(&skip, grace).await);
             }
@@ -407,7 +407,7 @@ impl Child {
     }
 
     /// As the sync call's `shut_down_root_through_pidfd`, with the grace awaited.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn shut_down_root_through_pidfd(&self, skip: &crate::containment::Skip, grace: Duration) -> Error {
         let call = self.inner.skip_call(
             "graceful_shutdown_tree",

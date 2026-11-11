@@ -1111,12 +1111,11 @@ impl Marker {
         }
     }
 
-    /// The marker's kill as a tree call decides it, for every caller, on one look at `root` (see
-    /// [`look_at`](Self::look_at)): every channel while the root's number names the root; the holders
-    /// alone, as the whole answer, once this handle reaped the root and its group is empty or it had
-    /// none ([`TreeKillOutcome::Answered`]); and the holders alone, with the rest skipped
-    /// ([`TreeKillOutcome::Skipped`]), when the number may name another process or the root is
-    /// `Unpinned` or `Unknown`.
+    /// The marker's kill, decided on one look at `root` (see [`look_at`](Self::look_at)): every channel
+    /// while the root's number names the root; the holders alone, as the whole answer, once this handle
+    /// reaped the root and its group is empty or it had none ([`TreeKillOutcome::Answered`]); and the
+    /// holders alone, with the rest skipped ([`TreeKillOutcome::Skipped`]), when the number may name
+    /// another process or the root is `Unpinned` or `Unknown`.
     pub(crate) fn kill_tree(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
         let holders_only = |except| self.hard_kill_impl(Scope::HoldersOnly { except });

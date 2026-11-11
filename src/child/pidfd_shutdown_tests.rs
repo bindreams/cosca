@@ -34,6 +34,18 @@ fn skip() -> Skip {
     }
 }
 
+/// The `Unassessable` the call ends in names the skip: what it left undone and why.
+fn assert_names_the_skip(err: &Error) {
+    let Error::Unassessable { detail, .. } = err else {
+        panic!("{err:?}")
+    };
+    let said = format!(
+        "graceful_shutdown_tree(): the root's own handle could not say whether it (pid {PGID}) was reaped (forced), \
+         so its number may name another process; it did not signal its process group (pgid {PGID}), and "
+    );
+    assert!(detail.starts_with(&said), "{detail}");
+}
+
 fn unkillable(what: &str) -> Error {
     Error::Elevation {
         kind: crate::error::ElevationErrorKind::Unkillable,
@@ -99,7 +111,7 @@ fn a_front_the_sigterm_may_not_reach_is_refused_with_nothing_sent() {
 
 #[skuld::test]
 fn a_failed_grace_wait_kills_the_root_at_once() {
-    crate::log_capture::install();
+    // `run` installs the capture; this mark is before its debug record.
     let mark = crate::log_capture::mark();
     let (err, sent, warns) = run(
         Gate::Open,
@@ -108,7 +120,7 @@ fn a_failed_grace_wait_kills_the_root_at_once() {
         Gate::Open,
         Ok(Sent::Delivered),
     );
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_names_the_skip(&err);
     assert_eq!(sent, ["term", "grace", "kill"]);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
@@ -165,7 +177,7 @@ fn a_sigterm_that_reached_nothing_waits_no_grace() {
         (Sent::Unverified, "sent nothing: the root's handle no longer reaches it"),
     ] {
         let (err, sent, warns) = run(Gate::Open, Ok(term), None, Gate::Open, Ok(Sent::Delivered));
-        assert!(matches!(err, Error::Unassessable { .. }), "{says}: {err:?}");
+        assert_names_the_skip(&err);
         assert_eq!(sent, ["term"], "{says}");
         assert_eq!(warns.len(), 1, "{says}: {warns:?}");
         assert!(warns[0].contains(says), "{warns:?}");
@@ -182,7 +194,7 @@ fn a_kill_that_finds_the_root_gone_says_so() {
         Gate::Open,
         Ok(Sent::Gone),
     );
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_names_the_skip(&err);
     assert_eq!(sent, ["term", "grace", "kill"]);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
