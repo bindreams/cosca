@@ -12,10 +12,9 @@ use crate::containment::{Containment, Root, TerminateOutcome};
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
 /// as a [`Mechanism`] and asks it nothing about which it is.
 pub(crate) trait Contains: fmt::Debug {
-    /// Kill every member it names. Never waits. `root` is the root a mechanism that names its tree by
-    /// the root's pid looks at, right before each send by the number, and decides what to send by
-    /// it: the outcome says what it did not send, and why ([`Skip`](crate::containment::Skip)).
-    /// Every other mechanism ignores it.
+    /// Kill every member it names. Never waits. `root` is read right before each send by a mechanism
+    /// that names its tree by the root's pid, which decides from it what to send; the outcome says
+    /// what was skipped and why ([`Skip`](crate::containment::Skip)). Others ignore it.
     ///
     /// What `Ok` says depends on how the mechanism names the tree:
     ///
@@ -308,12 +307,9 @@ impl Release {
         }
     }
 
-    /// The steps of [`wait`](Self::wait) that can be awaited instead of blocked on: a leaf's first
-    /// step, the one its drop takes first
-    /// ([`CgroupLeaf::remove_else_kill`](crate::containment::cgroup::CgroupLeaf::remove_else_kill)),
-    /// then the drain a landed kill bounds, so that the drop in `wait` finds it drained. A drain that
-    /// cannot be watched is left to `wait`. The resource stays held, so a future dropped mid-await
-    /// leaves the whole of it to `wait`. `child` is the child's pid, which names it in the debug lines.
+    /// The awaitable steps of [`wait`](Self::wait) (see
+    /// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain));
+    /// a future dropped mid-await leaves the rest to `wait`. `child` names it in debug lines.
     #[cfg(feature = "tokio")]
     #[cfg_attr(
         not(target_os = "linux"),

@@ -12,11 +12,9 @@ use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::{Containment, Root, TerminateOutcome};
 use crate::error::Error;
 
-/// Owns the OS containment resource for a spawned child; [`kill`](Self::kill) and
-/// [`terminate`](Self::terminate) act on the tree, [`disarm`](Self::disarm) neutralizes teardown for
-/// `detach()`. `killed` is where the tree stands after the kills and drops that settled it
-/// ([`TreeKilled`]); it is the handle's, whatever it holds, and outlives the mechanism's
-/// [`release`](Self::release).
+/// Owns the OS containment resource for a spawned child. `killed` is where the tree stands after the
+/// kills and drops that settled it ([`TreeKilled`]); it is the handle's, whatever it holds, and
+/// outlives the mechanism's [`release`](Self::release).
 #[derive(Debug, Default)]
 pub(crate) struct Tree {
     holder: Holder,
@@ -79,7 +77,16 @@ impl Tree {
     /// Guard for the `_tree` operations (single-sourced with the async `Child`): they act on the
     /// containment group's teardown mechanism, so a child that holds none has no tree to act on.
     pub(crate) fn require_contained(&self) -> Result<(), Error> {
-        if matches!(self.holder, Holder::Contained(_)) {
+        let contained = matches!(self.holder, Holder::Contained(_));
+        if self.released_as.is_none() {
+            debug_assert_eq!(
+                self.containment().can_teardown(),
+                contained,
+                "`can_teardown` disagrees with the holder of {:?}",
+                self.containment()
+            );
+        }
+        if contained {
             return Ok(());
         }
         Err(Error::Unsupported {
@@ -98,10 +105,19 @@ impl Tree {
     /// "has the whole tree exited" without polling. `None` for everything else (an uncontained child,
     /// a nested `Delegated` member, or a teardown-only mechanism like a process group or a walk).
     pub(crate) fn drain_edge(&self) -> Option<DrainEdge<'_>> {
-        match &self.holder {
+        let edge = match &self.holder {
             Holder::Contained(mechanism) => mechanism.drain_edge(),
             Holder::None | Holder::Delegated => None,
+        };
+        if self.released_as.is_none() {
+            debug_assert_eq!(
+                self.containment().can_observe_drain(),
+                edge.is_some(),
+                "`can_observe_drain` disagrees with the drain edge of {:?}",
+                self.containment()
+            );
         }
+        edge
     }
 
     /// What a call that needs the tree's drain edge answers when it has none.
@@ -145,7 +161,10 @@ impl Tree {
     /// delegated has nothing to kill.
     pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         match &self.holder {
-            Holder::None | Holder::Delegated => TreeKillOutcome::Ran(Ok(())),
+            Holder::None | Holder::Delegated => {
+                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                TreeKillOutcome::Ran(Ok(()))
+            }
             Holder::Contained(mechanism) => mechanism.send_kill(root),
         }
     }
@@ -184,7 +203,10 @@ impl Tree {
     #[cfg(unix)]
     pub(crate) fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
         match &self.holder {
-            Holder::None | Holder::Delegated => Ok(false),
+            Holder::None | Holder::Delegated => {
+                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                Ok(false)
+            }
             Holder::Contained(mechanism) => mechanism.would_reach(pid, pidfd),
         }
     }
@@ -196,16 +218,11 @@ impl Tree {
     /// resource is a field of that handle and drops with it regardless — and a `CgroupLeaf`'s
     /// `Drop` fires `cgroup.kill` over an occupied leaf, a Job Object's close fires
     /// `KILL_ON_JOB_CLOSE`. So the opt-out has to reach the resource as well, which is what
-    /// [`disarm`](Self::disarm) is for; without this, `kill_on_drop(false)` killed exactly the
-    /// contained trees [`Child::detach`](crate::Child::detach) (which disarms) keeps alive,
-    /// while [`Command::kill_on_drop`](crate::Command::kill_on_drop) documents the two as the
-    /// same opt-out.
+    /// [`disarm`](Self::disarm) is for.
     ///
-    /// Called by `spawn` as it hands the handle to the caller, not when the handle is built: a
-    /// spawn that fails after that (the POSIX password write) must still tear its tree down.
-    /// Not in `Drop` either: a supervisor that exits without running destructors still has its
-    /// Job Object handle closed by the OS, and with `KILL_ON_JOB_CLOSE` still set that close is
-    /// the kill. `detach()` disarms eagerly for the same reason.
+    /// Called as spawn hands the handle over, not earlier (a later spawn failure must still tear the
+    /// tree down) and not in `Drop` (a supervisor exiting without destructors still has its Job
+    /// closed by the OS, and `KILL_ON_JOB_CLOSE` is the kill).
     ///
     /// # Errors
     ///
@@ -224,7 +241,10 @@ impl Tree {
     /// that is none or delegated owns nothing to neutralize.
     pub(crate) fn disarm(&self) -> std::io::Result<()> {
         match &self.holder {
-            Holder::None | Holder::Delegated => Ok(()),
+            Holder::None | Holder::Delegated => {
+                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                Ok(())
+            }
             Holder::Contained(mechanism) => mechanism.disarm(),
         }
     }
@@ -243,10 +263,8 @@ impl Tree {
         }
     }
 
-    /// The awaited steps of a cgroup leaf's drop
-    /// ([`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)),
-    /// taken with the leaf left in the tree, for the awaited teardown of a child whose handle then
-    /// drops it. Any other tree has no leaf, so nothing to await.
+    /// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)
+    /// with the leaf left in the tree; a no-op for any other tree.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) async fn step_leaf_and_await_drain(&self, child: u32) {
         if let Holder::Contained(Mechanism::Cgroup(leaf)) = &self.holder {
@@ -264,8 +282,7 @@ impl Tree {
         }
     }
 
-    /// Whether this handle already killed the tree completely, as the settlement left it. Only a Unix
-    /// drop reads it ([`DropView`](crate::containment::DropView)), and the tests.
+    /// Whether this handle already killed the tree completely, as the settlement left it.
     #[cfg(unix)]
     pub(crate) fn is_killed(&self) -> bool {
         self.killed.is_set()
@@ -330,8 +347,7 @@ impl crate::child::owned::teardown::Reach for Tree {
 
 // Test accessors -----
 //
-// Each answers for the mechanism it names, and `None` (or `false`) for every other one, the fake
-// included. The `pub` accessors of `Child` that integration tests reach forward to them.
+// The `pub` accessors of `Child` that integration tests reach forward to them.
 
 #[cfg(windows)]
 impl Tree {

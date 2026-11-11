@@ -44,10 +44,10 @@ fn a_tree_reports_the_containment_of_what_holds_it() {
 }
 
 /// A tree is driven only through what a mechanism answers: its kind, its sends, its drain edge, its
-/// reach and its release are the fake's stated ones, and a child's own calls go through them.
+/// reach and its release are the fake's stated ones, and the fake is sent every call the tree makes.
 ///
-/// Mutant: a consumer matches on the mechanism and bypasses the trait; the tree answers a stated
-/// edge where the mechanism has none.
+/// Mutant: a `Tree` stops forwarding a call to its mechanism (`disarm` or `release` answers without
+/// asking it); the tree answers a stated edge where the mechanism has none.
 #[skuld::test]
 fn a_consumer_drives_a_tree_only_through_what_its_mechanism_answers() {
     let (fake, sends) = FakeContains::new(Containment::ProcessGroup, true);
@@ -66,6 +66,34 @@ fn a_consumer_drives_a_tree_only_through_what_its_mechanism_answers() {
     tree.disarm().expect("nothing to neutralize");
     #[cfg(unix)]
     tree.release().wait();
+    #[cfg(unix)]
+    assert_eq!(*sends.lock().unwrap(), ["kill", "disarm", "release"]);
+    #[cfg(not(unix))]
+    assert_eq!(*sends.lock().unwrap(), ["kill", "disarm"]);
+}
+
+/// A tree that is none or delegated holds no mechanism to reach with, and a fake whose kill does not
+/// reach the child asked about answers so through the tree.
+///
+/// Mutant: a tree that is none or delegated answers `true`; the tree answers `true` for a mechanism
+/// whose `reaches` is stated `false`, or asks it for the other call's answer.
+#[cfg(unix)]
+#[skuld::test]
+fn a_tree_reaches_only_what_its_mechanism_says_it_reaches() {
+    use crate::child::owned::teardown::Reach;
+    use crate::os_process::fake::FakeProcess;
+    use crate::test_child::over_fake::child_over;
+
+    let child = child_over(&FakeProcess::new([]));
+    for tree in [Tree::none(), Tree::delegated()] {
+        assert!(!tree.would_reach(1, None).expect("a tree with no mechanism answers"));
+        assert!(!tree.reached(&child.proc).expect("a tree with no mechanism answers"));
+    }
+
+    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
+    let tree = Tree::contained(Mechanism::Fake(fake));
+    assert!(!tree.would_reach(1, None).expect("stated"));
+    assert!(!tree.reached(&child.proc).expect("stated"));
 }
 
 /// What names a tree in a message about its teardown is the text it always had, for each kind of

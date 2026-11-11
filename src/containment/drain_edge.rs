@@ -50,10 +50,8 @@ impl DrainEdge<'_> {
             DrainEdge::Job(job) => job_wait_tree_drained(job, deadline).await,
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => {
-                // Mirrors `Marker::wait_drained`'s own preamble exactly: a reissued read-end fd
-                // would falsely deliver `EV_EOF` instantly here just as readily as it would there,
-                // so this path must not skip the check just because it reads the raw fd directly
-                // instead of going through `Marker::wait_drained`.
+                // Same reissued-fd check as `Marker::wait_drained`: a reissued read-end fd would
+                // deliver a false `EV_EOF`.
                 m.check_read_end_still_valid()?;
                 debug_assert_ne!(
                     crate::containment::marker_eof::write_end_check(m.read_end()),
@@ -68,22 +66,9 @@ impl DrainEdge<'_> {
 
 // The per-OS drivers -----
 
-/// Resolve when every holder of the containment marker's write end has exited — genuinely
-/// poll-free, reactor-native, and with no internal deadline at all.
-///
-/// **Unlike `block_until_drained`, this future has no deadline parameter.** Below `NOTE_LOWAT`'s
-/// clamp it never wakes except on `EV_EOF`. At or past the clamp (a member sustaining writes ≥
-/// the pipe's buffer capacity) this primitive does NOT drain on the writer's behalf, unlike the
-/// sync form's bounded case — see `marker_eof`'s module doc for why an unbounded wait cannot
-/// honestly offer both zero CPU and forward progress for a sustained writer, and why this
-/// primitive, having no deadline to bound the alternative, chooses zero CPU: the writer's own
-/// `write()` call blocks against the full pipe (the marker fd's documented misuse contract —
-/// `fdmarker`'s module doc), and this future stays genuinely asleep until that descriptor
-/// closes. A caller that wants such a writer to make forward progress toward closing the
-/// descriptor cannot get that from this primitive; a caller that merely wants a time bound on
-/// the wait itself can still bound it with a deadline instant (see [`crate::tokio::drive`] for
-/// the deadline; outside the crate, `tokio::time::timeout_at`) — that bounds the CALLER's
-/// patience, not the writer's blocked state.
+/// Resolve when every holder of the marker's write end has exited: poll-free, no internal deadline.
+/// It never drains a sustained writer on its behalf (see `marker_eof`'s module doc); bound the
+/// caller's patience with a deadline instant.
 ///
 /// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
 /// the root as well.
@@ -92,7 +77,6 @@ impl DrainEdge<'_> {
 /// descriptor: a knote is keyed on `(kqueue, fd, filter)`, so a second waiter registering the
 /// same descriptor directly would take over the first's registration and park it forever —
 /// each call arms its OWN private kqueue (`marker_eof::arm`).
-///
 #[cfg(all(feature = "tokio", target_os = "macos"))]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
     wait_tree_drained_watched(read_end, None).await
@@ -102,17 +86,8 @@ pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> 
 /// arm of `tokio::Child::wait_tree`/`wait_tree_timeout`. `Duration::ZERO` delegates to the sync
 /// backend's one-shot, non-blocking probe (safe to call directly from async code).
 ///
-/// The bounded arm (`Some(d)`) arms with `unbounded_wait: false` — computed the same way the
-/// sync backend's `block_until_drained` does (`crate::wait::remaining(deadline).is_none()`,
-/// `false` whenever a real deadline governs this call) — NOT via [`wait_tree_drained`], which is
-/// always unbounded by construction (see its own doc). Arming unbounded here would be a real,
-/// observable divergence from the sync twin: `refuse_if_write_end_held` would refuse an
-/// `Unassessable` write-end scan that a bounded caller should tolerate (its own deadline caps
-/// the risk), and `interpret_read_event` would stop draining a sustained writer at the low-water
-/// clamp, so a bounded wait could only ever expire into `MembersRemain` where the sync call
-/// drains through to the real edge. [`arm_at`](crate::tokio::wait::arm_at) still supplies the
-/// actual bound, armed with the caller's deadline instant; this only fixes what the ARMED kqueue
-/// itself is told.
+/// The bounded arm arms with `unbounded_wait: false`, as the sync `block_until_drained` does for a
+/// real deadline; `wait_tree_drained` is always unbounded.
 #[cfg(all(feature = "tokio", target_os = "macos"))]
 pub(crate) async fn wait_tree_deadline(
     read_end: std::os::fd::BorrowedFd<'_>,
@@ -206,9 +181,7 @@ pub(crate) async fn wait_tree_drained_for_test(
 }
 
 /// The ONE call site for [`wait_tree_drained`]'s own "always unbounded" choice — shared with
-/// [`wait_tree_drained_for_test`] so a mutant on that literal breaks both identically. A test
-/// that instead called `wait_tree_drained_inner` with its OWN independent `true` would not
-/// notice a mutant that changed only the production caller's.
+/// [`wait_tree_drained_for_test`].
 #[cfg(all(feature = "tokio", target_os = "macos"))]
 async fn wait_tree_drained_watched(
     read_end: std::os::fd::BorrowedFd<'_>,
@@ -218,9 +191,8 @@ async fn wait_tree_drained_watched(
 }
 
 /// `unbounded_wait` must be the SAME expression the sync backend's `block_until_drained` uses
-/// (`crate::wait::remaining(deadline).is_none()`) for whichever deadline the caller is honoring
-/// — threaded through to both `arm` and `drain_kqueue` (see [`wait_tree_deadline`]'s own doc for
-/// why arming this wrong is a real, observable divergence, not a cosmetic one).
+/// (`crate::wait::remaining(deadline).is_none()`) for whichever deadline the caller is honoring,
+/// threaded through to both `arm` and `drain_kqueue`.
 ///
 /// `armed`, if given, receives the raw fd of the kqueue this call just armed (test-only; see
 /// [`wait_tree_drained_for_test`]). That fd is valid only while this future is alive.
@@ -303,20 +275,9 @@ pub(crate) async fn cgroup_wait_tree_drained(
 /// releasing the blocking thread promptly on drop via the same cancel-event idiom
 /// [`cancellable_blocking`](crate::tokio::wait::cancellable_blocking) uses for the process wait.
 ///
-/// **Handle ownership across cancellation.** [`cancellable_blocking`](crate::tokio::wait::cancellable_blocking)
-/// gets away with borrowing nothing at all — a process wait clones the process handle into the
-/// closure. A job object has no such re-openable identity, so this function instead duplicates the
-/// live job `HANDLE` into one the spawned task owns outright (`DuplicateHandle`, closed by the
-/// closure itself on every exit path, panic included) before ever spawning. This matters because
-/// dropping THIS future only cancels the `.await` — it does not join the blocking task, which keeps
-/// running detached. A caller cancelling the `wait_tree`/`wait_tree_timeout` future (via `select!`,
-/// an outer `timeout()`, or simply not polling it again) can therefore race `JobHandle::hard_kill`/
-/// `Drop` closing the ORIGINAL handle while the detached task is still mid-syscall on it. A
-/// borrowed raw `HANDLE` would then alias a handle value the kernel is free to recycle onto an
-/// unrelated object the moment it is closed; the duplicate has its own independent lifetime,
-/// closed only by the task that owns it, and is never touched by `JobHandle` at all — so no
-/// such aliasing is possible regardless of what the caller does with the `Child` after
-/// cancelling.
+/// Dropping this future does not join the blocking task, so the task owns a `DuplicateHandle` copy
+/// of the job handle (closed on every exit path, panic included) rather than borrowing one the
+/// `Child` may close and the kernel recycle.
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
@@ -331,11 +292,8 @@ async fn job_wait_tree_drained(
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
         return job.wait_drained(deadline, None);
     }
-    /// An independently-owned duplicate of the job handle, held only by the spawned blocking
-    /// task and closed by it on every exit path, panic included — see this function's own doc
-    /// for why a borrowed handle is not safe to hand across the cancellation boundary here.
-    /// Closing a job handle only fires `KILL_ON_JOB_CLOSE` if it is the LAST open handle to
-    /// that job (Win32 semantics); `JobHandle`'s own, separate handle is unaffected either way.
+    /// The duplicate the blocking task owns. Closing a job handle only fires `KILL_ON_JOB_CLOSE` if
+    /// it is the LAST open handle to that job (Win32 semantics); `JobHandle`'s own is unaffected.
     struct OwnedJobDup(HANDLE);
     impl Drop for OwnedJobDup {
         fn drop(&mut self) {
@@ -348,16 +306,12 @@ async fn job_wait_tree_drained(
     }
 
     // Duplicate INSIDE the closure, so the lock is still held when `DuplicateHandle` reads the
-    // handle. Returning the handle out of `with_handle` first would release the guard before
-    // the call — leaving the load-then-use gap this is meant to close — and Windows recycles a
-    // closed handle's value onto unrelated kernel objects.
+    // handle: returning it out of `with_handle` first would release the guard before the call.
     let Some(dup) = job
         .with_handle(crate::containment::windows::duplicate_job)
         .transpose()?
     else {
-        // Mirrors `JobHandle::wait_drained`'s own early return exactly (this function only
-        // reaches here once that method's Duration::ZERO delegation above has already been
-        // ruled out) — see `consumed_job_handle_error`'s own doc for the full justification.
+        // Same early return as `JobHandle::wait_drained` (see `consumed_job_handle_error`).
         return Err(crate::containment::windows::consumed_job_handle_error());
     };
     let job_dup = OwnedJobDup(dup);

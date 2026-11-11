@@ -1,6 +1,6 @@
 //! A mechanism of stated answers, for the tests of what consumes a [`Tree`](crate::containment::Tree):
-//! it names no process, and answers from what the test stated. It records only which signals it was
-//! asked to send, which is what a consumer's row reads.
+//! it names no process, and answers from what the test stated. It records only which sends it was
+//! asked for, which is what a consumer's row reads.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +11,8 @@ use crate::containment::mechanism::Contains;
 use crate::containment::mechanism::Release;
 use crate::containment::{Containment, Root, TerminateOutcome};
 
-/// The sends a [`FakeContains`] was asked for, in order: `"kill"` and `"terminate"`.
+/// The sends a [`FakeContains`] was asked for, in order: `"kill"`, `"terminate"`, `"disarm"` and
+/// `"release"`.
 pub(crate) type Sends = Arc<Mutex<Vec<&'static str>>>;
 
 /// The answers of a mechanism that names a tree no process is in.
@@ -70,6 +71,7 @@ impl Contains for FakeContains {
     }
 
     fn disarm(&self) -> std::io::Result<()> {
+        self.record("disarm");
         Ok(())
     }
 
@@ -90,6 +92,7 @@ impl Contains for FakeContains {
 
     #[cfg(unix)]
     fn release(self) -> Release {
+        self.record("release");
         Release::nothing()
     }
 }
