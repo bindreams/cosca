@@ -129,7 +129,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
             state(
                 pgid,
                 Signal::SIGKILL,
-                &crate::containment::GroupRoot::trusted_for_test()
+                Some(&crate::test_support::stated_root::StatedRoot::unreaped())
             ),
             GroupState::Cleared
         ),
@@ -159,7 +159,7 @@ fn state_of_an_all_zombie_group_is_cleared() {
             state(
                 pid as i32,
                 Signal::SIGKILL,
-                &crate::containment::GroupRoot::trusted_for_test()
+                Some(&crate::test_support::stated_root::StatedRoot::unreaped())
             ),
             GroupState::Cleared
         ),
@@ -314,7 +314,7 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable() {
         state(
             pgid,
             Signal::SIGTERM,
-            &crate::containment::GroupRoot::trusted_for_test(),
+            Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         ),
         reachable,
     ) {
@@ -376,8 +376,11 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
         let mark = crate::log_capture::mark();
         let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(errno));
         let capture = Capture::start();
-        let reached =
-            super::check_or_signal_linux_sigkill(&kernel, id, &crate::containment::GroupRoot::trusted_for_test());
+        let reached = super::check_or_signal_linux_sigkill(
+            &kernel,
+            id,
+            Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        );
 
         assert!(matches!(reached, super::Reached::Unknown), "{errno}: got {reached:?}");
         assert!(capture.group_steps().is_empty(), "{errno}: nothing was sent");
@@ -407,7 +410,7 @@ fn converge_re_verifies_a_member_through_its_kernel() {
         &kernel,
         pid as i32,
         Signal::SIGTERM,
-        &crate::containment::GroupRoot::trusted_for_test(),
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
 
     assert!(
@@ -435,16 +438,11 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
         Ok(&crate::test_child::stat_of_a_new_owner(pid)),
     );
     let checks = std::cell::Cell::new(0);
-    let check = || {
+    let root = crate::test_support::stated_root::StatedRoot::with_state(pid, || {
         checks.set(checks.get() + 1);
-        Ok(())
-    };
-    let state = super::converge(
-        &kernel,
-        pid as i32,
-        Signal::SIGTERM,
-        &crate::containment::GroupRoot::new(None, &check),
-    );
+        crate::signal::RootState::Unreaped
+    });
+    let state = super::converge(&kernel, pid as i32, Signal::SIGTERM, Some(&root));
 
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
     assert_eq!(checks.get(), 0, "nothing was attempted on a member that is not alive");
@@ -474,7 +472,7 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
         &kernel,
         pid as i32,
         Signal::SIGTERM,
-        &crate::containment::GroupRoot::trusted_for_test(),
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
     drop(refusing);
 
@@ -502,7 +500,7 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
         &kernel,
         pid as i32,
         Signal::SIGKILL,
-        &crate::containment::GroupRoot::trusted_for_test(),
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
     let sent = capture.group_steps();
     drop(capture);
@@ -538,7 +536,11 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
         rustix::process::PidfdFlags::empty(),
         Err(rustix::io::Errno::NOENT),
     );
-    let reached = super::check_or_signal_linux_sigkill(&kernel, id, &crate::containment::GroupRoot::trusted_for_test());
+    let reached = super::check_or_signal_linux_sigkill(
+        &kernel,
+        id,
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+    );
 
     assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");
     assert_eq!(

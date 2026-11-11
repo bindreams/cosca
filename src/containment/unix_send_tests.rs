@@ -4,10 +4,10 @@
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::kill_group;
-use crate::containment::GroupRoot;
 use crate::send_log::{GroupStep, Route};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_support::stated_root::StatedRoot;
 
 /// A leader in a group of its own with two members, all blocked on reads of the test's pipe, the
 /// write end that ends them once dropped, and the members' pids. Returns once both members exist.
@@ -65,11 +65,10 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
 fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     let (mut child, stdin, members) = group_of_three();
     let pgid = child.id() as i32;
-    let check = || Ok(());
-    let root = GroupRoot::new(None, &check);
+    let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
-    kill_group(pgid, &root).expect("kill_group on an owned group");
+    kill_group(pgid, Some(&root)).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);
@@ -109,16 +108,15 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
 fn a_failed_check_sends_nothing_by_the_group_number() {
     let (mut child, stdin, _) = group_of_three();
     let pgid = child.id() as i32;
-    let check = || Err("the root was reaped elsewhere".to_owned());
-    let root = GroupRoot::new(None, &check);
+    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
     let capture = crate::send_log::Capture::start();
-    let err = kill_group(pgid, &root).expect_err("a failed check is an error");
+    let err = kill_group(pgid, Some(&root)).expect_err("a failed check is an error");
     let steps = capture.group_steps();
 
     assert_eq!(steps, [GroupStep::Check], "nothing was sent");
     match &err {
         crate::error::Error::Unassessable { detail, source: None } => {
-            assert!(detail.contains("the root was reaped elsewhere"), "{detail}");
+            assert!(detail.contains("was reaped elsewhere"), "{detail}");
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
@@ -135,10 +133,9 @@ fn kill_group_signals_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _gro
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
-    let check = || Ok(());
-    let root = GroupRoot::new(Some(pidfd.as_fd()), &check);
+    let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
-    kill_group(child.id() as i32, &root).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
     let steps = capture.group_steps();
     drop(stdin);
 
@@ -172,11 +169,10 @@ fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
-    let check = || Ok(());
-    let root = GroupRoot::new(Some(pidfd.as_fd()), &check);
+    let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_pidfd_group_flag();
-    kill_group(child.id() as i32, &root).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);
@@ -205,11 +201,10 @@ fn the_leader_signal_goes_through_the_root_pidfd() {
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
-    let check = || Ok(());
-    let root = GroupRoot::new(Some(pidfd.as_fd()), &check);
+    let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
-    kill_group(child.id() as i32, &root).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);
@@ -235,10 +230,10 @@ fn the_leader_signal_goes_through_the_root_pidfd() {
 #[skuld::test]
 fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
     let (mut child, stdin, _) = group_of_three();
-    let root = GroupRoot::trusted_for_test();
+    let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
-    let result = super::term_group(child.id() as i32, &root);
+    let result = super::term_group(child.id() as i32, Some(&root));
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);
@@ -262,11 +257,11 @@ fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
 #[skuld::test]
 fn a_member_probe_is_a_recorded_send() {
     let (mut child, stdin, members) = group_of_three();
-    let root = GroupRoot::trusted_for_test();
+    let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
     let refusing = super::fault::refuse_probes();
-    let result = super::term_group(child.id() as i32, &root);
+    let result = super::term_group(child.id() as i32, Some(&root));
     drop((refused, refusing));
     let steps = capture.group_steps_with_probes();
     drop(stdin);

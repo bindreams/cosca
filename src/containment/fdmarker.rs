@@ -832,7 +832,7 @@ pub(crate) mod fault {
 
 use std::io;
 
-use crate::containment::GroupRoot;
+use crate::containment::Root;
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
@@ -841,7 +841,7 @@ use crate::identity::{ProcessId, Resolved};
 enum Scope<'r> {
     /// Every channel: the group, the root's number, the ppid walk and the marker holders. The group
     /// is signalled as `root` allows.
-    Full(&'r GroupRoot<'r>),
+    Full(Option<&'r dyn Root>),
     /// The marker holders alone, for a root whose number names no one reliably any more. `except`
     /// is a holder to leave alone: the root, when this process does not pin it.
     HoldersOnly { except: Option<ProcessId> },
@@ -1055,7 +1055,7 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    pub(crate) fn hard_kill(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+    pub(crate) fn hard_kill(&self, root: Option<&dyn Root>) -> Result<(), Error> {
         self.hard_kill_impl(Scope::Full(root))
     }
 
@@ -1111,7 +1111,7 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    pub(crate) fn terminate(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
+    pub(crate) fn terminate(&self, root: Option<&dyn Root>) -> Result<(), Error> {
         self.terminate_impl(Scope::Full(root))
     }
 
@@ -1296,8 +1296,8 @@ impl Marker {
     /// same class of check-then-act window `src/containment/unix.rs` already documents for
     /// `ProcessGroup`'s own one-shot `killpg` — narrowed here to "immediately after a live
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
-    /// that. Each pass's `killpg` also checks the root right before it (`root`, see
-    /// [`GroupRoot::check`]), on every pass, not once for the sweep.
+    /// that. Each pass's `killpg` also checks the root right before it (`group_root`, see
+    /// [`check_number`](crate::containment::check_number)), on every pass, not once for the sweep.
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,
@@ -1308,8 +1308,8 @@ impl Marker {
         scope: Scope<'_>,
     ) -> bool {
         let walk = matches!(scope, Scope::Full(_));
-        let group = match scope {
-            Scope::Full(root) => Some(root),
+        let group_root = match scope {
+            Scope::Full(root) => root,
             Scope::HoldersOnly { .. } => None,
         };
         let except = match scope {
@@ -1473,15 +1473,17 @@ impl Marker {
                         .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
                 });
             let should_fire = first_pass || live_holder_confirms_pgid;
-            if group.is_none() {
-            } else if let (Some(root), true) = (group, should_fire) {
+            if !walk {
+            } else if should_fire {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors` below).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
-                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => crate::containment::unix::kill_group(pgid, root),
-                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, root),
+                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => {
+                        crate::containment::unix::kill_group(pgid, group_root)
+                    }
+                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, group_root),
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {

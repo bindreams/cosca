@@ -445,7 +445,7 @@ impl Child {
                 // A cgroup kill names no group by the root's pid, so no root is given.
                 debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
                 self.attached
-                    .hard_kill_settled(op, &self.tree_killed, &crate::containment::GroupRoot::none())
+                    .hard_kill_settled(op, &self.tree_killed, None)
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
                 self.cgroup_kill_reached(front)?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -630,9 +630,9 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
         #[cfg(unix)]
-        let group = held.group();
+        let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
-        let group = crate::containment::GroupRoot::none();
+        let root: Option<&dyn crate::containment::Root> = None;
         #[cfg(unix)]
         let root_ended_by_handle = std::cell::Cell::new(false);
         #[cfg(unix)]
@@ -650,7 +650,7 @@ impl Child {
                     root_ended_by_handle.set(SweepFailure::killed_root(&sent));
                     sent
                 },
-                &group,
+                root,
             )
         {
             return result.map_err(|error| SweepFailure {
@@ -658,7 +658,7 @@ impl Child {
                 root_ended: root_ended_by_handle.get(),
             });
         }
-        let group_result = self.attached.hard_kill(&group);
+        let group_result = self.attached.hard_kill(root);
         #[cfg(unix)]
         drop(held);
         let group_result = self.attached.unless_unwalked(op, &self.tree_killed, group_result)?;
@@ -787,23 +787,23 @@ impl Child {
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
         #[cfg(unix)]
-        let group = held.group();
+        let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
-        let group = crate::containment::GroupRoot::none();
+        let root: Option<&dyn crate::containment::Root> = None;
         #[cfg(unix)]
         if let Some(result) = self
             .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-            .root_checked(|| held.state(), || held.signal(crate::signal::Sig::Term), &group)
+            .root_checked(|| held.state(), || held.signal(crate::signal::Sig::Term), root)
         {
             return result;
         }
-        self.terminate_tree_unchecked(&group)
+        self.terminate_tree_unchecked(root)
     }
 
-    /// The group's termination signal, with no look at the root's state but `group`'s own check
+    /// The group's termination signal, with no look at the root's state but `root`'s own check
     /// before each send by the root's number.
-    pub(crate) fn terminate_tree_unchecked(&self, group: &crate::containment::GroupRoot<'_>) -> Result<(), Error> {
-        self.attached.terminate(self.pid(), group)
+    pub(crate) fn terminate_tree_unchecked(&self, root: Option<&dyn crate::containment::Root>) -> Result<(), Error> {
+        self.attached.terminate(self.pid(), root)
     }
 
     /// A tree call on this child's tree ([`TreeCall`]).

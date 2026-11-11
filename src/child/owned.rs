@@ -445,20 +445,24 @@ impl ReapHold<'_> {
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         self.child.signal_locked(&self.lock, sig)
     }
-
-    /// The root's group, for a send by the root's pid: its check reads this hold's
-    /// [`state`](Self::state), so no reap of ours lands between a check and its send. On Linux the
-    /// root's pidfd names the group exactly; on macOS there is none.
-    pub(crate) fn group(&self) -> crate::containment::GroupRoot<'_> {
-        crate::containment::GroupRoot::new(self.child.pidfd(), self)
-    }
 }
 
-/// Whether the root's pid still names its group, from this hold's own evidence.
+/// The root for a send by its pid: [`state`](ReapHold::state) reads this hold's own evidence, so
+/// no reap of ours lands between a check and its send. On Linux the root's pidfd names the group
+/// exactly; on macOS there is none.
 #[cfg(unix)]
-impl crate::containment::RootCheck for ReapHold<'_> {
-    fn check(&self) -> Result<(), String> {
-        super::tree_call::group_number_holds(self.pid, self.state())
+impl crate::containment::Root for ReapHold<'_> {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn state(&self) -> crate::signal::RootState {
+        ReapHold::state(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.child.pidfd()
     }
 }
 

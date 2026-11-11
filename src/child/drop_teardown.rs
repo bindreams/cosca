@@ -165,7 +165,7 @@ impl Child {
         }
         #[cfg(not(unix))]
         {
-            let tree = self.attached.hard_kill(&crate::containment::GroupRoot::none());
+            let tree = self.attached.hard_kill(None);
             let parts = DropParts {
                 caller,
                 tree: Some(tree),
@@ -229,7 +229,7 @@ impl Child {
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
         let held = self.proc.hold(self.pid());
-        let kill = self.attached.hard_kill_for_drop(&view, &held.group());
+        let kill = self.attached.hard_kill_for_drop(&view, Some(&held));
         drop(held);
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
