@@ -873,6 +873,7 @@ impl JobHandle {
 
 /// Duplicate a job handle, for the one wait that outlives its borrow of the `JobHandle`: the
 /// async drain's blocking thread, which `spawn_blocking` does not join when its future is dropped.
+#[cfg(feature = "tokio")]
 pub(crate) fn duplicate_job(handle: HANDLE) -> Result<HANDLE, crate::error::Error> {
     use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
     use windows::Win32::System::Threading::GetCurrentProcess;

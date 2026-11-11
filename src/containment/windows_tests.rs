@@ -260,6 +260,7 @@ fn invalid_handle_with_a_console_attached_stays_io() {
 ///
 /// Mutant: `duplicate_job` converts with the `windows` crate's own `io::Error` conversion, which
 /// keeps the HRESULT (`0x80070006`).
+#[cfg(feature = "tokio")]
 #[skuld::test]
 fn duplicate_job_failure_carries_the_win32_code() {
     let err = super::duplicate_job(windows::Win32::Foundation::HANDLE::default())
