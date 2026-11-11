@@ -268,7 +268,10 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
 
 /// A `TreeWalk` proves its root still holds its pid before it walks, as a tree call's does. A reaped
 /// root fails that proof, so the drop walks nothing (the recorder notes a walk only once the proof
-/// passed) and warns that no walk ran. Mutant: the reaped `TreeWalk` still walks.
+/// passed) and warns that no walk ran. Mutant: the reaped `TreeWalk` still walks. Not macOS: there a
+/// `TreeWalk` root is an fd marker without a group, which
+/// `fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders` pins.
+#[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran() {
     crate::log_capture::install();
