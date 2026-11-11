@@ -389,6 +389,7 @@ fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
         why,
         root_alone,
         holders: None,
+        earlier: None,
     }
 }
 

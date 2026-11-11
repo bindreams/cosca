@@ -96,15 +96,23 @@ use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolu
 use crate::Recursive;
 
 /// A tree named by parentage: the root's identity, from which its descendants are enumerated and
-/// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]).
+/// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]), and the members its kills left.
+///
+/// The root's death reparents a descendant out of any later walk, so the walk holds each member its
+/// kills left: every later kill tries them again ([`send_kill`](Contains::send_kill)).
 #[derive(Debug)]
 pub(crate) struct Walker {
     root: ProcessId,
+    /// The members the last kill left, in the order its outcome has them.
+    left: std::sync::Mutex<Vec<Left>>,
 }
 
 impl Walker {
     pub(crate) fn new(root: ProcessId) -> Walker {
-        Walker { root }
+        Walker {
+            root,
+            left: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// The root the walk starts from.
@@ -112,11 +120,40 @@ impl Walker {
     pub(crate) fn root(&self) -> ProcessId {
         self.root
     }
+
+    /// `outcome`, the kill the walk just made (or skipped), with the members the kills before it left:
+    /// each one whose identity was read is killed again by it, so one that is gone stops failing the
+    /// call and one that still refuses is `MemberNotKilled` again; one never read is `MemberNotKilled`
+    /// again as it was. A member `outcome` names itself is not repeated. The earlier members come
+    /// first, as the first failure stands, and what `outcome` then leaves is what is held next.
+    ///
+    /// The members are read, killed and written under one lock, so two kills of one tree answer in
+    /// turn; the kills by identity take a `Kernel` and a `ProcessId` and never reach the walk, so the
+    /// lock is not re-entered.
+    fn with_earlier(&self, kernel: &dyn Kernel, outcome: TreeKillOutcome) -> TreeKillOutcome {
+        let mut held = self.left.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let named: Vec<RawPid> = match &outcome {
+            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Answered(Err(left)) => left
+                .members
+                .iter()
+                .filter_map(|member| match member {
+                    Error::MemberNotKilled { pid, .. } => Some(*pid),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let outcome = outcome.with_earlier(again(kernel, &held, &named));
+        // Written once, here, so an unwind leaves what was held.
+        *held = Left::in_outcome(&outcome);
+        outcome
+    }
 }
 
 impl Contains for Walker {
+    /// The walk's kill, and the members earlier kills left killed again ([`Walker::with_earlier`]).
     fn send_kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
-        kill_tree(self.root, root)
+        self.with_earlier(&crate::identity::HostKernel, kill_tree(self.root, root))
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
@@ -638,8 +675,8 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome
         .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
     {
         Ok(Some(walk)) => walk,
-        Ok(None) => return TreeKillOutcome::NoRoot,
-        Err(error) => return TreeKillOutcome::Unwalked(error),
+        Ok(None) => return TreeKillOutcome::NoRoot(None),
+        Err(error) => return TreeKillOutcome::Unwalked(error, None),
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
@@ -702,8 +739,7 @@ fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
     }
 }
 
-/// A member of a `TreeWalk` tree that a walk left, as the handle holds it for the next kill
-/// ([`with_earlier`]).
+/// A member of a `TreeWalk` tree that a walk left, as the [`Walker`] holds it for the next kill.
 #[derive(Debug, Clone)]
 pub(crate) enum Left {
     /// The walk read its identity and its kill was refused: a later kill kills it by identity again.
@@ -747,6 +783,24 @@ impl Left {
             .collect()
     }
 
+    /// The members `outcome` leaves that the walk holds: the ones its own walk left, or the earlier
+    /// ones it left still.
+    fn in_outcome(outcome: &TreeKillOutcome) -> Vec<Left> {
+        match outcome {
+            TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Answered(Err(left)) => Left::of(left),
+            TreeKillOutcome::Unwalked(_, Some(earlier))
+            | TreeKillOutcome::NoRoot(Some(earlier))
+            | TreeKillOutcome::Skipped(Skip {
+                earlier: Some(earlier), ..
+            }) => Left::of(earlier),
+            TreeKillOutcome::Ran(Ok(()))
+            | TreeKillOutcome::Answered(Ok(()))
+            | TreeKillOutcome::Unwalked(_, None)
+            | TreeKillOutcome::NoRoot(None)
+            | TreeKillOutcome::Skipped(Skip { earlier: None, .. }) => Vec::new(),
+        }
+    }
+
     fn pid(&self) -> RawPid {
         match self {
             Left::Resolved(id) => id.pid(),
@@ -755,60 +809,38 @@ impl Left {
     }
 }
 
-/// `walked`, the answer of a kill that walked a tree, with `earlier`, the members the kills before it
-/// left. The root's death reparents a descendant out of any later walk, so such a walk cannot find
-/// them: each one read is killed again by its identity, so one that is gone stops failing the call
-/// and one that still refuses is `MemberNotKilled` again; one never read is `MemberNotKilled` again
-/// as it was. A member the walk names itself is not repeated. The earlier members come first, as the
-/// first failure stands.
-pub(crate) fn with_earlier(
-    kernel: &dyn Kernel,
-    earlier: Vec<Left>,
-    walked: Result<(), Unkilled>,
-) -> Result<(), Unkilled> {
-    let mut walked = match walked {
-        Ok(()) => Unkilled {
-            members: Vec::new(),
-            root: None,
-            resolved: Vec::new(),
-        },
-        Err(left) => left,
-    };
-    let named: Vec<RawPid> = walked
-        .members
-        .iter()
-        .filter_map(|member| match member {
-            Error::MemberNotKilled { pid, .. } => Some(*pid),
-            _ => None,
-        })
-        .collect();
+/// The members of `earlier` not in `named` (the members the kill that comes after them names itself),
+/// tried again: each one read is killed again by its identity, so one that is gone stops failing the
+/// call and one that still refuses is `MemberNotKilled` again; one never read is `MemberNotKilled`
+/// again as it was. `None` when none is left.
+fn again(kernel: &dyn Kernel, earlier: &[Left], named: &[RawPid]) -> Option<Unkilled> {
     let mut members = Vec::new();
-    for left in earlier.into_iter().filter(|left| !named.contains(&left.pid())) {
+    let mut resolved = Vec::new();
+    for left in earlier.iter().filter(|left| !named.contains(&left.pid())) {
         match left {
             Left::Resolved(id) => {
                 #[cfg(any(unix, windows))]
-                if let Some(error) = left_behind(id, kill_one(kernel, id)) {
+                if let Some(error) = left_behind(*id, kill_one(kernel, *id)) {
                     members.push(error);
-                    walked.resolved.push(id);
+                    resolved.push(*id);
                 }
                 #[cfg(not(any(unix, windows)))]
                 let _ = (kernel, id);
             }
             Left::Unread { pid, said } => members.push(not_killed(
-                pid,
+                *pid,
                 Error::Unassessable {
-                    detail: said,
+                    detail: said.clone(),
                     source: None,
                 },
             )),
         }
     }
-    if members.is_empty() && walked.members.is_empty() && walked.root.is_none() {
-        return Ok(());
-    }
-    members.append(&mut walked.members);
-    walked.members = members;
-    Err(walked)
+    (!members.is_empty()).then_some(Unkilled {
+        members,
+        root: None,
+        resolved,
+    })
 }
 
 /// The error for the member `pid` a walk left behind, `source` why.
@@ -1042,6 +1074,7 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
                 why: Why::Untrusted(crate::signal::why_untrusted(&state)),
                 root_alone: false,
                 holders: None,
+                earlier: None,
             });
         }
     }

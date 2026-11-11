@@ -632,7 +632,7 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
 }
 
 /// The members an earlier kill left, against a later walk that finds none of them
-/// ([`with_earlier`](super::with_earlier)): one whose identity was read is killed by it again, and
+/// ([`again`](super::again)): one whose identity was read is killed by it again, and
 /// is `MemberNotKilled` again while the kernel still cannot reach it; one never read is
 /// `MemberNotKilled` again with its first cause, and the kernel is not asked about it.
 ///
@@ -640,15 +640,15 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
 /// acted on by its pid.
 #[skuld::test]
 fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again() {
-    use super::{with_earlier, Left};
+    use super::{again, Left};
     let sends = crate::send_log::Capture::start();
     let (child, _, descendant, kernel) = root_with_an_unreadable_descendant();
 
-    let again = with_earlier(&kernel, vec![Left::Resolved(descendant)], Ok(()))
-        .expect_err("the kernel still cannot reach the descendant");
-    assert_eq!(again.members.len(), 1, "{again:?}");
+    let again_left =
+        again(&kernel, &[Left::Resolved(descendant)], &[]).expect("the kernel still cannot reach the descendant");
+    assert_eq!(again_left.members.len(), 1, "{again_left:?}");
     assert_not_killed(
-        Err(again.into_error()),
+        Err(again_left.into_error()),
         descendant.pid(),
         &["identity could not be read: pidfd_open"],
     );
@@ -658,9 +658,9 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
         pid: descendant.pid(),
         said: "its identity could not be read".into(),
     };
-    let again = with_earlier(&kernel, vec![unread], Ok(())).expect_err("never read, so never shown killed");
+    let again_left = again(&kernel, &[unread], &[]).expect("never read, so never shown killed");
     assert_not_killed(
-        Err(again.into_error()),
+        Err(again_left.into_error()),
         descendant.pid(),
         &["its identity could not be read"],
     );
