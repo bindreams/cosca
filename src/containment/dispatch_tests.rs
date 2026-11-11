@@ -191,13 +191,17 @@ fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::process::ExitStatusExt as _;
 
     use super::TreeKillOutcome;
     use crate::containment::treewalk::Walker;
     use crate::containment::{Mechanism, TerminateOutcome, Tree, Why};
     use crate::signal::RootState;
     use crate::test_support::stated_root::StatedRoot;
+
+    // Held for the body: the marker's write end is open in this process between its install and
+    // the holder's exec, and a fork landing there would inherit it.
+    let _serialize = crate::child::spawn::spawn_lock();
 
     let walk = || Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
     let rooted = |state: fn() -> RootState| StatedRoot::with_state(1234, state);
@@ -213,27 +217,38 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
         assert!(matches!(termed, TerminateOutcome::End(_)), "{name}: {termed:?}");
     }
 
-    let (read, write) = std::io::pipe().expect("pipe");
-    let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
-    let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
-    let prepared = crate::containment::fdmarker::PreparedMarker {
-        read: std::os::fd::OwnedFd::from(read),
-        handle,
-        read_handle,
-        fd: write.as_fd().as_raw_fd(),
+    // A marker whose only holder is a live child: this process holding the write end would be its
+    // own holder, which a sweep refuses. Each call is signalled once, so each gets a fresh holder.
+    let held = || {
+        let mut cmd = crate::test_child::member_command(0);
+        let prepared = crate::containment::fdmarker::fdmarker_tests::install_on(&mut cmd, &[]).expect("install");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the test holds spawn_lock for its whole body via `_serialize`"
+        )]
+        let mut holder = cmd.spawn().expect("spawn the holder");
+        drop(cmd);
+        crate::test_child::await_member_ready(&mut holder);
+        let root_id = crate::containment::fdmarker::fdmarker_tests::inert_root();
+        let marker = Tree::contained(Mechanism::Marker(crate::containment::fdmarker::Marker::new(
+            prepared,
+            root_id,
+            Some(1234),
+        )));
+        (marker, holder)
     };
-    let root_id = crate::containment::fdmarker::fdmarker_tests::inert_root();
-    let marker = Tree::contained(Mechanism::Marker(crate::containment::fdmarker::Marker::new(
-        prepared,
-        root_id,
-        Some(1234),
-    )));
     for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
+        let (marker, mut holder) = held();
         let killed = marker.kill(Some(&root));
         assert!(
             matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && matches!(skip.holders, Some(Ok(())))),
             "{name}: {killed:?}"
         );
+        // A signal ended it, not the stdin's EOF at `wait`, which exits `sh` 1 with none.
+        let status = holder.wait().expect("reap the holder");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{name}: {status:?}");
+
+        let (marker, mut holder) = held();
         let termed = marker.terminate(1234, Some(&root));
         assert!(
             matches!(
@@ -245,6 +260,8 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
             ),
             "{name}: {termed:?}"
         );
+        let status = holder.wait().expect("reap the holder");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
 }
 

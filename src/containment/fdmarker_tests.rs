@@ -45,7 +45,10 @@ pub(crate) fn inert_root() -> crate::identity::ProcessId {
 }
 
 /// `install` on `cmd`, as the only step of its hook.
-fn install_on(cmd: &mut std::process::Command, reserved: &[std::os::fd::RawFd]) -> Option<super::PreparedMarker> {
+pub(crate) fn install_on(
+    cmd: &mut std::process::Command,
+    reserved: &[std::os::fd::RawFd],
+) -> Option<super::PreparedMarker> {
     crate::child::spawn::in_child::register_alone(cmd, |steps| super::install(steps, reserved))
 }
 
