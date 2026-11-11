@@ -521,11 +521,7 @@ fn a_bind_error_has_its_cause_as_its_source() {
         },
     ];
     for error in errors {
-        assert_eq!(
-            crate::elevation::shim::fixtures::os_code(&error),
-            Some(libc::ENOMEM),
-            "{error}"
-        );
+        assert_eq!(crate::error::first_os_code(&error), Some(libc::ENOMEM), "{error}");
         assert!(
             !error.to_string().contains(&os().to_string()),
             "the cause is in the text: {error}"

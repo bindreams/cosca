@@ -262,7 +262,7 @@ pub(crate) struct ScopeReadError {
 pub(crate) fn scope_error(e: ScopeReadError) -> Error {
     Error::IdentityRecord {
         kind: RecordErrorKind::ScopeUnreadable,
-        detail: format!("{} could not be read: {}", e.path, e.source),
+        detail: format!("{} could not be read", e.path),
         source: Some(Error::io_cause(e.source)),
     }
 }

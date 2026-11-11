@@ -264,7 +264,7 @@ fn relative_or_missing_tmpdir_is_an_error_naming_it() {
     };
     assert!(e.to_string().contains(&missing.display().to_string()), "{e}");
     assert!(!e.to_string().contains("No such file"), "the cause is in the text: {e}");
-    assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::ENOENT));
+    assert_eq!(crate::error::first_os_code(&e), Some(libc::ENOENT));
 }
 
 #[skuld::test]
@@ -273,14 +273,14 @@ fn a_private_directory_error_has_its_cause_as_its_source() {
     let Err(e @ PrivateDirError::Create { .. }) = PrivateDir::create_with(root.path(), open_fails, true) else {
         panic!("a failing open must be a Create error");
     };
-    assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::EIO));
+    assert_eq!(crate::error::first_os_code(&e), Some(libc::EIO));
     assert!(
         !e.to_string().contains("Input/output error"),
         "the cause is in the text: {e}"
     );
 
     let e = PrivateDirError::ForkGuard(std::io::Error::from_raw_os_error(libc::ENOMEM));
-    assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::ENOMEM));
+    assert_eq!(crate::error::first_os_code(&e), Some(libc::ENOMEM));
     assert!(
         !e.to_string()
             .contains(&std::io::Error::from_raw_os_error(libc::ENOMEM).to_string()),

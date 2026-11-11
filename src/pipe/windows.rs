@@ -20,15 +20,15 @@ use std::process::Stdio;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::NtOpenFile;
 use windows::Win32::Foundation::{
-    RtlNtStatusToDosError, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, HANDLE, NTSTATUS,
-    UNICODE_STRING, WAIT_OBJECT_0,
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, HANDLE, NTSTATUS, UNICODE_STRING,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED};
 
 use super::{ParentEnd, PipeReader, PipeWriter};
-use crate::error::win32_io_error;
+use crate::error::{nt_io_error, win32_io_error};
 use crate::stdio::Direction;
 
 // The NT create =====
@@ -74,11 +74,6 @@ extern "system" {
     ) -> NTSTATUS;
 }
 
-fn nt_error(status: NTSTATUS) -> io::Error {
-    // SAFETY: a pure status-to-code mapping.
-    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
-}
-
 /// An unnamed pipe for a child: `(ours, theirs)`. `ours` is overlapped and readable if
 /// `ours_readable`, else writable; `theirs` is synchronous and the other direction, the end the
 /// child is given. Neither is inheritable: the spawn gives the child its end explicitly.
@@ -113,7 +108,7 @@ fn nt_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
         )
     };
     if status.is_err() {
-        return Err(nt_error(status));
+        return Err(nt_io_error(status));
     }
     // SAFETY: `NtOpenFile` succeeded, so the handle is ours to close.
     let directory_handle = unsafe { OwnedHandle::from_raw_handle(directory_handle.0) };
@@ -153,7 +148,7 @@ fn nt_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
         )
     };
     if status.is_err() {
-        return Err(nt_error(status));
+        return Err(nt_io_error(status));
     }
     // SAFETY: `NtCreateNamedPipeFile` succeeded.
     let ours = unsafe { OwnedHandle::from_raw_handle(ours.0) };
@@ -177,7 +172,7 @@ fn nt_pipe(ours_readable: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
         )
     };
     if status.is_err() {
-        return Err(nt_error(status));
+        return Err(nt_io_error(status));
     }
     // SAFETY: `NtOpenFile` succeeded.
     let theirs = unsafe { OwnedHandle::from_raw_handle(theirs.0) };
@@ -233,7 +228,7 @@ pub(crate) fn is_overlapped(handle: BorrowedHandle<'_>) -> io::Result<bool> {
         )
     };
     if status.is_err() {
-        return Err(nt_error(status));
+        return Err(nt_io_error(status));
     }
     Ok(mode.Mode & FILE_SYNCHRONOUS_IO_MASK == 0)
 }
@@ -483,7 +478,7 @@ impl<S: BorrowMut<OVERLAPPED>> Drop for Operation<S> {
             // `ERROR_NOT_FOUND`: the operation completed first. Any other error leaves the kernel
             // with the buffer, and unwinding would free it.
             if e.code() != windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0) {
-                abort_with_buffer_in_kernel(&format!("cancelling a pipe operation ({e})"));
+                abort_with_buffer_in_kernel(&format!("cancelling a pipe operation ({})", crate::error::Report(&e)));
             }
         }
         wait_or_abort(self.event());

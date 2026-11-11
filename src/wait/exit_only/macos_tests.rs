@@ -66,6 +66,45 @@ fn an_identity_read_gone_takes_the_echild_path() {
     reap_by_pid(pid);
 }
 
+/// `err` is a refused read's: `PermissionDenied`, `EPERM` as its OS code, `words` in its message
+/// and no "errno" in it.
+fn assert_refused_read(err: &std::io::Error, words: &str) {
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert_eq!(crate::error::first_os_code(err), Some(libc::EPERM), "{err}");
+    let said = crate::error::Report(err).to_string();
+    assert!(said.contains(words), "{said}");
+    assert!(!said.contains("errno"), "{said}");
+}
+
+/// A peek whose id read of an exited child is refused does not consume the exit: it is an error
+/// with the refusal's code.
+///
+/// Mutant: the branch answers `Foreign(Gone)`, or words the errno in its text.
+#[skuld::test]
+fn a_refused_identity_read_of_an_exited_child_is_an_error_with_the_refusals_code() {
+    let (_os, pid) = exited_unreaped_blocker();
+    let target = Target::pid(pid, Some(unique_of(pid)));
+    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EPERM));
+    let err = exit_only::peek(&target).expect_err("an exit that cannot be tied to the child is not consumed");
+    drop(forced);
+    assert_refused_read(&err, "its exit was not consumed");
+    reap_by_pid(pid);
+}
+
+/// A verified peek of a running child whose id read is refused cannot show it to be ours: an error
+/// with the refusal's code.
+///
+/// Mutant: the branch answers `Running`, or words the errno in its text.
+#[skuld::test]
+fn a_refused_identity_read_of_a_running_child_is_an_error_to_a_verified_peek() {
+    let (_os, id, _stdin) = adopted_blocker();
+    let target = Target::pid(id.pid(), Some(unique_of(id.pid())));
+    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    let err = exit_only::peek_verified(&target).expect_err("a running child cannot be shown to be ours");
+    drop(forced);
+    assert_refused_read(&err, "it cannot be shown to be ours");
+}
+
 // The second reap =====
 
 /// The second reap of an exited, unreaped child, whose unique id reads as `read`. The zombie is
@@ -318,4 +357,5 @@ fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
     let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
     let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");
 }

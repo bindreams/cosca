@@ -197,9 +197,9 @@ fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
 }
 
 fn refused(pid: u32, errno: i32) -> WalkError {
-    WalkError::Identity(std::io::Error::new(
-        std::io::Error::from_raw_os_error(errno).kind(),
-        format!("tracer {pid}: its identity could not be read (errno {errno})"),
+    WalkError::Identity(crate::error::io_context(
+        format!("tracer {pid}: its identity could not be read"),
+        std::io::Error::from_raw_os_error(errno),
     ))
 }
 

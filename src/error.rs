@@ -434,11 +434,33 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> std::io::Error {
     }
 }
 
+/// `status` as the `io::Error` std would report for the Win32 code it maps to
+/// (`RtlNtStatusToDosError`). The mapping is lossy: the exact `NTSTATUS` is not kept, and one with
+/// no Win32 code maps to `ERROR_MR_MID_NOT_FOUND`, in which case the status is logged at `debug`.
+#[cfg(windows)]
+pub(crate) fn nt_io_error(status: windows::Win32::Foundation::NTSTATUS) -> std::io::Error {
+    // SAFETY: a pure status-to-code mapping.
+    let code = unsafe { windows::Win32::Foundation::RtlNtStatusToDosError(status) };
+    if code == windows::Win32::Foundation::ERROR_MR_MID_NOT_FOUND.0 {
+        log::debug!("NTSTATUS {:#010x} has no Win32 code", status.0 as u32);
+    }
+    std::io::Error::from_raw_os_error(code as i32)
+}
+
 /// `error`, then each of its [`source`](std::error::Error::source)s, outermost first.
 pub(crate) fn chain<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
     std::iter::successors(Some(error), |e| e.source())
+}
+
+/// The first OS code down `error`'s [`chain`]: the first `io::Error` layer that has one. `None`
+/// when the chain holds none.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    chain(error)
+        .filter_map(|layer| layer.downcast_ref::<std::io::Error>())
+        .find_map(std::io::Error::raw_os_error)
 }
 
 /// An error as one line: every layer of its [`chain`], each layer's `Display` joined with `": "`.
@@ -563,17 +585,18 @@ impl Error {
         }
     }
 
-    /// The OS error code of a failure, for a look whose failure is told apart by it: the first of
-    /// [`io_errors`](Error::io_errors) that has one. `None` when the chain holds none.
+    /// The OS error code of a failure, for a look whose failure is told apart by it: the first
+    /// `io::Error` down the `source()` chain that has one ([`first_os_code`]). `None` when the
+    /// chain holds none.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
-        self.io_errors().find_map(std::io::Error::raw_os_error)
+        first_os_code(self)
     }
 
     /// The `io::Error`s down this error's `source()` chain, outermost first. Under [`io_context`]
     /// and [`with_note`](Error::with_note) the first of them is a code-less wrapper and the OS error
     /// comes below it.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
         chain(self).filter_map(|s| s.downcast_ref::<std::io::Error>())
     }

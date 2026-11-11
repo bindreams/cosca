@@ -264,15 +264,12 @@ pub(crate) fn classify_spawn_denial(
     if !flags.breakaway_from_job {
         return err;
     }
-    let Error::Io(io) = &err else {
+    let Error::Io(io) = err else {
         return err;
     };
-    if io.raw_os_error() != Some(ERROR_ACCESS_DENIED.0 as i32) {
-        return err;
-    }
     // Never assert a cause the process just measured to be false, or could not measure at all.
-    if job != JobBreakaway::Forbidden {
-        return err;
+    if io.raw_os_error() != Some(ERROR_ACCESS_DENIED.0 as i32) || job != JobBreakaway::Forbidden {
+        return Error::Io(io);
     }
     Error::Containment {
         detail: "the spawn was refused with ACCESS_DENIED, and this process's job object sets \
@@ -285,7 +282,7 @@ pub(crate) fn classify_spawn_denial(
                  contain(), the job is cosca's own, which sets neither limit and whose limits a \
                  member process cannot relax."
             .into(),
-        source: None,
+        source: Some(Error::io_cause(io)),
     }
 }
 

@@ -554,6 +554,31 @@ fn win32_io_error_unwraps_a_win32_hresult() {
     assert_eq!(e_fail.raw_os_error(), Some(0x8000_4005u32 as i32));
 }
 
+/// A mapped `NTSTATUS` becomes its Win32 code, so `kind()` classifies it.
+#[cfg(windows)]
+#[skuld::test]
+fn nt_io_error_maps_a_status_to_its_win32_code() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, STATUS_ACCESS_DENIED};
+    let e = crate::error::nt_io_error(STATUS_ACCESS_DENIED);
+    assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32));
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+/// `0xC0FFEE01` is a made-up error status (a facility and code Microsoft never assigned), which
+/// `RtlNtStatusToDosError` has no Win32 code for: it maps to `ERROR_MR_MID_NOT_FOUND`, and the
+/// status is logged at `debug`, as it is kept nowhere else.
+#[cfg(windows)]
+#[skuld::test]
+fn nt_io_error_logs_a_status_with_no_win32_code() {
+    use windows::Win32::Foundation::{ERROR_MR_MID_NOT_FOUND, NTSTATUS};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let e = crate::error::nt_io_error(NTSTATUS(0xC0FF_EE01u32 as i32));
+    assert_eq!(e.raw_os_error(), Some(ERROR_MR_MID_NOT_FOUND.0 as i32));
+    let levels = crate::log_capture::levels_since(mark, "0xc0ffee01");
+    assert_eq!(levels, [log::Level::Debug], "one debug record names the status");
+}
+
 #[skuld::test]
 fn io_error_source_is_the_wrapped_io_error() {
     let e = Error::Io(std::io::Error::from_raw_os_error(13));

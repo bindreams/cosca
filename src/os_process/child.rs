@@ -245,6 +245,6 @@ pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {}", crate::error::Report(&e)));
     (os, id, stdin)
 }

@@ -408,9 +408,9 @@ fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Res
         // All ASCII digits, so UTF-8; the only way to fail is overflow.
         let text = String::from_utf8_lossy(&name);
         let pid = text.parse::<u32>().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the /proc entry {text:?} is all digits but not a pid: {e}"),
+            crate::error::io_context(
+                format!("the /proc entry {text:?} is all digits but not a pid"),
+                io::Error::new(io::ErrorKind::InvalidData, e),
             )
         })?;
         debug_assert!(

@@ -130,10 +130,7 @@ mod macos {
         let err = crate::signal::identity_unreadable(77, libc::EPERM);
         match err {
             crate::error::Error::Unassessable { detail, source } => {
-                assert!(
-                    detail.contains("pid 77") && detail.contains("EPERM") || detail.contains("errno 1"),
-                    "{detail}"
-                );
+                assert!(detail.contains("pid 77") && !detail.contains("errno"), "{detail}");
                 assert_eq!(source.map(|e| e.raw_os_error()), Some(Some(libc::EPERM)));
             }
             other => panic!("expected Unassessable, got {other:?}"),

@@ -66,7 +66,7 @@
 //! read fails (no record, on Windows no sequence number, or a parent number that cannot be read) goes to the proof of the accepted parent
 //! first: a parent that is gone drops it quietly, as `Gone`; one that cannot be proved drops it with
 //! an error naming `ppid N`; and only a held parent lets its own failure stand, an error naming the
-//! candidate (on Windows, with the `NTSTATUS` of a refused creator-pid or sequence-number query).
+//! candidate (on Windows, with the refused query's `NTSTATUS`, as a Win32 code, for its source).
 //!
 //! # A walk that could not assess a member
 //!
@@ -143,8 +143,18 @@ impl Walk {
         let Some((_, first)) = unassessed.next() else {
             return Ok(members);
         };
+        // The entry says the candidate's `detail` and its source chain, not the variant's prefix the
+        // first error already carries.
+        let entry = |why: &Error| match why {
+            Error::Unassessable { detail, source: None } => detail.clone(),
+            Error::Unassessable {
+                detail,
+                source: Some(source),
+            } => format!("{detail}: {}", crate::error::Report(source)),
+            other => crate::error::Report(other).to_string(),
+        };
         let others: Vec<String> = unassessed
-            .map(|(pid, why)| format!("pid {pid} ({})", cause_text(&why)))
+            .map(|(pid, why)| format!("pid {pid} ({})", entry(&why)))
             .collect();
         Err(if others.is_empty() {
             first
@@ -154,14 +164,6 @@ impl Walk {
                 others.join("; ")
             ))
         })
-    }
-}
-
-/// What an unassessed candidate's error says, without the variant's wrapping.
-fn cause_text(why: &Error) -> String {
-    match why {
-        Error::Unassessable { detail, .. } => detail.clone(),
-        other => other.to_string(),
     }
 }
 
