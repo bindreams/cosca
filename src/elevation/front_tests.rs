@@ -159,7 +159,6 @@ fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
     }
 }
 
-/// An OS error the tests send through a gate, to find it again at the other end.
 const CODE: i32 = 5;
 
 fn os_error() -> io::Error {
@@ -173,8 +172,6 @@ fn refusal(g: Gate) -> Error {
     }
 }
 
-/// `error` is an `Unkillable` refusal whose `detail` says `words` and not the OS error's text, and
-/// whose cause is the OS error, found down `source()`.
 #[track_caller]
 fn assert_refused_by_one_read(error: &Error, words: &str) {
     let Error::Elevation {
@@ -193,8 +190,6 @@ fn assert_refused_by_one_read(error: &Error, words: &str) {
     assert_eq!(error.raw_os_error(), Some(CODE), "{error:?}");
 }
 
-/// A front whose state or membership cannot be read is closed, and says what it could not read;
-/// the cause is the error's `source()`.
 #[skuld::test]
 fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
     let g = kill_gate(Some(Front::Sudo), PID, || Err(os_error()), || Ok(false));
@@ -203,14 +198,12 @@ fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
     assert_refused_by_one_read(&refusal(g), "whether its cgroup kill reaches it could not be read");
 }
 
-/// A front whose place after the cgroup kill cannot be read is refused, with the read as the cause.
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_after_the_kill_has_the_read_as_its_cause() {
     let (r, _) = reached_asking(Ok(false), Err(os_error()));
     assert_refused_by_one_read(&r.expect_err("not shown reached"), "its cgroup could not be read");
 }
 
-/// A front whose cgroup kill failed is refused, with the kill's error as the cause.
 #[skuld::test]
 fn a_front_whose_cgroup_kill_failed_has_the_failure_as_its_cause() {
     let e = super::cgroup_kill_failed(Front::Sudo, PID, Error::Io(os_error()));

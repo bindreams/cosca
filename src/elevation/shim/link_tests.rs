@@ -505,7 +505,6 @@ fn the_socket_is_removed_through_the_directory_descriptor() {
     assert_eq!(shim.read_byte(), Some(b'A'));
 }
 
-/// A bind error says what could not be set up in its own words; the OS error is its `source()`.
 #[skuld::test]
 fn a_bind_error_has_its_cause_as_its_source() {
     use super::super::link::BindError;

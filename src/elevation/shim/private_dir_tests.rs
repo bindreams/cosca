@@ -267,8 +267,6 @@ fn relative_or_missing_tmpdir_is_an_error_naming_it() {
     assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::ENOENT));
 }
 
-/// A private directory that could not be made says so in its own words, and its cause is the
-/// error's `source()`: the `mkdirat` failure, and the fork guard's.
 #[skuld::test]
 fn a_private_directory_error_has_its_cause_as_its_source() {
     let root = tempfile::tempdir().unwrap();

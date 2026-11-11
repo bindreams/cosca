@@ -1,7 +1,6 @@
-use super::{parse, IoFailure, PkexecVersion, KEEP_CWD_SINCE};
-use crate::error::Error;
+use super::{parse, PkexecVersion, KEEP_CWD_SINCE};
+use crate::error::{Error, IoFailure};
 
-/// An OS code the tests send through a version, to find it again down a refusal's `source()`.
 const OS_CODE: i32 = 2;
 
 /// `pkexec --version`'s stdout, verbatim (exit 0, empty stderr), measured per image.
@@ -122,6 +121,13 @@ fn each_refusal_names_its_case_and_the_raw_text() {
             },
             "/opt/bin/pkexec could not be resolved to its real file;",
         ),
+        (
+            PkexecVersion::Unpinned {
+                path: "/opt/bin/pkexec".into(),
+                error: IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE)),
+            },
+            "pkexec at /opt/bin/pkexec could not be opened as its real file;",
+        ),
     ];
     for (v, needle) in cases {
         let detail = refusal_detail(v.clone());
@@ -137,15 +143,16 @@ fn each_refusal_names_its_case_and_the_raw_text() {
     assert!(failed.contains("\"oops\"") && failed.contains("\"boom\""), "{failed}");
 }
 
-/// A refusal that follows a failed read says what could not be done in its `detail`, and keeps the
-/// failure as its `source()`: the OS code is found down the chain, and its text is not in the
-/// detail.
 #[skuld::test]
 fn a_refusal_that_follows_a_failed_read_has_it_as_its_cause() {
     let os = || std::io::Error::from_raw_os_error(OS_CODE);
     for v in [
         PkexecVersion::SpawnFailed(IoFailure::of(&os())),
         PkexecVersion::Unresolved {
+            path: "/opt/bin/pkexec".into(),
+            error: IoFailure::of(&os()),
+        },
+        PkexecVersion::Unpinned {
             path: "/opt/bin/pkexec".into(),
             error: IoFailure::of(&os()),
         },
@@ -159,8 +166,6 @@ fn a_refusal_that_follows_a_failed_read_has_it_as_its_cause() {
     }
 }
 
-/// A failure kept as data comes back as an equal `io::Error`: the OS code survives, and so does the
-/// kind and text of an error that has none.
 #[skuld::test]
 fn a_kept_failure_comes_back_as_an_equal_io_error() {
     let os = std::io::Error::from_raw_os_error(OS_CODE);

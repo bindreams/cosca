@@ -476,6 +476,33 @@ impl std::error::Error for IoContext {
     }
 }
 
+/// An `io::Error` kept as data, for a type that is `Clone` and `Eq`. [`to_io`](Self::to_io) makes
+/// the error again: the same OS code, or the same kind and text for one that has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IoFailure {
+    kind: std::io::ErrorKind,
+    code: Option<i32>,
+    text: String,
+}
+
+impl IoFailure {
+    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix pkexec probe keeps a failure"))]
+    pub(crate) fn of(e: &std::io::Error) -> IoFailure {
+        IoFailure {
+            kind: e.kind(),
+            code: e.raw_os_error(),
+            text: e.to_string(),
+        }
+    }
+
+    pub(crate) fn to_io(&self) -> std::io::Error {
+        match self.code {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::new(self.kind, self.text.clone()),
+        }
+    }
+}
+
 impl Error {
     /// Windows has no per-process graceful-termination signal: what a graceful terminate of a lone
     /// process answers there.

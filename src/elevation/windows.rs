@@ -249,10 +249,15 @@ use crate::identity::ProcessId;
 use crate::identity::{windows_terminate_held, Termination};
 use crate::os_process::windows::WindowsProcess;
 
-/// The failure `code` as the cause of an error: [`win32_io_error`](crate::error::win32_io_error) of
-/// it, so `raw_os_error` finds the Win32 code.
+/// So `raw_os_error` finds the Win32 code; an HRESULT that is not one carries its hex in the chain.
 fn hresult_cause(code: windows::core::HRESULT) -> Box<Error> {
-    Error::io_cause(crate::error::win32_io_error(windows::core::Error::from_hresult(code)))
+    let io = crate::error::win32_io_error(windows::core::Error::from_hresult(code));
+    let hr = code.0 as u32;
+    Error::io_cause(if hr & 0xFFFF_0000 == 0x8007_0000 {
+        io
+    } else {
+        crate::error::io_context(format!("HRESULT {hr:#010x}"), io)
+    })
 }
 
 /// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
@@ -499,8 +504,8 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 /// back as `outcome`. `pid` is what `GetProcessId` returned: its error when the pid could not be
 /// read, else the pid whose identity could not be resolved. Never waits.
 ///
-/// The second value is the failed read, the cause of the detail when it is the only failure. When
-/// the termination was refused too, both failures are in the detail's text.
+/// The second value is the failed read when it is the only failure (its cause); with a refused
+/// termination too, both are in the detail.
 fn untracked_outcome(
     pid: Result<u32, windows::core::Error>,
     outcome: Termination,
@@ -530,21 +535,21 @@ fn untracked_outcome(
             // would block, and this launch runs inside the async spawn too.
             ChildFate::Killed,
         ),
-        Termination::Failed(e) => {
-            let why = match read_failure {
-                Some(read) => format!("its pid could not be read (GetProcessId: {read})"),
-                None => why,
-            };
-            (
+        Termination::Failed(e) => match read_failure {
+            Some(read) => (
                 format!(
-                    "{who} launched but {why} and {}; it may still be running",
+                    "{who} launched but its pid could not be read (GetProcessId: {read}) and {}; it may still be running",
                     crate::child::owned::teardown::kill_refused(&e)
                 ),
                 None,
-                // Its identity is what could not be resolved.
                 ChildFate::Running { id: None },
-            )
-        }
+            ),
+            None => (
+                format!("{who} launched but {why} and could not be terminated; it may still be running"),
+                Some(cause(e)),
+                ChildFate::Running { id: None },
+            ),
+        },
     }
 }
 

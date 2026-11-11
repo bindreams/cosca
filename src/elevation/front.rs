@@ -119,11 +119,10 @@ pub(crate) fn kill_gate(
     }
 }
 
-/// The reads of a gate that failed: each is what could not be read, and the error.
+/// Failed reads of a gate.
 type Unread = Vec<(&'static str, io::Error)>;
 
-/// What a refusal's `detail` says after the front's description, and the failure behind it when
-/// there is one.
+/// A refusal's reason: its words and, if any, its cause.
 struct Reason {
     words: String,
     cause: Option<Box<Error>>,
@@ -138,8 +137,8 @@ impl Reason {
     }
 }
 
-/// `unread` as a refusal's reason, or `None` when nothing failed. A single failed read is the
-/// refusal's cause. Several are all in its words, since a refusal has one `source`.
+/// A single failed read becomes the refusal's cause; several go into its words, since a refusal
+/// has one `source`.
 fn unread_reason(mut unread: Unread) -> Option<Reason> {
     match unread.len() {
         0 => None,
@@ -218,7 +217,7 @@ pub(crate) fn cgroup_kill_reached(
 }
 
 /// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
-/// sent, since a kill of the front itself would orphan its elevated program. `error` is its cause.
+/// sent, since a kill of the front itself would orphan its elevated program.
 pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error {
     let reason = Reason {
         words: "its cgroup kill failed".to_owned(),
@@ -227,10 +226,7 @@ pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error 
     refused(front, pid, Signal::Kill, Some(reason))
 }
 
-/// The refusal of a kill of the front `pid` whose cgroup no kill reached: its kill failed as
-/// `failure` says, or (`None`) none was made. Nothing else was sent, since a kill of the front
-/// itself would orphan its elevated program. `failure` is the text of an error, so it is in the
-/// detail; a caller that holds the error uses [`cgroup_kill_failed`].
+/// A caller that holds the error uses [`cgroup_kill_failed`].
 pub(crate) fn cgroup_not_killed(front: Front, pid: u32, failure: Option<&str>) -> Error {
     let why = match failure {
         Some(failure) => format!("its cgroup kill failed: {failure}"),

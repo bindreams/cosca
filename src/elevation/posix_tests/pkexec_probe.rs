@@ -241,15 +241,17 @@ fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
     assert_eq!(host.available.pkexec, None);
     assert!(host.pkexec_pin.is_none());
     match host.pkexec_version {
-        PkexecVersion::Unresolved { path, error } => {
+        PkexecVersion::Unpinned { path, error } => {
             assert_eq!(Path::new(&path), bin.join("pkexec"));
             let refusal = error.to_io();
-            assert!(
-                refusal.raw_os_error() == Some(libc::ELOOP) || refusal.to_string().contains("not a regular file"),
-                "{refusal}"
-            );
+            // Linux's `O_PATH | O_NOFOLLOW` opens the link itself, which is not a regular file;
+            // elsewhere `O_NOFOLLOW` fails the open.
+            #[cfg(target_os = "linux")]
+            assert_eq!(refusal.to_string(), "not a regular file");
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(refusal.raw_os_error(), Some(libc::ELOOP), "{refusal}");
         }
-        other => panic!("expected Unresolved, got {other:?}"),
+        other => panic!("expected Unpinned, got {other:?}"),
     }
 }
 
@@ -278,9 +280,9 @@ fn a_fifo_at_the_canonical_path_is_not_pinned() {
     );
     assert!(host.pkexec_pin.is_none());
     match host.pkexec_version {
-        PkexecVersion::Unresolved { error, .. } => {
+        PkexecVersion::Unpinned { error, .. } => {
             assert!(error.to_io().to_string().contains("not a regular file"), "{error:?}")
         }
-        other => panic!("expected Unresolved, got {other:?}"),
+        other => panic!("expected Unpinned, got {other:?}"),
     }
 }

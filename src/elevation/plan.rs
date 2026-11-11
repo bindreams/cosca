@@ -83,7 +83,7 @@ pub struct Host {
     /// is plain data.
     pub arg_max: Option<usize>,
     /// What [`BackendSet::pkexec`]'s `--version` said, or why a pkexec on `PATH` was not stored
-    /// ([`super::pkexec::PkexecVersion::Unresolved`]); asked only for a request that launches pkexec
+    /// ([`super::pkexec::PkexecVersion::Unresolved`], [`super::pkexec::PkexecVersion::Unpinned`]); asked only for a request that launches pkexec
     /// — `Backend::Pkexec` with `Auth::Gui`, from a non-root caller, on Linux.
     pub pkexec_version: super::pkexec::PkexecVersion,
     /// [`BackendSet::pkexec`], opened by detection: the version probe and the launch both exec this
@@ -216,7 +216,7 @@ impl Host {
                 Some(p) => (explicit, p.to_path_buf()),
                 None => {
                     let unresolved = (explicit == Backend::Pkexec)
-                        .then(|| self.pkexec_version.unresolved())
+                        .then(|| self.pkexec_version.not_stored())
                         .flatten();
                     return match unresolved {
                         Some(why) => reject_backend_unavailable(&why, self.pkexec_version.cause()),

@@ -99,12 +99,9 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
     }
 }
 
-/// An OS code the tests send through a mapper, to find it again down `source()`: a permission
-/// refusal (`ERROR_ACCESS_DENIED`, `EACCES`), the kind both mappers act on.
+/// A permission refusal (`ERROR_ACCESS_DENIED`, `EACCES`), the kind both mappers act on.
 const OS_CODE: i32 = if cfg!(windows) { 5 } else { 13 };
 
-/// The OS error of a refused kill of an elevated wrapper is the `Unkillable` error's source, found
-/// by `raw_os_error`; its text is not in the detail.
 #[skuld::test]
 fn an_unkillable_error_has_the_refusal_as_its_cause() {
     use crate::error::{ElevationErrorKind, Error};
@@ -127,7 +124,6 @@ fn an_unkillable_error_has_the_refusal_as_its_cause() {
     }
 }
 
-/// The error that made a backend unusable is the `BackendUnavailable` error's source.
 #[skuld::test]
 fn a_backend_unavailable_error_has_the_failed_exec_as_its_cause() {
     use crate::error::Error;

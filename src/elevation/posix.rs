@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
-use super::pkexec::{IoFailure, PkexecVersion};
+use super::pkexec::PkexecVersion;
 use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
 use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, CommandInput, EnvOp};
+use crate::error::IoFailure;
 use crate::error::{ElevationErrorKind, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -357,22 +358,32 @@ pub(crate) fn detect_with(
     run: impl FnOnce(std::process::Command) -> PkexecVersion,
 ) -> Host {
     let on_path = |program| path_var.and_then(|p| resolve_in_path_var(p, program));
-    let unresolved = |found: &Path, error: &std::io::Error| PkexecVersion::Unresolved {
-        path: found.display().to_string(),
-        error: IoFailure::of(error),
-    };
     let (pkexec, pkexec_pin, pkexec_version) = if !launches_pkexec(os, backend, auth, elevated) {
         (on_path("pkexec"), None, PkexecVersion::NotProbed)
     } else {
         match path_var.and_then(|p| pkexec_on(p, canonicalize)) {
             None => (None, None, PkexecVersion::NotProbed),
-            Some(Err((found, e))) => (None, None, unresolved(&found, &e)),
+            Some(Err((found, e))) => (
+                None,
+                None,
+                PkexecVersion::Unresolved {
+                    path: found.display().to_string(),
+                    error: IoFailure::of(&e),
+                },
+            ),
             Some(Ok(real)) => match pin(&real) {
                 Ok(pinned) => {
                     let version = probe_pkexec(&real, &pinned, run);
                     (Some(real), Some(std::sync::Arc::new(pinned)), version)
                 }
-                Err(e) => (None, None, unresolved(&real, &e)),
+                Err(e) => (
+                    None,
+                    None,
+                    PkexecVersion::Unpinned {
+                        path: real.display().to_string(),
+                        error: IoFailure::of(&e),
+                    },
+                ),
             },
         }
     };
@@ -477,7 +488,7 @@ fn wait_writable(writer: &std::io::PipeWriter) -> Result<bool, std::io::Error> {
     }
 }
 
-/// The password delivery failed as `detail` says; `cause` is the OS error behind it, if any.
+/// The password delivery failed as `detail` says.
 fn auth_failed(detail: impl Into<String>, cause: Option<std::io::Error>) -> Error {
     Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,

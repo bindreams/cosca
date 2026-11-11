@@ -671,12 +671,25 @@ mod rewrite_tests {
         assert_eq!(got[secret_bytes.len()], b'\n');
     }
 
-    /// A password write the OS refuses is an `AuthFailed` that says so in its own words; the
-    /// refusal is its `source()`, found by its OS code.
+    /// The BrokenPipe-after-a-partial-write and poll-failure sites hand `auth_failed` the OS error;
+    /// neither can be made to happen on demand (the first needs the reader to close between two
+    /// `write(2)` calls, the second a failing `poll(2)`), so the shared constructor is the row.
+    #[skuld::test]
+    fn an_auth_failure_from_a_broken_pipe_or_a_failed_poll_has_the_error_as_its_cause() {
+        for code in [libc::EPIPE, libc::EINVAL] {
+            let error = super::super::auth_failed(
+                "password delivery failed",
+                Some(std::io::Error::from_raw_os_error(code)),
+            );
+            assert_eq!(error.raw_os_error(), Some(code), "{error:?}");
+        }
+    }
+
+    /// A password write the OS refuses is an `AuthFailed` with the refusal as its source.
     #[skuld::test]
     fn a_refused_password_write_has_the_refusal_as_its_cause() {
         use crate::error::ElevationErrorKind;
-        // A descriptor open for reading only: `write(2)` on it fails with `EBADF`.
+        // write(2) on a read-only descriptor fails with EBADF.
         let read_only = std::fs::File::open("/dev/null").unwrap();
         let mut writer = std::io::PipeWriter::from(std::os::fd::OwnedFd::from(read_only));
         let error = super::super::write_password_bytes(&mut writer, b"pw").expect_err("the write is refused");
