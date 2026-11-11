@@ -248,7 +248,7 @@ fn detect_without_a_path_finds_no_backend_on_the_process_path() {
     use std::os::unix::fs::PermissionsExt;
 
     const NAME: &str = "elevation::elevation_tests::detect_without_a_path_finds_no_backend_on_the_process_path";
-    const INNER: &str = "COSCA_TEST_DETECT_NONE_PATH";
+    const INNER: &str = "COSCA_TESTCFG_DETECT_NONE_PATH";
     if std::env::var_os(INNER).is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         for program in ["sudo", "doas", "pkexec"] {

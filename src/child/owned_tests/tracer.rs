@@ -101,7 +101,7 @@ mod macos {
     use crate::test_groups::{tracer_group, Group};
     use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
 
-    const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
+    const MARKER: &str = "COSCA_TESTCFG_SHARED_TRACER";
 
     /// The failure bound of the driver's wait for its fixture, which aborts from its own
     /// [`BOUND`] watchdog well before.

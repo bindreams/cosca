@@ -14,7 +14,7 @@ use crate::test_groups::{namespaces, setuid, tracer_group, uid_switch, Group};
 
 // A pid namespace of its own -----
 
-const PIDNS: &str = "COSCA_TEST_PIDNS";
+const PIDNS: &str = "COSCA_TESTCFG_PIDNS";
 
 /// Runs the calling test in a pid namespace of its own, where it is pid 1.
 ///

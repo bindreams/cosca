@@ -22,12 +22,12 @@ use crate::containment::cgroup::test_support::KillOnDrop;
 use crate::test_child::{fixture_command, fixture_path, is_marked_fixture_reexec};
 
 /// Marks the helper re-exec; the value is the driver's pid.
-const MARKER: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER";
+const MARKER: &str = "COSCA_TESTCFG_SHARED_FOREIGN_TRACER";
 
-const PID_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_PID";
+const PID_ENV: &str = "COSCA_TESTCFG_SHARED_FOREIGN_TRACER_PID";
 
 /// Set (to anything) for a helper that seizes its tracee with `PTRACE_O_TRACEEXIT`.
-const HOLD_EXIT_ENV: &str = "COSCA_TEST_SHARED_FOREIGN_TRACER_HOLD_EXIT";
+const HOLD_EXIT_ENV: &str = "COSCA_TESTCFG_SHARED_FOREIGN_TRACER_HOLD_EXIT";
 
 /// The go bytes. `STOP` makes the helper stop the tracee and report it; `LET_EXIT` lets a tracee
 /// held at its exit stop on from it; `REAP` and `EXIT` hand the zombie back.
@@ -358,7 +358,7 @@ fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -
 
 /// Marks the [`tokio_tracee`] re-exec; the value is the driver's pid.
 #[cfg(feature = "tokio")]
-const TRACEE_MARKER: &str = "COSCA_TEST_FOREIGN_TRACER_TOKIO_TRACEE";
+const TRACEE_MARKER: &str = "COSCA_TESTCFG_FOREIGN_TRACER_TOKIO_TRACEE";
 
 /// A tracee for a `cosca::tokio::Command`, which has no `pre_exec`: it calls
 /// [`allow_any_tracer_now`], reports `allowed`, and reads stdin to EOF. A no-op unless it is the
