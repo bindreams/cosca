@@ -218,7 +218,7 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
-        detail: format!("pid {pid}: its identity could not be read (errno {errno}); the child was not adopted"),
+        detail: format!("pid {pid}: its identity could not be read; the child was not adopted"),
         source: Some(crate::error::Error::io_cause(io::Error::from_raw_os_error(errno))),
     }
 }

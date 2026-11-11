@@ -175,6 +175,32 @@ fn the_error_for_a_diverged_view_carries_the_view() {
     );
 }
 
+/// The OS error behind an unreadable view is the error's `source`, not part of its `detail`.
+#[skuld::test]
+fn the_error_for_an_unopenable_proc_keeps_the_os_error_as_its_source() {
+    let kernel = ticks_host(std::process::id()).open_proc_fails(Errno::MFILE);
+    let err = cause_error_of_live_read(&kernel).expect("no /proc is an error");
+    let Error::Unassessable { detail, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        detail,
+        "the spawned child identity could not be read: /proc could not be opened"
+    );
+    assert_eq!(err.raw_os_error(), Some(Errno::MFILE.raw_os_error()), "{err:?}");
+}
+
+/// The errno of a failed pidfd call is the error's `source`, not part of its `detail`.
+#[skuld::test]
+fn the_error_for_a_failed_pidfd_call_keeps_the_errno_as_its_source() {
+    let err = crate::identity::call_error("pid 4242", crate::identity::FailedCall::pidfd_open(Errno::MFILE));
+    let Error::Unassessable { detail, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(detail, "pid 4242 identity could not be read: pidfd_open");
+    assert_eq!(err.raw_os_error(), Some(Errno::MFILE.raw_os_error()), "{err:?}");
+}
+
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
 #[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {

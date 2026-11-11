@@ -130,14 +130,26 @@ mod macos {
         let err = crate::signal::identity_unreadable(77, libc::EPERM);
         match err {
             crate::error::Error::Unassessable { detail, source } => {
-                assert!(
-                    detail.contains("pid 77") && detail.contains("EPERM") || detail.contains("errno 1"),
-                    "{detail}"
-                );
+                assert!(detail.contains("pid 77") && !detail.contains("errno"), "{detail}");
                 assert_eq!(source.map(|e| e.raw_os_error()), Some(Some(libc::EPERM)));
             }
             other => panic!("expected Unassessable, got {other:?}"),
         }
+    }
+
+    /// A refused identity read for an open is `Unassessable` whose `detail` names no errno: the errno
+    /// is the source.
+    #[skuld::test]
+    fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
+        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
+        let err = crate::os_process::macos::read_for_open(77, "wait", "it was not opened").expect_err("refused");
+        match &err {
+            crate::error::Error::Unassessable { detail, .. } => {
+                assert_eq!(detail, "pid 77 identity could not be read; it was not opened");
+            }
+            other => panic!("expected Unassessable, got {other:?}"),
+        }
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
     }
 
     // `via_audit_token` -----

@@ -272,9 +272,8 @@ fn view_unreadable(id: ProcessId, why: ViewUnreadable, pidfd_errno: Option<rusti
     }
 }
 
-/// [`Error::Unassessable`] for `id`, logged at `warn`. `why` (with `source`'s text, if any) and
-/// the `pidfd_open` errno, if there was one, are in the message, so the cause survives a
-/// caller that only prints it; `source()` is the OS error behind `why`, else the errno.
+/// [`Error::Unassessable`] for `id`, logged at `warn`. `source()` is the OS error behind `why`,
+/// else the `pidfd_open` errno. When both exist the errno has no other place, so the message names it.
 fn unassessable(
     id: ProcessId,
     why: &str,
@@ -282,20 +281,18 @@ fn unassessable(
     pidfd_errno: Option<rustix::io::Errno>,
 ) -> Error {
     let mut detail = format!("pid {} identity could not be confirmed: {why}", id.pid());
-    if let Some(source) = &source {
-        detail.push_str(&format!(": {source}"));
-    }
-    if let Some(errno) = pidfd_errno {
+    if let (Some(_), Some(errno)) = (&source, pidfd_errno) {
         detail.push_str(&format!(" (pidfd_open: {errno})"));
     }
     detail.push_str(&format!("; {OPEN_CONSEQUENCE}"));
-    log::warn!("wait: {detail}");
-    Error::Unassessable {
+    let error = Error::Unassessable {
         detail,
         source: source
             .or_else(|| pidfd_errno.map(std::io::Error::from))
             .map(Error::io_cause),
-    }
+    };
+    log::warn!("wait: {}", crate::error::Report(&error));
+    error
 }
 
 #[cfg(test)]

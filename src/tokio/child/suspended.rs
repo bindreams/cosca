@@ -94,8 +94,8 @@ impl SuspendedChild {
                     .tear_down_or_hand_back(crate::child::owned::teardown::Disposition::Leave);
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
-                        detail: format!("could not resume the frozen child: {e}"),
-                        source: None,
+                        detail: "could not resume the frozen child".into(),
+                        source: Some(Error::io_cause(e)),
                     },
                     fate,
                     unreaped,

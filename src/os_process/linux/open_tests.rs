@@ -163,7 +163,7 @@ fn assert_unassessable_with_cause(
     expect_source: bool,
     marker: &str,
     mark: usize,
-) {
+) -> crate::error::Error {
     use std::error::Error as _;
 
     let err = match result {
@@ -188,6 +188,7 @@ fn assert_unassessable_with_cause(
         vec![log::Level::Warn],
         "the verdict must be logged once, at warn: {text}"
     );
+    err
 }
 
 /// A live non-leader tid under a DIVERGED view: `Unassessable` naming the view and the
@@ -202,7 +203,10 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .on_pidfd_open(worker.id.pid(), Err(Errno::NOENT))
         .diverged_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
-    assert_unassessable_with_cause(result, &["outer pid namespace", "pidfd_open: "], true, &marker, mark);
+    let err = assert_unassessable_with_cause(result, &["outer pid namespace"], true, &marker, mark);
+    // The `pidfd_open` errno is the source, not part of the message.
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err:?}");
+    assert!(!err.to_string().contains("pidfd_open"), "{err}");
 }
 
 /// Twin for a view that could not be established: the reason is in the message.

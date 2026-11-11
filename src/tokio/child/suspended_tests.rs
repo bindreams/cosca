@@ -585,6 +585,8 @@ mod on_windows {
             .fate()
             .unwrap_or_else(|| panic!("expected MayHaveStarted, got {err:?}"));
         assert!(matches!(fate, ChildFate::Killed | ChildFate::Reaped), "{fate:?}");
+        // The OS refusal is the failure's source, not part of its words.
+        assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{err:?}");
         release_and_expect_it_killed(&thread, writer, &remote, "a failed resume");
     }
 

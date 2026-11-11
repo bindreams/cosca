@@ -256,9 +256,9 @@ pub(crate) fn has_exited(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Re
 /// The error of a [`has_exited`] that was refused with `errno`: the child cannot be shown to be
 /// running.
 pub(crate) fn has_exited_error(pid: RawPid, errno: i32) -> std::io::Error {
-    std::io::Error::new(
-        std::io::Error::from_raw_os_error(errno).kind(),
-        format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be running"),
+    crate::error::io_context(
+        format!("pid {pid}: its identity could not be read; it cannot be shown to be running"),
+        std::io::Error::from_raw_os_error(errno),
     )
 }
 

@@ -483,7 +483,7 @@ impl<S: BorrowMut<OVERLAPPED>> Drop for Operation<S> {
             // `ERROR_NOT_FOUND`: the operation completed first. Any other error leaves the kernel
             // with the buffer, and unwinding would free it.
             if e.code() != windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0) {
-                abort_with_buffer_in_kernel(&format!("cancelling a pipe operation ({e})"));
+                abort_with_buffer_in_kernel(&format!("cancelling a pipe operation ({})", crate::error::Report(&e)));
             }
         }
         wait_or_abort(self.event());
