@@ -67,8 +67,7 @@ pub(crate) enum WaitFor<'a> {
     Signalled(BorrowedHandle<'a>),
 }
 
-/// The words of what a failed look at a process leaves undone, which [`EXIT_CONSEQUENCE`] and
-/// [`OPEN_CONSEQUENCE`] both say.
+/// The words of what a failed look at a process leaves undone.
 #[cfg(unix)]
 macro_rules! exit_unobserved {
     () => {

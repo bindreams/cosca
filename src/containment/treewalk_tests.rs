@@ -66,6 +66,17 @@ fn an_unverified_send_is_a_contract_breach() {
     );
 }
 
+/// Release reads an unverified send as nothing sent to a process that may be running. Mutant: it
+/// is read as delivered or gone.
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn an_unverified_send_is_not_attempted_in_release() {
+    match super::KillOutcome::of(Ok(crate::signal::Sent::Unverified)) {
+        super::KillOutcome::NotAttempted(Error::Unassessable { .. }) => {}
+        other => panic!("an unverified send is not attempted, Unassessable: {other:?}"),
+    }
+}
+
 /// The one reading of a send's answer, for a walk's members and the root alike. Mutants: a refusal
 /// is read as delivered or gone.
 #[skuld::test]
@@ -621,7 +632,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         children.iter().any(|id| id.pid() == held),
         "{held} not among {children:?}"
     );
-    super::hard_kill(&HostKernel, root, &super::root_by_identity(&HostKernel, root))
+    super::hard_kill(&HostKernel, root, &super::ByIdentity::new(&HostKernel, root))
         .into_result()
         .expect("an exited root whose handle is held is walked completely");
 
@@ -661,7 +672,7 @@ fn a_walk_members_handle_can_be_waited_on_after_its_kill() {
         matches!(os.exited(), Ok(crate::os_process::Exit::Running(_))),
         "a live member's handle is waited on, not refused"
     );
-    let outcome = super::send_to_member(id, &*os, crate::signal::Sig::Kill);
+    let outcome = super::KillOutcome::of(os.signal(crate::signal::Sig::Kill));
     assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
     assert!(
         crate::os_process::drive::exited_held(&*os, None).expect("the member's handle can be waited on"),
@@ -706,7 +717,7 @@ fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let kernel = crate::identity::HostKernel;
-    match super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id)).into_result() {
+    match super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id)).into_result() {
         Err(super::Unkilled {
             members,
             root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
@@ -741,7 +752,7 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
-    let left = super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id))
+    let left = super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id))
         .into_result()
         .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
@@ -778,7 +789,7 @@ fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_
 
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
-    let left = super::hard_kill(&kernel, id, &super::root_by_identity(&kernel, id))
+    let left = super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id))
         .into_result()
         .expect_err("the helper refuses the kill");
 
@@ -870,7 +881,7 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
 
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
-    super::terminate(&kernel, id, &super::root_by_identity(&kernel, id)).expect("best effort");
+    super::terminate(&kernel, id, &super::ByIdentity::new(&kernel, id)).expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     let warned = crate::log_capture::warns_since(mark, "was sent no SIGTERM");

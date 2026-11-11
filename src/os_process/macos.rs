@@ -68,9 +68,8 @@ impl MacProcess {
         }))
     }
 
-    /// The watch on this process, armed. The watch is armed on whatever holds the pid now: the same
-    /// unique id after the arming proves it was this process (a unique id is never reused), and any
-    /// other answer means the process is gone, so the watch reads as exited.
+    /// The watch on this process, armed on whatever holds the pid now; the same unique id read after
+    /// arming proves it was this process, any other answer reads as exited.
     fn arm(&self) -> Result<ExitWatch, Error> {
         let pid = self.id.pid();
         let watch = ExitWatch::proc_exit(pid)?;

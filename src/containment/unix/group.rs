@@ -461,25 +461,9 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
 ///   is told through the handle, so without one nothing proves that its pid still names the
 ///   listed member, and a bare pid is never signalled on a guess.
 ///
-/// **Why this never signals when `id.exists()` answers `Unknown` inside the open.** (That is the
-/// path of a `Ticks` id, on a Linux host before 6.9. A `Pidfs` id is proved by the open pidfd's
-/// own inode and reads no `/proc`, so it has no such gap.) This looks tempting — `pidfd_open`
-/// already succeeded, so *something* is there — but it does not actually close the gap:
-/// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
-/// called, exactly like a bare `kill(2)`. If the member `members()` listed at T0 exited and
-/// its pid was recycled onto an unrelated, signalable process before `pidfd_open` runs at T1,
-/// `pidfd_open` succeeds — for the WRONG process. `id.exists()`'s subsequent `Unknown` answer
-/// is precisely the case where this recycle cannot be ruled out (a permission-denied `/proc`
-/// read under `hidepid`, or the platform's equivalent, giving neither a clear "same identity"
-/// nor a clear "gone"). The pidfd's real safety property is narrower than "identity-pinned
-/// from the moment of listing": it guarantees the target does not change identity AFTER a
-/// successful open, not that the identity was already correct AT open time — exactly the gap
-/// the open's own `id.exists()` step exists to close, and exactly the gap `Existence::
-/// Unknown` says was NOT closed this time. Left as a disclosed, asymmetric gap
-/// rather than closed with an unsound fix: on a genuinely `hidepid`-restricted host, a live
-/// member whose identity cannot be re-confirmed at delivery time is correctly left unsignalled
-/// and reported `Unassessable`, even though the earlier `Liveness::Unknown`-admitting gate
-/// (`classify_member`) let it through to the attempt.
+/// Never signals when `id.exists()` answers `Unknown` in the open: `pidfd_open` binds to whatever
+/// holds the pid number now, so a recycled pid would be hit. The member is left unsignalled and
+/// reported `Unassessable` (`hidepid` hosts, `Ticks` ids before 6.9).
 fn resend_sigkill(
     kernel: &dyn crate::identity::Kernel,
     id: crate::identity::ProcessId,
@@ -492,19 +476,7 @@ fn resend_sigkill(
         Ok(Some(os)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
             Ok(()) => {
-                let sent = os.signal(Sig::Kill);
-                // Where a test records a send, as the resend before it did.
-                #[cfg(test)]
-                crate::send_log::record_group(crate::send_log::GroupStep::Member(
-                    if cfg!(target_os = "linux") {
-                        crate::send_log::Route::Pidfd
-                    } else {
-                        crate::send_log::Route::AuditToken
-                    },
-                    id.pid(),
-                    libc::SIGKILL,
-                ));
-                match KillOutcome::of(sent) {
+                match KillOutcome::of(os.signal(Sig::Kill)) {
                     // Exited between the open and the send, or delivered.
                     KillOutcome::Terminated | KillOutcome::AlreadyGone => Reached::Yes,
                     KillOutcome::NotAttempted(crate::error::Error::Io(refused))
@@ -556,9 +528,7 @@ fn resend_sigkill(
 /// refuser), so without this re-check a member that finished dying mid-teardown would be
 /// misreported as a survivor. Only `Survivor` is re-checked — `NotASurvivor`/`Unassessable`
 /// need no second look, since neither claims a definite, still-running refuser. A downgrade
-/// is logged: it overturns an `EPERM` already logged once inside `resend_sigkill`, and a
-/// debug session starting from "why did teardown report Cleared/Unassessable despite the
-/// EPERM in the logs" needs this decision to be visible too, not just the original refusal.
+/// is logged so the decision is visible next to the original refusal.
 ///
 /// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`.** Downgrading
 /// on `Unknown` too would throw away STRONGER evidence for WEAKER: the `Survivor` this
@@ -611,9 +581,9 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
 /// that exactly, and elsewhere the root's state stands in for it (unreaped). Each `SIGKILL` resend
-/// and `SIGTERM` probe checks the root ([`check_number`]) first. A `SIGKILL` resend first opens the
-/// member by its identity (a pidfd on Linux, an audit token on macOS), then checks the root, then
-/// sends through that handle; a member that cannot be opened is unassessable and not signalled. A
+/// and `SIGTERM` probe checks the root ([`check_number`]) first. A `SIGKILL` resend opens the
+/// member by its identity before that check (see `containment::unix`'s module doc); a member that cannot be opened
+/// is unassessable and not signalled. A
 /// `SIGTERM` probe checks the root, then the member's identity right before the probe. A member
 /// whose root check fails is unassessable and not signalled; on
 /// 6.9+, once the group has no member left, it is in another group that took the number, and is not

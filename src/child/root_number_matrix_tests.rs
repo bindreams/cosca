@@ -374,8 +374,8 @@ struct Sent {
     /// The signals the root, also a marker holder, got through the holders channel.
     root_holder: Vec<nix::sys::signal::Signal>,
     pidfd: bool,
-    /// `kill_tree`'s handle backstop was sent the root's kill, after its sweep. A walk sends the root
-    /// its own kill through the same handle, and `pidfd` shows both: this tells the two apart.
+    /// `kill_tree`'s handle backstop was sent the root's kill, after its sweep: the root was killed
+    /// through its pidfd twice, once by the walk and once by the backstop.
     backstop: bool,
     /// A cgroup member's `SIGTERM` through its pidfd.
     member_term: bool,
@@ -481,8 +481,8 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         (true, false, _) => Want::Yes,
     };
     // The walk has already killed the root through the handle when `kill_tree` reaches the backstop,
-    // so only the backstop's own record shows that it was sent: a `kill_tree` that skips it leaves the
-    // root to a walk that may have found nothing.
+    // so the backstop shows as a second kill through it: a `kill_tree` that skips it leaves the root
+    // to a walk that may have found nothing.
     let backstop =
         if cfg!(target_os = "linux") && mechanism == Mechanism::TreeWalk && reap == Reap::None && op == Op::Kill {
             Want::Yes
@@ -607,7 +607,13 @@ impl Recorders {
             #[cfg(not(target_os = "macos"))]
             root_holder: Vec::new(),
             pidfd: entries.iter().any(|(pid, _, via)| *pid == root && *via == Via::Pidfd),
-            backstop: entries.iter().any(|(pid, _, via)| *pid == root && *via == Via::Handle),
+            // The walk's own kill of the root and the backstop's go through the same handle: a second
+            // kill through it is the backstop's.
+            backstop: entries
+                .iter()
+                .filter(|(pid, sig, via)| *pid == root && *sig == crate::signal::Sig::Kill && *via == Via::Pidfd)
+                .count()
+                >= 2,
             cgroup_kill,
             survivor_ended_alone: false,
         }

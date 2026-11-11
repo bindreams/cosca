@@ -39,14 +39,14 @@ fn group_of_three() -> (std::process::Child, std::process::ChildStdin, [u32; 2])
 }
 
 /// Every send whose target is named by the group's number is right after its own check of the
-/// root: the `killpg`, the leader's signal by number after a refused group send, and each member's
-/// resend (a member is the group's by its number, whatever names the member itself).
+/// root: the `killpg` and the leader's signal by number after a refused group send. A member's
+/// resend is a send through its own handle, which the steps do not show.
 #[track_caller]
 fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
     for (i, step) in steps.iter().enumerate() {
         let by_number = matches!(
             step,
-            GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _) | GroupStep::Member(..)
+            GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _)
         );
         if by_number {
             assert!(
@@ -79,14 +79,30 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
             && steps.iter().any(|s| matches!(s, GroupStep::Leader(..))),
         "the group's send and the leader's signal were made: {steps:?}"
     );
-    // The leader is resent too when it had not yet exited from its own kill at the listing.
-    let resent: Vec<u32> = steps
-        .iter()
-        .filter_map(|s| match s {
-            GroupStep::Member(_, pid, _) => Some(*pid),
-            _ => None,
-        })
+    // The leader is resent too when it had not yet exited from its own kill at the listing. A
+    // resend is a send through the member's handle, which notes itself by identity.
+    let resent: Vec<u32> = capture
+        .by_identity()
+        .into_iter()
+        .filter(|&(_, signo)| signo == libc::SIGKILL)
+        .map(|(pid, _)| pid)
         .collect();
+    // The handle's sends are noted apart from the steps, so their own checks are counted.
+    let by_number = steps
+        .iter()
+        .filter(|s| {
+            matches!(
+                s,
+                GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _)
+            )
+        })
+        .count();
+    let checks = steps.iter().filter(|s| matches!(s, GroupStep::Check)).count();
+    assert!(
+        checks >= by_number + resent.len(),
+        "each send has a check of its own: {checks} checks for {by_number} sends by number and {} resends: {steps:?}",
+        resent.len()
+    );
     for member in members {
         assert_eq!(
             resent.iter().filter(|&&pid| pid == member).count(),

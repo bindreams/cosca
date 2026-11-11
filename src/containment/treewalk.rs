@@ -90,10 +90,12 @@ use crate::containment::mechanism::Contains;
 use crate::containment::mechanism::Release;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
-use crate::containment::{Containment, Skip, TerminateOutcome};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::os_process::OsProcess;
+#[cfg(unix)]
+use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
 use crate::Recursive;
 
@@ -529,49 +531,16 @@ fn unproved(pid: RawPid, error: Error) -> Error {
     }
 }
 
-/// How a walk sends its root a signal: through the handle its caller holds on it ([`Root::signal`],
-/// or a [`Process`](crate::Process)'s own), never through a second open of its identity.
-pub(crate) type SendRoot<'a> = &'a dyn Fn(Sig) -> Result<Sent, Error>;
-
-/// `os`'s `sig`, the one send to `id`, a process held by an open of its identity, and where a test
-/// records that send: after it, whatever it answered.
-#[cfg(any(unix, windows))]
-fn signal_by_identity(id: ProcessId, os: &dyn OsProcess, sig: Sig) -> Result<Sent, Error> {
-    let sent = os.signal(sig);
-    #[cfg(all(test, target_os = "linux"))]
-    {
-        let signo = match sig {
-            Sig::Kill => libc::SIGKILL,
-            Sig::Term => libc::SIGTERM,
-        };
-        crate::send_log::record_by_identity(id.pid(), signo);
-        crate::send_log::record_group(crate::send_log::GroupStep::Member(
-            crate::send_log::Route::Pidfd,
-            id.pid(),
-            signo,
-        ));
-    }
-    #[cfg(not(all(test, target_os = "linux")))]
-    let _ = id;
-    sent
-}
-
-/// `os`'s `sig`, the one send to a walked member, as the outcome of a kill by identity.
-#[cfg(any(unix, windows))]
-fn send_to_member(id: ProcessId, os: &dyn OsProcess, sig: Sig) -> KillOutcome {
-    KillOutcome::of(signal_by_identity(id, os, sig))
-}
-
-/// [`send_to_member`] to what `opened` found: nothing is sent to a process that is gone, or that
-/// another process's pid names now.
+/// The one send to a walked member, through `opened`'s handle: nothing is sent to a process that is
+/// gone, or that another process's pid names now.
 #[cfg(any(unix, windows))]
 fn kill_opened(id: ProcessId, opened: Result<Option<Box<dyn OsProcess>>, Error>, sig: Sig) -> KillOutcome {
     match opened {
         Ok(Some(os)) => {
-            // Where a test makes the member exit between its open and its send.
+            // Test seam: makes the member exit between its open and its send.
             #[cfg(all(test, windows))]
             fault::run_before_terminate();
-            send_to_member(id, &*os, sig)
+            KillOutcome::of(os.signal(sig))
         }
         Ok(None) => {
             log::debug!(
@@ -630,12 +599,13 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// whose kill sent nothing, in the order they were tried. It reports none of them: the caller does,
 /// once, after the root's death by its handle has had its say ([`Tree::settle`]).
 ///
-/// The root's kill goes through `send_root`, the handle its caller holds on it, which must name
-/// `root`: never a second open of its identity. Each descendant is killed through a handle opened by
-/// its identity.
+/// The root's kill goes through [`Root::signal`] of `held`, which must name `root`
+/// ([`ByIdentity`] where the caller holds no handle on it). Each descendant is killed through a
+/// handle opened by its identity.
 ///
 /// [`Tree::settle`]: crate::containment::Tree::settle
-pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoot<'_>) -> TreeKillOutcome {
+pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> TreeKillOutcome {
+    debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     // Test-only fault seam: skip the root's kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
@@ -679,7 +649,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoo
     #[cfg(any(unix, windows))]
     {
         if !skip_root {
-            root_left = left_behind(root, KillOutcome::of(send_root(Sig::Kill))).or(root_left);
+            root_left = left_behind(root, KillOutcome::of(held.signal(Sig::Kill))).or(root_left);
         }
         for id in descendants {
             if let Some(error) = left_behind(id, kill_one(kernel, id)) {
@@ -689,7 +659,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoo
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (kernel, root, descendants, skip_root, send_root);
+    let _ = (kernel, root, descendants, skip_root, held);
     if left.is_empty() && root_left.is_none() {
         return TreeKillOutcome::Ran(Ok(()));
     }
@@ -840,16 +810,40 @@ fn left_behind(id: ProcessId, outcome: KillOutcome) -> Option<Error> {
     }
 }
 
-/// How a walk's root is sent a signal when its caller holds no handle on it: opened by its identity
-/// through `kernel` for each send, as a member is.
-#[cfg(any(unix, windows))]
-pub(crate) fn root_by_identity<'k>(
+/// A walk's root for a caller that holds no handle on it: opened by its identity through `kernel`
+/// for each send, as a member is.
+pub(crate) struct ByIdentity<'k> {
     kernel: &'k dyn Kernel,
-    root: ProcessId,
-) -> impl Fn(Sig) -> Result<Sent, Error> + 'k {
-    move |sig| match open_by_identity(kernel, root)? {
-        Some(os) => signal_by_identity(root, &*os, sig),
-        None => Ok(Sent::Gone),
+    id: ProcessId,
+}
+
+impl<'k> ByIdentity<'k> {
+    pub(crate) fn new(kernel: &'k dyn Kernel, id: ProcessId) -> ByIdentity<'k> {
+        ByIdentity { kernel, id }
+    }
+}
+
+impl Root for ByIdentity<'_> {
+    fn pid(&self) -> u32 {
+        self.id.pid()
+    }
+
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        match open_by_identity(self.kernel, self.id)? {
+            Some(os) => os.signal(sig),
+            None => Ok(Sent::Gone),
+        }
+    }
+
+    /// No handle is held, so none says whether the root was reaped.
+    #[cfg(unix)]
+    fn state(&self) -> RootState {
+        RootState::unheld()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
     }
 }
 
@@ -1015,9 +1009,10 @@ pub(crate) mod fault {
 ///
 /// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
 ///
-/// On Unix the root's `SIGTERM` goes through `send_root`, as [`hard_kill`]'s kill does; Windows
-/// signals the root's process group and sends it nothing.
-pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoot<'_>) -> Result<(), Error> {
+/// On Unix the root's `SIGTERM` goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does;
+/// Windows signals the root's process group and sends it nothing.
+pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> Result<(), Error> {
+    debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     {
         let parents = crate::containment::enumerate::process_parents(kernel)?;
@@ -1028,7 +1023,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoo
         fault::note_walk(root.pid());
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
-        warn_if_not_attempted(root, Signal::SIGTERM, &KillOutcome::of(send_root(Sig::Term)));
+        warn_if_not_attempted(root, Signal::SIGTERM, &KillOutcome::of(held.signal(Sig::Term)));
         for id in walk.members {
             warn_if_not_attempted(id, Signal::SIGTERM, &kill_by_identity(kernel, id, Signal::SIGTERM));
         }
@@ -1036,12 +1031,12 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, send_root: SendRoo
     }
     #[cfg(windows)]
     {
-        let _ = (kernel, send_root);
+        let _ = (kernel, held);
         crate::containment::windows::terminate(root.pid())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (kernel, root, send_root);
+        let _ = (kernel, root, held);
         Ok(())
     }
 }
@@ -1075,48 +1070,27 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
     None
 }
 
-/// How the root is sent its signal: through `owner`'s handle, which must name it, and by an open of
-/// its identity, as a member is, where the caller holds none.
-fn root_sender<'a>(
-    kernel: &'a dyn Kernel,
-    root: ProcessId,
-    owner: Option<&'a dyn crate::containment::Root>,
-) -> Box<dyn Fn(Sig) -> Result<Sent, Error> + 'a> {
-    match owner {
-        Some(owner) => {
-            debug_assert_eq!(owner.pid(), root.pid(), "the owner is not the walk's root");
-            Box::new(|sig| owner.signal(sig))
-        }
-        #[cfg(any(unix, windows))]
-        None => Box::new(root_by_identity(kernel, root)),
-        #[cfg(not(any(unix, windows)))]
-        None => {
-            let _ = (kernel, root);
-            Box::new(|_| Ok(Sent::Gone))
-        }
-    }
-}
-
 /// [`hard_kill`] from the host's process table, the root killed through `owner`'s handle if there is
-/// one: skipped where the root's number cannot be trusted ([`skipped_walk`]), else walked.
-pub(crate) fn kill_tree(root: ProcessId, owner: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
+/// one, else by its identity: skipped where the root's number cannot be trusted ([`skipped_walk`]),
+/// else walked.
+pub(crate) fn kill_tree(root: ProcessId, owner: Option<&dyn Root>) -> TreeKillOutcome {
     match skipped_walk(owner) {
         Some(skip) => TreeKillOutcome::Skipped(skip),
         None => {
             let kernel = &crate::identity::HostKernel;
-            hard_kill(kernel, root, &*root_sender(kernel, root, owner))
+            hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)))
         }
     }
 }
 
 /// [`terminate`] from the host's process table, as [`kill_tree`] decides it.
-pub(crate) fn terminate_tree(root: ProcessId, owner: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
+pub(crate) fn terminate_tree(root: ProcessId, owner: Option<&dyn Root>) -> TerminateOutcome {
     match skipped_walk(owner) {
         Some(skip) => TerminateOutcome::End(skip),
         None => {
             let kernel = &crate::identity::HostKernel;
             TerminateOutcome::Sent {
-                result: terminate(kernel, root, &*root_sender(kernel, root, owner)),
+                result: terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))),
                 earlier: Some("the SIGTERM"),
             }
         }

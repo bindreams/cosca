@@ -58,23 +58,12 @@ pub(crate) fn blocked_tree() -> BlockedTree {
     }
 }
 
-/// The `SIGTERM`s of the tree walk over `root` and its `grandchild`: exactly the root, then the
-/// grandchild. The root goes through the `Process`'s held handle, so on Linux the one log that has
-/// both in order is the by-handle one, written at each pidfd send; macOS records both by identity.
+/// The identity-checked `SIGTERM`s of the tree walk over `root` and its `grandchild`: exactly the
+/// root, then the grandchild.
 pub(crate) fn assert_tree_sigtermed(sends: &Capture, root: u32, grandchild: u32) {
-    #[cfg(target_os = "linux")]
-    let sent = sends.entries();
-    #[cfg(target_os = "linux")]
-    let expected = [
-        (root, crate::signal::Sig::Term, crate::send_log::Via::Pidfd),
-        (grandchild, crate::signal::Sig::Term, crate::send_log::Via::Pidfd),
-    ];
-    #[cfg(not(target_os = "linux"))]
-    let sent = sends.by_identity();
-    #[cfg(not(target_os = "linux"))]
-    let expected = [(root, libc::SIGTERM), (grandchild, libc::SIGTERM)];
     assert_eq!(
-        sent, expected,
+        sends.by_identity(),
+        [(root, libc::SIGTERM), (grandchild, libc::SIGTERM)],
         "the walk must SIGTERM the root {root}, then its grandchild {grandchild}"
     );
 }

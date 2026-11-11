@@ -59,7 +59,7 @@ impl Process {
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         // No handle backstop: the root is left as any member is, and the first member left is the
         // error. This call's one report of the others.
-        crate::containment::treewalk::hard_kill(kernel, self.id, &|sig| self.os.signal(sig))
+        crate::containment::treewalk::hard_kill(kernel, self.id, self)
             .into_result()
             .or_else(|left| left.unsettled(false))
             .map_err(|left| left.report("Process::kill_tree"))
@@ -83,7 +83,7 @@ impl Process {
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            crate::containment::treewalk::terminate(kernel, self.id, &|sig| self.os.signal(sig))
+            crate::containment::treewalk::terminate(kernel, self.id, self)
         }
         #[cfg(windows)]
         {

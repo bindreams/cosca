@@ -383,7 +383,8 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
         );
 
         assert!(matches!(reached, super::Reached::Unknown), "{errno}: got {reached:?}");
-        assert!(capture.group_steps().is_empty(), "{errno}: nothing was sent");
+        assert_eq!(capture.by_identity(), [], "{errno}: nothing was sent");
+        assert!(capture.group_steps().is_empty(), "{errno}: nothing was sent by number");
         let lines = crate::log_capture::records_since_on_current_thread(mark, "could not be opened by identity");
         assert_eq!(lines.len(), 1, "{errno}: {lines:?}");
         assert_eq!(lines[0].0, log::Level::Warn);
@@ -502,11 +503,11 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
         Signal::SIGKILL,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
-    let sent = capture.group_steps();
+    let sent = (capture.group_steps(), capture.by_identity());
     drop(capture);
 
     assert!(state.is_err(), "the group cannot be listed: {state:?}");
-    assert!(sent.is_empty(), "nothing was sent: {sent:?}");
+    assert!(sent.0.is_empty() && sent.1.is_empty(), "nothing was sent: {sent:?}");
     _ = child.kill();
     _ = child.wait();
 }
@@ -549,6 +550,35 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     );
     _ = stop_tx.send(());
     worker.join().unwrap();
+}
+
+/// What `resend_sigkill` answers for a live member whose send the kernel answers as `errno` (`None`:
+/// a real send, which ends the member).
+fn resend_answer(errno: Option<i32>) -> super::Reached {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
+    await_member_ready(&mut child);
+    let id = ProcessId::of(child.id()).found().expect("the live member resolves");
+    let answering = errno.map(crate::signal::seams::fail_kills_with);
+    let reached = super::resend_sigkill(
+        &HostKernel,
+        id,
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+    );
+    drop(answering);
+    _ = child.kill();
+    _ = child.wait();
+    reached
+}
+
+/// The send's answer is the member's: delivered, or already gone (`ESRCH`), reached it; `EPERM` is a
+/// confirmed refusal; any other errno says nothing about the member. Mutants: "`EPERM` is
+/// `Unknown`", "another errno is `No`", "`Gone` is `Unknown`".
+#[skuld::test]
+fn a_resends_answer_is_the_members_reached() {
+    assert!(matches!(resend_answer(None), super::Reached::Yes), "delivered");
+    assert!(matches!(resend_answer(Some(libc::ESRCH)), super::Reached::Yes), "gone");
+    assert!(matches!(resend_answer(Some(libc::EPERM)), super::Reached::No), "EPERM");
+    assert!(matches!(resend_answer(Some(libc::EIO)), super::Reached::Unknown), "EIO");
 }
 
 // Checked /proc view (Linux) =====

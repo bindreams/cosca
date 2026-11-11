@@ -283,14 +283,15 @@ fn kill_tree_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     let (child, armed) = EmptiedGroup::new().arm();
+    let root = child.pid();
     let capture = Capture::start();
     let result = child.kill_tree();
-    let steps = capture.group_steps();
+    let sent = capture.by_identity();
     armed.finish();
     result.expect("the tree is gone");
     assert!(
-        !steps.iter().any(|step| matches!(step, GroupStep::Member(..))),
-        "nothing was resent: {steps:?}"
+        sent.iter().all(|&(pid, _)| pid == root),
+        "nothing was resent to a member: {sent:?}"
     );
 }
 

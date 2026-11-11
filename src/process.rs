@@ -21,9 +21,8 @@ mod graceful;
 /// An open handle on a process, held since [`open`](Self::open). Acts through the handle
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-/// `graceful_shutdown_tree`) signal each member through a handle opened by its identity (a pidfd
-/// proved to name it on Linux, a process handle on Windows, an audit token on macOS); each signals
-/// the root through this handle. Not `Clone`: open the [`ProcessId`] again.
+/// `graceful_shutdown_tree`) signal each member through a handle opened by its identity, and the
+/// root through this handle. Not `Clone`: open the [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,
@@ -145,6 +144,28 @@ impl Process {
     #[cfg(feature = "tokio")]
     pub(crate) fn os(&self) -> &dyn OsProcess {
         &*self.os
+    }
+}
+
+/// The root of a tree walk that signals it through this handle. Never reaped by this handle, so
+/// nothing is sent by its pid on its word ([`RootState::unheld`](crate::signal::RootState::unheld)).
+impl crate::containment::Root for Process {
+    fn pid(&self) -> u32 {
+        self.id.pid()
+    }
+
+    fn signal(&self, sig: crate::signal::Sig) -> Result<crate::signal::Sent, Error> {
+        self.os.signal(sig)
+    }
+
+    #[cfg(unix)]
+    fn state(&self) -> crate::signal::RootState {
+        crate::signal::RootState::unheld()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(self.os.os_handle())
     }
 }
 

@@ -20,9 +20,6 @@ use crate::signal::Sig;
 pub(crate) enum Via {
     Pidfd,
     Pid,
-    /// `Child::kill_tree`'s backstop, the root's kill through the child's own handle after the
-    /// sweep: written by the caller beside the send's own record, when the OS accepted a send the
-    /// backstop made.
     Handle,
     Identity,
 }
@@ -73,15 +70,9 @@ pub(crate) fn assert_group_signalled_first_through_the_pidfd(steps: &[GroupStep]
 /// How a [`GroupStep`] send named its target.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "only Linux sends through a pidfd, and only macOS through an audit token"
-)]
+#[allow(dead_code, reason = "only Linux sends through a pidfd")]
 pub(crate) enum Route {
     Pidfd,
-    /// macOS: a send to a held process through an audit token, which the kernel checks against the
-    /// process's `p_idversion`.
-    AuditToken,
     Number,
 }
 
@@ -121,12 +112,6 @@ pub(crate) fn record(pid: u32, sig: Sig, via: Via) {
     });
 }
 
-/// How many sends [`record`] has logged on this thread.
-#[cfg(target_os = "linux")]
-pub(crate) fn recorded() -> usize {
-    LOG.with(|log| log.borrow().as_ref().map_or(0, Vec::len))
-}
-
 /// Collects this thread's send attempts until dropped.
 pub(crate) struct Capture(());
 
@@ -156,9 +141,8 @@ impl Capture {
 }
 
 impl Capture {
-    /// The identity-checked sends: the tree walk on every unix (by number on macOS, through the
-    /// proved pidfd on Linux, where [`group_steps`](Self::group_steps) shows the route), and on
-    /// macOS also the signals a held `os_process` sends.
+    /// The identity-checked sends: every signal a held `os_process` sends, written inside that send
+    /// (a pidfd's on Linux, an audit token's on macOS), whatever the kernel answered.
     #[cfg(unix)]
     pub(crate) fn by_identity(&self) -> Vec<IdentityEntry> {
         BY_IDENTITY.with(|log| log.borrow().clone().expect("a live capture has a log"))
