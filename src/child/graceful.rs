@@ -13,7 +13,7 @@ use crate::error::Error;
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
 /// performs — root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
-/// ([`crate::containment::Attached::wait_drained`]). Outside test builds the seam module does
+/// ([`DrainEdge::wait`](crate::containment::mechanism::DrainEdge::wait)). Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
 pub(crate) fn take_forced_watch_error() -> Option<Error> {
@@ -189,9 +189,13 @@ impl Child {
             // A live front in its cgroup: killed through it, and nothing signalled after it.
             crate::elevation::front::Gate::CgroupOnly(front) => {
                 // A cgroup kill names no group by the root's pid, so no root is given.
-                debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
-                self.attached
-                    .hard_kill_settled("graceful_shutdown", &self.tree_killed, None)
+                debug_assert_eq!(
+                    self.containment(),
+                    crate::containment::Containment::CgroupV2,
+                    "CgroupOnly is a front in a cgroup"
+                );
+                self.tree
+                    .kill_settled("graceful_shutdown", None)
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
                 self.cgroup_kill_reached(front)?;
             }
@@ -383,7 +387,11 @@ impl Child {
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
         } else if self.containment().can_observe_drain() {
-            match self.attached.wait_drained(crate::wait::deadline_from(grace)) {
+            match self
+                .tree
+                .drain_edge()
+                .and_then(|edge| edge.wait(crate::wait::deadline_from(grace)))
+            {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
@@ -470,7 +478,7 @@ impl Child {
     }
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
-    /// mechanism's own, decided on its look at the root ([`Attached::terminate`]). This handle's reaps
+    /// mechanism's own, decided on its look at the root ([`Tree::terminate`](crate::containment::Tree::terminate)). This handle's reaps
     /// are held off from the look until the `SIGTERM` is sent. A plain `fn`: the std-lock hold and the
     /// root borrowing it must not live in an async caller's state, so paths that send nothing release
     /// the hold here, before the grace.
@@ -485,7 +493,7 @@ impl Child {
         if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
             return forced;
         }
-        match self.attached.terminate(self.pid(), root) {
+        match self.tree.terminate(self.pid(), root) {
             TerminateOutcome::Sent { result, earlier } => SignalTreeCooperativelyOutcome::Sent { result, earlier },
             #[cfg(unix)]
             TerminateOutcome::End(skip) => {
@@ -494,7 +502,7 @@ impl Child {
                     crate::containment::dispatch::TreeSignal::Term,
                     None,
                 );
-                match call.answer(&self.attached, &self.tree_killed, skip, None) {
+                match call.answer(&self.tree, skip, None) {
                     Err(e) => SignalTreeCooperativelyOutcome::End(e),
                     // The tree is already killed, as this handle's own reap shows: nothing is left to
                     // signal, and the sweep and the reap go on.
@@ -511,7 +519,7 @@ impl Child {
             // A tree this handle already killed leaves nothing for the grace and the kill of the holders
             // to do: the sweep that follows answers as the tree calls do.
             #[cfg(unix)]
-            TerminateOutcome::HoldersOnly(mut skip) if skip.is_moot(&self.tree_killed) => {
+            TerminateOutcome::HoldersOnly(mut skip) if skip.is_moot(&self.tree) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): this handle already killed the tree, so the holders' grace is skipped",
                     self.pid()
@@ -572,7 +580,11 @@ impl Child {
             crate::containment::dispatch::TreeSignal::Term,
             None,
         );
-        if let Err(e) = self.attached.wait_drained(crate::wait::deadline_from(grace)) {
+        if let Err(e) = self
+            .tree
+            .drain_edge()
+            .and_then(|edge| edge.wait(crate::wait::deadline_from(grace)))
+        {
             call.holders_grace_failed(&e);
         }
         self.holders_shutdown_error(&call, skip)
@@ -584,9 +596,9 @@ impl Child {
     pub(crate) fn holders_shutdown_error(&self, call: &SkipCall<'_>, skip: &Skip) -> Error {
         let kill = {
             let held = self.proc.hold(self.pid());
-            self.attached.hard_kill(Some(&held))
+            self.tree.kill(Some(&held))
         };
-        call.holders_shutdown_error(&self.attached, &self.tree_killed, skip, kill)
+        call.holders_shutdown_error(&self.tree, skip, kill)
     }
 }
 

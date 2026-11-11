@@ -472,7 +472,7 @@ pub(crate) fn to_real_clock(deadline: Option<std::time::Instant>) -> Option<std:
 /// such aliasing is possible regardless of what the caller does with the `Child` after
 /// cancelling.
 #[cfg(windows)]
-async fn job_wait_tree_drained(
+pub(crate) async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, Error> {
@@ -567,41 +567,6 @@ async fn job_wait_tree_drained(
             debug_assert!(false, "unknown JoinError variant: {e:?}");
             Err(Error::Io(std::io::Error::other(e)))
         }
-    }
-}
-
-/// Async equivalent of `Attached::wait_drained`, dispatched by mechanism. macOS is reactor-native
-/// (`AsyncFd`); Linux awaits a broadcast from the pump thread its leaf owns (an
-/// `event_listener` future, no reactor registration); Windows hands its sync loop to `spawn_blocking` with a
-/// cancel event (job objects have no pollable handle). Every other mechanism delegates to the
-/// sync `Attached::wait_drained`, whose non-drainable arm returns `Unsupported` immediately —
-/// never blocking — so calling it directly here (no `spawn_blocking`) is safe.
-///
-/// `deadline` is on [`tokio_now`]'s clock (build it with [`deadline_from`]).
-pub(crate) async fn wait_tree_drained_dispatch(
-    attached: &crate::containment::Attached,
-    deadline: Option<std::time::Instant>,
-) -> Result<crate::containment::TreeDrain, Error> {
-    match attached {
-        #[cfg(target_os = "linux")]
-        crate::containment::Attached::Cgroup(leaf) => cgroup_wait_tree_drained(leaf, deadline).await,
-        #[cfg(windows)]
-        crate::containment::Attached::JobObject(job) => job_wait_tree_drained(job, deadline).await,
-        #[cfg(target_os = "macos")]
-        crate::containment::Attached::FdMarker(m) => {
-            // Mirrors `Marker::wait_drained`'s own preamble exactly: a reissued read-end fd
-            // would falsely deliver `EV_EOF` instantly here just as readily as it would there,
-            // so this path must not skip the check just because it reads the raw fd directly
-            // instead of going through `Marker::wait_drained`.
-            m.check_read_end_still_valid()?;
-            debug_assert_ne!(
-                crate::containment::marker_eof::write_end_check(m.read_end()),
-                crate::containment::marker_eof::WriteEndCheck::HeldByUs,
-                "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
-            );
-            wait_tree_deadline(m.read_end(), deadline).await
-        }
-        other => other.wait_drained(deadline),
     }
 }
 

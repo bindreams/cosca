@@ -36,7 +36,7 @@ const SESSION_CONTAINMENT: Containment = Containment::FdMarker;
 #[cfg(not(target_os = "macos"))]
 const SESSION_CONTAINMENT: Containment = Containment::Session;
 
-/// A command in its own session: `Attached::ProcessGroup` off macOS, `Attached::FdMarker` on it.
+/// A command in its own session: a process group off macOS, an fd marker on it.
 fn session(argv: &[&str]) -> Command {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(argv.iter().copied());
@@ -622,7 +622,7 @@ fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_m
         other => panic!("expected MemberNotKilled, got {other:?}"),
     };
     assert_eq!(pid_of(&second), pid_of(&first), "{first:?}, {second:?}");
-    assert!(!child.tree_killed.is_set(), "a member was left");
+    assert!(!child.tree.is_killed(), "a member was left");
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
 }
@@ -672,7 +672,7 @@ fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
         other => panic!("expected MemberNotKilled, got {other:?}"),
     };
     assert_eq!(pid_of(&second), pid_of(&first), "{first:?}, {second:?}");
-    assert!(!child.tree_killed.is_set(), "a member was left");
+    assert!(!child.tree.is_killed(), "a member was left");
 }
 
 /// The drop after `wait` is the same reader: the root is reaped, so the drop's walk has no root, and
@@ -739,7 +739,7 @@ fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_ma
         .expect_err("a root that is gone leaves no tree to walk: nothing was killed");
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
 
-    assert!(!child.tree_killed.is_set(), "a walk that found no root killed nothing");
+    assert!(!child.tree.is_killed(), "a walk that found no root killed nothing");
     let mark = crate::log_capture::mark();
     drop(child);
     let records = drop_walk_warns_since(mark);

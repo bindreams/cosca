@@ -326,7 +326,7 @@ fn cgroup_kill_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _grou
     child.kill().expect("the cgroup kill reaches the program");
     assert_eq!(sent.entries(), [], "nothing is signalled after it");
     drop(sent);
-    assert!(child.tree_killed.is_set(), "the kill must go through the cgroup");
+    assert!(child.tree.is_killed(), "the kill must go through the cgroup");
     // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
@@ -340,7 +340,7 @@ fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] 
     child.kill_tree().expect("the cgroup kill reaches the program");
     assert_eq!(sent.entries(), [], "nothing is signalled after it");
     drop(sent);
-    assert!(child.tree_killed.is_set());
+    assert!(child.tree.is_killed());
     // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
@@ -402,10 +402,7 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
     crate::log_capture::install();
     let teardowns = record_root_teardowns();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let crate::containment::Attached::Cgroup(leaf) = &child.attached else {
-        panic!("expected a cgroup leaf, got {:?}", child.attached);
-    };
-    let leaf = leaf.path().to_path_buf();
+    let leaf = leaf_of(&child).path().to_path_buf();
     let pid = child.pid();
     let mark = crate::log_capture::mark();
     let stdin = Rc::new(std::cell::Cell::new(Some(stdin)));
@@ -924,7 +921,7 @@ fn cgroup_a_front_that_left_its_leaf_is_unkillable_and_sent_nothing(#[fixture(cg
     move_out_of_its_leaf(pid);
     assert_unkillable_front(child.kill(), pid);
     assert_unkillable_front(child.kill_tree(), pid);
-    assert!(!child.tree_killed.is_set(), "no cgroup kill ran");
+    assert!(!child.tree.is_killed(), "no cgroup kill ran");
     drop(child);
     assert_eq!(teardowns.count(), 0, "the drop must not kill or reap the front");
     drop(stdin);
@@ -1310,7 +1307,7 @@ fn cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup(#[fixture(cg
     let status = child
         .graceful_shutdown(std::time::Duration::ZERO)
         .expect("the cgroup kill ends the front");
-    assert!(child.tree_killed.is_set(), "the escalation must go through the cgroup");
+    assert!(child.tree.is_killed(), "the escalation must go through the cgroup");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
 }
 
@@ -1420,10 +1417,10 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixtu
 
 /// The leaf `child` is contained in.
 fn leaf_of(child: &crate::Child) -> &crate::containment::cgroup::CgroupLeaf {
-    match &child.attached {
-        crate::containment::Attached::Cgroup(leaf) => leaf,
-        other => panic!("expected a cgroup leaf, got {other:?}"),
-    }
+    child
+        .tree
+        .cgroup_leaf_for_test()
+        .unwrap_or_else(|| panic!("expected a cgroup leaf, got {:?}", child.tree))
 }
 
 /// A front killed through its leaf stays in it, by its pidfd's cgroup id, until it is freed: as a
@@ -1434,11 +1431,11 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
     let pid = child.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    child.attached.hard_kill(None).into_result().expect("cgroup.kill");
+    child.tree.kill(None).into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
-    let names = leaf_of(&child).names(pid, child.proc.pidfd());
+    let names = child.tree.would_reach(pid, child.proc.pidfd());
     drop(hidden);
     assert!(
         names.expect("the pidfd read needs no /proc"),
@@ -1454,16 +1451,18 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
     let pid = killed.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    killed.attached.hard_kill(None).into_result().expect("cgroup.kill");
+    killed.tree.kill(None).into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
-    assert!(leaf_of(&killed)
-        .names(pid, killed.proc.pidfd())
+    assert!(killed
+        .tree
+        .would_reach(pid, killed.proc.pidfd())
         .expect("/proc is readable here"));
     let (moved, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     move_out_of_its_leaf(moved.pid());
-    assert!(!leaf_of(&moved)
-        .names(moved.pid(), moved.proc.pidfd())
+    assert!(!moved
+        .tree
+        .would_reach(moved.pid(), moved.proc.pidfd())
         .expect("/proc is readable here"));
 }
 
@@ -1474,7 +1473,7 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(#[fixture(cgroup
     let pid = child.pid();
     move_out_of_its_leaf(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
-    let names = leaf_of(&child).names(pid, child.proc.pidfd());
+    let names = child.tree.would_reach(pid, child.proc.pidfd());
     drop(hidden);
     assert!(
         !names.expect("the pidfd read needs no /proc"),
@@ -1490,7 +1489,7 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(#[fixture(cgroup)] _group
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
     move_under_its_leaf(pid);
-    let names = || leaf_of(&child).names(pid, child.proc.pidfd());
+    let names = || child.tree.would_reach(pid, child.proc.pidfd());
     assert!(names().expect("/proc is readable here"));
     {
         let _hidden = crate::containment::cgroup::fault::hide_proc();

@@ -59,7 +59,7 @@ pub enum Containment {
     /// Teardown kills the union of three channels: marker holders and the ppid walk each
     /// verify the target's identity before signalling; the process group (when one was
     /// created) is signalled by `killpg(pgid)` with no additional re-verification beyond what
-    /// `Attached::ProcessGroup` already does — the same pgid-reuse caveat documented in
+    /// the process-group mechanism already does — the same pgid-reuse caveat documented in
     /// `src/containment/unix.rs` applies to the FIRST group signal exactly as it does today.
     /// `kill_tree` (SIGKILL) re-snapshots the host and repeats until nothing new appears AND
     /// each pass makes actual progress (no fixed pass count); a LATER pass re-signals the group
@@ -170,55 +170,6 @@ impl TreeDrain {
             TreeDrain::AllMarkersClosed | TreeDrain::MembersRemain => false,
         }
     }
-}
-
-/// Guard for the `_tree` operations, shared by the sync and async `Child`: they act on the
-/// containment group's teardown mechanism, so a child whose mechanism is a no-op has no tree
-/// to act on.
-pub(crate) fn require_contained(containment: Containment, attached: &Attached) -> Result<(), crate::error::Error> {
-    debug_assert_eq!(
-        containment.can_teardown(),
-        attached.is_actionable(),
-        "Containment/Attached actionability diverged"
-    );
-    if !attached.is_actionable() {
-        return Err(crate::error::Error::Unsupported {
-            op: "tree teardown (kill_tree / terminate_tree)".into(),
-            platform: std::env::consts::OS,
-            detail: "this child holds no actionable tree-teardown mechanism (uncontained, \
-                     or a nested member of an ancestor's containment group). Use kill() for a \
-                     lone process, or tear down the tree via the outermost .contain()ed handle."
-                .into(),
-            source: None,
-        });
-    }
-    Ok(())
-}
-
-/// Guard for `wait_tree`/`wait_tree_timeout`, shared by the sync and async `Child`: only a
-/// mechanism with a real kernel drain edge ([`Containment::can_observe_drain`]) can answer
-/// "has the whole tree exited" without polling — everything else (an uncontained child, a
-/// nested `Delegated` member, or a teardown-only mechanism like `ProcessGroup`/`TreeWalk`)
-/// returns `Unsupported`.
-pub(crate) fn require_drainable(containment: Containment, attached: &Attached) -> Result<(), crate::error::Error> {
-    debug_assert_eq!(
-        containment.can_observe_drain(),
-        attached.can_observe_drain(),
-        "Containment/Attached drain-observability diverged"
-    );
-    if !attached.can_observe_drain() {
-        return Err(crate::error::Error::Unsupported {
-            op: "wait for the contained tree to drain (wait_tree / wait_tree_timeout)".into(),
-            platform: std::env::consts::OS,
-            detail: format!(
-                "this child's containment mechanism ({containment}) exposes no kernel edge for \
-                 tree drain — only cgroup v2, a Windows job object, and the macOS fd marker do. \
-                 Use kill_tree()/terminate_tree() for teardown, or wait() to watch the root alone."
-            ),
-            source: None,
-        });
-    }
-    Ok(())
 }
 
 impl fmt::Display for Containment {
@@ -333,6 +284,16 @@ pub(crate) mod treewalk;
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
 
+#[path = "containment/mechanism.rs"]
+pub(crate) mod mechanism;
+
+#[cfg(test)]
+#[path = "containment/fake.rs"]
+pub(crate) mod fake;
+
+#[path = "containment/tree.rs"]
+mod tree;
+
 #[path = "containment/root.rs"]
 mod root;
 
@@ -346,7 +307,12 @@ pub(crate) use dispatch::DropView;
     unused_imports,
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
-pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
+pub(crate) use dispatch::{attach, prepare, Attachment, Prepared, RootIdentity, TreeKilled};
+#[allow(
+    unused_imports,
+    reason = "a mechanism is named outside containment/ only by tests and the macOS late spawn"
+)]
+pub(crate) use mechanism::{Contains, Mechanism};
 #[cfg(all(test, unix))]
 pub(crate) use root::Refusal;
 pub(crate) use root::Root;
@@ -357,6 +323,7 @@ pub(crate) use root::{check_number, NotItsGroup};
 pub(crate) use skip::{Skip, TerminateOutcome};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};
+pub(crate) use tree::Tree;
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

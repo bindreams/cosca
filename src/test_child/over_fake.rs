@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
-use crate::containment::{Attached, Attachment, Containment};
+use crate::containment::{Attachment, Tree};
 use crate::graceful::GracefulMechanism;
 use crate::identity::{Key, ProcessId};
 use crate::os_process::child::ExitRecord;
@@ -25,8 +25,7 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
         BTreeMap::new(),
         false,
         Attachment {
-            containment: Containment::None,
-            attached: Attached::None,
+            tree: Tree::None,
             graceful: if cfg!(windows) {
                 GracefulMechanism::None
             } else {

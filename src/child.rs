@@ -133,10 +133,8 @@ pub struct Child {
     pub(crate) id: Option<ProcessId>,
     pub(crate) pipes: BTreeMap<Fd, ParentEnd>,
     pub(crate) kill_on_drop: bool,
-    containment: Containment,
-    pub(crate) attached: crate::containment::Attached,
-    /// Where this handle's tree stands after its kills; see [`crate::containment::TreeKilled`].
-    pub(crate) tree_killed: crate::containment::TreeKilled,
+    /// The tree this handle owns, and where it stands after its kills; see [`crate::containment::Tree`].
+    pub(crate) tree: crate::containment::Tree,
     graceful: crate::graceful::GracefulMechanism,
     /// What the spawn achieved; [`Child::front`] reads the front from it.
     elevation: Option<crate::elevation::ElevationReport>,
@@ -169,9 +167,7 @@ impl Child {
             id,
             pipes,
             kill_on_drop,
-            containment: attachment.containment,
-            attached: attachment.attached,
-            tree_killed: Default::default(),
+            tree: attachment.tree,
             graceful: attachment.graceful,
             elevation,
             #[cfg(unix)]
@@ -188,12 +184,12 @@ impl Child {
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
-    /// [`Attached::honor_kill_on_drop`](crate::containment::Attached::honor_kill_on_drop)).
+    /// [`Tree::honor_kill_on_drop`](crate::containment::Tree::honor_kill_on_drop)).
     ///
     /// A refused disarm (Windows) fails the commit: the still-armed child is torn down as a failed
     /// run's is (handed back in the error if its kill is refused), with the refusal as the cause.
     pub(crate) fn commit_kill_on_drop(mut self) -> Result<Child, crate::child::spawn::SpawnFailure> {
-        let Err(refusal) = self.attached.honor_kill_on_drop(self.kill_on_drop) else {
+        let Err(refusal) = self.tree.honor_kill_on_drop(self.kill_on_drop) else {
             return Ok(self);
         };
         // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
@@ -219,7 +215,7 @@ impl Child {
     /// [`Containment::can_teardown`] to predict whether `kill_tree`/`terminate_tree`
     /// act or return `Unsupported`.
     pub fn containment(&self) -> Containment {
-        self.containment
+        self.tree.containment()
     }
 
     /// Which cooperative signal [`terminate`](Child::terminate) sends this child, how far it
@@ -241,12 +237,7 @@ impl Child {
 
     /// Guard for the `_tree` operations (single-sourced with the async `Child`).
     pub(crate) fn require_contained(&self) -> Result<(), Error> {
-        crate::containment::require_contained(self.containment, &self.attached)
-    }
-
-    /// Guard for `wait_tree`/`wait_tree_timeout` (single-sourced with the async `Child`).
-    pub(crate) fn require_drainable(&self) -> Result<(), Error> {
-        crate::containment::require_drainable(self.containment, &self.attached)
+        self.tree.require_contained()
     }
 
     /// This child's stable identity (see [`crate::identity::ProcessId`]), or `None` when the OS
@@ -442,9 +433,13 @@ impl Child {
             // Nothing is signalled after the cgroup kill: it could only be refused.
             Gate::CgroupOnly(front) => {
                 // A cgroup kill names no group by the root's pid, so no root is given.
-                debug_assert!(self.attached.is_cgroup(), "CgroupOnly is a front in a cgroup");
-                self.attached
-                    .hard_kill_settled(op, &self.tree_killed, None)
+                debug_assert_eq!(
+                    self.containment(),
+                    Containment::CgroupV2,
+                    "CgroupOnly is a front in a cgroup"
+                );
+                self.tree
+                    .kill_settled(op, None)
                     .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
                 self.cgroup_kill_reached(front)?;
                 return Ok(crate::signal::Sent::Delivered);
@@ -465,7 +460,7 @@ impl Child {
             self.front(),
             pid,
             || self.root_running(),
-            || self.attached.kill_reaches_across_credentials(pid, self.proc.pidfd()),
+            || self.tree.would_reach(pid, self.proc.pidfd()),
         )
     }
 
@@ -478,7 +473,7 @@ impl Child {
             front,
             pid,
             || self.root_running().map(|running| !running),
-            || self.attached.cgroup_names(pid, self.proc.pidfd()),
+            || self.tree.would_reach(pid, self.proc.pidfd()),
         )
     }
 
@@ -628,15 +623,15 @@ impl Child {
         let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
         let root: Option<&dyn crate::containment::Root> = None;
-        let group_result = self.attached.hard_kill(root);
+        let group_result = self.tree.kill(root);
         #[cfg(unix)]
         let group_result = match group_result {
             // An answer that needs no kill ends the call: no backstop.
             answered @ TreeKillOutcome::Answered(_) => {
                 drop(held);
                 return self
-                    .attached
-                    .settle_for_kill_tree(op, &self.tree_killed, answered, false)
+                    .tree
+                    .settle_for_kill_tree(op, answered, false)
                     .map_err(SweepFailure::from);
             }
             TreeKillOutcome::Skipped(skip) => {
@@ -648,9 +643,9 @@ impl Child {
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
                 });
                 let root_ended = sent.as_ref().is_some_and(SweepFailure::killed_root);
-                let answered =
-                    self.skip_call(op, TreeSignal::Kill, earlier)
-                        .answer(&self.attached, &self.tree_killed, skip, sent);
+                let answered = self
+                    .skip_call(op, TreeSignal::Kill, earlier)
+                    .answer(&self.tree, skip, sent);
                 drop(held);
                 return answered.map_err(|error| SweepFailure { error, root_ended });
             }
@@ -659,17 +654,13 @@ impl Child {
                 other
             }
         };
-        let group_result = self.attached.unless_unwalked(op, &self.tree_killed, group_result)?;
+        let group_result = self.tree.unless_unwalked(op, group_result)?;
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            return match (
-                self.attached
-                    .settle_for_kill_tree(op, &self.tree_killed, group_result, false),
-                in_cgroup,
-            ) {
+            return match (self.tree.settle_for_kill_tree(op, group_result, false), in_cgroup) {
                 (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
                 (Err(left), Some(front)) => Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left)),
                 (other, None) => other,
@@ -693,14 +684,7 @@ impl Child {
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
-        SweepFailure::of(
-            op,
-            &self.attached,
-            &self.tree_killed,
-            group_result,
-            backstop,
-            root_ended,
-        )
+        SweepFailure::of(op, &self.tree, group_result, backstop, root_ended)
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -788,18 +772,18 @@ impl Child {
         let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
         let root: Option<&dyn crate::containment::Root> = None;
-        let outcome = self.attached.terminate(self.pid(), root);
+        let outcome = self.tree.terminate(self.pid(), root);
         #[cfg(unix)]
         {
             let call = self.skip_call("terminate_tree", TreeSignal::Term, None);
             match outcome {
                 TerminateOutcome::Sent { result, .. } => result,
                 TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
-                    call.answer(&self.attached, &self.tree_killed, skip, None)
+                    call.answer(&self.tree, skip, None)
                 }
                 TerminateOutcome::RootThroughPidfd(skip) => {
                     let sent = held.signal(crate::signal::Sig::Term);
-                    call.answer(&self.attached, &self.tree_killed, skip, Some(sent))
+                    call.answer(&self.tree, skip, Some(sent))
                 }
             }
         }
@@ -897,7 +881,7 @@ impl Child {
         if !self.kill_on_drop {
             return Ok(());
         }
-        self.attached.disarm().map_err(Error::Io)?;
+        self.tree.disarm().map_err(Error::Io)?;
         self.kill_on_drop = false;
         Ok(())
     }
@@ -944,7 +928,7 @@ impl Child {
     /// opened.
     #[cfg(windows)]
     pub fn test_job_handle_contains(&self, pid: u32) -> bool {
-        crate::containment::windows::job_contains_pid(&self.attached, pid)
+        self.tree.job_contains_for_test(pid)
     }
 
     /// Test-only: the marker pipe's kernel identity, for tests that must sweep this tree.
@@ -954,10 +938,7 @@ impl Child {
         reason = "awaits a unit-test consumer; not visible to integration tests (pub(crate))"
     )]
     pub(crate) fn test_marker_handle(&self) -> Option<u64> {
-        match &self.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.handle()),
-            _ => None,
-        }
+        self.tree.marker_handle_for_test()
     }
 
     /// Test-only: the fd-marker descriptor's number in the child, so this crate's OWN
@@ -966,15 +947,12 @@ impl Child {
     /// `tests/macos_fdmarker.rs` had a testbin mode scan its own open fds for "the one nobody
     /// explains" — passing locally but flaky on CI, where the runner hands the process extra
     /// inherited descriptors the scan could not tell apart from the marker (#59). This is the
-    /// crate's own bookkeeping, not a guess: `None` if `self` is not `Attached::FdMarker`.
+    /// crate's own bookkeeping, not a guess: `None` if the child is not contained by an fd marker.
     /// `#[doc(hidden)]`: not public API, present only for this crate's own `tests/` binaries.
     #[doc(hidden)]
     #[cfg(target_os = "macos")]
     pub fn test_fdmarker_fd(&self) -> Option<i32> {
-        match &self.attached {
-            crate::containment::Attached::FdMarker(m) => Some(m.own_fd()),
-            _ => None,
-        }
+        self.tree.marker_fd_for_test()
     }
 
     /// Test-only: force the FdMarker mechanism's process-group id, so a test can drive
@@ -985,36 +963,27 @@ impl Child {
     /// refuser (the `Error::Containment` scenario) needs real root to construct at all — see
     /// `tests/group_teardown_setuid.rs`'s own module docs for why that is not reliably
     /// provisionable on macOS (SIP) — and because calling `Marker::hard_kill`/`terminate`
-    /// directly, the way `fdmarker_tests.rs` otherwise does, bypasses `dispatch.rs`'s
-    /// `Attached::FdMarker` arm entirely: exactly where an earlier version of this fix
+    /// directly, the way `fdmarker_tests.rs` otherwise does, bypasses the tree's dispatch to
+    /// its marker mechanism entirely: exactly where an earlier version of this fix
     /// laundered `Error::Containment` into `Error::Io` without any test noticing.
     ///
-    /// Panics if `self` is not `Attached::FdMarker` — a misuse of this seam by the caller,
+    /// Panics if the child is not contained by an fd marker — a misuse of this seam by the caller,
     /// not a case to silently no-op past.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_force_fdmarker_pgid(&mut self, pgid: i32) {
-        match &mut self.attached {
-            crate::containment::Attached::FdMarker(m) => m.force_pgid_for_test(pgid),
-            other => panic!("test_force_fdmarker_pgid called on a non-FdMarker child: {other:?}"),
-        }
+        self.tree.force_marker_pgid_for_test(pgid);
     }
 
     /// The root a `TreeWalk` attachment walks from.
     #[cfg(all(test, unix))]
     pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
-        match &self.attached {
-            crate::containment::Attached::TreeWalk(root) => Some(*root),
-            _ => None,
-        }
+        self.tree.walk_root_for_test()
     }
 
     /// The root an fd marker's ppid-walk channel starts from.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
-        match &self.attached {
-            crate::containment::Attached::FdMarker(m) => m.root(),
-            _ => None,
-        }
+        self.tree.marker_root_for_test()
     }
 }
 

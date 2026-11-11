@@ -171,14 +171,13 @@ mod leaf_drain {
             &self,
             elevation: Option<crate::elevation::ElevationReport>,
         ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-            crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
-                containment: crate::containment::Containment::CgroupV2,
-                attached: crate::containment::Attached::Cgroup(entered_leaf_at(self.fake.leaf.clone())),
-                graceful: crate::graceful::GracefulMechanism::Process,
-            });
-            held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
+            let (mut child, stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
                 cmd.set_elevation_report(elevation)
-            })
+            });
+            child.inner.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
+                entered_leaf_at(self.fake.leaf.clone()),
+            ));
+            (child, stdin)
         }
 
         fn drain(&self) {

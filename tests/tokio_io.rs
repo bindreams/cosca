@@ -478,7 +478,7 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     // `kill_on_drop(false)` disarms the drop, so the teardown (hard_kill + the root's kill) must
     // not run and the root stays alive. Proven by positive liveness on the
     // never-signaled root (race-free, mirroring async_detach_leaves_the_tree_running).
-    // UNCONTAINED on purpose: `Attached::None` isolates the early-return itself from the
+    // UNCONTAINED on purpose: `Tree::None` isolates the early-return itself from the
     // containment resource's own drop, which
     // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
@@ -503,7 +503,7 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
-    // The spawn disarms the resource (see `Attached::honor_kill_on_drop`). On Linux outside the
+    // The spawn disarms the resource (see `Tree::honor_kill_on_drop`). On Linux outside the
     // cgroup lane this is a process group, whose disarm is a no-op;
     // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
@@ -543,7 +543,7 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running(#[fixture(cgroup)]
 
 #[cfg(feature = "tokio")]
 /// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
-/// `Attached::honor_kill_on_drop`).
+/// `Tree::honor_kill_on_drop`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {

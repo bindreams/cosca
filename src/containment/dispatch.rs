@@ -1,6 +1,7 @@
 //! Per-OS containment dispatch (two-phase: prepare before spawn, attach after).
 
-use crate::containment::{ContainMode, ContainRequest, Containment, Nesting, Skip, TerminateOutcome};
+use crate::containment::mechanism::Mechanism;
+use crate::containment::{ContainMode, ContainRequest, Nesting, Skip, Tree};
 use crate::error::Error;
 #[cfg(unix)]
 use crate::signal::RootState;
@@ -128,15 +129,14 @@ impl Prepared {
     }
 }
 
-/// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
+/// What a spawn achieved, beyond the child handle itself: the tree it owns and the
 /// cooperative-signal mechanism, which are independent axes (see [`crate::graceful`]).
 ///
 /// Bundled rather than threaded as separate positional arguments so the spawn constructors do
 /// not grow an argument per spawn fact, and so a new fact is a compile error at every
 /// construction site rather than a silently diverging path.
 pub(crate) struct Attachment {
-    pub containment: Containment,
-    pub attached: Attached,
+    pub tree: Tree,
     pub graceful: crate::graceful::GracefulMechanism,
 }
 
@@ -151,8 +151,7 @@ impl Attachment {
     /// ever; cosca can make neither claim about a child it did not create.
     pub(crate) fn uac_elevated() -> Attachment {
         Attachment {
-            containment: Containment::None,
-            attached: Attached::None,
+            tree: Tree::None,
             graceful: crate::graceful::GracefulMechanism::Unknown,
         }
     }
@@ -235,7 +234,7 @@ impl DropView {
         root_pid: u32,
         id: Option<crate::identity::ProcessId>,
         root: impl FnOnce() -> RootState,
-        tree_killed: &TreeKilled,
+        tree: &Tree,
     ) -> DropView {
         let label = caller.label();
         let now = crate::child::root_identity_now(root_pid);
@@ -265,7 +264,7 @@ impl DropView {
             caller,
             root_pid,
             root,
-            tree_killed: tree_killed.is_set(),
+            tree_killed: tree.is_killed(),
         };
         if now.is_unknown() && !handle_reaped {
             if view.unsettled() {
@@ -314,7 +313,7 @@ impl DropView {
 }
 
 /// Where a `Child` handle's tree stands after the kills and drops that settled it
-/// ([`Attached::settle`] alone writes it): one state under one lock, so a reader sees what the last
+/// ([`TreeKilled::settle`] alone writes it): one state under one lock, so a reader sees what the last
 /// settlement left. `settle` holds the lock across its kills by identity, which take a `Kernel` and
 /// a `ProcessId` and never reach a `TreeKilled`, so the lock is not re-entered.
 ///
@@ -426,7 +425,7 @@ pub(crate) enum TreeSignal {
 }
 
 /// A tree kill that did not complete, and every member it left running. It reports none of them:
-/// [`Attached::settle`] decides what the root's own death leaves, and the caller reports that, once.
+/// [`Tree::settle`] decides what the root's own death leaves, and the caller reports that, once.
 #[derive(Debug)]
 pub(crate) struct Unkilled {
     /// Every member left but the root. For a walk, in the order it found them; for a mechanism that
@@ -485,7 +484,7 @@ impl From<Error> for Unkilled {
     }
 }
 
-/// What a tree kill left once the root's own death had its say ([`Attached::settle`]): the first
+/// What a tree kill left once the root's own death had its say ([`Tree::settle`]): the first
 /// member left, which the caller returns, and the others, as data for the caller's one report.
 #[derive(Debug)]
 pub(crate) struct Unsettled {
@@ -521,7 +520,7 @@ impl std::fmt::Display for Unsettled {
     }
 }
 
-/// How an [`Attached::settle`] that found nothing left came out, by the state it left ([`TreeKilled`]):
+/// How a [`Tree::settle`] that found nothing left came out, by the state it left ([`TreeKilled`]):
 /// the answer `Ok` does not say the tree is vouched for, this does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettleOutcome {
@@ -604,7 +603,7 @@ impl UnvouchedKind {
     }
 }
 
-/// What a tree kill did ([`Attached::hard_kill`]): the one value [`Attached::settle`] turns into what
+/// What a tree kill did ([`Contains::send_kill`](crate::containment::Contains::send_kill)): the one value [`Tree::settle`] turns into what
 /// is left and into the handle's state ([`TreeKilled`]).
 #[derive(Debug)]
 pub(crate) enum TreeKillOutcome {
@@ -639,7 +638,7 @@ pub(crate) enum TreeKillOutcome {
     Skipped(Skip),
 }
 
-/// A kill that ran: what [`Attached::hard_kill`] and the paths that send by hand return.
+/// A kill that ran: what [`Tree::kill`] and the paths that send by hand return.
 impl From<Result<(), Unkilled>> for TreeKillOutcome {
     fn from(result: Result<(), Unkilled>) -> TreeKillOutcome {
         TreeKillOutcome::Ran(result)
@@ -802,18 +801,17 @@ impl SweepFailure {
     }
 
     /// The answer of a `kill_tree` sweep: the walk's error, settled by the root's death
-    /// ([`Attached::settle`]), else the backstop's. `root_ended`: the backstop ended the root. This is
+    /// ([`Tree::settle`]), else the backstop's. `root_ended`: the backstop ended the root. This is
     /// the call's one report of the members the walk left: the error names the first, and each other
     /// is warned of here. `op` names the call.
     pub(crate) fn of(
         op: &str,
-        attached: &Attached,
-        killed: &TreeKilled,
+        tree: &Tree,
         walk: TreeKillOutcome,
         backstop: Result<(), Error>,
         root_ended: bool,
     ) -> Result<(), SweepFailure> {
-        let walk = attached.settle_for_kill_tree(op, killed, walk, root_ended);
+        let walk = tree.settle_for_kill_tree(op, walk, root_ended);
         if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
             // The backstop's error is dropped: the walk's names the member left.
             log::debug!(
@@ -826,157 +824,15 @@ impl SweepFailure {
     }
 }
 
-/// Owns the OS containment resource for a spawned child; `hard_kill`/`terminate`
-/// act on the tree, `disarm` neutralizes teardown for `detach()`. `None` =
-/// uncontained (lone-process semantics).
-#[derive(Debug, Default)]
-pub(crate) enum Attached {
-    #[default]
-    None,
-    /// A nested containment member: it joined an ancestor's group/job and owns no
-    /// teardown mechanism of its own (the outermost root tears the tree down). Distinct
-    /// from `None` (genuinely uncontained) so `_tree` ops can error honestly.
-    Delegated,
-    #[cfg(unix)]
-    ProcessGroup(i32), // pgid (== root pid)
-    #[cfg(target_os = "linux")]
-    Cgroup(crate::containment::cgroup::CgroupLeaf),
-    #[cfg(windows)]
-    JobObject(crate::containment::windows::JobHandle),
-    /// macOS inherited-fd marker: membership survives `setsid`, `setpgid`, reparenting and
-    /// `exec`. Owns the supervisor's read end of the marker pipe — which is what keeps the
-    /// pipe's kernel identity from being re-issued — plus, when the mode created one, the pgid.
-    #[cfg(target_os = "macos")]
-    FdMarker(crate::containment::fdmarker::Marker),
-    /// Identity-aware tree-walk teardown (cross-platform; the root identity is
-    /// re-enumerated and killed by identity at teardown). No cfg gate: this is
-    /// the universal fallback and a directly-selectable mode on every OS.
-    TreeWalk(crate::identity::ProcessId),
-}
-
-// CgroupLeaf is not Debug; provide a minimal impl.
-#[cfg(target_os = "linux")]
-impl std::fmt::Debug for crate::containment::cgroup::CgroupLeaf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CgroupLeaf").finish_non_exhaustive()
-    }
-}
-
-impl Attached {
-    /// What names this mechanism's tree in a message about its teardown: the cgroup leaf's path
-    /// (`hard_kill` returns the kernel's error unwrapped, so the error does not name it), else
-    /// the mechanism itself.
-    #[cfg(unix)]
-    pub(crate) fn teardown_subject(&self) -> String {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return format!("cgroup leaf {}", leaf.path().display());
-        }
-        format!("{self:?}")
-    }
-
-    /// Whether this mechanism's kill reaches `pid` whatever its credentials: only a cgroup's
-    /// `cgroup.kill` does, and only while `pid` is in it. A signal to a group or to walked members is
-    /// subject to the kernel's permission check, so it is `false` for every other mechanism.
-    /// `pid` must be this process's unreaped child, so its number is not reused.
-    #[cfg(unix)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    pub(crate) fn kill_reaches_across_credentials(
-        &self,
-        pid: u32,
-        pidfd: Option<std::os::fd::BorrowedFd<'_>>,
-    ) -> std::io::Result<bool> {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.holds_member(pid, pidfd);
-        }
-        Ok(false)
-    }
-
-    /// Whether this is a cgroup leaf with a `cgroup.kill` write that landed or found the leaf gone,
-    /// which bounds its drain.
-    /// `false` for every other mechanism.
-    #[cfg(all(feature = "tokio", target_os = "linux"))]
-    pub(crate) fn cgroup_kill_landed(&self) -> bool {
-        matches!(self, Attached::Cgroup(leaf) if leaf.kill_landed())
-    }
-
-    /// Whether `pid` (which `pidfd` names, when there is one) is in a cgroup's leaf or a cgroup
-    /// under it (see `CgroupLeaf::names`). `false` for every other mechanism.
-    #[cfg(unix)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    pub(crate) fn cgroup_names(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.names(pid, pidfd);
-        }
-        Ok(false)
-    }
-
-    /// Hard-kill the contained tree (best-effort; a member that is already gone is success). What
-    /// `Ok` says depends on how the mechanism names the tree:
-    ///
-    /// - A cgroup leaf and a Job Object name it in the kernel: `Ok` says the kernel killed every
-    ///   member, however it was spawned.
-    /// - A process group or session, and an fd marker, name it by a number or a pipe: `Ok` says every
-    ///   member they list or find holding it was reached. A member outside it (one that left the group,
-    ///   or on Linux one `hidepid` hides) is not.
-    /// - A `TreeWalk` names it by parentage: `Ok` says every descendant of the root at the walk's
-    ///   snapshot was killed. A process already reparented away from the root (an orphan), or one the
-    ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
-    ///   running is an [`Error::MemberNotKilled`].
-    ///
-    /// `root` is the root a mechanism that names its tree by the root's pid (a process group, a macOS
-    /// fd marker, a tree walk on macOS) looks at, right before each send by the number, and decides
-    /// what to send by it: the outcome says what it did not send, and why ([`Skip`]). Every other
-    /// mechanism ignores it.
-    #[cfg_attr(
-        not(unix),
-        allow(unused_variables, reason = "only Unix names a group by the root's pid")
-    )]
-    pub(crate) fn hard_kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
-        #[cfg(any(target_os = "linux", windows))]
-        let ran = |result: Result<(), Error>| TreeKillOutcome::Ran(result.map_err(Unkilled::from));
-        match self {
-            Attached::None | Attached::Delegated => TreeKillOutcome::Ran(Ok(())),
-            #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group_tree(*pgid, root),
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => ran(leaf.hard_kill()),
-            #[cfg(windows)]
-            Attached::JobObject(job) => ran(job.hard_kill().map_err(Error::Io)),
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.kill_tree(root),
-            Attached::TreeWalk(id) => crate::containment::treewalk::kill_tree(*id, root),
-        }
-    }
-
-    /// [`hard_kill`](Self::hard_kill) for a caller with no root to kill after it, settled and reported
-    /// as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not ended. `caller`
-    /// names the call in the warns of the members it left besides the first.
-    #[cfg(unix)]
-    pub(crate) fn hard_kill_settled(
-        &self,
-        caller: &str,
-        killed: &TreeKilled,
-        root: Option<&dyn crate::containment::Root>,
-    ) -> Result<(), Error> {
-        self.settle_for_kill_tree(caller, killed, self.hard_kill(root), false)
-    }
-
+impl TreeKilled {
     /// What a tree kill's `outcome` comes to once the root's own handle has had its say: the one place
-    /// that decides what a walk left behind, and the only one that writes `killed`. `root_ended`: the
+    /// that decides what a walk left behind, and the only one that writes the state. `walk`: the tree
+    /// is a tree walk's. `root_ended`: the
     /// root is not running (killed, or already dead), so a root the walk left is not left. The answer
     /// is `Ok` when nothing is left. Otherwise it is the first member left, and the others as data: it
     /// reports none of them.
     ///
-    /// It decides under the one lock of `killed`, by its state and the outcome, and leaves the state
+    /// It decides under the one lock of the state, by it and the outcome, and leaves the state
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever
     /// the outcome. A gone root over a killed tree is `Ok`, and over held members still left it adds no
     /// error of its own; over a tree never settled it is [`TreeKillOutcome::no_root_error`], and over
@@ -987,13 +843,12 @@ impl Attached {
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
     pub(crate) fn settle(
         &self,
-        killed: &TreeKilled,
+        walk: bool,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<SettleOutcome, Unsettled> {
         let outcome = outcome.into();
-        let walk = matches!(self, Attached::TreeWalk(_));
-        let mut state = killed.lock();
+        let mut state = self.lock();
         let was_killed = matches!(*state, TreeState::Killed);
         // The state is read here and written once, at the end, so an unwind leaves it as it was.
         let held = match &*state {
@@ -1060,28 +915,28 @@ impl Attached {
     pub(crate) fn settle_for_kill_tree(
         &self,
         caller: &str,
-        killed: &TreeKilled,
-        walk: impl Into<TreeKillOutcome>,
+        walk: bool,
+        outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<(), Error> {
-        self.settle(killed, walk, root_ended)
+        self.settle(walk, outcome, root_ended)
             .map(drop)
             .map_err(|left| left.report(caller))
     }
 
-    /// `walk` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not walk
-    /// killed nothing, and the root's death would strand the descendants beyond a retry, so it is
-    /// settled here and returned as the error with the tree intact. Any other `walk` is handed back.
+    /// `outcome` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not
+    /// walk killed nothing, and the root's death would strand the descendants beyond a retry, so it is
+    /// settled here and returned as the error with the tree intact. Any other `outcome` is handed back.
     pub(crate) fn unless_unwalked(
         &self,
         caller: &str,
-        killed: &TreeKilled,
-        walk: TreeKillOutcome,
+        walk: bool,
+        outcome: TreeKillOutcome,
     ) -> Result<TreeKillOutcome, SweepFailure> {
-        if !matches!(walk, TreeKillOutcome::Unwalked(_)) {
-            return Ok(walk);
+        if !matches!(outcome, TreeKillOutcome::Unwalked(_)) {
+            return Ok(outcome);
         }
-        match self.settle_for_kill_tree(caller, killed, walk, false) {
+        match self.settle_for_kill_tree(caller, walk, outcome, false) {
             Err(error) => Err(SweepFailure::from(error)),
             // The walk's error is a member left, and the root is not ended.
             Ok(()) => unreachable!("a walk not made leaves its error"),
@@ -1092,7 +947,7 @@ impl Attached {
     /// here and only when it will be logged.
     pub(crate) fn settle_for_drop(
         &self,
-        killed: &TreeKilled,
+        walk: bool,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Option<String> {
@@ -1105,183 +960,12 @@ impl Attached {
             | TreeKillOutcome::NoRoot
             | TreeKillOutcome::Skipped(_) => "",
         };
-        let left = match self.settle(killed, outcome, root_ended) {
+        let left = match self.settle(walk, outcome, root_ended) {
             Err(left) => left.log_text(),
             Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
         };
         Some(format!("contained-tree teardown did not fully succeed: {left}{after}"))
-    }
-
-    /// Send the graceful termination signal to the tree (signal-only), as [`hard_kill`](Self::hard_kill)
-    /// decides it from `root`: the outcome says what went out, or what was skipped and what the caller
-    /// does about it.
-    #[cfg_attr(
-        not(unix),
-        allow(unused_variables, reason = "only Unix names a group by the root's pid")
-    )]
-    pub(crate) fn terminate(&self, _child_pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
-        let sent = |result: Result<(), Error>| TerminateOutcome::Sent {
-            result,
-            earlier: Some("the SIGTERM"),
-        };
-        match self {
-            Attached::None | Attached::Delegated => {
-                debug_assert!(
-                    self.is_actionable(),
-                    "Attached::terminate on a non-actionable mechanism"
-                );
-                sent(Err(crate::error::Error::Unsupported {
-                    op: "terminate on a non-actionable mechanism".into(),
-                    platform: std::env::consts::OS,
-                    detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
-                    source: None,
-                }))
-            }
-            #[cfg(unix)]
-            Attached::ProcessGroup(pgid) => crate::containment::unix::term_group_tree(*pgid, root),
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => sent(leaf.terminate()),
-            #[cfg(windows)]
-            Attached::JobObject(_) => sent(crate::containment::windows::terminate(_child_pid)),
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.terminate_tree(root),
-            Attached::TreeWalk(id) => crate::containment::treewalk::terminate_tree(*id, root),
-        }
-    }
-
-    /// Apply a handle's `kill_on_drop` decision to the containment resource, once its spawn is
-    /// committed.
-    ///
-    /// `Child::drop` returning early on `kill_on_drop == false` skips only ITS teardown. The
-    /// resource is a field of that handle and drops with it regardless — and a `CgroupLeaf`'s
-    /// `Drop` fires `cgroup.kill` over an occupied leaf, a Job Object's close fires
-    /// `KILL_ON_JOB_CLOSE`. So the opt-out has to reach the resource as well, which is what
-    /// [`disarm`](Self::disarm) is for; without this, `kill_on_drop(false)` killed exactly the
-    /// contained trees [`Child::detach`](crate::Child::detach) (which disarms) keeps alive,
-    /// while [`Command::kill_on_drop`](crate::Command::kill_on_drop) documents the two as the
-    /// same opt-out.
-    ///
-    /// Called by `spawn` as it hands the handle to the caller, not when the handle is built: a
-    /// spawn that fails after that (the POSIX password write) must still tear its tree down.
-    /// Not in `Drop` either: a supervisor that exits without running destructors still has its
-    /// Job Object handle closed by the OS, and with `KILL_ON_JOB_CLOSE` still set that close is
-    /// the kill. `detach()` disarms eagerly for the same reason.
-    ///
-    /// # Errors
-    ///
-    /// The refusal of the disarm (Windows: `SetInformationJobObject`), when the handle opted out
-    /// of `kill_on_drop`: the resource is then still armed, and the caller must not hand the child
-    /// over as one cosca no longer kills.
-    pub(crate) fn honor_kill_on_drop(&self, kill_on_drop: bool) -> std::io::Result<()> {
-        if kill_on_drop {
-            Ok(())
-        } else {
-            self.disarm()
-        }
-    }
-
-    /// Neutralize teardown so `detach()` leaves the tree running. For Job Objects,
-    /// clears `KILL_ON_JOB_CLOSE` so the handle close does not kill the tree; for a cgroup
-    /// leaf, stops `Drop` firing `cgroup.kill`. No-op only for mechanisms whose resource-drop
-    /// genuinely does not kill (pgroup/treewalk/fd marker/none), which `Child::drop`'s
-    /// `kill_on_drop` opt-out already covers.
-    ///
-    /// Only a Job Object's disarm can fail (the OS refuses `SetInformationJobObject`); the
-    /// resource is then still armed.
-    pub(crate) fn disarm(&self) -> std::io::Result<()> {
-        match self {
-            Attached::None | Attached::Delegated => {}
-            #[cfg(unix)]
-            Attached::ProcessGroup(_) => {} // pgroup drop doesn't kill — no-op
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.disarm(), // CgroupLeaf::drop kills an occupied leaf
-            #[cfg(windows)]
-            Attached::JobObject(job) => return job.disarm(), // clear KILL_ON_JOB_CLOSE before handle drops
-            // dropping the read end does not kill; detach opts out via kill_on_drop
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(_) => {}
-            Attached::TreeWalk(_) => {} // no kernel resource whose drop kills; detach opts out via kill_on_drop
-        }
-        Ok(())
-    }
-
-    /// Whether this mechanism signals a process group named by the root's pid: `ProcessGroup`, and
-    /// a macOS fd marker whose mode made a group.
-    #[cfg(all(test, unix))]
-    pub(crate) fn signals_a_group(&self) -> bool {
-        match self {
-            Attached::ProcessGroup(_) => true,
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.pgid().is_some(),
-            _ => false,
-        }
-    }
-
-    /// Whether this is a Linux cgroup leaf.
-    #[cfg(unix)]
-    pub(crate) fn is_cgroup(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        return matches!(self, Attached::Cgroup(_));
-        #[cfg(not(target_os = "linux"))]
-        false
-    }
-
-    /// Whether this child holds an actionable tree-teardown mechanism.
-    pub(crate) fn is_actionable(&self) -> bool {
-        match self {
-            Attached::None | Attached::Delegated => false,
-            #[cfg(unix)]
-            Attached::ProcessGroup(_) => true,
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(_) => true,
-            #[cfg(windows)]
-            Attached::JobObject(_) => true,
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(_) => true,
-            Attached::TreeWalk(_) => true,
-        }
-    }
-
-    /// Whether this handle owns a mechanism with a kernel drain edge — mirrors
-    /// [`Containment::can_observe_drain`](crate::containment::Containment::can_observe_drain),
-    /// checked against the concrete resource rather than the reported enum so the two can
-    /// never drift silently (`require_drainable` asserts them equal in debug).
-    pub(crate) fn can_observe_drain(&self) -> bool {
-        match self {
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(_) => true,
-            #[cfg(windows)]
-            Attached::JobObject(_) => true,
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(_) => true,
-            _ => false,
-        }
-    }
-
-    /// Block until every member of the contained tree has EXITED (not reaped), or until
-    /// `deadline`. `Unsupported` on every mechanism without a kernel drain edge (checked by the
-    /// caller via `require_drainable`/`can_observe_drain` before this is reached in the public
-    /// API, but this still refuses honestly if ever called directly against a non-drainable
-    /// mechanism).
-    pub(crate) fn wait_drained(
-        &self,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<crate::containment::TreeDrain, Error> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.wait_drained(deadline),
-            #[cfg(windows)]
-            Attached::JobObject(job) => job.wait_drained(deadline, None),
-            #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.wait_drained(deadline),
-            _ => Err(Error::Unsupported {
-                op: "wait for the contained tree to drain".into(),
-                platform: std::env::consts::OS,
-                detail: "this child's containment mechanism exposes no kernel edge for tree drain".into(),
-                source: None,
-            }),
-        }
     }
 }
 
@@ -1303,25 +987,6 @@ pub(crate) enum RootIdentity {
     Gone,
     /// The read was refused or could not be trusted.
     Unknown,
-}
-
-/// Whether the tree kill of this mechanism reached the child. Only a cgroup leaf's `cgroup.kill` is
-/// shown to, whatever the child's credentials: its flag says the write landed, then where the child
-/// is says it was in the leaf. A signal to a group or to walked members is subject to the kernel's
-/// permission check, as the child's own kill is, so it reaches nothing that kill does not.
-#[cfg(unix)]
-impl crate::child::owned::teardown::Reach for Attached {
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.subtree()?.reached(child);
-        }
-        Ok(false)
-    }
 }
 
 /// Which Unix setup action to apply to a root `Command` for a given mode.
@@ -1619,7 +1284,7 @@ pub(crate) fn prepare(
 
 /// Phase 2 (after spawn, before the `OwnedChild` adopts): attach the mechanism and bundle it with the
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
-/// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
+/// cleanly to the cgroup mechanism without requiring interior mutability — hence the
 /// cooperative-signal mechanism is read off it first.
 ///
 /// `id` is the identity the spawn read of the root, or the error of the read that failed. A
@@ -1634,7 +1299,7 @@ pub(crate) fn attach(
     prepared: Prepared,
 ) -> Result<Attachment, Error> {
     let graceful = prepared.graceful_mechanism();
-    let (containment, attached) = attach_tree(
+    let tree = attach_tree(
         #[cfg(unix)]
         pid,
         id,
@@ -1644,11 +1309,7 @@ pub(crate) fn attach(
         proc_handle,
         prepared,
     )?;
-    Ok(Attachment {
-        containment,
-        attached,
-        graceful,
-    })
+    Ok(Attachment { tree, graceful })
 }
 
 /// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.
@@ -1658,7 +1319,10 @@ fn attach_tree(
     #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<(Containment, Attached), Error> {
+) -> Result<Tree, Error> {
+    use crate::containment::treewalk::Walker;
+    #[cfg(unix)]
+    use crate::containment::unix::Group;
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
@@ -1668,7 +1332,7 @@ fn attach_tree(
                 // TreeWalk root: no kernel container / process group; teardown is
                 // by identity: the one the spawn verified against the child's handle.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
 
                 let raw_pid = pid;
@@ -1681,7 +1345,7 @@ fn attach_tree(
                 // Session mode: setsid was applied pre-spawn; no cgroup.
                 // pgid == sid == pid for the session leader; killpg works.
                 if matches!(prepared.mode, Some(ContainMode::Session)) {
-                    return Ok((Containment::Session, Attached::ProcessGroup(pgid)));
+                    return Ok(Tree::contained(Mechanism::Group(Group::session(pgid))));
                 }
 
                 // Strongest: cgroup v2 if available, else process group.
@@ -1694,7 +1358,7 @@ fn attach_tree(
                     // not mean the child has made it — then releases the leaf's fd and pipe.
                     match leaf.take_placement(child) {
                         Ok(()) => {
-                            return Ok((Containment::CgroupV2, Attached::Cgroup(leaf)));
+                            return Ok(Tree::contained(Mechanism::Cgroup(leaf)));
                         }
                         // Nothing of the child's is in the leaf: its final report is not Placed. The
                         // process group set pre-spawn is the real container; the leaf is
@@ -1702,17 +1366,17 @@ fn attach_tree(
                         Err(reason) => {
                             crate::containment::cgroup::log_degrade(&reason);
                             leaf.remove_unentered();
-                            return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
+                            return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
                         }
                     }
                 }
                 // No cgroup leaf: fall back to process group (set pre-spawn).
-                return Ok((Containment::ProcessGroup, Attached::ProcessGroup(pgid)));
+                return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
             } else {
                 // Nested member: it joined the ancestor's cgroup/process group (or the
                 // root's tree-walk) rather than creating its own, so it owns no teardown —
                 // the outermost root tears the whole tree down.
-                return Ok((Containment::Delegated, Attached::Delegated));
+                return Ok(Tree::Delegated);
             }
         }
     }
@@ -1720,7 +1384,7 @@ fn attach_tree(
     // Non-Linux Unix: process group or session.
     // For Session: setsid was called pre-spawn (not process_group(0)); the child
     // is a session leader with pgid == pid. Teardown via killpg is identical —
-    // Attached::ProcessGroup(pgid) is reused since the pgroup == session leader's pid.
+    // the group mechanism is reused since the pgroup == session leader's pid.
     // For Strongest (= ProcessGroup on macOS): process_group(0) was called pre-spawn.
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -1741,14 +1405,13 @@ fn attach_tree(
                             Some(pid as i32)
                         }
                     };
-                    return Ok((
-                        Containment::FdMarker,
-                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, id?, pgid)),
-                    ));
+                    return Ok(Tree::contained(Mechanism::Marker(
+                        crate::containment::fdmarker::Marker::new(marker, id?, pgid),
+                    )));
                 }
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
                 let raw_pid = pid;
                 debug_assert!(
@@ -1756,11 +1419,11 @@ fn attach_tree(
                     "pid {raw_pid} exceeds i32::MAX; pgid cast would truncate"
                 );
                 let pgid = raw_pid as i32;
-                let containment = match prepared.mode {
-                    Some(ContainMode::Session) => Containment::Session,
-                    _ => Containment::ProcessGroup,
+                let group = match prepared.mode {
+                    Some(ContainMode::Session) => Group::session(pgid),
+                    _ => Group::process_group(pgid),
                 };
-                return Ok((containment, Attached::ProcessGroup(pgid)));
+                return Ok(Tree::contained(Mechanism::Group(group)));
             } else {
                 // Nested member: it joined the ancestor's process group (or the root's
                 // tree-walk) rather than creating its own, so it owns no teardown — the
@@ -1777,7 +1440,7 @@ fn attach_tree(
                         "a nested member inherits the root's marker and must never create one"
                     );
                 }
-                return Ok((Containment::Delegated, Attached::Delegated));
+                return Ok(Tree::Delegated);
             }
         }
     }
@@ -1789,13 +1452,13 @@ fn attach_tree(
             // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
             // identity teardown, with CTRL_BREAK to the group as cooperative term.
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
+                return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
             }
             // A frozen root is assigned its job and left suspended. It gets no `TreeWalk` fallback:
             // a frozen root without a job would have nothing to kill it if its owner died.
             if prepared.frozen {
                 return match crate::containment::windows::assign_held(proc_handle) {
-                    Ok(job) => Ok((Containment::JobObject, Attached::JobObject(job))),
+                    Ok(job) => Ok(Tree::contained(Mechanism::Job(job))),
                     Err(e) => Err(Error::Containment {
                         detail: e.to_string(),
                         source: None,
@@ -1803,13 +1466,13 @@ fn attach_tree(
                 };
             }
             match crate::containment::windows::attach_job(proc_handle) {
-                Ok(Some(job)) => return Ok((Containment::JobObject, Attached::JobObject(job))),
+                Ok(Some(job)) => return Ok(Tree::contained(Mechanism::Job(job))),
                 Ok(None) => {
                     // Job assignment failed: fall back to the universal TreeWalk
                     // mechanism rather than silently yielding no containment. The
                     // root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags),
                     // so `terminate`'s CTRL_BREAK still reaches the group.
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
                 Err(e) => {
                     return Err(Error::Containment {
@@ -1822,13 +1485,13 @@ fn attach_tree(
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no
             // new job is created), so it owns no teardown — the outermost root's job tears
             // the whole tree down.
-            return Ok((Containment::Delegated, Attached::Delegated));
+            return Ok(Tree::Delegated);
         }
     }
 
     // Uncontained (or unsupported platform).
     let _ = prepared;
-    Ok((Containment::None, Attached::None))
+    Ok(Tree::None)
 }
 
 #[cfg(test)]

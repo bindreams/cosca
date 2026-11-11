@@ -594,7 +594,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
 // remounted cgroupfs) — a kill that did NOT happen.
 
 /// A `cgroup.kill` write the kernel refused must reach the caller through the public
-/// `Attached::hard_kill` arm, exactly as every sibling mechanism's failure does. Swallowing it
+/// `Tree::kill`'s cgroup arm, exactly as every sibling mechanism's failure does. Swallowing it
 /// makes `Child::kill_tree()` return `Ok(())` over a tree that is still running.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -620,10 +620,10 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
         "the kernel's errno must reach the caller, got {err}"
     );
 
-    let attached = crate::containment::Attached::Cgroup(leaf);
+    let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
-        attached.hard_kill(None).into_result().is_err(),
-        "Attached::Cgroup must propagate like every sibling arm; swallowing it makes \
+        tree.kill(None).into_result().is_err(),
+        "a cgroup tree must propagate like every sibling mechanism; swallowing it makes \
          kill_tree() report a completed teardown over a live tree"
     );
 }
@@ -664,15 +664,15 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
     leaf.terminate()
         .expect("an already-removed leaf has no member left to signal");
 
-    let attached = crate::containment::Attached::Cgroup(leaf);
+    let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
         matches!(
-            attached.terminate(0, None),
+            tree.terminate(0, None),
             crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }
         ),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
-    assert!(attached.hard_kill(None).into_result().is_ok());
+    assert!(tree.kill(None).into_result().is_ok());
 }
 
 // Drop's leaf-removal reporting -----
@@ -780,10 +780,12 @@ fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
     // it to tell a leaf still holding its tree from one that already drained on its own.
     std::fs::write(leaf_path.join("cgroup.events"), b"populated 1\nfrozen 0\n").expect("create cgroup.events");
 
-    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
+    let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(entered_leaf_at(
+        leaf_path.clone(),
+    )));
     let mark = crate::log_capture::mark();
-    attached.disarm().expect("disarm");
-    drop(attached);
+    tree.disarm().expect("disarm");
+    drop(tree);
 
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
@@ -827,9 +829,11 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     let leaf_path = dir.path().join("cosca-detached-empty-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
-    let attached = crate::containment::Attached::Cgroup(entered_leaf_at(leaf_path.clone()));
-    attached.disarm().expect("disarm");
-    drop(attached);
+    let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(entered_leaf_at(
+        leaf_path.clone(),
+    )));
+    tree.disarm().expect("disarm");
+    drop(tree);
 
     assert!(
         !leaf_path.exists(),

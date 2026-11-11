@@ -1151,7 +1151,7 @@ fn main() {
         }
         "report-nested-kill-tree" => {
             // This process is itself spawned CONTAINED (so NESTED_ENV is set). A crate
-            // spawn here is a nested member (Attached::Delegated), whose kill_tree() must
+            // spawn here is a nested member (Tree::Delegated), whose kill_tree() must
             // be Unsupported. Report 'D' (Delegated + Unsupported) or 'O' (other).
             let addr = &args[2];
             let exe = std::env::current_exe().unwrap();

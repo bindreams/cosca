@@ -11,7 +11,7 @@ use std::io::{ErrorKind, Read, Write};
 
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
-use crate::containment::{Attached, Attachment, Containment};
+use crate::containment::{Attachment, Tree};
 use crate::os_process::fake::FakeProcess;
 use crate::pipe::ParentEnd;
 use crate::stdio::Fd;
@@ -23,8 +23,7 @@ use super::Child;
 /// attached).
 fn a_child_without_a_process() -> Child {
     let attachment = Attachment {
-        containment: Containment::None,
-        attached: Attached::None,
+        tree: Tree::None,
         graceful: crate::graceful::GracefulMechanism::Process,
     };
     Child::from_sync(crate::Child::from_parts(

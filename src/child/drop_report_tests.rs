@@ -388,7 +388,7 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
     assert!(!warns[0].contains("members"), "{warns:?}");
-    assert!(!child.tree_killed.is_set(), "the walk saw the root running");
+    assert!(!child.tree.is_killed(), "the walk saw the root running");
     drop(writer);
 }
 
@@ -679,20 +679,16 @@ fn child_in_a_leaf_whose_kill_fails() -> (
     std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
     let kill_file = leaf_path.join("cgroup.kill");
     std::fs::create_dir(&kill_file).expect("make cgroup.kill a directory");
-    crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.clone(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let child = crate::child::spawn::spawn_uncommitted(&mut cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
+    let mut child = crate::child::spawn::spawn_uncommitted(&mut cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
         .expect("spawn");
-    child.attached.disarm().expect("disarm");
+    child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
+        crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone()),
+    ));
+    child.tree.disarm().expect("disarm");
     (child, writer, leaf_path, kill_file, dir)
 }
 
@@ -967,10 +963,7 @@ fn a_teardown_that_skipped_the_tree_kill_does_not_mark_the_tree_killed() {
     );
 
     assert!(torn.fate.not_running(), "{:?}", torn.fate);
-    assert!(
-        !child.tree_killed.is_set(),
-        "a skipped kill does not mark the tree killed"
-    );
+    assert!(!child.tree.is_killed(), "a skipped kill does not mark the tree killed");
     drop(writer);
 }
 
@@ -993,7 +986,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
         child.pid(),
         child.id,
         || child.proc.state(),
-        &child.tree_killed,
+        &child.tree,
     );
 
     fake.assert_peeks_exhausted();
@@ -1027,7 +1020,7 @@ fn the_look_a_kill_decides_on_is_the_one_the_report_is_worded_from() {
         child.pid(),
         child.id,
         || child.proc.state(),
-        &child.tree_killed,
+        &child.tree,
     );
 
     fake.assert_peeks_exhausted();

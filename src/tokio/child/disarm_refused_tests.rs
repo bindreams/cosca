@@ -6,7 +6,7 @@ use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use super::Child;
 use crate::containment::windows::JobHandle;
-use crate::containment::Attached;
+use crate::containment::{Mechanism, Tree};
 use crate::error::{ChildFate, Error};
 use crate::identity::{Liveness, ProcessId};
 use crate::test_child::{expect_may_have_started_parts, held_blocker_async, Console};
@@ -16,7 +16,7 @@ fn refusing_child(kill_on_drop: bool) -> (Child, crate::tokio::ChildStdin, Proce
     let (mut child, stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
         _ = cmd.kill_on_drop(kill_on_drop);
     });
-    child.inner.attached = Attached::JobObject(JobHandle::create_without_set_access_for_test());
+    child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     (child, stdin, id)
 }
@@ -95,7 +95,7 @@ async fn a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag() {
             _ = cmd.kill_on_drop(false);
             cmd.set_elevation_report(Some(report(via.clone())));
         });
-        child.inner.attached = Attached::JobObject(JobHandle::create_without_set_access_for_test());
+        child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
 
         let error = Error::from(child.commit_kill_on_drop().expect_err("the disarm was refused"));
 
