@@ -439,9 +439,11 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     child.kill().expect("kill the root");
-    child.wait().expect("this handle reaps the root");
+    holder.release_root();
+    let status = child.wait().expect("this handle reaps the root");
+    crate::test_child::assert_killed("the root", status);
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 
@@ -479,9 +481,11 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     child.kill().expect("kill the root");
-    child.wait().expect("this handle reaps the root");
+    holder.release_root();
+    let status = child.wait().expect("this handle reaps the root");
+    crate::test_child::assert_killed("the root", status);
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
 
     let err = child
@@ -529,9 +533,11 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_t
     let termed = record_term_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, true);
     child.kill().expect("kill the root");
-    child.wait().expect("this handle reaps the root");
+    holder.release_root();
+    let status = child.wait().expect("this handle reaps the root");
+    crate::test_child::assert_killed("the root", status);
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
 
     let err = child
@@ -578,15 +584,16 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_t
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
-    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind};
+    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind_status};
     crate::log_capture::install();
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     let pid = child.pid();
     child.kill().expect("kill the root");
-    reap_behind(pid);
+    holder.release_root();
+    crate::test_child::assert_killed("the root", reap_behind_status(pid));
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -619,16 +626,17 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
-    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind};
+    use crate::test_child::reaped_elsewhere::{escaped_holder_tree, reap_behind_status};
     crate::log_capture::install();
     let killed = record_kill_group();
     let termed = record_term_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, true);
     let pid = child.pid();
     child.kill().expect("kill the root");
-    reap_behind(pid);
+    holder.release_root();
+    crate::test_child::assert_killed("the root", reap_behind_status(pid));
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -667,15 +675,16 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
 #[skuld::test]
 fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder() {
     use crate::test_child::reaped_elsewhere::{
-        assert_one_reaped_elsewhere_walk_warn, escaped_holder_tree, reap_behind,
+        assert_one_reaped_elsewhere_walk_warn, escaped_holder_tree, reap_behind_status,
     };
     crate::log_capture::install();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
     let pid = child.pid();
     child.kill().expect("kill the root");
-    reap_behind(pid);
+    holder.release_root();
+    crate::test_child::assert_killed("the root", reap_behind_status(pid));
 
     let mark = crate::log_capture::mark();
     let result = child.kill_tree();
@@ -707,9 +716,11 @@ fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_t
     crate::log_capture::install();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
+    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
     child.kill().expect("kill the root");
-    child.wait().expect("this handle reaps the root");
+    holder.release_root();
+    let status = child.wait().expect("this handle reaps the root");
+    crate::test_child::assert_killed("the root", status);
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
 

@@ -179,8 +179,8 @@ impl EmptiedGroup {
     pub(crate) fn new() -> EmptiedGroup {
         use crate::test_child::{await_member_ready, member_command};
         // The member waits for a line on stdin, then leaves the group by `setsid`, says so, and holds
-        // stderr's write end until stdin's EOF. The root blocks on the same stdin, which it never
-        // reads: nothing is written to it until the root is dead.
+        // stderr's write end until stdin's EOF. The root, `exec cat`, reads the same stdin: nothing is
+        // written to it until the root is dead, so no byte reaches the root instead of the member.
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.args([
             "sh",

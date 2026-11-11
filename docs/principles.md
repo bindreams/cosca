@@ -259,8 +259,14 @@ work cosca controls. A timeout a caller passes to cosca is the caller's policy: 
 re-reads state at expiry and reports what it finds (`wait_timeout` returns `Ok(None)` (`Ok(false)`
 on `Process`), `wait_tree_timeout` returns `MembersRemain`, and `graceful_shutdown`'s grace
 escalates to a kill). A backoff that re-checks a deterministic condition, with no cap, is fine. No
-arbitrary retry or loop caps. A test child kept alive is a held child (`BLOCKER_ARGV` and the `held_*`
-constructors in [`src/test_child.rs`](../src/test_child.rs)), never a `sleep` or `ping`.
+arbitrary retry or loop caps. A test child kept alive is a held child, never a `sleep` or `ping`: use
+`BLOCKER_ARGV`, the `held_*` constructors and `member_command` in
+[`src/test_child.rs`](../src/test_child.rs), `ROOT_LEAVING_A_MEMBER` in
+[`identity_group_tests.rs`](../src/child/spawn/identity_group_tests.rs), or on Windows `windows_more` and
+`spawn_restricted*` in [`windows_fixture.rs`](../src/identity/windows_fixture.rs). On Windows a held
+child released by EOF must not exit with the code a kill gives (1): `more.com` exits 0, `findstr x`
+exits 1, so the `more.com` helpers, not `findstr`, are the ones a test can tell a kill from a release
+by.
 
 **Why:** a sleep is a bet that something has happened by then, and loses on a slow or loaded
 machine.

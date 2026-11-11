@@ -526,17 +526,10 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     let read = std::io::Read::read(shell.stdout.as_mut().expect("piped stdout"), &mut first).expect("read the echo");
     assert_eq!(read, 1, "the root closed its output before its child echoed");
     // The root's children are its console host and its `more`.
-    let is_more = |id: &ProcessId| {
-        crate::identity::windows_fixture::image_file_name(id.pid()).is_some_and(|image| {
-            std::path::Path::new(&image)
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
-        })
-    };
     let children = root.children(Recursive::No).expect("the root's children");
     let held = children
         .into_iter()
-        .find(is_more)
+        .find(|id| crate::identity::windows_fixture::is_more_com(id.pid()))
         .expect("the root has a `more` child")
         .pid();
     let Opened::Found(held_handle) =

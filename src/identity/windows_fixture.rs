@@ -41,9 +41,12 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
+
+use crate::child::spawn::windows_raw::AttributeList;
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
 ///
@@ -110,6 +113,16 @@ pub(crate) fn image_file_name(pid: u32) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// Whether process `pid` runs `more.com`, the child the fixtures hold (see
+/// [`crate::test_child::windows_more`]); `false` once it is gone.
+pub(crate) fn is_more_com(pid: u32) -> bool {
+    image_file_name(pid).is_some_and(|image| {
+        std::path::Path::new(&image)
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
+    })
 }
 
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
@@ -184,15 +197,12 @@ impl RestrictedChild {
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
-            for pid in members.into_iter().filter(|&pid| pid != self.pid) {
-                let is_more = image_file_name(pid).is_some_and(|image| {
-                    std::path::Path::new(&image)
-                        .file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
-                });
-                if is_more {
-                    return pid;
-                }
+            if let Some(pid) = members
+                .into_iter()
+                .filter(|&pid| pid != self.pid)
+                .find(|&pid| is_more_com(pid))
+            {
+                return pid;
             }
             std::thread::yield_now();
         }
@@ -294,10 +304,13 @@ pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
 pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> RestrictedChild {
+    let cmd = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
+        .join("System32")
+        .join("cmd.exe");
     spawn_with_ace_cmdline(
         alone,
         granted | PROCESS_TERMINATE.0,
-        &format!("C:\\Windows\\System32\\cmd.exe /c {}", quoted_more()),
+        &format!("\"{}\" /c {}", cmd.display(), quoted_more()),
     )
 }
 
@@ -322,8 +335,10 @@ fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
-/// writes to `NUL`. It is created with handle inheritance on, so until it exits it inherits the
-/// handles this process already holds inheritable, besides its stdio; the fixture's `Drop` ends it.
+/// writes to `NUL`. It inherits exactly those two handles (a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), as
+/// the raw spawn backend's children do, so no handle another thread holds inheritable at that moment
+/// reaches it. The list scopes the child, not the window: another spawner that passes
+/// `bInheritHandles` with no list can still take the two while they are inheritable here.
 fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
@@ -395,13 +410,19 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
     // terminator, so a caller that forgot one would send it reading past the end of the
     // allocation. No call site can get this wrong.
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdInput: stdin,
-        hStdOutput: stdout,
-        hStdError: stdout,
-        ..Default::default()
+    // Outlives the attribute list, which keeps the pointer to it.
+    let listed = [stdin, stdout];
+    let attributes = AttributeList::build(&listed).expect("the inheritance list of the fixture child");
+    let si = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: size_of::<STARTUPINFOEXW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: stdin,
+            hStdOutput: stdout,
+            hStdError: stdout,
+            ..Default::default()
+        },
+        lpAttributeList: attributes.as_ptr(),
     };
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
@@ -413,10 +434,10 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
             Some(&sa),
             None,
             true,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
             None,
             None,
-            &si,
+            &si.StartupInfo,
             &mut pi,
         )
     }

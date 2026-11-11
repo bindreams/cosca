@@ -149,19 +149,18 @@ pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
     (child, pid)
 }
 
-/// A root `sh` that leaves a marker holder outside its process group, then blocks on its stdin, which
-/// it never reads: nothing is written to it. The holder is a
-/// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
-/// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It
-/// prints its pid once it has left the group. It holds the stderr pipe's write end: once the root is
-/// gone, stderr reaches EOF exactly when the holder is. With `ignore_term`, the holder ignores
-/// `SIGTERM` (an ignored signal stays ignored across `exec`), so only a kill ends it.
+/// A root `sh` that leaves a marker holder outside its process group, then `exec`s a `cat` that
+/// blocks on its own stdin. The holder is a `cat` that called `setsid` (through `perl`, as macOS has
+/// no `setsid` command) and reads a pipe of its own, which the spawn passes as fd 3, so the root's
+/// end and the holder's end are separate: EOF on one ends only its reader. It prints its pid once it
+/// has left the group. It holds the stderr pipe's write end: once the root is gone, stderr reaches
+/// EOF exactly when the holder is. With `ignore_term`, the holder ignores `SIGTERM` (an ignored
+/// signal stays ignored across `exec`), so only a kill ends it.
 #[cfg(target_os = "macos")]
 pub(crate) fn escaped_holder_script(ignore_term: bool) -> String {
     let ignore = if ignore_term { r#"$SIG{TERM} = "IGNORE"; "# } else { "" };
     format!(
-        r#"exec 3<&0
-perl -MPOSIX -e '{ignore}POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
+        r#"perl -MPOSIX -e '{ignore}POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
 exec 3<&-
 exec cat"#
     )
@@ -187,11 +186,20 @@ pub(crate) struct EscapedHolder {
     pub(crate) pid: u32,
     /// Held so the holder's `cat` ends only when killed.
     _stdin: crate::PipeWriter,
+    /// The root's own stdin, held until [`EscapedHolder::release_root`].
+    root_stdin: Option<crate::PipeWriter>,
     stderr: crate::PipeReader,
 }
 
 #[cfg(target_os = "macos")]
 impl EscapedHolder {
+    /// Releases the root's stdin. Call it only after the test killed the root, then check the root's
+    /// status with `assert_killed`: a kill that sent nothing lets the root's `cat` exit `0` on this
+    /// EOF, which fails there instead of leaving the wait to block.
+    pub(crate) fn release_root(&mut self) {
+        drop(self.root_stdin.take());
+    }
+
     /// Blocks until the holder is gone: its stderr reaches EOF. Call only once the test has shown
     /// the holder was signalled, so a missed kill fails an assertion rather than hanging here.
     pub(crate) fn assert_dies(mut self) {
@@ -210,6 +218,7 @@ pub(crate) fn escaped_holder_tree(mode: crate::ContainMode, ignore_term: bool) -
     cmd.args(["sh", "-c", &escaped_holder_script(ignore_term)]);
     cmd.contain_with(mode);
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::pipe_in()).expect("the holder's pipe");
     cmd.stdout(crate::Stdio::pipe_out()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -222,7 +231,8 @@ pub(crate) fn escaped_holder_tree(mode: crate::ContainMode, ignore_term: bool) -
     assert_left_the_group(pid, child.pid());
     let holder = EscapedHolder {
         pid,
-        _stdin: child.stdin().expect("stdin pipe"),
+        _stdin: child.fd_write_end(3.into()).expect("the holder's write end"),
+        root_stdin: Some(child.stdin().expect("stdin pipe")),
         stderr: child.stderr().expect("stderr pipe"),
     };
     (child, holder)
