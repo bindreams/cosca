@@ -298,8 +298,12 @@ impl Child {
     /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
     /// its group is shut down as usual while it has a member. After this handle's own reap, with
     /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
-    /// call goes on as usual. The `SIGTERM` and the sweep each decide on a look of their own at the
-    /// root, and each send by the group's number after it is checked as for `kill_tree`.
+    /// call goes on as usual. With a pid that names no process, the group's number may be taken, so
+    /// the call ends at once with [`Error::Unassessable`](crate::error::Error::Unassessable) and the
+    /// remedy: call `kill_tree` before `wait` to end the descendants. A macOS marker's holders
+    /// still get the `SIGTERM`, the grace and the kill. The `SIGTERM` and the sweep each decide on a
+    /// look of their own at the root, and each send by the group's number after it is checked as for
+    /// `kill_tree`.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

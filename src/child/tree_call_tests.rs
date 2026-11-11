@@ -219,8 +219,6 @@ enum Answer {
     Empty,
     #[cfg(target_os = "macos")]
     Untrusted,
-    #[cfg(target_os = "macos")]
-    NoWalk,
     /// `MayNameAnother`, with `exact_root` and a phrase its `why` contains.
     MayNameAnother(bool, &'static str),
 }
@@ -253,15 +251,18 @@ fn answer(attached: &Attached, state: State, own: bool, read: Resolved<ProcessId
         RootNumber::Empty => Answer::Empty,
         #[cfg(target_os = "macos")]
         RootNumber::Untrusted(_) => Answer::Untrusted,
-        #[cfg(target_os = "macos")]
-        RootNumber::NoWalk => Answer::NoWalk,
         #[cfg(target_os = "linux")]
         RootNumber::GroupGone => panic!("only a tree call's look through the root's pidfd answers GroupGone"),
         RootNumber::MayNameAnother { why, exact_root } => {
-            let phrase = ["could not be read", "was reaped elsewhere", "could not say whether it"]
-                .into_iter()
-                .find(|phrase| why.contains(phrase))
-                .unwrap_or_else(|| panic!("an unexpected reason: {why}"));
+            let phrase = [
+                "could not be read",
+                "was reaped elsewhere",
+                "could not say whether it",
+                "names no process",
+            ]
+            .into_iter()
+            .find(|phrase| why.contains(phrase))
+            .unwrap_or_else(|| panic!("an unexpected reason: {why}"));
             Answer::MayNameAnother(exact_root, phrase)
         }
     };
@@ -309,12 +310,12 @@ fn root_number_answers_each_state_own_reap_and_identity_read() {
             "reaped elsewhere"
         );
     }
-    // This handle's own reap: the pid names nothing (the group's id while a member survives), names
-    // another process (so the group is empty), or cannot be read.
+    // This handle's own reap: the pid names nothing (a later process may take it, so nothing is sent
+    // by it), names another process (so the group is empty), or cannot be read.
     let [gone, found, unknown] = reads();
     assert_eq!(
         answer(&group, State::Reaped, true, gone).0,
-        Answer::Trusted,
+        Answer::MayNameAnother(false, "names no process"),
         "own reap, gone"
     );
     assert_eq!(
@@ -375,11 +376,10 @@ fn root_number_answers_an_unpinned_root_untrusted() {
 
 // group_number_holds -----
 
-/// A send by the group's number is allowed only while the root is unreaped, or after this handle's
-/// own reap with its pid naming no process. Mutant: "a root reaped elsewhere, or one its handle
-/// cannot answer for, passes the check".
+/// A send by the group's number is allowed only while the root is unreaped. Mutant: "a root reaped
+/// elsewhere, one its handle cannot answer for, or one this handle reaped passes the check".
 #[skuld::test]
-fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_reap() {
+fn group_number_holds_only_for_an_unreaped_root() {
     use super::group_number_holds;
     let own = std::process::id();
     assert_eq!(group_number_holds(own, RootState::Unreaped), Ok(()));
@@ -401,7 +401,8 @@ fn group_number_holds_only_for_an_unreaped_root_or_a_free_number_after_its_own_r
 }
 
 /// `group_number_holds` reads `own` from the state: a reap by someone else refuses whatever the
-/// pid's identity read says, and an own reap is decided by that read. Mutant: "`own` is ignored".
+/// pid's identity read says, and an own reap is refused whatever that read says. Mutant: "`own` is
+/// ignored", or "an own reap whose pid names no process passes".
 #[skuld::test]
 fn group_number_holds_reads_own_from_the_state() {
     use super::group_number_holds;
@@ -413,7 +414,8 @@ fn group_number_holds_reads_own_from_the_state() {
         assert!(err.contains("reaped elsewhere"), "{err}");
     }
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-    assert_eq!(group_number_holds(PGID as u32, RootState::Reaped { own: true }), Ok(()));
+    let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("names no process");
+    assert!(err.contains("names no process"), "{err}");
     drop(_gone);
     let _found = crate::child::fault::force_root_reads(Resolved::Found(other()));
     let err = group_number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("another process holds");

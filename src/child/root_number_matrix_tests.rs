@@ -14,9 +14,6 @@
 //! marker) that ignores `SIGTERM` and outlives the root. Both end once stdin closes, so a root an
 //! entry point leaves alone ends without a signal. Every cell is checked, and the whole matrix is
 //! printed if any cell is wrong.
-//!
-//! One send by number is routed, and its cells expect it until the issue lands:
-//! [`KILLPG_AFTER_OWN_REAP`] (a group after this handle's own reap, the pid naming nothing).
 
 use std::time::Duration;
 
@@ -390,14 +387,12 @@ enum Want {
     Yes,
     No,
     Any,
-    /// Sent today, and wrongly: the issue that removes it.
-    Routed(&'static str),
 }
 
 impl Want {
     fn holds(self, sent: bool) -> bool {
         match self {
-            Want::Yes | Want::Routed(_) => sent,
+            Want::Yes => sent,
             Want::No => !sent,
             Want::Any => true,
         }
@@ -420,19 +415,15 @@ struct Expected {
     survivor_ended_alone: Want,
 }
 
-/// The killpg after this handle's own reap, while the pid names nothing: the group may still have
-/// members, but once none survives another process may take the number first.
-const KILLPG_AFTER_OWN_REAP: Want = Want::Routed("bindreams/cosca#382");
-
 fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     use nix::sys::signal::Signal::{SIGKILL, SIGTERM};
     let reaped = reap.reaped();
-    let killpg = match (mechanism.has_group(), reap) {
-        (false, _) => Want::No,
-        (true, Reap::None) => Want::Yes,
-        // A teardown reads its own reap as a reap.
-        (true, Reap::OwnFree) if !op.tears_down() => KILLPG_AFTER_OWN_REAP,
-        (true, _) => Want::No,
+    // After this handle's own reap with the pid naming nothing, the group may still have members,
+    // but once none survives another process may take the number first: nothing is sent by it.
+    let killpg = if mechanism.has_group() && reap == Reap::None {
+        Want::Yes
+    } else {
+        Want::No
     };
     let walk = if mechanism.walks() && reap == Reap::None {
         Want::Yes
@@ -836,26 +827,14 @@ fn check_matrix(mechanisms: &[Mechanism]) {
                     };
                     let want = expected(mechanism, reap, op);
                     let wrong = mismatches(&want, &sent);
-                    let routed: Vec<_> = [want.killpg, want.by_pid]
-                        .into_iter()
-                        .filter_map(|w| match w {
-                            Want::Routed(issue) => Some(issue),
-                            _ => None,
-                        })
-                        .collect();
                     let verdict = if wrong.is_empty() {
                         "ok".to_owned()
                     } else {
                         failed += 1;
                         format!("WRONG: {}", wrong.join("; "))
                     };
-                    let routed = if routed.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (routed: {})", routed.join(", "))
-                    };
                     rows.push(format!(
-                        "{mechanism:?} | {reap:?} | {op:?} | {api:?} | {sent:?} | {verdict}{routed}"
+                        "{mechanism:?} | {reap:?} | {op:?} | {api:?} | {sent:?} | {verdict}"
                     ));
                 }
             }
@@ -873,7 +852,7 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 /// The process group, the tree walk, and on macOS both fd markers.
 ///
 /// Mutants: `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
-/// reused, (macOS, an fd marker) an own reap whose pid names nothing, or (macOS) a root that is
+/// reused or names nothing (a group), or (macOS) a root that is
 /// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
 /// without `anchor`.

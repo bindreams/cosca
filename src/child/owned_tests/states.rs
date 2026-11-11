@@ -874,12 +874,11 @@ fn the_state_is_an_own_reap_only_once_a_look_returns_the_record() {
 }
 
 /// A hold's group check reads the hold's own state: an unreaped root's pid names its group, a root
-/// reaped by someone else does not, and after this handle's own reap the pid names it only while no
-/// other process holds the number. The own-reaped root's peek table is empty, so a check that
-/// peeks panics.
+/// reaped by someone else or by this handle does not, whatever the pid reads. The own-reaped root's
+/// peek table is empty, so a check that peeks panics.
 ///
-/// Mutant: the check passes whatever the state, reads the OS instead of the hold, or treats an own
-/// reap as a reap elsewhere.
+/// Mutant: the check passes whatever the state, reads the OS instead of the hold, or passes an own
+/// reap whose pid names no process.
 #[cfg(unix)]
 #[skuld::test]
 fn a_hold_checks_the_roots_group_by_its_own_state() {
@@ -896,7 +895,8 @@ fn a_hold_checks_the_roots_group_by_its_own_state() {
     status(child.wait(None));
     {
         let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-        assert_eq!(child.hold(UNREAD_PID).check(), Ok(()));
+        let refused = child.hold(UNREAD_PID).check().expect_err("the pid names no process");
+        assert!(refused.contains("names no process"), "{refused}");
     }
     let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
     let refused = child.hold(UNREAD_PID).check().expect_err("the pid could not be read");

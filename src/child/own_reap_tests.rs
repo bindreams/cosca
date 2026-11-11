@@ -121,17 +121,22 @@ fn terminate_tree_holds_off_an_own_wait_until_its_sends_are_done() {
     );
 }
 
-/// The `SIGTERM` is the send the look decides; the sweep after the grace takes its own look.
+/// The `SIGTERM` is the send the look decides; the sweep after the grace takes its own look. The
+/// wait reaps the root once the `SIGTERM` is out, so the pid names no process and the call ends
+/// `Unassessable` (on Linux the pidfd group signal is refused, as below 6.9: with it the group is
+/// named exactly).
 #[skuld::test]
 fn graceful_shutdown_tree_holds_off_an_own_wait_until_its_sigterm_is_sent() {
     let termed = record_term_group();
     let _killed = record_kill_group();
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     own_wait_lands_after_the_sends(
         |child| {
-            child
+            let err = child
                 .graceful_shutdown_tree(std::time::Duration::ZERO)
-                .map(drop)
-                .unwrap_or_else(|e| panic!("shut the tree down: {e}"))
+                .expect_err("a reaped root's group is not signalled by its number");
+            assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
         },
         |hook| termed.on_send(hook),
     );

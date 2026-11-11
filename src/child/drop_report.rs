@@ -8,6 +8,11 @@ use crate::child::owned::teardown::{Remains, TeardownOutcome};
 use crate::containment::dispatch::RootView;
 use crate::containment::DropView;
 
+/// The remedy for descendants that outlive a root this handle has reaped, in a drop's warn and in a
+/// tree call's error.
+pub(crate) const END_THEM_BEFORE_WAIT: &str =
+    "call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)";
+
 /// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
 /// event reported from something new.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +114,7 @@ impl<'a> DropReport<'a> {
                 format!(
                     "the root is already reaped, so {this} does not {action}, whose number may now belong to an \
                  unrelated process. Descendants that outlived the reaped root are not torn down by {this}; \
-                 call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)"
+                 {END_THEM_BEFORE_WAIT}"
                 ),
             ));
         }
