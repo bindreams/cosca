@@ -29,7 +29,8 @@ use crate::os_process::{OpenFailure, OPEN_CONSEQUENCE};
 const OP_NAME: &str = "process open";
 
 /// [`open_verified_with`] with its failure as the error [`Process::open`](crate::Process::open)
-/// documents.
+/// documents. The tests' entry.
+#[cfg(test)]
 pub(crate) fn open_verified_error_with(
     kernel: &dyn Kernel,
     id: ProcessId,

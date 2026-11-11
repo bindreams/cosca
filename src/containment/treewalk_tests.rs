@@ -15,6 +15,29 @@ use std::collections::HashMap;
 const ROOT_PID: RawPid = 100;
 const ROOT_TOKEN: u64 = 1_000;
 
+/// The one reading of a send's answer, for a walk's members and the root alike. Mutants: a refusal
+/// is read as delivered or gone; an unverified send is read as delivered.
+#[skuld::test]
+fn a_sends_answer_is_one_outcome_whoever_sent() {
+    use super::KillOutcome;
+    use crate::signal::Sent;
+
+    assert!(matches!(KillOutcome::of(Ok(Sent::Delivered)), KillOutcome::Terminated));
+    assert!(matches!(KillOutcome::of(Ok(Sent::Gone)), KillOutcome::AlreadyGone));
+    assert!(matches!(
+        KillOutcome::of(Ok(Sent::Unverified)),
+        KillOutcome::NotAttempted(Error::Unassessable { .. })
+    ));
+    match KillOutcome::of(Err(Error::Io(std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied,
+    )))) {
+        KillOutcome::NotAttempted(Error::Io(refused)) => {
+            assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("a refusal is not attempted, with the OS's own error: {other:?}"),
+    }
+}
+
 fn id(pid: RawPid, token: u64) -> ProcessId {
     ProcessId::from_parts_for_test(pid, Key::for_test(token))
 }

@@ -179,3 +179,61 @@ fn drop_closes_the_childs_untaken_stdout() {
     assert_eq!(after, -1, "the drop must close the child's untaken stdout");
     teardown.assert_killed();
 }
+
+/// A `TreeWalk` child's `kill_tree` sends the root's kill through the child's own handle, with no
+/// second open of the root's identity: the walk's send, then the backstop's. The scripted handle
+/// answers both, and the live process behind it, which a send by identity would kill, runs on.
+/// Not macOS, where a `TreeWalk` root is an fd marker.
+///
+/// Mutant: the walk opens its root by identity (the handle is sent only the backstop's kill).
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
+    use crate::signal::{Sent, Sig};
+
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    let fake = child
+        .proc
+        .script_over(|f| f.signals([Ok(Sent::Delivered), Ok(Sent::Delivered)]));
+
+    child.kill_tree().expect("the handle took both kills");
+
+    assert_eq!(
+        fake.signal_calls(),
+        vec![Sig::Kill, Sig::Kill],
+        "the walk's, then the backstop's"
+    );
+    assert!(
+        child.try_wait().expect("look at the live process").is_none(),
+        "the real process was killed by its identity, not through the child's handle"
+    );
+}
+
+/// A `TreeWalk` child's `terminate_tree` sends the root's `SIGTERM` through the child's own handle.
+/// Mutant: the walk opens its root by identity (the handle is sent nothing).
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+fn a_tree_walk_terminate_tree_sends_the_roots_term_through_the_childs_handle() {
+    use crate::signal::{Sent, Sig};
+
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    let fake = child.proc.script_over(|f| f.signals([Ok(Sent::Delivered)]));
+
+    child.terminate_tree().expect("the handle took the SIGTERM");
+
+    assert_eq!(fake.signal_calls(), vec![Sig::Term]);
+    assert!(
+        child.try_wait().expect("look at the live process").is_none(),
+        "the real process was terminated by its identity, not through the child's handle"
+    );
+}
