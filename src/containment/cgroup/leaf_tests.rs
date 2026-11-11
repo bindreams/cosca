@@ -377,7 +377,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // reap the last member only once that thread's own `drain_blocking` signal proves it armed a
     // listener while the leaf still read populated — a real rendezvous, not a race against how
     // fast the kernel clears `populated` relative to `wait()` returning. A missed wake then hangs
-    // until the nextest bound on this test, not a duration this test invented.
+    // until the suite slow-timeout, not a duration this test invented.
     let (rendezvous_tx, rendezvous_rx) = mpsc::channel();
     let (result, parks, zero_remainings) = std::thread::scope(|scope| {
         let handle = scope.spawn(|| {

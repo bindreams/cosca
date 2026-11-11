@@ -135,7 +135,7 @@ async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns(
 /// The awaited teardown awaits its cgroup leaf's drain and never blocks the thread on it: a drain
 /// that is pending leaves the teardown pending. A fake leaf that no one empties holds the drain
 /// open. The rows fail only by hanging (a teardown that blocks on the drain never returns), so
-/// they are `death_watch_` rows, which nextest bounds.
+/// the suite slow-timeout bounds them.
 #[cfg(target_os = "linux")]
 mod leaf_drain {
     use std::task::Poll;

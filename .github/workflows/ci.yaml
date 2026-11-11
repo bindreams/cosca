@@ -191,8 +191,9 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }}
 
       # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
-      # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
-      # plus the suite's runtime, so a hang costs one step. On Unix the runner signals only the
+      # step bounded above the suite's per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
+      # plus the suite's runtime, so one hang costs one step. Several hangs can outlast the step;
+      # nextest's SLOW lines in the log still name each test that hung. On Unix the runner signals only the
       # step's top-level shell when the bound fires. A run step therefore `exec`s
       # .github/scripts/run-nextest.py (`matrix.nextest`), so the signal lands on forward.py's loop,
       # which relays it to the command's whole process group. The script also selects the step's own

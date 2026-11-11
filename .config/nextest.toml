@@ -93,7 +93,7 @@ inherits = "ci"
 [profile.ci-shell-execute]
 inherits = "ci"
 
-[[profile.ci.overrides]]
+[[profile.default.overrides]]
 # `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
 # `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
 # safety net on top of that in-process bound, for whatever it cannot cover: a wait this binary

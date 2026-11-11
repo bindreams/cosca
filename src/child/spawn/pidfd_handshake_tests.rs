@@ -89,8 +89,8 @@ fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
 
 // Normal spawns =====
 
-/// Mutant: a handshake that leaves the child held forever (the spawn hangs: bounded by the nextest
-/// override) or aborts it.
+/// Mutant: a handshake that leaves the child held forever (the spawn hangs: bounded by the suite
+/// slow-timeout) or aborts it.
 #[skuld::test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();
@@ -960,7 +960,7 @@ fn fixture_unreported_death_init() {
 /// where the scope waits for it.
 ///
 /// Mutant: the gate is opened only after the hook returns. This test then hangs, bounded by the
-/// nextest override; `the_verdict_hook_runs_under_a_guard_that_opens_the_hold` fails at once.
+/// suite slow-timeout; `the_verdict_hook_runs_under_a_guard_that_opens_the_hold` fails at once.
 #[skuld::test]
 #[should_panic(expected = "the verdict hook panicked on purpose")]
 fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
