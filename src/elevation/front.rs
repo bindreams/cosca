@@ -97,11 +97,12 @@ pub(crate) fn kill_gate(
     let Some(front) = front else {
         return Gate::Open;
     };
-    let unread = match running() {
+    let mut unread = Unread::new();
+    match running() {
         Ok(false) => return Gate::Exited,
-        Ok(true) => None,
-        Err(e) => Some(format!("whether it had exited could not be read: {e}")),
-    };
+        Ok(true) => {}
+        Err(e) => unread.push(("whether it had exited could not be read", e)),
+    }
     #[cfg(test)]
     seams::run_between_gate_reads();
     let placed = in_cgroup();
@@ -110,12 +111,51 @@ pub(crate) fn kill_gate(
     }
     match placed {
         Ok(true) => Gate::CgroupOnly(front),
-        Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, unread)),
+        Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, unread_reason(unread))),
         Err(e) => {
-            let why = format!("whether its cgroup kill reaches it could not be read: {e}");
-            let why = unread.map_or(why.clone(), |r| format!("{r}; {why}"));
-            Gate::Closed(refused(front, pid, Signal::Kill, Some(why)))
+            unread.push(("whether its cgroup kill reaches it could not be read", e));
+            Gate::Closed(refused(front, pid, Signal::Kill, unread_reason(unread)))
         }
+    }
+}
+
+/// Failed reads of a gate.
+type Unread = Vec<(&'static str, io::Error)>;
+
+/// A refusal's reason: its words and, if any, its cause.
+struct Reason {
+    words: String,
+    cause: Option<Box<Error>>,
+}
+
+impl Reason {
+    fn words(words: impl Into<String>) -> Reason {
+        Reason {
+            words: words.into(),
+            cause: None,
+        }
+    }
+}
+
+/// A single failed read becomes the refusal's cause; several go into its words, since a refusal
+/// has one `source`.
+fn unread_reason(mut unread: Unread) -> Option<Reason> {
+    match unread.len() {
+        0 => None,
+        1 => {
+            let (what, e) = unread.remove(0);
+            Some(Reason {
+                words: what.to_owned(),
+                cause: Some(Error::io_cause(e)),
+            })
+        }
+        _ => Some(Reason::words(
+            unread
+                .iter()
+                .map(|(what, e)| format!("{what}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
     }
 }
 
@@ -146,11 +186,11 @@ pub(crate) fn cgroup_kill_reached(
         }
         exited()
     };
-    let mut unread = Vec::new();
+    let mut unread = Unread::new();
     match exited() {
         Ok(true) => return Ok(()),
         Ok(false) => {}
-        Err(e) => unread.push(format!("whether it had exited could not be read: {e}")),
+        Err(e) => unread.push(("whether it had exited could not be read", e)),
     }
     #[cfg(test)]
     seams::run_between_reach_reads();
@@ -162,33 +202,37 @@ pub(crate) fn cgroup_kill_reached(
         Ok(true) => return Ok(()),
         Ok(false) => "it reads as having left the cgroup before its kill, which did not reach it".to_owned(),
         Err(e) => {
-            unread.push(format!("its cgroup could not be read: {e}"));
+            unread.push(("its cgroup could not be read", e));
             "nothing shows the cgroup kill reached it".to_owned()
         }
     };
-    let why = if unread.is_empty() {
-        why
-    } else {
-        format!("{why} ({})", unread.join("; "))
+    let reason = match unread_reason(unread) {
+        None => Reason::words(why),
+        Some(Reason { words, cause }) => Reason {
+            words: format!("{why} ({words})"),
+            cause,
+        },
     };
-    Err(refused(front, pid, Signal::Kill, Some(why)))
+    Err(refused(front, pid, Signal::Kill, Some(reason)))
 }
 
 /// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
 /// sent, since a kill of the front itself would orphan its elevated program.
 pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error {
-    cgroup_not_killed(front, pid, Some(&error.to_string()))
+    let reason = Reason {
+        words: "its cgroup kill failed".to_owned(),
+        cause: Some(Box::new(error)),
+    };
+    refused(front, pid, Signal::Kill, Some(reason))
 }
 
-/// The refusal of a kill of the front `pid` whose cgroup no kill reached: its kill failed with
-/// `failure`, or (`None`) none was made. Nothing else was sent, since a kill of the front itself
-/// would orphan its elevated program.
+/// A caller that holds the error uses [`cgroup_kill_failed`].
 pub(crate) fn cgroup_not_killed(front: Front, pid: u32, failure: Option<&str>) -> Error {
     let why = match failure {
         Some(failure) => format!("its cgroup kill failed: {failure}"),
         None => "its cgroup was not killed".to_owned(),
     };
-    refused(front, pid, Signal::Kill, Some(why))
+    refused(front, pid, Signal::Kill, Some(Reason::words(why)))
 }
 
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
@@ -204,7 +248,7 @@ pub(crate) fn terminate_gate(front: Option<Front>, pid: u32, running: impl FnOnc
             front,
             pid,
             Signal::Term,
-            Some(format!("whether it had exited could not be read: {e}")),
+            unread_reason(vec![("whether it had exited could not be read", e)]),
         )),
     }
 }
@@ -236,7 +280,7 @@ enum Signal {
     Term,
 }
 
-fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Error {
+fn refused(front: Front, pid: u32, signal: Signal, why: Option<Reason>) -> Error {
     let what = match signal {
         Signal::Kill => "no kill",
         Signal::Term => "no SIGTERM",
@@ -246,13 +290,15 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
     if matches!(signal, Signal::Kill) && !matches!(front, Front::Osascript) {
         detail.push_str(" Only a cgroup (Linux containment) that holds it reaches the program.");
     }
-    if let Some(why) = unread {
-        detail.push_str(&format!(" ({why})"));
+    let mut source = None;
+    if let Some(Reason { words, cause }) = why {
+        detail.push_str(&format!(" ({words})"));
+        source = cause;
     }
     Error::Elevation {
         kind: ElevationErrorKind::Unkillable,
         detail,
-        source: None,
+        source,
     }
 }
 

@@ -36,12 +36,12 @@ pub(crate) const SOCKET_NAME: &str = "s";
 pub(crate) enum BindError {
     #[error(transparent)]
     Dir(#[from] PrivateDirError),
-    #[error("cannot set up the shim channel in {}: {source}", dir.display())]
+    #[error("cannot set up the shim channel in {}", dir.display())]
     Io { dir: std::path::PathBuf, source: io::Error },
-    #[error("cannot set up the fork guard of the shim channel: {0}")]
-    ForkGuard(io::Error),
+    #[error("cannot set up the fork guard of the shim channel")]
+    ForkGuard(#[source] io::Error),
     #[error(
-        "the shim's socket is bound relative to its directory through /proc/thread-self/fd, so /proc must be mounted and usable here ({source}); TMPDIR is {}",
+        "the shim's socket is bound relative to its directory through /proc/thread-self/fd, so /proc must be mounted and usable here; TMPDIR is {}",
         tmpdir.display()
     )]
     ProcUnusable {
@@ -293,7 +293,7 @@ impl ShimLink {
                 report = crate::error::Report(&e)
             );
             std::mem::forget(self.acceptor.take());
-            debug_assert!(false, "writing the stop byte failed: {e}");
+            debug_assert!(false, "writing the stop byte failed: {}", crate::error::Report(&e));
             return;
         }
         if let Some(thread) = self.acceptor.take() {

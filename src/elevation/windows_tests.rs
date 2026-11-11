@@ -1064,6 +1064,45 @@ fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
     ));
 }
 
+#[skuld::test]
+fn a_failed_shell_execute_has_the_windows_error_as_its_cause() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{ERROR_DDE_FAIL, ERROR_FILE_NOT_FOUND};
+
+    use crate::child::spawn::SpawnFailure;
+    use crate::error::{ElevationErrorKind, Error};
+
+    for (code, inst_app) in [(ERROR_FILE_NOT_FOUND.0, 2), (ERROR_DDE_FAIL.0, 0)] {
+        let error = match super::shell_execute_failure(HRESULT::from_win32(code), inst_app) {
+            SpawnFailure::NotStarted(error) => error,
+            SpawnFailure::MayHaveStarted { cause, .. } => cause,
+        };
+        assert_eq!(error.raw_os_error(), Some(code as i32), "{error:?}");
+        match error {
+            Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail,
+                ..
+            } => assert_eq!(detail, "ShellExecuteEx(runas) failed"),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+}
+
+#[skuld::test]
+fn an_hresult_cause_keeps_its_hex_unless_it_is_a_win32_code() {
+    use crate::error::Report;
+    use windows::core::HRESULT;
+
+    let win32 = super::hresult_cause(HRESULT(0x8007_0005_u32 as i32));
+    assert_eq!(win32.raw_os_error(), Some(5));
+    assert!(!Report(&*win32).to_string().contains("HRESULT"), "{win32}");
+
+    let other = super::hresult_cause(HRESULT(0x8000_4005_u32 as i32));
+    let text = Report(&*other).to_string();
+    assert!(text.contains("HRESULT 0x80004005"), "{text}");
+}
+
 /// `untracked_outcome` is the arm of `launch_runas_with_host` that terminates a child whose identity
 /// could not be read; that arm needs a UAC prompt to reach, so the mapping is tested here.
 ///
@@ -1077,11 +1116,12 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     use crate::identity::Termination;
     use windows::core::{Error as WinError, HRESULT};
 
-    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Terminated);
+    let (detail, source, fate) = untracked_outcome(Ok(4242), Termination::Terminated);
     assert_eq!(fate, ChildFate::Killed);
+    assert!(source.is_none(), "{source:?}");
     assert!(detail.ends_with("it was terminated"), "{detail}");
 
-    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Exited);
+    let (detail, _, fate) = untracked_outcome(Ok(4242), Termination::Exited);
     assert_eq!(fate, ChildFate::Killed);
     assert!(
         detail.ends_with("it exited or is exiting, and its exit was not waited for"),
@@ -1089,19 +1129,20 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     );
 
     let refusal = WinError::from_hresult(HRESULT::from_win32(5));
-    let (detail, fate) = untracked_outcome(Ok(4242), Termination::Failed(refusal));
+    let (detail, source, fate) = untracked_outcome(Ok(4242), Termination::Failed(refusal));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(detail.contains("pid 4242"), "{detail}");
     assert!(detail.contains("identity could not be resolved"), "{detail}");
     assert!(
-        detail.contains("could not be terminated (") && detail.contains("it may still be running"),
+        detail.ends_with("and could not be terminated; it may still be running"),
         "{detail}"
     );
+    assert_eq!(source.expect("the refusal is the cause").raw_os_error(), Some(5));
 
     // A failed `GetProcessId` has no pid to show, and is not an identity failure.
     let no_pid = || Err(WinError::from_hresult(HRESULT::from_win32(6)));
     let refusal = WinError::from_hresult(HRESULT::from_win32(5));
-    let (detail, fate) = untracked_outcome(no_pid(), Termination::Failed(refusal));
+    let (detail, _, fate) = untracked_outcome(no_pid(), Termination::Failed(refusal));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(!detail.contains("pid 0"), "{detail}");
     assert!(
@@ -1113,10 +1154,11 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
         detail.contains("could not be terminated (") && detail.contains("it may still be running"),
         "{detail}"
     );
-    let (detail, fate) = untracked_outcome(no_pid(), Termination::Terminated);
+    let (detail, source, fate) = untracked_outcome(no_pid(), Termination::Terminated);
     assert_eq!(fate, ChildFate::Killed);
-    assert!(detail.contains("pid could not be read ("), "{detail}");
+    assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(detail.ends_with("it was terminated"), "{detail}");
+    assert_eq!(source.expect("the failed read is the cause").raw_os_error(), Some(6));
 }
 
 /// A spawn that finds the parent already elevated gives its child the `AlreadyElevated` report and

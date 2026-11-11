@@ -452,8 +452,14 @@ fn a_proc_whose_descriptor_names_another_directory_is_refused() {
         panic!("a /proc that names another directory must refuse the bind");
     };
     assert!(
-        error.to_string().contains("is not this process's descriptor"),
+        crate::error::Report(&error)
+            .to_string()
+            .contains("is not this process's descriptor"),
         "{error}"
+    );
+    assert!(
+        !error.to_string().contains("is not this process's descriptor"),
+        "the cause is in the text: {error}"
     );
     assert_eq!(
         std::fs::read_dir(&decoy).unwrap().count(),
@@ -497,6 +503,34 @@ fn the_socket_is_removed_through_the_directory_descriptor() {
         "the socket under its new name is removed"
     );
     assert_eq!(shim.read_byte(), Some(b'A'));
+}
+
+#[skuld::test]
+fn a_bind_error_has_its_cause_as_its_source() {
+    use super::super::link::BindError;
+    let os = || std::io::Error::from_raw_os_error(libc::ENOMEM);
+    let errors = [
+        BindError::Io {
+            dir: "/tmp/cosca-x".into(),
+            source: os(),
+        },
+        BindError::ForkGuard(os()),
+        BindError::ProcUnusable {
+            tmpdir: "/tmp".into(),
+            source: os(),
+        },
+    ];
+    for error in errors {
+        assert_eq!(
+            crate::elevation::shim::fixtures::os_code(&error),
+            Some(libc::ENOMEM),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains(&os().to_string()),
+            "the cause is in the text: {error}"
+        );
+    }
 }
 
 /// Running out of descriptors while opening through `/proc` is an I/O error, not a verdict on `/proc`.

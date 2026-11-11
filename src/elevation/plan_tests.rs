@@ -309,18 +309,26 @@ fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
         false,
         true,
     );
+    let refusal = std::io::Error::from_raw_os_error(40);
+    let text = refusal.to_string();
     h.pkexec_version = crate::elevation::pkexec::PkexecVersion::Unresolved {
         path: "/opt/bin/pkexec".into(),
-        error: "Too many levels of symbolic links (os error 40)".into(),
+        error: crate::error::IoFailure::of(&refusal),
     };
-    match reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui)) {
+    let error = reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui));
+    assert_eq!(
+        error.raw_os_error(),
+        Some(40),
+        "the failed resolution is the cause: {error:?}"
+    );
+    match error {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail,
             ..
         } => {
             assert!(detail.contains("/opt/bin/pkexec"), "{detail}");
-            assert!(detail.contains("Too many levels of symbolic links"), "{detail}");
+            assert!(!detail.contains(&text), "the cause is in the text: {detail}");
             assert!(!detail.contains("not on PATH"), "{detail}");
         }
         other => panic!("expected BackendUnavailable, got {other:?}"),
