@@ -425,9 +425,17 @@ fn combine(
                 "GetProcessTimes failed on an opened handle for pid {pid}: {report}",
                 report = crate::error::Report(&e)
             );
-            let cause = sequence
-                .err()
-                .map_or_else(UnknownCause::default, UnknownCause::of_sequence_status);
+            let cause = match sequence {
+                Ok(_) => UnknownCause::default(),
+                Err(status) => {
+                    log::debug!(
+                        "NtQueryInformationProcess(ProcessSequenceNumber) failed on an opened handle for pid {pid}: \
+                         NTSTATUS {:#010x}",
+                        status.0 as u32
+                    );
+                    UnknownCause::of_sequence_status(status)
+                }
+            };
             (Resolved::Unknown, cause)
         }
     }

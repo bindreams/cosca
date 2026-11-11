@@ -644,7 +644,7 @@ fn cause_text(cause: crate::identity::UnknownCause) -> Option<String> {
 }
 
 /// `ERROR_BAD_LENGTH`, the Win32 code of `REFUSED` (`STATUS_INFO_LENGTH_MISMATCH`).
-const REFUSED_CODE: i32 = 24;
+const REFUSED_CODE: i32 = windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32;
 
 /// The Win32 code a read's cause carries as its source.
 fn cause_code(cause: crate::identity::UnknownCause) -> Option<i32> {

@@ -264,10 +264,10 @@ pub(crate) fn classify_spawn_denial(
     if !flags.breakaway_from_job {
         return err;
     }
-    // Never assert a cause the process just measured to be false, or could not measure at all.
     let Error::Io(io) = err else {
         return err;
     };
+    // Never assert a cause the process just measured to be false, or could not measure at all.
     if io.raw_os_error() != Some(ERROR_ACCESS_DENIED.0 as i32) || job != JobBreakaway::Forbidden {
         return Error::Io(io);
     }

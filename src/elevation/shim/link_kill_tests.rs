@@ -110,7 +110,7 @@ fn an_unexpected_send_errno_is_an_io_error() {
                 "sending to the shim",
                 "the cause is the source, not the text"
             );
-            assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::EIO));
+            assert_eq!(crate::error::first_os_code(&e), Some(libc::EIO));
         }
         other => panic!("expected an I/O error, got {other:?}"),
     }

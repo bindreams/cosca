@@ -21,10 +21,3 @@ pub(crate) fn shim_args(program: &[u8], rest: &[&[u8]]) -> ShimArgs {
         args: rest.iter().map(|a| OsString::from_vec(a.to_vec())).collect(),
     }
 }
-
-/// The first OS code down `error`'s `source()` chain.
-pub(crate) fn os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    crate::error::chain(error)
-        .filter_map(|layer| layer.downcast_ref::<std::io::Error>())
-        .find_map(std::io::Error::raw_os_error)
-}

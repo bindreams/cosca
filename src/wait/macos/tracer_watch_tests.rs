@@ -249,8 +249,7 @@ fn a_refused_read_of_a_tracer_is_an_error() {
     let _links = force_links([Link::Refused(libc::EPERM)]);
     let err = identity_error(watch.held_by(&kq, u32::MAX - 1));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-    let err = crate::error::Error::Io(err);
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");
 }
 
 /// A refused `kinfo_proc` read of a tracer is an error.
@@ -277,6 +276,5 @@ fn a_refused_re_read_after_the_registration_is_an_error() {
     let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Link, UniqRead::Refused(libc::EPERM));
     let err = identity_error(watch.held_by(&kq, tracer.pid()));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-    let err = crate::error::Error::Io(err);
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");
 }

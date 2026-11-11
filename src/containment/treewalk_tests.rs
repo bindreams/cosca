@@ -165,8 +165,34 @@ fn complete_members_names_every_unassessed_candidate_with_its_cause() {
     let said = error.to_string();
     assert!(said.contains(&format!("cause of {first}")), "{said}");
     for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        assert!(said.contains(&format!("pid {other} (cause of {other})")), "{said}");
+        assert!(
+            said.contains(&format!("pid {other} (")) && said.contains(&format!("cause of {other})")),
+            "{said}"
+        );
     }
+}
+
+/// The note on `complete_members` carries each other candidate's whole chain, its OS error included.
+/// Mutant: the note keeps only the candidate's `detail`.
+#[skuld::test]
+fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
+    let parents = [(200, ROOT_PID), (300, ROOT_PID)];
+    let os_error = |pid: RawPid| std::io::Error::from_raw_os_error(if pid == 200 { 2 } else { 3 });
+    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
+        Err(Error::Unassessable {
+            detail: format!("cause of {pid}"),
+            source: Some(Error::io_cause(os_error(pid))),
+        })
+    });
+    let first = got.unassessed[0].0;
+    let other = if first == 200 { 300 } else { 200 };
+    let error = got.complete_members().expect_err("two candidates were not assessed");
+    let said = error.to_string();
+    let os_text = os_error(other).to_string();
+    assert!(
+        said.contains(&format!("pid {other} (")) && said.contains(&os_text),
+        "{said}"
+    );
 }
 
 /// A snapshot that lists the unreadable pid twice reads it once and counts it once.
@@ -401,7 +427,10 @@ fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_window
     };
     assert_eq!(detail, "pid 7 exists but its creator process id query failed");
     // `STATUS_INFO_LENGTH_MISMATCH` as its Win32 code, `ERROR_BAD_LENGTH`.
-    assert_eq!(error.raw_os_error(), Some(24));
+    assert_eq!(
+        error.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32)
+    );
 }
 
 /// The Windows wiring of the walk to the creator read, through `walk_from` with real

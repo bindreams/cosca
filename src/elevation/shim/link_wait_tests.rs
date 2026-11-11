@@ -263,7 +263,7 @@ fn a_local_poll_error_in_wait_settles_nothing() {
                 "waiting for the shim",
                 "the cause is the source, not the text"
             );
-            assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::ENOMEM));
+            assert_eq!(crate::error::first_os_code(&e), Some(libc::ENOMEM));
         }
         other => panic!("expected a poll error, got {other:?}"),
     }
