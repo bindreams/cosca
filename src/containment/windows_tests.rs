@@ -1,42 +1,28 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
+use std::os::windows::io::AsRawHandle;
+
 use crate::test_child::Console;
 
 #[skuld::test]
 fn job_handle_debug_does_not_panic() {
-    // Verify the Debug impl compiles and runs cleanly for a consumed (raw == null) handle.
-    // `port` is never a legal null, so there is no struct-literal shortcut to that state: go
-    // through the real constructor (`create_empty_for_test`) and a real consuming path
-    // (`hard_kill`, which both nulls `raw` and closes the underlying job handle — unlike a bare
-    // `take`, it doesn't leak the real handle this constructor opened) instead of hand-building
-    // a `JobHandle`.
     use super::JobHandle;
     let h = JobHandle::create_empty_for_test();
-    h.hard_kill().expect("hard_kill on a live job");
     let s = format!("{h:?}");
     assert!(s.contains("JobHandle"), "debug output: {s}");
 }
 
-/// A `wait_drained` call against an already-consumed job handle must report `Unassessable`,
-/// never a guessed `AllMembersExited` — the handle is gone, so nothing here re-checked whether
-/// every member actually finished exiting (`TerminateJobObject`/`CloseHandle` are not
-/// documented as synchronous with member process teardown).
+/// `wait_drained` after `hard_kill` asks the kernel and reports the drain once the killed member
+/// has exited.
 #[skuld::test]
-fn wait_drained_on_a_consumed_handle_is_unassessable() {
-    use super::JobHandle;
-    let h = JobHandle::create_empty_for_test();
-    h.hard_kill().expect("hard_kill on a live job");
-    let err = h
-        .wait_drained(None, None)
-        .expect_err("a consumed job handle must not report a live drain verdict");
-    let crate::error::Error::Unassessable { source, .. } = err else {
-        panic!("expected Unassessable, got {err:?}");
-    };
-    assert!(
-        source.is_none(),
-        "nothing was asked of the OS on this path — no source is expected"
-    );
+fn wait_drained_after_hard_kill_reports_the_drain() {
+    let (mut child, job) = spawn_job_member();
+    job.hard_kill().expect("hard_kill on a live job");
+    let verdict = job.wait_drained(None, None).expect("wait_drained after hard_kill");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    let status = child.wait().expect("reap the killed member");
+    assert!(!status.success(), "the member was killed: {status:?}");
 }
 
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
@@ -46,8 +32,7 @@ fn wait_drained_on_a_consumed_handle_is_unassessable() {
 fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
-    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    let pids = super::query_job_pid_list(job.raw).expect("query pid list");
     assert!(pids.is_empty(), "an empty job must report no members: {pids:?}");
 }
 
@@ -57,7 +42,7 @@ fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
 fn wait_drained_raw_reports_drained_for_an_empty_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let job_handle = job.handle();
     let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
@@ -86,9 +71,9 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     let raw = child.as_raw_handle();
 
     let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let job_handle = job.handle();
 
-    let pids = super::query_job_pid_list(job_handle).expect("query pid list");
+    let pids = super::query_job_pid_list(job.raw).expect("query pid list");
     assert_eq!(
         pids,
         vec![child.id()],
@@ -115,18 +100,22 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 // Deadline contract for `wait_drained_raw`: never report `MembersRemain` before the real
 // deadline. Seams are documented in `crate::wait`.
 
-/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
-/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
-fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
-    use std::os::windows::io::AsRawHandle;
-    let child = crate::test_spawn::spawn(
+/// `cmd /C more`, blocked reading its own piped stdin until EOF.
+fn spawn_blocker() -> std::process::Child {
+    crate::test_spawn::spawn(
         std::process::Command::new("cmd")
             .args(["/C", "more"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .expect("spawn cmd /C more");
+    .expect("spawn cmd /C more")
+}
+
+/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
+/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
+fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
+    let child = spawn_blocker();
     let raw = child.as_raw_handle();
     let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
     (child, job)
@@ -146,7 +135,7 @@ fn let_member_exit(mut child: std::process::Child) {
 fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     use std::time::{Duration, Instant};
     let (child, job) = spawn_job_member();
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let job_handle = job.handle();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
     crate::wait::wait_ms_probe::take();
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
@@ -179,7 +168,7 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     use std::time::{Duration, Instant};
     let (mut child, job) = spawn_job_member();
     let stdin = child.stdin.take().expect("piped stdin");
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let job_handle = job.handle();
     crate::wait::wait_ms_probe::take();
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> member exits for real
@@ -203,7 +192,7 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     use std::time::{Duration, Instant};
     let (mut child, job) = spawn_job_member();
     let stdin = child.stdin.take().expect("piped stdin");
-    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let job_handle = job.handle();
     crate::wait::wait_ms_probe::take();
     let _clamp = crate::wait::wait_clamp_seam::set(5);
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
@@ -270,21 +259,6 @@ fn invalid_handle_with_a_console_attached_stays_io() {
     // The probe contradicts the code: never claim a cause we just measured to be false.
     let e = super::classify_ctrl_event_failure(1, io_err(ERROR_INVALID_HANDLE), Ok(true));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
-}
-
-/// A Win32 failure inside the containment layer reaches the caller as its plain Win32 code, so
-/// `kind()` and `raw_os_error()` classify it. A null handle is a real `ERROR_INVALID_HANDLE`.
-///
-/// Mutant: `duplicate_job` converts with the `windows` crate's own `io::Error` conversion, which
-/// keeps the HRESULT (`0x80070006`).
-#[skuld::test]
-fn duplicate_job_failure_carries_the_win32_code() {
-    let err = super::duplicate_job(windows::Win32::Foundation::HANDLE::default())
-        .expect_err("duplicating a null handle must fail");
-    let crate::error::Error::Io(err) = err else {
-        panic!("expected Error::Io, got {err:?}");
-    };
-    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
 /// The error `GenerateConsoleCtrlEvent` returns when the caller has no console: what the `windows`
@@ -1374,10 +1348,18 @@ fn disarm_of_an_empty_job_is_ok() {
         .expect("a job made by the crate can be disarmed");
 }
 
-/// A `disarm` after the handle was consumed is `Ok` and does nothing: there is nothing to refuse.
+/// A `disarm` after `hard_kill` clears `KILL_ON_JOB_CLOSE`: the flag the real create path sets.
+///
+/// Mutant: `disarm` does nothing.
 #[skuld::test]
-fn disarm_of_a_consumed_job_is_ok() {
-    let job = super::JobHandle::create_empty_for_test();
+fn disarm_after_hard_kill_clears_the_flag() {
+    let (child, job) = spawn_job_member();
+    assert!(
+        super::job_kills_on_close(&job),
+        "the create path sets KILL_ON_JOB_CLOSE"
+    );
     job.hard_kill().expect("hard_kill on a live job");
-    job.disarm().expect("a consumed handle has nothing to disarm");
+    job.disarm().expect("disarm after hard_kill");
+    assert_eq!(crate::test_frozen::limit_flags(&job).0, 0);
+    let_member_exit(child);
 }

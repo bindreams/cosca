@@ -481,9 +481,10 @@ impl CgroupLeaf {
 
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
     ///
-    /// `Ok` means the tree is dead: either the atomic kill fired, or the leaf was already gone
-    /// ([`removed_after_drain`]), which is itself proof every member had exited — `rmdir` on a
-    /// cgroup v2 leaf succeeds only once `populated` reads 0.
+    /// `Ok` means the kill was delivered, not that the members have exited yet (see
+    /// [`wait_drained`](CgroupLeaf::wait_drained)): either the atomic kill fired, or the leaf was
+    /// already gone ([`removed_after_drain`]), which is itself proof every member had exited —
+    /// `rmdir` on a cgroup v2 leaf succeeds only once `populated` reads 0.
     ///
     /// Every other errno means the atomic kill did NOT happen — the tree may still be running
     /// (a delegated subtree whose `cgroup.kill` stopped being writable after a privilege drop,

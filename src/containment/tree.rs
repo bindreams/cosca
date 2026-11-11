@@ -362,7 +362,7 @@ impl Tree {
     }
 
     /// Whether this tree's Job Object kills its members when its last handle closes. `false` for any
-    /// other tree. Panics, naming the cause, when the query fails or the job handle is closed.
+    /// other tree. Panics, naming the cause, when the query fails.
     pub(crate) fn job_kills_on_close_for_test(&self) -> bool {
         match self.job_for_test() {
             Some(job) => crate::containment::windows::job_kills_on_close(job),
