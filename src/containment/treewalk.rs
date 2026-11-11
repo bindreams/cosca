@@ -119,6 +119,17 @@ impl Contains for Walker {
         kill_tree(self.root, root)
     }
 
+    /// Kills again the members an earlier kill left ([`with_earlier`]), and holds the ones this one
+    /// leaves.
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        let merged = with_earlier(&crate::identity::HostKernel, left, result);
+        let left_now = match &merged {
+            Ok(()) => Vec::new(),
+            Err(left) => Left::of(left),
+        };
+        (merged, left_now)
+    }
+
     fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
         terminate_tree(self.root, root)
     }
@@ -155,8 +166,13 @@ impl Contains for Walker {
     }
 
     #[cfg(unix)]
-    fn release(self) -> Release {
-        Release::nothing()
+    fn release(self) -> (Release, Option<Walker>) {
+        (Release::nothing(), Some(self))
+    }
+
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
+        None
     }
 }
 

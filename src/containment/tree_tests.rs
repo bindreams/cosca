@@ -43,6 +43,28 @@ fn a_tree_reports_the_containment_of_what_holds_it() {
     }
 }
 
+/// Only a cgroup leaf has awaitable release steps: the awaited teardown asks every mechanism the same
+/// question and takes the steps of the one that answers.
+///
+/// Mutant: a mechanism other than the leaf answers `Some`; the leaf answers `None`.
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+#[skuld::test]
+fn only_a_cgroup_leaf_has_awaitable_release_steps() {
+    use crate::containment::mechanism::Contains;
+    use crate::containment::unix::Group;
+    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
+    let others = [
+        Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())),
+        Mechanism::Group(Group::process_group(1)),
+        Mechanism::Fake(fake),
+    ];
+    for other in &others {
+        assert!(other.awaitable_release().is_none(), "{other:?}");
+    }
+    let leaf = Mechanism::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test());
+    assert!(leaf.awaitable_release().is_some());
+}
+
 /// A tree is driven only through what a mechanism answers: its kind, its sends, its drain edge, its
 /// reach and its release are the fake's stated ones, and the fake is sent every call the tree makes.
 ///
@@ -144,37 +166,115 @@ fn a_released_tree_keeps_what_its_kills_settled() {
 }
 
 /// A tree released still is what it was: it reports its containment, and a settle after the release
-/// is a walk's when the tree was a walk's (its held members and its root left are the walk's own).
+/// is the real settle of the tree: a walk's still re-kills the members it holds.
 ///
-/// Mutant: `release` leaves a tree that reports `None` and settles as a tree that is not a walk's.
+/// Mutant: `release` leaves a tree that reports `None`, or one a walk's settle no longer reaches.
 #[cfg(unix)]
 #[skuld::test]
 fn a_released_tree_keeps_its_kind() {
     use crate::containment::dispatch::Unkilled;
+    use crate::containment::unix::Group;
 
-    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
-    let mut group = Tree::contained(Mechanism::Fake(fake));
-    group.release().wait();
-    assert_eq!(group.containment(), Containment::ProcessGroup);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let trees = [
+        (
+            Tree::contained(Mechanism::Group(Group::process_group(1))),
+            Containment::ProcessGroup,
+        ),
+        (Tree::contained(Mechanism::Fake(fake)), Containment::Session),
+    ];
+    for (mut tree, kind) in trees {
+        tree.release().wait();
+        assert_eq!(tree.containment(), kind);
+        tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+            .expect("a kill that left nothing");
+    }
 
     let mut walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    let left_running = || {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![Error::MemberNotKilled {
+                pid: 8,
+                source: Box::new(Error::Unassessable {
+                    detail: "its identity could not be read".into(),
+                    source: None,
+                }),
+                note: None,
+            }],
+            root: None,
+            resolved: Vec::new(),
+        }))
+    };
+    walk.settle(left_running(), true).expect_err("a member is running");
     walk.release().wait();
     assert_eq!(walk.containment(), Containment::TreeWalk);
-    // Only a walk leaves the root: a settle that is not a walk's asserts against it.
-    let root_left = TreeKillOutcome::Ran(Err(Unkilled {
-        members: Vec::new(),
-        root: Some(Error::MemberNotKilled {
-            pid: 1,
-            source: Box::new(Error::Unassessable {
-                detail: "its identity could not be read".into(),
-                source: None,
-            }),
-            note: None,
-        }),
-        resolved: Vec::new(),
-    }));
-    walk.settle(root_left, true)
-        .expect("a root the walk left is not left once it has ended");
+    walk.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .expect_err("the walk still holds the member it left running");
+}
+
+/// A tree released is not one to act or wait on, whether its release consumed the mechanism or gave it
+/// back: no tree teardown is actionable and there is no drain edge.
+///
+/// Mutant: a tree whose release gave its mechanism back answers `Ok` to `require_contained` or
+/// `Some` to `drain_edge`.
+#[cfg(unix)]
+#[skuld::test]
+fn a_released_tree_is_not_actionable_and_has_no_drain_edge() {
+    use crate::containment::unix::Group;
+
+    let trees = [
+        Tree::contained(Mechanism::Group(Group::process_group(1))),
+        Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current()))),
+    ];
+    for mut tree in trees {
+        tree.release().wait();
+        let err = tree.require_contained().expect_err("a released tree is not actionable");
+        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+        assert!(tree.drain_edge().is_none());
+    }
+}
+
+/// A send on a released tree whose mechanism the release gave back asserts in debug, as one on a tree
+/// that holds none does.
+///
+/// Mutant: a tree that kept its mechanism through a release sends to it without the assertion.
+#[cfg(all(unix, debug_assertions))]
+#[skuld::test]
+fn a_send_on_a_released_tree_that_kept_its_mechanism_asserts() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::containment::unix::Group;
+
+    let mut tree = Tree::contained(Mechanism::Group(Group::process_group(1)));
+    tree.release().wait();
+    let asserts = |send: &dyn Fn()| catch_unwind(AssertUnwindSafe(send)).is_err();
+    assert!(asserts(&|| _ = tree.kill(None)), "kill did not assert");
+    assert!(asserts(&|| _ = tree.terminate(1, None)), "terminate did not assert");
+    assert!(asserts(&|| _ = tree.would_reach(1, None)), "would_reach did not assert");
+    assert!(asserts(&|| _ = tree.disarm()), "disarm did not assert");
+}
+
+/// A cgroup leaf's release consumes it: the tree still reports a cgroup, a settle still answers, and
+/// the awaited steps of the release have nothing left to take.
+///
+/// Mutant: a released leaf's tree reports `None`, or `await_release_steps` reaches a leaf the release
+/// owns.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_released_cgroup_leaf_leaves_a_tree_that_still_reports_and_settles() {
+    let leaf = crate::containment::cgroup::CgroupLeaf::placeholder_for_test();
+    let mut tree = Tree::contained(Mechanism::Cgroup(leaf));
+
+    tree.release().wait();
+
+    assert_eq!(tree.containment(), Containment::CgroupV2);
+    tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .expect("a kill that left nothing");
+    #[cfg(feature = "tokio")]
+    ::tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(tree.await_release_steps(1));
 }
 
 /// A child over a mechanism of stated answers: what it reports and what its tree calls do come from

@@ -109,7 +109,7 @@ impl Child {
         // bounds. The awaited steps are taken here, and the leaf then drops with the handle in place,
         // which finds nothing left to wait for. Every other mechanism drops with the handle.
         #[cfg(target_os = "linux")]
-        self.tree.step_leaf_and_await_drain(self.pid()).await;
+        self.tree.await_release_steps(self.pid()).await;
         remains
     }
 

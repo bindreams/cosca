@@ -1,6 +1,6 @@
 //! Per-OS containment dispatch (two-phase: prepare before spawn, attach after).
 
-use crate::containment::mechanism::Mechanism;
+use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::{ContainMode, ContainRequest, Nesting, Skip, Tree};
 use crate::error::Error;
 #[cfg(unix)]
@@ -825,12 +825,13 @@ impl SweepFailure {
 }
 
 impl TreeKilled {
-    /// What a tree kill's `outcome` comes to once the root's own handle has had its say: the one place
-    /// that decides what a walk left behind, and the only one that writes the state. `walk`: the tree
-    /// is a tree walk's. `root_ended`: the
-    /// root is not running (killed, or already dead), so a root the walk left is not left. The answer
-    /// is `Ok` when nothing is left. Otherwise it is the first member left, and the others as data: it
-    /// reports none of them.
+    /// What a tree kill's `outcome` comes to once the root's own handle has had its say: the only place
+    /// that writes the state. The mechanism decides what a kill left held
+    /// ([`Contains::kill_left`](crate::containment::Contains::kill_left)); the settlement records it.
+    /// `mechanism`: what names the tree, `None` for a tree that is none or delegated, which holds
+    /// nothing. `root_ended`: the root is not running (killed, or already dead), so a root the walk
+    /// left is not left. `Ok` when nothing is left, else the first member left as the error, the rest
+    /// as its data.
     ///
     /// It decides under the one lock of the state, by it and the outcome, and leaves the state
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever
@@ -843,14 +844,14 @@ impl TreeKilled {
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
     pub(crate) fn settle(
         &self,
-        walk: bool,
+        mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<SettleOutcome, Unsettled> {
         let outcome = outcome.into();
         let mut state = self.lock();
         let was_killed = matches!(*state, TreeState::Killed);
-        // The state is read here and written once, at the end, so an unwind leaves it as it was.
+        // Copied, not taken: the state is written once, at the end, so an unwind between leaves it as it was.
         let held = match &*state {
             TreeState::Left(held) => held.clone(),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
@@ -861,14 +862,11 @@ impl TreeKilled {
         let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot | TreeKillOutcome::Unwalked(_));
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && !matches!(*state, TreeState::Never);
-        let mut result = if covered { Ok(()) } else { outcome.into_result() };
-        let mut left_now = Vec::new();
-        if walk {
-            result = crate::containment::treewalk::with_earlier(&crate::identity::HostKernel, held, result);
-            if let Err(left) = &result {
-                left_now = crate::containment::treewalk::Left::of(left);
-            }
-        }
+        let result = if covered { Ok(()) } else { outcome.into_result() };
+        let (mut result, left_now) = match mechanism {
+            Some(mechanism) => mechanism.kill_left(result, held),
+            None => crate::containment::mechanism::nothing_held(result),
+        };
         // A member the walk saw running un-vouches the tree, whatever ended it afterwards: it may have
         // forked first. Only the answer follows the root's end.
         let running = result.is_err() && !looked_for_no_member;
@@ -891,10 +889,7 @@ impl TreeKilled {
         }
         let unsettled = match result {
             Ok(()) => Ok(()),
-            Err(left) => {
-                debug_assert!(left.root.is_none() || walk, "only a tree walk leaves the root alone");
-                left.unsettled(root_ended)
-            }
+            Err(left) => left.unsettled(root_ended),
         };
         // The answer follows the state left: `Killed` only over a vouched tree. A gone root answers
         // `Ok` only over a killed tree.
@@ -915,11 +910,11 @@ impl TreeKilled {
     pub(crate) fn settle_for_kill_tree(
         &self,
         caller: &str,
-        walk: bool,
+        mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<(), Error> {
-        self.settle(walk, outcome, root_ended)
+        self.settle(mechanism, outcome, root_ended)
             .map(drop)
             .map_err(|left| left.report(caller))
     }
@@ -930,13 +925,13 @@ impl TreeKilled {
     pub(crate) fn unless_unwalked(
         &self,
         caller: &str,
-        walk: bool,
+        mechanism: Option<&Mechanism>,
         outcome: TreeKillOutcome,
     ) -> Result<TreeKillOutcome, SweepFailure> {
         if !matches!(outcome, TreeKillOutcome::Unwalked(_)) {
             return Ok(outcome);
         }
-        match self.settle_for_kill_tree(caller, walk, outcome, false) {
+        match self.settle_for_kill_tree(caller, mechanism, outcome, false) {
             Err(error) => Err(SweepFailure::from(error)),
             // The walk's error is a member left, and the root is not ended.
             Ok(()) => unreachable!("a walk not made leaves its error"),
@@ -947,7 +942,7 @@ impl TreeKilled {
     /// here and only when it will be logged.
     pub(crate) fn settle_for_drop(
         &self,
-        walk: bool,
+        mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Option<String> {
@@ -960,7 +955,7 @@ impl TreeKilled {
             | TreeKillOutcome::NoRoot
             | TreeKillOutcome::Skipped(_) => "",
         };
-        let left = match self.settle(walk, outcome, root_ended) {
+        let left = match self.settle(mechanism, outcome, root_ended) {
             Err(left) => left.log_text(),
             Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
