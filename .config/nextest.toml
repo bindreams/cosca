@@ -95,19 +95,15 @@ inherits = "ci"
 
 [[profile.default.overrides]]
 # `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
-# `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
-# safety net on top of that in-process bound, for whatever it cannot cover: a wait this binary
-# cannot cancel, or a kill that itself does not land.
+# `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s).
 #
 # The per-test worst case, not the single-wait bound, is what this has to clear:
 # `does_create_process_with_logon_elevate` calls `logon_one_account` once per scratch account (an
 # administrator, then a standard user), and each call makes its own `CHILD_EXIT_BOUND_MS` (120s)
 # `wait_for` call in sequence — two 120s waits back to back, 240s, before any of the account-creation
 # and token-query overhead around them (`net user`, `icacls`, `LogonUser`/`CreateProcessWithLogonW`,
-# `describe`'s token queries) is even counted. 300s (5 * 60s) left only 60s of headroom over that
-# 240s floor for overhead this code does not bound, so it is raised here to 600s (10 * 60s) — the
-# same roughly 2.5x margin the original 300s kept over a single 120s wait, applied to the 240s floor
-# instead of the 120s one. One hang here fails one test instead of the whole job.
+# `describe`'s token queries) is even counted. That exceeds the suite's
+# 300s, so this binary gets 600s.
 filter = 'binary(windows_elevation_routes)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 

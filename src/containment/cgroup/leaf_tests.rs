@@ -1112,7 +1112,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
 /// An armed `Drop` after a `cgroup.kill` that failed does not write it again: the failure is final,
 /// the leaf is left behind and the failed kill is warned once. The fault fails only the first
 /// write, so a second would be recorded as a kill (and would drain the leaf, so the drop would wait
-/// for it, with nothing to end the wait: `death_watch_` bounds it).
+/// for it, with nothing to end the wait: the suite slow-timeout bounds it).
 ///
 /// Mutant: the armed `Drop` writes `cgroup.kill` again after a failed write.
 #[cfg(target_os = "linux")]
