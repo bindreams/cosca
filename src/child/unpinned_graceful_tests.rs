@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
-    assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity, assert_tree_refused,
-    group_blocker, orphan, session_tree, walked_blocker, Untrusted, BOTH,
+    assert_descendant_dies, assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity,
+    assert_tree_refused, group_blocker, orphan, session_tree, walked_blocker, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::log_capture::warns_since;
@@ -214,7 +214,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
         let _holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (mut child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant, gone) = session_tree();
         let sends = Capture::start();
         let pid = child.pid();
         let mark = crate::log_capture::mark();
@@ -255,6 +255,7 @@ fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only(
         assert_eq!(signalled, want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
         assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
+        assert_descendant_dies(gone);
         drop(writer);
     }
 }

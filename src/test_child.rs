@@ -1496,13 +1496,19 @@ pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
     .expect("spawn")
 }
 
-/// `more.com` by its `System32` path (no `PATH` lookup): blocks reading stdin and exits 0 on EOF,
+/// `name` by its `System32` path (no `PATH` lookup).
+#[cfg(windows)]
+pub(crate) fn system32(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
+        .join("System32")
+        .join(name)
+}
+
+/// `more.com` by its `System32` path: blocks reading stdin and exits 0 on EOF,
 /// unlike `findstr x`, whose exit 1 is indistinguishable from a kill.
 #[cfg(windows)]
 pub(crate) fn windows_more() -> std::path::PathBuf {
-    std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
-        .join("System32")
-        .join("more.com")
+    system32("more.com")
 }
 
 /// A contained [`windows_more`] child blocked on a piped stdin the caller holds. It ends only by a
