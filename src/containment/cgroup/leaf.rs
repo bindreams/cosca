@@ -808,7 +808,7 @@ impl CgroupLeaf {
         Err(if failed.is_empty() {
             crate::error::Error::Unassessable { detail, source: None }
         } else {
-            crate::error::Error::Containment { detail }
+            crate::error::Error::Containment { detail, source: None }
         })
     }
 

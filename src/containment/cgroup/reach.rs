@@ -388,6 +388,7 @@ fn unplaceable(why: String) -> crate::error::Error {
             "{why}. cosca could not tell whether a cgroup kill reached the elevated front, so the spawn is \
              refused before anything is spawned"
         ),
+        source: None,
     }
 }
 

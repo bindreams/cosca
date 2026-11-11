@@ -108,6 +108,7 @@ pub(crate) fn elevation_argv<'a>(
         op: format!("{} {what}", words.op_prefix),
         platform: words.platform,
         detail: detail.into(),
+        source: None,
     };
     if let Some(spec) = cmd.executable_spec() {
         let setter = match spec {
@@ -393,6 +394,7 @@ pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: boo
         Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
             detail: format!("could not signal the elevated child: {err}"),
+            source: None,
         }
     } else {
         Error::Io(err)
@@ -458,6 +460,7 @@ pub(crate) fn remap_derived_spawn_error(
                     "elevation backend {} could not be executed: {e}",
                     backend_path.display()
                 ),
+                source: None,
             }
         }
         other => other,

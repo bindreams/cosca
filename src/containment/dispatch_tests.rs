@@ -14,7 +14,10 @@ fn unsettled_logs_every_member_with_its_chain() {
     use crate::error::Error;
     let member = |text: &str| Error::MemberNotKilled {
         pid: 1,
-        source: Box::new(Error::Containment { detail: text.into() }),
+        source: Box::new(Error::Containment {
+            detail: text.into(),
+            source: None,
+        }),
         note: None,
     };
     let unsettled = super::Unsettled {
@@ -391,6 +394,7 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
         pid,
         source: Box::new(Error::Containment {
             detail: "refused".into(),
+            source: None,
         }),
         note: None,
     };
@@ -1507,6 +1511,7 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
         pid,
         source: Box::new(Error::Containment {
             detail: "refused".into(),
+            source: None,
         }),
         note: None,
     };

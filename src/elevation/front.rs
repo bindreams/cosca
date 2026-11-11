@@ -252,6 +252,7 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
     Error::Elevation {
         kind: ElevationErrorKind::Unkillable,
         detail,
+        source: None,
     }
 }
 

@@ -5,6 +5,7 @@ use crate::test_child::over_fake::exited_unreaped;
 fn containment_error_displays_detail() {
     let e = Error::Containment {
         detail: "cgroup leaf not writable".into(),
+        source: None,
     };
     assert!(e.to_string().contains("cgroup leaf not writable"), "{e}");
 }
@@ -66,6 +67,7 @@ fn unsupported_displays_op_platform_and_detail() {
         op: "fd 3".into(),
         platform: "windows",
         detail: "arbitrary fds require the raw backend".into(),
+        source: None,
     };
     let s = e.to_string();
     assert!(s.contains("fd 3"), "{s}");
@@ -79,6 +81,7 @@ fn elevation_error_displays_kind_and_detail() {
     let e = Error::Elevation {
         kind: ElevationErrorKind::NoTty,
         detail: "interactive auth requested with no controlling terminal".into(),
+        source: None,
     };
     let s = e.to_string();
     assert!(s.contains("no controlling terminal"), "{s}");
@@ -148,7 +151,9 @@ fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
 fn unassessable_reads_as_a_refusal_not_a_failure() {
     let e = crate::error::Error::Unassessable {
         detail: "pid 4 could not be opened".into(),
-        source: Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        source: Some(Box::new(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))),
     };
     let s = e.to_string();
     assert!(
@@ -211,10 +216,80 @@ fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
         "no code anywhere"
     );
     assert_eq!(
-        Error::Containment { detail: "d".into() }.raw_os_error(),
+        Error::Containment {
+            detail: "d".into(),
+            source: None
+        }
+        .raw_os_error(),
         None,
-        "not an Error::Io"
+        "a variant with no cause"
     );
+}
+
+#[skuld::test]
+fn raw_os_error_walks_the_chain_of_any_variant() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || Box::new(Error::Io(std::io::Error::from_raw_os_error(code)));
+    let context = || {
+        Box::new(Error::Io(crate::error::io_context(
+            "pidfd_open",
+            std::io::Error::from_raw_os_error(code),
+        )))
+    };
+
+    let unassessable = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(os()),
+    };
+    assert_eq!(unassessable.raw_os_error(), Some(code), "Unassessable");
+    let leader = Error::NotThreadGroupLeader {
+        pid: 1,
+        detail: "d".into(),
+        source: context(),
+    };
+    assert_eq!(
+        leader.raw_os_error(),
+        Some(code),
+        "NotThreadGroupLeader, under io_context"
+    );
+    let record = Error::IdentityRecord {
+        kind: crate::error::RecordErrorKind::ScopeUnreadable,
+        detail: "d".into(),
+        source: Some(os()),
+    };
+    assert_eq!(record.raw_os_error(), Some(code), "IdentityRecord");
+    let containment = Error::Containment {
+        detail: "d".into(),
+        source: Some(os()),
+    };
+    assert_eq!(containment.raw_os_error(), Some(code), "Containment");
+    let unsupported = Error::Unsupported {
+        op: "op".into(),
+        platform: "p",
+        detail: "d".into(),
+        source: Some(os()),
+    };
+    assert_eq!(unsupported.raw_os_error(), Some(code), "Unsupported");
+    let elevation = Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: "d".into(),
+        source: Some(os()),
+    };
+    assert_eq!(elevation.raw_os_error(), Some(code), "Elevation");
+    let member = Error::MemberNotKilled {
+        pid: 1,
+        source: Box::new(Error::Unassessable {
+            detail: "d".into(),
+            source: Some(os()),
+        }),
+        note: None,
+    };
+    assert_eq!(member.raw_os_error(), Some(code), "through two boxed causes");
+    let no_code = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(Box::new(Error::Io(std::io::Error::other("no code")))),
+    };
+    assert_eq!(no_code.raw_os_error(), None, "no code anywhere");
 }
 
 /// Where the OS code sits below an `Error::Io`: its own `source()` is the wrapper cosca added, which
@@ -250,32 +325,31 @@ fn a_note_on_a_context_error_io_has_the_code_under_both_wrappers() {
     assert_eq!(codes_down(&e), [None, None, Some(code)]);
 }
 
-/// Only an `Error::Io` has `io_errors`: another variant's chain may hold an `io::Error`, and it is
-/// not listed.
 #[skuld::test]
-fn io_errors_of_a_variant_other_than_io_is_empty_though_its_chain_holds_one() {
+fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let os = || std::io::Error::from_raw_os_error(code);
     let leader = Error::NotThreadGroupLeader {
         pid: 1,
         detail: "d".into(),
-        source: os(),
+        source: Box::new(Error::Io(os())),
     };
     assert!(
         chain(&leader).any(|layer| layer.is::<std::io::Error>()),
         "the chain holds an io::Error"
     );
-    assert_eq!(codes_down(&leader), []);
+    assert_eq!(codes_down(&leader), [Some(code)]);
     let member = Error::MemberNotKilled {
         pid: 1,
         source: Box::new(Error::Io(os())),
         note: None,
     };
-    assert!(
-        chain(&member).any(|layer| layer.is::<std::io::Error>()),
-        "the chain holds an io::Error"
-    );
-    assert_eq!(codes_down(&member), []);
+    assert_eq!(codes_down(&member), [Some(code)]);
+    let bare = Error::Containment {
+        detail: "d".into(),
+        source: None,
+    };
+    assert_eq!(codes_down(&bare), []);
 }
 
 /// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
@@ -284,13 +358,8 @@ fn io_errors_of_a_variant_other_than_io_is_empty_though_its_chain_holds_one() {
 #[skuld::test]
 fn with_note_keeps_each_variant_and_appends() {
     use crate::error::{ElevationErrorKind, RecordErrorKind};
-    use std::error::Error as _;
     let os = || std::io::Error::from_raw_os_error(libc::EACCES);
-    let source_code = |e: &Error| {
-        e.source()
-            .and_then(|s| s.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::raw_os_error)
-    };
+    let cause = || Box::new(Error::Io(os()));
     let note = "left running";
 
     let noted = Error::Io(os()).with_note(note);
@@ -309,50 +378,59 @@ fn with_note_keeps_each_variant_and_appends() {
         op: "op".into(),
         platform: "linux",
         detail: "d".into(),
+        source: Some(cause()),
     }
     .with_note(note);
     assert!(
-        matches!(&e, Error::Unsupported { op, platform: "linux", detail } if op == "op" && detail == "d; left running")
+        matches!(&e, Error::Unsupported { op, platform: "linux", detail, .. } if op == "op" && detail == "d; left running")
     );
-    let e = Error::Containment { detail: "d".into() }.with_note(note);
-    assert!(matches!(&e, Error::Containment { detail } if detail == "d; left running"));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    let e = Error::Containment {
+        detail: "d".into(),
+        source: Some(cause()),
+    }
+    .with_note(note);
+    assert!(matches!(&e, Error::Containment { detail, .. } if detail == "d; left running"));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
     let e = Error::NoConsole { detail: "d".into() }.with_note(note);
     assert!(matches!(&e, Error::NoConsole { detail } if detail == "d; left running"));
     let e = Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,
         detail: "d".into(),
+        source: Some(cause()),
     }
     .with_note(note);
     assert!(matches!(
         &e,
-        Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail } if detail == "d; left running"
+        Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail, .. } if detail == "d; left running"
     ));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
     let e = Error::Unassessable {
         detail: "d".into(),
-        source: Some(os()),
+        source: Some(cause()),
     }
     .with_note(note);
     assert!(matches!(&e, Error::Unassessable { detail, .. } if detail == "d; left running"));
-    assert_eq!(source_code(&e), Some(libc::EACCES));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
     let e = Error::NotThreadGroupLeader {
         pid: 7,
         detail: "d".into(),
-        source: os(),
+        source: cause(),
     }
     .with_note(note);
     assert!(matches!(&e, Error::NotThreadGroupLeader { pid: 7, detail, .. } if detail == "d; left running"));
-    assert_eq!(source_code(&e), Some(libc::EACCES));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
     let e = Error::IdentityRecord {
         kind: RecordErrorKind::ForeignPlatform,
         detail: "d".into(),
-        source: Some(os()),
+        source: Some(cause()),
     }
     .with_note(note);
     assert!(matches!(
         &e,
         Error::IdentityRecord { kind: RecordErrorKind::ForeignPlatform, detail, .. } if detail == "d; left running"
     ));
-    assert_eq!(source_code(&e), Some(libc::EACCES));
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
 }
 
 /// A member left behind by a refused kill takes a note and keeps its OS error as the error's source:
@@ -445,7 +523,10 @@ fn with_note_keeps_the_unreaped_child() {
     let error = Error::MayHaveStarted {
         fate: ChildFate::Running { id: Some(id) },
         wrapper_elevated: false,
-        source: Box::new(Error::Containment { detail: "x".into() }),
+        source: Box::new(Error::Containment {
+            detail: "x".into(),
+            source: None,
+        }),
         unreaped: Some(exited_unreaped(id)),
     }
     .with_note("front left");
@@ -454,7 +535,7 @@ fn with_note_keeps_the_unreaped_child() {
     };
     assert_eq!(unreaped.as_ref().map(|child| child.pid()), Some(Some(id.pid())));
     assert!(
-        matches!(**source, Error::Containment { ref detail } if detail == "x; front left"),
+        matches!(**source, Error::Containment { ref detail, .. } if detail == "x; front left"),
         "{source:?}"
     );
 }
@@ -529,7 +610,10 @@ fn report_keeps_a_layer_whose_display_is_empty() {
 
 #[skuld::test]
 fn report_of_a_leaf_is_its_display() {
-    let leaf = Error::Containment { detail: "d".into() };
+    let leaf = Error::Containment {
+        detail: "d".into(),
+        source: None,
+    };
     assert_eq!(Report(&leaf).to_string(), leaf.to_string());
 }
 

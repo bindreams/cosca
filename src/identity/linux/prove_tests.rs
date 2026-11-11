@@ -67,17 +67,17 @@ fn a_pid_with_no_process_is_gone_and_dead() {
 /// A descriptor limit is no answer about the pid, and says so.
 #[skuld::test]
 fn a_pid_that_cannot_be_opened_for_want_of_descriptors_is_unknown_with_the_errno() {
-    use std::error::Error as _;
-
     for errno in [Errno::MFILE, Errno::NFILE] {
         let (existence, cause) = id(100).exists_with(&refusing(errno));
         assert_eq!(existence, Existence::Unknown, "{errno}");
         assert_eq!(id(100).is_alive_with(&refusing(errno)), Liveness::Unknown, "{errno}");
         let err = cause.into_error("pid 4242").expect("the errno is the cause");
         assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-        let source = err.source().expect("the errno is the source");
-        let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
-        assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
+        assert_eq!(
+            err.raw_os_error(),
+            Some(errno.raw_os_error()),
+            "the errno is in the chain"
+        );
     }
 }
 
@@ -97,8 +97,6 @@ fn a_refused_pidfd_open_is_unknown_and_unsupported() {
 /// call's own failure, `Unassessable` with the raw errno. Mutant: "the refusal rule ignores the call".
 #[skuld::test]
 fn only_a_failed_pidfd_open_is_a_refusal() {
-    use std::error::Error as _;
-
     use crate::identity::{FailedCall, UnknownCause};
 
     for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
@@ -115,9 +113,11 @@ fn only_a_failed_pidfd_open_is_a_refusal() {
         for (call, cause) in causes {
             let err = cause.into_error("pid 4242").expect("the call is the cause");
             assert!(matches!(err, Error::Unassessable { .. }), "{call} {errno}: {err:?}");
-            let source = err.source().expect("the errno is the source");
-            let source = source.downcast_ref::<std::io::Error>().expect("an OS error");
-            assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()), "{call} {errno}");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(errno.raw_os_error()),
+                "{call} {errno}: the errno is in the chain"
+            );
         }
     }
 }

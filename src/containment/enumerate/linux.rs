@@ -66,7 +66,7 @@ fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {
     log::warn!("enumerate::process_parents: {detail}");
     Error::Unassessable {
         detail,
-        source: Some(unreadable.into_source()),
+        source: Some(Error::io_cause(unreadable.into_source())),
     }
 }
 
@@ -76,7 +76,10 @@ fn unassessable(why: &str, source: Option<std::io::Error>) -> Error {
         detail.push_str(&format!(": {source}"));
     }
     log::warn!("enumerate::process_parents: {detail}");
-    Error::Unassessable { detail, source }
+    Error::Unassessable {
+        detail,
+        source: source.map(Error::io_cause),
+    }
 }
 
 #[cfg(test)]

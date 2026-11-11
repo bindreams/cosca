@@ -575,6 +575,7 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
                 pid: 4242,
                 source: Box::new(crate::error::Error::Containment {
                     detail: "refused".into(),
+                    source: None,
                 }),
                 note: None,
             }),

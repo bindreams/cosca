@@ -328,7 +328,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixtu
 
     // (1) The teardown reports Err(Containment), not Ok(()).
     match &result {
-        Err(cosca::error::Error::Containment { detail }) => {
+        Err(cosca::error::Error::Containment { detail, .. }) => {
             assert!(
                 detail.contains(&priv_pid.to_string()),
                 "Containment error should name the refusing pid {priv_pid}, got: {detail}"

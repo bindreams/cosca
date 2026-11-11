@@ -269,6 +269,7 @@ pub(crate) fn ensure_fd_table_fits(fds: &BTreeMap<Fd, ResolvedStdio>) -> Result<
             op: format!("fd {maxfd}"),
             platform: "windows",
             detail: "descriptor table exceeds the 64KiB cbReserved2 limit".into(),
+            source: None,
         });
     }
     Ok(())

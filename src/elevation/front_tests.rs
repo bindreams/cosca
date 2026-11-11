@@ -103,6 +103,7 @@ fn refusal_detail(g: Gate) -> String {
         Gate::Closed(Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
             detail,
+            ..
         }) => detail,
         other => panic!("expected a closed gate with Unkillable, got {other:?}"),
     }

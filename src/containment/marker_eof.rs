@@ -442,6 +442,7 @@ fn refuse_if_write_end_held(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> R
                 detail: "the supervisor still holds a copy of the containment marker's write end, so the \
                          tree-drain edge can never fire"
                     .into(),
+                source: None,
             })
         }
     }

@@ -725,6 +725,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     let written = Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "forced password-write failure".into(),
+        source: None,
     });
     let mark = crate::log_capture::mark();
     let (err, fate) = super::finish_elevated(child, written)
@@ -1088,6 +1089,7 @@ fn failed_write() -> Result<(), Error> {
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "forced password-write failure".into(),
+        source: None,
     })
 }
 
@@ -1428,6 +1430,7 @@ fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the
     let unsettled = || Unsettled {
         first: Error::Containment {
             detail: "refused".into(),
+            source: None,
         },
         others: Vec::new(),
     };
@@ -1463,6 +1466,7 @@ fn finish_elevated_detail_and_fate(child: crate::Child) -> (String, ChildFate) {
         Err(Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("the spawn fails")

@@ -101,6 +101,7 @@ impl ViewUnreadable {
             op: op.into(),
             platform: "linux",
             detail,
+            source: None,
         })
     }
 

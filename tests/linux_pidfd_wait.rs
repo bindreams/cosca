@@ -59,11 +59,14 @@ fn open_pid_of_a_live_non_leader_tid_is_an_error() {
     );
 
     match cosca::Process::open_pid(tid) {
-        Err(cosca::error::Error::NotThreadGroupLeader { pid, source, .. }) => {
+        Err(error @ cosca::error::Error::NotThreadGroupLeader { pid, .. }) => {
             assert_eq!(pid, tid);
+            let code = std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| e.source())
+                .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                .find_map(std::io::Error::raw_os_error);
             assert!(
-                matches!(source.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)),
-                "pidfd_open's refusal is EINVAL (< 6.16) or ENOENT (>= 6.16), got {source:?}"
+                matches!(code, Some(libc::EINVAL | libc::ENOENT)),
+                "pidfd_open's refusal is EINVAL (< 6.16) or ENOENT (>= 6.16), got {error:?}"
             );
         }
         other => panic!("Process::open_pid of a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
