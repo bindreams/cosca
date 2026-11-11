@@ -1,9 +1,6 @@
-//! Unit tests for the public `Child::wait_tree`/`wait_tree_timeout`. A test of the drained verdict
-//! runs on the platform's one drainable mechanism (`drainable_gives`: a cgroup leaf on Linux, a Job
-//! Object on Windows, the fd marker on macOS) and asserts it got that one. The `Unsupported` refusal
-//! is checked on a mechanism with no kernel drain edge: a requested `ContainMode::TreeWalk` on Linux
-//! and Windows, a requested `Session` (`contain_without_cgroup`) on Linux, and an uncontained child
-//! on macOS, which promotes every contained request to the drainable fd marker.
+//! Unit tests for the public `Child::wait_tree`/`wait_tree_timeout`. Drained-verdict tests run on
+//! `drainable_gives` and assert exactly it; `Unsupported` is checked on a mechanism with no kernel
+//! drain edge (see each test).
 
 use std::time::Duration;
 
@@ -224,8 +221,7 @@ fn wait_tree_is_unsupported_on_an_uncontained_child() {
 }
 
 /// On macOS the fd marker is installed for every contained root regardless of the requested mode
-/// (`dispatch.rs`'s `attach()`, macOS branch — it is what survives `setsid`/reparenting/`exec` that
-/// a mode-specific mechanism does not), so an explicit `TreeWalk` request comes back
+/// (it is what survives `setsid`/reparenting/`exec` that a mode-specific mechanism does not), so an explicit `TreeWalk` request comes back
 /// `Containment::FdMarker` and drains correctly through it.
 #[cfg(target_os = "macos")]
 #[skuld::test]

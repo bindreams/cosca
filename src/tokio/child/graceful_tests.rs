@@ -489,8 +489,7 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     cleanup(&mut child).await;
 }
 
-// Async twin of `child::graceful_tests::drained_tree_sweep_decision` — see there for the full
-// rationale, `contain` and `expected`.
+// Async twin of `child::graceful_tests::drained_tree_sweep_decision`.
 async fn drained_tree_sweep_decision(contain: impl FnOnce(&mut crate::tokio::Command), expected: crate::Containment) {
     crate::tokio::test_runtime::assert_current_thread();
     // Asked on Windows: the test sends a console-group break to a child that registered with the
@@ -692,12 +691,7 @@ async fn members_remain_still_reaps_an_already_exited_root(
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
-        if drainable {
-            "MembersRemain branch"
-        } else {
-            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
-        }
+        "an already-exited root must be best-effort reaped even when the sweep fails"
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
     // call above reaped the root.
@@ -729,6 +723,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
 #[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
+        assert_eq!(child.containment(), crate::test_child::session_gives());
         // Below Linux 6.9 a group is signalled by its number alone.
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();

@@ -176,8 +176,7 @@ async fn assert_wait_tree_unsupported(mut child: crate::tokio::Child) {
     _ = child.wait().await;
 }
 
-/// See the sync twin's identical test for the full rationale. macOS does not honor a `TreeWalk`
-/// request (see the test below).
+/// macOS does not honor a `TreeWalk` request (see the test below).
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
@@ -186,7 +185,6 @@ async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     assert_wait_tree_unsupported(child).await;
 }
 
-/// See the sync twin's identical test.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_session() {
@@ -195,7 +193,6 @@ async fn async_wait_tree_is_unsupported_on_a_session() {
     assert_wait_tree_unsupported(child).await;
 }
 
-/// See the sync twin's identical test.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_an_uncontained_child() {
@@ -204,8 +201,8 @@ async fn async_wait_tree_is_unsupported_on_an_uncontained_child() {
     assert_wait_tree_unsupported(child).await;
 }
 
-/// See the sync twin's identical test: macOS promotes every contained root's mechanism to the
-/// drainable fd marker regardless of the requested mode.
+/// macOS promotes every contained root's mechanism to the drainable fd marker regardless of the
+/// requested mode.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn async_a_treewalk_request_is_promoted_to_the_fd_marker_which_drains() {

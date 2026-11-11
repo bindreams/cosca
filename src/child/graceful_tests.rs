@@ -693,7 +693,6 @@ fn members_remain_still_reaps_an_already_exited_root(mode: crate::ContainMode, s
         crate::identity::Existence::Present,
         "the exited root must still be an unreaped zombie before graceful_shutdown_tree runs"
     );
-    let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(2))
@@ -706,12 +705,7 @@ fn members_remain_still_reaps_an_already_exited_root(mode: crate::ContainMode, s
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails ({})",
-        if drainable {
-            "MembersRemain branch"
-        } else {
-            "non-drain-observable fallback branch — pre-existing, unaffected behavior"
-        }
+        "an already-exited root must be best-effort reaped even when the sweep fails"
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
     // call above reaped the root.
@@ -734,6 +728,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(#
 #[skuld::test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
+        assert_eq!(child.containment(), crate::test_child::session_gives());
         // Below Linux 6.9 a group is signalled by its number alone.
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();

@@ -1121,21 +1121,22 @@ pub async fn spawn_blocker_async() -> (cosca::tokio::Child, TcpStream) {
 /// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
 /// sockets identified by tag (accept order is not guaranteed).
 #[cfg(feature = "tokio")]
-pub async fn spawn_grandchild_async(contain: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+pub async fn spawn_grandchild_async(
+    contain: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_grandchild_async_with(contain, true).await
 }
 
-/// `spawn_grandchild_async` with explicit `contain` and `kill_on_drop` flags, so a test can
-/// exercise the `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`.
+/// `spawn_grandchild_async` with an explicit `kill_on_drop`, so a test can exercise the
+/// `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`. `contain`
+/// sets the containment; an uncontained tree passes `|_| {}`.
 #[cfg(feature = "tokio")]
 pub async fn spawn_grandchild_async_with(
-    contain: bool,
+    contain: impl FnOnce(&mut cosca::tokio::Command),
     kill_on_drop: bool,
 ) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_tree_async("spawn-grandchild", |cmd| {
-        if contain {
-            cmd.contain();
-        }
+        contain(cmd);
         cmd.kill_on_drop(kill_on_drop);
     })
     .await

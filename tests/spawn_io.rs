@@ -1186,7 +1186,7 @@ fn unix_session_child_is_own_session_leader() {
 // TreeWalk containment =====
 
 /// Spawn a contained tree using `ContainMode::TreeWalk` and return the handles.
-/// Sibling of `spawn_contained_tree`; selects the identity-aware walk directly. Available on `any(unix, windows)`.
+/// Sibling of `spawn_contained_tree`; selects the identity-aware walk directly.
 ///
 /// Returns `(child, grandchild_stream, root_stream)`. **The caller MUST keep
 /// `root_stream` alive until after the teardown call.** TreeWalk enumerates the

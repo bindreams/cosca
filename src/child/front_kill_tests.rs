@@ -20,7 +20,7 @@ use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 use crate::os_process::fake::failed_signal;
 use crate::signal::Sig;
-use crate::{ContainMode, Containment, Stdio};
+use crate::{ContainMode, Stdio};
 
 /// The report of a child launched by `sudo`.
 pub(crate) fn sudo_report() -> Option<ElevationReport> {
@@ -313,7 +313,7 @@ fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() 
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Session);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    assert_ne!(child.containment(), Containment::CgroupV2);
+    assert_eq!(child.containment(), crate::test_child::session_gives());
     assert_unkillable_front(child.kill_tree(), child.pid());
     assert_ends_unsignalled(&child, stdin);
 }
