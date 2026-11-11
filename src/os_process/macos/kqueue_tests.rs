@@ -275,8 +275,8 @@ fn a_readable_subscription_reports_the_close() {
     );
 }
 
-const SIGNAL_COUNT_MARKER: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT";
-const SIGNAL_COUNT_CASE: &str = "COSCA_TEST_KQUEUE_SIGNAL_COUNT_CASE";
+const SIGNAL_COUNT_MARKER: &str = "COSCA_TESTCFG_KQUEUE_SIGNAL_COUNT";
+const SIGNAL_COUNT_CASE: &str = "COSCA_TESTCFG_KQUEUE_SIGNAL_COUNT_CASE";
 
 /// Runs re-exec'd: it ignores `SIGUSR1` process-wide.
 #[skuld::test]

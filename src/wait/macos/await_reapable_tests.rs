@@ -226,7 +226,7 @@ fn dropped_hook_guards_remove_their_hooks() {
 
 // EV_CLEAR =====
 
-const MARKER_KNOTE: &str = "COSCA_TEST_AWAIT_KNOTE";
+const MARKER_KNOTE: &str = "COSCA_TESTCFG_AWAIT_KNOTE";
 
 /// After the round that delivered `NOTE_EXIT`, no `EVFILT_PROC` event arrives again: the knote is
 /// registered with `EV_CLEAR`, so a backoff `kevent` blocks for its interval rather than
@@ -275,7 +275,7 @@ fn run_case(path: &str, marker: &str, case: &str) {
     crate::test_child::run_fixture_case(path, marker, CASE_ENV, case);
 }
 
-const CASE_ENV: &str = "COSCA_TEST_AWAIT_CASE";
+const CASE_ENV: &str = "COSCA_TESTCFG_AWAIT_CASE";
 
 fn case() -> String {
     std::env::var(CASE_ENV).expect("the driver sets the case")
@@ -299,7 +299,7 @@ fn reap_by_number(pid: u32) -> Option<i32> {
 
 // The ESRCH paths =====
 
-const MARKER_ESRCH: &str = "COSCA_TEST_AWAIT_ESRCH";
+const MARKER_ESRCH: &str = "COSCA_TESTCFG_AWAIT_ESRCH";
 
 /// A registration that got `ESRCH` sends the wait to its backoff, and the backoff follows the
 /// kernel, not the `SIGCHLD` disposition: the disposition is flipped between re-peeks (default to
@@ -361,7 +361,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
 /// Mutant: no self-registration: the wait blocks on a `NOTE_EXIT` that never comes.
 #[skuld::test]
 fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
-    const MARKER: &str = "COSCA_TEST_AWAIT_CALLER_ESRCH";
+    const MARKER: &str = "COSCA_TESTCFG_AWAIT_CALLER_ESRCH";
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
         return run_case(
             crate::test_child::fixture_path!(await_reapable_on_waits_out_a_caller_registration_that_got_esrch),

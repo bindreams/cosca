@@ -121,7 +121,7 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         Launch::RawBinTrue => testbin.args(["raw", "/bin/true"]),
     };
     if let Some((uid, gid)) = drop_to {
-        testbin.env("COSCA_TEST_DROP_TO", format!("{uid}:{gid}"));
+        testbin.env("COSCA_TESTCFG_DROP_TO", format!("{uid}:{gid}"));
     }
     let out = common::output_locked(&mut testbin).expect("run the testbin");
     assert!(

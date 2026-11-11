@@ -2284,7 +2284,7 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
 
     const NAME: &str =
         "containment::cgroup::leaf::leaf_tests::placement_hook_proceeds_when_the_parent_decided_without_the_exchange";
-    const INNER: &str = "COSCA_TEST_DECIDED_ALONE";
+    const INNER: &str = "COSCA_TESTCFG_DECIDED_ALONE";
     if std::env::var_os(INNER).is_none() {
         let out = crate::test_spawn::output_captured(
             crate::test_reexec::with_json_events(

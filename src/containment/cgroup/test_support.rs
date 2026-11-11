@@ -385,7 +385,7 @@ pub(crate) fn childs_copy(
 /// the socket open past the close.
 #[cfg(target_os = "linux")]
 pub(crate) fn alone(name: &str) -> bool {
-    const ALONE: &str = "COSCA_TEST_ALONE";
+    const ALONE: &str = "COSCA_TESTCFG_ALONE";
     if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
         return true;
     }

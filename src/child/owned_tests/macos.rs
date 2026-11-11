@@ -67,8 +67,8 @@ fn a_second_peek_runs_after_every_first_reap() {
 
 // Task 2b: the `SIG_IGN` hang =====
 
-const MARKER: &str = "COSCA_TEST_SHARED_SIGIGN";
-const CASE_ENV: &str = "COSCA_TEST_SHARED_SIGIGN_CASE";
+const MARKER: &str = "COSCA_TESTCFG_SHARED_SIGIGN";
+const CASE_ENV: &str = "COSCA_TESTCFG_SHARED_SIGIGN_CASE";
 
 fn run_case(path: &str, case: &str) {
     crate::test_child::run_fixture_case(path, MARKER, CASE_ENV, case);

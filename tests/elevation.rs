@@ -3,10 +3,10 @@
 //! selects it. Run where elevation cannot work, a test fails; none returns early.
 //!
 //! The ELEVATION lanes in `ci.yaml` set the machine up: `sudo` (passwords from
-//! `COSCA_TEST_ELEVATION_PASSWORD`), `pkexec` and, on macOS, `osascript`, through
+//! `COSCA_TESTCFG_ELEVATION_PASSWORD`), `pkexec` and, on macOS, `osascript`, through
 //! `.github/scripts/unattended-gui-elevation.py`, which approves the graphical tiers
 //! (`gui_elevated_child_runs_as_root`, `pkexec_gui_auth_reaches_root`) without a person; `doas` on Linux; and
-//! on Windows an unelevated administrator, with `COSCA_TEST_ELEVATION_MARKER_DIR` a directory only an
+//! on Windows an unelevated administrator, with `COSCA_TESTCFG_ELEVATION_MARKER_DIR` a directory only an
 //! administrator can write. The pure tiers cover all logic unconditionally; only the privilege gain runs here.
 //!
 //! Outside the group: the controlling-terminal probes below, which need no elevation, and the `group` module,
@@ -149,8 +149,8 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 #[skuld::test]
 fn posix_stdin_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
-        .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
+    let pw = std::env::var("COSCA_TESTCFG_ELEVATION_PASSWORD")
+        .expect("COSCA_TESTCFG_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
     let mut c = common::command(common::Console::Hidden);
     c.args(["whoami"])
         .elevation_backend(cosca::elevation::Backend::Sudo)
@@ -200,8 +200,8 @@ impl Drop for SecretDir {
 #[skuld::test]
 fn posix_askpass_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
-        .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
+    let pw = std::env::var("COSCA_TESTCFG_ELEVATION_PASSWORD")
+        .expect("COSCA_TESTCFG_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
     // A minimal askpass script that echoes the password. Its directory is removed on every exit: the script holds
     // the password.
     let dir = SecretDir::new();
@@ -291,9 +291,9 @@ fn already_elevated_inherit_spawn_reports_already_elevated(#[fixture(elevation)]
 #[skuld::test]
 fn windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let dir = std::env::var_os("COSCA_TEST_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os("COSCA_TESTCFG_ELEVATION_MARKER_DIR")
         .map(PathBuf::from)
-        .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .expect("COSCA_TESTCFG_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = common::command(common::Console::Hidden);
@@ -367,12 +367,12 @@ fn doas_non_interactive_auth_reaches_root(#[fixture(elevation)] _group: &Group) 
 /// `Unkillable` and the payload is still alive. `Ok` with a live payload is a false kill. The 20 s is the failure bound
 /// on the OS ending a process: shorter than nextest's suite bound on the whole test, so a false kill is this panic.
 ///
-/// `COSCA_TEST_ELEVATION_EXPECT_KILL` pins the lane's outcome, `ok` or `unkillable`, so a regression to the other one
+/// `COSCA_TESTCFG_ELEVATION_EXPECT_KILL` pins the lane's outcome, `ok` or `unkillable`, so a regression to the other one
 /// fails; without it either truthful outcome passes.
 #[cfg(windows)]
 fn assert_kill_matches_payload(killed: &Result<(), cosca::error::Error>, payload: &mut common::payload::Payload) {
     use std::io::Read as _;
-    let expected = std::env::var("COSCA_TEST_ELEVATION_EXPECT_KILL").ok();
+    let expected = std::env::var("COSCA_TESTCFG_ELEVATION_EXPECT_KILL").ok();
     match (killed, expected.as_deref()) {
         (
             Err(cosca::error::Error::Elevation {
@@ -397,7 +397,7 @@ fn assert_kill_matches_payload(killed: &Result<(), cosca::error::Error>, payload
             }
         }
         (other, expected) => panic!(
-            "kill() answered {other:?}, which COSCA_TEST_ELEVATION_EXPECT_KILL={expected:?} does not allow (unset: `Ok` with a dead payload, or the typed Unkillable)"
+            "kill() answered {other:?}, which COSCA_TESTCFG_ELEVATION_EXPECT_KILL={expected:?} does not allow (unset: `Ok` with a dead payload, or the typed Unkillable)"
         ),
     }
 }
@@ -591,9 +591,9 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
 #[skuld::test]
 async fn async_windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let dir = std::env::var_os("COSCA_TEST_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os("COSCA_TESTCFG_ELEVATION_MARKER_DIR")
         .map(PathBuf::from)
-        .expect("COSCA_TEST_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .expect("COSCA_TESTCFG_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
     let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = common::tokio_command(common::Console::Hidden);

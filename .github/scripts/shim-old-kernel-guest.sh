@@ -54,7 +54,7 @@ chmod 4755 "$helper"
 # credentials a peer sends (SCM_CREDENTIALS), which root skips.
 unpriv_log="$(mktemp)"
 status=0
-setpriv --reuid="$uid" --regid="$gid" --clear-groups env "${groups_unprivileged[@]}" "COSCA_TEST_SETUID_HELPER=$helper" \
+setpriv --reuid="$uid" --regid="$gid" --clear-groups env "${groups_unprivileged[@]}" "COSCA_TESTCFG_SETUID_HELPER=$helper" \
     "${nextest[@]}" >"$unpriv_log" 2>&1 || status=$?
 cat "$unpriv_log"
 ((status == 0)) || exit "$status"

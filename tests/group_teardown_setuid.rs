@@ -27,15 +27,15 @@
 //! Root may signal the setuid helper, so the scenario needs an unprivileged caller. Started as
 //! root, the test re-executes this binary as uid 65534 (`nobody`), running only itself, and
 //! requires that run to pass. Both this test binary (so every directory on its path, e.g. the
-//! cargo target dir) and `COSCA_TEST_SETUID_HELPER` must be reachable by uid 65534: a `0700` home
+//! cargo target dir) and `COSCA_TESTCFG_SETUID_HELPER` must be reachable by uid 65534: a `0700` home
 //! directory on the path makes the re-run fail to start. The re-run identifies itself by
-//! `COSCA_TEST_SETUID_RERUN` holding its parent's pid; a value inherited from elsewhere is an
+//! `COSCA_TESTCFG_SETUID_RERUN` holding its parent's pid; a value inherited from elsewhere is an
 //! error, not proof of a re-run. The CI "Run setuid-root process-group teardown test as root"
 //! step exercises this path.
 //!
 //! # Gating
 //! The `SETUID` group (`COSCA_TEST_SETUID`). `common::setuid` gives what
-//! `COSCA_TEST_SETUID_HELPER` must be. The spawned helper (`setuid-control-block` in
+//! `COSCA_TESTCFG_SETUID_HELPER` must be. The spawned helper (`setuid-control-block` in
 //! `testbin/main.rs`) runs the shared provisioning check of `setuid-stdin-block` and reports a
 //! failure over the control socket used for the readiness handshake, so a nosuid mount or a wrong
 //! owner/mode surfaces as a loud panic here, not a false green.
@@ -81,9 +81,9 @@ const UNPRIVILEGED: u32 = 65534;
 /// Set by the parent to its own pid; the re-executed child accepts it only if it equals its
 /// parent's pid (see [`rerun_role`]). The child then prints [`RERAN`] because the runner exits 0 when
 /// the filter matches no test.
-const RERUN_ENV: &str = "COSCA_TEST_SETUID_RERUN";
+const RERUN_ENV: &str = "COSCA_TESTCFG_SETUID_RERUN";
 #[cfg(target_os = "linux")]
-const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
+const RERAN: &str = "COSCA_TESTCFG_SETUID_RERUN ran";
 
 #[cfg(target_os = "linux")]
 /// The `--exact` name of `$name`; a rename that misses this call site fails to compile
@@ -138,7 +138,7 @@ fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
 }
 
 #[cfg(target_os = "linux")]
-/// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
+/// The child inherits `COSCA_TESTCFG_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
 fn rerun_unprivileged() {
@@ -206,7 +206,7 @@ fn classify(line: &str, stream: TcpStream) -> Handshake {
     if let Some(reason) = line.strip_prefix("F ") {
         panic!(
             "setuid helper provisioning failed: {reason}\n\
-             (check that COSCA_TEST_SETUID_HELPER points at a copy of cosca_testbin that is \
+             (check that COSCA_TESTCFG_SETUID_HELPER points at a copy of cosca_testbin that is \
              owned by root, mode u+s, on a filesystem NOT mounted nosuid)"
         );
     }
