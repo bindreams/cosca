@@ -309,13 +309,12 @@ joined with `#[fixture(unprivileged)] _group: &Group`, selected by `SKULD_LABELS
 root step of CI selects its tests by label, so none runs it; a root run of the unfiltered suite sets
 `COSCA_TEST_UNPRIVILEGED=0`.
 
-`COSCA_TEST_` names only a group's switch (`COSCA_TEST_<GROUP>`) and its consent
-(`COSCA_TEST_<GROUP>_CONSENT`); `cosca-path`'s `COSCA_TEST_NON_ROOT` off-switch is shaped as one. A test setting in
-that shape that is not a group (a path, a knob or an internal marker) is `COSCA_TESTCFG_<NAME>`.
-
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
 the process.
+
+Any other test setting (a path, a knob, an internal marker) is `COSCA_TESTCFG_<NAME>`; `cosca-path`'s
+`COSCA_TEST_NON_ROOT` keeps the group shape.
 
 **Applies to:** all tests.
 
