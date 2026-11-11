@@ -1145,6 +1145,7 @@ impl Attached {
                     op: "terminate on a non-actionable mechanism".into(),
                     platform: std::env::consts::OS,
                     detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
+                    source: None,
                 })
             }
             #[cfg(unix)]
@@ -1518,6 +1519,7 @@ impl Attached {
                 op: "wait for the contained tree to drain".into(),
                 platform: std::env::consts::OS,
                 detail: "this child's containment mechanism exposes no kernel edge for tree drain".into(),
+                source: None,
             }),
         }
     }
@@ -2034,7 +2036,10 @@ fn attach_tree(
             if prepared.frozen {
                 return match crate::containment::windows::assign_held(proc_handle) {
                     Ok(job) => Ok((Containment::JobObject, Attached::JobObject(job))),
-                    Err(e) => Err(Error::Containment { detail: e.to_string() }),
+                    Err(e) => Err(Error::Containment {
+                        detail: e.to_string(),
+                        source: None,
+                    }),
                 };
             }
             match crate::containment::windows::attach_job(proc_handle) {
@@ -2046,7 +2051,12 @@ fn attach_tree(
                     // so `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok((Containment::TreeWalk, Attached::TreeWalk(id?)));
                 }
-                Err(e) => return Err(Error::Containment { detail: e.to_string() }),
+                Err(e) => {
+                    return Err(Error::Containment {
+                        detail: e.to_string(),
+                        source: None,
+                    })
+                }
             }
         } else if prepared.mode.is_some() {
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no

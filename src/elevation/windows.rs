@@ -131,6 +131,7 @@ pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
             op: op.into(),
             platform: "windows",
             detail: detail.into(),
+            source: None,
         })
     };
     for (&slot, resolved) in cmd.fds() {
@@ -256,11 +257,13 @@ pub(crate) fn shell_execute_failure(code: windows::core::HRESULT, inst_app: isiz
             "ShellExecuteEx(runas) failed: {}",
             windows::core::Error::from_hresult(code)
         ),
+        source: None,
     };
     match classify(code.0, inst_app) {
         RunasFailure::Declined => SpawnFailure::NotStarted(Error::Elevation {
             kind: ElevationErrorKind::AuthDeclined,
             detail: "the UAC elevation prompt was declined".into(),
+            source: None,
         }),
         RunasFailure::BeforeLaunch => SpawnFailure::NotStarted(failed()),
         RunasFailure::MayHaveLaunched => SpawnFailure::started(failed(), ChildFate::Unknown, None),
@@ -331,6 +334,7 @@ impl ComInit {
             Err(Error::Elevation {
                 kind: ElevationErrorKind::AuthFailed,
                 detail: format!("CoInitializeEx failed before ShellExecuteEx: {hr:?}"),
+                source: None,
             })
         }
     }
@@ -562,6 +566,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
                 Error::Elevation {
                     kind: ElevationErrorKind::AuthFailed,
                     detail: "ShellExecuteEx(runas) returned no process handle".into(),
+                    source: None,
                 },
                 ChildFate::Unknown,
                 None,
@@ -592,6 +597,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
                 detail,
+                source: None,
             },
             fate,
             None,

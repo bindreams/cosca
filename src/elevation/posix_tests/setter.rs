@@ -84,7 +84,9 @@ fn assert_refused(setter: &str, set: fn(&mut Command, &str), programs: &[&str]) 
                     apply(&mut c, &mut host, backend);
                     let at = format!("{name}, elevated={elevated}, {setter}({program:?}), {fault}");
                     match rewrite_with_host(&mut c, &host) {
-                        Err(Error::Unsupported { op, platform, detail }) => {
+                        Err(Error::Unsupported {
+                            op, platform, detail, ..
+                        }) => {
                             let want_op = format!("{} of a program set by {setter}()", words.op_prefix);
                             if (platform, &op, &detail) != (words.platform, &want_op, &words.setter.to_owned()) {
                                 wrong.push(format!("{at}: refused as {op:?}: {detail}"));

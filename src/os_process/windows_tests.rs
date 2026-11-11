@@ -302,7 +302,10 @@ fn denied_open_source(
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("expected Unassessable, got {err:?}");
     };
-    source.expect("the OS error is preserved")
+    let Some(crate::error::Error::Io(os)) = source.map(|source| *source) else {
+        panic!("the OS error is preserved");
+    };
+    os
 }
 
 // OsChild =====

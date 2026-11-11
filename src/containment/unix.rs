@@ -569,7 +569,7 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
                     list = list(&unassessable),
                 ));
             }
-            Err(Error::Containment { detail })
+            Err(Error::Containment { detail, source: None })
         }
         // A listing that can never work here (no `openat2`) is the platform's `Unsupported`, as
         // from a wait or a spawn, not an unassessable group.
@@ -579,8 +579,12 @@ fn verify(pgid: i32, signal: Signal, root: &GroupRoot<'_>) -> Result<(), Error> 
             op: format!("listing process group {pgid}"),
             platform: std::env::consts::OS,
             detail: source.to_string(),
+            source: None,
         }),
-        group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable { detail, source }),
+        group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
+            detail,
+            source: source.map(Error::io_cause),
+        }),
     }
 }
 

@@ -116,6 +116,7 @@ impl SuspendedChild {
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
                         detail: format!("could not resume the frozen child: {e}"),
+                        source: None,
                     },
                     fate,
                     unreaped,

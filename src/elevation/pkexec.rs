@@ -104,6 +104,7 @@ impl PkexecVersion {
                  pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit \
                  {KEEP_CWD_SINCE} or later"
             ),
+            source: None,
         })
     }
 }

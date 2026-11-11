@@ -82,6 +82,7 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail,
+            ..
         } => {
             assert!(
                 detail.contains("/nonexistent/sudo"),
@@ -118,6 +119,7 @@ fn remap_passes_through_unrelated_errors() {
             op: "x".into(),
             platform: "unix",
             detail: "y".into(),
+            source: None,
         },
         std::path::Path::new("/nonexistent/sudo"),
     );
@@ -142,6 +144,7 @@ fn remap_backend_exists_but_not_executable_is_backend_unavailable() {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail,
+            ..
         } => {
             assert!(
                 detail.contains(backend_path.to_str().unwrap()),
@@ -329,7 +332,9 @@ fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
         setter: "argv[0] only here",
     };
     let refusal = |c: &Command| match super::elevation_argv(c, &WORDS) {
-        Err(Error::Unsupported { op, platform, detail }) => {
+        Err(Error::Unsupported {
+            op, platform, detail, ..
+        }) => {
             assert_eq!(platform, "test");
             format!("{op} / {detail}")
         }

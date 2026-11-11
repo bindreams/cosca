@@ -841,6 +841,7 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
         Err(crate::error::Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn");
@@ -884,6 +885,7 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
             Err(crate::error::Error::Elevation {
                 kind: crate::error::ElevationErrorKind::AuthFailed,
                 detail: "forced password-write failure".into(),
+                source: None,
             }),
         )
         .expect_err("a failed write fails the spawn")
@@ -1009,6 +1011,7 @@ fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: 
         Err(crate::error::Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
+            source: None,
         }),
     )
     .expect_err("a failed write fails the spawn");

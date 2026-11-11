@@ -1184,7 +1184,8 @@ use super::is_teardown_mechanism_failure;
 #[skuld::test]
 fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable() {
     assert!(!is_teardown_mechanism_failure(&crate::error::Error::Containment {
-        detail: "refused".into()
+        detail: "refused".into(),
+        source: None
     }));
     assert!(!is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
         detail: "unknown".into(),
@@ -1199,7 +1200,9 @@ fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable()
 fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
     assert!(is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
         detail: "process group 372 could not be listed after SIGKILL".into(),
-        source: Some(std::io::Error::other("sysctl KERN_PROC_PGRP failed"))
+        source: Some(Box::new(crate::error::Error::Io(std::io::Error::other(
+            "sysctl KERN_PROC_PGRP failed"
+        ))))
     }));
 }
 

@@ -648,6 +648,7 @@ pub(crate) mod fault {
             Forced::None => unreachable!("forced_terminate_error called with Forced::None"),
             Forced::Containment => crate::error::Error::Containment {
                 detail: "forced term_group refusal (test seam)".into(),
+                source: None,
             },
             Forced::UnassessablePerMember => crate::error::Error::Unassessable {
                 detail: "forced per-member unconfirmed state (test seam) — group::decide's shape".into(),
@@ -655,12 +656,15 @@ pub(crate) mod fault {
             },
             Forced::UnassessableMechanism => crate::error::Error::Unassessable {
                 detail: "forced listing-mechanism failure (test seam) — group::state's shape".into(),
-                source: Some(std::io::Error::other("forced (test seam)")),
+                source: Some(crate::error::Error::io_cause(std::io::Error::other(
+                    "forced (test seam)",
+                ))),
             },
             Forced::Unsupported => crate::error::Error::Unsupported {
                 op: "terminate_tree".into(),
                 platform: "test",
                 detail: "forced (test seam) — models NoConsole/Unsupported, NOT a #61 refusal".into(),
+                source: None,
             },
         }
     }

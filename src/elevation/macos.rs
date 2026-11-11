@@ -31,6 +31,7 @@ fn unsupported(op: &str, detail: String) -> Error {
         op: op.into(),
         platform: "macos",
         detail,
+        source: None,
     }
 }
 
@@ -156,6 +157,7 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
                      Shorten the command, or write the arguments to a file the elevated program reads",
                     script.len()
                 ),
+                source: None,
             });
         }
     }

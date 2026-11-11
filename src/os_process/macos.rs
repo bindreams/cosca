@@ -86,7 +86,7 @@ pub(crate) fn read_for_open(pid: u32, caller: &str, consequence: &str) -> Result
             log::warn!("{caller}: pid {pid} identity could not be read (errno {errno}); {consequence}");
             Err(Error::Unassessable {
                 detail: format!("pid {pid} identity could not be read (errno {errno}); {consequence}"),
-                source: Some(std::io::Error::from_raw_os_error(errno)),
+                source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
             })
         }
     }

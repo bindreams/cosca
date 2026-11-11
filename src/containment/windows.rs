@@ -1133,7 +1133,7 @@ pub(crate) fn wait_drained_raw(
                     detail: "could not open a handle to any live member of the contained tree \
                                  to observe its exit"
                         .into(),
-                    source: Some(e),
+                    source: Some(Error::io_cause(e)),
                 });
             }
             // Every candidate in this round's batch had already exited by the time we tried

@@ -69,7 +69,7 @@ fn snapshot_failed(call: &str, e: windows::core::Error) -> Error {
     );
     Error::Unassessable {
         detail: format!("the process snapshot could not be taken: {call} failed ({e})"),
-        source: Some(crate::error::win32_io_error(e)),
+        source: Some(Error::io_cause(crate::error::win32_io_error(e))),
     }
 }
 

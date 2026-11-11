@@ -285,7 +285,7 @@ fn breakaway_with_containment_is_refused() {
 #[skuld::test]
 fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
     let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), breakaway(), JobBreakaway::Forbidden);
-    let Error::Containment { detail } = out else {
+    let Error::Containment { detail, .. } = out else {
         panic!("expected Containment, got {out:?}");
     };
     assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
@@ -340,11 +340,15 @@ fn a_non_io_error_is_returned_unchanged() {
             op: "some op".into(),
             platform: "windows",
             detail: "some detail".into(),
+            source: None,
         },
         breakaway(),
         JobBreakaway::Forbidden,
     );
-    let Error::Unsupported { op, platform, detail } = &out else {
+    let Error::Unsupported {
+        op, platform, detail, ..
+    } = &out
+    else {
         panic!("a non-Io error must pass through unchanged, got {out:?}");
     };
     assert_eq!(

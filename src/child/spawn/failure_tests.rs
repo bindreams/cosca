@@ -257,7 +257,10 @@ fn map_keeps_the_answer_the_fate_and_the_flag() {
 #[skuld::test]
 fn a_note_on_a_may_have_started_error_reaches_its_cause() {
     let error = Error::from(SpawnFailure::started(
-        Error::Containment { detail: "x".into() },
+        Error::Containment {
+            detail: "x".into(),
+            source: None,
+        },
         ChildFate::Gone,
         None,
     ))
@@ -267,7 +270,7 @@ fn a_note_on_a_may_have_started_error_reaches_its_cause() {
     };
     assert_eq!(*fate, ChildFate::Gone);
     assert!(
-        matches!(**source, Error::Containment { ref detail } if detail == "x; front left"),
+        matches!(**source, Error::Containment { ref detail, .. } if detail == "x; front left"),
         "{source:?}"
     );
 }

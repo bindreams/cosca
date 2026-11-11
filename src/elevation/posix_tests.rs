@@ -783,7 +783,7 @@ mod rewrite_tests {
         let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
         match rewrite_with_host(&mut c, &host) {
-            Err(Error::Elevation { kind, detail }) => {
+            Err(Error::Elevation { kind, detail, .. }) => {
                 assert_eq!(kind, crate::error::ElevationErrorKind::BackendUnavailable);
                 assert!(detail.contains("osascript"), "{detail}");
             }

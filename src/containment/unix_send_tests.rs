@@ -279,7 +279,7 @@ fn a_member_probe_is_a_recorded_send() {
         );
     }
     match result {
-        Err(crate::error::Error::Containment { detail }) => {
+        Err(crate::error::Error::Containment { detail, .. }) => {
             assert!(members.iter().all(|m| detail.contains(&m.to_string())), "{detail}");
         }
         other => panic!("the refused probes leave the members refused, got {other:?}"),

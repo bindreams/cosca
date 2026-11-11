@@ -416,7 +416,9 @@ fn a_scope_read_failure_keeps_the_path_and_the_cause() {
         detail.contains("/proc/sys/kernel/random/boot_id"),
         "the failing path must be in the detail, got {detail:?}"
     );
-    let source = source.as_ref().expect("the io error must be preserved as the source");
+    let Some(Error::Io(source)) = source.as_deref() else {
+        panic!("the io error must be preserved as the source, got {source:?}");
+    };
     assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     // And the rendered message must not just repeat the variant's own text.
     let rendered = e.to_string();
@@ -445,10 +447,10 @@ fn a_failed_scope_read_aborts_writing_a_record() {
         panic!("expected Error::IdentityRecord, got {e:?}");
     };
     assert_eq!(*kind, RecordErrorKind::ScopeUnreadable);
-    assert_eq!(
-        source.as_ref().expect("cause preserved").kind(),
-        std::io::ErrorKind::PermissionDenied
-    );
+    let Some(Error::Io(cause)) = source.as_deref() else {
+        panic!("cause preserved, got {source:?}");
+    };
+    assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[skuld::test]
@@ -618,10 +620,10 @@ fn an_unreadable_boot_session_is_reported_with_its_path_and_cause() {
     };
     assert_eq!(*kind, RecordErrorKind::ScopeUnreadable);
     assert!(detail.contains("/proc/cosca-no-such-boot-id"), "{detail}");
-    assert_eq!(
-        source.as_ref().expect("cause preserved").kind(),
-        std::io::ErrorKind::NotFound
-    );
+    let Some(Error::Io(cause)) = source.as_deref() else {
+        panic!("cause preserved, got {source:?}");
+    };
+    assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[cfg(target_os = "linux")]

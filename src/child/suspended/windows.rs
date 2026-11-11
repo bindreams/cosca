@@ -71,6 +71,7 @@ pub(crate) fn spawn_frozen<T>(
             detail: "an elevated spawn goes through ShellExecuteEx, which cannot create a process \
                      suspended; drop one of the two"
                 .into(),
+            source: None,
         });
     }
     let wanted_kill_on_drop = cmd.kill_on_drop_flag();

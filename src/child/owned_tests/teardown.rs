@@ -390,6 +390,7 @@ fn a_refusal_is_classified_by_what_it_is() {
     let denied = || Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     let contained = || Error::Containment {
         detail: "refused".into(),
+        source: None,
     };
     let kinds = [
         (denied(), std::io::ErrorKind::PermissionDenied),
