@@ -309,6 +309,10 @@ joined with `#[fixture(unprivileged)] _group: &Group`, selected by `SKULD_LABELS
 root step of CI selects its tests by label, so none runs it; a root run of the unfiltered suite sets
 `COSCA_TEST_UNPRIVILEGED=0`.
 
+`COSCA_TEST_` names only a group's switch (`COSCA_TEST_<GROUP>`) and its consent
+(`COSCA_TEST_<GROUP>_CONSENT`). Every other environment variable a test or its helper reads, a path, a knob or an
+internal marker, is `COSCA_TESTCFG_<NAME>`.
+
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
 the process.
@@ -337,7 +341,7 @@ the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` an
 namespaces) has a consent variable too. Both it and `COSCA_TEST_ROOT` (tests that need a DAC
 bypass) are `test_group!` rows in `src/test_groups.rs`, which gives their tests the off-switch, the
 consent check and a `SKULD_LABELS` label. A test joins with `#[fixture(namespaces)] _group: &Group`, not by name. So does `COSCA_TEST_SETUID` (tests that run a setuid-root
-copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the helper only in the
+copy of `cosca_testbin`, named by `COSCA_TESTCFG_SETUID_HELPER`): CI provisions the helper only in the
 Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there.
 `SKULD_LABELS=setuid` selects its tests, and `setuid_root` the one the Linux root-run step also
 runs. So does

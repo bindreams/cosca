@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Makes `sudo` on a throwaway Linux or macOS CI runner honest for the ELEVATION group's live tests.
 #
-# Usage (every form starts with the flag; the password is in COSCA_TEST_ELEVATION_PASSWORD):
+# Usage (every form starts with the flag; the password is in COSCA_TESTCFG_ELEVATION_PASSWORD):
 #   elevation-lane-sudoers.sh --this-machine-is-disposable --create-account <user>   # macOS only
 #   elevation-lane-sudoers.sh --this-machine-is-disposable <user> <cosca_testbin>
 #   elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup <user>
@@ -72,7 +72,7 @@ case "${1:-}" in
         exit 2
     fi
     account="${2:?usage: $0 --this-machine-is-disposable --create-account <user>}"
-    : "${COSCA_TEST_ELEVATION_PASSWORD:?the password for the new account}"
+    : "${COSCA_TESTCFG_ELEVATION_PASSWORD:?the password for the new account}"
     if dscl . -read "/Users/$account" >/dev/null 2>&1; then
         echo "the account $account already exists; refusing to adopt it" >&2
         exit 1
@@ -80,7 +80,7 @@ case "${1:-}" in
     # The record first (exclusively: it is also the refusal of a second setup), then the account. A marker
     # without an account is fine for `--cleanup`; an account without a marker would be left behind.
     write_marker "$account"
-    sudo sysadminctl -addUser "$account" -password "$COSCA_TEST_ELEVATION_PASSWORD"
+    sudo sysadminctl -addUser "$account" -password "$COSCA_TESTCFG_ELEVATION_PASSWORD"
     exit 0
     ;;
 --cleanup)
@@ -90,9 +90,9 @@ case "${1:-}" in
         exit 0
     fi
     if [[ "$darwin" != true ]]; then
-        : "${COSCA_TEST_ELEVATION_PASSWORD:?the password the setup set}"
+        : "${COSCA_TESTCFG_ELEVATION_PASSWORD:?the password the setup set}"
         # The user's own `sudo` asks its password until the rules file is gone.
-        printf '%s\n' "$COSCA_TEST_ELEVATION_PASSWORD" | sudo -S rm -f "$rules_file"
+        printf '%s\n' "$COSCA_TESTCFG_ELEVATION_PASSWORD" | sudo -S rm -f "$rules_file"
     fi
     recorded="$(sudo cat "$marker")"
     if [[ "$darwin" == true ]]; then
@@ -142,7 +142,7 @@ if [[ $# -ne 2 ]]; then
 fi
 user="$1"
 testbin="$2"
-: "${COSCA_TEST_ELEVATION_PASSWORD:?the password the tests deliver to sudo}"
+: "${COSCA_TESTCFG_ELEVATION_PASSWORD:?the password the tests deliver to sudo}"
 
 if [[ "$testbin" != /* || ! -x "$testbin" ]]; then
     echo "cosca_testbin must be an absolute path to an executable file: $testbin" >&2
@@ -171,7 +171,7 @@ else
         exit 1
     fi
     write_marker "$user:$original_entry" || exit 1
-    printf '%s:%s\n' "$user" "$COSCA_TEST_ELEVATION_PASSWORD" | sudo chpasswd
+    printf '%s:%s\n' "$user" "$COSCA_TESTCFG_ELEVATION_PASSWORD" | sudo chpasswd
 fi
 sudo install -m 0440 -o root -g 0 "$rules" "$rules_file"
 
@@ -205,7 +205,7 @@ case "$whoami_out" in
     exit 1
     ;;
 esac
-if [[ "$(printf '%s\n' "$COSCA_TEST_ELEVATION_PASSWORD" | as_user sudo -S whoami)" != root ]]; then
+if [[ "$(printf '%s\n' "$COSCA_TESTCFG_ELEVATION_PASSWORD" | as_user sudo -S whoami)" != root ]]; then
     echo "sudo -S whoami with the password did not run as root" >&2
     exit 1
 fi

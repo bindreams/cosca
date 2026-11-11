@@ -1,14 +1,14 @@
 //! The helper side of the `SETUID` group (`test_groups.rs`): tests that need a real setuid-root
 //! helper. Depends only on std and libc, so an integration test includes this file with `#[path]`.
 //!
-//! `COSCA_TEST_SETUID_HELPER` names a copy of `cosca_testbin` that is owned by root with the
+//! `COSCA_TESTCFG_SETUID_HELPER` names a copy of `cosca_testbin` that is owned by root with the
 //! set-user-ID bit, on a filesystem not mounted `nosuid`.
 
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-const HELPER: &str = "COSCA_TEST_SETUID_HELPER";
+const HELPER: &str = "COSCA_TESTCFG_SETUID_HELPER";
 
 /// The helper's path. Call it only from a test that joined the `SETUID` group.
 ///
@@ -40,7 +40,7 @@ pub fn stat(path: &Path) -> std::io::Result<Meta> {
 /// The validated helper path.
 ///
 /// # Panics
-/// When `helper` (`COSCA_TEST_SETUID_HELPER`) is unset, when `stat` fails, when the path is not a
+/// When `helper` (`COSCA_TESTCFG_SETUID_HELPER`) is unset, when `stat` fails, when the path is not a
 /// regular file, when the file is not owned by root with the set-user-ID bit, or when the caller
 /// (`euid`) is root, since then nothing is unsignalable by it.
 pub fn check_helper(helper: Option<OsString>, stat: impl FnOnce(&Path) -> std::io::Result<Meta>, euid: u32) -> PathBuf {

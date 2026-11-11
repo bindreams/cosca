@@ -265,7 +265,7 @@ impl ShimRig {
             command.env("COSCA_SEAM_EXHAUST_FDS", "1");
         }
         if spec.shipped {
-            command.env("COSCA_TEST_SHIM_SHIPPED", "1");
+            command.env("COSCA_TESTCFG_SHIM_SHIPPED", "1");
         }
         for (name, value) in &spec.raw_seams {
             command.env(name, value);

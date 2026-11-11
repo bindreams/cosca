@@ -26,7 +26,7 @@ use super::accept::{
 
 /// Env var telling a `spawn-grandchild*` testbin root where to report its grandchild's pid.
 /// Unset, the root reports nothing, so other consumers of these modes see no extra connection.
-pub const GC_PID_ADDR_ENV: &str = "COSCA_TEST_GC_PID_ADDR";
+pub const GC_PID_ADDR_ENV: &str = "COSCA_TESTCFG_GC_PID_ADDR";
 
 thread_local! {
     static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };

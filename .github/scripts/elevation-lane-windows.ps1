@@ -210,8 +210,8 @@ try {
         "set TMP=$tmp",
         'set COSCA_TEST_ELEVATION=1',
         'set COSCA_TEST_ELEVATION_CONSENT=1',
-        'set COSCA_TEST_ELEVATION_EXPECT_KILL=ok',
-        "set COSCA_TEST_ELEVATION_MARKER_DIR=$marker",
+        'set COSCA_TESTCFG_ELEVATION_EXPECT_KILL=ok',
+        "set COSCA_TESTCFG_ELEVATION_MARKER_DIR=$marker",
         'set SKULD_LABELS=elevation',
         "set NEXTEST_PROFILE=$nextestProfile",
         "`"$(Join-Path $bin 'cargo-nextest.exe')`" nextest run --archive-file `"$(Join-Path $bin 'elevation.tar.zst')`" --extract-to `"$extract`" --workspace-remap `"$workspace`" --no-tests=fail -E `"binary(=elevation)`" > `"$out`" 2>&1"

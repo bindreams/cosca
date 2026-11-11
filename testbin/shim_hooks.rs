@@ -18,9 +18,9 @@
 //!
 //! [`init`] is what the test binaries call first in `main`. Two variables change what it does:
 //!
-//! - `COSCA_TEST_SHIM_SHIPPED`: the process runs the shim as a host ships it, through `cosca::init()`
+//! - `COSCA_TESTCFG_SHIM_SHIPPED`: the process runs the shim as a host ships it, through `cosca::init()`
 //!   with no hooks, whatever else the environment says.
-//! - `COSCA_TEST_INIT_PROBE`: the process prints whether `cosca::installed()` held before and after
+//! - `COSCA_TESTCFG_INIT_PROBE`: the process prints whether `cosca::installed()` held before and after
 //!   `cosca::init()`, and exits.
 
 use std::ffi::OsString;
@@ -54,7 +54,7 @@ fn flag(name: &str) -> bool {
 
 /// Starts the shim if this process was started as one, and otherwise returns.
 pub fn init() {
-    if var("COSCA_TEST_INIT_PROBE").is_some() {
+    if var("COSCA_TESTCFG_INIT_PROBE").is_some() {
         let before = cosca::installed();
         cosca::init();
         // Not `quiet_io`: the lib's unit-test binary includes this file too. A closed stdout is a
@@ -63,11 +63,11 @@ pub fn init() {
         match writeln!(out, "installed before={before} after={}", cosca::installed()).and_then(|()| out.flush()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => panic!("COSCA_TEST_INIT_PROBE: write stdout: {e}"),
+            Err(e) => panic!("COSCA_TESTCFG_INIT_PROBE: write stdout: {e}"),
         }
         std::process::exit(0);
     }
-    if var("COSCA_TEST_SHIM_SHIPPED").is_some() {
+    if var("COSCA_TESTCFG_SHIM_SHIPPED").is_some() {
         cosca::init();
     } else {
         cosca::init_with_test_hooks(&HOOKS);

@@ -10,8 +10,8 @@ use crate::test_own_process_gate::{child_args, is_reexecution, ENV};
 use crate::test_spawn::spawn;
 
 const FIXTURE: &str = "test_own_process_tests::fixture_records_its_pid_and_misbehaves_on_request";
-const MODE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_MODE";
-const PIDFILE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_PIDFILE";
+const MODE: &str = "COSCA_TESTCFG_OWN_PROCESS_FIXTURE_MODE";
+const PIDFILE: &str = "COSCA_TESTCFG_OWN_PROCESS_FIXTURE_PIDFILE";
 
 // The gated body =====
 

@@ -449,8 +449,8 @@ jobs:
       - name: Check the setuid lane (Linux)
         if: matrix.os == 'linux'
         env:
-          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
-        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
+          COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
+        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TESTCFG_SETUID_HELPER"
 
       - name: Build setuid tests (Linux)
         if: matrix.os == 'linux'
@@ -463,7 +463,7 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
+          COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
 
@@ -481,7 +481,7 @@ jobs:
           COSCA_TEST_CGROUP_CONSENT: "1"
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
+          COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: cgroup & setuid
         run: |
           # shellcheck disable=SC2016 # the inner shell expands its own variables
@@ -510,7 +510,7 @@ jobs:
       # helper must all be reachable by that uid: every directory above the checkout and the
       # extraction directory is made traversable and `target` readable. `--extract-to` is what lets
       # nextest run an archive there: its default extraction directory is root-only. `sudo --preserve-env` keeps
-      # COSCA_TEST_SETUID_HELPER and the group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
+      # COSCA_TESTCFG_SETUID_HELPER and the group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
       - name: Archive the setuid-root process-group teardown test (Linux)
         id: lin_setuid_archive
         if: matrix.os == 'linux'
@@ -533,11 +533,11 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
+          COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid_root
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TEST_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -euxc '
+          exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TESTCFG_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci-setuid-root --no-tests=fail -E "binary(group_teardown_setuid)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
@@ -710,7 +710,7 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-          COSCA_TEST_SETUID_HELPER: ${{ steps.mac_helper.outputs.helper }}
+          COSCA_TESTCFG_SETUID_HELPER: ${{ steps.mac_helper.outputs.helper }}
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
 
@@ -873,7 +873,7 @@ jobs:
           password="$(openssl rand -hex 16)"
           echo "::add-mask::$password"
           echo "password=$password" >> "$GITHUB_OUTPUT"
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/$TARGET/debug/cosca_testbin"
+          COSCA_TESTCFG_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/$TARGET/debug/cosca_testbin"
 
       - name: Elevation (Linux) - run the elevation tests
         id: lin_elev_run
@@ -883,7 +883,7 @@ jobs:
         env:
           COSCA_TEST_ELEVATION: "1"
           COSCA_TEST_ELEVATION_CONSENT: "1"
-          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
+          COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
           SKULD_LABELS: elevation
         run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --target ${{ matrix.target }} --no-tests=fail -E 'binary(=elevation)'
 
@@ -901,7 +901,7 @@ jobs:
         if: ${{ always() && steps.lin_elev_sudo.outcome != 'skipped' && steps.lin_elev_sudo.outcome != '' }}
         shell: bash
         env:
-          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
+          COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
         run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
 
       - name: Elevation (Linux) - revert unattended GUI elevation
@@ -1109,11 +1109,11 @@ jobs:
           password="$(openssl rand -hex 16)"
           echo "::add-mask::$password"
           echo "password=$password" >> "$GITHUB_OUTPUT"
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --create-account coscaelev
+          COSCA_TESTCFG_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --create-account coscaelev
           # Listing extracts the archive, so the test binaries and `cosca_testbin` belong to the user.
           sudo -u coscaelev -H "$(command -v cargo-nextest)" nextest list --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
             --extract-to "$RUNNER_TEMP/elevation-extract" --workspace-remap "$PWD" > /dev/null
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable coscaelev "$RUNNER_TEMP/elevation-extract/target/$TARGET/debug/cosca_testbin"
+          COSCA_TESTCFG_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable coscaelev "$RUNNER_TEMP/elevation-extract/target/$TARGET/debug/cosca_testbin"
 
       - name: Elevation (macOS) - run the elevation tests
         id: mac_elev_run
@@ -1121,14 +1121,14 @@ jobs:
         timeout-minutes: 10
         shell: bash
         env:
-          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.mac_elev_user.outputs.password }}
+          COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.mac_elev_user.outputs.password }}
           SELECTION: binary(=elevation)
         # The forwarder runs as root (`sudo -E`), so the step's bound can signal the user's whole process tree.
         run: |
           exec python3 .github/scripts/run-nextest.py elevation sudo -E "$(command -v python3)" .github/scripts/forward.py \
             sudo -u coscaelev -H env \
             COSCA_TEST_ELEVATION=1 COSCA_TEST_ELEVATION_CONSENT=1 SKULD_LABELS=elevation \
-            COSCA_TEST_ELEVATION_PASSWORD="$COSCA_TEST_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
+            COSCA_TESTCFG_ELEVATION_PASSWORD="$COSCA_TESTCFG_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
             "$(command -v cargo-nextest)" nextest run --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
             --extract-to "$RUNNER_TEMP/elevation-extract" --extract-overwrite --workspace-remap "$PWD" --no-tests=fail -E "$SELECTION"
 

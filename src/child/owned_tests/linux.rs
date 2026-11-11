@@ -5,8 +5,8 @@ use crate::child::owned::OwnedChild;
 
 // The pidfd's number =====
 
-const SLOT_MARKER: &str = "COSCA_TEST_OWNED_STDIO_SLOT";
-const SLOT_CASE_ENV: &str = "COSCA_TEST_OWNED_STDIO_SLOT_CASE";
+const SLOT_MARKER: &str = "COSCA_TESTCFG_OWNED_STDIO_SLOT";
+const SLOT_CASE_ENV: &str = "COSCA_TESTCFG_OWNED_STDIO_SLOT_CASE";
 
 /// The adopted pidfd never sits in a stdio slot, even when 0, 1 or 2 is closed at adoption: an
 /// application that restores its stdio with `dup2` afterwards would otherwise destroy it.

@@ -19,7 +19,7 @@ use std::net::TcpListener;
 mod common;
 
 #[cfg(windows)]
-const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
+const SEAM_ENV: &str = "COSCA_TESTCFG_ACK_SEAM";
 
 #[cfg(windows)]
 /// How a mode is launched and read.

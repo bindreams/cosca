@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
 /// Set (to any value) in a target's environment to make its connections wait for the ack.
-pub const ACK_ENV: &str = "COSCA_TEST_ACCEPT_ACK";
+pub const ACK_ENV: &str = "COSCA_TESTCFG_ACCEPT_ACK";
 
 /// The single byte the harness writes to a connection right after accepting it.
 pub const ACK_BYTE: u8 = 0xA5;
@@ -37,7 +37,7 @@ pub fn enabled() -> bool {
 ///   [`ACK_ENV`] from its own environment, so only an explicit `.env` reaches its children.
 /// - [`SEAM_DIE`]: once connected the process sets [`SEAM_DIE_NOW`], under which a descendant's
 ///   connect exits before connecting: a child that dies before the mode's accept.
-pub const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
+pub const SEAM_ENV: &str = "COSCA_TESTCFG_ACK_SEAM";
 pub const SEAM_STRICT: &str = "strict";
 pub const SEAM_DIE: &str = "die";
 pub const SEAM_DIE_NOW: &str = "die-now";

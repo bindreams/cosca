@@ -6,7 +6,7 @@
 //! # The gate
 //!
 //! The parent re-executes the test binary as `<exe> <`[`child_args`]`>` with
-//! `COSCA_TEST_OWN_PROCESS=<parent pid>:<transport>:<test>`. A process takes the child role only if
+//! `COSCA_TESTCFG_OWN_PROCESS=<parent pid>:<transport>:<test>`. A process takes the child role only if
 //! all of these hold at once: the value's pid is its real parent's, its test is the one being
 //! gated, and its argv is exactly [`child_args`]. An environment variable alone is forgeable and
 //! inheritable (a shell export, an outer harness, a grandchild); the parent pid binds the value to
@@ -22,7 +22,7 @@ use std::process::{Child, Command};
 pub(crate) type Spawn = fn(&mut Command) -> std::io::Result<Child>;
 
 /// The role marker: `<parent pid>:<transport>:<test>`. See the module doc.
-pub(crate) const ENV: &str = "COSCA_TEST_OWN_PROCESS";
+pub(crate) const ENV: &str = "COSCA_TESTCFG_OWN_PROCESS";
 
 /// The path of the test fn `$name` (sync or `async`), for `own_process`. `let _ = $name;` makes a
 /// stale name a compile error rather than a filter that matches nothing.

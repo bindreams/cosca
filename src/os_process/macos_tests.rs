@@ -413,7 +413,7 @@ fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
     tracer.wait().expect("reap the stand-in tracer");
 }
 
-const KQUEUE_MARKER: &str = "COSCA_TEST_MACCHILD_KQUEUE";
+const KQUEUE_MARKER: &str = "COSCA_TESTCFG_MACCHILD_KQUEUE";
 
 /// A refused kqueue fails the adoption with the refusal, instead of an adopted child that can
 /// never be waited on. The descriptor table is full from the fixture's own lowered limit, so the
@@ -427,7 +427,7 @@ fn adoption_fails_when_a_kqueue_cannot_be_made() {
         crate::test_child::run_fixture_case(
             crate::test_child::fixture_path!(adoption_fails_when_a_kqueue_cannot_be_made),
             KQUEUE_MARKER,
-            "COSCA_TEST_MACCHILD_KQUEUE_CASE",
+            "COSCA_TESTCFG_MACCHILD_KQUEUE_CASE",
             "",
         );
         return;

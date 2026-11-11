@@ -135,7 +135,7 @@ fn fake_pkexec(args: &[String]) {
     writeln!(f, "{line}").expect("append to the log");
 }
 
-/// If root, become the `uid:gid` the test names in `COSCA_TEST_DROP_TO`: one the test checked this
+/// If root, become the `uid:gid` the test names in `COSCA_TESTCFG_DROP_TO`: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
 /// (`/proc/self/setgroups` reads `deny`), leaving the supplementary groups root had. Runs
 /// single-threaded, before anything else in the mode.
@@ -145,8 +145,8 @@ fn drop_root() {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
-    let target = std::env::var("COSCA_TEST_DROP_TO").expect("a root testbin needs COSCA_TEST_DROP_TO=uid:gid");
-    let (uid, gid) = target.split_once(':').expect("COSCA_TEST_DROP_TO is uid:gid");
+    let target = std::env::var("COSCA_TESTCFG_DROP_TO").expect("a root testbin needs COSCA_TESTCFG_DROP_TO=uid:gid");
+    let (uid, gid) = target.split_once(':').expect("COSCA_TESTCFG_DROP_TO is uid:gid");
     let uid: libc::uid_t = uid.parse().expect("uid");
     let gid: libc::gid_t = gid.parse().expect("gid");
     let setgroups_denied = std::fs::read_to_string("/proc/self/setgroups").is_ok_and(|s| s.trim() == "deny");
@@ -309,7 +309,7 @@ fn hold(sock: &mut std::net::TcpStream) {
     }
 }
 
-/// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TEST_GC_PID_ADDR`,
+/// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TESTCFG_GC_PID_ADDR`,
 /// report its pid there as one `<pid>\n` line on a throwaway connection, then wait for the
 /// harness's release (the second ack) before returning. The harness resolves the grandchild's
 /// identity while this root is held here, alive and still its parent, so the pid names the
@@ -327,7 +327,7 @@ fn hold(sock: &mut std::net::TcpStream) {
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     // `connect_control` waits for the first ack: the harness has accepted this connection.
-    let report = std::env::var_os("COSCA_TEST_GC_PID_ADDR")
+    let report = std::env::var_os("COSCA_TESTCFG_GC_PID_ADDR")
         .map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
     #[allow(
         clippy::disallowed_methods,
@@ -658,7 +658,7 @@ fn main() {
         "control-once" => {
             // Like control-block, but exits immediately after the tag instead of blocking: the
             // shape of a target that connects and dies before the harness accepts. Run without
-            // the accept handshake (the harness sets no `COSCA_TEST_ACCEPT_ACK`), this is a
+            // the accept handshake (the harness sets no `COSCA_TESTCFG_ACCEPT_ACK`), this is a
             // target that does not wait for the ack, which the harness reports as dead.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
@@ -753,7 +753,7 @@ fn main() {
         }
         "spawn-grandchild-report-eof" => {
             // Connects to the pid report address, then exits without reporting anything.
-            let addr = std::env::var("COSCA_TEST_GC_PID_ADDR").expect("COSCA_TEST_GC_PID_ADDR");
+            let addr = std::env::var("COSCA_TESTCFG_GC_PID_ADDR").expect("COSCA_TESTCFG_GC_PID_ADDR");
             let _sock = crate::ack::connect_control(addr).unwrap();
         }
         "hold-until-stdin-eof" => {
@@ -808,7 +808,7 @@ fn main() {
         #[cfg(unix)]
         "setuid-control-block" => {
             // Only ever exec'd from a SEPARATE, pre-provisioned copy of this binary that CI
-            // chowns root:root and chmods u+s (see `COSCA_TEST_SETUID_HELPER` in
+            // chowns root:root and chmods u+s (see `COSCA_TESTCFG_SETUID_HELPER` in
             // tests/group_teardown_setuid.rs). Reports readiness (or a provisioning
             // failure) as ONE line, then blocks like control-block. A single connect: every
             // outcome — success or failure — is reported over the SAME socket, so the

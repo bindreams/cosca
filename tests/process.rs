@@ -675,7 +675,8 @@ fn seamed_control_block(seam: &str, opted_in: bool) -> (std::process::Child, std
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = std::process::Command::new(common::testbin());
-    cmd.args(["control-block", &addr, "T"]).env("COSCA_TEST_ACK_SEAM", seam);
+    cmd.args(["control-block", &addr, "T"])
+        .env("COSCA_TESTCFG_ACK_SEAM", seam);
     if opted_in {
         cmd.env(common::ACK_ENV, "1");
     }

@@ -225,8 +225,8 @@ fn merge_to_merge_is_rejected() {
 fn env_variable_reaches_child() {
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
-        .args(["cosca_testbin", "env", "COSCA_TEST_VAR"])
-        .env("COSCA_TEST_VAR", "hello123")
+        .args(["cosca_testbin", "env", "COSCA_TESTCFG_VAR"])
+        .env("COSCA_TESTCFG_VAR", "hello123")
         .stdout(Stdio::pipe())
         .expect("stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -235,7 +235,7 @@ fn env_variable_reaches_child() {
     reader.read_to_string(&mut out).expect("read");
     drop(reader);
     let _ = child.wait();
-    assert_eq!(out.trim(), "COSCA_TEST_VAR=hello123");
+    assert_eq!(out.trim(), "COSCA_TESTCFG_VAR=hello123");
 }
 
 #[skuld::test]
@@ -1794,12 +1794,12 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child(#[f
 /// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`] closes:
 /// comma-separated, empty for none.
 #[cfg(target_os = "linux")]
-const CLOSED_SLOTS_ENV: &str = "COSCA_TEST_CLOSED_SLOTS";
+const CLOSED_SLOTS_ENV: &str = "COSCA_TESTCFG_CLOSED_SLOTS";
 
 /// Set to deny `pidfd_open` in one case of
 /// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`].
 #[cfg(target_os = "linux")]
-const DENY_PIDFD_ENV: &str = "COSCA_TEST_DENY_PIDFD";
+const DENY_PIDFD_ENV: &str = "COSCA_TESTCFG_DENY_PIDFD";
 
 /// Make `pidfd_open` fail with `EPERM` on the calling thread and every process it forks, as a
 /// seccomp-filtered container does.

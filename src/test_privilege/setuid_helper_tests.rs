@@ -37,7 +37,7 @@ fn setuid_check_helper_panics_naming_the_variable_when_it_is_unset() {
     let msg = panic_message(|| {
         check_helper(None, stat_of(SETUID_ROOT), 1000);
     });
-    assert!(msg.contains("COSCA_TEST_SETUID_HELPER is not set"), "{msg}");
+    assert!(msg.contains("COSCA_TESTCFG_SETUID_HELPER is not set"), "{msg}");
 }
 
 #[skuld::test]
