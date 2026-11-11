@@ -723,7 +723,8 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(#
     });
 }
 
-/// A reaped root's group is not signalled by its number.
+/// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
+/// number its own while the call runs.
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {

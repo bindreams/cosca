@@ -18,7 +18,7 @@ use super::{LateTree, Sweep};
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::os_process::child::PeekOutcome;
-use crate::test_groups::{tracer_group, Group};
+use crate::test_groups::{stray_signal, tracer_group, Group};
 use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
 
 // What the one warn says =====
@@ -1455,7 +1455,7 @@ fn macos_an_unverified_child_is_said_to_be_unsignalled_because_it_could_not_be_v
 /// that sweep's send by its group's number: the check right before the send sees the reap, and
 /// nothing goes by that number. Mutant: "the late tree's check always passes".
 #[skuld::test]
-fn macos_late_tree_checks_the_root_again_before_a_send_by_number() {
+fn macos_late_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     use crate::child::spawn::fault::{set_at, SpawnPoint};
     use crate::graceful_hooks::{at, HookPoint};
     use std::cell::RefCell;

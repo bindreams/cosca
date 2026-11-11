@@ -3,6 +3,7 @@
 // (`unix_kill_tree_reaps_the_grandchild` in `tests/spawn_io.rs`).
 
 use super::{kill_group, term_group};
+use crate::test_groups::{stray_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
 
 // This file deliberately has NO "absent group" test that calls kill_group/term_group on a
@@ -48,7 +49,7 @@ fn await_zombie(pid: u32) {
 /// involved, and a correct implementation never reaches the `killpg`/`signal_direct` calls
 /// this guards, so there is nothing to signal even if the test is wrong.
 #[skuld::test]
-fn kill_group_and_term_group_reject_non_positive_pgid() {
+fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _stray: &Group) {
     for pgid in [0, -1, i32::MIN] {
         let kill_err =
             kill_group(pgid, Some(&StatedRoot::unreaped())).expect_err("kill_group(non-positive) must be Err");

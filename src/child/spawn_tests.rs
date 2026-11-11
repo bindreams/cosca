@@ -14,7 +14,9 @@ use crate::error::ChildFate;
 use crate::error::Error;
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, setuid, Group};
+use crate::test_groups::{cgroup, setuid};
+#[cfg(unix)]
+use crate::test_groups::{stray_signal, Group};
 
 /// A command for a child that only a real kill ends and that the test never holds, for the macOS
 /// tests whose child is left alone: its stdin writer is leaked.
@@ -1369,7 +1371,7 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 /// Mutant: `finish_elevated` runs `hard_kill` before it learns the root was reaped.
 #[cfg(unix)]
 #[skuld::test]
-fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let recorder = crate::containment::unix::fault::record_kill_group();

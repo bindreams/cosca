@@ -5,7 +5,7 @@
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::{pidfd_group_signal, stray_signal, Group};
 
 /// Who reaps the root.
 #[derive(Debug, Clone, Copy)]
@@ -71,10 +71,13 @@ fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let (child, member) = root_with_a_member();
     reap_root(&child, reap);
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let groups = crate::containment::unix::fault::record_kill_group();
     let capture = Capture::start();
     tear_down(child, teardown);
     let steps = capture.group_steps();
-    drop(old_kernel);
+    drop((old_kernel, refused));
+    assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
     assert_eq!(steps, [], "nothing was sent to the group");
     member.assert_survived();
 }
@@ -144,6 +147,7 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing
 #[skuld::test]
 fn a_drop_after_its_own_wait_sends_nothing_to_an_empty_group_and_does_not_warn(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Own, Teardown::Drop);
 }
@@ -151,6 +155,7 @@ fn a_drop_after_its_own_wait_sends_nothing_to_an_empty_group_and_does_not_warn(
 #[skuld::test]
 fn a_drop_after_a_foreign_reap_sends_nothing_to_an_empty_group_and_does_not_warn(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Foreign, Teardown::Drop);
 }
@@ -158,6 +163,7 @@ fn a_drop_after_a_foreign_reap_sends_nothing_to_an_empty_group_and_does_not_warn
 #[skuld::test]
 fn a_failed_elevated_spawns_cleanup_after_its_own_wait_reports_no_skip_for_an_empty_group(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Own, Teardown::FinishElevated);
 }
@@ -165,6 +171,7 @@ fn a_failed_elevated_spawns_cleanup_after_its_own_wait_reports_no_skip_for_an_em
 #[skuld::test]
 fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_reports_no_skip_for_an_empty_group(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Foreign, Teardown::FinishElevated);
 }
@@ -195,6 +202,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_kills_its_group_through_the_pidfd(
 #[skuld::test]
 fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_group(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     use crate::identity::Resolved;
     crate::log_capture::install();
@@ -255,6 +263,7 @@ fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown
 #[skuld::test]
 fn a_teardown_of_an_unreadable_handle_with_a_gone_number_and_an_empty_group_does_not_warn(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(Teardown::Drop);
 }
@@ -262,6 +271,7 @@ fn a_teardown_of_an_unreadable_handle_with_a_gone_number_and_an_empty_group_does
 #[skuld::test]
 fn a_failed_elevated_spawns_cleanup_of_an_unreadable_handle_with_a_gone_number_and_an_empty_group_does_not_warn(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(Teardown::FinishElevated);
 }
