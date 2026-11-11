@@ -954,6 +954,17 @@ jobs:
           # virtme-ng imports pkg_resources, which the runner's Python does not ship.
           pipx inject --force virtme-ng "setuptools==75.8.0"
 
+      # virtme-ng downloads each mainline kernel from kernel.ubuntu.com into this directory and skips the download
+      # when it is already there. A tag's packages never change, so a cached copy keeps that host off the gate.
+      - name: "Shim on Linux: cache the old kernels"
+        if: ${{ !cancelled() && steps.shim_vng.outcome == 'success' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cache/virtme-ng/v5.6/amd64
+            ~/.cache/virtme-ng/v6.1/amd64
+          key: virtme-ng-mainline-v5.6-v6.1-amd64
+
       # The guest runs `cargo nextest run --lib` on this checkout, so the library's tests are built here first. The
       # test that refuses a setuid copy of the shim runs a setuid-root copy of the test binary, which the guest makes;
       # the binary is built here, as the user who owns the checkout.
