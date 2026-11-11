@@ -50,11 +50,6 @@ system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To kee
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
 table of `~/.cargo/config.toml`.
 
-`SIGNAL_BY_NUMBER` (`COSCA_TEST_SIGNAL_BY_NUMBER`) holds the tests that signal a pid or process-group
-number, which would reach an unrelated process if the number were wrong. It needs
-`COSCA_TEST_SIGNAL_BY_NUMBER_CONSENT=1`, which CI gives on its throwaway runners; on your own machine
-set `COSCA_TEST_SIGNAL_BY_NUMBER=0` to skip it, or run it in a container or VM.
-
 `ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
 `osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
 `COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the `elevation_*` jobs in `.github/workflows/ci.yaml` do (passwords,
@@ -62,6 +57,12 @@ polkit, `doas`). Those setups change system policy (the polkit rule, the macOS a
 `ConsentPromptBehaviorAdmin` value), so undo them when you are done: `unattended-gui-elevation.py` saves the prior
 state and restores it with `--revert` (same guard and root check as enabling; on Linux pass the same `--user`), and
 `elevation-lane-sudoers.sh --cleanup` and `elevation-lane-linux.sh --cleanup` undo the rest.
+
+`STRAY_SIGNAL` (`COSCA_TEST_STRAY_SIGNAL`) holds the tests that, if the code they test regressed, could
+signal an unrelated process of yours: they signal a number no live process of the test pins, or walk from
+the pid of a root they reaped. It needs `COSCA_TEST_STRAY_SIGNAL_CONSENT=1`, which CI gives in the
+`Run the stray-signal tests (Unix)` step on its throwaway runners; on your own machine set
+`COSCA_TEST_STRAY_SIGNAL=0` to skip it, or run it in a container or VM.
 
 ### Tests that need root
 

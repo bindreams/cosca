@@ -74,10 +74,9 @@ pub const ELEVATION: skuld::Label;
 #[skuld::label]
 pub const PIDFD_GROUP_SIGNAL: skuld::Label;
 
-/// Selects the `SIGNAL_BY_NUMBER` group's tests: those that signal a pid or process-group number
-/// which, if wrong, would reach an unrelated process.
+/// Selects the `STRAY_SIGNAL` group's tests: those whose failure may signal an unrelated process.
 #[skuld::label]
-pub const SIGNAL_BY_NUMBER: skuld::Label;
+pub const STRAY_SIGNAL: skuld::Label;
 
 /// Selects the `UNPRIVILEGED` group's tests: those that mean something only when the process holds no
 /// privilege (for one, `RLIMIT_NPROC` does not bind root).

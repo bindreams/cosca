@@ -12,7 +12,7 @@ use crate::test_child::reaped_elsewhere::{
     session_cat,
 };
 #[cfg(target_os = "macos")]
-use crate::test_groups::{signal_by_number, Group};
+use crate::test_groups::{stray_signal, Group};
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
 #[skuld::test]
@@ -434,7 +434,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send() {
 /// Mutants: `Ok` without the holders sweep; the tree not marked killed.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
+fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group(#[fixture(stray_signal)] _stray: &Group) {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
@@ -473,7 +473,7 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
 /// containment) still kills its holders.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
+fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders(#[fixture(stray_signal)] _stray: &Group) {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
@@ -521,7 +521,9 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
 /// descendants, and the drop warns that the group was not killed.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_the_holders() {
+fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_the_holders(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
@@ -576,7 +578,7 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_t
 /// Mutant: no holders sweep after a foreign reap.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
+fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group(#[fixture(stray_signal)] _stray: &Group) {
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
     let groups = record_kill_group();
@@ -616,7 +618,9 @@ fn kill_tree_after_a_foreign_reap_kills_a_holder_that_left_the_group() {
 /// assertion before the wait for the holder's death.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm() {
+fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigterm(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
     let killed = record_kill_group();
@@ -663,7 +667,7 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder(
-    #[fixture(signal_by_number)] _by_number: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_walk_warn, escaped_holder_tree};
     crate::log_capture::install();
@@ -698,7 +702,7 @@ fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_h
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder(
-    #[fixture(signal_by_number)] _by_number: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;

@@ -4,7 +4,7 @@ use super::{members, state, GroupState, Member};
 #[cfg(target_os = "linux")]
 use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
 use crate::identity::{HostKernel, Liveness, ProcessId};
-use crate::test_groups::{signal_by_number, Group};
+use crate::test_groups::{stray_signal, Group};
 use nix::sys::signal::Signal;
 
 fn is_alive(m: &Member) -> bool {
@@ -118,7 +118,7 @@ fn members_id_matches_a_live_read_of_the_same_pid() {
 /// A group we own holds no refusers once SIGKILLed — and `state` really did deliver the
 /// signal, not just classify: the leader is dead afterward.
 #[skuld::test]
-fn state_of_an_owned_group_is_cleared_and_the_signal_was_real(#[fixture(signal_by_number)] _by_number: &Group) {
+fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     use std::os::unix::process::ExitStatusExt;
 
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
@@ -149,7 +149,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real(#[fixture(signal_b
 /// A group whose only member is our own unreaped zombie is cleared: there is nothing left
 /// running. This is the benign case macOS reports as EPERM.
 #[skuld::test]
-fn state_of_an_all_zombie_group_is_cleared(#[fixture(signal_by_number)] _by_number: &Group) {
+fn state_of_an_all_zombie_group_is_cleared() {
     use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
@@ -303,7 +303,7 @@ fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
 /// **`reachable` is asked directly of the kernel, not derived from a hand-reconstructed
 /// permission rule.**
 #[skuld::test]
-fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(signal_by_number)] _by_number: &Group) {
+fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_signal)] _stray: &Group) {
     let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(1)))
         .expect("pid 1 has a process group")
         .as_raw();
@@ -488,9 +488,7 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
 /// goes through the pidfd.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cannot_be_opened(
-    #[fixture(signal_by_number)] _by_number: &Group,
-) {
+fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cannot_be_opened() {
     use crate::send_log::Capture;
 
     let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");

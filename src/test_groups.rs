@@ -204,7 +204,7 @@ test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attach
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
 test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");
 test_group!(PIDFD_GROUP_SIGNAL => pidfd_group_signal, env = "COSCA_TEST_PIDFD_GROUP_SIGNAL", precondition = kernel_signals_groups_through_pidfds);
-test_group!(SIGNAL_BY_NUMBER => signal_by_number, env = "COSCA_TEST_SIGNAL_BY_NUMBER", consent = "sends signals by a pid or process-group number the test computed, or by the number of a root it reaped, so a wrong number may reach an unrelated process or group");
+test_group!(STRAY_SIGNAL => stray_signal, env = "COSCA_TEST_STRAY_SIGNAL", consent = "may signal an unrelated process: it signals a number no live process of the test pins, or walks from the pid of a root it reaped");
 test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
 
 /// The `PIDFD_GROUP_SIGNAL` group's precondition: the kernel takes `PIDFD_SIGNAL_PROCESS_GROUP`

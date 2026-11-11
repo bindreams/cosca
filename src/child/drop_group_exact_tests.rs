@@ -5,7 +5,7 @@
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
-use crate::test_groups::{pidfd_group_signal, signal_by_number, Group};
+use crate::test_groups::{pidfd_group_signal, Group};
 
 /// Who reaps the root.
 #[derive(Debug, Clone, Copy)]
@@ -66,15 +66,19 @@ fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
 }
 
 /// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
-/// on.
+/// on. The recorder and the refusal stop a send by the reaped root's number, so a mutant that makes
+/// one reaches no process.
 fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let (child, member) = root_with_a_member();
     reap_root(&child, reap);
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let groups = crate::containment::unix::fault::record_kill_group();
     let capture = Capture::start();
     tear_down(child, teardown);
     let steps = capture.group_steps();
-    drop(old_kernel);
+    drop((old_kernel, refused));
+    assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
     assert_eq!(steps, [], "nothing was sent to the group");
     member.assert_survived();
 }
@@ -122,26 +126,22 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_kills_the_group_left_be
 }
 
 #[skuld::test]
-fn a_drop_after_its_own_wait_below_6_9_sends_nothing_to_the_group(#[fixture(signal_by_number)] _by_number: &Group) {
+fn a_drop_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
     below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::Drop);
 }
 
 #[skuld::test]
-fn a_drop_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group(#[fixture(signal_by_number)] _by_number: &Group) {
+fn a_drop_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group() {
     below_6_9_sends_nothing_to_the_group(Reap::Foreign, Teardown::Drop);
 }
 
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_sends_nothing_to_the_group(
-    #[fixture(signal_by_number)] _by_number: &Group,
-) {
+fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
     below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::FinishElevated);
 }
 
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group(
-    #[fixture(signal_by_number)] _by_number: &Group,
-) {
+fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group() {
     below_6_9_sends_nothing_to_the_group(Reap::Foreign, Teardown::FinishElevated);
 }
 

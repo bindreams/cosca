@@ -301,7 +301,8 @@ child got asks for that mechanism and asserts it. The ways to ask: `contain_with
 on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `cgroup` fixture
 (`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests` (`ProcessGroup`,
 in-crate tests only). The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
-promotes every contained request to `FdMarker`.
+promotes every contained request to `FdMarker`. A consent group that gates a risk (principle 10)
+names the risk, as `STRAY_SIGNAL` does.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row
@@ -317,15 +318,15 @@ the process.
 
 ## 10. System-affecting tests run in a sandbox
 
-A test needs consent to run on a developer's machine when either holds:
+A test runs in a throwaway VM or container, on CI, or with the owner's consent, when either holds:
 
-1. its possible outcomes (it passes, it fails at any point, it panics) include a destructive one, for
-   example a broken system configuration or an unrelated process killed;
-2. it performs a visible operation on shared resources, for example a directory in a visible spot, a
-   user account, system configuration or a service.
+1. A destructive outcome is possible. Go through every way it can end (passes, fails at any point,
+   panics, is killed): could any leave the machine harmed (broken system configuration, an unrelated
+   process killed, data lost)?
+2. It does a visible operation on shared resources (a directory in a visible spot, a user account,
+   system configuration or policy, a service).
 
-Any other test needs none. A test that needs consent runs in a container, VM or CI, never on a
-developer's host.
+If neither holds, it runs normally on a developer's machine.
 
 Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
 host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
@@ -361,16 +362,16 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
-CI turns each off workflow-wide and opts in only in the step or job that runs it. The exception is
-`COSCA_TEST_SIGNAL_BY_NUMBER` (the tests that signal a pid or process-group number a wrong value of
-which would reach an unrelated process), a `test_group!` row joined with
-`#[fixture(signal_by_number)] _group: &Group`, selected by `SKULD_LABELS=signal_by_number`: it runs on
-every platform, so CI gives consent workflow-wide (`ci.yaml`), on its throwaway runners.
+CI turns each off workflow-wide and opts in only in the step or job that runs it. So does
+`COSCA_TEST_STRAY_SIGNAL` (the tests whose failure may signal an unrelated process: one that signals a
+number no live process of the test pins, or walks from the pid of a root it reaped), a `test_group!`
+row joined with `#[fixture(stray_signal)] _group: &Group`, selected by `SKULD_LABELS=stray_signal`: the
+`Run the stray-signal tests (Unix)` step of the `test` job opts in, on the Linux and macOS lanes.
 
-**Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
-correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
-4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)). Principle 9 turns every group on by default,
-so a bare test run would touch real system state without a second, explicit opt-in.
+**Why:** a test that can end in a destructive outcome, or does a visible operation on shared
+resources, harms or disturbs whatever machine it runs on when it goes wrong, so the sandbox, not the
+test's correctness, has to be what protects it. Principle 9 turns every group on by default, so a bare
+test run would reach real system state without a second, explicit opt-in.
 
 **Applies to:** all tests. CI's cgroup lane runs in a fresh cgroup on a throwaway runner
 ([`ci.yaml`](../.github/workflows/ci.yaml)).

@@ -3,7 +3,7 @@
 // (`unix_kill_tree_reaps_the_grandchild` in `tests/spawn_io.rs`).
 
 use super::{kill_group, term_group};
-use crate::test_groups::{signal_by_number, Group};
+use crate::test_groups::{stray_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
 
 // This file deliberately has NO "absent group" test that calls kill_group/term_group on a
@@ -49,7 +49,7 @@ fn await_zombie(pid: u32) {
 /// involved, and a correct implementation never reaches the `killpg`/`signal_direct` calls
 /// this guards, so there is nothing to signal even if the test is wrong.
 #[skuld::test]
-fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(signal_by_number)] _by_number: &Group) {
+fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _stray: &Group) {
     for pgid in [0, -1, i32::MIN] {
         let kill_err =
             kill_group(pgid, Some(&StatedRoot::unreaped())).expect_err("kill_group(non-positive) must be Err");
@@ -68,7 +68,7 @@ fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(signal_by_number
 
 /// kill_group on a real owned process group succeeds, and really did kill it.
 #[skuld::test]
-fn kill_group_on_owned_group_succeeds(#[fixture(signal_by_number)] _by_number: &Group) {
+fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
     // Spawn a child in its own private group (pgid == child pid) so we can
@@ -109,7 +109,7 @@ fn kill_group_on_owned_group_succeeds(#[fixture(signal_by_number)] _by_number: &
 /// Linux only: `fork` refuses once a fatal signal is pending; no such guarantee is asserted elsewhere.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_group_dooms_the_group_before_it_is_listed(#[fixture(signal_by_number)] _by_number: &Group) {
+fn kill_group_dooms_the_group_before_it_is_listed() {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
@@ -159,7 +159,7 @@ fn kill_group_dooms_the_group_before_it_is_listed(#[fixture(signal_by_number)] _
 /// stayed alive — exactly the false-`Ok` class #61 exists to close, on the one path with no
 /// closer until now.
 #[skuld::test]
-fn term_group_on_owned_group_succeeds(#[fixture(signal_by_number)] _by_number: &Group) {
+fn term_group_on_owned_group_succeeds() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
     // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
     // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
@@ -193,7 +193,7 @@ fn term_group_on_owned_group_succeeds(#[fixture(signal_by_number)] _by_number: &
 /// really an empty group. The assertion below pins that, so the test cannot
 /// quietly stop exercising the interesting path.
 #[skuld::test]
-fn kill_group_on_an_all_zombie_group_is_ok(#[fixture(signal_by_number)] _by_number: &Group) {
+fn kill_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
     let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();
@@ -220,7 +220,7 @@ fn kill_group_on_an_all_zombie_group_is_ok(#[fixture(signal_by_number)] _by_numb
 /// change) could leave this test passing on `term_group`'s own answer alone while silently
 /// no longer exercising the branch it documents.
 #[skuld::test]
-fn term_group_on_an_all_zombie_group_is_ok(#[fixture(signal_by_number)] _by_number: &Group) {
+fn term_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
     let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();

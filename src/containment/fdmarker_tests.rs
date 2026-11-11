@@ -32,7 +32,7 @@
 //! SIGKILL that bystander.
 
 use crate::test_child::{await_member_ready, member_command};
-use crate::test_groups::{setuid, signal_by_number, Group};
+use crate::test_groups::{setuid, Group};
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -870,9 +870,7 @@ fn high_fd_shell() -> std::process::Command {
 /// already relies on, applied here to keep `pgid` allocated across the gap instead of to query
 /// it.
 #[skuld::test]
-fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member(
-    #[fixture(signal_by_number)] _by_number: &Group,
-) {
+fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member() {
     let _serialize = test_spawn_lock();
     crate::log_capture::install();
 

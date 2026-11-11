@@ -11,7 +11,7 @@ use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, G
 use crate::test_child::member::{await_started, Member, RELEASE_FD};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_child::Console;
-use crate::test_groups::{cgroup, pidfd_group_signal, signal_by_number, Group};
+use crate::test_groups::{cgroup, pidfd_group_signal, Group};
 
 /// A session root `sh` that leaves a member in its group, says `started` and exits, as
 /// `sh -c 'sleep 300 & exit'` does. Its member is [`ROOT_WITH_A_MEMBER`]'s.
@@ -159,11 +159,15 @@ fn kills_the_group(container: Container) {
 /// Below 6.9 the old behaviour holds: the kernel refuses the group's send through the pidfd,
 /// nothing goes by the group's number, and its member lives on, which the cleanup says in one
 /// `warn` naming the root. Mutants: "a refused flag falls back to the group's number"; "the refusal
-/// is only a `debug`".
+/// is only a `debug`". The recorder and the refusal stop a send by the group's number, so a mutant
+/// that makes one reaches no process.
 fn below_6_9_sends_nothing_to_the_group(container: Container) {
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let groups = crate::containment::unix::fault::record_kill_group();
     let failed = failed_spawn(container);
-    drop(old_kernel);
+    drop((old_kernel, refused));
+    assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
     assert!(
         failed
             .steps
@@ -188,9 +192,7 @@ fn a_spawn_whose_root_was_reaped_before_its_identity_read_kills_the_group_left_b
 }
 
 #[skuld::test]
-fn a_spawn_whose_root_was_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group(
-    #[fixture(signal_by_number)] _by_number: &Group,
-) {
+fn a_spawn_whose_root_was_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group() {
     below_6_9_sends_nothing_to_the_group(Container::Session);
 }
 
@@ -205,7 +207,6 @@ fn cgroup_a_spawn_whose_leaf_did_not_take_its_root_reaped_before_its_identity_re
 #[skuld::test]
 fn cgroup_a_spawn_whose_leaf_did_not_take_its_root_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group(
     #[fixture(cgroup)] _cgroup: &Group,
-    #[fixture(signal_by_number)] _by_number: &Group,
 ) {
     below_6_9_sends_nothing_to_the_group(Container::LeafNotTaken);
 }

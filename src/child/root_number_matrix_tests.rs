@@ -22,7 +22,8 @@ use crate::test_child::Console;
 use crate::identity::{ProcessId, Resolved};
 use crate::test_child::reaped_elsewhere::kill_own_child;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::cgroup;
+use crate::test_groups::{stray_signal, Group};
 
 /// What a tree is contained by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,9 +856,10 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 /// reused or names nothing (a group), or (macOS) a root that is
 /// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks
-/// without `anchor`.
+/// without `anchor`. The recorders stop a `killpg`, not a walk from the reaped root's pid, so a
+/// mutant that walks may signal an unrelated process's children.
 #[skuld::test]
-fn tree_paths_send_nothing_by_the_root_number_after_a_reap() {
+fn tree_paths_send_nothing_by_the_root_number_after_a_reap(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     check_matrix(&[
