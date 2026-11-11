@@ -825,13 +825,13 @@ impl SweepFailure {
 }
 
 impl TreeKilled {
-    /// What a tree kill's `outcome` comes to once the root's own handle has had its say: the one place
-    /// that decides what a walk left behind, and the only one that writes the state. `mechanism`: what
-    /// names the tree, `None` for a tree that is none or delegated; it answers the members an earlier
-    /// kill left ([`Contains::kill_left`](crate::containment::Contains::kill_left)). `root_ended`: the
-    /// root is not running (killed, or already dead), so a root the walk left is not left. The answer
-    /// is `Ok` when nothing is left. Otherwise it is the first member left, and the others as data: it
-    /// reports none of them.
+    /// What a tree kill's `outcome` comes to once the root's own handle has had its say: the only place
+    /// that writes the state. The mechanism decides what a kill left held
+    /// ([`Contains::kill_left`](crate::containment::Contains::kill_left)); the settlement records it.
+    /// `mechanism`: what names the tree, `None` for a tree that is none or delegated, which holds
+    /// nothing. `root_ended`: the root is not running (killed, or already dead), so a root the walk
+    /// left is not left. The answer is `Ok` when nothing is left. Otherwise it is the first member
+    /// left, and the others as data: it reports none of them.
     ///
     /// It decides under the one lock of the state, by it and the outcome, and leaves the state
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever
@@ -851,9 +851,10 @@ impl TreeKilled {
         let outcome = outcome.into();
         let mut state = self.lock();
         let was_killed = matches!(*state, TreeState::Killed);
-        // The state is read here and written once, at the end, so an unwind leaves it as it was.
-        let held = match &*state {
-            TreeState::Left(held) => held.clone(),
+        // The held members move out here and the state is written once, at the end. An unwind between
+        // leaves `Left` with none held, and a later kill answers none of them.
+        let held = match &mut *state {
+            TreeState::Left(held) => std::mem::take(held),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
         };
         let gone_root = matches!(outcome, TreeKillOutcome::NoRoot);

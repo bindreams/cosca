@@ -166,37 +166,29 @@ fn a_released_tree_keeps_what_its_kills_settled() {
 }
 
 /// A tree released still is what it was: it reports its containment, and a settle after the release
-/// is a walk's when the tree was a walk's (its held members and its root left are the walk's own).
+/// is the real settle of a tree whose mechanism is gone. A walk is never released (its settle still
+/// needs the identities it holds).
 ///
-/// Mutant: `release` leaves a tree that reports `None` and settles as a tree that is not a walk's.
+/// Mutant: `release` leaves a tree that reports `None`.
 #[cfg(unix)]
 #[skuld::test]
 fn a_released_tree_keeps_its_kind() {
-    use crate::containment::dispatch::Unkilled;
+    use crate::containment::unix::Group;
 
-    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
-    let mut group = Tree::contained(Mechanism::Fake(fake));
-    group.release().wait();
-    assert_eq!(group.containment(), Containment::ProcessGroup);
-
-    let mut walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
-    walk.release().wait();
-    assert_eq!(walk.containment(), Containment::TreeWalk);
-    // Only a walk leaves the root: a settle that is not a walk's asserts against it.
-    let root_left = TreeKillOutcome::Ran(Err(Unkilled {
-        members: Vec::new(),
-        root: Some(Error::MemberNotKilled {
-            pid: 1,
-            source: Box::new(Error::Unassessable {
-                detail: "its identity could not be read".into(),
-                source: None,
-            }),
-            note: None,
-        }),
-        resolved: Vec::new(),
-    }));
-    walk.settle(root_left, true)
-        .expect("a root the walk left is not left once it has ended");
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let trees = [
+        (
+            Tree::contained(Mechanism::Group(Group::process_group(1))),
+            Containment::ProcessGroup,
+        ),
+        (Tree::contained(Mechanism::Fake(fake)), Containment::Session),
+    ];
+    for (mut tree, kind) in trees {
+        tree.release().wait();
+        assert_eq!(tree.containment(), kind);
+        tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+            .expect("a kill that left nothing");
+    }
 }
 
 /// A child over a mechanism of stated answers: what it reports and what its tree calls do come from

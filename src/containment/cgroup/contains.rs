@@ -8,8 +8,7 @@ use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 #[cfg(feature = "tokio")]
 use crate::containment::mechanism::AwaitableRelease;
-use crate::containment::mechanism::{nothing_held, Contains, Release};
-use crate::containment::treewalk::Left;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::{Containment, Root, TerminateOutcome};
 
 // The leaf's `Debug` hides its path; `subject` names it.
@@ -56,10 +55,6 @@ impl Contains for CgroupLeaf {
     /// [`hard_kill`](CgroupLeaf::hard_kill)).
     fn send_kill(&self, _root: Option<&dyn Root>) -> TreeKillOutcome {
         TreeKillOutcome::Ran(self.hard_kill().map_err(Unkilled::from))
-    }
-
-    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
-        nothing_held(result)
     }
 
     fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {

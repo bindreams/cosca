@@ -253,9 +253,16 @@ impl Tree {
     /// its [`Release`] owns it until its wait. What the kills left stays the tree's ([`TreeKilled`]),
     /// and so does what it was ([`containment`](Self::containment)), so a settle after the release is
     /// over the real state, with nothing held.
+    ///
+    /// A tree walk is never released: it holds the identities its settle still needs, and a released
+    /// tree has no mechanism to ask for them. Releasing one trips a `debug_assert`.
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
     pub(crate) fn release(&mut self) -> Release {
+        debug_assert!(
+            !matches!(&self.holder, Holder::Contained(mechanism) if mechanism.kind() == Containment::TreeWalk),
+            "a tree walk holds identities its settle still needs: it is never released"
+        );
         self.released_as = Some(self.containment());
         match std::mem::take(&mut self.holder) {
             Holder::None | Holder::Delegated => Release::nothing(),
@@ -267,11 +274,7 @@ impl Tree {
     /// resource left in the tree; a no-op for a tree whose mechanism has none.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     pub(crate) async fn await_release_steps(&self, child: u32) {
-        let steps = match &self.holder {
-            Holder::Contained(mechanism) => mechanism.awaitable_release(),
-            Holder::None | Holder::Delegated => None,
-        };
-        if let Some(steps) = steps {
+        if let Some(steps) = self.named_by().and_then(Contains::awaitable_release) {
             steps.wait(child).await;
         }
     }
@@ -293,7 +296,7 @@ impl Tree {
     }
 
     /// What names the tree, for its settlement ([`TreeKilled`]) to ask: `None` for a tree that is
-    /// none or delegated.
+    /// none, delegated or released (a released tree is never a walk's).
     fn named_by(&self) -> Option<&Mechanism> {
         match &self.holder {
             Holder::Contained(mechanism) => Some(mechanism),

@@ -16,6 +16,12 @@ fn walker() -> crate::containment::mechanism::Mechanism {
     ))
 }
 
+/// A mechanism that is not a walk, which holds nothing an earlier kill left.
+fn non_walk() -> crate::containment::mechanism::Mechanism {
+    let (fake, _) = crate::containment::fake::FakeContains::new(crate::containment::Containment::ProcessGroup, false);
+    crate::containment::mechanism::Mechanism::Fake(fake)
+}
+
 /// A kill that skipped `action`, with the sweep of its marker holders, if it made one, ended as
 /// `holders`.
 fn skipped_kill(action: &str, holders: Option<Result<(), crate::error::Error>>) -> super::TreeKillOutcome {
@@ -981,13 +987,13 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
     use super::{TreeKillOutcome, TreeKilled, Unkilled, UnvouchedKind};
     let killed = TreeKilled::default();
     killed
-        .settle(None, TreeKillOutcome::Ran(Ok(())), true)
+        .settle(Some(&non_walk()), TreeKillOutcome::Ran(Ok(())), true)
         .expect("a complete kill");
     assert_eq!(standing(&killed), Standing::Killed);
 
     let left = killed
         .settle(
-            None,
+            Some(&non_walk()),
             TreeKillOutcome::Ran(Err(Unkilled {
                 members: vec![member_left(8)],
                 root: None,
@@ -1002,16 +1008,17 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
 
     // The same for a skipped kill whose sweep of the holders left a member.
     killed
-        .settle(None, TreeKillOutcome::Ran(Ok(())), true)
+        .settle(Some(&non_walk()), TreeKillOutcome::Ran(Ok(())), true)
         .expect("a complete kill");
     assert_eq!(standing(&killed), Standing::Killed);
     let skipped_with_a_member = || skipped_kill("walk", Some(Err(member_left(9))));
     killed
-        .settle(None, skipped_with_a_member(), true)
+        .settle(Some(&non_walk()), skipped_with_a_member(), true)
         .expect_err("a member was left");
     assert_eq!(standing(&killed), Standing::Unvouched(UnvouchedKind::Earlier));
 
-    // Over a tree never settled, the sweep that left the member unvouches it too.
+    // Over a tree never settled, the sweep that left the member unvouches it too; a tree that is none
+    // or delegated has no mechanism to ask.
     let never = TreeKilled::default();
     never
         .settle(None, skipped_with_a_member(), true)
@@ -1335,7 +1342,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let earlier = TreeKilled::default();
     earlier
         .settle(
-            None,
+            Some(&non_walk()),
             TreeKillOutcome::Ran(Err(Unkilled {
                 members: vec![member_left(8)],
                 root: None,
@@ -1462,7 +1469,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             if start == "earlier" {
                 killed
                     .settle(
-                        None,
+                        Some(&non_walk()),
                         TreeKillOutcome::Ran(Err(Unkilled {
                             members: vec![member_left(8)],
                             root: None,

@@ -46,8 +46,11 @@ pub(crate) trait Contains: fmt::Debug {
     /// for every kill, under its one lock ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
     /// A tree walk's root death reparents a member out of every later walk, so it kills again the
     /// members whose identity it read ([`with_earlier`](crate::containment::treewalk::with_earlier)).
-    /// Every other mechanism hands `result` back, with nothing held ([`nothing_held`]).
-    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>);
+    /// Every other mechanism, and a tree that is none or delegated (it has no mechanism to ask), hands
+    /// `result` back with nothing held ([`nothing_held`]), which is this default.
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        nothing_held(result)
+    }
 
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
     /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only.
@@ -380,9 +383,9 @@ impl Release {
         }
     }
 
-    /// The awaitable steps of [`wait`](Self::wait) (see
-    /// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain));
-    /// a future dropped mid-await leaves the rest to `wait`. `child` names it in debug lines.
+    /// The awaitable steps of [`wait`](Self::wait), through the resource's
+    /// [`awaitable_release`](Contains::awaitable_release); a future dropped mid-await leaves the rest
+    /// to `wait`. `child` names it in debug lines.
     #[cfg(feature = "tokio")]
     #[cfg_attr(
         not(target_os = "linux"),
@@ -391,7 +394,9 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            leaf.step_and_await_drain(child).await;
+            if let Some(steps) = leaf.awaitable_release() {
+                steps.wait(child).await;
+            }
         }
     }
 }

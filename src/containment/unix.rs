@@ -52,9 +52,8 @@ use nix::sys::signal::Signal;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::mechanism::{nothing_held, Contains, Release};
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
-use crate::containment::treewalk::Left;
 use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
 
@@ -82,10 +81,6 @@ impl Group {
 impl Contains for Group {
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         kill_group_tree(self.pgid, root)
-    }
-
-    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
-        nothing_held(result)
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {

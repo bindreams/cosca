@@ -132,10 +132,12 @@ In order:
    in `Tree` or the drop teardown asks which mechanism it holds. The members a walk
    left stay in the settlement (`TreeKilled`, one lock), which asks the mechanism for them
    (`Contains::kill_left`: a walk kills them again, every other mechanism hands the result back);
-   the Linux awaited teardown takes the leaf's steps through
-   `Contains::awaitable_release`, which every mechanism answers and only the cgroup leaf does with
-   steps. The two `debug_assert`s on the `CgroupOnly` gate (`kill_sent_gated`, `graceful_shutdown`)
-   state a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge
+   the cgroup leaf's awaitable steps go through `Contains::awaitable_release` from both the Linux
+   awaited drop teardown (`Tree::await_release_steps`) and `Release::wait_async`; every mechanism
+   answers it and only the leaf has steps. `Tree`'s only matches on the kind of mechanism are its
+   `_for_test` accessors. A walk is never released (its settlement still needs its identities).
+   The two `debug_assert`s on the `CgroupOnly` gate (`kill_sent_gated`, `graceful_shutdown`) and the
+   one in `Tree::release` state a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge
    (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
