@@ -186,18 +186,38 @@ pub(crate) struct EscapedHolder {
     pub(crate) pid: u32,
     /// Held so the holder's `cat` ends only when killed.
     _stdin: crate::PipeWriter,
-    /// The root's own stdin, held until [`EscapedHolder::release_root`].
+    /// The root's own stdin, held until the root is killed and released.
     root_stdin: Option<crate::PipeWriter>,
     stderr: crate::PipeReader,
 }
 
 #[cfg(target_os = "macos")]
 impl EscapedHolder {
-    /// Releases the root's stdin. Call it only after the test killed the root, then check the root's
-    /// status with `assert_killed`: a kill that sent nothing lets the root's `cat` exit `0` on this
-    /// EOF, which fails there instead of leaving the wait to block.
-    pub(crate) fn release_root(&mut self) {
+    /// Releases the root's stdin. Only after the kill, and its status then checked with
+    /// `assert_killed`: a kill that sent nothing lets the root's `cat` exit `0` on this EOF, which
+    /// fails there instead of leaving the wait to block.
+    fn release_root(&mut self) {
         drop(self.root_stdin.take());
+    }
+
+    /// Kills the root, releases its stdin, reaps it through `child`'s own `wait`, and asserts it
+    /// died to the kill.
+    #[track_caller]
+    pub(crate) fn kill_and_wait(&mut self, child: &crate::Child) {
+        child.kill().expect("kill the root");
+        self.release_root();
+        let status = child.wait().expect("this handle reaps the root");
+        super::assert_killed("the root", status);
+    }
+
+    /// Kills the root, releases its stdin, reaps it behind `child`'s back ([`reap_behind_status`]),
+    /// and asserts it died to the kill.
+    #[track_caller]
+    pub(crate) fn kill_and_reap_behind(&mut self, child: &crate::Child) {
+        let pid = child.pid();
+        child.kill().expect("kill the root");
+        self.release_root();
+        super::assert_killed("the root", reap_behind_status(pid));
     }
 
     /// Blocks until the holder is gone: its stderr reaches EOF. Call only once the test has shown

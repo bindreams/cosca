@@ -304,9 +304,7 @@ pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
 pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> RestrictedChild {
-    let cmd = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
-        .join("System32")
-        .join("cmd.exe");
+    let cmd = crate::test_child::system32("cmd.exe");
     spawn_with_ace_cmdline(
         alone,
         granted | PROCESS_TERMINATE.0,
@@ -335,20 +333,17 @@ fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
-/// writes to `NUL`. It inherits exactly those two handles (a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), as
-/// the raw spawn backend's children do, so no handle another thread holds inheritable at that moment
-/// reaches it. The list scopes the child, not the window: another spawner that passes
-/// `bInheritHandles` with no list can still take the two while they are inheritable here.
+/// writes to `NUL`. It inherits exactly those two handles (a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so
+/// no handle another thread holds inheritable at that moment reaches it. The two are inheritable only
+/// under [`spawn_lock`](crate::child::spawn::spawn_lock), from marking them through `CreateProcessW`,
+/// and are closed here before the lock is released, so a cosca spawn on another thread cannot take
+/// them. Another spawner that passes `bInheritHandles` with no list is not under the lock and can.
+/// The caller must not hold `spawn_lock`.
 fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
     let (stdin, stdout) = (HANDLE(reader.as_raw_handle()), HANDLE(null.as_raw_handle()));
-    for handle in [stdin, stdout] {
-        // SAFETY: `handle` is live and owned by `reader` or `null`; the call only sets its flag.
-        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
-            .expect("make the child's stdio inheritable");
-    }
 
     // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
@@ -425,23 +420,34 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
         lpAttributeList: attributes.as_ptr(),
     };
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
-    // points at are alive for the duration of the call.
-    unsafe {
-        CreateProcessW(
-            None,
-            Some(PWSTR(cmdline.as_mut_ptr())),
-            Some(&sa),
-            None,
-            true,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-            None,
-            None,
-            &si.StartupInfo,
-            &mut pi,
-        )
+    {
+        let _guard = crate::child::spawn::spawn_lock();
+        // Rebound after the guard: locals drop in reverse order, so on success or a panic the
+        // child-side ends close before the lock is released.
+        let (_reader, _null) = (reader, null);
+        for handle in [stdin, stdout] {
+            // SAFETY: `handle` is live and owned by `_reader` or `_null`; the call only sets its flag.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+                .expect("make the child's stdio inheritable");
+        }
+        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
+        // points at are alive for the duration of the call.
+        unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                Some(&sa),
+                None,
+                true,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                None,
+                None,
+                &si.StartupInfo,
+                &mut pi,
+            )
+        }
+        .expect("CreateProcessW for the restricted fixture child");
     }
-    .expect("CreateProcessW for the restricted fixture child");
 
     // SAFETY: an unnamed job object has no preconditions; the handle is owned by the
     // RestrictedChild and closed in Drop.
