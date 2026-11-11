@@ -4,9 +4,8 @@
 //! process group instead (`drop_group_exact_tests`), so the tests here refuse that flag.
 //!
 //! The recorder tests replace `killpg` with a recorder (`unix::fault::record_kill_group`) and
-//! record the ppid walks (`treewalk::fault::record_walks`), so a mutant that still sends either
-//! never reaches an unrelated process. The behavioural tests use real groups of this test's own
-//! children, all signalled before their root is reaped.
+//! record the ppid walks (`treewalk::fault::record_walks`). The behavioural tests use real groups
+//! of this test's own children, all signalled before their root is reaped.
 
 use std::io::Read as _;
 
@@ -252,7 +251,6 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    // A mutant that sends by the reaped root's number reaches no process.
     let recorder = record_kill_group();
     let (child, mut pipes) = spawn_cat_tree();
     child.wait().expect("reap the root");
@@ -948,9 +946,7 @@ fn cgroup_drop_of_an_exited_unreaped_root_kills_its_orphaned_descendant(#[fixtur
 /// skipped too; the `killpg` or the walk still run.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_roots_number(
-    #[fixture(stray_signal)] _stray: &Group,
-) {
+fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_roots_number() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();

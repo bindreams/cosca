@@ -159,8 +159,7 @@ fn kills_the_group(container: Container) {
 /// Below 6.9 the old behaviour holds: the kernel refuses the group's send through the pidfd,
 /// nothing goes by the group's number, and its member lives on, which the cleanup says in one
 /// `warn` naming the root. Mutants: "a refused flag falls back to the group's number"; "the refusal
-/// is only a `debug`". The recorder and the refusal stop a send by the group's number, so a mutant
-/// that makes one reaches no process.
+/// is only a `debug`".
 fn below_6_9_sends_nothing_to_the_group(container: Container) {
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let refused = crate::containment::unix::fault::refuse_group_sends();

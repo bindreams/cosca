@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
-use crate::test_groups::cgroup;
-#[cfg(unix)]
-use crate::test_groups::{stray_signal, Group};
+use crate::test_groups::{cgroup, Group};
 
 use crate::child::graceful::fault as term_fault;
 use crate::wait::fault;
@@ -720,12 +718,11 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
     .await;
 }
 
-/// A reaped root's group is not signalled by its number.
+/// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
+/// number its own while the call runs.
 #[cfg(unix)]
 #[skuld::test]
-async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group(
-    #[fixture(stray_signal)] _stray: &Group,
-) {
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
         assert_eq!(child.containment(), crate::test_child::session_gives());
         // Below Linux 6.9 a group is signalled by its number alone.

@@ -9,7 +9,7 @@ use crate::test_child::Console;
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::test_child::reaped_elsewhere::{foreign_reaped_group_root, kill_own_child, reap_behind};
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::{pidfd_group_signal, stray_signal, Group};
 
 /// A [`ROOT_WITH_A_MEMBER`] spawn, once its member exists.
 pub(crate) fn root_with_a_member() -> (crate::Child, Member) {
@@ -85,6 +85,7 @@ fn kill_tree_kills_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_group_si
 #[skuld::test]
 fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     let (child, _pgid) = foreign_reaped_group_root();
     let capture = Capture::start();
@@ -104,7 +105,6 @@ fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() 
     child.wait().expect("this handle reaps the root");
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let refused = crate::containment::unix::fault::refuse_group_sends();
-    // A mutant that sends by the reaped root's number reaches no process.
     let groups = crate::containment::unix::fault::record_kill_group();
     let capture = Capture::start();
     let result = child.kill_tree();
@@ -359,6 +359,7 @@ fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_g
 #[skuld::test]
 fn terminate_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     let (child, _pgid) = foreign_reaped_group_root();
     let capture = Capture::start();
@@ -401,6 +402,7 @@ fn graceful_shutdown_tree_shuts_down_the_group_of_a_root_reaped_elsewhere(
 #[skuld::test]
 fn graceful_shutdown_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
 ) {
     crate::log_capture::install();
     let (child, _pgid) = foreign_reaped_group_root();

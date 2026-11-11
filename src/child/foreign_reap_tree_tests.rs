@@ -1,7 +1,6 @@
 //! `kill_tree` and `terminate_tree` of a group whose root was reaped behind its handle's back. Only
 //! the handle can tell: the root's number names nothing, or (macOS) nothing the number shows to be
-//! another process. The group recorders stand in for `killpg`, so a mutant that still sends one
-//! reaches no process.
+//! another process. The group recorders stand in for `killpg`.
 
 use crate::containment::unix::fault::{record_kill_group, record_term_group};
 use crate::log_capture::warns_since;

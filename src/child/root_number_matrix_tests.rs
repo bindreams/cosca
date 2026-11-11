@@ -8,8 +8,7 @@
 //! nothing once the root is gone.
 //!
 //! The recorders replace `killpg` with a record and record every walk, holder signal, pidfd signal,
-//! `cgroup.kill` write and cgroup member's `SIGTERM` with its route, so a mutant that sends by
-//! number reaches no process.
+//! `cgroup.kill` write and cgroup member's `SIGTERM` with its route.
 //! Each cell's tree is a root `cat` and a second `cat` in its group (in its leaf, holding its
 //! marker) that ignores `SIGTERM` and outlives the root. Both end once stdin closes, so a root an
 //! entry point leaves alone ends without a signal. Every cell is checked, and the whole matrix is

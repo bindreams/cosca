@@ -58,10 +58,8 @@ polkit, `doas`). Those setups change system policy (the polkit rule, the macOS a
 state and restores it with `--revert` (same guard and root check as enabling; on Linux pass the same `--user`), and
 `elevation-lane-sudoers.sh --cleanup` and `elevation-lane-linux.sh --cleanup` undo the rest.
 
-`STRAY_SIGNAL` (`COSCA_TEST_STRAY_SIGNAL`) holds the tests that, if the code they test regressed, could
-signal an unrelated process of yours: they signal a number no live process of the test pins, or walk from
-the pid of a root they reaped. It needs `COSCA_TEST_STRAY_SIGNAL_CONSENT=1`, which CI gives in the
-`Run the stray-signal tests (Unix)` step on its throwaway runners; on your own machine set
+`STRAY_SIGNAL` (`COSCA_TEST_STRAY_SIGNAL`) holds the tests that may signal an unrelated process of yours.
+It needs `COSCA_TEST_STRAY_SIGNAL_CONSENT=1`, which CI sets; on your own machine set
 `COSCA_TEST_STRAY_SIGNAL=0` to skip it, or run it in a container or VM.
 
 ### Tests that need root

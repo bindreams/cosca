@@ -259,13 +259,16 @@ pub(crate) mod fault {
     }
 
     /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
-    /// assert a kill was not issued without a real `killpg` ever reaching a recyclable number.
+    /// assert a kill was not issued without a real `killpg` ever reaching a recyclable number: a
+    /// mutant that sends by a reaped root's number reaches no process. Only that `killpg` is
+    /// stopped, not a `term_group`, a send by pid or a walk.
     pub(crate) fn record_kill_group() -> KillGroupRecorder {
         KILLED.with(|k| *k.borrow_mut() = Some(Vec::new()));
         KillGroupRecorder(())
     }
 
-    /// From now on `term_group` on THIS thread records its group and sends nothing.
+    /// From now on `term_group` on THIS thread records its group and sends nothing, as
+    /// [`record_kill_group`] does for `kill_group`.
     pub(crate) fn record_term_group() -> TermGroupRecorder {
         TERMED.with(|t| *t.borrow_mut() = Some(Vec::new()));
         TermGroupRecorder(())

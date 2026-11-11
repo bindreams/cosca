@@ -302,7 +302,7 @@ on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `c
 (`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests` (`ProcessGroup`,
 in-crate tests only). The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
 promotes every contained request to `FdMarker`. A consent group that gates a risk (principle 10)
-names the risk, as `STRAY_SIGNAL` does.
+names the risk.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row
@@ -320,11 +320,8 @@ the process.
 
 A test runs in a throwaway VM or container, on CI, or with the owner's consent, when either holds:
 
-1. A destructive outcome is possible. Go through every way it can end (passes, fails at any point,
-   panics, is killed): could any leave the machine harmed (broken system configuration, an unrelated
-   process killed, data lost)?
-2. It does a visible operation on shared resources (a directory in a visible spot, a user account,
-   system configuration or policy, a service).
+1. A destructive outcome is possible: some way the test can end could leave the machine harmed.
+2. It does a visible operation on shared resources.
 
 If neither holds, it runs normally on a developer's machine.
 
@@ -362,11 +359,7 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
-CI turns each off workflow-wide and opts in only in the step or job that runs it. So does
-`COSCA_TEST_STRAY_SIGNAL` (the tests whose failure may signal an unrelated process: one that signals a
-number no live process of the test pins, or walks from the pid of a root it reaped), a `test_group!`
-row joined with `#[fixture(stray_signal)] _group: &Group`, selected by `SKULD_LABELS=stray_signal`: the
-`Run the stray-signal tests (Unix)` step of the `test` job opts in, on the Linux and macOS lanes.
+CI turns each off workflow-wide and opts in only in the step or job that runs it.
 
 **Why:** a test that can end in a destructive outcome, or does a visible operation on shared
 resources, harms or disturbs whatever machine it runs on when it goes wrong, so the sandbox, not the
