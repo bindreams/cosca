@@ -1,42 +1,12 @@
 nextest-version = { required = "0.9.151" }
 
-# Death-watch tests that a regression would turn into a hang rather than a failure. Every one is
-# named `death_watch_*`, so a new one is bounded without touching this file.
-[[profile.default.overrides]]
-#
-# `payload_race` and `block_on_socket` (the elevation tests' payload helper and testbin's payload) and
-# `*_unkillable_and_drop_does_not_hang` (a `Drop` that waited on a live child blocks) cover the same shape of
-# regression. The helper's own tests fail on a broken helper without waiting; this
-# bound only stops a regression they did not anticipate from stalling the job.
-filter = 'test(/(^|::)death_watch_/) | test(/unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-# The pidfd handshake's tests, and the slow-teardown rows (the sync handshake's and the async
-# spawn's, under a foreign tracer): a side that never sees EOF, or a verdict hold nobody opens,
-# hangs the spawn forever, and a teardown that does not warn waits for a tracer that lets go only
-# after the warn, so a regression must end as a timeout, not a stuck job. With correct code each
-# finishes in milliseconds; this bound is pure headroom for a loaded runner.
-[[profile.default.overrides]]
-filter = 'test(/::pidfd_handshake_tests::/) | test(/::slow_teardown_tests::/)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-# cosca-path's FIFO test: `same_file` that opens a FIFO blocks until a writer appears, so a regression
-# must end as a timeout, not a stuck job.
-[[profile.default.overrides]]
-filter = 'package(cosca-path) & test(=fs::host::host_tests::host_filesystem_same_file_does_not_block_on_a_fifo)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-# The Windows cancel-event, dropped-wait and `exited_by_id_windows_` tests wait with no bound of their
-# own (`None`/INFINITE, or an unbounded grace); a broken release would hang, so this bound fails it
-# instead.
-[[profile.default.overrides]]
-filter = 'test(/tokio::drive::drive_tests::windows::cancel_event_/) | test(/tokio::drive::drive_tests::dropped_wait_releases_the_watch/) | test(/tokio::wait::wait_tests::exited_by_id_windows_/)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-# A broken cancel-event release leaves the test runtime's drop joining a `Duration::MAX` watcher.
-[[profile.default.overrides]]
-filter = 'binary(tokio_control) & test(=async_graceful_tree_cancel_does_not_escalate_on_windows)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+[profile.default]
+# The one hang backstop for every test in every binary: a hang never ends, so any finite bound
+# catches it. It is long because a test's start-up counts toward it, and under load that start-up
+# is slow before the test body runs (skuld's per-process coordination, measured past 40 s at 3x
+# oversubscription), so a short bound fails healthy tests. An override below exists only to give a
+# test more time than this, or to set something other than a bound.
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "1s" }
 
 # The Windows elevation kill tests spawn through UAC and then wait for the payload's socket to end, with their own 20 s
 # failure bound (`assert_kill_matches_payload`), so that a false kill is a diagnostic panic. This bound counts from
@@ -107,13 +77,6 @@ inherits = "ci"
 # JUnit file unless asked.
 [profile.ci-elevation.junit]
 report-skipped = "ignored"
-
-# `gui_elevated_child_runs_as_root` waits on osascript's administrator dialog. The macOS lane approves it beforehand
-# (`unattended-gui-elevation.py`), so it finishes in seconds; where nothing approves it, it hangs. This bound only
-# fails that hang: it is the failure bound on an external event, not a sync.
-[[profile.ci-elevation.overrides]]
-filter = 'test(=gui_elevated_child_runs_as_root)'
-slow-timeout = { period = "60s", terminate-after = 2, grace-period = "1s" }
 
 # M10 is a measurement: its output, the elevated child's cwd and environment, is the record, so it is printed on
 # success too.
@@ -201,88 +164,3 @@ test-group = 'windows-elevation-routes'
 [[profile.default.overrides]]
 filter = 'binary(windows_process_cwd)'
 test-group = 'windows-drive-mapping'
-
-[[profile.default.overrides]]
-# `windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited` backstops its own
-# paused-clock proof; this bound is headroom.
-# Under `profile.default` so `profile.ci` and local runs both inherit it — same reasoning as
-# `test_support_tests` below.
-filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited)'
-slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# Bounds a hang (blocking reap of a `pause()` child) if the guard stops killing, so it fails
-# instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
-filter = 'test(test_support_tests)'
-slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# `cgroup_wait_drained_tracks_two_real_members_through_exit`'s unbounded park is made
-# deterministic by a real rendezvous (kill the last member only once `drain_step`'s own
-# `drain_blocking` seam confirms it armed a listener): a missed wake would otherwise block
-# forever. Bounds that hang so it fails instead of stalling the whole job. Under
-# `profile.default` so `profile.ci` and local runs both inherit it, same as `test_support_tests`
-# above.
-filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
-slow-timeout = { period = "15s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
-# that the armed kqueue is already readable (which catches an `EV_DISABLE` arm) and then awaits
-# its `declined_hook` in a `select!`. What nothing in-process catches is the kqueue being readable
-# while the watch loop never reaches the `Declined` arm: an event misclassified as `Spurious`, a
-# dropped `notify`, or a lost wakeup leaves both `select!` arms pending forever. This turns that
-# hang into a bounded per-test failure instead of the darwin job's 15-minute CI timeout. Under
-# `default` so a local run is bounded the same way.
-filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
-slow-timeout = { period = "20s", terminate-after = 3, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# A hang backstop for the tracer tests, which block on the helper's reports. The tests assert
-# each report as it arrives, so a broken transition fails an assertion; this bound is the last
-# resort.
-filter = 'test(/^test_support::tracer::/)'
-slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# The macOS tracer tests re-exec a freshly signed copy of the test binary (up to ~2s on amd64).
-# This bound must outlast the fixture's watchdog (8s) and the driver's wait bound (12s), so that
-# their messages surface.
-filter = 'test(/^child::owned::owned_tests::tracer::macos::/)'
-slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# A backstop, not a detector. Each `traced` tracer helper runs from its own freshly signed copy of the test
-# binary (seconds on macOS/amd64), and one test chains two of them.
-filter = 'test(/^child::owned::owned_tests::traced::/)'
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# A backstop, not a detector: the `OwnedChild` tests fail by assertion (see `assert_handed_off`),
-# not by timing out. This bound only stops a regression those checks did not anticipate, in a test
-# that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
-# (`wait::macos::await_reapable::await_reapable_tests`) block on a real kqueue in the same way, and
-# the hand-back tests hold the release of a child the call under test might wrongly wait for. The
-# `*_warns_past_*threshold` rows (the `owned_tests` ones, and the front and held-teardown ones that
-# live elsewhere) script a wait that blocks once, which the test ends; a teardown that is not given
-# its policy's threshold blocks once more and nothing wakes it, so the regression they guard is a
-# hang, not a failed assertion. Under `profile.default` so `profile.ci` and local runs inherit it.
-filter = 'test(/^child::owned::owned_tests::/) | test(/^wait::macos::await_reapable::await_reapable_tests/) | test(/^child::hand_back_tests::/) | test(/_warns_past_(its_(spawns|policys)|the)_threshold/)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# Failure bound, not a sync: a fork copy that tore the owner's link down would hang. The test already
-# catches that via events; this only stops an unanticipated regression.
-filter = 'test(/::(fork_copy_drop_leaves_the_owner_intact|unknown_origin_in_a_fork_copy_leaves_the_owner_intact|control_calls_from_a_fork_copy_are_refused)$/)'
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
-
-[[profile.default.overrides]]
-# A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
-# stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
-# detect that themselves; this bound only stops a hang from stalling the job. It covers the whole
-# lib test binary (the one that holds those fixtures), not a list of tests, so a new fixture user is
-# bounded without touching this file. The slowest legitimate test is the batch-gate oracle, ~30s
-# under load, so 60s x 5 leaves ample headroom. Earlier overrides in this file win for the tests
-# they name.
-filter = 'binary(cosca)'
-slow-timeout = { period = "60s", terminate-after = 5, grace-period = "1s" }
