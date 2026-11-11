@@ -250,13 +250,19 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
     let teardowns = crate::child::owned::seams::record_root_teardowns();
     let mark = crate::log_capture::mark();
+    // The walk's send of the root's kill goes through this handle: it is answered first, and the
+    // cleanup's own kill is the refused one.
     child.proc.script_over(|f| {
-        f.signals([refused()])
+        f.signals([Ok(crate::signal::Sent::Delivered), refused()])
             .reaps([crate::os_process::fake::ReapAnswer::Err(std::io::ErrorKind::Other)])
     });
-    // The first walk killed the root: someone else reaps it before the early tree kill, which finds no root.
+    // The first walk killed the root (its scripted send does not, so the root is ended here): someone
+    // else reaps it before the early tree kill, which finds no root.
     let pid = child.pid();
     let _reaped = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        // SAFETY: `pid` is this test's own child, not yet reaped.
+        let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(killed, 0, "{}", std::io::Error::last_os_error());
         crate::test_child::wait_until_zombie(pid);
         let mut status = 0;
         // SAFETY: `pid` is this test's own zombie child.
@@ -370,11 +376,12 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
     let mark = crate::log_capture::mark();
+    // The walk's send of the root's kill goes through this handle too: it is answered first, and the
+    // teardown's own kill is the refused one.
     child.proc.script_over(|f| {
-        f.signals([refused()])
-            .reaps([crate::os_process::fake::ReapAnswer::Foreign(
-                crate::os_process::child::Foreign::Gone,
-            )])
+        f.signals([Ok(crate::signal::Sent::Delivered), refused()]).reaps([
+            crate::os_process::fake::ReapAnswer::Foreign(crate::os_process::child::Foreign::Gone),
+        ])
     });
 
     let torn = child.tear_down(

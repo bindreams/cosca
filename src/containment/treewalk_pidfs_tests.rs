@@ -362,12 +362,21 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
     let walks = super::fault::record_walks();
     assert!(
         matches!(
-            super::hard_kill(&root_changed_hands(), root()),
+            super::hard_kill(
+                &root_changed_hands(),
+                root(),
+                &super::ByIdentity::new(&root_changed_hands(), root())
+            ),
             crate::containment::dispatch::TreeKillOutcome::NoRoot
         ),
         "a gone root has no tree to walk"
     );
-    super::terminate(&root_changed_hands(), root()).expect("a gone root is Ok");
+    super::terminate(
+        &root_changed_hands(),
+        root(),
+        &super::ByIdentity::new(&root_changed_hands(), root()),
+    )
+    .expect("a gone root is Ok");
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
         assert_eq!(children.expect("a gone root is Ok"), vec![], "{recursive:?}");
@@ -385,10 +394,18 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
     let sends = crate::send_log::Capture::start();
     let walks = super::fault::record_walks();
     let results = [
-        super::hard_kill(&root_proof_fails(), root())
-            .into_result()
-            .map_err(crate::containment::dispatch::Unkilled::into_error),
-        super::terminate(&root_proof_fails(), root()),
+        super::hard_kill(
+            &root_proof_fails(),
+            root(),
+            &super::ByIdentity::new(&root_proof_fails(), root()),
+        )
+        .into_result()
+        .map_err(crate::containment::dispatch::Unkilled::into_error),
+        super::terminate(
+            &root_proof_fails(),
+            root(),
+            &super::ByIdentity::new(&root_proof_fails(), root()),
+        ),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),
     ];
@@ -427,7 +444,7 @@ fn live_child_in_a_table() -> (std::process::Child, ProcessId, FakeKernel<'stati
 
 /// Linux sends through the pidfd the identity was proved on, never by the pid's number, which could
 /// name another process the instant after the proof. Mutant: "send `kill(2)` by number after the
-/// proof": the send route is `Number` and no pidfd step is recorded.
+/// proof": no send through a pidfd is recorded.
 #[skuld::test]
 fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
     use nix::sys::signal::Signal;
@@ -437,12 +454,8 @@ fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
     let outcome = super::kill_by_identity(&kernel, id, Signal::SIGTERM);
     assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
     assert_eq!(
-        sends.group_steps(),
-        vec![crate::send_log::GroupStep::Member(
-            crate::send_log::Route::Pidfd,
-            id.pid(),
-            libc::SIGTERM
-        )]
+        sends.entries(),
+        [(id.pid(), crate::signal::Sig::Term, crate::send_log::Via::Pidfd)]
     );
     assert_eq!(
         child.wait().expect("the child exits").signal(),

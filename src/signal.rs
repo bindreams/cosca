@@ -22,7 +22,7 @@ impl Sig {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 impl Sig {
     pub(crate) fn as_libc(self) -> libc::c_int {
         match self {
@@ -163,6 +163,14 @@ impl RootState {
             Ok(PeekOutcome::Foreign(_)) => RootState::Reaped { own: false },
             Err(e) => RootState::Unknown(e),
         }
+    }
+
+    /// What a root that is signalled through a handle but never reaped or peeked says: it cannot say
+    /// whether its process was reaped, so nothing is sent by its pid on its word.
+    pub(crate) fn unheld() -> RootState {
+        RootState::Unknown(io::Error::other(
+            "the root is held by a handle that does not show whether it was reaped",
+        ))
     }
 
     /// The same answer, for a second reader of one look: an `Unknown`'s error keeps its kind and its

@@ -38,6 +38,11 @@ impl Root for StatedRoot<'_> {
         self.pid
     }
 
+    /// A stated root holds no process: its handle says the root is gone.
+    fn signal(&self, _sig: crate::signal::Sig) -> Result<crate::signal::Sent, crate::error::Error> {
+        Ok(crate::signal::Sent::Gone)
+    }
+
     fn state(&self) -> RootState {
         (self.state)()
     }

@@ -156,7 +156,8 @@ fn open_verified_on_a_live_non_leader_tid_is_not_thread_group_leader_whichever_e
 const UNASSESSABLE: &str = "identity could not be confirmed";
 
 /// `Unassessable` carrying `needles` in its message, with an OS error as `source()` iff
-/// `expect_source`, logged once at `warn` on this thread (`marker` finds the record).
+/// `expect_source`, and logged nothing on this thread (`marker` would find the record): the caller
+/// that returns the error passes it on, and one that drops it warns.
 fn assert_unassessable_with_cause(
     result: Result<bool, crate::error::Error>,
     needles: &[&str],
@@ -183,11 +184,7 @@ fn assert_unassessable_with_cause(
         .into_iter()
         .map(|(level, _)| level)
         .collect();
-    assert_eq!(
-        levels,
-        vec![log::Level::Warn],
-        "the verdict must be logged once, at warn: {text}"
-    );
+    assert_eq!(levels, Vec::<log::Level>::new(), "the open must log nothing: {text}");
     err
 }
 
@@ -250,9 +247,9 @@ fn open_verified_on_a_dead_non_leader_tid_is_gone() {
     );
 }
 
-/// The `INVAL`/`NOENT` arm's liveness check refused: `Unassessable` carrying the errno and one
-/// `warn`, never gone. The existence check reads the `stat` first and finds the process; the
-/// liveness check's read, the second, is refused.
+/// The `INVAL`/`NOENT` arm's liveness check refused: `Unassessable` carrying the errno, never gone.
+/// The existence check reads the `stat` first and finds the process; the liveness check's read, the
+/// second, is refused.
 #[skuld::test]
 fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     crate::log_capture::install();
@@ -282,14 +279,13 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     }
     assert_eq!(
         crate::log_capture::levels_since(mark, &marker),
-        vec![log::Level::Warn],
-        "the Unassessable verdict must be logged once, at warn"
+        Vec::<log::Level>::new(),
+        "the open logs nothing: its caller does"
     );
 }
 
 /// The `Unknown` branch of the `INVAL`/`NOENT` arm can't be produced for real, so the errno and the
-/// refused `stat` are stated. Unknown must be `Unassessable` carrying the errno + one warn, never
-/// gone.
+/// refused `stat` are stated. Unknown must be `Unassessable` carrying the errno, never gone.
 #[skuld::test]
 fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     crate::log_capture::install();

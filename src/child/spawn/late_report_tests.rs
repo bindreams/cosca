@@ -590,6 +590,81 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
     assert!(named.contains("pid 4242 was not killed"), "{named}");
 }
 
+/// A late child's root with `id`, for [`Root::signal`](crate::containment::Root::signal).
+fn late_root(pid: u32, id: Option<crate::identity::ProcessId>) -> LateTree {
+    LateTree {
+        tree: None,
+        sweep: Sweep::RootAlive,
+        pid,
+        unique: 1,
+        id,
+        sweeps: Vec::new(),
+        notes: Vec::new(),
+    }
+}
+
+/// A late child whose attach read no identity has nothing to open, so its root's send is
+/// `Unassessable` and nothing is sent. Mutant: the send is `Gone` or goes by the pid.
+#[skuld::test]
+fn a_late_roots_send_without_an_identity_is_unassessable_and_sends_nothing() {
+    use crate::containment::Root as _;
+    let sends = crate::send_log::Capture::start();
+    let err = late_root(4242, None)
+        .signal(crate::signal::Sig::Kill)
+        .expect_err("no identity, no send");
+    let crate::error::Error::Unassessable { detail, .. } = &err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    assert!(detail.contains("no identity to open it by"), "{detail}");
+    assert_eq!(sends.by_identity(), vec![], "nothing was sent");
+}
+
+/// A late child whose identity cannot be opened is the open's error, with the errno kept, and
+/// nothing is sent. Mutant: the open's failure reads as `Gone`.
+#[skuld::test]
+fn a_late_roots_send_whose_open_is_refused_is_the_opens_error() {
+    use crate::containment::Root as _;
+    let (mut child, _stdin, _) = std_blocker_with_unique();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("a live child");
+    let sends = crate::send_log::Capture::start();
+    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
+    let err = late_root(child.id(), Some(id))
+        .signal(crate::signal::Sig::Kill)
+        .expect_err("a refused open is an error");
+    let crate::error::Error::Unassessable {
+        source: Some(source), ..
+    } = &err
+    else {
+        panic!("expected Unassessable with its cause, got {err:?}");
+    };
+    assert_eq!(source.raw_os_error(), Some(libc::EPERM), "{err:?}");
+    assert_eq!(sends.by_identity(), vec![], "nothing was sent");
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// A late child whose pid names another process now is `Gone`: nothing is sent to the stranger.
+/// Mutant: the root is signalled by its pid.
+#[skuld::test]
+fn a_late_roots_send_to_a_recycled_pid_is_gone_and_sends_nothing() {
+    use crate::containment::Root as _;
+    let (mut child, _stdin, _) = std_blocker_with_unique();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("a live child");
+    let sends = crate::send_log::Capture::start();
+    let sent = late_root(child.id(), Some(id.with_other_value()))
+        .signal(crate::signal::Sig::Kill)
+        .expect("a recycled pid is no error");
+    assert_eq!(sent, crate::signal::Sent::Gone);
+    assert_eq!(sends.by_identity(), vec![], "nothing was sent to the stranger");
+    assert!(child.try_wait().expect("try_wait").is_none(), "the stranger still runs");
+    _ = child.kill();
+    _ = child.wait();
+}
+
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with
 /// what it starts after that. The first kill of its tree finds no group yet; the hook between that
 /// kill and the root's lets the child run on, `setsid`, `exec` and fork its grandchild, and waits

@@ -369,7 +369,7 @@ pub(crate) enum WriteEndCheck {
 /// the marker's parent-side descriptor not being inheritable), and a copy created in THIS
 /// process after the scan (e.g. a `dup()` racing the caller) is a snapshot gap of the same
 /// irreducible-window kind already documented at the `kill(2)` re-verify in
-/// `check_or_signal` (`src/containment/unix/group.rs`) — checked-then-acted-on, not held under
+/// `probe_member` (`src/containment/unix/group.rs`) — checked-then-acted-on, not held under
 /// a lock.
 pub(crate) fn write_end_check(read_end: BorrowedFd<'_>) -> WriteEndCheck {
     let me = std::process::id();

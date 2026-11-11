@@ -399,13 +399,15 @@ pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqu
         crate::identity::Existence::Gone => Ok(None), // recycled before the filter armed
         crate::identity::Existence::Unknown => {
             log::warn!(
-                "wait: pid {} identity could not be confirmed; its exit cannot be observed",
-                id.pid()
+                "wait: pid {} identity could not be confirmed; {}",
+                id.pid(),
+                crate::os_process::EXIT_CONSEQUENCE
             );
             Err(Error::Unassessable {
                 detail: format!(
-                    "pid {} identity could not be confirmed; its exit cannot be observed",
-                    id.pid()
+                    "pid {} identity could not be confirmed; {}",
+                    id.pid(),
+                    crate::os_process::EXIT_CONSEQUENCE
                 ),
                 source: None,
             })

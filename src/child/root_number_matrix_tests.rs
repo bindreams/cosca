@@ -374,6 +374,9 @@ struct Sent {
     /// The signals the root, also a marker holder, got through the holders channel.
     root_holder: Vec<nix::sys::signal::Signal>,
     pidfd: bool,
+    /// `kill_tree`'s handle backstop was sent the root's kill, after its sweep: the root was killed
+    /// through its pidfd twice, once by the walk and once by the backstop.
+    backstop: bool,
     /// A cgroup member's `SIGTERM` through its pidfd.
     member_term: bool,
     cgroup_kill: bool,
@@ -408,6 +411,7 @@ struct Expected {
     /// `None`: not checked.
     root_holder: Option<&'static [nix::sys::signal::Signal]>,
     pidfd: Want,
+    backstop: Want,
     /// A cgroup member's `SIGTERM` through its pidfd.
     member_term: Want,
     cgroup_kill: Want,
@@ -467,13 +471,24 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     };
     // The handle backstop, through the pidfd; after a reap it has nothing to reach. A root whose
     // handle cannot answer is signalled through it by every entry point: it names the root exactly.
+    // A walk sends its root's `SIGTERM` and its kill through the root's handle too.
     let pidfd = match (cfg!(target_os = "linux"), reaped, op) {
         (false, _, _) => Want::No,
         (true, true, _) => Want::Any,
         (true, false, _) if reap != Reap::None => Want::Yes,
+        (true, false, Op::Terminate) if mechanism.walks() => Want::Yes,
         (true, false, Op::Terminate) => Want::No,
         (true, false, _) => Want::Yes,
     };
+    // The walk has already killed the root through the handle when `kill_tree` reaches the backstop,
+    // so the backstop shows as a second kill through it: a `kill_tree` that skips it leaves the root
+    // to a walk that may have found nothing.
+    let backstop =
+        if cfg!(target_os = "linux") && mechanism == Mechanism::TreeWalk && reap == Reap::None && op == Op::Kill {
+            Want::Yes
+        } else {
+            Want::Any
+        };
     // The tree's second `cat` stays a running member, so the graceful half reaches it, reaped root
     // or not.
     let member_term = if mechanism.is_cgroup() && !op.kills() {
@@ -493,6 +508,7 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
         holder,
         root_holder,
         pidfd,
+        backstop,
         member_term,
         cgroup_kill,
         survivor_ended_alone: if cgroup_kill == Want::Yes { Want::No } else { Want::Any },
@@ -511,6 +527,7 @@ fn mismatches(want: &Expected, sent: &Sent) -> Vec<String> {
     check("walk", want.walk, sent.walk);
     check("by-pid", want.by_pid, sent.by_pid);
     check("pidfd", want.pidfd, sent.pidfd);
+    check("backstop", want.backstop, sent.backstop);
     check("member SIGTERM", want.member_term, sent.member_term);
     check("cgroup.kill", want.cgroup_kill, sent.cgroup_kill);
     check(
@@ -590,6 +607,13 @@ impl Recorders {
             #[cfg(not(target_os = "macos"))]
             root_holder: Vec::new(),
             pidfd: entries.iter().any(|(pid, _, via)| *pid == root && *via == Via::Pidfd),
+            // The walk's own kill of the root and the backstop's go through the same handle: a second
+            // kill through it is the backstop's.
+            backstop: entries
+                .iter()
+                .filter(|(pid, sig, via)| *pid == root && *sig == crate::signal::Sig::Kill && *via == Via::Pidfd)
+                .count()
+                >= 2,
             cgroup_kill,
             survivor_ended_alone: false,
         }

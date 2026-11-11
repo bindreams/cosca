@@ -26,7 +26,11 @@ impl LinuxProcess {
 
 impl OsProcess for LinuxProcess {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        send_pidfd(self.pidfd.as_fd(), self.pid, sig).map_err(|e| Error::Io(std::io::Error::from(e)))
+        let sent = send_pidfd(self.pidfd.as_fd(), self.pid, sig);
+        // After the syscall, whatever it answered, as macOS's `send_with_token` records.
+        #[cfg(test)]
+        crate::send_log::record_by_identity(self.pid.unwrap_or(0), sig.as_libc());
+        sent.map_err(|e| Error::Io(std::io::Error::from(e)))
     }
 
     fn exited(&self) -> Result<Exit<'_>, Error> {

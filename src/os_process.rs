@@ -67,10 +67,22 @@ pub(crate) enum WaitFor<'a> {
     Signalled(BorrowedHandle<'a>),
 }
 
+/// The words of what a failed look at a process leaves undone.
+#[cfg(unix)]
+macro_rules! exit_unobserved {
+    () => {
+        "its exit cannot be observed"
+    };
+}
+
+/// What is left undone when the look that arms an exit watch cannot go ahead (macOS).
+#[cfg(target_os = "macos")]
+pub(crate) const EXIT_CONSEQUENCE: &str = exit_unobserved!();
+
 /// What is left undone when an [`open`] cannot go ahead, for the errors it returns: the one open
 /// serves every act on the process.
 #[cfg(unix)]
-pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no signal was sent";
+pub(crate) const OPEN_CONSEQUENCE: &str = concat!(exit_unobserved!(), " and no signal was sent");
 
 /// What a message calls a child whose pid is not known ([`OsChild::pid`](child::OsChild::pid)).
 pub(crate) const PIDLESS_CHILD: &str = "the child (pid unknown)";
@@ -84,7 +96,38 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
 /// tests' entry; the library opens through [`open_with`].
 #[cfg(test)]
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    open_with(&crate::identity::HostKernel, id)
+    open_with(&crate::identity::HostKernel, id).map_err(OpenFailure::into_open_error)
+}
+
+/// Why an [`open_with`] opened nothing and found nothing gone. It logs nothing: the caller that
+/// returns the error passes it on, and one that drops it warns.
+#[derive(Debug)]
+pub(crate) enum OpenFailure {
+    /// Linux: a pidfd call failed for a reason that says nothing about the target. The call and its
+    /// errno are for a consumer to build its own error from: [`into_open_error`](Self::into_open_error)
+    /// is [`Process::open`](crate::Process::open)'s.
+    #[cfg(target_os = "linux")]
+    Call(crate::identity::FailedCall),
+    /// An error already in its final form: every other failure, on every platform.
+    Finished(Error),
+}
+
+impl From<Error> for OpenFailure {
+    fn from(error: Error) -> Self {
+        OpenFailure::Finished(error)
+    }
+}
+
+impl OpenFailure {
+    /// The error [`Process::open`](crate::Process::open) documents: a failed call is
+    /// [`open_error`](linux::open::open_error), the rest as they are.
+    pub(crate) fn into_open_error(self) -> Error {
+        match self {
+            #[cfg(target_os = "linux")]
+            OpenFailure::Call(call) => linux::open::open_error(call),
+            OpenFailure::Finished(error) => error,
+        }
+    }
 }
 
 /// [`open`] through `kernel`: the one entry to the open, on every platform. Only Linux's
@@ -92,10 +135,10 @@ pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
 pub(crate) fn open_with(
     kernel: &dyn crate::identity::Kernel,
     id: ProcessId,
-) -> Result<Option<Box<dyn OsProcess>>, Error> {
+) -> Result<Option<Box<dyn OsProcess>>, OpenFailure> {
     #[cfg(target_os = "linux")]
     {
-        Ok(linux::open::open_verified_error_with(kernel, id)?
+        Ok(linux::open::open_verified_with(kernel, id)?
             .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>))
     }
     #[cfg(windows)]

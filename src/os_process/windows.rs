@@ -125,11 +125,6 @@ fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
             Ok(false)
         }
         HandleIdentity::Unreadable(e) => {
-            log::warn!(
-                "wait: pid {} opened but its identity could not be verified ({report})",
-                id.pid(),
-                report = crate::error::Report(&e)
-            );
             close(handle);
             Err(Error::Unassessable {
                 detail: format!("pid {} opened but its identity could not be verified", id.pid()),
@@ -154,17 +149,10 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
         Opened::Denied(e) => {
             return match id.is_alive() {
                 Liveness::Dead => Ok(None),
-                Liveness::Alive | Liveness::Unknown => {
-                    log::warn!(
-                        "wait: pid {} could not be opened ({report}) - reporting an error, not an exit or a kill",
-                        id.pid(),
-                        report = crate::error::Report(&e)
-                    );
-                    Err(Error::Unassessable {
-                        detail: format!("pid {} could not be opened", id.pid()),
-                        source: Some(Error::io_cause(win32_io_error(e))),
-                    })
-                }
+                Liveness::Alive | Liveness::Unknown => Err(Error::Unassessable {
+                    detail: format!("pid {} could not be opened", id.pid()),
+                    source: Some(Error::io_cause(win32_io_error(e))),
+                }),
             }
         }
     };
