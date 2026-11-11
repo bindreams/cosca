@@ -851,10 +851,9 @@ impl TreeKilled {
         let outcome = outcome.into();
         let mut state = self.lock();
         let was_killed = matches!(*state, TreeState::Killed);
-        // The held members move out here and the state is written once, at the end. An unwind between
-        // leaves `Left` with none held, and a later kill answers none of them.
-        let held = match &mut *state {
-            TreeState::Left(held) => std::mem::take(held),
+        // Copied, not taken: the state is written once, at the end, so an unwind between leaves it as it was.
+        let held = match &*state {
+            TreeState::Left(held) => held.clone(),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
         };
         let gone_root = matches!(outcome, TreeKillOutcome::NoRoot);
