@@ -522,12 +522,24 @@ pub fn silence_async(cmd: &mut cosca::tokio::Command) {
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](cosca::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
 /// cgroup leaf first and logs a warning where none is delegated, so the same test would warn on one
-/// host and not on another. A test that is about cgroups takes the `cgroup` group instead.
+/// host and not on another. See principle 9 of `docs/principles.md`.
 pub fn contain_without_cgroup(cmd: &mut cosca::Command) -> &mut cosca::Command {
     #[cfg(target_os = "linux")]
     return cmd.contain_with(cosca::ContainMode::Session);
     #[cfg(not(target_os = "linux"))]
     cmd.contain()
+}
+
+/// The mechanism [`contain_without_cgroup`] gets on this platform: a session on Linux, the
+/// inherited-fd marker on macOS, a Job Object on Windows. A test that asks for it asserts exactly
+/// this, never a set.
+pub const fn contain_without_cgroup_gives() -> cosca::Containment {
+    #[cfg(target_os = "linux")]
+    return cosca::Containment::Session;
+    #[cfg(target_os = "macos")]
+    return cosca::Containment::FdMarker;
+    #[cfg(windows)]
+    return cosca::Containment::JobObject;
 }
 
 /// [`contain_without_cgroup`] for the async `Command`.

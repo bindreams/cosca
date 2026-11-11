@@ -266,22 +266,20 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixtu
     // killed or reaped from here), so it must not hold nextest's stdout/stderr.
     cmd.stdout(cosca::Stdio::null()).expect("null stdout");
     cmd.stderr(cosca::Stdio::null()).expect("null stderr");
-    cmd.contain();
+    common::contain_without_cgroup(&mut cmd);
     cmd.env(common::ACK_ENV, "1");
     let (report, report_addr) = common::bind_report();
     cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn contained root");
 
-    // The pgid-based mechanism specifically — NOT cgroup v2 (whose `cgroup.kill` bypasses the
-    // ordinary kill(2) permission check entirely and would not reproduce the bug at all) and NOT
-    // Delegated/None. `.contain()`'s cgroup path only activates given a delegated cgroup v2
-    // slice, which this lane's ordinary (unprivileged) `cargo nextest run` invocation does not have —
-    // asserted, not assumed, exactly like this suite's existing `unix_kill_tree_reaps_the_
-    // grandchild` (tests/spawn_io.rs).
+    // The pgid-based mechanism specifically — NOT cgroup v2, whose `cgroup.kill` bypasses the
+    // ordinary kill(2) permission check entirely and would not reproduce the bug at all. Asked for,
+    // so that a host with a delegated cgroup runs the same scenario: `contain_without_cgroup`
+    // gives a session, whose group is signalled by `killpg` as a process group's is.
     assert_eq!(
         child.containment(),
-        cosca::Containment::ProcessGroup,
-        "expected the pgid-based ProcessGroup mechanism, got {:?}",
+        common::contain_without_cgroup_gives(),
+        "expected the pgid-based mechanism, got {:?}",
         child.containment()
     );
 

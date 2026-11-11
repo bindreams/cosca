@@ -254,15 +254,25 @@ pub(crate) fn held_std_killable_blocker() -> std::process::Command {
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
 /// cgroup leaf first and logs a warning where none is delegated, so a test that holds a
-/// [`warn_watch`](crate::log_capture::warn_watch) would warn on one host and not on another. A test
-/// that is about cgroups takes the `cgroup` group instead. Mirrors `tests/common`'s helper of the
-/// same name, which a separate compilation unit cannot share.
+/// [`warn_watch`](crate::log_capture::warn_watch) would warn on one host and not on another. See
+/// principle 9 of `docs/principles.md`. Mirrors `tests/common`'s helper of the same name, which a
+/// separate compilation unit cannot share.
 #[cfg(unix)]
 pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Command {
     #[cfg(target_os = "linux")]
     return cmd.contain_with(crate::ContainMode::Session);
     #[cfg(not(target_os = "linux"))]
     cmd.contain()
+}
+
+/// The mechanism [`contain_without_cgroup`] gets on this platform: a session on Linux, the
+/// inherited-fd marker on macOS. A test that asks for it asserts exactly this, never a set.
+#[cfg(unix)]
+pub(crate) const fn contain_without_cgroup_gives() -> crate::Containment {
+    #[cfg(target_os = "linux")]
+    return crate::Containment::Session;
+    #[cfg(target_os = "macos")]
+    return crate::Containment::FdMarker;
 }
 
 /// [`contain_without_cgroup`] for the async `Command`.

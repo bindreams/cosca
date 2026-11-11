@@ -288,7 +288,9 @@ fails on whatever an environment without support produces: a failed support chec
 a skip.
 
 A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
-delegated cgroup with `unshare` permitted.
+delegated cgroup with `unshare` permitted. A test that spawns a contained child asks for its mechanism
+(`contain_without_cgroup`, or the `cgroup` fixture for `CgroupV2`) and asserts that one; none
+accepts whichever the host gave.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row

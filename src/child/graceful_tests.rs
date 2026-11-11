@@ -478,8 +478,10 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
 // the child has not registered with the console (Windows) or installed its disposition (Unix)
 // when the signal arrives, and what the test measures is an abrupt death during startup rather
 // than the cooperative path it is named for.
-#[skuld::test]
-fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
+//
+// `contain` is the mechanism the caller asks for and `expected` the one it must get, which
+// decides the arm: each mechanism has its own test below.
+fn drained_tree_sweep_decision(contain: impl FnOnce(&mut crate::Command), expected: crate::Containment) {
     use std::io::Read;
 
     // Asked on Windows: the test sends a console-group break to a child that registered with the
@@ -505,7 +507,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
         cmd.env(crate::test_child::ack::ACK_ENV, "1");
     }
-    cmd.contain();
+    contain(&mut cmd);
     #[cfg_attr(
         windows,
         allow(
@@ -514,6 +516,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         )
     )]
     let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), expected);
     #[cfg(unix)]
     let stdin = child.stdin().expect("piped stdin");
     #[cfg(unix)]
@@ -533,7 +536,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         sock
     };
     let authoritative = matches!(
-        child.containment(),
+        expected,
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
     );
     let armed = term_fault::ArmedKillTreeError::arm();
@@ -605,6 +608,30 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
             "the root must die to the console event, not to the cleanup sweep, got {status:?}"
         );
     }
+}
+
+/// A Job Object is authoritative: the drained tree skips the sweep.
+#[cfg(windows)]
+#[skuld::test]
+fn graceful_tree_drained_skips_sweep_in_a_job_object() {
+    drained_tree_sweep_decision(|cmd| _ = cmd.contain(), crate::Containment::JobObject);
+}
+
+/// A cgroup leaf is authoritative: the drained tree skips the sweep.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_tree_drained_skips_sweep_in_a_cgroup(#[fixture(cgroup)] _group: &Group) {
+    drained_tree_sweep_decision(|cmd| _ = cmd.contain(), crate::Containment::CgroupV2);
+}
+
+/// A session (Linux) has no drain edge and the macOS fd marker's is advisory: the sweep always runs.
+#[cfg(unix)]
+#[skuld::test]
+fn graceful_tree_drained_still_sweeps_without_an_authoritative_mechanism() {
+    drained_tree_sweep_decision(
+        |cmd| _ = crate::test_child::contain_without_cgroup(cmd),
+        crate::test_child::contain_without_cgroup_gives(),
+    );
 }
 
 // Regression test: on the `MembersRemain` branch (a drain-observable mechanism whose tree does

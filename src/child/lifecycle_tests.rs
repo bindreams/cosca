@@ -5,6 +5,8 @@
 use std::time::Duration;
 
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// The `TreeDrain` variant a fully-drained tree reports on `containment`'s mechanism:
 /// `AllMembersExited` everywhere authoritative (cgroup v2, Windows job object), but
@@ -275,16 +277,16 @@ fn drop_kills_and_reaps_the_child() {
 /// Dropping a `Child` whose tree is contained kills the whole tree, the grandchild too. The tree's
 /// stdin is released once the drop's root kill returned, so a drop that sent nothing lets the
 /// root exit 0 and the grandchild print `eof`, and fails the assertions instead of hanging in the
-/// drop. Both members hold the stdout pipe, so its end is the moment both are gone.
+/// drop. Both members hold the stdout pipe, so its end is the moment both are gone. `contain` is
+/// the mechanism the caller asks for, and `expected` the one it must get.
 #[cfg(unix)]
-#[skuld::test]
-fn drop_kills_a_contained_tree() {
+fn drop_kills_a_tree_contained_by(contain: impl FnOnce(&mut crate::Command), expected: crate::Containment) {
     use std::io::Read as _;
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::CAT_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
+    contain(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
@@ -293,19 +295,7 @@ fn drop_kills_a_contained_tree() {
     assert_eq!(&ready, b"r\n");
     // Containment was established, so a tree that survives the drop is a missing kill and not a
     // missing mechanism.
-    let got = child.containment();
-    let established = if cfg!(target_os = "linux") {
-        matches!(got, crate::Containment::CgroupV2 | crate::Containment::ProcessGroup)
-    } else {
-        matches!(
-            got,
-            crate::Containment::ProcessGroup | crate::Containment::Session | crate::Containment::FdMarker
-        )
-    };
-    assert!(
-        established,
-        "unexpected containment for a contained tree on this host: {got:?}"
-    );
+    assert_eq!(child.containment(), expected);
     let teardown = crate::child::spawn::fault::release_at_drop_kill(stdin);
 
     drop(child);
@@ -316,6 +306,21 @@ fn drop_kills_a_contained_tree() {
         .read_to_end(&mut rest)
         .expect("both members are gone, so the pipe ends");
     assert!(rest.is_empty(), "the drop missed the grandchild: {rest:?}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn drop_kills_a_contained_tree() {
+    drop_kills_a_tree_contained_by(
+        |cmd| _ = crate::test_child::contain_without_cgroup(cmd),
+        crate::test_child::contain_without_cgroup_gives(),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn drop_kills_a_cgroup_contained_tree(#[fixture(cgroup)] _group: &Group) {
+    drop_kills_a_tree_contained_by(|cmd| _ = cmd.contain(), crate::Containment::CgroupV2);
 }
 
 // A zombie launchd holds =====

@@ -489,10 +489,9 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     cleanup(&mut child).await;
 }
 
-// Async twin of `graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative` —
-// see there for the full rationale.
-#[skuld::test]
-async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
+// Async twin of `child::graceful_tests::drained_tree_sweep_decision` — see there for the full
+// rationale, `contain` and `expected`.
+async fn drained_tree_sweep_decision(contain: impl FnOnce(&mut crate::tokio::Command), expected: crate::Containment) {
     crate::tokio::test_runtime::assert_current_thread();
     // Asked on Windows: the test sends a console-group break to a child that registered with the
     // console; a unix child has no console, so the argument is moot there.
@@ -515,8 +514,9 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
         crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
         cmd.env(crate::test_child::ack::ACK_ENV, "1");
     }
-    cmd.contain();
+    contain(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
+    assert_eq!(child.containment(), expected);
     #[cfg(unix)]
     let stdin = child.stdin().expect("piped stdin");
     #[cfg(unix)]
@@ -541,7 +541,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
         sock
     };
     let authoritative = matches!(
-        child.containment(),
+        expected,
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
     );
     let armed = term_fault::ArmedKillTreeError::arm();
@@ -612,6 +612,28 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
             "the root must die to the console event, not to the cleanup sweep, got {status:?}"
         );
     }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+async fn async_graceful_tree_drained_skips_sweep_in_a_job_object() {
+    drained_tree_sweep_decision(|cmd| _ = cmd.contain(), crate::Containment::JobObject).await;
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_graceful_tree_drained_skips_sweep_in_a_cgroup(#[fixture(cgroup)] _group: &Group) {
+    drained_tree_sweep_decision(|cmd| _ = cmd.contain(), crate::Containment::CgroupV2).await;
+}
+
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_tree_drained_still_sweeps_without_an_authoritative_mechanism() {
+    drained_tree_sweep_decision(
+        |cmd| _ = crate::test_child::contain_without_cgroup_async(cmd),
+        crate::test_child::contain_without_cgroup_gives(),
+    )
+    .await;
 }
 
 // Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's

@@ -64,20 +64,7 @@ fn containment_smoke() {
         "contain() must use a real mechanism on this platform, got None"
     );
 
-    // Per-OS assertions on the specific mechanism.
-    #[cfg(windows)]
-    assert_eq!(child.containment(), Containment::JobObject);
-    #[cfg(target_os = "linux")]
-    assert_eq!(child.containment(), Containment::Session);
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    assert!(
-        matches!(
-            child.containment(),
-            Containment::ProcessGroup | Containment::Session | Containment::FdMarker
-        ),
-        "macOS/BSD must use ProcessGroup, Session or FdMarker, got {:?}",
-        child.containment()
-    );
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.kill_tree().expect("kill_tree");
     drop(stdin);
