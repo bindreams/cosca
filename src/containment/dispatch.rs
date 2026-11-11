@@ -218,7 +218,7 @@ impl TeardownCaller {
     }
 }
 
-/// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
+/// What a `Child`'s drop knows about its root, for its report and for what it does to the root.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DropView {
