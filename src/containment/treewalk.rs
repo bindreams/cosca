@@ -954,13 +954,14 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
 /// to look at there is nothing to skip.
 fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
     let root = root?;
-    #[cfg(all(test, unix))]
-    crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
     #[cfg(not(target_os = "macos"))]
     let _ = root;
     #[cfg(target_os = "macos")]
+    let state = root.state();
+    #[cfg(all(test, unix))]
+    crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+    #[cfg(target_os = "macos")]
     {
-        let state = root.state();
         if matches!(
             state,
             crate::signal::RootState::Unpinned | crate::signal::RootState::Unknown(_)

@@ -106,6 +106,14 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
     crate::log_capture::records_since_on_current_thread(mark, WARN)
 }
 
+/// The drop's warn over a `TreeWalk` whose walk found no root: the tree call's answer, as the
+/// settlement words it.
+const WALK_WARN: &str = "Child::drop: contained-tree teardown did not fully succeed";
+
+fn drop_walk_warns_since(mark: usize) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, WALK_WARN)
+}
+
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
 fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
@@ -279,7 +287,7 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran
         Vec::<u32>::new(),
         "a reaped root's number names no tree"
     );
-    let warns = drop_warns_since(mark);
+    let warns = drop_walk_warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn, got {warns:?}");
     let (level, text) = &warns[0];
     assert_eq!(*level, log::Level::Warn);
@@ -557,7 +565,7 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     let mark = crate::log_capture::mark();
     drop(child);
 
-    let records = drop_warns_since(mark);
+    let records = drop_walk_warns_since(mark);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn);
 }
@@ -657,9 +665,9 @@ fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
 }
 
 /// A walk that saw the root running and left it, whose backstop then killed it, is `Ok` for the
-/// caller but leaves the tree unvouched (the root may have forked first), so the drop's skip warns
-/// that the tree could not be vouched for, and speaks of no members. Mutant: the tree is marked
-/// killed.
+/// caller but leaves the tree unvouched (the root may have forked first). The drop walks as a tree
+/// call does and finds no root, so it warns that the tree could not be walked from the gone root and
+/// what it forked is unknown, and speaks of no members. Mutant: the tree is marked killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree() {
@@ -673,16 +681,16 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unv
     let mark = crate::log_capture::mark();
     drop(child);
 
-    let warns = drop_warns_since(mark);
+    let warns = drop_walk_warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert_eq!(warns[0].0, log::Level::Warn, "{warns:?}");
-    assert!(warns[0].1.contains("could not be vouched for"), "{warns:?}");
+    assert!(warns[0].1.contains("what it forked is unknown"), "{warns:?}");
     assert!(!warns[0].1.contains("members"), "{warns:?}");
 }
 
 /// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
-/// nothing: it is `Unassessable`, and does not mark the tree killed, so the drop still says it skips
-/// the walk, as it would without the call.
+/// nothing: it is `Unassessable`, and does not mark the tree killed, so the drop still warns that no
+/// walk ran, as it would without the call.
 ///
 /// Mutants: a walk that found no root counts as a kill that ran; it answers `Ok`.
 #[cfg(target_os = "linux")]
@@ -701,7 +709,7 @@ fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_ma
     assert!(!child.tree_killed.is_set(), "a walk that found no root killed nothing");
     let mark = crate::log_capture::mark();
     drop(child);
-    let records = drop_warns_since(mark);
+    let records = drop_walk_warns_since(mark);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn, "{records:?}");
 }

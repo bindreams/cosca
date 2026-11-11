@@ -352,16 +352,6 @@ mod group_kill_and_terminate {
         }
     }
 
-    /// With no root there is nothing to look at: the kill is sent as asked.
-    #[skuld::test]
-    fn a_group_kill_with_no_root_is_sent_as_asked() {
-        let recorder = fault::record_kill_group();
-        // Not a debug build's `check_number` contract breach: the recorder answers before any send.
-        let outcome = kill_group_tree(PGID, None);
-        assert!(matches!(outcome, TreeKillOutcome::Ran(Ok(()))), "{outcome:?}");
-        assert_eq!(recorder.killed(), [PGID]);
-    }
-
     /// The terminate: the same decisions, with a skip ending the call, and on Linux, for a root its
     /// handle cannot answer for, leaving the root alone to the caller through its handle.
     #[skuld::test]

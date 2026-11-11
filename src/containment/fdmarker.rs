@@ -1121,11 +1121,13 @@ impl Marker {
         let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
         let holders_only = |except| self.hard_kill_impl(Scope::HoldersOnly { except });
         let Some((look, except)) = self.look_at(root) else {
-            // No look to take: without its root only the holders are the tree; without a root to
-            // check, the sweep runs as asked.
-            return TreeKillOutcome::Ran(ran(match (self.root, root) {
-                (None, _) => holders_only(None),
-                (Some(_), _) => self.hard_kill(root),
+            // No look to take: without its root only the holders are the tree.
+            return TreeKillOutcome::Ran(ran(match self.root {
+                None => holders_only(None),
+                Some(_) => {
+                    debug_assert!(false, "a marker with a root was given no root to look at");
+                    self.hard_kill(root)
+                }
             }));
         };
         let root_pid = root.map_or(0, Root::pid);
@@ -1187,9 +1189,12 @@ impl Marker {
         let holders_only = |except| self.terminate_impl(Scope::HoldersOnly { except });
         let earlier = Some("the SIGTERM");
         let Some((look, except)) = self.look_at(root) else {
-            let result = match (self.root, root) {
-                (None, _) => holders_only(None),
-                (Some(_), _) => self.terminate(root),
+            let result = match self.root {
+                None => holders_only(None),
+                Some(_) => {
+                    debug_assert!(false, "a marker with a root was given no root to look at");
+                    self.terminate(root)
+                }
             };
             return TerminateOutcome::Sent { result, earlier };
         };

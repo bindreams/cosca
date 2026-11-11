@@ -890,9 +890,9 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
 
 /// A tree kill skipped because the root's state is unknown, and a root whose kill is refused and
 /// which is handed back: the early tree kill skips again and kills nothing, so the error still says
-/// the tree was not killed. The tree is a ppid walk from the root's number, which an unknown root
-/// skips on every kernel; a process group does not skip on Linux 6.9+, where the root's pidfd names
-/// it.
+/// the tree was not killed. The tree is a process group named by the root's number, which an unknown
+/// root skips where the root's pidfd cannot name it (below Linux 6.9, refused here). A `TreeWalk` does
+/// not skip on Linux: its walk proves its root itself.
 ///
 /// Linux only: a macOS root holds its fd marker whatever the mode, and the skipped kill still sweeps
 /// the marker's holders by identity, so the root is dead before its refused kill and nothing is
@@ -902,8 +902,9 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
-    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    let (mut child, writer) = contained_blocker(ContainMode::Session);
     child.proc.script_over(|f| {
         f.peeks([Err(std::io::Error::other("forced peek failure"))])
             .signals([refused()])
@@ -925,8 +926,10 @@ fn a_skipped_tree_kill_keeps_its_note_when_the_root_is_handed_back() {
 /// Mutant: a skipped kill marks the tree killed, which disarms the handle.
 #[skuld::test]
 fn finish_elevated_leaves_the_handle_armed_after_a_skipped_tree_kill() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
-    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    let (mut child, writer) = contained_blocker(ContainMode::Session);
     child
         .proc
         .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
@@ -950,8 +953,10 @@ fn finish_elevated_leaves_the_handle_armed_after_a_skipped_tree_kill() {
 /// Mutant: `settle` marks the tree killed for a kill that was skipped.
 #[skuld::test]
 fn a_teardown_that_skipped_the_tree_kill_does_not_mark_the_tree_killed() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
-    let (mut child, writer) = contained_blocker(ContainMode::TreeWalk);
+    let (mut child, writer) = contained_blocker(ContainMode::Session);
     child
         .proc
         .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));

@@ -483,6 +483,10 @@ impl Child {
         let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
         let root: Option<&dyn crate::containment::Root> = None;
+        #[cfg(test)]
+        if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
+            return forced;
+        }
         match self.attached.terminate(self.pid(), root) {
             TerminateOutcome::Sent { result, earlier } => SignalTreeCooperativelyOutcome::Sent { result, earlier },
             #[cfg(unix)]
@@ -741,7 +745,7 @@ pub(crate) mod fault {
     /// decided on, so a test that scripts the root's reads counts the same.
     pub(crate) fn forced_in_place_of_the_signal(
         root: Option<&dyn crate::containment::Root>,
-    ) -> Option<crate::containment::TerminateOutcome> {
+    ) -> Option<super::SignalTreeCooperativelyOutcome> {
         let kind = take_force_terminate();
         if kind == Forced::None {
             return None;
@@ -750,7 +754,7 @@ pub(crate) mod fault {
         let _ = root.map(crate::containment::Root::state);
         #[cfg(not(unix))]
         let _ = root;
-        Some(crate::containment::TerminateOutcome::Sent {
+        Some(super::SignalTreeCooperativelyOutcome::Sent {
             result: Err(forced_terminate_error(kind)),
             earlier: Some("the SIGTERM"),
         })

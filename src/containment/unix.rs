@@ -340,10 +340,11 @@ fn log_empty_group(pgid: i32, look: &NumberLook) {
 /// killed as usual while the root's number names it; sent nothing when it is empty
 /// ([`TreeKillOutcome::Answered`]); and skipped, nothing sent by the number, when the number may name
 /// another process ([`TreeKillOutcome::Skipped`]: on Linux the caller kills the root alone through
-/// its handle when [`Skip::root_alone`]). With no `root` there is nothing to look at.
+/// its handle when [`Skip::root_alone`]). A group kill is given its `root`, as [`check_number`] needs it.
 pub(crate) fn kill_group_tree(pgid: i32, root: Option<&dyn Root>) -> TreeKillOutcome {
     let ran = |sent: Result<(), Error>| TreeKillOutcome::Ran(sent.map_err(Unkilled::from));
     let Some(root) = root else {
+        debug_assert!(false, "a group kill was given no root to look at");
         return ran(kill_group(pgid, None));
     };
     match group_look(root) {
@@ -362,6 +363,7 @@ pub(crate) fn kill_group_tree(pgid: i32, root: Option<&dyn Root>) -> TreeKillOut
 pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOutcome {
     let earlier = Some("the SIGTERM");
     let Some(root) = root else {
+        debug_assert!(false, "a group terminate was given no root to look at");
         return TerminateOutcome::Sent {
             result: term_group(pgid, None),
             earlier,

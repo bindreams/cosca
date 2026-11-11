@@ -1,7 +1,5 @@
 //! Per-OS containment dispatch (two-phase: prepare before spawn, attach after).
 
-#[cfg(unix)]
-use crate::containment::Why;
 use crate::containment::{ContainMode, ContainRequest, Containment, Nesting, Skip, TerminateOutcome};
 use crate::error::Error;
 
@@ -774,10 +772,8 @@ impl TreeKillOutcome {
         let TreeKillOutcome::Skipped(skip) = self else {
             return;
         };
-        let why = match &skip.why {
-            Why::Untrusted(why) => why.clone(),
-            Why::MayNameAnother(refusal) => refusal.to_string(),
-        };
+        // The drop's own look at the root words it, as its warn does.
+        let why = view.why_number_untrusted();
         let (label, this, action) = (view.caller.label(), view.caller.this_event(), &skip.action);
         if view.tree_killed {
             log::debug!("{label}: {why} and this handle already killed the tree, so {this} does not {action}");
@@ -1140,10 +1136,6 @@ impl Attached {
         allow(unused_variables, reason = "only Unix names a group by the root's pid")
     )]
     pub(crate) fn terminate(&self, _child_pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
-        #[cfg(test)]
-        if let Some(forced) = crate::child::graceful::fault::forced_in_place_of_the_signal(root) {
-            return forced;
-        }
         let sent = |result: Result<(), Error>| TerminateOutcome::Sent {
             result,
             earlier: Some("the SIGTERM"),
