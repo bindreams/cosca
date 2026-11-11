@@ -1,8 +1,8 @@
 //! Tests for [`OwnedChild`](super::OwnedChild): one deterministic test per row of the state
 //! table, each with the mutant it turns RED against named in its doc.
 //!
-//! Every test that `recv()`s or `join()`s on our own code has a nextest override
-//! (`.config/nextest.toml`) as the failure bound of a hanging mutant.
+//! A test that `recv()`s or `join()`s on our own code hangs on a mutant; the suite's `slow-timeout`
+//! (`.config/nextest.toml`) is its failure bound.
 
 #[path = "owned_tests/fixtures.rs"]
 mod fixtures;

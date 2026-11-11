@@ -1,6 +1,6 @@
 //! Tests for the macOS wait (`await_reapable`): its own `kevent` loop, the self-registration, the
-//! backoff and the deadline. Every test that blocks on a real kqueue is covered by the nextest
-//! override in `.config/nextest.toml`.
+//! backoff and the deadline. Every test that blocks on a real kqueue is covered by the suite's
+//! `slow-timeout` in `.config/nextest.toml`.
 //!
 //! The cases that change the process-wide `SIGCHLD` disposition each run in a fresh re-exec of
 //! this test binary (`run_case`), so they cannot affect the other tests.

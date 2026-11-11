@@ -8,9 +8,9 @@
 //! Each spawn runs on both backends: argv (std) and `executable()` (raw `CreateProcessW`). With the
 //! `tokio` feature, the async API gets the same two legs where a helper process matters.
 //!
-//! The death tests are named `death_watch_*`: their waits are on a process handle with no timeout
-//! of their own, and `.config/nextest.toml` bounds that name pattern, so a containment that stops
-//! working fails the test instead of hanging the job.
+//! The death tests (`death_watch_*`, a descriptive name only) wait on a process handle with no
+//! timeout of their own; the suite's `slow-timeout` in `.config/nextest.toml` bounds them, so a containment
+//! that stops working fails the test instead of hanging the job.
 
 #[cfg(windows)]
 use std::io::Write;

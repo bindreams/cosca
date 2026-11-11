@@ -717,7 +717,7 @@ mod on_windows {
     }
 
     /// A command used for `spawn_suspended` and then for `spawn` yields a running child. A child
-    /// that stayed frozen never exits, so the wait is bounded by nextest's `death_watch_` override.
+    /// that stayed frozen never exits, so the wait is bounded by the suite slow-timeout.
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
         let mut cmd = findstr_blocker(false);

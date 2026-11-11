@@ -377,7 +377,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // reap the last member only once that thread's own `drain_blocking` signal proves it armed a
     // listener while the leaf still read populated — a real rendezvous, not a race against how
     // fast the kernel clears `populated` relative to `wait()` returning. A missed wake then hangs
-    // until the nextest bound on this test, not a duration this test invented.
+    // until the suite slow-timeout, not a duration this test invented.
     let (rendezvous_tx, rendezvous_rx) = mpsc::channel();
     let (result, parks, zero_remainings) = std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
@@ -1109,7 +1109,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
 /// An armed `Drop` after a `cgroup.kill` that failed does not write it again: the failure is final,
 /// the leaf is left behind and the failed kill is warned once. The fault fails only the first
 /// write, so a second would be recorded as a kill (and would drain the leaf, so the drop would wait
-/// for it, with nothing to end the wait: `death_watch_` bounds it).
+/// for it, with nothing to end the wait: the suite slow-timeout bounds it).
 ///
 /// Mutant: the armed `Drop` writes `cgroup.kill` again after a failed write.
 #[cfg(target_os = "linux")]

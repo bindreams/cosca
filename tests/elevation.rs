@@ -365,7 +365,7 @@ fn doas_non_interactive_auth_reaches_root(#[fixture(elevation)] _group: &Group) 
 /// CI lane's account owns its elevated child; measured: `kill()` is `Ok` and the payload is gone), `Ok` is the truth and
 /// the payload must be dead, seen as EOF or a reset on its socket. Where it may not, the answer is the typed
 /// `Unkillable` and the payload is still alive. `Ok` with a live payload is a false kill. The 20 s is the failure bound
-/// on the OS ending a process: shorter than nextest's 60 s bound on the whole test, so a false kill is this panic.
+/// on the OS ending a process: shorter than nextest's suite bound on the whole test, so a false kill is this panic.
 ///
 /// `COSCA_TEST_ELEVATION_EXPECT_KILL` pins the lane's outcome, `ok` or `unkillable`, so a regression to the other one
 /// fails; without it either truthful outcome passes.
