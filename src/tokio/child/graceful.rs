@@ -289,29 +289,19 @@ impl Child {
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.inner.require_contained()?;
 
-        // One look at the root decides the cooperative signal (see `terminate_tree`), and what the
-        // sweep may say was sent before it.
-        #[cfg(unix)]
-        let call = self.inner.tree_call(
-            crate::containment::dispatch::TreeSignal::Term,
-            "graceful_shutdown_tree",
-            None,
-        );
-        #[cfg(unix)]
-        let decision = self.inner.signal_tree_cooperatively(&call);
-        #[cfg(not(unix))]
-        let decision = self.inner.signal_tree_cooperatively();
-        let (term_result, earlier) = match decision {
+        // The mechanism's look at the root decides the cooperative signal (see `terminate_tree`), and
+        // what the sweep may say was sent before it.
+        let (term_result, earlier) = match self.inner.signal_tree_cooperatively() {
             SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
             #[cfg(unix)]
             SignalTreeCooperativelyOutcome::End(e) => return Err(e),
-            #[cfg(target_os = "linux")]
-            SignalTreeCooperativelyOutcome::RootThroughPidfd(why) => {
-                return Err(self.shut_down_root_through_pidfd(&call, grace, &why).await);
+            #[cfg(unix)]
+            SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
+                return Err(self.shut_down_root_through_pidfd(&skip, grace).await);
             }
-            #[cfg(target_os = "macos")]
-            SignalTreeCooperativelyOutcome::HoldersOnly(why) => {
-                return Err(self.shut_down_holders_only(&call, grace, &why).await);
+            #[cfg(unix)]
+            SignalTreeCooperativelyOutcome::HoldersOnly(skip) => {
+                return Err(self.shut_down_holders_only(&skip, grace).await);
             }
         };
 
@@ -424,7 +414,7 @@ impl Child {
             return Err(crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"));
         }
         #[cfg(unix)]
-        let status = crate::child::tree_call::status_unless_reaped_elsewhere(self.wait().await, self.pid())?;
+        let status = crate::child::graceful::status_unless_reaped_elsewhere(self.wait().await, self.pid())?;
         #[cfg(not(unix))]
         let status = self.wait().await?;
         if let Some(e) = watch_err {
@@ -445,15 +435,15 @@ impl Child {
         Ok(status)
     }
 
-    /// [`Graceful::RootThroughPidfd`](crate::child::Graceful::RootThroughPidfd), `why` its reason.
-    #[cfg(target_os = "linux")]
-    async fn shut_down_root_through_pidfd(
-        &self,
-        call: &crate::child::TreeCall<'_>,
-        grace: Duration,
-        why: &str,
-    ) -> Error {
-        let shutdown = match crate::child::PidfdShutdown::start(self.inner.terminate_gate(), || {
+    /// As the sync call's `shut_down_root_through_pidfd`, with the grace awaited.
+    #[cfg(unix)]
+    async fn shut_down_root_through_pidfd(&self, skip: &crate::containment::Skip, grace: Duration) -> Error {
+        let call = self.inner.skip_call(
+            "graceful_shutdown_tree",
+            crate::containment::dispatch::TreeSignal::Term,
+            None,
+        );
+        let shutdown = match crate::child::graceful::PidfdShutdown::start(self.inner.terminate_gate(), || {
             self.inner.proc.signal(crate::signal::Sig::Term)
         }) {
             Ok(shutdown) => shutdown,
@@ -467,8 +457,8 @@ impl Child {
             None
         };
         shutdown.finish(
-            call,
-            why,
+            &call,
+            skip,
             exited,
             || self.inner.kill_gate(),
             || {
@@ -479,10 +469,14 @@ impl Child {
         )
     }
 
-    /// [`Graceful::HoldersOnly`](crate::child::Graceful::HoldersOnly), `why` its reason.
-    #[cfg(target_os = "macos")]
-    async fn shut_down_holders_only(&self, call: &crate::child::TreeCall<'_>, grace: Duration, why: &str) -> Error {
-        let term = call.holders_term();
+    /// As the sync call's `shut_down_holders_only`, with the grace awaited.
+    #[cfg(unix)]
+    async fn shut_down_holders_only(&self, skip: &crate::containment::Skip, grace: Duration) -> Error {
+        let call = self.inner.skip_call(
+            "graceful_shutdown_tree",
+            crate::containment::dispatch::TreeSignal::Term,
+            None,
+        );
         if let Err(e) = crate::tokio::wait::wait_tree_drained_dispatch(
             &self.inner.attached,
             crate::tokio::wait::deadline_from(grace),
@@ -491,7 +485,7 @@ impl Child {
         {
             call.holders_grace_failed(&e);
         }
-        call.holders_shutdown_error(why, term)
+        self.inner.holders_shutdown_error(&call, skip)
     }
 }
 

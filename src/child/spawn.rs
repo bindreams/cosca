@@ -139,21 +139,34 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
     let gate = child.kill_gate();
-    // The look at the root, right before the tree kill it decides.
+    // The look at the root, right before the tree kill it decides: the one look both tree kills
+    // decide on.
+    let mut look = None;
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::FinishElevated,
         child.pid(),
         child.id,
-        || child.proc.state(),
+        || {
+            let state = child.proc.state();
+            look = Some(state.duplicate());
+            state
+        },
         &child.tree_killed,
     );
+    let look = look.expect("the view read the root's state");
     let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.pid());
-        child.attached.hard_kill_for_drop(&view, Some(&held))
+        let kill = {
+            let looked = crate::containment::Looked::new(&held, look.duplicate());
+            child.attached.hard_kill(Some(&looked))
+        };
+        drop(held);
+        kill.log_skip(&view);
+        kill
     };
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         let kill = kill_tree();
@@ -1078,20 +1091,10 @@ enum Sweep {
     RootKilled { zombie: bool },
 }
 
-/// What can reach the tree of a child whose report came late.
-#[cfg(target_os = "macos")]
-enum Reach {
-    /// No tree of its own: uncontained, or a nested member of another root's.
-    None,
-    /// The containment, attached to the root, whose identity was read and shown ours.
-    Attached(crate::containment::Attached),
-    /// The root is not shown ours, so nothing may name the tree by its pid: only the fd marker's
-    /// holders, which the kernel names by the marker pipe, can be reached.
-    Holders(crate::containment::fdmarker::Marker),
-}
-
 /// The late child's root, for a send by its pid: the state is a verified peek, read afresh right
-/// before each send. There is no pidfd on macOS.
+/// before each send, until the root's kill has been made and it is not shown an unreaped zombie of
+/// ours ([`Sweep::RootKilled`] with `zombie: false`): then it is not pinned, and a marker kills its
+/// holders alone, the root excepted. There is no pidfd on macOS.
 #[cfg(target_os = "macos")]
 impl crate::containment::Root for LateTree {
     fn pid(&self) -> u32 {
@@ -1099,6 +1102,9 @@ impl crate::containment::Root for LateTree {
     }
 
     fn state(&self) -> crate::signal::RootState {
+        if matches!(self.sweep, Sweep::RootKilled { zombie: false }) {
+            return crate::signal::RootState::Unpinned;
+        }
         let target = crate::wait::exit_only::Target::pid(self.pid, Some(self.unique));
         crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
     }
@@ -1107,7 +1113,13 @@ impl crate::containment::Root for LateTree {
 /// The tree of a child whose report came late, and the notes its sweeps owe the teardown's `warn`.
 #[cfg(target_os = "macos")]
 struct LateTree {
-    reach: Reach,
+    /// The containment, attached to the root, whose identity was read and shown ours; or, when the
+    /// root is not shown ours, only its marker without the root, whose holders the kernel names by
+    /// the marker pipe. `None`: no tree of its own (uncontained, or a nested member of another
+    /// root's).
+    attached: Option<crate::containment::Attached>,
+    /// The sweep being run: what the root reports.
+    sweep: Sweep,
     /// The root's pid and the unique id it must still have for a send by its number.
     pid: u32,
     unique: u64,
@@ -1128,7 +1140,8 @@ impl LateTree {
     fn attach(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> LateTree {
         use crate::identity::Resolved;
         let mut tree = LateTree {
-            reach: Reach::None,
+            attached: None,
+            sweep: Sweep::RootAlive,
             pid,
             unique,
             id: None,
@@ -1147,7 +1160,7 @@ impl LateTree {
             Resolved::Found(id) => {
                 tree.id = Some(id);
                 match attach_or_fault(pid, Ok(id), prepared) {
-                    Ok(attachment) => tree.reach = Reach::Attached(attachment.attached),
+                    Ok(attachment) => tree.attached = Some(attachment.attached),
                     Err(e) => {
                         assert_attach_cannot_fail(&e);
                         tree.notes
@@ -1165,7 +1178,9 @@ impl LateTree {
                     "{unshown}, so its tree is reached only through its marker's holders, not its process group \
                      or the processes its pid parents"
                 )));
-                tree.reach = Reach::Holders(crate::containment::fdmarker::Marker::without_root(marker));
+                tree.attached = Some(crate::containment::Attached::FdMarker(
+                    crate::containment::fdmarker::Marker::without_root(marker),
+                ));
             }
             None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
         }
@@ -1174,32 +1189,36 @@ impl LateTree {
 
     /// Runs `sweep`.
     fn kill(&mut self, sweep: Sweep) {
-        use crate::containment::Attached;
-        match (&self.reach, sweep) {
-            (Reach::None, _) => {}
-            (Reach::Attached(attached), Sweep::RootAlive | Sweep::RootKilled { zombie: true }) => {
-                // The root is this process's unreaped child, shown by a verified peek right before each
-                // send by its pid.
-                #[cfg(test)]
-                crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
-                let sweep = attached.hard_kill(Some(&*self)).into_result();
-                self.sweeps.push(sweep);
-            }
-            // The root is not shown ours any more: only the holders, and never the root.
-            (Reach::Attached(Attached::FdMarker(m)), Sweep::RootKilled { zombie: false }) => {
-                if let Err(e) = m.hard_kill_holders_only(m.root()) {
+        use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+        self.sweep = sweep;
+        let Some(attached) = &self.attached else {
+            return;
+        };
+        // The mechanism looks at the root, which reports this sweep ([`Root::state`]): a root this
+        // process's unreaped child is shown by a verified peek right before each send by its pid; one
+        // not shown ours any more is skipped, its marker's holders alone swept, and never the root.
+        match attached.hard_kill(Some(&*self)) {
+            TreeKillOutcome::Skipped(skip) if matches!(sweep, Sweep::RootKilled { zombie: false }) => {
+                if let Some(Err(e)) = &skip.holders {
                     self.notes.push(format!(
                         "its marker's holders were not all killed after its kill: {}",
-                        crate::error::Report(&e)
+                        crate::error::Report(e)
                     ));
                 }
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
-            (Reach::Attached(_), Sweep::RootKilled { zombie: false }) => self.notes.push(NOT_SWEPT_AGAIN.to_owned()),
-            (Reach::Holders(m), _) => self.sweeps.push(
-                m.hard_kill_holders_only(None)
-                    .map_err(crate::containment::dispatch::Unkilled::from),
-            ),
+            // The root stopped being shown ours between the sweeps: nothing by its pid was sent.
+            TreeKillOutcome::Skipped(skip) => self.sweeps.push(Err(Unkilled::from(match skip.holders {
+                Some(Err(e)) => e,
+                _ => crate::error::Error::Unassessable {
+                    detail: format!(
+                        "the root could not be shown to be ours, so its tree did not {}",
+                        skip.action
+                    ),
+                    source: None,
+                },
+            }))),
+            other => self.sweeps.push(other.into_result()),
         }
     }
 

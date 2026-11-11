@@ -50,7 +50,9 @@ use std::io;
 
 use nix::sys::signal::Signal;
 
-use crate::containment::{check_number, Root};
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::root::NumberLook;
+use crate::containment::{check_number, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).
@@ -291,6 +293,101 @@ pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error
         return Ok(());
     }
     signal_group(pgid, Signal::SIGTERM, root)
+}
+
+/// What a process group's kill or terminate sends by the root's number, from one look at `root`
+/// ([`look`](crate::containment::root::look)), decided again by the root's pidfd on Linux 6.9+. Each
+/// send by the number after it checks the root again ([`check_number`]).
+fn group_look(root: &dyn Root) -> NumberLook {
+    let look = crate::containment::root::look(root, true);
+    #[cfg(target_os = "linux")]
+    let look = crate::containment::root::through_the_pidfd(look, root);
+    #[cfg(test)]
+    crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+    look
+}
+
+/// What a skipped send to the group `pgid` left undone, and why.
+fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
+    let (why, root_alone) = match look {
+        NumberLook::Untrusted(state) => (Why::Untrusted(crate::signal::why_untrusted(&state)), false),
+        NumberLook::MayNameAnother { refusal, exact_root } => (Why::MayNameAnother(refusal), exact_root),
+        NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
+            unreachable!("a send to a group that is not skipped has no skip to say")
+        }
+    };
+    Skip {
+        action: format!("{verb} its process group (pgid {pgid})"),
+        why,
+        root_alone,
+        holders: None,
+    }
+}
+
+/// The nothing a group's kill or terminate sends once its group is empty, for `look`.
+fn log_empty_group(pgid: i32, look: &NumberLook) {
+    match look {
+        NumberLook::GroupGone => log::debug!(
+            "containment::unix: the root is reaped, and its pidfd shows process group {pgid} has no member left, so nothing is sent"
+        ),
+        _ => log::debug!(
+            "containment::unix: this handle reaped the root, so process group {pgid} is empty, and nothing is sent by its number"
+        ),
+    }
+}
+
+/// [`kill_group`] as a tree call decides it, for every caller: on one look at `root`, the group is
+/// killed as usual while the root's number names it; sent nothing when it is empty
+/// ([`TreeKillOutcome::Answered`]); and skipped, nothing sent by the number, when the number may name
+/// another process ([`TreeKillOutcome::Skipped`]: on Linux the caller kills the root alone through
+/// its handle when [`Skip::root_alone`]). With no `root` there is nothing to look at.
+pub(crate) fn kill_group_tree(pgid: i32, root: Option<&dyn Root>) -> TreeKillOutcome {
+    let ran = |sent: Result<(), Error>| TreeKillOutcome::Ran(sent.map_err(Unkilled::from));
+    let Some(root) = root else {
+        return ran(kill_group(pgid, None));
+    };
+    match group_look(root) {
+        NumberLook::Trusted => ran(kill_group(pgid, Some(root))),
+        look @ (NumberLook::Empty | NumberLook::GroupGone) => {
+            log_empty_group(pgid, &look);
+            TreeKillOutcome::Answered(Ok(()))
+        }
+        look => TreeKillOutcome::Skipped(skipped_group(pgid, "kill", look)),
+    }
+}
+
+/// [`term_group`] as a tree call decides it, on one look at `root` ([`kill_group_tree`]). A skip ends
+/// the call, or, on Linux when the root's handle still names it exactly, leaves the root alone to the
+/// caller ([`TerminateOutcome::RootThroughPidfd`]).
+pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOutcome {
+    let earlier = Some("the SIGTERM");
+    let Some(root) = root else {
+        return TerminateOutcome::Sent {
+            result: term_group(pgid, None),
+            earlier,
+        };
+    };
+    match group_look(root) {
+        NumberLook::Trusted => TerminateOutcome::Sent {
+            result: term_group(pgid, Some(root)),
+            earlier,
+        },
+        look @ (NumberLook::Empty | NumberLook::GroupGone) => {
+            log_empty_group(pgid, &look);
+            TerminateOutcome::Sent {
+                result: Ok(()),
+                earlier: None,
+            }
+        }
+        look => {
+            let skip = skipped_group(pgid, "signal", look);
+            if skip.root_alone {
+                TerminateOutcome::RootThroughPidfd(skip)
+            } else {
+                TerminateOutcome::End(skip)
+            }
+        }
+    }
 }
 
 /// Signal the group and report what was actually achieved. `killpg`'s return value is a

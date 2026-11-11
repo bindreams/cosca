@@ -1216,21 +1216,16 @@ fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -
     super::Marker::new(prepared, root, pgid)
 }
 
-/// The drop's skip names what the marker would have done by the root's number: the walk always,
-/// and the group only when the mode made one. Mutant: the rule drops the walk, or names a group
-/// the marker does not have.
+/// A kill skipped because the root was reaped elsewhere names what the marker would have done by the
+/// root's number: the walk always, and the group only when the mode made one.
 #[skuld::test]
-fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
+fn a_skipped_kill_names_the_walk_and_the_group_only_when_there_is_one() {
     let _serialize = test_spawn_lock();
-    let view = crate::containment::DropView {
-        caller: crate::containment::dispatch::TeardownCaller::Drop,
-        root_pid: 4242,
-        root: crate::containment::dispatch::RootView::Reaped,
-        tree_killed: false,
-    };
+    let reaped = crate::test_support::stated_root::StatedRoot::with_state(4242, || crate::signal::RootState::Reaped {
+        own: false,
+    });
     let skipped = |marker| {
-        let kill = crate::containment::Attached::FdMarker(marker)
-            .hard_kill_for_drop(&view, Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
+        let kill = crate::containment::Attached::FdMarker(marker).hard_kill(Some(&reaped));
         let skipped = kill
             .skipped()
             .expect("the reaped root's kill by its number is skipped")

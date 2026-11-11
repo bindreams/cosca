@@ -832,7 +832,9 @@ pub(crate) mod fault {
 
 use std::io;
 
-use crate::containment::Root;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::root::NumberLook;
+use crate::containment::{Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
@@ -965,8 +967,8 @@ impl Marker {
     }
 
     /// The marker of a root that is not shown to be this process's child: no channel that names the
-    /// tree by the root's number may run, so only
-    /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) is called on it.
+    /// tree by the root's number may run, so its kill sweeps its holders alone
+    /// ([`kill_tree`](Self::kill_tree)).
     pub(crate) fn without_root(prepared: PreparedMarker) -> Marker {
         Marker {
             read: prepared.read,
@@ -994,11 +996,13 @@ impl Marker {
     }
 
     /// The root the ppid walk starts from; `None` for a marker made [`without_root`](Self::without_root).
+    #[cfg(test)]
     pub(crate) fn root(&self) -> Option<ProcessId> {
         self.root
     }
 
     /// The group `killpg` targets, if this mode created one.
+    #[cfg(test)]
     pub(crate) fn pgid(&self) -> Option<i32> {
         self.pgid
     }
@@ -1055,21 +1059,81 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    pub(crate) fn hard_kill(&self, root: Option<&dyn Root>) -> Result<(), Error> {
+    fn hard_kill(&self, root: Option<&dyn Root>) -> Result<(), Error> {
         self.hard_kill_impl(Scope::Full(root))
     }
 
-    /// [`hard_kill`](Self::hard_kill) through the marker-holder channel alone. For a caller whose
-    /// root is already reaped: the `killpg` on `self.pgid`, the root's identity kill and
-    /// the ppid walk from the root's pid all name their target by that number, which may now
-    /// belong to an unrelated process, so none runs. A holder is named by the kernel object it
-    /// holds, which no reuse of a pid number can change.
-    ///
-    /// `except` is a holder to leave alone: the root, when this process does not pin it (launchd
-    /// holds it), because signalling a process by a pid this process does not pin can hit whoever
-    /// reuses the pid.
-    pub(crate) fn hard_kill_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::HoldersOnly { except })
+    /// What `look` at `root` (`None` for a marker made [`without_root`](Self::without_root), whose
+    /// tree is its holders alone) lets this marker send by the root's number. The `killpg` on
+    /// `self.pgid`, the root's identity kill and the ppid walk from the root's pid all name their
+    /// target by that number, which may belong to an unrelated process once the root is reaped or
+    /// not pinned, so then none runs: only the marker holders, which the kernel names by the pipe
+    /// they hold, are signalled. `except` is a holder to leave alone: the root, when this process
+    /// does not pin it (launchd holds it), because signalling a process by a pid this process does
+    /// not pin can hit whoever reuses the pid.
+    fn look_at(&self, root: Option<&dyn Root>) -> Option<(NumberLook, Option<ProcessId>)> {
+        let (Some(_), Some(root)) = (self.root, root) else {
+            return None;
+        };
+        let look = crate::containment::root::look(root, self.pgid.is_some());
+        #[cfg(test)]
+        crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+        let except = match &look {
+            NumberLook::Untrusted(crate::signal::RootState::Unpinned) => self.root,
+            _ => None,
+        };
+        Some((look, except))
+    }
+
+    /// What this marker's channels by the root's number are, as an action for a message.
+    fn number_named(&self, verb: &str, root_pid: u32) -> String {
+        let walk = format!("walk the process table from the root's pid (root pid {root_pid})");
+        match self.pgid {
+            Some(pgid) => format!("{verb} its process group (pgid {pgid}) or {walk}"),
+            None => walk,
+        }
+    }
+
+    /// What this marker skipped, and why, for `look`: its holders' own signal, `holders`, was sent.
+    fn skip(&self, verb: &str, root_pid: u32, look: NumberLook, holders: Result<(), Error>) -> Skip {
+        let why = match look {
+            NumberLook::Untrusted(state) => Why::Untrusted(crate::signal::why_untrusted(&state)),
+            NumberLook::MayNameAnother { refusal, .. } => Why::MayNameAnother(refusal),
+            NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
+                unreachable!("a send that is not skipped has no skip to say")
+            }
+        };
+        Skip {
+            action: self.number_named(verb, root_pid),
+            why,
+            root_alone: false,
+            holders: Some(holders),
+        }
+    }
+
+    /// The marker's kill as a tree call decides it, for every caller, on one look at `root` (see
+    /// [`look_at`](Self::look_at)): every channel while the root's number names the root; the holders
+    /// alone, as the whole answer, once this handle reaped the root and its group is empty or it had
+    /// none ([`TreeKillOutcome::Answered`]); and the holders alone, with the rest skipped
+    /// ([`TreeKillOutcome::Skipped`]), when the number may name another process or the root is
+    /// `Unpinned` or `Unknown`.
+    pub(crate) fn kill_tree(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+        let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
+        let holders_only = |except| self.hard_kill_impl(Scope::HoldersOnly { except });
+        let Some((look, except)) = self.look_at(root) else {
+            // No look to take: without its root only the holders are the tree; without a root to
+            // check, the sweep runs as asked.
+            return TreeKillOutcome::Ran(ran(match (self.root, root) {
+                (None, _) => holders_only(None),
+                (Some(_), _) => self.hard_kill(root),
+            }));
+        };
+        let root_pid = root.map_or(0, Root::pid);
+        match look {
+            NumberLook::Trusted => TreeKillOutcome::Ran(ran(self.hard_kill(root))),
+            NumberLook::Empty => TreeKillOutcome::Answered(ran(holders_only(None))),
+            look => TreeKillOutcome::Skipped(self.skip("kill", root_pid, look, holders_only(except))),
+        }
     }
 
     fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
@@ -1111,14 +1175,40 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    pub(crate) fn terminate(&self, root: Option<&dyn Root>) -> Result<(), Error> {
+    fn terminate(&self, root: Option<&dyn Root>) -> Result<(), Error> {
         self.terminate_impl(Scope::Full(root))
     }
 
-    /// [`terminate`](Self::terminate) through the marker-holder channel alone, as
-    /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) does for the kill.
-    pub(crate) fn terminate_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
-        self.terminate_impl(Scope::HoldersOnly { except })
+    /// The marker's cooperative signal as a tree call decides it, on one look at `root`
+    /// ([`kill_tree`](Self::kill_tree)): the holders alone get it when the root's number names no
+    /// one, and then, once the number may name another process, the caller waits the grace and
+    /// kills any left ([`TerminateOutcome::HoldersOnly`]).
+    pub(crate) fn terminate_tree(&self, root: Option<&dyn Root>) -> TerminateOutcome {
+        let holders_only = |except| self.terminate_impl(Scope::HoldersOnly { except });
+        let earlier = Some("the SIGTERM");
+        let Some((look, except)) = self.look_at(root) else {
+            let result = match (self.root, root) {
+                (None, _) => holders_only(None),
+                (Some(_), _) => self.terminate(root),
+            };
+            return TerminateOutcome::Sent { result, earlier };
+        };
+        let root_pid = root.map_or(0, Root::pid);
+        match look {
+            NumberLook::Trusted => TerminateOutcome::Sent {
+                result: self.terminate(root),
+                earlier,
+            },
+            NumberLook::Untrusted(_) => TerminateOutcome::Sent {
+                result: holders_only(except),
+                earlier,
+            },
+            NumberLook::Empty => TerminateOutcome::Sent {
+                result: holders_only(None),
+                earlier: Some("the SIGTERM to any marker holders"),
+            },
+            look => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, holders_only(None))),
+        }
     }
 
     fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {

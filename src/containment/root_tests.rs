@@ -1,8 +1,4 @@
-// `check_number` and `number_holds`: a send by the root's pid is allowed while the root's handle
-// vouches for the number. On Linux 6.9+ the root's pidfd answers whether its group still has a
-// member, which no state can see; on an older kernel the root's state answers.
-
-use super::number_holds;
+use super::{number_holds, Refusal};
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::RootState;
 
@@ -11,12 +7,11 @@ const PGID: i32 = 999_999;
 
 // number_holds -----
 
-/// A send by the group's number is allowed only while the root is unreaped. Mutant: "a root reaped
-/// elsewhere, one its handle cannot answer for, or one this handle reaped passes the check".
+/// A send by the group's number is allowed only while the root is unreaped.
 #[skuld::test]
 fn number_holds_only_for_an_unreaped_root() {
     let own = std::process::id();
-    assert_eq!(number_holds(own, RootState::Unreaped), Ok(()));
+    assert!(number_holds(own, RootState::Unreaped).is_ok());
     let refused = [
         (RootState::Reaped { own: false }, "reaped elsewhere"),
         (
@@ -29,14 +24,13 @@ fn number_holds_only_for_an_unreaped_root() {
     ];
     for (state, why) in refused {
         let label = format!("{state:?}");
-        let err = number_holds(own, state).expect_err(&label);
+        let err = number_holds(own, state).expect_err(&label).to_string();
         assert!(err.contains(why), "{label}: {err}");
     }
 }
 
 /// `number_holds` reads `own` from the state: a reap by someone else refuses whatever the pid's
-/// identity read says, and an own reap is refused whatever that read says. Mutant: "`own` is
-/// ignored", or "an own reap whose pid names no process passes".
+/// identity read says, and an own reap is refused whatever that read says, each as its own variant.
 #[skuld::test]
 fn number_holds_reads_own_from_the_state() {
     let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
@@ -44,19 +38,21 @@ fn number_holds_reads_own_from_the_state() {
     for read in reads() {
         let _read = crate::child::fault::force_root_reads(read);
         let err = number_holds(PGID as u32, RootState::Reaped { own: false }).expect_err("reaped elsewhere");
-        assert!(err.contains("reaped elsewhere"), "{err}");
+        assert!(matches!(err, Refusal::ReapedElsewhere(_)), "{err}");
     }
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
     let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("names no process");
-    assert!(err.contains("names no process"), "{err}");
+    assert!(matches!(err, Refusal::ReapedPidGone(_)), "{err}");
+    assert!(err.to_string().contains("names no process"), "{err}");
     drop(_gone);
     let _found = crate::child::fault::force_root_reads(Resolved::Found(other()));
     let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("another process holds");
-    assert!(err.contains("another process holds"), "{err}");
+    assert!(matches!(err, Refusal::ReapedPidTaken(_)), "{err}");
     drop(_found);
     let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
     let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
-    assert!(err.contains("could not be read"), "{err}");
+    assert!(matches!(err, Refusal::ReapedPidUnread(_)), "{err}");
+    assert!(err.to_string().contains("could not be read"), "{err}");
 }
 
 // check_number through the root's pidfd -----
@@ -97,18 +93,17 @@ mod pidfd {
     }
 
     /// A reaped root whose group has no member left fails the check, though its state would pass
-    /// it: its number may name another group. Mutant: "the check asks only the root's state".
+    /// it: its number may name another group.
     #[skuld::test]
     fn check_fails_once_the_group_has_no_member(#[fixture(pidfd_group_signal)] _group: &Group) {
         let (leader, pidfd) = leader();
         kill_and_reap(leader);
         let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
-        assert_eq!(check_number(Some(&root)), Err(NotItsGroup::Empty));
+        assert!(matches!(check_number(Some(&root)), Err(NotItsGroup::Empty)));
     }
 
     /// A root reaped elsewhere whose group still has a member passes the check, though its state
-    /// fails it: the group's number is still its own. Mutant: "the check asks only the root's
-    /// state".
+    /// fails it: the group's number is still its own.
     #[skuld::test]
     fn check_passes_while_the_group_has_a_member(#[fixture(pidfd_group_signal)] _group: &Group) {
         let (leader, pidfd) = leader();
@@ -123,7 +118,7 @@ mod pidfd {
     }
 
     /// A kernel that refuses `PIDFD_SIGNAL_PROCESS_GROUP` leaves the answer to the root's state,
-    /// even for a group with a member. Mutant: "a refused flag passes the check".
+    /// even for a group with a member.
     #[skuld::test]
     fn check_asks_the_roots_state_when_the_kernel_refuses_the_flag() {
         let (mut leader, pidfd) = leader();
@@ -136,13 +131,15 @@ mod pidfd {
         drop(refused);
         leader.kill().expect("kill the leader");
         leader.wait().expect("reap the leader");
-        assert_eq!(failed, Err(NotItsGroup::Unproven(reaped_elsewhere_text(pid))));
-        assert_eq!(passed, Ok(()));
+        assert_eq!(
+            failed.expect_err("reaped elsewhere").to_string(),
+            reaped_elsewhere_text(pid)
+        );
+        passed.expect("an unreaped root");
     }
 
     /// A signal-0 group send answered `EPERM` (as a seccomp filter may answer for a group whose
-    /// number another group took) says nothing about the group: the root's state answers. Mutant:
-    /// "`EPERM` reads as a group with a member".
+    /// number another group took) says nothing about the group: the root's state answers.
     #[skuld::test]
     fn check_asks_the_roots_state_when_the_group_probe_answers_eperm() {
         let (mut leader, pidfd) = leader();
@@ -153,11 +150,14 @@ mod pidfd {
         drop(answered);
         leader.kill().expect("kill the leader");
         leader.wait().expect("reap the leader");
-        assert_eq!(checked, Err(NotItsGroup::Unproven(reaped_elsewhere_text(pid))));
+        assert_eq!(
+            checked.expect_err("reaped elsewhere").to_string(),
+            reaped_elsewhere_text(pid)
+        );
     }
 
     /// The check's signal-0 group send is a send like any other: recorded, through the root's
-    /// pidfd, on any kernel. Mutant: "the group probe bypasses `send_signal`".
+    /// pidfd, on any kernel.
     #[skuld::test]
     fn the_group_probe_is_a_recorded_send() {
         use crate::send_log::{GroupStep, Route};
@@ -168,6 +168,6 @@ mod pidfd {
         let steps = capture.group_steps_with_probes();
         kill_and_reap(leader);
         assert_eq!(steps, [GroupStep::Check, GroupStep::Group(Route::Pidfd, 0)]);
-        assert_eq!(checked, Ok(()), "the leader's group has a member");
+        checked.expect("the leader's group has a member");
     }
 }

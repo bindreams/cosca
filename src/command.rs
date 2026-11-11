@@ -497,20 +497,22 @@ impl Command {
     ///
     /// The root is reaped by [`wait`](crate::Child::wait), by a
     /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
-    /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it, or a
-    /// walk of the process table from it, could hit an unrelated process that reused it. That
-    /// covers a process group, a Unix tree walk, and a macOS fd marker's group and walk; the fd
-    /// marker still sweeps the descendants that hold the marker, which it names by identity. A
-    /// cgroup and a Job Object name their tree without the number, and still kill. A descendant
-    /// that outlived the reaped root keeps running: call [`kill_tree`](crate::Child::kill_tree)
-    /// **before** `wait()` to end it; once it has killed the tree completely, the skip is logged at
-    /// `debug`. A root reaped by someone else is neither killed nor waited for by its number
-    /// either. The evidence is the child's own handle (on Linux its pidfd), or the number no
-    /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
-    /// skipped and a warning says so; the root itself is still killed through its handle. This is
-    /// decided on one look at the root, as is the cleanup of an elevated spawn whose password could
-    /// not be written. Each send by the group's number after that look checks the root again, as
-    /// for [`kill_tree`](crate::Child::kill_tree).
+    /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it could
+    /// hit an unrelated process that reused it. That covers a process group, and a macOS fd
+    /// marker's group and its walk from the root's pid; the fd marker still sweeps the descendants
+    /// that hold the marker, which it names by identity. A tree walk is its own guard: it proves its
+    /// root still holds its pid, so a reaped root walks nothing (on macOS it is skipped for a root
+    /// launchd holds or whose handle cannot say). A cgroup and a Job Object name their tree without
+    /// the number, and still kill. A descendant that outlived the reaped root keeps running: call
+    /// [`kill_tree`](crate::Child::kill_tree) **before** `wait()` to end it; once it has killed the
+    /// tree completely, the skip is logged at `debug`. A root reaped by someone else is neither
+    /// killed nor waited for by its number either. The evidence is the child's own handle (on Linux
+    /// its pidfd), or the number no longer reading as the root. If the handle cannot say (a failed
+    /// peek), the same kills are skipped and a warning says so; the root itself is still killed
+    /// through its handle, and a tree walk walks as usual. This is decided on one look at the root,
+    /// as is the cleanup of an elevated spawn whose password could not be written. Each send by the
+    /// group's number after that look checks the root again, as for
+    /// [`kill_tree`](crate::Child::kill_tree).
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`

@@ -335,6 +335,9 @@ pub(crate) mod dispatch;
 
 #[path = "containment/root.rs"]
 mod root;
+
+#[path = "containment/skip.rs"]
+mod skip;
 #[cfg(target_os = "linux")]
 pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]
@@ -344,11 +347,14 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
-#[cfg(target_os = "linux")]
-pub(crate) use root::group_has_member;
+#[cfg(unix)]
+pub(crate) use root::Looked;
 pub(crate) use root::Root;
 #[cfg(unix)]
-pub(crate) use root::{check_number, reaped_pid_names_no_process, NotItsGroup};
+pub(crate) use root::{check_number, NotItsGroup};
+pub(crate) use skip::{Skip, TerminateOutcome};
+#[cfg(unix)]
+pub(crate) use skip::{SkipCall, Why};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

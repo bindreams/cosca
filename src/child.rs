@@ -7,7 +7,9 @@ use crate::child::owned::teardown::Disposition;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::containment::dispatch::{SweepFailure, TeardownCaller};
-use crate::containment::Containment;
+#[cfg(unix)]
+use crate::containment::dispatch::{TreeKillOutcome, TreeSignal};
+use crate::containment::{Containment, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
@@ -40,14 +42,6 @@ pub use suspended::SuspendedChild;
 
 #[path = "child/graceful.rs"]
 pub(crate) mod graceful;
-
-#[cfg(unix)]
-#[path = "child/tree_call.rs"]
-pub(crate) mod tree_call;
-#[cfg(target_os = "linux")]
-pub(crate) use tree_call::PidfdShutdown;
-#[cfg(unix)]
-pub(crate) use tree_call::{Graceful, TreeCall};
 
 #[cfg(test)]
 #[path = "child_tests.rs"]
@@ -289,8 +283,9 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     ///
-    /// Reaps the root; a later drop then skips number-named kills, so call
-    /// [`kill_tree`](Child::kill_tree) first to end descendants (see `Drop`).
+    /// Reaps the root; a later drop then skips kills named by its number (a tree walk proves its own
+    /// root, and is not one of them), so call [`kill_tree`](Child::kill_tree) first to end
+    /// descendants (see `Drop`).
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
@@ -579,15 +574,12 @@ impl Child {
     ///
     /// **After this handle's own reap.** The root's children were reparented at its exit, so no walk
     /// runs from its pid. Another process at that pid means the group is empty: nothing is sent by
-    /// the pid, and the call is `Ok` once every marker holder was reached. A pid that cannot be read
-    /// is `Unassessable` as above, and so is a pid that names no process: once the group has no
-    /// member, another process may take the number, and lead a group by it, first. Where the root's
-    /// pidfd does not name the group (Linux without a pidfd group signal: below 6.9, or no pidfd;
-    /// macOS), nothing is sent by the pid, and the call returns `Unassessable` (or a marker holders'
-    /// error) with a `warn`. Descendants that outlived the reaped root are then not ended: call
-    /// `kill_tree` before [`wait`](Child::wait) to end them. On Linux 6.9+ the root's pidfd shows exactly whether the group still has a member,
-    /// so the group is killed through it while it has one, and no send by number reaches a group that
-    /// took the number.
+    /// the pid, and the call is `Ok` once every marker holder was reached. A macOS fd marker with no
+    /// group, whose pid names no process, is answered the same way: it has no group to skip. A pid
+    /// that cannot be read is `Unassessable` as above, and so is any other pid that names no
+    /// process: once the group has no member, another process may take the number, and lead a group
+    /// by it, first. Descendants that outlived the reaped root are then not ended: call `kill_tree`
+    /// before [`wait`](Child::wait) to end them. A tree this handle already killed is `Ok`.
     ///
     /// **A reap after the look.** All of this is decided on one look at the root. A
     /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
@@ -624,43 +616,45 @@ impl Child {
             crate::elevation::front::Gate::Exited => Some(None),
             crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
         };
-        // One look at the root decides: one launchd holds, or one the handle cannot vouch for, is
-        // signalled by identity alone, and so is a group named by the root's pid once that pid may
-        // name another process. This handle's reaps are held off from the look to the sweep's end.
+        // The mechanism looks at the root right before it sends by the root's number. This handle's
+        // reaps are held off from the look to the end of the sweep's sends.
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
         #[cfg(unix)]
         let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
         let root: Option<&dyn crate::containment::Root> = None;
-        #[cfg(unix)]
-        let root_ended_by_handle = std::cell::Cell::new(false);
-        #[cfg(unix)]
-        if let Some(result) = self
-            .tree_call(crate::containment::dispatch::TreeSignal::Kill, op, earlier)
-            .root_checked(
-                || held.state(),
-                || {
-                    // The root's handle names the root even when its number is reused; its kill ends
-                    // the root.
-                    let sent = held
-                        .signal(crate::signal::Sig::Kill)
-                        .map_err(Error::into_io)
-                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()));
-                    root_ended_by_handle.set(SweepFailure::killed_root(&sent));
-                    sent
-                },
-                root,
-            )
-        {
-            return result.map_err(|error| SweepFailure {
-                error,
-                root_ended: root_ended_by_handle.get(),
-            });
-        }
         let group_result = self.attached.hard_kill(root);
         #[cfg(unix)]
-        drop(held);
+        let group_result = match group_result {
+            // An answer that needs no kill ends the call: no backstop.
+            answered @ TreeKillOutcome::Answered(_) => {
+                drop(held);
+                return self
+                    .attached
+                    .settle_for_kill_tree(op, &self.tree_killed, answered, false)
+                    .map_err(SweepFailure::from);
+            }
+            TreeKillOutcome::Skipped(skip) => {
+                // The root's handle names the root even when its number is reused; its kill ends the
+                // root.
+                let sent = skip.root_alone.then(|| {
+                    held.signal(crate::signal::Sig::Kill)
+                        .map_err(Error::into_io)
+                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
+                });
+                let root_ended = sent.as_ref().is_some_and(SweepFailure::killed_root);
+                let answered =
+                    self.skip_call(op, TreeSignal::Kill, earlier)
+                        .answer(&self.attached, &self.tree_killed, skip, sent);
+                drop(held);
+                return answered.map_err(|error| SweepFailure { error, root_ended });
+            }
+            other => {
+                drop(held);
+                other
+            }
+        };
         let group_result = self.attached.unless_unwalked(op, &self.tree_killed, group_result)?;
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
@@ -782,7 +776,7 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // One look at the root decides, as for `kill_tree`, and this handle's reaps are held off
+        // The mechanism looks at the root as for `kill_tree`, and this handle's reaps are held off
         // until the signal is sent.
         #[cfg(unix)]
         let held = self.proc.hold(self.pid());
@@ -790,37 +784,41 @@ impl Child {
         let root: Option<&dyn crate::containment::Root> = Some(&held);
         #[cfg(not(unix))]
         let root: Option<&dyn crate::containment::Root> = None;
+        let outcome = self.attached.terminate(self.pid(), root);
         #[cfg(unix)]
-        if let Some(result) = self
-            .tree_call(crate::containment::dispatch::TreeSignal::Term, "terminate_tree", None)
-            .root_checked(|| held.state(), || held.signal(crate::signal::Sig::Term), root)
         {
-            return result;
+            let call = self.skip_call("terminate_tree", TreeSignal::Term, None);
+            match outcome {
+                TerminateOutcome::Sent { result, .. } => result,
+                TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
+                    call.answer(&self.attached, &self.tree_killed, skip, None)
+                }
+                TerminateOutcome::RootThroughPidfd(skip) => {
+                    let sent = held.signal(crate::signal::Sig::Term);
+                    call.answer(&self.attached, &self.tree_killed, skip, Some(sent))
+                }
+            }
         }
-        self.terminate_tree_unchecked(root)
+        #[cfg(not(unix))]
+        match outcome {
+            TerminateOutcome::Sent { result, .. } => result,
+            _ => unreachable!("only a Unix mechanism skips by the root's number"),
+        }
     }
 
-    /// The group's termination signal, with no look at the root's state but `root`'s own check
-    /// before each send by the root's number.
-    pub(crate) fn terminate_tree_unchecked(&self, root: Option<&dyn crate::containment::Root>) -> Result<(), Error> {
-        self.attached.terminate(self.pid(), root)
-    }
-
-    /// A tree call on this child's tree ([`TreeCall`]).
+    /// A tree call on this child's tree that skipped what the root's number names ([`SkipCall`]).
     #[cfg(unix)]
-    pub(crate) fn tree_call<'a>(
-        &'a self,
-        signal: crate::containment::dispatch::TreeSignal,
-        op: &'static str,
+    pub(crate) fn skip_call<'a>(
+        &self,
+        op: &'a str,
+        signal: TreeSignal,
         earlier: Option<&'a str>,
-    ) -> TreeCall<'a> {
-        TreeCall {
-            attached: &self.attached,
+    ) -> crate::containment::SkipCall<'a> {
+        crate::containment::SkipCall {
+            op,
             pid: self.pid(),
             signal,
-            op,
             earlier,
-            killed: &self.tree_killed,
         }
     }
 
@@ -1095,7 +1093,9 @@ pub(crate) mod fault {
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::Command::kill_on_drop). On Linux 6.9+ a process
-/// group is decided by the root's pidfd instead: killed while it has a member left.
+/// group is decided by the root's pidfd instead: killed while it has a member left. A tree walk
+/// proves its root before it walks, so a reaped root, or one its handle cannot vouch for, walks as
+/// usual (on Linux).
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when

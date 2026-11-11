@@ -84,6 +84,9 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+#[cfg(target_os = "macos")]
+use crate::containment::Why;
+use crate::containment::{Skip, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
@@ -942,6 +945,54 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId) -> Result<(), Erro
     {
         let _ = (kernel, root);
         Ok(())
+    }
+}
+
+/// macOS: the skip of a walk that names the tree by the root's pid, when `root` cannot be shown to be
+/// this process's unreaped child (`Unpinned` or `Unknown`). Elsewhere the walk is its own guard: it
+/// proves its root still holds its pid ([`anchor`]), and a reaped root walks nothing. Without a root
+/// to look at there is nothing to skip.
+fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
+    let root = root?;
+    #[cfg(all(test, unix))]
+    crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
+    #[cfg(not(target_os = "macos"))]
+    let _ = root;
+    #[cfg(target_os = "macos")]
+    {
+        let state = root.state();
+        if matches!(
+            state,
+            crate::signal::RootState::Unpinned | crate::signal::RootState::Unknown(_)
+        ) {
+            return Some(Skip {
+                action: format!("walk the process table from the root's pid (root pid {})", root.pid()),
+                why: Why::Untrusted(crate::signal::why_untrusted(&state)),
+                root_alone: false,
+                holders: None,
+            });
+        }
+    }
+    None
+}
+
+/// [`hard_kill`] from the host's process table, as a tree call decides it for every caller: skipped
+/// where the root's number cannot be trusted ([`skipped_walk`]), else walked.
+pub(crate) fn kill_tree(root: ProcessId, owner: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
+    match skipped_walk(owner) {
+        Some(skip) => TreeKillOutcome::Skipped(skip),
+        None => hard_kill(&crate::identity::HostKernel, root),
+    }
+}
+
+/// [`terminate`] from the host's process table, as [`kill_tree`] decides it.
+pub(crate) fn terminate_tree(root: ProcessId, owner: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
+    match skipped_walk(owner) {
+        Some(skip) => TerminateOutcome::End(skip),
+        None => TerminateOutcome::Sent {
+            result: terminate(&crate::identity::HostKernel, root),
+            earlier: Some("the SIGTERM"),
+        },
     }
 }
 

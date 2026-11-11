@@ -148,8 +148,8 @@ impl Child {
     /// can be settled without waiting. Nothing that names the tree by the root's number runs once
     /// the root is reaped, or when its handle cannot say: the handle's own answer (`RootState`), or
     /// the number no longer reading as this root. Each send by the group's number checks the root
-    /// again, as for [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the
-    /// root's pidfd ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)).
+    /// again, as for [`kill_tree`](Child::kill_tree): the drop's tree kill is the mechanism's own,
+    /// the same answer as a tree call's ([`Attached::hard_kill`](crate::containment::Attached::hard_kill)).
     /// An unreaped root stays a zombie, pinning its number, until its teardown settles.
     pub(crate) fn begin_tear_down(
         &mut self,
@@ -209,8 +209,19 @@ impl Child {
         // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
         // gate comes first, so the look at the root is right before the kill it decides.
         let gate = self.kill_gate();
-        let view =
-            crate::containment::DropView::read(caller, self.pid(), self.id, || self.proc.state(), &self.tree_killed);
+        // The view's read of the root's state is the one look the mechanism decides on too.
+        let mut look = None;
+        let view = crate::containment::DropView::read(
+            caller,
+            self.pid(),
+            self.id,
+            || {
+                let state = self.proc.state();
+                look = Some(state.duplicate());
+                state
+            },
+            &self.tree_killed,
+        );
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
@@ -229,8 +240,12 @@ impl Child {
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
         let held = self.proc.hold(self.pid());
-        let kill = self.attached.hard_kill_for_drop(&view, Some(&held));
+        let kill = {
+            let looked = crate::containment::Looked::new(&held, look.expect("the view read the root's state"));
+            self.attached.hard_kill(Some(&looked))
+        };
         drop(held);
+        kill.log_skip(&view);
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
         // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
