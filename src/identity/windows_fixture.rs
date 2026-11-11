@@ -134,13 +134,11 @@ pub(crate) struct RestrictedChild {
     handle: HANDLE,
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
-    /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `more.com` it launched
-    /// ran on. `wait_for_child` reads this job's members.
+    /// this `spawn_restricted_shell`'s `cmd.exe` would die and leave the `more.com` it
+    /// launched behind. `wait_for_child` reads this job's members.
     job: HANDLE,
     pid: u32,
-    /// The write end of the stdin the `more.com` blocks on, held so that only a kill ends it:
-    /// [`spawn_restricted_releasable`] hands it to the caller instead, and `Drop` closes it
-    /// after the child is terminated.
+    /// The write end of the stdin the `more.com` blocks on, held so that only a kill ends it.
     stdin: Option<std::io::PipeWriter>,
 }
 
@@ -333,12 +331,10 @@ fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
 /// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
-/// writes to `NUL`. It inherits exactly those two handles (a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so
-/// no handle another thread holds inheritable at that moment reaches it. The two are inheritable only
-/// under [`spawn_lock`](crate::child::spawn::spawn_lock), from marking them through `CreateProcessW`,
-/// and are closed here before the lock is released, so a cosca spawn on another thread cannot take
-/// them. Another spawner that passes `bInheritHandles` with no list is not under the lock and can.
-/// The caller must not hold `spawn_lock`.
+/// writes to `NUL`. The child inherits only its stdin and stdout (a handle list), and both are
+/// inheritable only under [`spawn_lock`](crate::child::spawn::spawn_lock) and closed before it is
+/// released. A spawner outside the lock that inherits with no list can still take them. The caller
+/// must not hold `spawn_lock`.
 fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");

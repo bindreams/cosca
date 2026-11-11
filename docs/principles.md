@@ -263,7 +263,8 @@ arbitrary retry or loop caps. A test child kept alive is a held child, never a `
 `BLOCKER_ARGV` for a held child, the `held_*` constructors and `member_command` in
 [`src/test_child.rs`](../src/test_child.rs), `ROOT_LEAVING_A_MEMBER` in
 [`identity_group_tests.rs`](../src/child/spawn/identity_group_tests.rs), or on Windows `windows_more` and
-`spawn_restricted*` in [`windows_fixture.rs`](../src/identity/windows_fixture.rs). On Windows a held
+`held_std_killable_blocker` in [`src/test_child.rs`](../src/test_child.rs) and `spawn_restricted*` in
+[`windows_fixture.rs`](../src/identity/windows_fixture.rs). On Windows a held
 child released by EOF must not exit with the code a kill gives (1): `more.com` exits 0, `findstr x`
 (`BLOCKER_ARGV` there) exits 1, so a test that tells a kill from a release uses the `more.com`
 helpers, not `BLOCKER_ARGV`.

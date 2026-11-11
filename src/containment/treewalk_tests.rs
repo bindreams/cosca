@@ -519,7 +519,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
     // `more` inherits the root's pipes. It echoes a line as it reads it, so the first byte read
     // back says it exists. Both pipes stay open: `std`'s `wait` would close the stdin, which ends
-    // `more`, and a closed stdout would end it too. The stdin is released after the kill.
+    // `more`, and a closed stdout would end it too.
     let mut stdin = shell.stdin.take().expect("piped stdin");
     std::io::Write::write_all(&mut stdin, b"x\r\n").expect("feed the child a line");
     let mut first = [0u8; 1];

@@ -91,9 +91,9 @@ pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
 /// A session child whose root `cat` (held on its stdin, so only a signal ends it) holds one
 /// descendant `cat`, a second marker holder on the same stdin, and that descendant's pid, read once
 /// the root has started it. Nothing is written to the stdin, so neither exits on its own before the
-/// writer drops, and the holders do not change under a sweep. The last element is the write end of
-/// a pipe only the descendant holds (fd 4; the root closes it), for [`assert_descendant_dies`]:
-/// it reaches EOF when the descendant ends, whatever happens to the stdin.
+/// writer drops, and the holders do not change under a sweep. The last element is the read end of a
+/// pipe only the descendant holds, for [`assert_descendant_dies`]: it reaches EOF when the
+/// descendant ends, whatever happens to the stdin.
 pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32, crate::PipeReader) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);

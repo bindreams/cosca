@@ -63,7 +63,7 @@ pub(crate) fn assert_one_untrusted_number_warn(mark: usize, pgid: u32) {
 /// stdin pipe it gets from the child's handle. A test that must see a signal end it holds that stdin
 /// (`child.stdin()`) and drops it only after the signal's send: a send that went nowhere then shows
 /// in the exit status (`0`, which no signal gives) instead of leaving a wait to block on a root that
-/// never ends. A test that ends it itself leaves the stdin in the handle.
+/// never ends.
 pub(crate) fn session_cat() -> crate::Command {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
@@ -193,15 +193,13 @@ pub(crate) struct EscapedHolder {
 
 #[cfg(target_os = "macos")]
 impl EscapedHolder {
-    /// Releases the root's stdin. Only after the kill, and its status then checked with
-    /// `assert_killed`: a kill that sent nothing lets the root's `cat` exit `0` on this EOF, which
-    /// fails there instead of leaving the wait to block.
+    /// Releases the root's stdin; call only after the kill.
     fn release_root(&mut self) {
         drop(self.root_stdin.take());
     }
 
-    /// Kills the root, releases its stdin, reaps it through `child`'s own `wait`, and asserts it
-    /// died to the kill.
+    /// Kills the root and reaps it through `child`'s `wait`; the stdin is released only after the
+    /// kill, so a kill that sent nothing fails `assert_killed` (status 0) instead of hanging.
     #[track_caller]
     pub(crate) fn kill_and_wait(&mut self, child: &crate::Child) {
         child.kill().expect("kill the root");
@@ -210,8 +208,9 @@ impl EscapedHolder {
         super::assert_killed("the root", status);
     }
 
-    /// Kills the root, releases its stdin, reaps it behind `child`'s back ([`reap_behind_status`]),
-    /// and asserts it died to the kill.
+    /// Kills the root and reaps it behind `child`'s back ([`reap_behind_status`]); the stdin is
+    /// released only after the kill, so a kill that sent nothing fails `assert_killed` (status 0)
+    /// instead of hanging.
     #[track_caller]
     pub(crate) fn kill_and_reap_behind(&mut self, child: &crate::Child) {
         let pid = child.pid();
