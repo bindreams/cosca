@@ -255,7 +255,7 @@ fn term_group_on_an_all_zombie_group_is_ok() {
 
 // What a group's kill and terminate decide on one look at the root -----
 
-mod tree_calls {
+mod group_kill_and_terminate {
     use super::super::{fault, kill_group_tree, term_group_tree};
     use crate::containment::dispatch::TreeKillOutcome;
     use crate::containment::{Refusal, TerminateOutcome, Why};
