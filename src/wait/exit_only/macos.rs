@@ -102,9 +102,9 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
             // The read was refused (a MACF denial): an exit that cannot be tied to the child is not
             // consumed by a bare pid. The errno stays in the error, so `EPERM` stays
             // `PermissionDenied`.
-            IdCheck::Unreadable(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!("pid {pid}: its identity could not be read (errno {errno}); its exit was not consumed"),
+            IdCheck::Unreadable(errno) => Err(crate::error::io_context(
+                format!("pid {pid}: its identity could not be read; its exit was not consumed"),
+                io::Error::from_raw_os_error(errno),
             )),
         },
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
@@ -116,9 +116,9 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
             IdCheck::Gone => Ok((PeekOutcome::Foreign(Foreign::Gone), None)),
             IdCheck::Matches => Ok((peeked, None)),
             IdCheck::Unreadable(_) if !verified => Ok((peeked, None)),
-            IdCheck::Unreadable(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be ours"),
+            IdCheck::Unreadable(errno) => Err(crate::error::io_context(
+                format!("pid {pid}: its identity could not be read; it cannot be shown to be ours"),
+                io::Error::from_raw_os_error(errno),
             )),
         },
         // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
@@ -146,9 +146,9 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
             // A MACF denial: not ours to see. A caller that treats `Running` as "this is our
             // child" cannot tell a reap from a denial, so it gets the error, with the errno.
             Held::Refused(_) if !verified => Ok((peeked, None)),
-            Held::Refused(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be reaped"),
+            Held::Refused(errno) => Err(crate::error::io_context(
+                format!("pid {pid}: its identity could not be read; it cannot be shown to be reaped"),
+                io::Error::from_raw_os_error(errno),
             )),
         },
         PeekOutcome::Foreign(Foreign::Other | Foreign::Orphaned) => Ok((peeked, None)),

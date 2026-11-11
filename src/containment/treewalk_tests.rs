@@ -165,7 +165,43 @@ fn complete_members_names_every_unassessed_candidate_with_its_cause() {
     let said = error.to_string();
     assert!(said.contains(&format!("cause of {first}")), "{said}");
     for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        assert!(said.contains(&format!("pid {other} (cause of {other})")), "{said}");
+        let entry = note_entry(&said, other);
+        assert_eq!(entry, format!("pid {other} (cause of {other})"), "{said}");
+    }
+}
+
+/// The note's entry for `pid`: from its `pid {pid} (` to the next entry, or the end.
+fn note_entry(said: &str, pid: RawPid) -> &str {
+    let start = said
+        .find(&format!("pid {pid} ("))
+        .unwrap_or_else(|| panic!("no entry for pid {pid} in: {said}"));
+    said[start..].split("; pid ").next().expect("split yields one piece")
+}
+
+/// The note on `complete_members` carries each other candidate's whole chain, its OS error included.
+#[skuld::test]
+fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
+    let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
+    // A code per pid, so an entry paired with another candidate's error fails.
+    let os_error = |pid: RawPid| {
+        std::io::Error::from_raw_os_error(match pid {
+            200 => 2,
+            300 => 3,
+            _ => 5,
+        })
+    };
+    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
+        Err(Error::Unassessable {
+            detail: format!("cause of {pid}"),
+            source: Some(Error::io_cause(os_error(pid))),
+        })
+    });
+    let first = got.unassessed[0].0;
+    let error = got.complete_members().expect_err("three candidates were not assessed");
+    let said = error.to_string();
+    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
+        let os_text = os_error(other).to_string();
+        assert!(note_entry(&said, other).contains(&os_text), "{said}");
     }
 }
 
@@ -383,8 +419,8 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
 }
 
 /// The text of `resolve_or_drop`'s warn for a candidate whose creator-pid query was refused: the
-/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the `NTSTATUS`
-/// and does not fall back to "access denied?".
+/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the query, and
+/// it does not fall back to "access denied?".
 ///
 /// The failed query itself is not driven through the walk: forcing one needs a hook in production
 /// code, and Windows has no `FakeKernel` methods to state it in.
@@ -395,12 +431,15 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
 fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_windows() {
     let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
     let cause = crate::identity::UnknownCause::default().with_creator_status(refused);
-    let crate::error::Error::Unassessable { detail, .. } = crate::identity::unqueryable_read("pid", 7, cause) else {
+    let error = crate::identity::unqueryable_read("pid", 7, cause);
+    let crate::error::Error::Unassessable { detail, .. } = &error else {
         panic!("a refused creator query is Unassessable");
     };
+    assert_eq!(detail, "pid 7 exists but its creator process id query failed");
+    // `STATUS_INFO_LENGTH_MISMATCH` as its Win32 code, `ERROR_BAD_LENGTH`.
     assert_eq!(
-        detail,
-        "pid 7 exists but its creator process id query failed: NTSTATUS 0xc0000004"
+        error.raw_os_error(),
+        Some(windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32)
     );
 }
 

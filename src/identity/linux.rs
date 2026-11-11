@@ -503,23 +503,15 @@ pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
     match call.refusal() {
         Some(name) => crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), name),
         None => Error::Unassessable {
-            detail: format!(
-                "{subject} identity could not be read: {}: {}",
-                call.name(),
-                call.errno()
-            ),
+            detail: format!("{subject} identity could not be read: {}", call.name()),
             source: Some(Error::io_cause(std::io::Error::from(call.errno()))),
         },
     }
 }
 
 fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>) -> Error {
-    let mut detail = format!("{subject} identity could not be read: {reason}");
-    if let Some(source) = &source {
-        detail.push_str(&format!(": {source}"));
-    }
     Error::Unassessable {
-        detail,
+        detail: format!("{subject} identity could not be read: {reason}"),
         source: source.map(Error::io_cause),
     }
 }

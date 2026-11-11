@@ -398,6 +398,7 @@ mod on_windows {
         drop(forced);
 
         assert!(matches!(err.fate(), Some(ChildFate::Reaped)), "got {err:?}");
+        assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{err:?}");
         assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
         teardown.assert_reaps_killed();
     }

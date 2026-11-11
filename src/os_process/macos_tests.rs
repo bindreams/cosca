@@ -253,6 +253,32 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
     child.wait().unwrap();
 }
 
+#[skuld::test]
+fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
+    use crate::identity::uniq_fault::force_uniq_read_once;
+
+    let _forced = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
+    let err = super::read_for_open(77, "wait", "it was not opened").expect_err("refused");
+    match &err {
+        Error::Unassessable { detail, .. } => {
+            assert_eq!(detail, "pid 77 identity could not be read; it was not opened");
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
+}
+
+/// A refused `has_exited` read is `PermissionDenied` with the errno as its OS code, and the
+/// message does not word it as an "errno".
+#[skuld::test]
+fn a_refused_has_exited_read_keeps_its_errno_and_kind_and_words_none() {
+    let err = crate::identity::has_exited_error(77, libc::EPERM);
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    let said = crate::error::Report(&err).to_string();
+    assert!(!said.contains("errno"), "{said}");
+}
+
 /// `kernel_task` is pid 0, which macOS resolves: it is no signal target. Mutant: the guard is
 /// removed, so a token naming pid 0 reaches the kernel (it answers `EINVAL`, an `Io` error, and the
 /// attempt is recorded).

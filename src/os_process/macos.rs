@@ -83,11 +83,12 @@ pub(crate) fn read_for_open(pid: u32, caller: &str, consequence: &str) -> Result
         UniqRead::Found(info) => Ok(Some(info)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => {
-            log::warn!("{caller}: pid {pid} identity could not be read (errno {errno}); {consequence}");
-            Err(Error::Unassessable {
-                detail: format!("pid {pid} identity could not be read (errno {errno}); {consequence}"),
+            let error = Error::Unassessable {
+                detail: format!("pid {pid} identity could not be read; {consequence}"),
                 source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
-            })
+            };
+            log::warn!("{caller}: {}", crate::error::Report(&error));
+            Err(error)
         }
     }
 }

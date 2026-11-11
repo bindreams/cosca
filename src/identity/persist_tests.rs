@@ -420,9 +420,8 @@ fn a_scope_read_failure_keeps_the_path_and_the_cause() {
         panic!("the io error must be preserved as the source, got {source:?}");
     };
     assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-    // And the rendered message must not just repeat the variant's own text.
-    let rendered = e.to_string();
-    assert!(rendered.contains("/proc/sys/kernel/random/boot_id"), "{rendered}");
+    assert_eq!(source.to_string(), "No such file or directory");
+    assert!(!detail.contains("No such file or directory"), "{detail}");
 }
 
 // Live round trip ======================================================================

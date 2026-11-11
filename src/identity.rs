@@ -786,7 +786,8 @@ impl UnknownCause {
     /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
     /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
-    /// sequence-number query's `NTSTATUS`, else the refused creator-pid query's. `None` when nothing
+    /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
+    /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
     /// is known (or on macOS, which has no view and no pidfd): `hidepid`, a racing exit, an access
     /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
@@ -805,11 +806,8 @@ impl UnknownCause {
                 .map(|status| ("process sequence number", status))
                 .or(self.creator_status.map(|status| ("creator process id", status)));
             refused.map(|(query, status)| crate::error::Error::Unassessable {
-                detail: format!(
-                    "{subject} exists but its {query} query failed: NTSTATUS {:#010x}",
-                    status.0 as u32
-                ),
-                source: None,
+                detail: format!("{subject} exists but its {query} query failed"),
+                source: Some(crate::error::Error::io_cause(crate::error::nt_io_error(status))),
             })
         }
         #[cfg(not(any(target_os = "linux", windows)))]

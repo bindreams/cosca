@@ -741,13 +741,6 @@ fn walk_verdict_returns_the_first_failure() {
     );
 }
 
-/// The OS code of an `io_context` error, read from its source.
-fn source_os_code(e: &std::io::Error) -> Option<i32> {
-    std::error::Error::source(e.get_ref()?)
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .and_then(std::io::Error::raw_os_error)
-}
-
 /// A failed Win32 call on a thread reaches the caller with its plain Win32 code and the kind it
 /// classifies to, and the message still names the call, the thread and the pid.
 ///
@@ -761,7 +754,8 @@ fn fail_win32_keeps_the_win32_code_and_kind() {
     walk.fail_win32("ResumeThread", 1, 9, cause);
     let err = walk_verdict(9, walk).expect_err("a failure");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
-    assert_eq!(source_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
     assert!(
         err.to_string()
             .starts_with("ResumeThread failed for thread 1 of pid 9: "),
@@ -777,7 +771,7 @@ fn fail_unidentified_has_no_os_code() {
     walk.fail_unidentified(7, 12, 34);
     let err = walk_verdict(7, walk).expect_err("a failure");
     assert_eq!(err.raw_os_error(), None, "{err:?}");
-    assert_eq!(source_os_code(&err), None, "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), None, "{err:?}");
 }
 
 /// When every listed thread was stale the walk fails, and the error names the last skip.
@@ -861,7 +855,8 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
 #[skuld::test]
 fn process_pid_of_failure_carries_the_win32_code() {
     let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default()).expect_err("a null handle");
-    assert_eq!(source_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
     assert_eq!(
         err.kind(),
         std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE).kind(),

@@ -643,6 +643,14 @@ fn cause_text(cause: crate::identity::UnknownCause) -> Option<String> {
     cause.into_error("pid 7").map(|e| e.to_string())
 }
 
+/// `ERROR_BAD_LENGTH`, the Win32 code of `REFUSED` (`STATUS_INFO_LENGTH_MISMATCH`).
+const REFUSED_CODE: i32 = windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32;
+
+/// The Win32 code a read's cause carries as its source.
+fn cause_code(cause: crate::identity::UnknownCause) -> Option<i32> {
+    cause.into_error("pid 7").and_then(|e| e.raw_os_error())
+}
+
 /// Both reads answered: the id's key and the order key, from one handle.
 ///
 /// Mutant: the order key is the key.
@@ -665,11 +673,13 @@ fn a_refused_sequence_number_on_the_expected_process_is_unknown_with_its_status(
     for expected in [None, Some(key)] {
         let (read, cause) = super::combine(7, expected, Ok(key), Err(REFUSED));
         assert_eq!(read, Resolved::Unknown);
-        let text = cause_text(cause).expect("the refusal is the cause");
+        let error = cause.into_error("pid 7").expect("the refusal is the cause");
+        let text = error.to_string();
         assert!(
-            text.contains("pid 7") && text.contains("process sequence number query failed: NTSTATUS 0xc0000004"),
+            text.contains("pid 7") && text.contains("process sequence number query failed"),
             "{text}"
         );
+        assert_eq!(error.raw_os_error(), Some(REFUSED_CODE), "the status is the source");
     }
 }
 
@@ -697,7 +707,7 @@ fn two_failed_reads_keep_both_failures() {
     let (read, cause) = super::combine(70_007, Some(Key::for_test(5)), refused_key(), Err(REFUSED));
     assert_eq!(read, Resolved::Unknown);
     assert!(
-        cause_text(cause).is_some_and(|t| t.contains("NTSTATUS 0xc0000004")),
+        cause_code(cause) == Some(REFUSED_CODE),
         "the sequence-number refusal is the cause"
     );
     assert!(
@@ -840,9 +850,15 @@ fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_er
 
     let (parent, cause) = creator_read(7, Err(ACCESS_DENIED), UnknownCause::of_sequence_status(REFUSED));
     assert_eq!(parent, ParentRead::Unreadable);
-    let text = cause_text(cause).expect("a refusal is the cause");
+    let error = cause.into_error("pid 7").expect("a refusal is the cause");
+    let text = error.to_string();
     assert!(
-        text.contains("process sequence number query failed: NTSTATUS 0xc0000004") && !text.contains("creator"),
+        text.contains("process sequence number query failed") && !text.contains("creator"),
         "{text}"
+    );
+    assert_eq!(
+        error.raw_os_error(),
+        Some(REFUSED_CODE),
+        "the sequence status, not the creator's"
     );
 }
