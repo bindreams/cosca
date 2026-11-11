@@ -31,8 +31,7 @@ use windows::Win32::System::Threading::{
 /// surfaced to whoever reads the log — not a synchronisation device. [`wait_for`] gives this to
 /// `Job::wait_tree_timeout`, which drains the WHOLE job tree assigned via THIS SAME `contain` call
 /// through a real kernel primitive, not just the immediate child. If it trips, `wait_for` kills the
-/// whole tree, then waits (unboundedly) on the child's OWN process handle for that kill to land, and
-/// only then reports that the tree did not finish; it never silently continues. On that kill/timeout
+/// whole tree, then waits (unboundedly) for that kill to land (`kill_and_reap`), and only then reports that the tree did not finish; it never silently continues. On that kill/timeout
 /// fallback path the whole tree is confirmed too, unless `kill_tree` or `wait_tree` fails: then
 /// only the immediate child is (see `kill_and_reap`). On success the whole tree is confirmed
 /// exited, so callers may touch files or accounts any member held open.
