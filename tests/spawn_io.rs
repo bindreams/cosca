@@ -901,6 +901,8 @@ fn spawn_contained_tree(contain: impl FnOnce(&mut cosca::Command)) -> (cosca::Ch
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     contain(&mut cmd);
+    // macOS's fd marker explains a degrade through `log`; this puts the reason above a failed
+    // mechanism assertion.
     #[cfg(unix)]
     stderr_log::install();
     let (report, report_addr) = common::bind_report();
@@ -956,6 +958,7 @@ fn spawn_contained_echo_tree(contain: impl FnOnce(&mut cosca::Command), kill_on_
     common::silence(&mut cmd);
     contain(&mut cmd);
     cmd.kill_on_drop(kill_on_drop);
+    // As in `spawn_contained_tree`.
     #[cfg(unix)]
     stderr_log::install();
     let (report, report_addr) = common::bind_report();
@@ -1134,48 +1137,11 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
 
 // Unix session containment =====
 
-/// Spawn a contained tree using `ContainMode::Session` and return the handles.
-/// Unlike `spawn_contained_tree`, it asks for `Session` on every Unix, macOS included.
-#[cfg(unix)]
-fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
-    let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = common::command(common::Console::Hidden);
-    cmd.env(common::ACK_ENV, "1");
-    cmd.env(common::ECHO_HELD_ENV, "1");
-    cmd.executable(testbin())
-        .args(["cosca_testbin", "spawn-grandchild", &addr]);
-    cmd.contain_with(cosca::ContainMode::Session);
-    let (report, report_addr) = common::bind_report();
-    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
-    let mut child = cmd.spawn().expect("spawn session-contained tree");
-    let mut tags = Vec::new();
-    let socks = common::accept_tree(listener, report, &mut child, |s| {
-        let mut tag = [0u8; 1];
-        s.read_exact(&mut tag).expect("read tag");
-        tags.push(tag[0]);
-        tag[0] == b'G'
-    });
-    let mut gc = None;
-    for (tag, s) in tags.into_iter().zip(socks) {
-        if tag == b'G' {
-            gc = Some(s);
-        }
-    }
-    (child, gc.expect("grandchild connected"))
-}
-
 #[cfg(unix)]
 #[skuld::test]
 fn unix_session_containment_reports_session() {
-    let (child, mut gc_stream) = spawn_session_tree();
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::Session
-    };
-    assert_eq!(child.containment(), expected);
+    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
@@ -1225,8 +1191,7 @@ fn unix_session_child_is_own_session_leader() {
 // TreeWalk containment =====
 
 /// Spawn a contained tree using `ContainMode::TreeWalk` and return the handles.
-/// Sibling of `spawn_session_tree`/`spawn_contained_tree`; selects the
-/// identity-aware walk directly. Available on `any(unix, windows)`.
+/// Sibling of `spawn_contained_tree`; selects the identity-aware walk directly. Available on `any(unix, windows)`.
 ///
 /// Returns `(child, grandchild_stream, root_stream)`. **The caller MUST keep
 /// `root_stream` alive until after the teardown call.** TreeWalk enumerates the

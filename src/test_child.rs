@@ -265,12 +265,13 @@ pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Co
     cmd.contain()
 }
 
-// What [`contain_without_cgroup`] gets: the integration tests' table, compiled from its real source.
-#[cfg(unix)]
+// What a contained test asks of containment and gets: the integration tests' table, compiled from
+// its real source.
 #[path = "../tests/common/contain_gives.rs"]
 mod contain_gives;
 #[cfg(unix)]
 pub(crate) use contain_gives::contain_without_cgroup_gives;
+pub(crate) use contain_gives::drainable_gives;
 
 /// [`contain_without_cgroup`] for the async `Command`.
 #[cfg(all(unix, feature = "tokio"))]

@@ -3,16 +3,10 @@
 
 use std::time::Duration;
 
-use crate::test_child::Console;
+use crate::test_child::{drainable_gives, Console};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::Containment;
-
-/// The drainable mechanism `.contain()` gives without a Linux cgroup fixture.
-#[cfg(windows)]
-const DRAINABLE: Containment = Containment::JobObject;
-#[cfg(target_os = "macos")]
-const DRAINABLE: Containment = Containment::FdMarker;
 
 /// The `TreeDrain` variant a fully-drained tree reports on `containment`'s mechanism:
 /// `AllMembersExited` everywhere authoritative (cgroup v2, Windows job object), but
@@ -72,13 +66,13 @@ async fn wait_tree_drained_verdict(expected: Containment) {
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
-    wait_tree_drained_verdict(DRAINABLE).await;
+    wait_tree_drained_verdict(drainable_gives()).await;
 }
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains(#[fixture(cgroup)] _group: &Group) {
-    wait_tree_drained_verdict(Containment::CgroupV2).await;
+    wait_tree_drained_verdict(drainable_gives()).await;
 }
 
 async fn wait_tree_timeout_members_remain(expected: Containment) {
@@ -95,13 +89,13 @@ async fn wait_tree_timeout_members_remain(expected: Containment) {
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    wait_tree_timeout_members_remain(DRAINABLE).await;
+    wait_tree_timeout_members_remain(drainable_gives()).await;
 }
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline(#[fixture(cgroup)] _group: &Group) {
-    wait_tree_timeout_members_remain(Containment::CgroupV2).await;
+    wait_tree_timeout_members_remain(drainable_gives()).await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_members_remain_on_a_live_tree` — see there for
@@ -120,13 +114,13 @@ async fn wait_tree_timeout_zero_members_remain(expected: Containment) {
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    wait_tree_timeout_zero_members_remain(DRAINABLE).await;
+    wait_tree_timeout_zero_members_remain(drainable_gives()).await;
 }
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree(#[fixture(cgroup)] _group: &Group) {
-    wait_tree_timeout_zero_members_remain(Containment::CgroupV2).await;
+    wait_tree_timeout_zero_members_remain(drainable_gives()).await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained`
@@ -154,7 +148,7 @@ async fn wait_tree_timeout_zero_drained_verdict(expected: Containment) {
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained() {
-    wait_tree_timeout_zero_drained_verdict(DRAINABLE).await;
+    wait_tree_timeout_zero_drained_verdict(drainable_gives()).await;
 }
 
 #[cfg(target_os = "linux")]
@@ -162,18 +156,36 @@ async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree
 async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained(
     #[fixture(cgroup)] _group: &Group,
 ) {
-    wait_tree_timeout_zero_drained_verdict(Containment::CgroupV2).await;
+    wait_tree_timeout_zero_drained_verdict(drainable_gives()).await;
 }
 
-/// A quick-exiting child of an explicit `ContainMode::TreeWalk` request.
-fn quick_treewalk_child() -> crate::tokio::Child {
+/// A quick-exiting child under the containment `contain` asks for.
+fn quick_child(contain: impl FnOnce(&mut crate::tokio::Command)) -> crate::tokio::Child {
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
     cmd.args(["cmd", "/C", "exit 0"]);
-    cmd.contain_with(crate::ContainMode::TreeWalk);
+    contain(&mut cmd);
     cmd.spawn().expect("spawn")
+}
+
+/// A quick-exiting child of an explicit `ContainMode::TreeWalk` request.
+fn quick_treewalk_child() -> crate::tokio::Child {
+    quick_child(|cmd| _ = cmd.contain_with(crate::ContainMode::TreeWalk))
+}
+
+/// Every wait of `child` is `Unsupported`, and the child is reaped.
+async fn assert_wait_tree_unsupported(mut child: crate::tokio::Child) {
+    for result in [
+        child.wait_tree_timeout(Duration::from_millis(200)).await,
+        child.wait_tree_timeout(Duration::ZERO).await,
+        child.wait_tree().await,
+    ] {
+        let err = result.expect_err("this mechanism has no kernel drain edge");
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    }
+    _ = child.wait().await;
 }
 
 /// See the sync twin's identical test for the full rationale. macOS does not honor a `TreeWalk`
@@ -181,17 +193,27 @@ fn quick_treewalk_child() -> crate::tokio::Child {
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
-    let mut child = quick_treewalk_child();
+    let child = quick_treewalk_child();
     assert_eq!(child.containment(), Containment::TreeWalk);
-    for result in [
-        child.wait_tree_timeout(Duration::from_millis(200)).await,
-        child.wait_tree_timeout(Duration::ZERO).await,
-        child.wait_tree().await,
-    ] {
-        let err = result.expect_err("TreeWalk has no kernel drain edge");
-        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
-    }
-    _ = child.wait().await;
+    assert_wait_tree_unsupported(child).await;
+}
+
+/// See the sync twin's identical test.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_wait_tree_is_unsupported_on_a_session() {
+    let child = quick_child(|cmd| _ = crate::test_child::contain_without_cgroup_async(cmd));
+    assert_eq!(child.containment(), crate::test_child::contain_without_cgroup_gives());
+    assert_wait_tree_unsupported(child).await;
+}
+
+/// See the sync twin's identical test.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn async_wait_tree_is_unsupported_on_an_uncontained_child() {
+    let child = quick_child(|_| {});
+    assert_eq!(child.containment(), Containment::None);
+    assert_wait_tree_unsupported(child).await;
 }
 
 /// See the sync twin's identical test: macOS promotes every contained root's mechanism to the
@@ -203,7 +225,7 @@ async fn async_a_treewalk_request_is_promoted_to_the_fd_marker_which_drains() {
     assert_eq!(child.containment(), Containment::FdMarker);
     assert_eq!(
         child
-            .wait_tree_timeout(Duration::from_millis(200))
+            .wait_tree()
             .await
             .expect("macOS promotes an explicit TreeWalk request to the drainable fd marker"),
         expected_drained_verdict(Containment::FdMarker),
