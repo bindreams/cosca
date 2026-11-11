@@ -31,7 +31,6 @@ fn skip() -> Skip {
         why: Why::MayNameAnother(Refusal::Unsure(PGID as u32, std::io::Error::other("forced"))),
         root_alone: true,
         holders: None,
-        earlier: None,
     }
 }
 

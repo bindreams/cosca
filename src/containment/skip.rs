@@ -2,7 +2,6 @@
 //! ([`Skip`], in the outcome of its kill and of its terminate), and how a tree call words it
 //! ([`SkipCall`]).
 
-use crate::containment::dispatch::Unkilled;
 use crate::containment::root::Refusal;
 use crate::error::Error;
 
@@ -22,9 +21,6 @@ pub(crate) struct Skip {
     /// macOS: the sweep by identity a fd marker still makes of its holders, which no reuse of a pid
     /// redirects. `None`: the mechanism has none.
     pub(crate) holders: Option<Result<(), Error>>,
-    /// A tree walk's: the members an earlier kill left that this skipped kill tried again by identity
-    /// and left still ([`TreeKillOutcome::with_earlier`](crate::containment::dispatch::TreeKillOutcome::with_earlier)).
-    pub(crate) earlier: Option<Unkilled>,
 }
 
 #[cfg(unix)]
@@ -124,16 +120,13 @@ mod call {
                     why: Why::Untrusted(why),
                     action,
                     holders,
-                    earlier,
                     ..
                 } => {
                     let error = self.untrusted(&action, &why, holders);
                     return match self.signal {
-                        TreeSignal::Kill => tree.settle_for_kill_tree(
-                            self.op,
-                            TreeKillOutcome::Ran(Unkilled::after(earlier, Err(Unkilled::from(error)))),
-                            false,
-                        ),
+                        TreeSignal::Kill => {
+                            tree.settle_for_kill_tree(self.op, TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
+                        }
                         TreeSignal::Term => Err(error),
                     };
                 }

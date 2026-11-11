@@ -65,7 +65,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     assert!(
         matches!(
             super::hard_kill(&crate::identity::HostKernel, stale),
-            crate::containment::dispatch::TreeKillOutcome::NoRoot(_)
+            crate::containment::dispatch::TreeKillOutcome::NoRoot
         ),
         "a root that lost its pid is nothing to do"
     );

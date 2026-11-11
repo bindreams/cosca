@@ -292,6 +292,12 @@ impl Tree {
         self.killed.is_set()
     }
 
+    /// The tree's settlement ([`TreeKilled`]) and whether the tree is a walk's, whose held members
+    /// are the walk's own state, for `f`.
+    fn settling<R>(&self, f: impl FnOnce(&TreeKilled, bool) -> R) -> R {
+        f(&self.killed, self.containment() == Containment::TreeWalk)
+    }
+
     /// What a tree kill's `outcome` comes to once the root's own handle has had its say
     /// ([`TreeKilled::settle`]). Only a Unix cleanup reads the answer itself.
     #[cfg(unix)]
@@ -300,7 +306,7 @@ impl Tree {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<SettleOutcome, Unsettled> {
-        self.killed.settle(outcome, root_ended)
+        self.settling(|killed, walk| killed.settle(walk, outcome, root_ended))
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
@@ -311,7 +317,7 @@ impl Tree {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Result<(), Error> {
-        self.killed.settle_for_kill_tree(caller, outcome, root_ended)
+        self.settling(|killed, walk| killed.settle_for_kill_tree(caller, walk, outcome, root_ended))
     }
 
     /// `outcome` for a `kill_tree` that goes on to the root's backstop (see
@@ -321,13 +327,13 @@ impl Tree {
         caller: &str,
         outcome: TreeKillOutcome,
     ) -> Result<TreeKillOutcome, SweepFailure> {
-        self.killed.unless_unwalked(caller, outcome)
+        self.settling(|killed, walk| killed.unless_unwalked(caller, walk, outcome))
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
     /// here and only when it will be logged.
     pub(crate) fn settle_for_drop(&self, outcome: impl Into<TreeKillOutcome>, root_ended: bool) -> Option<String> {
-        self.killed.settle_for_drop(outcome, root_ended)
+        self.settling(|killed, walk| killed.settle_for_drop(walk, outcome, root_ended))
     }
 }
 

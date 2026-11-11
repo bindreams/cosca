@@ -1152,7 +1152,6 @@ impl Marker {
             why,
             root_alone: false,
             holders: Some(holders),
-            earlier: None,
         }
     }
 

@@ -363,7 +363,7 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
     assert!(
         matches!(
             super::hard_kill(&root_changed_hands(), root()),
-            crate::containment::dispatch::TreeKillOutcome::NoRoot(_)
+            crate::containment::dispatch::TreeKillOutcome::NoRoot
         ),
         "a gone root has no tree to walk"
     );
