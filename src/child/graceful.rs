@@ -298,12 +298,13 @@ impl Child {
     /// it is still running; nothing goes out by its number, and the call ends the same way. On 6.9+
     /// its group is shut down as usual while it has a member. After this handle's own reap, with
     /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
-    /// call goes on as usual. With a pid that names no process, the group's number may be taken, so
-    /// the call ends at once with [`Error::Unassessable`](crate::error::Error::Unassessable) and the
-    /// remedy: call `kill_tree` before `wait` to end the descendants. A macOS marker's holders
-    /// still get the `SIGTERM`, the grace and the kill. The `SIGTERM` and the sweep each decide on a
-    /// look of their own at the root, and each send by the group's number after it is checked as for
-    /// `kill_tree`.
+    /// call goes on as usual; so it does for a macOS fd marker with no group, whose pid names no
+    /// process, which has no group to skip. With any other pid that names no process, the group's
+    /// number may be taken, so the call ends at once with
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) and the remedy: call `kill_tree`
+    /// before `wait` to end the descendants, unless this handle already killed the tree, when it goes
+    /// on and returns the status. A macOS marker's holders still get the `SIGTERM`, the grace and the
+    /// kill. The `SIGTERM` and the sweep each decide on a look of their own at the root.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
@@ -503,6 +504,19 @@ impl Child {
             }
             #[cfg(unix)]
             TerminateOutcome::RootThroughPidfd(skip) => SignalTreeCooperativelyOutcome::RootThroughPidfd(skip),
+            // A tree this handle already killed leaves nothing for the grace and the kill of the holders
+            // to do: the sweep that follows answers as the tree calls do.
+            #[cfg(unix)]
+            TerminateOutcome::HoldersOnly(skip) if skip.is_moot(&self.tree_killed) => {
+                log::debug!(
+                    "graceful_shutdown_tree({}): this handle already killed the tree, so the holders' grace is skipped",
+                    self.pid()
+                );
+                SignalTreeCooperativelyOutcome::Sent {
+                    result: Ok(()),
+                    earlier: None,
+                }
+            }
             #[cfg(unix)]
             TerminateOutcome::HoldersOnly(skip) => SignalTreeCooperativelyOutcome::HoldersOnly(skip),
             #[cfg(not(unix))]
@@ -819,6 +833,10 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "graceful_tests.rs"]
 mod graceful_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "pidfd_shutdown_tests.rs"]
+mod pidfd_shutdown_tests;
 
 #[cfg(all(test, windows))]
 #[path = "ctrl_break_tests.rs"]

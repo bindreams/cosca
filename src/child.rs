@@ -72,6 +72,10 @@ mod root_number_matrix_tests;
 mod own_reap_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/killed_tree_tests.rs"]
+mod killed_tree_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/foreign_reap_after_look_tests.rs"]
 pub(crate) mod foreign_reap_after_look_tests;
 

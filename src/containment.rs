@@ -349,6 +349,8 @@ pub(crate) use dispatch::DropView;
 pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
 #[cfg(unix)]
 pub(crate) use root::Looked;
+#[cfg(all(test, unix))]
+pub(crate) use root::Refusal;
 pub(crate) use root::Root;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};

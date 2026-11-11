@@ -683,18 +683,8 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         }
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
-    // call above reaped the root. A cgroup leaf is swept by its own handle. A group the pid no
-    // longer names is not signalled by that number (pidfd group signal refused: Linux below 6.9),
-    // so the cleanup is `Unassessable` and the descendant ends by its stdin closing.
-    #[cfg(target_os = "linux")]
-    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    let swept = child.kill_tree();
-    if child.containment() == crate::containment::Containment::CgroupV2 {
-        swept.expect("the leaf is swept by its own handle");
-    } else {
-        let err = swept.expect_err("a reaped root's group is not signalled by its number");
-        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
-    }
+    // call above reaped the root: a group the pid no longer names is not signalled by that number,
+    // so no sweep is made here. The descendant ends by its stdin closing.
     drop(stdin);
 }
 

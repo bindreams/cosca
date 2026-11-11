@@ -258,18 +258,17 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
         .expect("stderr reaches EOF once the cat is gone");
 }
 
-/// A `TreeWalk` names its tree by ppid edges from the root's number. After the reap the only
-/// processes with that ppid belong to whoever reused the number, so the drop walks nothing and
-/// warns naming the root. Mutant: the reaped `TreeWalk` still walks.
+/// A `TreeWalk` proves its root still holds its pid before it walks, as a tree call's does. A reaped
+/// root fails that proof, so the drop walks nothing (the recorder notes a walk only once the proof
+/// passed) and warns that no walk ran. Mutant: the reaped `TreeWalk` still walks.
 #[skuld::test]
-fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
+fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran() {
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["true"]);
     cmd.contain_with(ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn");
-    let pid = child.pid();
     child.wait().expect("reap the root");
 
     let mark = crate::log_capture::mark();
@@ -285,12 +284,8 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pi
     let (level, text) = &warns[0];
     assert_eq!(*level, log::Level::Warn);
     assert!(
-        text.contains(&format!("root pid {pid}")),
-        "the warn names the root: {text}"
-    );
-    assert!(
-        text.contains("kill_tree()"),
-        "the warn says how to end descendants: {text}"
+        text.contains("no walk ran and nothing was killed"),
+        "the warn says no walk ran: {text}"
     );
 }
 
@@ -951,22 +946,22 @@ fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
     (pid, child)
 }
 
-/// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs.
-/// Mutant: the walk or the root kill still run for it.
+/// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs, and
+/// that sweep is the whole answer, as for a tree call: it has no group to skip, so the drop warns of
+/// nothing.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
     crate::log_capture::install();
     let walks = record_walks();
-    let (pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
+    let (_pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
 
     let mark = crate::log_capture::mark();
     drop(child);
 
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no ppid walk from the reaped root");
     let warns = drop_warns_since(mark);
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains(&format!("root pid {pid}")), "{warns:?}");
+    assert_eq!(warns, Vec::new(), "the holders' sweep is the whole answer");
 }
 
 /// The same with a group: no `killpg`, no walk, one warn. Mutant: the walk still runs for a marker

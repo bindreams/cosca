@@ -118,6 +118,28 @@ fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() 
     member.assert_survived();
 }
 
+/// 6.9+: after this handle's own reap the root's pidfd still names its group exactly, so `kill_tree`
+/// kills the members left through it, though the pid names no process.
+#[skuld::test]
+fn kill_tree_after_this_handles_own_reap_kills_the_group_through_the_pidfd_while_it_has_a_member(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    let (child, member) = root_with_a_member();
+    kill_own_child(child.pid());
+    child.wait().expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_root_reads(crate::identity::Resolved::Gone);
+    let capture = Capture::start();
+    let result = child.kill_tree();
+    let steps = capture.group_steps();
+    result.expect("the group is killed through the root's pidfd");
+    assert_eq!(
+        steps.first(),
+        Some(&GroupStep::Group(Route::Pidfd, libc::SIGKILL)),
+        "{steps:?}"
+    );
+    member.assert_killed();
+}
+
 /// 6.9+: a root whose handle cannot say whether it was reaped still names its group exactly through
 /// its pidfd, so `kill_tree` kills the group as usual. Mutant: "only a reaped root's group is
 /// decided by the pidfd".

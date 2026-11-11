@@ -1,9 +1,112 @@
-use super::{number_holds, Refusal};
+use super::{look, number_holds, NumberLook, Refusal};
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::RootState;
+use crate::test_support::stated_root::StatedRoot;
 
 /// A pgid no test process holds: the checks only name it in their text.
 const PGID: i32 = 999_999;
+
+// look -----
+
+/// What `look` answered, in a comparable shape.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Trusted,
+    Empty,
+    /// macOS: the root is `Unpinned` or `Unknown`.
+    Untrusted,
+    /// `MayNameAnother`, with `exact_root` and the refusal's kind.
+    MayNameAnother(bool, &'static str),
+}
+
+fn answered(state: impl Fn() -> RootState, has_group: bool, read: Resolved<ProcessId>) -> Answer {
+    let _read = crate::child::fault::force_root_reads(read);
+    let root = StatedRoot::with_state(PGID as u32, state);
+    match look(&root, has_group) {
+        NumberLook::Trusted => Answer::Trusted,
+        NumberLook::Empty => Answer::Empty,
+        NumberLook::Untrusted(_) => Answer::Untrusted,
+        NumberLook::GroupGone => panic!("only a look through the root's pidfd answers GroupGone"),
+        NumberLook::MayNameAnother { refusal, exact_root } => Answer::MayNameAnother(
+            exact_root,
+            match refusal {
+                Refusal::ReapedPidGone(_) => "gone",
+                Refusal::ReapedPidTaken(_) => "taken",
+                Refusal::ReapedPidUnread(_) => "unread",
+                Refusal::ReapedElsewhere(_) => "elsewhere",
+                Refusal::Unsure(..) => "unsure",
+                Refusal::Unpinned(_) => "unpinned",
+            },
+        ),
+    }
+}
+
+/// `look` over every state, own-reap flag and identity read, for a mechanism with a group and one
+/// without. The identity read matters only after this handle's own reap.
+#[skuld::test]
+fn look_answers_each_state_own_reap_and_identity_read() {
+    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+    let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
+    // macOS trusts no number its root's handle cannot vouch for, before the mechanism matters.
+    #[cfg(target_os = "macos")]
+    let unknown_answer = Answer::Untrusted;
+    #[cfg(not(target_os = "macos"))]
+    let unknown_answer = Answer::MayNameAnother(cfg!(target_os = "linux"), "unsure");
+    for has_group in [true, false] {
+        for read in reads() {
+            assert_eq!(answered(|| RootState::Unreaped, has_group, read), Answer::Trusted);
+        }
+        for read in reads() {
+            assert_eq!(
+                answered(|| RootState::Unknown(std::io::Error::other("forced")), has_group, read),
+                unknown_answer,
+                "unknown, group: {has_group}"
+            );
+        }
+        for read in reads() {
+            assert_eq!(
+                answered(|| RootState::Reaped { own: false }, has_group, read),
+                Answer::MayNameAnother(false, "elsewhere"),
+                "reaped elsewhere, group: {has_group}"
+            );
+        }
+        // This handle's own reap: another process at the pid means the group is empty; a pid that
+        // names no process may be taken once the group has no member, so with a group nothing is
+        // sent by it; a pid that cannot be read is no answer.
+        let own = || RootState::Reaped { own: true };
+        let [gone, found, unread] = reads();
+        let gone_answer = if has_group {
+            Answer::MayNameAnother(false, "gone")
+        } else {
+            Answer::Empty
+        };
+        assert_eq!(
+            answered(own, has_group, gone),
+            gone_answer,
+            "own reap, gone, group: {has_group}"
+        );
+        assert_eq!(
+            answered(own, has_group, found),
+            Answer::Empty,
+            "own reap, found, group: {has_group}"
+        );
+        assert_eq!(
+            answered(own, has_group, unread),
+            Answer::MayNameAnother(false, "unread"),
+            "own reap, unreadable, group: {has_group}"
+        );
+    }
+}
+
+/// macOS: an `Unpinned` root is `Untrusted` whatever the identity read.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn look_answers_an_unpinned_root_untrusted() {
+    let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+    for read in [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown] {
+        assert_eq!(answered(|| RootState::Unpinned, true, read), Answer::Untrusted);
+    }
+}
 
 // number_holds -----
 
@@ -90,6 +193,34 @@ mod pidfd {
 
     fn reaped_elsewhere_text(pid: u32) -> String {
         format!("the root (pid {pid}) was reaped elsewhere")
+    }
+
+    /// A reaped root's group with no member left has no tree to signal, but a root its handle cannot
+    /// answer for may have left its group alive, so it keeps the reason it may name another process.
+    #[skuld::test]
+    fn through_the_pidfd_keeps_a_root_its_handle_cannot_answer_for(#[fixture(pidfd_group_signal)] _group: &Group) {
+        use std::os::unix::process::CommandExt as _;
+
+        use crate::containment::root::{through_the_pidfd, NumberLook};
+        use crate::containment::Refusal;
+        let mut lone = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn");
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(lone.id());
+        lone.wait().expect("reap it");
+        let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
+        let decide = |exact_root| {
+            through_the_pidfd(
+                NumberLook::MayNameAnother {
+                    refusal: Refusal::ReapedElsewhere(super::PGID as u32),
+                    exact_root,
+                },
+                &root,
+            )
+        };
+        assert!(matches!(decide(false), NumberLook::GroupGone));
+        assert!(matches!(
+            decide(true),
+            NumberLook::MayNameAnother { exact_root: true, .. }
+        ));
     }
 
     /// A reaped root whose group has no member left fails the check, though its state would pass

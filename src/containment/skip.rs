@@ -23,6 +23,19 @@ pub(crate) struct Skip {
     pub(crate) holders: Option<Result<(), Error>>,
 }
 
+#[cfg(unix)]
+impl Skip {
+    /// Whether this handle's own reap is why the root's pid names no process or cannot be read, and
+    /// the handle already killed the tree: there is nothing left for the skip to leave undone.
+    pub(crate) fn is_moot(&self, killed: &crate::containment::TreeKilled) -> bool {
+        killed.is_set()
+            && matches!(
+                &self.why,
+                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_))
+            )
+    }
+}
+
 /// Why the root's number was not used.
 #[derive(Debug)]
 #[cfg_attr(
@@ -128,7 +141,7 @@ mod call {
             let Why::MayNameAnother(refusal) = &skip.why else {
                 unreachable!("an untrusted skip is answered above")
             };
-            if killed.is_set() && matches!(refusal, Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_)) {
+            if skip.is_moot(killed) {
                 log::debug!(
                     "{}({}): {refusal}, and this handle already killed the tree, so it does not {}",
                     self.op,

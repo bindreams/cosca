@@ -155,6 +155,64 @@ fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_
     assert!(matches!(grouped, TreeKillOutcome::Skipped(_)), "{grouped:?}");
 }
 
+/// macOS: a root launchd holds (`Unpinned`), or one its handle cannot answer for, skips what names
+/// the tree by the root's pid: a tree walk walks nothing, and a marker sweeps its holders alone, the
+/// root excepted when it is not pinned. A root its handle shows unreaped is killed as usual.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use super::{Attached, TreeKillOutcome};
+    use crate::containment::{TerminateOutcome, Why};
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
+
+    let walk = || Attached::TreeWalk(crate::identity::ProcessId::current());
+    let rooted = |state: fn() -> RootState| StatedRoot::with_state(1234, state);
+    let unpinned = || rooted(|| RootState::Unpinned);
+    let unknown = || rooted(|| RootState::Unknown(std::io::Error::other("a failed peek")));
+    for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
+        let killed = walk().hard_kill(Some(&root));
+        assert!(
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && skip.holders.is_none()),
+            "{name}: {killed:?}"
+        );
+        let termed = walk().terminate(1234, Some(&root));
+        assert!(matches!(termed, TerminateOutcome::End(_)), "{name}: {termed:?}");
+    }
+
+    let (read, write) = std::io::pipe().expect("pipe");
+    let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
+    let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
+    let prepared = crate::containment::fdmarker::PreparedMarker {
+        read: std::os::fd::OwnedFd::from(read),
+        handle,
+        read_handle,
+        fd: write.as_fd().as_raw_fd(),
+    };
+    let root_id = crate::containment::fdmarker::fdmarker_tests::inert_root();
+    let marker = Attached::FdMarker(crate::containment::fdmarker::Marker::new(prepared, root_id, Some(1234)));
+    for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
+        let killed = marker.hard_kill(Some(&root));
+        assert!(
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && matches!(skip.holders, Some(Ok(())))),
+            "{name}: {killed:?}"
+        );
+        let termed = marker.terminate(1234, Some(&root));
+        assert!(
+            matches!(
+                termed,
+                TerminateOutcome::Sent {
+                    result: Ok(()),
+                    earlier: Some("the SIGTERM")
+                }
+            ),
+            "{name}: {termed:?}"
+        );
+    }
+}
+
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested
 /// (`!is_root`) contained spawn must yield BOTH halves of the delegated pair —
 /// `Containment::Delegated` and `Attached::Delegated` — for a kernel mechanism
