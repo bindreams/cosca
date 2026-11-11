@@ -270,8 +270,8 @@ pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Co
 #[path = "../tests/common/contain_gives.rs"]
 mod contain_gives;
 #[cfg(unix)]
-pub(crate) use contain_gives::contain_without_cgroup_gives;
-pub(crate) use contain_gives::drainable_gives;
+pub(crate) use contain_gives::{contain_without_cgroup_gives, session_gives};
+pub(crate) use contain_gives::{drainable_gives, tree_walk_gives};
 
 /// [`contain_without_cgroup`] for the async `Command`.
 #[cfg(all(unix, feature = "tokio"))]

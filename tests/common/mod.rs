@@ -55,7 +55,9 @@ pub use factory::*;
 mod locked;
 pub use locked::*;
 mod contain_gives;
-pub use contain_gives::{contain_without_cgroup_gives, drainable_gives};
+#[cfg(unix)]
+pub use contain_gives::session_gives;
+pub use contain_gives::{contain_without_cgroup_gives, tree_walk_gives};
 
 #[cfg(unix)]
 mod uid_switch;

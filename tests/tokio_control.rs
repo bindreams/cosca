@@ -137,14 +137,7 @@ async fn async_contain_with_treewalk_tears_down_tree() {
         cmd.env(common::ECHO_HELD_ENV, "1");
     })
     .await;
-    // On macOS, ContainMode::TreeWalk still attaches Containment::FdMarker (decision 2: the
-    // fd marker installs for every contained root regardless of requested mode).
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::TreeWalk
-    };
-    assert_eq!(child.containment(), expected);
+    assert_eq!(child.containment(), common::tree_walk_gives());
     let (root, grand) = (
         common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),

@@ -901,8 +901,8 @@ fn spawn_contained_tree(contain: impl FnOnce(&mut cosca::Command)) -> (cosca::Ch
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     contain(&mut cmd);
-    // macOS's fd marker explains a degrade through `log`; this puts the reason above a failed
-    // mechanism assertion.
+    // A degrading mechanism (the Linux cgroup leaf, the macOS fd marker) explains itself through
+    // `log`; see the `stderr_log` module doc.
     #[cfg(unix)]
     stderr_log::install();
     let (report, report_addr) = common::bind_report();
@@ -1140,8 +1140,8 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_session_containment_reports_session() {
-    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
-    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
+    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = cmd.contain_with(cosca::ContainMode::Session));
+    assert_eq!(child.containment(), common::session_gives());
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
@@ -1166,12 +1166,7 @@ fn unix_session_child_is_own_session_leader() {
         .expect("stdout pipe")
         .contain_with(cosca::ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn sid-report");
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::Session
-    };
-    assert_eq!(child.containment(), expected);
+    assert_eq!(child.containment(), common::session_gives());
 
     let mut reader = child.stdout().expect("stdout reader");
     let mut out = String::new();
@@ -1252,12 +1247,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
     let root = common::Member::new(root_stream, child.pid());
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::TreeWalk
-    };
-    assert_eq!(child.containment(), expected);
+    assert_eq!(child.containment(), common::tree_walk_gives());
 
     child.kill_tree().expect("kill_tree");
     // The root still holds its socket, so a kill that did not come would leave it alive: prove
@@ -1283,12 +1273,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
     let mut root = common::Member::new(root_stream, child.pid());
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::TreeWalk
-    };
-    assert_eq!(child.containment(), expected);
+    assert_eq!(child.containment(), common::tree_walk_gives());
 
     child.terminate_tree().expect("terminate_tree");
     root.assert_dead("the root");
@@ -1317,12 +1302,7 @@ fn treewalk_kills_process_group_escapee() {
     let (report, report_addr) = common::bind_report();
     cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn tree-walk escapee tree");
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::TreeWalk
-    };
-    assert_eq!(child.containment(), expected);
+    assert_eq!(child.containment(), common::tree_walk_gives());
 
     let mut tags = Vec::new();
     let socks = common::accept_tree(listener, report, &mut child, |s| {

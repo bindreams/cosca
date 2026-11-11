@@ -24,19 +24,6 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
     }
 }
 
-/// A quick, self-terminating contained child: the drain edge (when the mechanism has one)
-/// fires almost immediately, so an UNBOUNDED `wait_tree()` call below is safe — it is a real
-/// blocking wait on a genuinely-terminating event, not an indefinite one.
-fn quick_contained_child() -> crate::Child {
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    #[cfg(unix)]
-    cmd.args(["true"]);
-    #[cfg(windows)]
-    cmd.args(["cmd", "/C", "exit 0"]);
-    cmd.contain();
-    cmd.spawn().expect("spawn")
-}
-
 /// A contained blocker and its stdin writer, which the caller must keep for exactly as long as the
 /// child must stay running. On Windows it is `more.com`, not the `findstr` of
 /// [`crate::test_child::BLOCKER_ARGV`]: released stdin must not look like a kill to
@@ -64,7 +51,7 @@ fn kill_then_release(child: crate::Child, stdin: crate::PipeWriter) {
 /// mechanism-correct drained verdict (`expected_drained_verdict`) of the `expected` mechanism the
 /// caller's `.contain()` must get.
 fn wait_tree_drained_verdict(expected: Containment) {
-    let child = quick_contained_child();
+    let child = quick_child(|cmd| _ = cmd.contain());
     assert_eq!(child.containment(), expected);
     let result = child.wait_tree();
     assert_eq!(
@@ -146,7 +133,7 @@ fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree(#[fixture(cgroup
 /// first is the genuine happens-before edge that the tree has fully drained before the ZERO
 /// probe below ever runs.
 fn wait_tree_timeout_zero_drained_verdict(expected: Containment) {
-    let child = quick_contained_child();
+    let child = quick_child(|cmd| _ = cmd.contain());
     assert_eq!(child.containment(), expected);
     child
         .wait_tree()
@@ -176,7 +163,9 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
     wait_tree_timeout_zero_drained_verdict(drainable_gives());
 }
 
-/// A quick-exiting child under the containment `contain` asks for.
+/// A quick, self-terminating child under the containment `contain` asks for: the drain edge (when
+/// the mechanism has one) fires almost immediately, so an UNBOUNDED `wait_tree()` on it is a real
+/// blocking wait on a genuinely-terminating event, not an indefinite one.
 fn quick_child(contain: impl FnOnce(&mut crate::Command)) -> crate::Child {
     let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
@@ -211,16 +200,16 @@ fn assert_wait_tree_unsupported(child: &crate::Child) {
 #[skuld::test]
 fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     let child = quick_treewalk_child();
-    assert_eq!(child.containment(), Containment::TreeWalk);
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
     assert_wait_tree_unsupported(&child);
 }
 
-/// `Unsupported` on a session, the mechanism a Linux test asks for through `contain_without_cgroup`.
+/// `Unsupported` on a session, which an explicit `ContainMode::Session` request gets on Linux.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn wait_tree_is_unsupported_on_a_session() {
-    let child = quick_child(|cmd| _ = crate::test_child::contain_without_cgroup(cmd));
-    assert_eq!(child.containment(), crate::test_child::contain_without_cgroup_gives());
+    let child = quick_child(|cmd| _ = cmd.contain_with(crate::ContainMode::Session));
+    assert_eq!(child.containment(), Containment::Session);
     assert_wait_tree_unsupported(&child);
 }
 
@@ -242,7 +231,7 @@ fn wait_tree_is_unsupported_on_an_uncontained_child() {
 #[skuld::test]
 fn a_treewalk_request_is_promoted_to_the_fd_marker_which_drains() {
     let child = quick_treewalk_child();
-    assert_eq!(child.containment(), Containment::FdMarker);
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
     assert_eq!(
         child
             .wait_tree()
@@ -273,7 +262,7 @@ fn spawn_never_exiting() -> (crate::Child, crate::PipeWriter) {
 /// Mutant: return `None` when `remaining` is zero before asking the backend.
 #[skuld::test]
 fn wait_deadline_in_the_past_reports_an_exited_child() {
-    let child = quick_contained_child();
+    let child = quick_child(|cmd| _ = cmd.contain());
     let waited = child.wait().expect("wait");
     let status = child
         .wait_deadline(Instant::now())

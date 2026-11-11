@@ -20,16 +20,6 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
     }
 }
 
-fn quick_contained_cmd() -> crate::tokio::Command {
-    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-    #[cfg(unix)]
-    cmd.args(["true"]);
-    #[cfg(windows)]
-    cmd.args(["cmd", "/C", "exit 0"]);
-    cmd.contain();
-    cmd
-}
-
 /// Async twin of `child::lifecycle_tests::long_lived_contained_child`.
 fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     #[cfg(unix)]
@@ -52,8 +42,7 @@ async fn kill_then_release(mut child: crate::tokio::Child, stdin: crate::tokio::
 }
 
 async fn wait_tree_drained_verdict(expected: Containment) {
-    let mut cmd = quick_contained_cmd();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = quick_child(|cmd| _ = cmd.contain());
     assert_eq!(child.containment(), expected);
     let result = child.wait_tree().await;
     assert_eq!(
@@ -126,8 +115,7 @@ async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree(#[fi
 /// Async twin of `wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained`
 /// — see there for the full rationale.
 async fn wait_tree_timeout_zero_drained_verdict(expected: Containment) {
-    let mut cmd = quick_contained_cmd();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = quick_child(|cmd| _ = cmd.contain());
     assert_eq!(child.containment(), expected);
     child
         .wait_tree()
@@ -194,7 +182,7 @@ async fn assert_wait_tree_unsupported(mut child: crate::tokio::Child) {
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     let child = quick_treewalk_child();
-    assert_eq!(child.containment(), Containment::TreeWalk);
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
     assert_wait_tree_unsupported(child).await;
 }
 
@@ -202,8 +190,8 @@ async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_session() {
-    let child = quick_child(|cmd| _ = crate::test_child::contain_without_cgroup_async(cmd));
-    assert_eq!(child.containment(), crate::test_child::contain_without_cgroup_gives());
+    let child = quick_child(|cmd| _ = cmd.contain_with(crate::ContainMode::Session));
+    assert_eq!(child.containment(), Containment::Session);
     assert_wait_tree_unsupported(child).await;
 }
 
@@ -222,7 +210,7 @@ async fn async_wait_tree_is_unsupported_on_an_uncontained_child() {
 #[skuld::test]
 async fn async_a_treewalk_request_is_promoted_to_the_fd_marker_which_drains() {
     let mut child = quick_treewalk_child();
-    assert_eq!(child.containment(), Containment::FdMarker);
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
     assert_eq!(
         child
             .wait_tree()
