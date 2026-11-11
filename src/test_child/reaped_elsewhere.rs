@@ -59,19 +59,11 @@ pub(crate) fn assert_one_untrusted_number_warn(mark: usize, pgid: u32) {
     );
 }
 
-/// A `sleep` in its own session: a process group, or on macOS an fd marker with a group.
-pub(crate) fn session_sleep() -> crate::Command {
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(["sleep", "300"]);
-    cmd.contain_with(crate::ContainMode::Session);
-    cmd
-}
-
-/// A `cat` in its own session, reading a stdin pipe it gets from the child's handle. A test that
-/// must see a signal end it holds that stdin and drops it only after the signal's send: a send that
-/// went nowhere then shows in the exit status (`0`, which no signal gives) instead of leaving a
-/// wait to block on a root that never ends.
-#[cfg(target_os = "linux")]
+/// A `cat` in its own session (a process group, or on macOS an fd marker with a group), reading a
+/// stdin pipe it gets from the child's handle. A test that must see a signal end it holds that stdin
+/// (`child.stdin()`) and drops it only after the signal's send: a send that went nowhere then shows
+/// in the exit status (`0`, which no signal gives) instead of leaving a wait to block on a root that
+/// never ends. A test that ends it itself leaves the stdin in the handle.
 pub(crate) fn session_cat() -> crate::Command {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["cat"]);
@@ -148,16 +140,17 @@ pub(crate) fn reap_behind_status(pid: u32) -> std::process::ExitStatus {
     std::process::ExitStatus::from_raw(status)
 }
 
-/// A [`session_sleep`] child, killed and reaped behind its back, and its group's id.
+/// A [`session_cat`] child, killed and reaped behind its back, and its group's id.
 pub(crate) fn foreign_reaped_group_root() -> (crate::Child, u32) {
-    let child = session_sleep().spawn().expect("spawn");
+    let child = session_cat().spawn().expect("spawn");
     let pid = child.pid();
     kill_own_child(pid);
     reap_behind(pid);
     (child, pid)
 }
 
-/// A root `sh` that leaves a marker holder outside its process group, then sleeps. The holder is a
+/// A root `sh` that leaves a marker holder outside its process group, then blocks on its stdin, which
+/// it never reads: nothing is written to it. The holder is a
 /// `cat` that called `setsid` (through `perl`, as macOS has no `setsid` command) and reads the
 /// root's stdin through fd 3, as `sh` points a background job's stdin at `/dev/null` otherwise. It
 /// prints its pid once it has left the group. It holds the stderr pipe's write end: once the root is
@@ -170,7 +163,7 @@ pub(crate) fn escaped_holder_script(ignore_term: bool) -> String {
         r#"exec 3<&0
 perl -MPOSIX -e '{ignore}POSIX::setsid() > 0 or die "setsid: $!"; $| = 1; print "$$\n"; open(STDOUT, ">", "/dev/null") or die; exec("cat") or die' <&3 3<&- &
 exec 3<&-
-exec sleep 300"#
+exec cat"#
     )
 }
 

@@ -89,12 +89,18 @@ pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
 }
 
 /// A session child whose root `cat` (held on its stdin, so only a signal ends it) holds one
-/// descendant `sleep`, a second marker holder, and that descendant's pid, read once the root has
-/// started it. Neither exits on its own, so the holders do not change under a sweep.
+/// descendant `cat`, a second marker holder on the same stdin, and that descendant's pid, read once
+/// the root has started it. Nothing is written to the stdin, so neither exits on its own before the
+/// writer drops, and the holders do not change under a sweep.
 pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);
+    // A background job's stdin is `/dev/null` unless it is redirected (see `BLOCKER_ARGV`).
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; cat <&3 3<&- >/dev/null & echo $!; exec cat 3<&-",
+    ]);
     cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
     cmd.contain_with(ContainMode::Session);

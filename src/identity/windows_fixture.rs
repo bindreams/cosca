@@ -121,10 +121,14 @@ pub(crate) struct RestrictedChild {
     handle: HANDLE,
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
-    /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `ping.exe` it launched
-    /// ran on for an hour. `wait_for_child` reads this job's members.
+    /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `more.com` it launched
+    /// ran on. `wait_for_child` reads this job's members.
     job: HANDLE,
     pid: u32,
+    /// The write end of the stdin the `more.com` blocks on, held so that only a kill ends it:
+    /// [`spawn_restricted_releasable`] hands it to the caller instead, and `Drop` closes it
+    /// after the child is terminated.
+    stdin: Option<std::io::PipeWriter>,
 }
 
 impl RestrictedChild {
@@ -164,12 +168,12 @@ impl RestrictedChild {
         );
     }
 
-    /// The pid of the `ping.exe` this fixture's shell launched, once it exists.
+    /// The pid of the `more.com` this fixture's shell launched, once it exists.
     ///
     /// Reads the fixture's job, not the process tree: the job lists exactly the processes
     /// created under the shell, so a pre-existing orphan whose creator pid was recycled onto
     /// this shell is not in it. The job also holds the console host (`conhost.exe`) the shell
-    /// was given, listed before `ping`, so the child is the member whose image is `ping.exe`.
+    /// was given, listed before `more`, so the child is the member whose image is `more.com`.
     /// Nothing opens the shell, which may grant us no query right (`spawn_restricted_shell`
     /// with `PROCESS_SYNCHRONIZE`); the members are opened by pid, and they are not
     /// DACL-restricted.
@@ -181,12 +185,12 @@ impl RestrictedChild {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
             for pid in members.into_iter().filter(|&pid| pid != self.pid) {
-                let is_ping = image_file_name(pid).is_some_and(|image| {
+                let is_more = image_file_name(pid).is_some_and(|image| {
                     std::path::Path::new(&image)
                         .file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
+                        .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
                 });
-                if is_ping {
+                if is_more {
                     return pid;
                 }
             }
@@ -293,20 +297,34 @@ pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> Restri
     spawn_with_ace_cmdline(
         alone,
         granted | PROCESS_TERMINATE.0,
-        "C:\\Windows\\System32\\cmd.exe /c ping.exe -n 3600 127.0.0.1",
-        None,
+        &format!("C:\\Windows\\System32\\cmd.exe /c {}", quoted_more()),
     )
 }
 
-/// Like [`spawn_restricted`], but the child is `more.com` reading a piped stdin, and the caller
-/// holds the write end: dropping it lets the child exit by itself, with code 0. For a test whose
-/// kill is the behaviour under test: the child it spares ends on that release, so a kill that sent
-/// nothing fails an assertion on the exit code (`1` for a kill) instead of leaving a wait on a child
-/// that never ends.
-///
-/// Until it exits, the child inherits the handles this process already holds inheritable, besides
-/// its stdio; the fixture's `Drop` ends it.
+/// Like [`spawn_restricted`], but the caller holds the write end of the child's stdin: dropping it
+/// lets the child exit by itself, with code 0. For a test whose kill is the behaviour under test:
+/// the child it spares ends on that release, so a kill that sent nothing fails an assertion on the
+/// exit code (`1` for a kill) instead of leaving a wait on a child that never ends.
 pub(crate) fn spawn_restricted_releasable(alone: &Completion, granted: u32) -> (RestrictedChild, std::io::PipeWriter) {
+    let mut child = spawn_restricted(alone, granted);
+    let writer = child.stdin.take().expect("the fixture holds the child's stdin");
+    (child, writer)
+}
+
+/// `more.com`, quoted for a command line.
+fn quoted_more() -> String {
+    format!("\"{}\"", crate::test_child::windows_more().display())
+}
+
+fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
+    spawn_with_ace_cmdline(alone, granted, &quoted_more())
+}
+
+/// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
+/// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
+/// writes to `NUL`. It is created with handle inheritance on, so until it exits it inherits the
+/// handles this process already holds inheritable, besides its stdio; the fixture's `Drop` ends it.
+fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
@@ -316,35 +334,7 @@ pub(crate) fn spawn_restricted_releasable(alone: &Completion, granted: u32) -> (
         unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
             .expect("make the child's stdio inheritable");
     }
-    let more = crate::test_child::windows_more();
-    let child = spawn_with_ace_cmdline(
-        alone,
-        granted | PROCESS_TERMINATE.0,
-        &format!("\"{}\"", more.display()),
-        Some((stdin, stdout)),
-    );
-    // `reader` and `null` close here, so the write end is the pipe's only other holder.
-    (child, writer)
-}
 
-fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(
-        alone,
-        granted,
-        "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1",
-        None,
-    )
-}
-
-/// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
-/// pass vacuously. `stdio` is the child's stdin and its stdout and stderr, as inheritable
-/// handles; given, the child is created with handle inheritance on.
-fn spawn_with_ace_cmdline(
-    alone: &Completion,
-    granted: u32,
-    cmdline: &str,
-    stdio: Option<(HANDLE, HANDLE)>,
-) -> RestrictedChild {
     // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
     drop_se_debug_privilege(alone);
@@ -405,16 +395,14 @@ fn spawn_with_ace_cmdline(
     // terminator, so a caller that forgot one would send it reading past the end of the
     // allocation. No call site can get this wrong.
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut si = STARTUPINFOW {
+    let si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: stdin,
+        hStdOutput: stdout,
+        hStdError: stdout,
         ..Default::default()
     };
-    if let Some((stdin, stdout)) = stdio {
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = stdin;
-        si.hStdOutput = stdout;
-        si.hStdError = stdout;
-    }
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
     // points at are alive for the duration of the call.
@@ -424,7 +412,7 @@ fn spawn_with_ace_cmdline(
             Some(PWSTR(cmdline.as_mut_ptr())),
             Some(&sa),
             None,
-            stdio.is_some(),
+            true,
             CREATE_NO_WINDOW | CREATE_SUSPENDED,
             None,
             None,
@@ -470,6 +458,7 @@ fn spawn_with_ace_cmdline(
         thread: pi.hThread,
         job,
         pid: pi.dwProcessId,
+        stdin: Some(writer),
     };
     // A child that died on startup would still keep its kernel object alive through our
     // handle, so every OpenProcess verdict would look right while testing nothing.

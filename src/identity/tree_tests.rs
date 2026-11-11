@@ -34,7 +34,7 @@ fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
 
 /// The ppid branch, distinct from the anchor branch: the subject resolves fine, but its
 /// PARENT is access-denied. Built by having the restricted fixture itself be the parent - a
-/// DACL is not inherited, so `cmd.exe` is unopenable while the `ping` it spawns is not.
+/// DACL is not inherited, so `cmd.exe` is unopenable while the `more` it spawns is not.
 #[cfg(windows)]
 #[skuld::test]
 fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_ppid() {

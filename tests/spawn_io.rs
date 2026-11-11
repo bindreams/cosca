@@ -1618,8 +1618,15 @@ fn cgroup_leaf_guard_removes_a_leaf_with_a_live_member_when_the_test_panics(#[fi
     // Dropped in reverse: the member is killed and reaped first, then the leaf removed, so a failing assertion leaks
     // neither.
     let _outer_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
+    // Blocked on a piped stdin it holds: `wait` closes that stdin, so a guard that killed nothing
+    // ends the member by itself (status 0), which the assertion below fails, instead of hanging.
     let mut member = common::KillOnDrop::new(
-        common::spawn_locked(std::process::Command::new("sleep").arg("3600")).expect("spawn a member"),
+        common::spawn_locked(
+            std::process::Command::new(common::stdin_blocker_program())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null()),
+        )
+        .expect("spawn a member"),
     );
     std::fs::write(leaf.join("cgroup.procs"), member.id().to_string()).expect("place the member in the leaf");
 

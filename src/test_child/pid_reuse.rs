@@ -95,11 +95,11 @@ pub(crate) fn reap_behind_and_reuse(pid: u32) -> Child {
     reuse(pid)
 }
 
-/// Starts a `std` child that takes `pid`, which must name no process now.
+/// Starts a `std` child that takes `pid`, which must name no process now. It blocks on its piped
+/// stdin, which its `Child` holds: only a signal ends it before the `Child` drops.
 pub(crate) fn reuse(pid: u32) -> Child {
     ns::set_last_pid(pid - 1);
-    let mut cmd = std::process::Command::new("sleep");
-    cmd.arg("3600");
+    let mut cmd = super::held_std_blocker(std::process::Stdio::null());
     let reuser = crate::test_spawn::spawn(&mut cmd).expect("spawn the reuser");
     assert_eq!(
         reuser.id(),

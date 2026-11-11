@@ -259,7 +259,8 @@ work cosca controls. A timeout a caller passes to cosca is the caller's policy: 
 re-reads state at expiry and reports what it finds (`wait_timeout` returns `Ok(None)` (`Ok(false)`
 on `Process`), `wait_tree_timeout` returns `MembersRemain`, and `graceful_shutdown`'s grace
 escalates to a kill). A backoff that re-checks a deterministic condition, with no cap, is fine. No
-arbitrary retry or loop caps.
+arbitrary retry or loop caps. A test child kept alive is a held child (`BLOCKER_ARGV` and the `held_*`
+constructors in [`src/test_child.rs`](../src/test_child.rs)), never a `sleep` or `ping`.
 
 **Why:** a sleep is a bet that something has happened by then, and loses on a slow or loaded
 machine.
