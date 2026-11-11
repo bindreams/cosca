@@ -7,6 +7,7 @@ use crate::elevation::pkexec::PkexecVersion;
 use crate::elevation::plan::{BackendSet, Host, Os};
 use crate::elevation::{Auth, Backend, ElevatedVia};
 use crate::error::Error;
+use crate::error::IoFailure;
 use crate::test_child::Console;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -174,7 +175,7 @@ fn a_pkexec_older_than_121_is_refused() {
             release: Some(120),
         },
         PkexecVersion::Unparsed("polkit 122\n".into()),
-        PkexecVersion::SpawnFailed("No such file or directory".into()),
+        PkexecVersion::SpawnFailed(IoFailure::of(&std::io::Error::from_raw_os_error(libc::ENOENT))),
     ] {
         let host = Host {
             pkexec_version: version.clone(),

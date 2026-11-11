@@ -108,8 +108,8 @@ pub(crate) enum WaitError {
     NotOwner(#[from] NotOwner),
     /// Waiting for the shim failed here, say for lack of memory. The outcome is not settled: the
     /// shim may be fine, and a later call can still read its frame.
-    #[error("waiting for the shim: {0}")]
-    Poll(io::Error),
+    #[error("waiting for the shim")]
+    Poll(#[source] io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,8 +122,8 @@ pub(crate) enum KillError {
     Unkillable,
     #[error(transparent)]
     NotOwner(#[from] NotOwner),
-    #[error("sending to the shim: {0}")]
-    Io(io::Error),
+    #[error("sending to the shim")]
+    Io(#[source] io::Error),
 }
 
 /// A control call from a process that did not bind the link.

@@ -8,7 +8,7 @@
 //! shown to be [`KEEP_CWD_SINCE`] or later is refused, including an older one with the option
 //! backported.
 
-use crate::error::Error;
+use crate::error::{Error, IoFailure};
 
 /// The first polkit release whose pkexec has `--keep-cwd`: polkit NEWS lists "add option
 /// (--keep-cwd) for pkexec" under polkit 121. Measured: 121 (Fedora 37) honours it.
@@ -24,9 +24,12 @@ pub enum PkexecVersion {
     NotProbed,
     /// `PATH` has a `pkexec` at `path`, but its real file could not be found (`error`), so it is
     /// neither stored nor asked.
-    Unresolved { path: String, error: String },
+    Unresolved { path: String, error: IoFailure },
+    /// `PATH` has a `pkexec` whose real file is at `path`, but it could not be opened as a pinned
+    /// regular file (`error`), so it is neither stored nor asked.
+    Unpinned { path: String, error: IoFailure },
     /// `pkexec --version` could not be run.
-    SpawnFailed(String),
+    SpawnFailed(IoFailure),
     /// It exited unsuccessfully; both streams are kept, lossily decoded.
     Failed {
         status: String,
@@ -69,13 +72,27 @@ pub(crate) fn parse(stdout: &[u8]) -> PkexecVersion {
 }
 
 impl PkexecVersion {
-    /// For [`PkexecVersion::Unresolved`], why no pkexec was stored; the planner reports it in place
-    /// of "not on PATH".
-    pub(crate) fn unresolved(&self) -> Option<String> {
+    /// For [`PkexecVersion::Unresolved`] and [`PkexecVersion::Unpinned`], why no pkexec was stored;
+    /// the planner reports it in place of "not on PATH".
+    pub(crate) fn not_stored(&self) -> Option<String> {
         match self {
-            PkexecVersion::Unresolved { path, error } => Some(format!(
-                "pkexec on PATH at {path} could not be resolved to its real file: {error}"
+            PkexecVersion::Unresolved { path, .. } => Some(format!(
+                "pkexec on PATH at {path} could not be resolved to its real file"
             )),
+            PkexecVersion::Unpinned { path, .. } => {
+                Some(format!("pkexec at {path} could not be opened as its real file"))
+            }
+            _ => None,
+        }
+    }
+
+    /// The failed read behind the unresolved, unpinned or failed-spawn probe, for the reporting
+    /// error's `source`.
+    pub(crate) fn cause(&self) -> Option<Box<Error>> {
+        match self {
+            PkexecVersion::Unresolved { error, .. }
+            | PkexecVersion::Unpinned { error, .. }
+            | PkexecVersion::SpawnFailed(error) => Some(Error::io_cause(error.to_io())),
             _ => None,
         }
     }
@@ -86,11 +103,13 @@ impl PkexecVersion {
             PkexecVersion::Parsed { release: Some(n), .. } if *n >= KEEP_CWD_SINCE => return None,
             PkexecVersion::Parsed { version, .. } => format!("pkexec reports version {version}"),
             PkexecVersion::NotProbed => "the pkexec version was not checked".into(),
-            PkexecVersion::SpawnFailed(e) => format!("`pkexec --version` could not be run: {e}"),
+            PkexecVersion::SpawnFailed(_) => "`pkexec --version` could not be run".into(),
             PkexecVersion::Failed { status, stdout, stderr } => {
                 format!("`pkexec --version` exited with {status}, printing {stdout:?} and, to stderr, {stderr:?}")
             }
-            PkexecVersion::Unresolved { .. } => self.unresolved().expect("an Unresolved has a reason"),
+            PkexecVersion::Unresolved { .. } | PkexecVersion::Unpinned { .. } => {
+                self.not_stored().expect("an unstored pkexec has a reason")
+            }
             PkexecVersion::NonUtf8(lossy) => format!("`pkexec --version` printed non-UTF-8 output {lossy:?}"),
             PkexecVersion::Unparsed(text) => {
                 format!("`pkexec --version` printed {text:?}, not `pkexec version <N>`")
@@ -104,7 +123,7 @@ impl PkexecVersion {
                  pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit \
                  {KEEP_CWD_SINCE} or later"
             ),
-            source: None,
+            source: self.cause(),
         })
     }
 }

@@ -70,7 +70,7 @@ pub(super) fn replace_stdio(log: &Log) {
                 "cannot replace {name} with /dev/null: {}",
                 crate::error::Report(&e)
             ));
-            debug_assert!(false, "dup2 of /dev/null onto {name}: {e}");
+            debug_assert!(false, "dup2 of /dev/null onto {name}: {}", crate::error::Report(&e));
         }
     }
 }

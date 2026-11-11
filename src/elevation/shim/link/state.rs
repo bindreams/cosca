@@ -241,7 +241,7 @@ impl Shared {
         };
         if let Err(e) = written {
             if e != Errno::AGAIN {
-                debug_assert!(false, "writing the settled byte failed: {e}");
+                debug_assert!(false, "writing the settled byte failed: {}", crate::error::Report(&e));
                 log::warn!(
                     "cannot signal the outcome of the shim at {}: {report}",
                     self.sock_path.display(),

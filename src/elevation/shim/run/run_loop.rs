@@ -108,7 +108,8 @@ fn drain_control(conn: BorrowedFd<'_>, log: &Log) -> Vec<Control> {
                 ));
                 debug_assert!(
                     !matches!(e, Errno::BADF | Errno::INVAL),
-                    "recv on the shim's own connection: {e}"
+                    "recv on the shim's own connection: {}",
+                    crate::error::Report(&e)
                 );
                 controls.push(Control::Eof);
                 return controls;

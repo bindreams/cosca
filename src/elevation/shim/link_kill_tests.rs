@@ -104,7 +104,14 @@ fn an_unexpected_send_errno_is_an_io_error() {
     let _shim = rig.live();
     rig.probe.fail_next_send(rustix::io::Errno::IO);
     match rig.link.kill() {
-        Err(KillError::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+        Err(e @ KillError::Io(_)) => {
+            assert_eq!(
+                e.to_string(),
+                "sending to the shim",
+                "the cause is the source, not the text"
+            );
+            assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::EIO));
+        }
         other => panic!("expected an I/O error, got {other:?}"),
     }
     assert_eq!(rig.link.observe().unwrap().outcome, None);

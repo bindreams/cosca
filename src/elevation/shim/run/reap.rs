@@ -36,7 +36,7 @@ impl Spawned {
                     "cannot kill the program's process: {}",
                     crate::error::Report(&e)
                 ));
-                debug_assert!(false, "pidfd_send_signal(SIGKILL): {e}");
+                debug_assert!(false, "pidfd_send_signal(SIGKILL): {}", crate::error::Report(&e));
             }
         }
     }
@@ -94,7 +94,7 @@ fn wait_on(child: &Spawned, options: WaitIdOptions, log: &Log) -> Wait {
                     "waitid on the program's pidfd: {}",
                     crate::error::Report(&e)
                 ));
-                debug_assert!(false, "waitid on the program's pidfd: {e}");
+                debug_assert!(false, "waitid on the program's pidfd: {}", crate::error::Report(&e));
                 Wait::Gone
             }
         };

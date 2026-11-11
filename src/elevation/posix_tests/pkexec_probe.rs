@@ -92,7 +92,7 @@ fn only_a_linux_gui_pkexec_request_from_a_non_root_caller_launches_pkexec() {
 fn a_probe_that_cannot_run_says_so() {
     let v = run_version_probe(std::process::Command::new("/nonexistent/pkexec"));
     assert!(
-        matches!(v, PkexecVersion::SpawnFailed(ref e) if e.contains("No such file")),
+        matches!(v, PkexecVersion::SpawnFailed(ref e) if e.to_io().raw_os_error() == Some(libc::ENOENT)),
         "{v:?}"
     );
 }
@@ -218,10 +218,7 @@ fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
     match host.pkexec_version {
         PkexecVersion::Unresolved { path, error } => {
             assert_eq!(Path::new(&path), bin.join("pkexec"));
-            assert!(
-                error.contains(&std::io::Error::from_raw_os_error(libc::ELOOP).to_string()),
-                "{error}"
-            );
+            assert_eq!(error.to_io().raw_os_error(), Some(libc::ELOOP), "{error:?}");
         }
         other => panic!("expected Unresolved, got {other:?}"),
     }
@@ -244,8 +241,17 @@ fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
     assert_eq!(host.available.pkexec, None);
     assert!(host.pkexec_pin.is_none());
     match host.pkexec_version {
-        PkexecVersion::Unresolved { error, .. } => assert!(error.starts_with("opening "), "{error}"),
-        other => panic!("expected Unresolved, got {other:?}"),
+        PkexecVersion::Unpinned { path, error } => {
+            assert_eq!(Path::new(&path), bin.join("pkexec"));
+            let refusal = error.to_io();
+            // Linux's `O_PATH | O_NOFOLLOW` opens the link itself, which is not a regular file;
+            // elsewhere `O_NOFOLLOW` fails the open.
+            #[cfg(target_os = "linux")]
+            assert_eq!(refusal.to_string(), "not a regular file");
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(refusal.raw_os_error(), Some(libc::ELOOP), "{refusal}");
+        }
+        other => panic!("expected Unpinned, got {other:?}"),
     }
 }
 
@@ -274,7 +280,9 @@ fn a_fifo_at_the_canonical_path_is_not_pinned() {
     );
     assert!(host.pkexec_pin.is_none());
     match host.pkexec_version {
-        PkexecVersion::Unresolved { error, .. } => assert!(error.contains("not a regular file"), "{error}"),
-        other => panic!("expected Unresolved, got {other:?}"),
+        PkexecVersion::Unpinned { error, .. } => {
+            assert!(error.to_io().to_string().contains("not a regular file"), "{error:?}")
+        }
+        other => panic!("expected Unpinned, got {other:?}"),
     }
 }
