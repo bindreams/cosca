@@ -50,6 +50,11 @@ system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To kee
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
 table of `~/.cargo/config.toml`.
 
+`SIGNAL_BY_NUMBER` (`COSCA_TEST_SIGNAL_BY_NUMBER`) holds the tests that signal a pid or process-group
+number, which would reach an unrelated process if the number were wrong. It needs
+`COSCA_TEST_SIGNAL_BY_NUMBER_CONSENT=1`, which CI gives on its throwaway runners; on your own machine
+set `COSCA_TEST_SIGNAL_BY_NUMBER=0` to skip it, or run it in a container or VM.
+
 `ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
 `osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
 `COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the `elevation_*` jobs in `.github/workflows/ci.yaml` do (passwords,

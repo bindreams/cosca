@@ -43,6 +43,8 @@ env:
   COSCA_TEST_SHELL_EXECUTE: "0"
   COSCA_TEST_SHELL_PROBES: "0"
   COSCA_TEST_ELEVATION_ROUTES: "0"
+  # The by-number signal tests run in every lane; a runner is the sandbox, so consent is given workflow-wide.
+  COSCA_TEST_SIGNAL_BY_NUMBER_CONSENT: "1"
 
 jobs:
   lint:
@@ -417,6 +419,8 @@ jobs:
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             # For the namespace tests that also attach a foreign tracer; no other test here takes it.
             export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
+            # The `cgroup`-labelled by-number signal tests of this lane; sudo-rs drops the workflow-wide value.
+            export COSCA_TEST_SIGNAL_BY_NUMBER_CONSENT=1
             status=0
             SKULD_LABELS="(cgroup | namespaces) & !setuid" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.

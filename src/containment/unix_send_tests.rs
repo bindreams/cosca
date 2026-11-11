@@ -6,7 +6,8 @@ use std::os::unix::process::ExitStatusExt as _;
 use super::kill_group;
 use crate::send_log::{GroupStep, Route};
 #[cfg(target_os = "linux")]
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::pidfd_group_signal;
+use crate::test_groups::{signal_by_number, Group};
 use crate::test_support::stated_root::StatedRoot;
 
 /// A leader in a group of its own with two members, all blocked on reads of the test's pipe, the
@@ -62,7 +63,7 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
 /// before the `killpg` and send the rest on its strength", "no check before the leader's signal",
 /// "check once before the members' resends".
 #[skuld::test]
-fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
+fn each_send_by_the_group_number_has_its_own_check_right_before_it(#[fixture(signal_by_number)] _by_number: &Group) {
     let (mut child, stdin, members) = group_of_three();
     let pgid = child.id() as i32;
     let root = StatedRoot::unreaped();
@@ -105,7 +106,7 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
 /// A check that fails sends nothing by the group's number, and says why. Mutant: "send on a failed
 /// check".
 #[skuld::test]
-fn a_failed_check_sends_nothing_by_the_group_number() {
+fn a_failed_check_sends_nothing_by_the_group_number(#[fixture(signal_by_number)] _by_number: &Group) {
     let (mut child, stdin, _) = group_of_three();
     let pgid = child.id() as i32;
     let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
@@ -129,7 +130,10 @@ fn a_failed_check_sends_nothing_by_the_group_number() {
 /// nothing goes by its number. Mutant: "always `killpg`".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_group_signals_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _group: &Group) {
+fn kill_group_signals_through_the_root_pidfd(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
@@ -165,7 +169,9 @@ fn kernel_release() -> String {
 /// by its number, after a check. Mutant: "`EINVAL` is an error".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
+fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
@@ -197,7 +203,7 @@ fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
 /// never by its number. Mutant: "the leader by number".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn the_leader_signal_goes_through_the_root_pidfd() {
+fn the_leader_signal_goes_through_the_root_pidfd(#[fixture(signal_by_number)] _by_number: &Group) {
     use std::os::fd::AsFd as _;
     let (mut child, stdin, _) = group_of_three();
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
@@ -228,7 +234,9 @@ fn the_leader_signal_goes_through_the_root_pidfd() {
 /// right after a check, and it ends the leader. Mutant: "the leader's signal by number is not made"
 /// (the leader then exits once its members end at their stdin's EOF).
 #[skuld::test]
-fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
+fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     let (mut child, stdin, _) = group_of_three();
     let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();
@@ -255,7 +263,7 @@ fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
 /// member probe bypasses `send_signal`".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_member_probe_is_a_recorded_send() {
+fn a_member_probe_is_a_recorded_send(#[fixture(signal_by_number)] _by_number: &Group) {
     let (mut child, stdin, members) = group_of_three();
     let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();

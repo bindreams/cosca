@@ -317,13 +317,15 @@ the process.
 
 ## 10. System-affecting tests run in a sandbox
 
-Tests that touch real system state run in a container, VM or CI, never on a developer's host:
-cgroups, Job Objects, elevation, process-group and session signals, `kqueue` or `waitpid` teardown
-of trees, signals to processes the test didn't spawn, and anything under `sudo`. The only exemption
-is a test that spawns this repo's own short-lived children and signals them only through the `Child`
-handle cosca returned for each, before that handle reaps the child, never by process group, session
-or a PID the test computed. On Unix that kill reaches `kill(2)` by number, which is safe while the
-child is unreaped.
+A test needs consent to run on a developer's machine when either holds:
+
+1. its possible outcomes (it passes, it fails at any point, it panics) include a destructive one, for
+   example a broken system configuration or an unrelated process killed;
+2. it performs a visible operation on shared resources, for example a directory in a visible spot, a
+   user account, system configuration or a service.
+
+Any other test needs none. A test that needs consent runs in a container, VM or CI, never on a
+developer's host.
 
 Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
 host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
@@ -359,7 +361,11 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
-CI turns each off workflow-wide and opts in only in the step or job that runs it.
+CI turns each off workflow-wide and opts in only in the step or job that runs it. The exception is
+`COSCA_TEST_SIGNAL_BY_NUMBER` (the tests that signal a pid or process-group number a wrong value of
+which would reach an unrelated process), a `test_group!` row joined with
+`#[fixture(signal_by_number)] _group: &Group`, selected by `SKULD_LABELS=signal_by_number`: it runs on
+every platform, so CI gives consent workflow-wide (`ci.yaml`), on its throwaway runners.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle

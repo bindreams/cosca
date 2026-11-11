@@ -11,6 +11,8 @@ use crate::test_child::reaped_elsewhere::{
     assert_one_reaped_elsewhere_warn, assert_one_untrusted_number_warn, foreign_reaped_group_root, kill_own_child,
     session_cat,
 };
+#[cfg(target_os = "macos")]
+use crate::test_groups::{signal_by_number, Group};
 
 /// Mutants: `killpg` sent; the decision taken on the number alone (it shows no recycle).
 #[skuld::test]
@@ -660,7 +662,9 @@ fn graceful_shutdown_tree_after_a_foreign_reap_kills_a_holder_that_ignores_sigte
 /// Mutant: the root is checked only for a mechanism with a pgid.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder() {
+fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_holder(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     use crate::test_child::reaped_elsewhere::{assert_one_reaped_elsewhere_walk_warn, escaped_holder_tree};
     crate::log_capture::install();
     let walks = crate::containment::treewalk::fault::record_walks();
@@ -693,7 +697,9 @@ fn kill_tree_of_a_walk_marker_after_a_foreign_reap_walks_nothing_and_kills_the_h
 /// Mutant: the root is checked only for a mechanism with a pgid.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder() {
+fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_the_holder(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();

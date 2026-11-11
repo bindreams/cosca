@@ -5,7 +5,7 @@
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::{pidfd_group_signal, signal_by_number, Group};
 
 /// Who reaps the root.
 #[derive(Debug, Clone, Copy)]
@@ -122,22 +122,26 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_kills_the_group_left_be
 }
 
 #[skuld::test]
-fn a_drop_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
+fn a_drop_after_its_own_wait_below_6_9_sends_nothing_to_the_group(#[fixture(signal_by_number)] _by_number: &Group) {
     below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::Drop);
 }
 
 #[skuld::test]
-fn a_drop_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group() {
+fn a_drop_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group(#[fixture(signal_by_number)] _by_number: &Group) {
     below_6_9_sends_nothing_to_the_group(Reap::Foreign, Teardown::Drop);
 }
 
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
+fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_sends_nothing_to_the_group(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::FinishElevated);
 }
 
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group() {
+fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     below_6_9_sends_nothing_to_the_group(Reap::Foreign, Teardown::FinishElevated);
 }
 

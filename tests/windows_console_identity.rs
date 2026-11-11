@@ -53,6 +53,8 @@ impl Probe {
 }
 
 #[cfg(windows)]
+use common::test_groups::signal_by_number;
+#[cfg(windows)]
 use common::{escape_report_field as escape_field, read_report_line, report_field as field};
 
 #[cfg(windows)]
@@ -207,7 +209,9 @@ fn a_gui_subsystem_child_never_joins_the_callers_console() {
 /// is evidence in neither direction. The child's own `sees_caller=0` is the structural proof the
 /// event cannot arrive on this route — no timing, and no betting on how long a non-delivery takes.
 #[skuld::test]
-fn ctrl_break_reports_success_for_a_child_outside_our_console() {
+fn ctrl_break_reports_success_for_a_child_outside_our_console(
+    #[fixture(signal_by_number)] _by_number: &common::test_groups::Group,
+) {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
 
     let p = probe_raw(

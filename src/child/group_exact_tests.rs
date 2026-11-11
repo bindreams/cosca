@@ -9,7 +9,7 @@ use crate::test_child::Console;
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
 use crate::test_child::reaped_elsewhere::{foreign_reaped_group_root, kill_own_child, reap_behind};
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::{pidfd_group_signal, signal_by_number, Group};
 
 /// A [`ROOT_WITH_A_MEMBER`] spawn, once its member exists.
 pub(crate) fn root_with_a_member() -> (crate::Child, Member) {
@@ -98,7 +98,9 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
 /// group has no member, so `kill_tree` sends nothing by it, answers `Unassessable` with how to end
 /// the descendants, and the group's member lives on.
 #[skuld::test]
-fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() {
+fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     let (child, member) = root_with_a_member();
     kill_own_child(child.pid());
     child.wait().expect("this handle reaps the root");

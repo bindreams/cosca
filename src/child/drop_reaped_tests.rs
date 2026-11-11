@@ -18,7 +18,8 @@ use crate::command::Command;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::cgroup;
+use crate::test_groups::{signal_by_number, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 /// [`root_that_leaves_a_cat`]'s shell, with the `cat` in a shell that prints `eof` if the `cat`
@@ -244,7 +245,9 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 /// `fd_marker_drop_after_wait_sweeps_the_marker_holders_but_sends_no_killpg`.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
+fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     let (child, mut pipes) = spawn_cat_tree();
@@ -268,7 +271,9 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
 /// `fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders` pins.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran() {
+fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = crate::test_child::command(Console::Hidden);
@@ -576,7 +581,7 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 /// on macOS, where `TreeWalk` mode is an fd marker (the test above).
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
+fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns(#[fixture(signal_by_number)] _by_number: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -649,7 +654,7 @@ fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
 /// Mutant: the held members are retried only when the new kill ran.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
+fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left(#[fixture(signal_by_number)] _by_number: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
     let first = child.kill_tree().expect_err("the walk left a member");
@@ -674,7 +679,7 @@ fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
 /// Mutant: the drop's reaped path does not retry the held members.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
+fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it(#[fixture(signal_by_number)] _by_number: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -696,7 +701,9 @@ fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
 /// what it forked is unknown, and speaks of no members. Mutant: the tree is marked killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree() {
+fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -721,7 +728,9 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unv
 /// Mutants: a walk that found no root counts as a kill that ran; it answers `Ok`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_mark_the_tree_killed() {
+fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_mark_the_tree_killed(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker();
     drop(stdin);
@@ -985,7 +994,9 @@ fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
 /// nothing.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
+fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     crate::log_capture::install();
     let walks = record_walks();
     let (_pid, child) = reaped_blocker_root(ContainMode::TreeWalk);

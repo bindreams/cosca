@@ -11,7 +11,7 @@ use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, G
 use crate::test_child::member::{await_started, Member, RELEASE_FD};
 use crate::test_child::reaped_elsewhere::reap_behind;
 use crate::test_child::Console;
-use crate::test_groups::{cgroup, pidfd_group_signal, Group};
+use crate::test_groups::{cgroup, pidfd_group_signal, signal_by_number, Group};
 
 /// A session root `sh` that leaves a member in its group, says `started` and exits, as
 /// `sh -c 'sleep 300 & exit'` does. Its member is [`ROOT_WITH_A_MEMBER`]'s.
@@ -188,7 +188,9 @@ fn a_spawn_whose_root_was_reaped_before_its_identity_read_kills_the_group_left_b
 }
 
 #[skuld::test]
-fn a_spawn_whose_root_was_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group() {
+fn a_spawn_whose_root_was_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group(
+    #[fixture(signal_by_number)] _by_number: &Group,
+) {
     below_6_9_sends_nothing_to_the_group(Container::Session);
 }
 
@@ -203,6 +205,7 @@ fn cgroup_a_spawn_whose_leaf_did_not_take_its_root_reaped_before_its_identity_re
 #[skuld::test]
 fn cgroup_a_spawn_whose_leaf_did_not_take_its_root_reaped_before_its_identity_read_below_6_9_sends_nothing_to_the_group(
     #[fixture(cgroup)] _cgroup: &Group,
+    #[fixture(signal_by_number)] _by_number: &Group,
 ) {
     below_6_9_sends_nothing_to_the_group(Container::LeafNotTaken);
 }
