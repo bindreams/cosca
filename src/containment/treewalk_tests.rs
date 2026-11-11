@@ -165,19 +165,32 @@ fn complete_members_names_every_unassessed_candidate_with_its_cause() {
     let said = error.to_string();
     assert!(said.contains(&format!("cause of {first}")), "{said}");
     for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        assert!(
-            said.contains(&format!("pid {other} (")) && said.contains(&format!("cause of {other})")),
-            "{said}"
-        );
+        let entry = note_entry(&said, other);
+        assert!(entry.ends_with(&format!("cause of {other})")), "{said}");
     }
+}
+
+/// The note's entry for `pid`: from its `pid {pid} (` to the next entry, or the end.
+fn note_entry(said: &str, pid: RawPid) -> &str {
+    let start = said
+        .find(&format!("pid {pid} ("))
+        .unwrap_or_else(|| panic!("no entry for pid {pid} in: {said}"));
+    said[start..].split("; pid ").next().expect("split yields one piece")
 }
 
 /// The note on `complete_members` carries each other candidate's whole chain, its OS error included.
 /// Mutant: the note keeps only the candidate's `detail`.
 #[skuld::test]
 fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
-    let parents = [(200, ROOT_PID), (300, ROOT_PID)];
-    let os_error = |pid: RawPid| std::io::Error::from_raw_os_error(if pid == 200 { 2 } else { 3 });
+    let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
+    // A code per pid, so an entry paired with another candidate's error fails.
+    let os_error = |pid: RawPid| {
+        std::io::Error::from_raw_os_error(match pid {
+            200 => 2,
+            300 => 3,
+            _ => 5,
+        })
+    };
     let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
         Err(Error::Unassessable {
             detail: format!("cause of {pid}"),
@@ -185,14 +198,12 @@ fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
         })
     });
     let first = got.unassessed[0].0;
-    let other = if first == 200 { 300 } else { 200 };
-    let error = got.complete_members().expect_err("two candidates were not assessed");
+    let error = got.complete_members().expect_err("three candidates were not assessed");
     let said = error.to_string();
-    let os_text = os_error(other).to_string();
-    assert!(
-        said.contains(&format!("pid {other} (")) && said.contains(&os_text),
-        "{said}"
-    );
+    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
+        let os_text = os_error(other).to_string();
+        assert!(note_entry(&said, other).contains(&os_text), "{said}");
+    }
 }
 
 /// A snapshot that lists the unreadable pid twice reads it once and counts it once.

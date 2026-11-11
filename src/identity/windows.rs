@@ -413,11 +413,7 @@ fn combine(
         (Ok(now), _) if expected.is_some_and(|expected| expected != now) => (Resolved::Gone, UnknownCause::default()),
         (Ok(key), Ok(sequence)) => (Resolved::Found((key, OrderKey(sequence))), UnknownCause::default()),
         (Ok(_), Err(status)) => {
-            log::debug!(
-                "NtQueryInformationProcess(ProcessSequenceNumber) failed on an opened handle for pid {pid}: \
-                 NTSTATUS {:#010x}",
-                status.0 as u32
-            );
+            log_sequence_failure(pid, status);
             (Resolved::Unknown, UnknownCause::of_sequence_status(status))
         }
         (Err(e), sequence) => {
@@ -428,17 +424,21 @@ fn combine(
             let cause = match sequence {
                 Ok(_) => UnknownCause::default(),
                 Err(status) => {
-                    log::debug!(
-                        "NtQueryInformationProcess(ProcessSequenceNumber) failed on an opened handle for pid {pid}: \
-                         NTSTATUS {:#010x}",
-                        status.0 as u32
-                    );
+                    log_sequence_failure(pid, status);
                     UnknownCause::of_sequence_status(status)
                 }
             };
             (Resolved::Unknown, cause)
         }
     }
+}
+
+fn log_sequence_failure(pid: RawPid, status: NTSTATUS) {
+    log::debug!(
+        "NtQueryInformationProcess(ProcessSequenceNumber) failed on an opened handle for pid {pid}: \
+         NTSTATUS {:#010x}",
+        status.0 as u32
+    );
 }
 
 /// The order key of the process that holds `pid` as `key`: [`Resolved::Gone`] when another

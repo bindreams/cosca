@@ -754,6 +754,8 @@ fn fail_win32_keeps_the_win32_code_and_kind() {
     walk.fail_win32("ResumeThread", 1, 9, cause);
     let err = walk_verdict(9, walk).expect_err("a failure");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+    // The top layer is the context; the code is in its source.
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
     assert!(
         err.to_string()
@@ -854,6 +856,8 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
 #[skuld::test]
 fn process_pid_of_failure_carries_the_win32_code() {
     let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default()).expect_err("a null handle");
+    // The top layer is the context; the code is in its source.
+    assert_eq!(err.raw_os_error(), None, "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(ERROR_INVALID_HANDLE), "{err:?}");
     assert_eq!(
         err.kind(),
