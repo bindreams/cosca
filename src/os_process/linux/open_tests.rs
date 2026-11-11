@@ -184,7 +184,7 @@ fn assert_unassessable_with_cause(
         .into_iter()
         .map(|(level, _)| level)
         .collect();
-    assert_eq!(levels, vec![], "the open must log nothing: {text}");
+    assert_eq!(levels, Vec::<log::Level>::new(), "the open must log nothing: {text}");
     err
 }
 
@@ -279,7 +279,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     }
     assert_eq!(
         crate::log_capture::levels_since(mark, &marker),
-        vec![],
+        Vec::<log::Level>::new(),
         "the open logs nothing: its caller does"
     );
 }
