@@ -1,7 +1,6 @@
 use cosca::error::QuoteErrorKind;
 use cosca::quote::posix;
 use cosca::quote::windows;
-use cosca::Containment;
 
 #[skuld::test]
 fn public_surface_is_usable() {
@@ -30,8 +29,8 @@ fn public_surface_is_usable() {
     let _ = cmd; // input model exercised in unit tests
 }
 
-/// Containment public-surface smoke: `.contain()` on a supported host must
-/// report a mechanism other than `None`. The test spawns a child that blocks on a piped stdin
+/// Containment public-surface smoke: a contained child must report the mechanism
+/// `contain_without_cgroup` asks for. The test spawns a child that blocks on a piped stdin
 /// it holds, asserts the achieved containment, kills the tree and waits — all via the public API.
 /// The child leaves with status 0 once stdin is released, so a `kill_tree` that sends nothing
 /// fails the final assertion instead of hanging the wait. The full tree-death proof lives in
@@ -55,14 +54,6 @@ fn containment_smoke() {
     common::contain_without_cgroup(&mut cmd);
     let mut child = cmd.spawn().expect("spawn contained child");
     let stdin = child.stdin().expect("piped stdin");
-
-    // On every supported host (Unix + Windows) the strongest mechanism must
-    // not be None.
-    assert_ne!(
-        child.containment(),
-        Containment::None,
-        "contain() must use a real mechanism on this platform, got None"
-    );
 
     assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 

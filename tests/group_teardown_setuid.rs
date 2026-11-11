@@ -4,6 +4,9 @@
 //! torn down through the crate's real public path, `Child::kill_tree` (which calls
 //! `containment::unix::kill_group`, `SIGKILL`).
 //!
+//! The group is a `Containment::Session` (asked for through `contain_without_cgroup`, asserted
+//! below): the same `killpg` path as a `ProcessGroup`, which an integration test cannot ask for.
+//!
 //! Every OTHER real-process test in this suite (`tests/spawn_io.rs`'s `unix_kill_tree_reaps_the_
 //! grandchild` and friends) spawns a group where every member is equally killable by the test's
 //! own uid, so a regression that made `converge` silently drop a real refuser would still pass

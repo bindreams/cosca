@@ -54,6 +54,8 @@ mod factory;
 pub use factory::*;
 mod locked;
 pub use locked::*;
+mod contain_gives;
+pub use contain_gives::contain_without_cgroup_gives;
 
 #[cfg(unix)]
 mod uid_switch;
@@ -528,18 +530,6 @@ pub fn contain_without_cgroup(cmd: &mut cosca::Command) -> &mut cosca::Command {
     return cmd.contain_with(cosca::ContainMode::Session);
     #[cfg(not(target_os = "linux"))]
     cmd.contain()
-}
-
-/// The mechanism [`contain_without_cgroup`] gets on this platform: a session on Linux, the
-/// inherited-fd marker on macOS, a Job Object on Windows. A test that asks for it asserts exactly
-/// this, never a set.
-pub const fn contain_without_cgroup_gives() -> cosca::Containment {
-    #[cfg(target_os = "linux")]
-    return cosca::Containment::Session;
-    #[cfg(target_os = "macos")]
-    return cosca::Containment::FdMarker;
-    #[cfg(windows)]
-    return cosca::Containment::JobObject;
 }
 
 /// [`contain_without_cgroup`] for the async `Command`.

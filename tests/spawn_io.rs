@@ -716,17 +716,17 @@ fn unix_fd3_file_round_trips() {
     assert_eq!(buf, b"from file via fd3");
 }
 
-/// Spawn a contained child that writes a token to fd 3, and return the containment it achieved
-/// and what fd 3 carried. Read to EOF; no timers.
+/// Spawn a child that writes a token to fd 3, contained as `contain` asks, and return the
+/// containment it achieved and what fd 3 carried. Read to EOF; no timers.
 #[cfg(target_os = "linux")]
-fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
+fn contain_with_fd3(contain: impl FnOnce(&mut cosca::Command)) -> (cosca::Containment, Vec<u8>) {
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
         .args(["cosca_testbin", "fd3-write", "FD3PAYLOAD"])
         // pipe_out: child writes, parent holds the read end.
         .fd(3, Stdio::pipe_out())
         .expect("fd 3 pipe_out");
-    cmd.contain();
+    contain(&mut cmd);
     let mut child = cmd.spawn().expect("spawn contained child with fd 3");
     let containment = child.containment();
     let mut fd3_reader = child.fd_read_end(Fd::from(3)).expect("fd 3 reader");
@@ -737,29 +737,29 @@ fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
     (containment, buf)
 }
 
-/// `.contain()` + `.fd(3, pipe_out())` on Linux: whatever mechanism is achieved, the child's fd 3
-/// carries exactly its own token, and containment is established. The child's one `pre_exec` hook
-/// writes "0" to a pre-opened `cgroup.procs` fd, then dup2's the user's fd onto child fd 3; if they
-/// collided, the "0" would land in the stream or the pipe would break.
+/// A contained session (no cgroup) + `.fd(3, pipe_out())` on Linux: the child's fd 3 carries exactly
+/// its own token, and the session is established.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_contain_with_fd3_delivers_the_exact_payload() {
     stderr_log::install();
-    let (containment, buf) = contain_with_fd3();
-    assert_ne!(
+    let (containment, buf) = contain_with_fd3(|cmd| _ = common::contain_without_cgroup(cmd));
+    assert_eq!(
         containment,
-        cosca::Containment::None,
-        "contain() + fd(3) must still establish containment"
+        common::contain_without_cgroup_gives(),
+        "contain + fd(3) must still establish containment"
     );
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
-/// Under a delegated cgroup, `.fd(3, ..)` must still leave the spawn in a cgroup (`CgroupV2`).
+/// Under a delegated cgroup, `.fd(3, ..)` must still leave the spawn in a cgroup (`CgroupV2`). The
+/// child's one `pre_exec` hook writes "0" to a pre-opened `cgroup.procs` fd, then dup2's the user's
+/// fd onto child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    let (containment, buf) = contain_with_fd3();
+    let (containment, buf) = contain_with_fd3(|cmd| _ = cmd.contain());
     assert_eq!(
         containment,
         cosca::Containment::CgroupV2,
@@ -891,9 +891,7 @@ fn uncontained_child_reports_containment_none() {
         reason = "every caller is `#[cfg(unix)]` or `#[cfg(windows)]`, so a target that is neither leaves this unused"
     )
 )]
-fn spawn_contained_tree(
-    contain: fn(&mut cosca::Command) -> &mut cosca::Command,
-) -> (cosca::Child, std::net::TcpStream) {
+fn spawn_contained_tree(contain: impl FnOnce(&mut cosca::Command)) -> (cosca::Child, std::net::TcpStream) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
@@ -903,8 +901,6 @@ fn spawn_contained_tree(
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     contain(&mut cmd);
-    // Every contained-tree test below goes through here, and each of them asserts an achieved
-    // mechanism that can silently be a weaker one. Route the reason for that.
     #[cfg(unix)]
     stderr_log::install();
     let (report, report_addr) = common::bind_report();
@@ -949,7 +945,7 @@ struct EchoTree {
     grand_pid: u32,
 }
 
-fn spawn_contained_echo_tree(contain: fn(&mut cosca::Command) -> &mut cosca::Command, kill_on_drop: bool) -> EchoTree {
+fn spawn_contained_echo_tree(contain: impl FnOnce(&mut cosca::Command), kill_on_drop: bool) -> EchoTree {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
@@ -960,8 +956,6 @@ fn spawn_contained_echo_tree(contain: fn(&mut cosca::Command) -> &mut cosca::Com
     common::silence(&mut cmd);
     contain(&mut cmd);
     cmd.kill_on_drop(kill_on_drop);
-    // As in `spawn_contained_tree`: every caller asserts an achieved mechanism that can
-    // silently be a weaker one, so route the reason for that.
     #[cfg(unix)]
     stderr_log::install();
     let (report, report_addr) = common::bind_report();
@@ -1018,7 +1012,7 @@ fn assert_echo_grandchild_dead(grand: &mut std::net::TcpStream, why: &str) {
 #[cfg(unix)]
 #[skuld::test]
 fn unix_kill_tree_reaps_the_grandchild() {
-    let (child, mut gc_stream) = spawn_contained_tree(common::contain_without_cgroup);
+    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
     assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.kill_tree().expect("kill_tree");
@@ -1039,7 +1033,7 @@ fn unix_kill_tree_reaps_the_grandchild() {
 fn unix_terminate_tree_reaps_the_grandchild() {
     let EchoTree {
         child, root, mut grand, ..
-    } = spawn_contained_echo_tree(common::contain_without_cgroup, true);
+    } = spawn_contained_echo_tree(|cmd| _ = common::contain_without_cgroup(cmd), true);
     assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.terminate_tree().expect("terminate_tree");
@@ -1064,8 +1058,8 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_kill_tree_reaps_the_grandchild() {
-    let (child, gc_stream) = spawn_contained_tree(common::contain_without_cgroup);
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    let (child, gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
     let grand = common::Member::new(
         gc_stream,
         common::last_reported_grandchild().expect("the grandchild's pid"),
@@ -1084,8 +1078,8 @@ fn windows_kill_tree_reaps_the_grandchild() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_child_is_inside_our_job_after_spawn() {
-    let (child, _gc_stream) = spawn_contained_tree(common::contain_without_cgroup);
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    let (child, _gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     // test_job_handle_contains_self() is cfg(all(windows,test)) — confirms the job we hold.
     let in_job = child.test_job_handle_contains_self();
@@ -1103,8 +1097,8 @@ fn windows_detach_leaves_the_tree_running() {
         mut root,
         mut grand,
         ..
-    } = spawn_contained_echo_tree(common::contain_without_cgroup, true);
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    } = spawn_contained_echo_tree(|cmd| _ = common::contain_without_cgroup(cmd), true);
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.detach().expect("detach");
 
@@ -1126,8 +1120,8 @@ fn windows_kill_on_drop_false_leaves_the_tree_running() {
         mut root,
         mut grand,
         ..
-    } = spawn_contained_echo_tree(common::contain_without_cgroup, false);
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
+    } = spawn_contained_echo_tree(|cmd| _ = common::contain_without_cgroup(cmd), false);
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     drop(child);
 
@@ -1402,7 +1396,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Gr
     // A usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
     // and the assert below will fail loudly — that's intentional.
-    let (child, mut gc_stream) = spawn_contained_tree(cosca::Command::contain);
+    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = cmd.contain());
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -1428,7 +1422,7 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group
     stderr_log::install();
     let EchoTree {
         child, root, mut grand, ..
-    } = spawn_contained_echo_tree(cosca::Command::contain, true);
+    } = spawn_contained_echo_tree(|cmd| _ = cmd.contain(), true);
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -1458,7 +1452,7 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group
 fn linux_cgroup_v2_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     assert_opted_out_tree_survives(
-        || spawn_contained_echo_tree(cosca::Command::contain, true),
+        || spawn_contained_echo_tree(|cmd| _ = cmd.contain(), true),
         |child| child.detach().expect("detach"),
     );
 }
@@ -1470,7 +1464,7 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Gr
 #[skuld::test]
 fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(cosca::Command::contain, false), drop);
+    assert_opted_out_tree_survives(|| spawn_contained_echo_tree(|cmd| _ = cmd.contain(), false), drop);
 }
 
 /// An opted-out handle still removes the leaf of a tree that has fully exited, as
@@ -1484,7 +1478,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
         mut root,
         mut grand,
         grand_pid,
-    } = spawn_contained_echo_tree(cosca::Command::contain, false);
+    } = spawn_contained_echo_tree(|cmd| _ = cmd.contain(), false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
     let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
@@ -1531,7 +1525,7 @@ fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drai
         mut root,
         mut grand,
         grand_pid,
-    } = spawn_contained_echo_tree(cosca::Command::contain, false);
+    } = spawn_contained_echo_tree(|cmd| _ = cmd.contain(), false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
     let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
@@ -2060,7 +2054,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
 #[skuld::test]
 fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    let (child, mut gc_stream) = spawn_contained_tree(cosca::Command::contain);
+    let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = cmd.contain());
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
 
     // The root is alive (it holds its control socket), so its cgroup is readable.

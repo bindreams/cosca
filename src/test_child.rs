@@ -265,15 +265,12 @@ pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Co
     cmd.contain()
 }
 
-/// The mechanism [`contain_without_cgroup`] gets on this platform: a session on Linux, the
-/// inherited-fd marker on macOS. A test that asks for it asserts exactly this, never a set.
+// What [`contain_without_cgroup`] gets: the integration tests' table, compiled from its real source.
 #[cfg(unix)]
-pub(crate) const fn contain_without_cgroup_gives() -> crate::Containment {
-    #[cfg(target_os = "linux")]
-    return crate::Containment::Session;
-    #[cfg(target_os = "macos")]
-    return crate::Containment::FdMarker;
-}
+#[path = "../tests/common/contain_gives.rs"]
+mod contain_gives;
+#[cfg(unix)]
+pub(crate) use contain_gives::contain_without_cgroup_gives;
 
 /// [`contain_without_cgroup`] for the async `Command`.
 #[cfg(all(unix, feature = "tokio"))]
