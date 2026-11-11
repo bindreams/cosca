@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime};
 use windows::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, RtlNtStatusToDosError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, NTSTATUS, STILL_ACTIVE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, NTSTATUS, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
@@ -206,7 +206,7 @@ pub(crate) fn exit_look(handle: HANDLE, has_synchronize: bool) -> windows::core:
 
 /// The access `handle` was granted, from `NtQueryObject(ObjectBasicInformation)`. For a handle whose
 /// opener did not choose its access (`ShellExecuteEx`'s): read it once, where the handle is taken.
-pub(crate) fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
+pub(crate) fn granted_access(handle: HANDLE) -> std::io::Result<u32> {
     let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
     // SAFETY: `handle` is live; `info` is the buffer the class describes, and its size is passed.
     let status = unsafe {
@@ -221,11 +221,7 @@ pub(crate) fn granted_access(handle: HANDLE) -> windows::core::Result<u32> {
     if status.is_ok() {
         return Ok(info.GrantedAccess);
     }
-    // SAFETY: a pure status-to-code mapping.
-    let code = unsafe { RtlNtStatusToDosError(status) };
-    Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
-        code,
-    )))
+    Err(crate::error::nt_io_error(status))
 }
 
 /// The exit code `terminate_held` ends a process with.

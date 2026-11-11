@@ -285,13 +285,18 @@ fn breakaway_with_containment_is_refused() {
 #[skuld::test]
 fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
     let out = super::classify_spawn_denial(io_err(ACCESS_DENIED), breakaway(), JobBreakaway::Forbidden);
-    let Error::Containment { detail, .. } = out else {
+    let Error::Containment { detail, .. } = &out else {
         panic!("expected Containment, got {out:?}");
     };
     assert!(detail.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"), "{detail}");
     assert!(detail.contains("breakaway_from_job()"), "{detail}");
     assert!(detail.contains("FIRST"), "{detail}");
-    crate::error::assert_detail_is_not_hard_wrapped(&detail);
+    crate::error::assert_detail_is_not_hard_wrapped(detail);
+    assert_eq!(
+        out.raw_os_error(),
+        Some(ACCESS_DENIED),
+        "the refused spawn's error is the source"
+    );
 }
 
 /// Measured (Windows 11 26100, 2026-08-18): a silent-breakaway job ACCEPTS the flag, so no

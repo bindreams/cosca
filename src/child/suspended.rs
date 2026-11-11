@@ -115,8 +115,8 @@ impl SuspendedChild {
                 let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::Leave);
                 Err(crate::child::spawn::after_the_spawn(
                     Error::Containment {
-                        detail: format!("could not resume the frozen child: {e}"),
-                        source: None,
+                        detail: "could not resume the frozen child".into(),
+                        source: Some(Error::io_cause(e)),
                     },
                     fate,
                     unreaped,

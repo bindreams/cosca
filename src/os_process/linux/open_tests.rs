@@ -204,9 +204,11 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .diverged_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
     let err = assert_unassessable_with_cause(result, &["outer pid namespace"], true, &marker, mark);
-    // The `pidfd_open` errno is the source, not part of the message.
+    // The `pidfd_open` errno is the source, not part of the message, and the Report names the call.
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err:?}");
     assert!(!err.to_string().contains("pidfd_open"), "{err}");
+    let report = crate::error::Report(&err).to_string();
+    assert!(report.contains("pidfd_open"), "{report}");
 }
 
 /// Twin for a view that could not be established: the reason is in the message.
@@ -259,10 +261,15 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
         .on_read_after(&stat, 1, Err(libc::EACCES));
     let result = open_verified_error_with(&kernel, id);
     match result {
-        Err(Error::Unassessable {
-            source: Some(source), ..
-        }) => {
+        Err(
+            ref e @ Error::Unassessable {
+                source: Some(ref source),
+                ..
+            },
+        ) => {
             assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
+            let report = crate::error::Report(e).to_string();
+            assert!(report.contains("pidfd_open"), "{report}");
         }
         other => panic!("Liveness::Unknown on the EINVAL/ENOENT arm must be Unassessable, got {other:?}"),
     }
@@ -286,13 +293,15 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
         .on_pidfd_open(own.pid(), Err(Errno::INVAL))
         .on_read(&format!("{}/stat", own.pid()), Err(libc::EACCES));
     let result = open_verified_error_with(&kernel, own);
-    assert_unassessable_with_cause(
+    let err = assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["existence query"],
         true,
         UNASSESSABLE,
         mark,
     );
+    let report = crate::error::Report(&err).to_string();
+    assert!(report.contains("pidfd_open"), "{report}");
 }
 
 /// A panic between building the fixture and releasing it must still tear down `L` and `M`.

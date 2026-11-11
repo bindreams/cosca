@@ -434,6 +434,16 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> std::io::Error {
     }
 }
 
+/// `status` as the `io::Error` std would report for the Win32 code it maps to
+/// (`RtlNtStatusToDosError`), which `raw_os_error()` and `kind()` classify. The mapping is lossy:
+/// the exact `NTSTATUS` is in the caller's debug log.
+#[cfg(windows)]
+pub(crate) fn nt_io_error(status: windows::Win32::Foundation::NTSTATUS) -> std::io::Error {
+    // SAFETY: a pure status-to-code mapping.
+    let code = unsafe { windows::Win32::Foundation::RtlNtStatusToDosError(status) };
+    std::io::Error::from_raw_os_error(code as i32)
+}
+
 /// `error`, then each of its [`source`](std::error::Error::source)s, outermost first.
 pub(crate) fn chain<'a>(
     error: &'a (dyn std::error::Error + 'static),

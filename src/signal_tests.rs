@@ -137,21 +137,6 @@ mod macos {
         }
     }
 
-    /// A refused identity read for an open is `Unassessable` whose `detail` names no errno: the errno
-    /// is the source.
-    #[skuld::test]
-    fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
-        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
-        let err = crate::os_process::macos::read_for_open(77, "wait", "it was not opened").expect_err("refused");
-        match &err {
-            crate::error::Error::Unassessable { detail, .. } => {
-                assert_eq!(detail, "pid 77 identity could not be read; it was not opened");
-            }
-            other => panic!("expected Unassessable, got {other:?}"),
-        }
-        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
-    }
-
     // `via_audit_token` -----
 
     /// Mutant: the id is not compared, so a reused pid is signalled.

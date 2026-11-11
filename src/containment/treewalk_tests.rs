@@ -383,8 +383,8 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
 }
 
 /// The text of `resolve_or_drop`'s warn for a candidate whose creator-pid query was refused: the
-/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the `NTSTATUS`
-/// and does not fall back to "access denied?".
+/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the query, the
+/// status is the error's source, and it does not fall back to "access denied?".
 ///
 /// The failed query itself is not driven through the walk: forcing one needs a hook in production
 /// code, and Windows has no `FakeKernel` methods to state it in.
@@ -395,13 +395,13 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
 fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_windows() {
     let refused = windows::Win32::Foundation::NTSTATUS(0xC000_0004_u32 as i32);
     let cause = crate::identity::UnknownCause::default().with_creator_status(refused);
-    let crate::error::Error::Unassessable { detail, .. } = crate::identity::unqueryable_read("pid", 7, cause) else {
+    let error = crate::identity::unqueryable_read("pid", 7, cause);
+    let crate::error::Error::Unassessable { detail, .. } = &error else {
         panic!("a refused creator query is Unassessable");
     };
-    assert_eq!(
-        detail,
-        "pid 7 exists but its creator process id query failed: NTSTATUS 0xc0000004"
-    );
+    assert_eq!(detail, "pid 7 exists but its creator process id query failed");
+    // `STATUS_INFO_LENGTH_MISMATCH` as its Win32 code, `ERROR_BAD_LENGTH`.
+    assert_eq!(error.raw_os_error(), Some(24));
 }
 
 /// The Windows wiring of the walk to the creator read, through `walk_from` with real

@@ -318,9 +318,6 @@ fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
     let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
     let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-    assert_eq!(
-        crate::elevation::shim::fixtures::os_code(&err),
-        Some(libc::EPERM),
-        "{err}"
-    );
+    let err = crate::error::Error::Io(err);
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
 }
