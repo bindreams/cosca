@@ -54,6 +54,10 @@ mod factory;
 pub use factory::*;
 mod locked;
 pub use locked::*;
+mod contain_gives;
+#[cfg(unix)]
+pub use contain_gives::session_gives;
+pub use contain_gives::{contain_without_cgroup_gives, tree_walk_gives};
 
 #[cfg(unix)]
 mod uid_switch;
@@ -522,7 +526,7 @@ pub fn silence_async(cmd: &mut cosca::tokio::Command) {
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](cosca::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
 /// cgroup leaf first and logs a warning where none is delegated, so the same test would warn on one
-/// host and not on another. A test that is about cgroups takes the `cgroup` group instead.
+/// host and not on another. See principle 9 of `docs/principles.md`.
 pub fn contain_without_cgroup(cmd: &mut cosca::Command) -> &mut cosca::Command {
     #[cfg(target_os = "linux")]
     return cmd.contain_with(cosca::ContainMode::Session);
@@ -1117,21 +1121,22 @@ pub async fn spawn_blocker_async() -> (cosca::tokio::Child, TcpStream) {
 /// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
 /// sockets identified by tag (accept order is not guaranteed).
 #[cfg(feature = "tokio")]
-pub async fn spawn_grandchild_async(contain: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+pub async fn spawn_grandchild_async(
+    contain: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_grandchild_async_with(contain, true).await
 }
 
-/// `spawn_grandchild_async` with explicit `contain` and `kill_on_drop` flags, so a test can
-/// exercise the `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`.
+/// `spawn_grandchild_async` with an explicit `kill_on_drop`, so a test can exercise the
+/// `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`. `contain`
+/// sets the containment; an uncontained tree passes `|_| {}`.
 #[cfg(feature = "tokio")]
 pub async fn spawn_grandchild_async_with(
-    contain: bool,
+    contain: impl FnOnce(&mut cosca::tokio::Command),
     kill_on_drop: bool,
 ) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_tree_async("spawn-grandchild", |cmd| {
-        if contain {
-            cmd.contain();
-        }
+        contain(cmd);
         cmd.kill_on_drop(kill_on_drop);
     })
     .await

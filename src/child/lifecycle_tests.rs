@@ -1,10 +1,13 @@
-//! Unit tests for the public `Child::wait_tree`/`wait_tree_timeout`. Every test branches on
-//! `Containment::can_observe_drain()` and asserts a real, non-trivial outcome on BOTH sides
-//! rather than skipping either — this crate's "never silently skip" testing convention.
+//! Unit tests for the public `Child::wait_tree`/`wait_tree_timeout`. Drained-verdict tests run on
+//! `drainable_gives` and assert exactly it; `Unsupported` is checked on a mechanism with no kernel
+//! drain edge (see each test).
 
 use std::time::Duration;
 
-use crate::test_child::Console;
+use crate::test_child::{drainable_gives, Console};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
+use crate::Containment;
 
 /// The `TreeDrain` variant a fully-drained tree reports on `containment`'s mechanism:
 /// `AllMembersExited` everywhere authoritative (cgroup v2, Windows job object), but
@@ -16,19 +19,6 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
         crate::containment::Containment::FdMarker => crate::containment::TreeDrain::AllMarkersClosed,
         _ => crate::containment::TreeDrain::AllMembersExited,
     }
-}
-
-/// A quick, self-terminating contained child: the drain edge (when the mechanism has one)
-/// fires almost immediately, so an UNBOUNDED `wait_tree()` call below is safe — it is a real
-/// blocking wait on a genuinely-terminating event, not an indefinite one.
-fn quick_contained_child() -> crate::Child {
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    #[cfg(unix)]
-    cmd.args(["true"]);
-    #[cfg(windows)]
-    cmd.args(["cmd", "/C", "exit 0"]);
-    cmd.contain();
-    cmd.spawn().expect("spawn")
 }
 
 /// A contained blocker and its stdin writer, which the caller must keep for exactly as long as the
@@ -54,68 +44,83 @@ fn kill_then_release(child: crate::Child, stdin: crate::PipeWriter) {
     crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
 }
 
-/// Drained case: on a drain-observable mechanism, an unbounded `wait_tree()` against a tree
-/// that fully exits on its own reports the mechanism-correct drained verdict
-/// (`expected_drained_verdict`). On a mechanism with no kernel drain edge, the SAME call must
-/// fail `Unsupported` instead — both are real, exercised assertions.
-#[skuld::test]
-fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
-    let child = quick_contained_child();
-    let containment = child.containment();
-    let drainable = containment.can_observe_drain();
+/// An unbounded `wait_tree()` against a tree that fully exits on its own reports the
+/// mechanism-correct drained verdict (`expected_drained_verdict`) of the `expected` mechanism the
+/// caller's `.contain()` must get.
+fn wait_tree_drained_verdict(expected: Containment) {
+    let child = quick_child(|cmd| _ = cmd.contain());
+    assert_eq!(child.containment(), expected);
     let result = child.wait_tree();
-    if drainable {
-        assert_eq!(
-            result.expect("a fully-exited tree must report a drained verdict"),
-            expected_drained_verdict(containment)
-        );
-    } else {
-        let err = result.expect_err("a non-drainable mechanism must refuse wait_tree");
-        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
-    }
-    // wait_tree never reaps — the root's exit still needs collecting either way.
+    assert_eq!(
+        result.expect("a fully-exited tree must report a drained verdict"),
+        expected_drained_verdict(expected)
+    );
+    // wait_tree never reaps — the root's exit still needs collecting.
     _ = child.wait();
 }
 
-/// Deadline-not-met case: on a drain-observable mechanism, `wait_tree_timeout` against a tree
-/// that is still alive at expiry reports `MembersRemain` — NOT an error, per its own doc. On a
-/// non-drainable mechanism the same call must still fail `Unsupported`.
+#[cfg(not(target_os = "linux"))]
+#[skuld::test]
+fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
+    wait_tree_drained_verdict(drainable_gives());
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn wait_tree_reports_the_drained_verdict_when_the_tree_drains(#[fixture(cgroup)] _group: &Group) {
+    wait_tree_drained_verdict(drainable_gives());
+}
+
+/// `wait_tree_timeout` against a tree that is still alive at expiry reports `MembersRemain` — NOT
+/// an error, per its own doc.
+fn wait_tree_timeout_members_remain(expected: Containment) {
+    let (child, stdin) = long_lived_contained_child();
+    assert_eq!(child.containment(), expected);
+    let result = child.wait_tree_timeout(Duration::from_millis(200));
+    assert_eq!(
+        result.expect("an unmet deadline on a live tree must not be an error"),
+        crate::containment::TreeDrain::MembersRemain
+    );
+    kill_then_release(child, stdin);
+}
+
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let (child, stdin) = long_lived_contained_child();
-    let drainable = child.containment().can_observe_drain();
-    let result = child.wait_tree_timeout(Duration::from_millis(200));
-    if drainable {
-        assert_eq!(
-            result.expect("an unmet deadline on a live tree must not be an error"),
-            crate::containment::TreeDrain::MembersRemain
-        );
-    } else {
-        let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
-        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
-    }
-    kill_then_release(child, stdin);
+    wait_tree_timeout_members_remain(drainable_gives());
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn wait_tree_timeout_reports_members_remain_before_the_deadline(#[fixture(cgroup)] _group: &Group) {
+    wait_tree_timeout_members_remain(drainable_gives());
 }
 
 /// `Duration::ZERO` against a still-alive tree: a one-shot, non-blocking probe (see
 /// `crate::wait::deadline_from`/`remaining`'s own docs) — `MembersRemain`, not an error, and
 /// returned without ever entering the backend's blocking wait (every `wait_drained`
 /// implementation checks `remaining == Duration::ZERO` before its first blocking syscall).
+fn wait_tree_timeout_zero_members_remain(expected: Containment) {
+    let (child, stdin) = long_lived_contained_child();
+    assert_eq!(child.containment(), expected);
+    let result = child.wait_tree_timeout(Duration::ZERO);
+    assert_eq!(
+        result.expect("a ZERO probe against a live tree must not be an error"),
+        crate::containment::TreeDrain::MembersRemain
+    );
+    kill_then_release(child, stdin);
+}
+
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let (child, stdin) = long_lived_contained_child();
-    let drainable = child.containment().can_observe_drain();
-    let result = child.wait_tree_timeout(Duration::ZERO);
-    if drainable {
-        assert_eq!(
-            result.expect("a ZERO probe against a live tree must not be an error"),
-            crate::containment::TreeDrain::MembersRemain
-        );
-    } else {
-        let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
-        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
-    }
-    kill_then_release(child, stdin);
+    wait_tree_timeout_zero_members_remain(drainable_gives());
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree(#[fixture(cgroup)] _group: &Group) {
+    wait_tree_timeout_zero_members_remain(drainable_gives());
 }
 
 /// `Duration::ZERO` against an ALREADY-drained tree: the one-shot probe must still observe and
@@ -124,72 +129,113 @@ fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
 /// on why a past deadline still performs exactly one check). The unbounded `wait_tree()` call
 /// first is the genuine happens-before edge that the tree has fully drained before the ZERO
 /// probe below ever runs.
-#[skuld::test]
-fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained() {
-    let child = quick_contained_child();
-    let containment = child.containment();
-    let drainable = containment.can_observe_drain();
-    let first = child.wait_tree();
-    if drainable {
-        first.expect("a fully-exited tree must report a drained verdict");
-        assert_eq!(
-            child
-                .wait_tree_timeout(Duration::ZERO)
-                .expect("a ZERO probe against an already-drained tree must not be an error"),
-            expected_drained_verdict(containment),
-            "a ZERO probe must observe the SAME drained state an unbounded wait already found, \
-             not report MembersRemain just because the deadline is already past"
-        );
-    } else {
-        first.expect_err("a non-drainable mechanism must refuse wait_tree");
-        let err = child.wait_tree_timeout(Duration::ZERO);
-        assert!(
-            matches!(err, Err(crate::error::Error::Unsupported { .. })),
-            "got {err:?}"
-        );
-    }
+fn wait_tree_timeout_zero_drained_verdict(expected: Containment) {
+    let child = quick_child(|cmd| _ = cmd.contain());
+    assert_eq!(child.containment(), expected);
+    child
+        .wait_tree()
+        .expect("a fully-exited tree must report a drained verdict");
+    assert_eq!(
+        child
+            .wait_tree_timeout(Duration::ZERO)
+            .expect("a ZERO probe against an already-drained tree must not be an error"),
+        expected_drained_verdict(expected),
+        "a ZERO probe must observe the SAME drained state an unbounded wait already found, \
+         not report MembersRemain just because the deadline is already past"
+    );
     _ = child.wait();
 }
 
-/// `Unsupported` on a non-drainable mechanism — explicitly REQUESTING `ContainMode::TreeWalk`,
-/// the one mode with no kernel drain edge on every platform where it is actually honored as
-/// requested (the walk mechanism carries no `#[cfg]` gate reserving it to one OS, unlike the
-/// per-OS drainable variants). **Not** portable to a single unconditional assertion, though:
-/// on macOS the fd marker is installed for every contained root regardless of the requested
-/// mode (`dispatch.rs`'s `attach()`, macOS branch — it is what survives `setsid`/reparenting/
-/// `exec` that a mode-specific mechanism does not), so a macOS `TreeWalk` request still comes
-/// back `Containment::FdMarker`, which IS drainable. Branches on the actual reported
-/// `can_observe_drain()` like the two tests above, rather than assuming a platform from the
-/// requested mode, so this asserts something real and non-tautological on every platform: the
-/// `Unsupported` refusal where `TreeWalk` is honored as non-drainable, and — on macOS — that
-/// an explicit `TreeWalk` request still drains correctly through the marker it was promoted to.
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
-fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
+fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained() {
+    wait_tree_timeout_zero_drained_verdict(drainable_gives());
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    wait_tree_timeout_zero_drained_verdict(drainable_gives());
+}
+
+/// A quick, self-terminating child under the containment `contain` asks for: the drain edge (when
+/// the mechanism has one) fires almost immediately, so an UNBOUNDED `wait_tree()` on it is a real
+/// blocking wait on a genuinely-terminating event, not an indefinite one.
+fn quick_child(contain: impl FnOnce(&mut crate::Command)) -> crate::Child {
     let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(["true"]);
     #[cfg(windows)]
     cmd.args(["cmd", "/C", "exit 0"]);
-    cmd.contain_with(crate::ContainMode::TreeWalk);
-    let treewalk_child = cmd.spawn().expect("spawn");
-    let containment = treewalk_child.containment();
-    let drainable = containment.can_observe_drain();
-    let err = treewalk_child.wait_tree_timeout(Duration::from_millis(200));
-    if drainable {
-        assert_eq!(
-            err.expect("macOS promotes an explicit TreeWalk request to the drainable fd marker"),
-            expected_drained_verdict(containment),
-            "a quick-exiting tree must still be observed as drained through the promoted mechanism"
-        );
-    } else {
-        let err = err.expect_err("TreeWalk, honored as requested, has no kernel drain edge");
+    contain(&mut cmd);
+    cmd.spawn().expect("spawn")
+}
+
+/// A quick-exiting child of an explicit `ContainMode::TreeWalk` request.
+fn quick_treewalk_child() -> crate::Child {
+    quick_child(|cmd| _ = cmd.contain_with(crate::ContainMode::TreeWalk))
+}
+
+/// Every wait of `child` is `Unsupported`, and the child is reaped.
+fn assert_wait_tree_unsupported(child: &crate::Child) {
+    for result in [
+        child.wait_tree_timeout(Duration::from_millis(200)),
+        child.wait_tree_timeout(Duration::ZERO),
+        child.wait_tree(),
+    ] {
+        let err = result.expect_err("this mechanism has no kernel drain edge");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
-        let err2 = treewalk_child
-            .wait_tree()
-            .expect_err("TreeWalk, honored as requested, has no kernel drain edge");
-        assert!(matches!(err2, crate::error::Error::Unsupported { .. }), "got {err2:?}");
     }
-    _ = treewalk_child.wait();
+    _ = child.wait();
+}
+
+/// `Unsupported` on a non-drainable mechanism: an explicit `ContainMode::TreeWalk` request, which
+/// has no kernel drain edge. macOS does not honor the request (see the test below).
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
+    let child = quick_treewalk_child();
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
+    assert_wait_tree_unsupported(&child);
+}
+
+/// `Unsupported` on a session, which an explicit `ContainMode::Session` request gets on Linux.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn wait_tree_is_unsupported_on_a_session() {
+    let child = quick_child(|cmd| _ = cmd.contain_with(crate::ContainMode::Session));
+    assert_eq!(child.containment(), Containment::Session);
+    assert_wait_tree_unsupported(&child);
+}
+
+/// `Unsupported` on an uncontained child, the one macOS mechanism with no drain edge: every
+/// contained request there is promoted to the fd marker.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn wait_tree_is_unsupported_on_an_uncontained_child() {
+    let child = quick_child(|_| {});
+    assert_eq!(child.containment(), Containment::None);
+    assert_wait_tree_unsupported(&child);
+}
+
+/// On macOS the fd marker is installed for every contained root regardless of the requested mode
+/// (it is what survives `setsid`/reparenting/`exec` that a mode-specific mechanism does not), so an explicit `TreeWalk` request comes back
+/// `Containment::FdMarker` and drains correctly through it.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_treewalk_request_is_promoted_to_the_fd_marker_which_drains() {
+    let child = quick_treewalk_child();
+    assert_eq!(child.containment(), crate::test_child::tree_walk_gives());
+    assert_eq!(
+        child
+            .wait_tree()
+            .expect("macOS promotes an explicit TreeWalk request to the drainable fd marker"),
+        expected_drained_verdict(Containment::FdMarker),
+        "a quick-exiting tree must still be observed as drained through the promoted mechanism"
+    );
+    _ = child.wait();
 }
 
 // `Child::wait_deadline` (portable) =====
@@ -212,7 +258,7 @@ fn spawn_never_exiting() -> (crate::Child, crate::PipeWriter) {
 /// Mutant: return `None` when `remaining` is zero before asking the backend.
 #[skuld::test]
 fn wait_deadline_in_the_past_reports_an_exited_child() {
-    let child = quick_contained_child();
+    let child = quick_child(|cmd| _ = cmd.contain());
     let waited = child.wait().expect("wait");
     let status = child
         .wait_deadline(Instant::now())
@@ -275,16 +321,16 @@ fn drop_kills_and_reaps_the_child() {
 /// Dropping a `Child` whose tree is contained kills the whole tree, the grandchild too. The tree's
 /// stdin is released once the drop's root kill returned, so a drop that sent nothing lets the
 /// root exit 0 and the grandchild print `eof`, and fails the assertions instead of hanging in the
-/// drop. Both members hold the stdout pipe, so its end is the moment both are gone.
+/// drop. Both members hold the stdout pipe, so its end is the moment both are gone. `contain` is
+/// the mechanism the caller asks for, and `expected` the one it must get.
 #[cfg(unix)]
-#[skuld::test]
-fn drop_kills_a_contained_tree() {
+fn drop_kills_a_tree_contained_by(contain: impl FnOnce(&mut crate::Command), expected: crate::Containment) {
     use std::io::Read as _;
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::CAT_TREE_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
+    contain(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
@@ -293,19 +339,7 @@ fn drop_kills_a_contained_tree() {
     assert_eq!(&ready, b"r\n");
     // Containment was established, so a tree that survives the drop is a missing kill and not a
     // missing mechanism.
-    let got = child.containment();
-    let established = if cfg!(target_os = "linux") {
-        matches!(got, crate::Containment::CgroupV2 | crate::Containment::ProcessGroup)
-    } else {
-        matches!(
-            got,
-            crate::Containment::ProcessGroup | crate::Containment::Session | crate::Containment::FdMarker
-        )
-    };
-    assert!(
-        established,
-        "unexpected containment for a contained tree on this host: {got:?}"
-    );
+    assert_eq!(child.containment(), expected);
     let teardown = crate::child::spawn::fault::release_at_drop_kill(stdin);
 
     drop(child);
@@ -316,6 +350,30 @@ fn drop_kills_a_contained_tree() {
         .read_to_end(&mut rest)
         .expect("both members are gone, so the pipe ends");
     assert!(rest.is_empty(), "the drop missed the grandchild: {rest:?}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn drop_kills_a_contained_tree() {
+    drop_kills_a_tree_contained_by(
+        |cmd| _ = crate::test_child::contain_without_cgroup(cmd),
+        crate::test_child::contain_without_cgroup_gives(),
+    );
+}
+
+/// `Strongest` with no cgroup leaf made (forced, so whatever the host gives) is a process group,
+/// the mechanism `.contain()` gives a Linux host without a delegated cgroup.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn drop_kills_a_process_group_contained_tree() {
+    let (mode, _forced) = crate::child::spawn::identity_group_tests::Container::Leafless.arm();
+    drop_kills_a_tree_contained_by(|cmd| _ = cmd.contain_with(mode), crate::Containment::ProcessGroup);
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn drop_kills_a_cgroup_contained_tree(#[fixture(cgroup)] _group: &Group) {
+    drop_kills_a_tree_contained_by(|cmd| _ = cmd.contain(), crate::Containment::CgroupV2);
 }
 
 // A zombie launchd holds =====

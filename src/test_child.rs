@@ -254,9 +254,9 @@ pub(crate) fn held_std_killable_blocker() -> std::process::Command {
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
 /// cgroup leaf first and logs a warning where none is delegated, so a test that holds a
-/// [`warn_watch`](crate::log_capture::warn_watch) would warn on one host and not on another. A test
-/// that is about cgroups takes the `cgroup` group instead. Mirrors `tests/common`'s helper of the
-/// same name, which a separate compilation unit cannot share.
+/// [`warn_watch`](crate::log_capture::warn_watch) would warn on one host and not on another. See
+/// principle 9 of `docs/principles.md`. Mirrors `tests/common`'s helper of the same name, which a
+/// separate compilation unit cannot share.
 #[cfg(unix)]
 pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Command {
     #[cfg(target_os = "linux")]
@@ -264,6 +264,14 @@ pub(crate) fn contain_without_cgroup(cmd: &mut crate::Command) -> &mut crate::Co
     #[cfg(not(target_os = "linux"))]
     cmd.contain()
 }
+
+// What a contained test asks of containment and gets: the integration tests' table, compiled from
+// its real source.
+#[path = "../tests/common/contain_gives.rs"]
+mod contain_gives;
+#[cfg(unix)]
+pub(crate) use contain_gives::{contain_without_cgroup_gives, session_gives};
+pub(crate) use contain_gives::{drainable_gives, tree_walk_gives};
 
 /// [`contain_without_cgroup`] for the async `Command`.
 #[cfg(all(unix, feature = "tokio"))]

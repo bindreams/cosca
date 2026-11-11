@@ -1,7 +1,6 @@
 use cosca::error::QuoteErrorKind;
 use cosca::quote::posix;
 use cosca::quote::windows;
-use cosca::Containment;
 
 #[skuld::test]
 fn public_surface_is_usable() {
@@ -30,8 +29,8 @@ fn public_surface_is_usable() {
     let _ = cmd; // input model exercised in unit tests
 }
 
-/// Containment public-surface smoke: `.contain()` on a supported host must
-/// report a mechanism other than `None`. The test spawns a child that blocks on a piped stdin
+/// Containment public-surface smoke: a contained child must report the mechanism
+/// `contain_without_cgroup` asks for. The test spawns a child that blocks on a piped stdin
 /// it holds, asserts the achieved containment, kills the tree and waits — all via the public API.
 /// The child leaves with status 0 once stdin is released, so a `kill_tree` that sends nothing
 /// fails the final assertion instead of hanging the wait. The full tree-death proof lives in
@@ -56,28 +55,7 @@ fn containment_smoke() {
     let mut child = cmd.spawn().expect("spawn contained child");
     let stdin = child.stdin().expect("piped stdin");
 
-    // On every supported host (Unix + Windows) the strongest mechanism must
-    // not be None.
-    assert_ne!(
-        child.containment(),
-        Containment::None,
-        "contain() must use a real mechanism on this platform, got None"
-    );
-
-    // Per-OS assertions on the specific mechanism.
-    #[cfg(windows)]
-    assert_eq!(child.containment(), Containment::JobObject);
-    #[cfg(target_os = "linux")]
-    assert_eq!(child.containment(), Containment::Session);
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    assert!(
-        matches!(
-            child.containment(),
-            Containment::ProcessGroup | Containment::Session | Containment::FdMarker
-        ),
-        "macOS/BSD must use ProcessGroup, Session or FdMarker, got {:?}",
-        child.containment()
-    );
+    assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
     child.kill_tree().expect("kill_tree");
     drop(stdin);
