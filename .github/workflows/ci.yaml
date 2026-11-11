@@ -563,7 +563,7 @@ jobs:
       # `Build tests (tokio feature)`. Every step that reverts a lane's changes runs
       # `always()`, straight after its own lane. The lanes' steps run `!cancelled()`, so one red lane does not hide
       # another, and each step also requires its own lane's earlier step to have succeeded. Each lane's
-      # `COSCA_TEST_<GROUP>` variables are set on its own steps, never job-wide.
+      # `COSCA_TEST_<GROUP>` and `COSCA_TESTCFG_*` variables are set on its own steps, never job-wide.
 
       # Windows path-resolution canaries and the elevating ShellExecuteEx probes (the `PATH_PROBES` and
       # `SHELL_EXECUTE` groups). windows-probes.yaml runs the same canaries weekly, because `windows-latest` floats.
