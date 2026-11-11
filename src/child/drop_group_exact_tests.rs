@@ -238,7 +238,7 @@ fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown
                 crate::child::owned::teardown::Disposition::Leave,
             );
             assert!(torn.fate.not_running(), "{:?}", torn.fate);
-            assert!(child.tree_killed.is_set(), "an emptied group is a killed tree");
+            assert!(child.tree.is_killed(), "an emptied group is a killed tree");
             None
         }
         Teardown::FinishElevated => tear_down(child, teardown),

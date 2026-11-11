@@ -27,8 +27,8 @@ pub(crate) struct Skip {
 impl Skip {
     /// Whether this handle's own reap is why the root's pid names no process or cannot be read, and
     /// the handle already killed the tree: there is nothing left for the skip to leave undone.
-    pub(crate) fn is_moot(&self, killed: &crate::containment::TreeKilled) -> bool {
-        killed.is_set()
+    pub(crate) fn is_moot(&self, tree: &crate::containment::Tree) -> bool {
+        tree.is_killed()
             && matches!(
                 &self.why,
                 Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_))
@@ -90,7 +90,7 @@ mod call {
     use super::{Skip, Why};
     use crate::containment::dispatch::{TreeKillOutcome, TreeSignal, Unkilled};
     use crate::containment::root::Refusal;
-    use crate::containment::{Attached, TreeKilled};
+    use crate::containment::Tree;
     use crate::error::Error;
     use crate::signal::Sent;
 
@@ -106,7 +106,7 @@ mod call {
 
     impl SkipCall<'_> {
         /// The call's answer to `skip`: its kill, or its terminate that ended there. A `Kill` is
-        /// settled into the handle's state through [`Attached::settle`], the only writer of it, and a
+        /// settled into the handle's state through [`Tree::settle`], the only writer of it, and a
         /// `Term` never is.
         ///
         /// Nothing was sent by the root's number, and what names the tree by identity (a macOS fd
@@ -114,13 +114,7 @@ mod call {
         /// its handle, if the caller sent one ([`Skip::root_alone`]). One `warn` names what was
         /// skipped and what was sent. The error is the holders' sweep's, the root signal's, or
         /// `Unassessable`; `Ok` only after this handle's own reap, when it already killed the tree.
-        pub(crate) fn answer(
-            &self,
-            attached: &Attached,
-            killed: &TreeKilled,
-            skip: Skip,
-            root: Option<Result<Sent, Error>>,
-        ) -> Result<(), Error> {
+        pub(crate) fn answer(&self, tree: &Tree, skip: Skip, root: Option<Result<Sent, Error>>) -> Result<(), Error> {
             let mut skip = match skip {
                 Skip {
                     why: Why::Untrusted(why),
@@ -130,12 +124,9 @@ mod call {
                 } => {
                     let error = self.untrusted(&action, &why, holders);
                     return match self.signal {
-                        TreeSignal::Kill => attached.settle_for_kill_tree(
-                            self.op,
-                            killed,
-                            TreeKillOutcome::Ran(Err(Unkilled::from(error))),
-                            false,
-                        ),
+                        TreeSignal::Kill => {
+                            tree.settle_for_kill_tree(self.op, TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
+                        }
                         TreeSignal::Term => Err(error),
                     };
                 }
@@ -144,7 +135,7 @@ mod call {
             let Why::MayNameAnother(refusal) = &skip.why else {
                 unreachable!("an untrusted skip is answered above")
             };
-            if skip.is_moot(killed) {
+            if skip.is_moot(tree) {
                 log::debug!(
                     "{}({}): {refusal}, and this handle already killed the tree, so it does not {}",
                     self.op,
@@ -152,9 +143,7 @@ mod call {
                     skip.action
                 );
                 return match self.signal {
-                    TreeSignal::Kill => {
-                        attached.settle_for_kill_tree(self.op, killed, TreeKillOutcome::Skipped(skip), false)
-                    }
+                    TreeSignal::Kill => tree.settle_for_kill_tree(self.op, TreeKillOutcome::Skipped(skip), false),
                     TreeSignal::Term => skip.holders.take().unwrap_or(Ok(())),
                 };
             }
@@ -188,7 +177,7 @@ mod call {
             let swept = skip.holders.is_some();
             let holders = match self.signal {
                 TreeSignal::Kill => {
-                    let settled = attached.settle_for_kill_tree(self.op, killed, TreeKillOutcome::Skipped(skip), false);
+                    let settled = tree.settle_for_kill_tree(self.op, TreeKillOutcome::Skipped(skip), false);
                     debug_assert!(
                         swept || settled.is_ok(),
                         "a skipped kill that swept nothing leaves nothing to report: {settled:?}"
@@ -265,18 +254,12 @@ mod call {
         /// `skip` is their `SIGTERM`), after the grace: `kill` is the kill of any holder left, the
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or
         /// `Unassessable`.
-        pub(crate) fn holders_shutdown_error(
-            &self,
-            attached: &Attached,
-            killed: &TreeKilled,
-            skip: &Skip,
-            kill: TreeKillOutcome,
-        ) -> Error {
+        pub(crate) fn holders_shutdown_error(&self, tree: &Tree, skip: &Skip, kill: TreeKillOutcome) -> Error {
             let term = match &skip.holders {
                 Some(Err(e)) => format!(", which failed ({})", crate::error::Report(e)),
                 _ => String::new(),
             };
-            let settled = attached.settle_for_kill_tree(self.op, killed, kill, false);
+            let settled = tree.settle_for_kill_tree(self.op, kill, false);
             let kill_failed = match &settled {
                 Ok(()) => String::new(),
                 Err(e) => format!(", which failed ({})", crate::error::Report(e)),

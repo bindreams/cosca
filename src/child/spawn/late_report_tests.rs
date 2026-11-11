@@ -565,7 +565,7 @@ fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() 
 fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
     use crate::containment::dispatch::Unkilled;
     let root_left = || LateTree {
-        attached: None,
+        tree: None,
         sweep: Sweep::RootAlive,
         pid: 4242,
         unique: 1,

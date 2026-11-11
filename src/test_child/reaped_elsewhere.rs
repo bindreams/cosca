@@ -59,7 +59,7 @@ pub(crate) fn assert_one_untrusted_number_warn(mark: usize, pgid: u32) {
     );
 }
 
-/// A `sleep` in its own session: `Attached::ProcessGroup`, or on macOS an fd marker with a group.
+/// A `sleep` in its own session: a process group, or on macOS an fd marker with a group.
 pub(crate) fn session_sleep() -> crate::Command {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sleep", "300"]);

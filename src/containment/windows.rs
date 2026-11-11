@@ -179,7 +179,7 @@ impl JobHandle {
 
     /// Test-only: a real but empty job object (no process assigned). Cheap to create and
     /// cleanly closed on `Drop`; for variant-level assertions like
-    /// `Attached::JobObject(_).is_actionable()`.
+    /// `Tree::contained(Mechanism::Job(_))`.
     pub(crate) fn create_empty_for_test() -> JobHandle {
         // Safety: CreateJobObjectW with null name/attrs returns an owned job handle.
         let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
@@ -236,6 +236,45 @@ impl Drop for JobHandle {
                 }
             }
         }
+    }
+}
+
+impl crate::containment::Contains for JobHandle {
+    /// `Ok` says the kernel killed every member, however it was spawned (see
+    /// [`hard_kill`](JobHandle::hard_kill)).
+    fn send_kill(&self, _root: Option<&dyn crate::containment::Root>) -> crate::containment::dispatch::TreeKillOutcome {
+        use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+        TreeKillOutcome::Ran(
+            self.hard_kill()
+                .map_err(crate::error::Error::Io)
+                .map_err(Unkilled::from),
+        )
+    }
+
+    /// `CTRL_BREAK` to the root's console group `pid`: a nested contained descendant leads its own
+    /// group and never receives it.
+    fn send_terminate(
+        &self,
+        pid: u32,
+        _root: Option<&dyn crate::containment::Root>,
+    ) -> crate::containment::TerminateOutcome {
+        crate::containment::TerminateOutcome::Sent {
+            result: terminate(pid),
+            earlier: Some("the SIGTERM"),
+        }
+    }
+
+    fn drain_edge(&self) -> Option<crate::containment::drain_edge::DrainEdge<'_>> {
+        Some(crate::containment::drain_edge::DrainEdge::Job(self))
+    }
+
+    fn kind(&self) -> crate::containment::Containment {
+        crate::containment::Containment::JobObject
+    }
+
+    /// Clears `KILL_ON_JOB_CLOSE` (see [`disarm`](JobHandle::disarm)).
+    fn disarm(&self) -> io::Result<()> {
+        JobHandle::disarm(self)
     }
 }
 
@@ -1731,18 +1770,14 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
     }
 }
 
-/// Test-only membership probe: whether `pid` is inside the Job Object held by `attached`, via
+/// Test-only membership probe: whether `pid` is inside the Job Object `job`, via
 /// `IsProcessInJob` against that job handle (not "any job"). Membership is immutable once assigned,
 /// so it is deterministic for a handle-pinned child regardless of run state. Shared by the sync and
 /// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
 /// integration crates can call them).
-pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32) -> bool {
+pub(crate) fn job_contains_pid(job: &JobHandle, pid: u32) -> bool {
     use windows::Win32::System::JobObjects::IsProcessInJob;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
-
-    let crate::containment::Attached::JobObject(job) = attached else {
-        return false;
-    };
 
     // Open the child process by PID; the backend doesn't expose its handle.
     // SAFETY: standard Win32 call; the handle is closed below.
@@ -1789,13 +1824,10 @@ pub(crate) fn job_limit_flags(
     Some(queried.map(|()| info.LimitFlags))
 }
 
-/// Test-only: whether the Job Object held by `attached` kills its members when its last handle
-/// closes. `false` when `attached` is not a job. Panics, naming the cause, when the query fails or
-/// the job handle is closed, so a failed query is not read as "no kill-on-close".
-pub(crate) fn job_kills_on_close(attached: &crate::containment::Attached) -> bool {
-    let crate::containment::Attached::JobObject(job) = attached else {
-        return false;
-    };
+/// Test-only: whether the Job Object `job` kills its members when its last handle closes. Panics,
+/// naming the cause, when the query fails or the job handle is closed, so a failed query is not
+/// read as "no kill-on-close".
+pub(crate) fn job_kills_on_close(job: &JobHandle) -> bool {
     let flags = job_limit_flags(job)
         .expect("the job handle is closed")
         .unwrap_or_else(|e| panic!("querying the job's limits failed: {e}"));

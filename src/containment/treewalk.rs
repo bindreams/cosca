@@ -84,12 +84,81 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::Contains;
+#[cfg(unix)]
+use crate::containment::mechanism::Release;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
-use crate::containment::{Skip, TerminateOutcome};
+use crate::containment::{Containment, Skip, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::Recursive;
+
+/// A tree named by parentage: the root's identity, from which its descendants are enumerated and
+/// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]).
+#[derive(Debug)]
+pub(crate) struct Walker {
+    root: ProcessId,
+}
+
+impl Walker {
+    pub(crate) fn new(root: ProcessId) -> Walker {
+        Walker { root }
+    }
+
+    /// The root the walk starts from.
+    #[cfg(all(test, unix))]
+    pub(crate) fn root(&self) -> ProcessId {
+        self.root
+    }
+}
+
+impl Contains for Walker {
+    fn send_kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
+        kill_tree(self.root, root)
+    }
+
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
+        terminate_tree(self.root, root)
+    }
+
+    /// No kernel object says "every member has exited".
+    fn drain_edge(&self) -> Option<DrainEdge<'_>> {
+        None
+    }
+
+    fn kind(&self) -> Containment {
+        Containment::TreeWalk
+    }
+
+    /// There is no kernel resource whose drop kills.
+    fn disarm(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn subject(&self) -> String {
+        format!("TreeWalk({:?})", self.root)
+    }
+
+    /// A signal to a walked member is subject to the kernel's permission check, as the child's own
+    /// kill is.
+    #[cfg(unix)]
+    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(unix)]
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(unix)]
+    fn release(self) -> Release {
+        Release::nothing()
+    }
+}
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
@@ -553,9 +622,9 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// was refused. Everything else was killed. The [`Unkilled`] holds every member left, the root
 /// apart: the candidates the walk could not read, in the order it found them, then the descendants
 /// whose kill sent nothing, in the order they were tried. It reports none of them: the caller does,
-/// once, after the root's death by its handle has had its say ([`Attached::settle`]).
+/// once, after the root's death by its handle has had its say ([`Tree::settle`]).
 ///
-/// [`Attached::settle`]: crate::containment::Attached::settle
+/// [`Tree::settle`]: crate::containment::Tree::settle
 pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
@@ -871,7 +940,7 @@ pub(crate) mod fault {
             }
         });
     }
-    // On macOS, `Attached::TreeWalk` (and so `hard_kill`) is only reached when the fd marker
+    // On macOS, a walk tree (and so `hard_kill`) is only reached when the fd marker
     // failed to install or is suppressed (decision 2: the marker otherwise takes priority) —
     // dispatch_tests.rs's backstop tests exercise the always-installed `fdmarker::fault` seam
     // there instead, leaving these two callers-only-on-other-platforms.

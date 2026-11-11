@@ -153,7 +153,7 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
 
 /// `Unsupported` on a non-drainable mechanism — explicitly REQUESTING `ContainMode::TreeWalk`,
 /// the one mode with no kernel drain edge on every platform where it is actually honored as
-/// requested (`Attached::TreeWalk` carries no `#[cfg]` gate reserving it to one OS, unlike the
+/// requested (the walk mechanism carries no `#[cfg]` gate reserving it to one OS, unlike the
 /// per-OS drainable variants). **Not** portable to a single unconditional assertion, though:
 /// on macOS the fd marker is installed for every contained root regardless of the requested
 /// mode (`dispatch.rs`'s `attach()`, macOS branch — it is what survives `setsid`/reparenting/

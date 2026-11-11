@@ -1225,7 +1225,8 @@ fn a_skipped_kill_names_the_walk_and_the_group_only_when_there_is_one() {
         own: false,
     });
     let skipped = |marker| {
-        let kill = crate::containment::Attached::FdMarker(marker).hard_kill(Some(&reaped));
+        let kill =
+            crate::containment::Tree::contained(crate::containment::Mechanism::Marker(marker)).kill(Some(&reaped));
         let skipped = kill
             .skipped()
             .expect("the reaped root's kill by its number is skipped")

@@ -51,9 +51,77 @@ use std::io;
 use nix::sys::signal::Signal;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
-use crate::containment::{check_number, Root, Skip, TerminateOutcome, Why};
+use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
+
+/// A process group or a session, named by the root's pid (`pgid == sid == pid` for a session's
+/// leader): its kill and its terminate send by that number, as the root's own state allows
+/// ([`kill_group_tree`], [`term_group_tree`]).
+#[derive(Debug)]
+pub(crate) struct Group {
+    pgid: i32,
+    session: bool,
+}
+
+impl Group {
+    /// The process group `pgid`, led by the root.
+    pub(crate) fn process_group(pgid: i32) -> Group {
+        Group { pgid, session: false }
+    }
+
+    /// The session whose initial process group is `pgid`, led by the root.
+    pub(crate) fn session(pgid: i32) -> Group {
+        Group { pgid, session: true }
+    }
+}
+
+impl Contains for Group {
+    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+        kill_group_tree(self.pgid, root)
+    }
+
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
+        term_group_tree(self.pgid, root)
+    }
+
+    /// No kernel object says "every member has exited".
+    fn drain_edge(&self) -> Option<DrainEdge<'_>> {
+        None
+    }
+
+    fn kind(&self) -> Containment {
+        if self.session {
+            Containment::Session
+        } else {
+            Containment::ProcessGroup
+        }
+    }
+
+    /// Dropping a group kills nothing.
+    fn disarm(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn subject(&self) -> String {
+        format!("ProcessGroup({})", self.pgid)
+    }
+
+    /// A signal to a group is subject to the kernel's permission check, as the child's own kill is.
+    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn release(self) -> Release {
+        Release::nothing()
+    }
+}
 
 /// Apply pre-spawn group setup to `std_cmd` (root spawns only).
 /// Must not be combined with `set_session` on the same command.
@@ -81,7 +149,7 @@ pub(crate) fn set_session(steps: &mut crate::child::spawn::in_child::InChild) {
 /// either reached or already gone — not an atomic, ongoing guarantee: a member that forks a
 /// new process into the group after that listing (an ordinary respawning supervisor, not
 /// only an adversarial fork-bomb) is never seen, never signalled, and does not affect the
-/// verdict. `Attached::Cgroup` (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
+/// verdict. A cgroup (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
 pub(crate) fn kill_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
     #[cfg(test)]

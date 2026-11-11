@@ -566,7 +566,7 @@ async fn async_wait_resolves_when_the_last_member_exits() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     let fd = marker.as_fd();
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let watch = crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx);
+    let watch = crate::containment::drain_edge::wait_tree_drained_for_test(fd, armed_tx);
     let end = async move {
         ::tokio::task::spawn_blocking(move || armed_rx.recv().expect("watch armed"))
             .await
@@ -594,8 +594,8 @@ async fn two_concurrent_async_waiters_both_observe_the_drain() {
     let fd = marker.as_fd();
     let (a_armed_tx, a_armed_rx) = std::sync::mpsc::channel();
     let (b_armed_tx, b_armed_rx) = std::sync::mpsc::channel();
-    let a = crate::tokio::wait::wait_tree_drained_for_test(fd, a_armed_tx);
-    let b = crate::tokio::wait::wait_tree_drained_for_test(fd, b_armed_tx);
+    let a = crate::containment::drain_edge::wait_tree_drained_for_test(fd, a_armed_tx);
+    let b = crate::containment::drain_edge::wait_tree_drained_for_test(fd, b_armed_tx);
     let end = async move {
         ::tokio::task::spawn_blocking(move || {
             a_armed_rx.recv().expect("waiter a armed");
@@ -617,7 +617,7 @@ async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     drop(stdin);
     child.wait().expect("reap");
-    crate::tokio::wait::wait_tree_drained(marker.as_fd())
+    crate::containment::drain_edge::wait_tree_drained(marker.as_fd())
         .await
         .expect("already-drained watch");
 }
@@ -641,7 +641,7 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
 
     let fd = marker.as_fd();
-    let watch = crate::tokio::wait::wait_tree_drained(fd);
+    let watch = crate::containment::drain_edge::wait_tree_drained(fd);
     let end = async move {
         // Blocking read on the report pipe: real synchronization for "the bytes are on the
         // marker now", off the async executor thread so it can't stall the reactor.
@@ -741,9 +741,9 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // resolve: proof the race below reached and passed judgment on a real event. `select!`
     // polls with the task's real waker, so the reactor registration is the one any caller gets.
     let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
-    let _declined_guard = crate::tokio::wait::declined_hook::DeclinedGuard::install(declined_tx);
+    let _declined_guard = crate::containment::drain_edge::declined_hook::DeclinedGuard::install(declined_tx);
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx));
+    let mut fut = std::pin::pin!(crate::containment::drain_edge::wait_tree_drained_for_test(fd, armed_tx));
 
     // One manual poll runs through `arm` (which sends the new kqueue's fd on `armed_tx`) and
     // stops at the reactor await, so `Pending` is the only correct outcome. The no-op waker is

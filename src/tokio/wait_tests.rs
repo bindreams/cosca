@@ -641,7 +641,7 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
     });
     crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
-    let drained = super::cgroup_wait_tree_drained(&leaf, None).await;
+    let drained = crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, None).await;
     crate::containment::cgroup::fault::take_drain_blocking_notifier();
     remover.join().expect("remover");
 
@@ -666,7 +666,7 @@ async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
         crate::wait::instant_near_ceiling(now).saturating_duration_since(now) - std::time::Duration::from_micros(500);
     let deadline = super::deadline_from(duration);
 
-    let fut = super::cgroup_wait_tree_drained(&leaf, deadline);
+    let fut = crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, deadline);
     ::tokio::pin!(fut);
     // A single poll is enough: reaching here without panicking is the proof. The fake leaf never
     // drains, so a correct call is Pending either way — nothing here needs it to resolve.
@@ -692,7 +692,7 @@ async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
 
     const BOUND: Duration = Duration::from_millis(50);
     let start = Instant::now();
-    let result = super::cgroup_wait_tree_drained(&leaf, Some(start + BOUND))
+    let result = crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, Some(start + BOUND))
         .await
         .expect("wait");
     let elapsed = start.elapsed();
@@ -723,7 +723,10 @@ async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
     let at = super::tokio_now() + Duration::from_secs(3600);
 
     {
-        let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(at)));
+        let mut fut = std::pin::pin!(crate::containment::drain_edge::cgroup_wait_tree_drained(
+            &leaf,
+            Some(at)
+        ));
         assert!(poll_once(fut.as_mut()).is_pending(), "the fake leaf never drains");
     }
     assert_eq!(rx.try_recv().expect("the wait site must arm via arm_at"), Armed::At(at));
@@ -743,7 +746,7 @@ async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
 
     {
-        let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, None));
+        let mut fut = std::pin::pin!(crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, None));
         assert!(poll_once(fut.as_mut()).is_pending(), "the fake leaf never drains");
     }
     assert_eq!(rx.try_recv().expect("an unbounded park is reported"), Armed::Unbounded);
@@ -949,7 +952,7 @@ async fn wait_tree_deadline_reports_an_eof_pending_when_the_timer_wins_the_first
     let _now = super::now_override::install(past);
     let deadline = super::deadline_from(Duration::from_secs(60));
 
-    let drain = super::wait_tree_deadline(marker.as_fd(), deadline)
+    let drain = crate::containment::drain_edge::wait_tree_deadline(marker.as_fd(), deadline)
         .await
         .expect("wait_tree_deadline");
     assert_eq!(drain, crate::containment::TreeDrain::AllMarkersClosed);
@@ -977,7 +980,10 @@ async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
     let _seam = super::armed_deadline_seam::install(tx);
     let at = super::tokio_now() + Duration::from_secs(3600);
     {
-        let mut fut = std::pin::pin!(super::wait_tree_deadline(marker.as_fd(), Some(at)));
+        let mut fut = std::pin::pin!(crate::containment::drain_edge::wait_tree_deadline(
+            marker.as_fd(),
+            Some(at)
+        ));
         assert!(poll_once(fut.as_mut()).is_pending(), "an hour-out deadline");
     }
     assert_eq!(rx.try_recv().expect("the wait site must arm via arm_at"), Armed::At(at));
@@ -1067,7 +1073,10 @@ async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let expired = super::tokio_now() - Duration::from_secs(1);
 
-    let mut fut = std::pin::pin!(super::cgroup_wait_tree_drained(&leaf, Some(expired)));
+    let mut fut = std::pin::pin!(crate::containment::drain_edge::cgroup_wait_tree_drained(
+        &leaf,
+        Some(expired)
+    ));
     match poll_once(fut.as_mut()) {
         std::task::Poll::Ready(r) => assert_eq!(r.expect("wait"), TreeDrain::MembersRemain),
         std::task::Poll::Pending => panic!("a deadline past on tokio's clock must answer at once"),
@@ -1094,7 +1103,7 @@ async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let expired = super::tokio_now() - Duration::from_secs(1);
 
-    let drain = super::wait_tree_deadline(marker.as_fd(), Some(expired))
+    let drain = crate::containment::drain_edge::wait_tree_deadline(marker.as_fd(), Some(expired))
         .await
         .expect("wait_tree_deadline");
     assert_eq!(drain, crate::containment::TreeDrain::MembersRemain);

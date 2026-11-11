@@ -6,7 +6,7 @@ use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use crate::child::Child;
 use crate::containment::windows::JobHandle;
-use crate::containment::Attached;
+use crate::containment::{Mechanism, Tree};
 use crate::error::{ChildFate, Error};
 use crate::identity::{Liveness, ProcessId};
 use crate::test_child::{expect_may_have_started_parts, held_uncontained_blocker};
@@ -14,7 +14,7 @@ use crate::test_child::{expect_may_have_started_parts, held_uncontained_blocker}
 /// A live blocker whose containment is a job that refuses `disarm`; `kill_on_drop` is the command's.
 fn refusing_child(kill_on_drop: bool) -> (Child, crate::PipeWriter, ProcessId) {
     let (mut child, stdin) = held_uncontained_blocker(kill_on_drop);
-    child.attached = Attached::JobObject(JobHandle::create_without_set_access_for_test());
+    child.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     (child, stdin, id)
 }

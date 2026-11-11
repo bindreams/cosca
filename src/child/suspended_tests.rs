@@ -229,7 +229,6 @@ mod on_windows {
     /// The resumed child is armed as a `spawn()` child is, or not, as the command said.
     #[skuld::test]
     fn resumed_child_takes_the_commands_kill_on_drop() {
-        use crate::containment::Attached;
         for kill_on_drop in [true, false] {
             let mut cmd = blocker(false);
             cmd.contain().kill_on_drop(kill_on_drop);
@@ -241,8 +240,8 @@ mod on_windows {
                 .expect("resume");
 
             assert_eq!(child.kill_on_drop, kill_on_drop);
-            let Attached::JobObject(job) = &child.attached else {
-                panic!("expected a job, got {:?}", child.attached);
+            let Some(job) = child.tree.job_for_test() else {
+                panic!("expected a job, got {:?}", child.tree);
             };
             let kills_on_close =
                 limit_flags(job).0 & windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0;
@@ -472,9 +471,9 @@ mod on_windows {
     fn frozen_with_a_refusing_job() -> (crate::child::SuspendedChild, crate::PipeWriter) {
         let (mut cmd, writer) = held_blocker(false);
         let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
-        frozen.child.attached = crate::containment::Attached::JobObject(
+        frozen.child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Job(
             crate::containment::windows::JobHandle::create_without_set_access_for_test(),
-        );
+        ));
         frozen.wanted_kill_on_drop = false;
         (frozen, writer)
     }

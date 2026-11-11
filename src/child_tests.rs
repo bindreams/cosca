@@ -12,9 +12,9 @@ use crate::test_child::Console;
 /// — reintroducing the bug #61 fixed.
 ///
 /// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
-/// `dispatch.rs`'s `Attached::FdMarker` arm where the laundering sat, so none of those tests
+/// the tree's dispatch to its marker mechanism where the laundering sat, so none of those tests
 /// could catch this. This test goes through the real public path instead: `Command::spawn` →
-/// `dispatch.rs`'s `Attached::FdMarker` → `Child::kill_tree`/`Drop` →
+/// the marker mechanism's `Tree` → `Child::kill_tree`/`Drop` →
 /// `is_teardown_mechanism_failure`.
 ///
 /// A live cross-uid refuser needs real root to construct (see `tests/group_teardown_setuid.rs`
@@ -66,19 +66,15 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
-    crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
-        containment: crate::containment::Containment::CgroupV2,
-        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
-            leaf_path.clone(),
-        )),
-        graceful: crate::graceful::GracefulMechanism::Process,
-    });
 
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    // The override is consumed by this spawn; `kill_on_drop` defaults to true.
+    // `kill_on_drop` defaults to true.
     let mut child = cmd.spawn().expect("spawn");
+    child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
+        crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone()),
+    ));
     // Released once the drop's root kill has returned: the drop blocks until the root is reaped.
     let stdin = child.stdin().expect("piped stdin");
     let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
