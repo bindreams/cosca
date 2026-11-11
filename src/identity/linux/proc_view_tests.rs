@@ -492,7 +492,6 @@ fn collect_pids_is_an_error_for_an_all_digit_name_that_overflows() {
         let err = collect_pids(names(&[b"1", name])).expect_err("a corrupt listing is an error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains(std::str::from_utf8(name).unwrap()), "{err}");
-        // The parse failure is the cause, one layer down.
         let cause = crate::error::chain(&err).last().expect("a chain").to_string();
         assert_eq!(cause, "number too large to fit in target type", "{err}");
         assert_eq!(crate::error::chain(&err).count(), 2, "{err}");

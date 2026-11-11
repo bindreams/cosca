@@ -204,14 +204,14 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .diverged_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
     let err = assert_unassessable_with_cause(result, &["outer pid namespace"], true, &marker, mark);
-    // The `pidfd_open` errno is the source, not part of the message, and the Report names the call.
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err:?}");
     assert!(!err.to_string().contains("pidfd_open"), "{err}");
     let report = crate::error::Report(&err).to_string();
     assert!(report.contains("pidfd_open"), "{report}");
 }
 
-/// Twin for a view that could not be established: the reason is in the message.
+/// Twin for a view that could not be established: the reason is in the message, the view's errno
+/// is the source, and the message notes the `pidfd_open` errno's call.
 #[skuld::test]
 fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
     crate::log_capture::install();
@@ -222,7 +222,14 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .on_pidfd_open(worker.id.pid(), Err(Errno::INVAL))
         .unreadable_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
-    assert_unassessable_with_cause(result, &[UNREADABLE_STATUS_REASON, "pidfd_open: "], true, &marker, mark);
+    let err = assert_unassessable_with_cause(
+        result,
+        &[UNREADABLE_STATUS_REASON, "(pidfd_open: "],
+        true,
+        &marker,
+        mark,
+    );
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err:?}");
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads

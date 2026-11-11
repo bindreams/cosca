@@ -435,12 +435,15 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> std::io::Error {
 }
 
 /// `status` as the `io::Error` std would report for the Win32 code it maps to
-/// (`RtlNtStatusToDosError`), which `raw_os_error()` and `kind()` classify. The mapping is lossy:
-/// the exact `NTSTATUS` is not kept, and one with no Win32 code maps to `ERROR_MR_MID_NOT_FOUND`.
+/// (`RtlNtStatusToDosError`). The mapping is lossy: the exact `NTSTATUS` is not kept, and one with
+/// no Win32 code maps to `ERROR_MR_MID_NOT_FOUND`, in which case the status is logged at `debug`.
 #[cfg(windows)]
 pub(crate) fn nt_io_error(status: windows::Win32::Foundation::NTSTATUS) -> std::io::Error {
     // SAFETY: a pure status-to-code mapping.
     let code = unsafe { windows::Win32::Foundation::RtlNtStatusToDosError(status) };
+    if code == windows::Win32::Foundation::ERROR_MR_MID_NOT_FOUND.0 {
+        log::debug!("NTSTATUS {:#010x} has no Win32 code", status.0 as u32);
+    }
     std::io::Error::from_raw_os_error(code as i32)
 }
 

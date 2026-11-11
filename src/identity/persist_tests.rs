@@ -421,7 +421,6 @@ fn a_scope_read_failure_keeps_the_path_and_the_cause() {
     };
     assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
     assert_eq!(source.to_string(), "No such file or directory");
-    // The cause is reached through `source()` only: the detail holds this layer's words.
     assert!(!detail.contains("No such file or directory"), "{detail}");
 }
 

@@ -787,7 +787,7 @@ impl UnknownCause {
     /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
     /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
-    /// source, mapped to its Win32 code ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
+    /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
     /// is known (or on macOS, which has no view and no pidfd): `hidepid`, a racing exit, an access
     /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {

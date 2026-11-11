@@ -166,7 +166,7 @@ fn complete_members_names_every_unassessed_candidate_with_its_cause() {
     assert!(said.contains(&format!("cause of {first}")), "{said}");
     for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
         let entry = note_entry(&said, other);
-        assert!(entry.ends_with(&format!("cause of {other})")), "{said}");
+        assert_eq!(entry, format!("pid {other} (cause of {other})"), "{said}");
     }
 }
 
@@ -179,7 +179,6 @@ fn note_entry(said: &str, pid: RawPid) -> &str {
 }
 
 /// The note on `complete_members` carries each other candidate's whole chain, its OS error included.
-/// Mutant: the note keeps only the candidate's `detail`.
 #[skuld::test]
 fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
     let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
@@ -420,8 +419,8 @@ fn resolve_or_drop_drops_an_access_denied_pid_as_an_error() {
 }
 
 /// The text of `resolve_or_drop`'s warn for a candidate whose creator-pid query was refused: the
-/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the query, the
-/// status is the error's source, and it does not fall back to "access denied?".
+/// cause reaches `unqueryable_read`, which words it, so the warn names the pid and the query, and
+/// it does not fall back to "access denied?".
 ///
 /// The failed query itself is not driven through the walk: forcing one needs a hook in production
 /// code, and Windows has no `FakeKernel` methods to state it in.

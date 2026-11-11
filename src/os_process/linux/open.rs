@@ -273,7 +273,7 @@ fn view_unreadable(id: ProcessId, why: ViewUnreadable, pidfd_errno: Option<rusti
 }
 
 /// [`Error::Unassessable`] for `id`, logged at `warn`. `source()` is the OS error behind `why`,
-/// else the `pidfd_open` errno, named as the failed call. When both exist the errno has no other place, so the message names it.
+/// else the `pidfd_open` errno. When both exist, the message names the errno's call.
 fn unassessable(
     id: ProcessId,
     why: &str,
