@@ -41,9 +41,12 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
+
+use crate::child::spawn::windows_raw::AttributeList;
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
 ///
@@ -112,6 +115,16 @@ pub(crate) fn image_file_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Whether process `pid` runs `more.com`, the child the fixtures hold (see
+/// [`crate::test_child::windows_more`]); `false` once it is gone.
+pub(crate) fn is_more_com(pid: u32) -> bool {
+    image_file_name(pid).is_some_and(|image| {
+        std::path::Path::new(&image)
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
+    })
+}
+
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
 const NO_ACE: u32 = u32::MAX;
 
@@ -121,10 +134,12 @@ pub(crate) struct RestrictedChild {
     handle: HANDLE,
     thread: HANDLE,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
-    /// this `spawn_restricted_shell`'s `cmd.exe` would die while the `ping.exe` it launched
-    /// ran on for an hour. `wait_for_child` reads this job's members.
+    /// this `spawn_restricted_shell`'s `cmd.exe` would die and leave the `more.com` it
+    /// launched behind. `wait_for_child` reads this job's members.
     job: HANDLE,
     pid: u32,
+    /// The write end of the stdin the `more.com` blocks on, held so that only a kill ends it.
+    stdin: Option<std::io::PipeWriter>,
 }
 
 impl RestrictedChild {
@@ -164,12 +179,12 @@ impl RestrictedChild {
         );
     }
 
-    /// The pid of the `ping.exe` this fixture's shell launched, once it exists.
+    /// The pid of the `more.com` this fixture's shell launched, once it exists.
     ///
     /// Reads the fixture's job, not the process tree: the job lists exactly the processes
     /// created under the shell, so a pre-existing orphan whose creator pid was recycled onto
     /// this shell is not in it. The job also holds the console host (`conhost.exe`) the shell
-    /// was given, listed before `ping`, so the child is the member whose image is `ping.exe`.
+    /// was given, listed before `more`, so the child is the member whose image is `more.com`.
     /// Nothing opens the shell, which may grant us no query right (`spawn_restricted_shell`
     /// with `PROCESS_SYNCHRONIZE`); the members are opened by pid, and they are not
     /// DACL-restricted.
@@ -180,15 +195,12 @@ impl RestrictedChild {
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
             let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
-            for pid in members.into_iter().filter(|&pid| pid != self.pid) {
-                let is_ping = image_file_name(pid).is_some_and(|image| {
-                    std::path::Path::new(&image)
-                        .file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
-                });
-                if is_ping {
-                    return pid;
-                }
+            if let Some(pid) = members
+                .into_iter()
+                .filter(|&pid| pid != self.pid)
+                .find(|&pid| is_more_com(pid))
+            {
+                return pid;
             }
             std::thread::yield_now();
         }
@@ -290,61 +302,45 @@ pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
 pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> RestrictedChild {
+    let cmd = crate::test_child::system32("cmd.exe");
     spawn_with_ace_cmdline(
         alone,
         granted | PROCESS_TERMINATE.0,
-        "C:\\Windows\\System32\\cmd.exe /c ping.exe -n 3600 127.0.0.1",
-        None,
+        &format!("\"{}\" /c {}", cmd.display(), quoted_more()),
     )
 }
 
-/// Like [`spawn_restricted`], but the child is `more.com` reading a piped stdin, and the caller
-/// holds the write end: dropping it lets the child exit by itself, with code 0. For a test whose
-/// kill is the behaviour under test: the child it spares ends on that release, so a kill that sent
-/// nothing fails an assertion on the exit code (`1` for a kill) instead of leaving a wait on a child
-/// that never ends.
-///
-/// Until it exits, the child inherits the handles this process already holds inheritable, besides
-/// its stdio; the fixture's `Drop` ends it.
+/// Like [`spawn_restricted`], but the caller holds the write end of the child's stdin: dropping it
+/// lets the child exit by itself, with code 0. For a test whose kill is the behaviour under test:
+/// the child it spares ends on that release, so a kill that sent nothing fails an assertion on the
+/// exit code (`1` for a kill) instead of leaving a wait on a child that never ends.
 pub(crate) fn spawn_restricted_releasable(alone: &Completion, granted: u32) -> (RestrictedChild, std::io::PipeWriter) {
+    let mut child = spawn_restricted(alone, granted);
+    let writer = child.stdin.take().expect("the fixture holds the child's stdin");
+    (child, writer)
+}
+
+/// `more.com`, quoted for a command line.
+fn quoted_more() -> String {
+    format!("\"{}\"", crate::test_child::windows_more().display())
+}
+
+fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
+    spawn_with_ace_cmdline(alone, granted, &quoted_more())
+}
+
+/// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
+/// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
+/// writes to `NUL`. The child inherits only its stdin and stdout (a handle list), and both are
+/// inheritable only under [`spawn_lock`](crate::child::spawn::spawn_lock) and closed before it is
+/// released. A spawner outside the lock that inherits with no list can still take them. The caller
+/// must not hold `spawn_lock`.
+fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
     let (stdin, stdout) = (HANDLE(reader.as_raw_handle()), HANDLE(null.as_raw_handle()));
-    for handle in [stdin, stdout] {
-        // SAFETY: `handle` is live and owned by `reader` or `null`; the call only sets its flag.
-        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
-            .expect("make the child's stdio inheritable");
-    }
-    let more = crate::test_child::windows_more();
-    let child = spawn_with_ace_cmdline(
-        alone,
-        granted | PROCESS_TERMINATE.0,
-        &format!("\"{}\"", more.display()),
-        Some((stdin, stdout)),
-    );
-    // `reader` and `null` close here, so the write end is the pipe's only other holder.
-    (child, writer)
-}
 
-fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(
-        alone,
-        granted,
-        "C:\\Windows\\System32\\ping.exe -n 3600 127.0.0.1",
-        None,
-    )
-}
-
-/// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
-/// pass vacuously. `stdio` is the child's stdin and its stdout and stderr, as inheritable
-/// handles; given, the child is created with handle inheritance on.
-fn spawn_with_ace_cmdline(
-    alone: &Completion,
-    granted: u32,
-    cmdline: &str,
-    stdio: Option<(HANDLE, HANDLE)>,
-) -> RestrictedChild {
     // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
     drop_se_debug_privilege(alone);
@@ -405,34 +401,49 @@ fn spawn_with_ace_cmdline(
     // terminator, so a caller that forgot one would send it reading past the end of the
     // allocation. No call site can get this wrong.
     let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
+    // Outlives the attribute list, which keeps the pointer to it.
+    let listed = [stdin, stdout];
+    let attributes = AttributeList::build(&listed).expect("the inheritance list of the fixture child");
+    let si = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: size_of::<STARTUPINFOEXW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: stdin,
+            hStdOutput: stdout,
+            hStdError: stdout,
+            ..Default::default()
+        },
+        lpAttributeList: attributes.as_ptr(),
     };
-    if let Some((stdin, stdout)) = stdio {
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = stdin;
-        si.hStdOutput = stdout;
-        si.hStdError = stdout;
-    }
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
-    // points at are alive for the duration of the call.
-    unsafe {
-        CreateProcessW(
-            None,
-            Some(PWSTR(cmdline.as_mut_ptr())),
-            Some(&sa),
-            None,
-            stdio.is_some(),
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
+    {
+        let _guard = crate::child::spawn::spawn_lock();
+        // Rebound after the guard: locals drop in reverse order, so on success or a panic the
+        // child-side ends close before the lock is released.
+        let (_reader, _null) = (reader, null);
+        for handle in [stdin, stdout] {
+            // SAFETY: `handle` is live and owned by `_reader` or `_null`; the call only sets its flag.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+                .expect("make the child's stdio inheritable");
+        }
+        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
+        // points at are alive for the duration of the call.
+        unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                Some(&sa),
+                None,
+                true,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                None,
+                None,
+                &si.StartupInfo,
+                &mut pi,
+            )
+        }
+        .expect("CreateProcessW for the restricted fixture child");
     }
-    .expect("CreateProcessW for the restricted fixture child");
 
     // SAFETY: an unnamed job object has no preconditions; the handle is owned by the
     // RestrictedChild and closed in Drop.
@@ -470,6 +481,7 @@ fn spawn_with_ace_cmdline(
         thread: pi.hThread,
         job,
         pid: pi.dwProcessId,
+        stdin: Some(writer),
     };
     // A child that died on startup would still keep its kernel object alive through our
     // handle, so every OpenProcess verdict would look right while testing nothing.

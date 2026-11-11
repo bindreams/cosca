@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::containment::unix::fault::{record_kill_group, KillGroupRecorder};
 use crate::identity::Resolved;
 use crate::log_capture::warns_since;
-use crate::test_child::reaped_elsewhere::{kill_own_child, session_sleep};
+use crate::test_child::reaped_elsewhere::{kill_own_child, session_cat};
 
 /// A session child whose root this handle reaped, with its pid reading as naming no process, and the
 /// guards that keep that so.
@@ -32,14 +32,19 @@ fn reaped_reading(kill_tree_first: bool, read: Resolved<crate::identity::Process
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let killed = record_kill_group();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     if kill_tree_first {
         // The recorder takes the group's kill; the handle backstop ends the root.
         child.kill_tree().expect("kill the tree");
     } else {
         kill_own_child(child.pid());
     }
-    child.wait().expect("this handle reaps the root");
+    // Released only after the kill: a kill that never came ends the root with status 0, which fails
+    // here instead of leaving the wait to block.
+    drop(stdin);
+    let status = child.wait().expect("this handle reaps the root");
+    crate::test_child::assert_killed("the session root", status);
     Reaped {
         child,
         killed,
@@ -93,10 +98,15 @@ fn kill_tree_after_a_kill_tree_and_a_foreign_reap_still_skips_and_warns() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let _killed = record_kill_group();
-    let child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
+    let stdin = child.stdin().expect("stdin pipe");
     // The recorder takes the group's kill; the handle backstop ends the root.
     child.kill_tree().expect("kill the tree");
-    crate::test_child::reaped_elsewhere::reap_behind(child.pid());
+    // Released only after the kill: a kill that never came ends the root with status 0, which fails
+    // here instead of leaving the reap to block.
+    drop(stdin);
+    let status = crate::test_child::reaped_elsewhere::reap_behind_status(child.pid());
+    crate::test_child::assert_killed("the session root", status);
     let mark = crate::log_capture::mark();
 
     child

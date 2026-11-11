@@ -4,7 +4,7 @@
 
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep};
-use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_sleep};
+use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
 use crate::test_groups::{pidfd_group_signal, Group};
 
 /// Who reaps the root.
@@ -83,7 +83,7 @@ fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
 /// nothing and reports no skipped kill.
 fn sends_nothing_to_an_empty_group_and_reports_no_skip(reap: Reap, teardown: Teardown) {
     crate::log_capture::install();
-    let child = session_sleep().spawn().expect("spawn");
+    let child = session_cat().spawn().expect("spawn");
     reap_root(&child, reap);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
@@ -198,7 +198,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
 ) {
     use crate::identity::Resolved;
     crate::log_capture::install();
-    let mut child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
@@ -223,7 +223,7 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
 fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown: Teardown) {
     use crate::identity::Resolved;
     crate::log_capture::install();
-    let mut child = session_sleep().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();

@@ -24,11 +24,11 @@ fn silent_leaf(dir: &tempfile::TempDir) -> (CgroupLeaf, OwnedFd) {
     (leaf, child_end)
 }
 
-/// Starts a `sleep` and returns its pid. Nothing waits on it through `std`: each test reaps it itself,
-/// behind the leaf's back.
-fn spawn_sleeper() -> u32 {
-    let mut cmd = std::process::Command::new("sleep");
-    cmd.arg("3600");
+/// Starts a blocker and returns its pid. Nothing waits on it through `std`: each test ends it through
+/// its pidfd and reaps it itself, behind the leaf's back. The forgotten `Child` keeps the write end
+/// of its stdin open, so only that kill ends it.
+fn spawn_blocker() -> u32 {
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the child");
     let pid = child.id();
     std::mem::forget(child);
@@ -70,7 +70,7 @@ fn assert_absent_and_exited(verdict: Result<(), NotPlaced>, pid: u32) {
 fn verdict_after_foreign_reap_and_reuse_body() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut leaf, _child_end) = silent_leaf(&dir);
-    let pid = spawn_sleeper();
+    let pid = spawn_blocker();
     let held = pidfd_of(pid);
     end(held.as_fd());
     let reuser = reap_behind_and_reuse(pid);
@@ -105,7 +105,7 @@ in_fresh_pid_ns!(
 fn verdict_after_foreign_reap_body() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut leaf, _child_end) = silent_leaf(&dir);
-    let pid = spawn_sleeper();
+    let pid = spawn_blocker();
     let held = pidfd_of(pid);
     end(held.as_fd());
     wait_pollin(held.as_fd());
@@ -134,7 +134,7 @@ fn state_read_over_a_reused_number_is_discarded_body() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    let pid = spawn_sleeper();
+    let pid = spawn_blocker();
     let held = pidfd_of(pid);
     let reuser = Rc::new(RefCell::new(None));
     let _hook = fault::set_before_state_read({

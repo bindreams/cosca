@@ -770,7 +770,7 @@ fn the_creator_pid_reads_on_every_process_that_opens() {
 }
 
 /// The creator pid is the pid of the process that made this one, and still is once that process has
-/// exited: Windows never reparents. The fixture shell is terminated while its `ping` lives on in the
+/// exited: Windows never reparents. The fixture shell is terminated while its `more` lives on in the
 /// fixture's job.
 ///
 /// Mutant: the creator read names the current parent, or is lost with the creator.
@@ -797,7 +797,7 @@ fn the_creator_pid_survives_the_creators_exit() {
 
 /// The candidate's creator is the claimed parent, but the parent's pid cannot be opened to prove it
 /// still holds it: the read is `Unknown`, blaming the parent and not the candidate. The parent is a
-/// real shell that grants no query right, and the candidate is the `ping` it launched.
+/// real shell that grants no query right, and the candidate is the `more` it launched.
 ///
 /// Mutant: an unprovable parent reads as held (`Found`) or as gone, or blames the candidate.
 #[skuld::test]
@@ -809,12 +809,12 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_opened_to_prove_it() {
         return;
     };
     let shell = spawn_restricted_shell(&done, PROCESS_SYNCHRONIZE.0);
-    let ping = shell.wait_for_child();
+    let candidate = shell.wait_for_child();
     assert!(shell.is_running(), "precondition: the parent must be live");
     // The shell cannot be read by pid, so its id is stated; only its pid is looked up.
     let parent = crate::identity::ProcessId::from_parts_for_test(shell.pid(), Key::for_test(1));
     let (read, cause) =
-        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, ping, Some(parent), None, None);
+        crate::identity::ProcessId::of_ordered_with(&crate::identity::HostKernel, candidate, Some(parent), None, None);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), Some(shell.pid()));
 }

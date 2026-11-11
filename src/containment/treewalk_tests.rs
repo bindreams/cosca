@@ -488,9 +488,9 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
 /// row says nothing about them. The root's order key and creator are read from its own handle, which
 /// is held.
 ///
-/// The root is a `cmd.exe` that holds its `ping` child, and the child ends by itself after 30
-/// seconds: a kill that did not happen fails the assertion on its exit code, and a failed row leaves
-/// the child running for that long at most.
+/// The root is a `cmd.exe` that holds its `more.com` child, blocked on a stdin this test holds: it is
+/// released (and exits `0`) only after `hard_kill`, so a kill that did not happen fails the assertion
+/// on its exit code instead of hanging the wait.
 ///
 /// Mutant: a root with no row in the snapshot is `Unassessable`, or walks nothing.
 #[cfg(windows)]
@@ -507,35 +507,33 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     use crate::Recursive;
 
     // The std `Child` holds the root's process handle until it is dropped, at the end of the row.
+    let more = crate::test_child::windows_more();
     let mut shell = crate::test_spawn::spawn(
         std::process::Command::new("cmd.exe")
-            .args(["/c", "ping.exe", "-n", "30", "127.0.0.1"])
-            .stdin(Stdio::null())
+            .arg("/c")
+            .arg(&more)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
     )
     .expect("spawn the root");
     let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
-    // The `ping` inherits the root's output pipe and prints its banner as it starts, so the first
-    // byte read says it exists. The pipe stays open in `shell`: a closed one would end the `ping`.
+    // `more` inherits the root's pipes. It echoes a line as it reads it, so the first byte read
+    // back says it exists. Both pipes stay open: `std`'s `wait` would close the stdin, which ends
+    // `more`, and a closed stdout would end it too.
+    let mut stdin = shell.stdin.take().expect("piped stdin");
+    std::io::Write::write_all(&mut stdin, b"x\r\n").expect("feed the child a line");
     let mut first = [0u8; 1];
-    let read = std::io::Read::read(shell.stdout.as_mut().expect("piped stdout"), &mut first).expect("read the banner");
-    assert_eq!(read, 1, "the root closed its output before its child printed");
-    // The root's children are its console host and its `ping`.
-    let is_ping = |id: &ProcessId| {
-        crate::identity::windows_fixture::image_file_name(id.pid()).is_some_and(|image| {
-            std::path::Path::new(&image)
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("ping.exe"))
-        })
-    };
+    let read = std::io::Read::read(shell.stdout.as_mut().expect("piped stdout"), &mut first).expect("read the echo");
+    assert_eq!(read, 1, "the root closed its output before its child echoed");
+    // The root's children are its console host and its `more`.
     let children = root.children(Recursive::No).expect("the root's children");
-    let ping = children
+    let held = children
         .into_iter()
-        .find(is_ping)
-        .expect("the root has a `ping` child")
+        .find(|id| crate::identity::windows_fixture::is_more_com(id.pid()))
+        .expect("the root has a `more` child")
         .pid();
-    let Opened::Found(ping_handle) =
-        windows_open_classified(ping, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
+    let Opened::Found(held_handle) =
+        windows_open_classified(held, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
     else {
         panic!("the child is ours and openable");
     };
@@ -544,27 +542,30 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
 
     let parents = crate::test_child::parents_once_unlisted(root.pid());
     assert!(
-        parents.iter().any(|&(pid, ppid)| pid == ping && ppid == root.pid()),
+        parents.iter().any(|&(pid, ppid)| pid == held && ppid == root.pid()),
         "precondition: the running child must still name the exited root as its creator"
     );
 
     let children = root.children(Recursive::No).expect("the exited root's children");
     assert!(
-        children.iter().any(|id| id.pid() == ping),
-        "{ping} not among {children:?}"
+        children.iter().any(|id| id.pid() == held),
+        "{held} not among {children:?}"
     );
     super::hard_kill(&HostKernel, root)
         .into_result()
         .expect("an exited root whose handle is held is walked completely");
 
-    // SAFETY: `ping_handle` is our live handle with the synchronize right. The wait ends with the
-    // kill just asked for, or with the child's own exit.
-    let waited = unsafe { WaitForSingleObject(ping_handle, INFINITE) };
+    // Released only now: a kill that never came ends the child by itself, with code 0, which the
+    // assertion below fails.
+    drop(stdin);
+    // SAFETY: `held_handle` is our live handle with the synchronize right. The wait ends with the
+    // kill just asked for, or with the child's release.
+    let waited = unsafe { WaitForSingleObject(held_handle, INFINITE) };
     assert_eq!(waited, WAIT_OBJECT_0, "the wait on the child returned {waited:?}");
     let mut code = 0u32;
-    // SAFETY: `ping_handle` is live with the query right; `code` is a u32.
-    unsafe { GetExitCodeProcess(ping_handle, &mut code) }.expect("the child's exit code");
-    windows_close(ping_handle);
+    // SAFETY: `held_handle` is live with the query right; `code` is a u32.
+    unsafe { GetExitCodeProcess(held_handle, &mut code) }.expect("the child's exit code");
+    windows_close(held_handle);
     assert_eq!(
         code,
         crate::identity::WINDOWS_TERMINATE_EXIT_CODE,

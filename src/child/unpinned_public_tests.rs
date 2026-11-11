@@ -89,21 +89,40 @@ pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
 }
 
 /// A session child whose root `cat` (held on its stdin, so only a signal ends it) holds one
-/// descendant `sleep`, a second marker holder, and that descendant's pid, read once the root has
-/// started it. Neither exits on its own, so the holders do not change under a sweep.
-pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32) {
+/// descendant `cat`, a second marker holder on the same stdin, and that descendant's pid, read once
+/// the root has started it. Nothing is written to the stdin, so neither exits on its own before the
+/// writer drops, and the holders do not change under a sweep. The last element is the read end of a
+/// pipe only the descendant holds, for [`assert_descendant_dies`]: it reaches EOF when the
+/// descendant ends, whatever happens to the stdin.
+pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32, crate::PipeReader) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);
+    // A background job's stdin is `/dev/null` unless it is redirected (see `BLOCKER_ARGV`).
+    cmd.args([
+        "sh",
+        "-c",
+        "exec 3<&0; cat <&3 3<&- >/dev/null & echo $!; exec cat 3<&- 4>&-",
+    ]);
     cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
+    cmd.fd(4, crate::Stdio::pipe_out()).expect("set the descendant's pipe");
     cmd.contain_with(ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
     let mut line = String::new();
     BufReader::new(child.stdout().expect("piped stdout"))
         .read_line(&mut line)
         .expect("the descendant's pid");
-    (child, writer, line.trim().parse().expect("a pid"))
+    let gone = child.fd_read_end(4.into()).expect("the descendant's pipe");
+    (child, writer, line.trim().parse().expect("a pid"), gone)
+}
+
+/// Blocks until the [`session_tree`] descendant is gone: its pipe reaches EOF. Call it once the test
+/// has shown the descendant was signalled and before releasing the stdin, so a signal that went
+/// nowhere cannot pass by the stdin's EOF ending the descendant anyway.
+pub(crate) fn assert_descendant_dies(mut gone: crate::PipeReader) {
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut gone, &mut rest).expect("the descendant's pipe reaches EOF");
+    assert!(rest.is_empty(), "unexpected output from the descendant: {rest:?}");
 }
 
 /// The two states the tree paths cannot send by number for.
@@ -385,7 +404,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let groups = crate::containment::unix::fault::record_kill_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (mut child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant, gone) = session_tree();
         let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -407,6 +426,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGKILL, &want, state);
         assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
+        assert_descendant_dies(gone);
         drop(writer);
     }
 }
@@ -506,7 +526,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         let groups = crate::containment::unix::fault::record_term_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (mut child, writer, descendant) = session_tree();
+        let (mut child, writer, descendant, gone) = session_tree();
         let pid = child.pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -527,6 +547,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_sent_by_identity(&sends, libc::SIGTERM, &want, state);
         assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
+        assert_descendant_dies(gone);
         drop(writer);
     }
 }
