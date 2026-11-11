@@ -536,7 +536,7 @@ fn host_filesystem_same_file_holds_both_files_while_comparing() {
 /// `same_file` does not wait for a writer on a FIFO.
 ///
 /// Mutant: `same_file` opens the paths for reading, which blocks until a writer appears. The bound
-/// for that hang is the `slow-timeout` override in `.config/nextest.toml`.
+/// for that hang is the suite's `slow-timeout` in `.config/nextest.toml`.
 #[cfg(unix)]
 #[skuld::test]
 fn host_filesystem_same_file_does_not_block_on_a_fifo() {

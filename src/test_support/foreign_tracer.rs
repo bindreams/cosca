@@ -429,7 +429,7 @@ pub(crate) enum Names {
 ///
 /// A teardown whose kill sends nothing waits all the same and returns once the tracer has let go, so
 /// it fails an assertion here instead of hanging. A teardown that polls instead of sleeping in
-/// `waitid` (`OwnedChild`'s wait) is waited for until nextest's bound.
+/// `waitid` (`OwnedChild`'s wait) is waited for until the suite slow-timeout.
 #[cfg(feature = "tokio")]
 pub(crate) fn assert_warns_once_before_blocking<R: Send>(
     names: Names,

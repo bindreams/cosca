@@ -759,7 +759,7 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
 
     // The pipe was full before `arm`, so a correctly armed knote is already ready. A zero-timeout
     // `kevent` on a separate probe kqueue checks that without touching `fut`'s queue. This
-    // catches an `EV_DISABLE` arm in-process; the nextest override covers what it cannot.
+    // catches an `EV_DISABLE` arm in-process; the suite slow-timeout covers what it cannot.
     assert!(
         kqueue_fd_is_already_readable(armed_kq_fd),
         "a knote armed without EV_DISABLE on a full pipe must be immediately readable, but the \

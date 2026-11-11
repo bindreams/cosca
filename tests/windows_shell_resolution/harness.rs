@@ -606,8 +606,8 @@ fn shell_execute_in_apartment(
 /// Hitting this bound is a FAILURE, not a passing answer: nothing about this probe's actual
 /// question was measured, whether the block sat inside `ShellExecuteExW` itself or inside the
 /// nested child wait and recovery — `shell_execute_bounded`'s error message names which, using
-/// `BoundedCallState`'s `CallState`. Chosen well below `.config/nextest.toml`'s 180s
-/// `terminate-after` for this binary, so a genuine block is diagnosed here and reported with
+/// `BoundedCallState`'s `CallState`. Chosen below the suite's 300s kill (`terminate-after`)
+/// in `.config/nextest.toml`, so a genuine block is diagnosed here and reported with
 /// context, rather than only visible as a bare timeout kill with no diagnosis.
 pub(crate) const SHELL_EXECUTE_BOUND: Duration = Duration::from_secs(60);
 

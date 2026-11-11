@@ -283,7 +283,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     let _ = child.wait().await.expect("reap after cancelled graceful");
     // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
     // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
-    // the nextest override).
+    // the suite slow-timeout).
 }
 
 #[cfg(feature = "tokio")]

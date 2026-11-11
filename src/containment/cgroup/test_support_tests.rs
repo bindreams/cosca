@@ -2,7 +2,7 @@ use super::{fork_running, reap, reap_status};
 
 /// A panic after `fork_running` must not leave the child unreaped: the guard's `Drop` reaps it
 /// during unwind. Checked via an independent pidfd, which reports `ECHILD` once the child is
-/// reaped. If the kill regresses, this hangs (bounded by `nextest.toml`).
+/// reaped. If the kill regresses, this hangs (bounded by the suite slow-timeout).
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_panic_after_fork_running_still_reaps_the_child() {
