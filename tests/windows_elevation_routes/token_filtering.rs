@@ -421,8 +421,8 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
                     Err(e) => panic!(
                         "PROBE unelevated-view: {route}'s medium child's exit could not be \
                          confirmed, so this route's measurement is incomplete and must not be \
-                         trusted: {e}. If that error came through kill_and_reap's fallback, only \
-                         the immediate child's death is confirmed there — never the rest of the \
+                         trusted: {e}. If that error says it confirms only the immediate child, \
+                         only the immediate child's death is confirmed — never the rest of the \
                          tree — and unwinding from this panic drops this probe's own temp \
                          directory, racing any grandchild that could still be alive and writing \
                          into it."
