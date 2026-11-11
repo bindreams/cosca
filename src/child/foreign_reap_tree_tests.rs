@@ -88,6 +88,42 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg() {
     assert_one_untrusted_number_warn(mark, pid);
 }
 
+/// After this handle's own reap, a pid that names no process may be taken by another process once
+/// its group has no member: `kill_tree` sends no `killpg`, and answers `Unassessable` with how to end
+/// the descendants.
+///
+/// Mutants: the group killed by a pid that names no process; the remedy left out of the error.
+#[skuld::test]
+fn kill_tree_after_own_wait_whose_pid_names_no_process_sends_no_killpg() {
+    #[cfg(target_os = "linux")]
+    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    crate::log_capture::install();
+    let recorder = record_kill_group();
+    let child = session_sleep().spawn().expect("spawn");
+    let pid = child.pid();
+    kill_own_child(pid);
+    child.wait().expect("this handle reaps the root");
+    let _gone = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
+
+    let mark = crate::log_capture::mark();
+    let err = child
+        .kill_tree()
+        .expect_err("a group the pid no longer names is not assessable");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
+        "{err}"
+    );
+    assert_eq!(
+        recorder.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a number that names no process"
+    );
+    assert_one_untrusted_number_warn(mark, pid);
+}
+
 /// A root whose own handle cannot say whether it was reaped: its pid may name another process, so
 /// `kill_tree` sends no `killpg`, kills the root through its pidfd, which names it exactly, and
 /// answers `Unassessable`. (macOS answers this earlier, through its untrusted-root path.)
@@ -436,13 +472,14 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group() {
 }
 
 /// After this handle's own reap, with the pid naming nothing, an fd marker with a group (the default
-/// containment) kills its group and its holders, and walks nothing from the pid. `Ok` follows, and
-/// the tree counts as killed, so the drop neither sweeps again nor warns.
+/// containment) sends no `killpg` and walks nothing from the pid, but still kills its holders. The
+/// call is `Unassessable`, its text says how to end the descendants, and the group counts as
+/// not killed, so the drop warns of it.
 ///
-/// Mutants: the tree not marked killed; `no_walk_signal` returns an error.
+/// Mutants: the group killed by the pid that names nothing; no holders sweep; `Ok` answered.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_killed() {
+fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders() {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
@@ -450,18 +487,24 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_ki
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, false);
-    let pid = child.pid();
     child.kill().expect("kill the root");
     child.wait().expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
 
-    child.kill_tree().expect("the group and every holder were reached");
+    let err = child
+        .kill_tree()
+        .expect_err("a group the pid no longer names is not assessable");
 
-    // A pid that names nothing is still killed as the group's id.
-    let by_id = groups.killed();
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert!(
-        !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
-        "the group is killed by its id: {by_id:?}"
+        err.to_string()
+            .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
+        "{err}"
+    );
+    assert_eq!(
+        groups.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
     );
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
     assert_eq!(
@@ -472,23 +515,23 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_is_ok_and_marks_the_tree_ki
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark, ""),
-        Vec::<String>::new(),
-        "the tree was killed: the drop does not warn"
+        warns_since(mark, "").len(),
+        1,
+        "the group was not killed: the drop warns once"
     );
     holder.assert_dies();
 }
 
-/// `graceful_shutdown_tree` after this handle's own reap, with the pid naming nothing: the group and
-/// the holders get the `SIGTERM`, then the kill, and no walk runs from the pid. The holder ignores
-/// the `SIGTERM`, so only the kill ends it. The call answers the status the wait collected, and the
-/// tree counts as killed, so the drop does not warn.
+/// `graceful_shutdown_tree` after this handle's own reap, with the pid naming nothing: the holders
+/// get the `SIGTERM`, then the kill, and nothing goes out by the pid. The holder ignores the
+/// `SIGTERM`, so only the kill ends it. The call is `Unassessable`, its text says how to end the
+/// descendants, and the drop warns that the group was not killed.
 ///
-/// Mutants: the `SIGTERM` skipped or answered with an error; the tree not marked killed;
-/// `no_walk_signal` returns an error.
+/// Mutants: the group signalled by the pid that names nothing; the `SIGTERM` or the kill of the
+/// holders skipped; the collected status answered.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_collected_status() {
+fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_the_holders() {
     use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::escaped_holder_tree;
     crate::log_capture::install();
@@ -497,23 +540,30 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_co
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
     let (child, holder) = escaped_holder_tree(crate::ContainMode::Session, true);
-    let pid = child.pid();
     child.kill().expect("kill the root");
-    let collected = child.wait().expect("this handle reaps the root");
+    child.wait().expect("this handle reaps the root");
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
 
-    let status = child
+    let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
-        .expect("the group and every holder were reached");
+        .expect_err("a group the pid no longer names is not assessable");
 
-    assert_eq!(status, collected, "the status the wait collected");
-    // A pid that names nothing is still signalled as the group's id.
-    for (what, by_id) in [("SIGTERM", termed.termed()), ("kill", killed.killed())] {
-        assert!(
-            !by_id.is_empty() && by_id.iter().all(|g| *g == pid as i32),
-            "the group's {what} by its id: {by_id:?}"
-        );
-    }
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
+        "{err}"
+    );
+    assert_eq!(
+        termed.termed(),
+        Vec::<i32>::new(),
+        "no SIGTERM by a reaped root's number"
+    );
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "no killpg by a reaped root's number"
+    );
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
     assert_eq!(
         holders.signals_to(holder.pid),
@@ -523,9 +573,9 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_answers_the_co
     let mark = crate::log_capture::mark();
     drop(child);
     assert_eq!(
-        warns_since(mark, ""),
-        Vec::<String>::new(),
-        "the tree was killed: the drop does not warn"
+        warns_since(mark, "").len(),
+        1,
+        "the group was not killed: the drop warns once"
     );
     holder.assert_dies();
 }

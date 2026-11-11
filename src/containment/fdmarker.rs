@@ -845,9 +845,6 @@ enum Scope<'r> {
     /// The marker holders alone, for a root whose number names no one reliably any more. `except`
     /// is a holder to leave alone: the root, when this process does not pin it.
     HoldersOnly { except: Option<ProcessId> },
-    /// The group and the marker holders, for a root this process reaped whose pid names no process:
-    /// the group lives while a member does, but a walk from the pid would find none of the tree.
-    GroupAndHolders(&'r GroupRoot<'r>),
 }
 
 /// The live marker for one contained tree.
@@ -1075,14 +1072,6 @@ impl Marker {
         self.hard_kill_impl(Scope::HoldersOnly { except })
     }
 
-    /// [`hard_kill`](Self::hard_kill) through the group and the marker-holder channel, with no root
-    /// identity kill and no walk from the root's pid: for a root this process reaped, whose pid
-    /// names no process. Its children were reparented at its exit, so a walk would find only a
-    /// later process's children.
-    pub(crate) fn hard_kill_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::GroupAndHolders(root))
-    }
-
     fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
@@ -1130,12 +1119,6 @@ impl Marker {
     /// [`hard_kill_holders_only`](Self::hard_kill_holders_only) does for the kill.
     pub(crate) fn terminate_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
         self.terminate_impl(Scope::HoldersOnly { except })
-    }
-
-    /// [`terminate`](Self::terminate) through the group and the marker-holder channel, as
-    /// [`hard_kill_group_and_holders`](Self::hard_kill_group_and_holders) does for the kill.
-    pub(crate) fn terminate_group_and_holders(&self, root: &GroupRoot<'_>) -> Result<(), Error> {
-        self.terminate_impl(Scope::GroupAndHolders(root))
     }
 
     fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
@@ -1326,12 +1309,12 @@ impl Marker {
     ) -> bool {
         let walk = matches!(scope, Scope::Full(_));
         let group = match scope {
-            Scope::Full(root) | Scope::GroupAndHolders(root) => Some(root),
+            Scope::Full(root) => Some(root),
             Scope::HoldersOnly { .. } => None,
         };
         let except = match scope {
             Scope::HoldersOnly { except } => except,
-            Scope::Full(_) | Scope::GroupAndHolders(_) => None,
+            Scope::Full(_) => None,
         };
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
@@ -1345,7 +1328,6 @@ impl Marker {
                     Scope::Full(_) => {
                         "the group signal and root kill below still run, since neither needs the process table"
                     }
-                    Scope::GroupAndHolders(_) => "the group signal below still runs, since it needs no process table",
                     Scope::HoldersOnly { .. } => "nothing else runs, so nothing is signalled this pass",
                 };
                 log::warn!(
@@ -1371,8 +1353,7 @@ impl Marker {
         // skipped when blind, since there is nothing to walk). The walk keeps a process whose
         // ppid, read after the root was proved, names it.
         //
-        // Skipped outside `Scope::Full`: the root's pid names no one reliably any more, or names no
-        // process and has no descendants left to walk to.
+        // Skipped outside `Scope::Full`: the root's pid names no one reliably any more.
         let mut new_walk: Vec<ProcessId> = Vec::new();
         debug_assert!(
             !walk || self.root.is_some(),

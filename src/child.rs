@@ -580,10 +580,14 @@ impl Child {
     /// **After this handle's own reap.** The root's children were reparented at its exit, so no walk
     /// runs from its pid. Another process at that pid means the group is empty: nothing is sent by
     /// the pid, and the call is `Ok` once every marker holder was reached. A pid that cannot be read
-    /// is `Unassessable` as above. A pid that names no process is still signalled as the group's id:
-    /// the root's group while a member survives, but once none does, another process may take the
-    /// number, and lead a group by it, first. On Linux 6.9+ the root's pidfd shows exactly whether
-    /// the group still has a member, so no send by number reaches a group that took the number.
+    /// is `Unassessable` as above, and so is a pid that names no process: once the group has no
+    /// member, another process may take the number, and lead a group by it, first. Where the root's
+    /// pidfd does not name the group (Linux below 6.9, macOS), nothing is sent by the pid, and the
+    /// call returns `Unassessable` (or a marker holders' error) with a `warn`. Descendants that
+    /// outlived the reaped root are then not ended: call `kill_tree` before [`wait`](Child::wait) to
+    /// end them. On Linux 6.9+ the root's pidfd shows exactly whether the group still has a member,
+    /// so the group is killed through it while it has one, and no send by number reaches a group that
+    /// took the number.
     ///
     /// **A reap after the look.** All of this is decided on one look at the root. A
     /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
