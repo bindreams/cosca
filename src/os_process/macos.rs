@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use mach2::message::audit_token_t;
 
-use super::{Exit, OsProcess, WaitFor, OPEN_CONSEQUENCE};
+use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
 use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
@@ -94,9 +94,6 @@ pub(crate) fn read_for_open(pid: u32, consequence: &str) -> Result<Option<UniqIn
         }),
     }
 }
-
-/// What a refused read that arms the exit watch leaves undone.
-const EXIT_CONSEQUENCE: &str = "its exit cannot be observed";
 
 /// An audit token that names `pid` at `id_version`: `val[5]` and `val[7]`, the two words the kernel
 /// reads.

@@ -13,7 +13,6 @@ use crate::signal::{Sent, Sig};
 /// never sends by the root's pid or to the root itself. A tree call and a drop alike get the same
 /// answer for the same root.
 pub(crate) trait Root {
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends by the root's pid"))]
     fn pid(&self) -> u32;
 
     /// Send `sig` to the root through the handle that holds it, the one route a walk sends the root

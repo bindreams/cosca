@@ -43,8 +43,8 @@ impl Process {
     /// - [`Error::NotThreadGroupLeader`]: on Linux, `id` names a live thread that is not its
     ///   process's leader.
     /// - [`Error::Io`]: the open failed otherwise (on Linux a failed pidfd call: `pidfd_open`, the
-    ///   pidfd's inode read, or its `poll`, prefixed with the call's name; a kqueue that cannot be
-    ///   created or armed on macOS).
+    ///   pidfd's inode read, or its `poll`, prefixed with the call's name). macOS opens no kqueue:
+    ///   the first look at the process does ([`wait`](Self::wait)).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
         Self::open_with(&crate::identity::HostKernel, id)
     }
@@ -111,7 +111,10 @@ impl Process {
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
     /// parent gets one). Non-reaping. Returns at once for a process that has already exited.
     /// `Err` only on a wait failure; on Windows, for a handle without `SYNCHRONIZE`, while the
-    /// process runs (`ERROR_ACCESS_DENIED`).
+    /// process runs (`ERROR_ACCESS_DENIED`). On macOS the first look at the process (a wait, a
+    /// timed wait or [`is_alive`](Self::is_alive)) arms its exit watch, a kqueue, so a wait there
+    /// can also fail with [`Error::Io`] when the kqueue cannot be created or armed (`EMFILE`), or
+    /// [`Error::Unassessable`] when the process's unique id cannot be read.
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::os_process::drive::exited_held(&*self.os, None)?;
         debug_assert!(exited);

@@ -21,7 +21,8 @@ pub(crate) enum Via {
     Pidfd,
     Pid,
     /// `Child::kill_tree`'s backstop, the root's kill through the child's own handle after the
-    /// sweep: written by the caller, beside the send's own record.
+    /// sweep: written by the caller beside the send's own record, when the OS accepted a send the
+    /// backstop made.
     Handle,
     Identity,
 }
@@ -118,6 +119,12 @@ pub(crate) fn record(pid: u32, sig: Sig, via: Via) {
             entries.push((pid, sig, via));
         }
     });
+}
+
+/// How many sends [`record`] has logged on this thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded() -> usize {
+    LOG.with(|log| log.borrow().as_ref().map_or(0, Vec::len))
 }
 
 /// Collects this thread's send attempts until dropped.

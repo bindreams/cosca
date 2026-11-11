@@ -470,23 +470,25 @@ impl crate::containment::Root for ReapHold<'_> {
     }
 }
 
-/// [`OwnedChild::hold`] where nothing is sent by the root's pid (Windows): there is no reap to hold
-/// off, and the root is what a tree call sends the root's own signal through.
+/// The root of a tree call where nothing is sent by the root's pid (Windows): the call sends the
+/// root its own signal through this handle. It holds no lock and holds off no reap.
 #[cfg(not(unix))]
-pub(crate) struct ReapHold<'a> {
+pub(crate) struct RootHandle<'a> {
     child: &'a OwnedChild,
     pid: u32,
 }
 
 #[cfg(not(unix))]
 impl OwnedChild {
-    pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {
-        ReapHold { child: self, pid }
+    /// The root for a tree call, under the name Unix's `hold` has, where it also locks the handle.
+    /// Windows has no reap to hold off, so nothing is locked.
+    pub(crate) fn hold(&self, pid: u32) -> RootHandle<'_> {
+        RootHandle { child: self, pid }
     }
 }
 
 #[cfg(not(unix))]
-impl crate::containment::Root for ReapHold<'_> {
+impl crate::containment::Root for RootHandle<'_> {
     fn pid(&self) -> u32 {
         self.pid
     }

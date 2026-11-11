@@ -676,10 +676,13 @@ impl Child {
             );
             (Ok(()), true)
         } else {
+            #[cfg(all(test, target_os = "linux"))]
+            let before = crate::send_log::recorded();
             let sent = self.kill_root();
-            // Where a test tells this send from the walk's own kill of the root through the same handle.
-            #[cfg(all(test, unix))]
-            if !matches!(sent, Ok(crate::signal::Sent::Gone)) {
+            // Where a test tells this send from the walk's own kill of the root through the same handle:
+            // only a send the backstop made, which the OS accepted, is its own.
+            #[cfg(all(test, target_os = "linux"))]
+            if matches!(sent, Ok(crate::signal::Sent::Delivered)) && crate::send_log::recorded() > before {
                 crate::send_log::record(self.pid(), crate::signal::Sig::Kill, crate::send_log::Via::Handle);
             }
             SweepFailure::backstop_of(

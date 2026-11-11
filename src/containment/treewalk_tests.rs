@@ -15,8 +15,59 @@ use std::collections::HashMap;
 const ROOT_PID: RawPid = 100;
 const ROOT_TOKEN: u64 = 1_000;
 
+/// A tree call given no owner kills and terminates the root by identity, as a member is: it walks
+/// and sends, it does not refuse. The blocker's stdin stays open, so only the kill ends it.
+///
+/// Mutant: a call given no owner answers `Unwalked` and sends nothing.
+#[cfg(any(unix, windows))]
+#[skuld::test]
+fn a_tree_call_given_no_owner_sends_the_roots_kill_by_identity() {
+    let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+
+    super::kill_tree(id, None)
+        .into_result()
+        .expect("the walk found the root and killed it");
+
+    let status = child.wait().expect("the killed root is reaped");
+    assert!(!status.success(), "the kill ended the root, not its stdin: {status:?}");
+    drop(stdin);
+}
+
+/// [`a_tree_call_given_no_owner_sends_the_roots_kill_by_identity`], for the `SIGTERM`.
+///
+/// Mutant: a call given no owner answers an error and sends nothing.
+#[cfg(unix)]
+#[skuld::test]
+fn a_tree_call_given_no_owner_sends_the_roots_term_by_identity() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+
+    match super::terminate_tree(id, None) {
+        crate::containment::TerminateOutcome::Sent { result: Ok(()), .. } => {}
+        other => panic!("the walk found the root and signalled it: {other:?}"),
+    }
+
+    let status = child.wait().expect("the signalled root is reaped");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    drop(stdin);
+}
+
+/// An unverified send, which no handle a walk sends through gives, asserts in debug. Mutant: it is
+/// read as an ordinary answer.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn an_unverified_send_is_a_contract_breach() {
+    assert!(
+        std::panic::catch_unwind(|| super::KillOutcome::of(Ok(crate::signal::Sent::Unverified))).is_err(),
+        "the breach did not assert"
+    );
+}
+
 /// The one reading of a send's answer, for a walk's members and the root alike. Mutants: a refusal
-/// is read as delivered or gone; an unverified send is read as delivered.
+/// is read as delivered or gone.
 #[skuld::test]
 fn a_sends_answer_is_one_outcome_whoever_sent() {
     use super::KillOutcome;
@@ -24,10 +75,6 @@ fn a_sends_answer_is_one_outcome_whoever_sent() {
 
     assert!(matches!(KillOutcome::of(Ok(Sent::Delivered)), KillOutcome::Terminated));
     assert!(matches!(KillOutcome::of(Ok(Sent::Gone)), KillOutcome::AlreadyGone));
-    assert!(matches!(
-        KillOutcome::of(Ok(Sent::Unverified)),
-        KillOutcome::NotAttempted(Error::Unassessable { .. })
-    ));
     match KillOutcome::of(Err(Error::Io(std::io::Error::from(
         std::io::ErrorKind::PermissionDenied,
     )))) {

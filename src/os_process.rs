@@ -67,10 +67,23 @@ pub(crate) enum WaitFor<'a> {
     Signalled(BorrowedHandle<'a>),
 }
 
+/// The words of what a failed look at a process leaves undone, which [`EXIT_CONSEQUENCE`] and
+/// [`OPEN_CONSEQUENCE`] both say.
+#[cfg(unix)]
+macro_rules! exit_unobserved {
+    () => {
+        "its exit cannot be observed"
+    };
+}
+
+/// What is left undone when the look that arms an exit watch cannot go ahead (macOS).
+#[cfg(target_os = "macos")]
+pub(crate) const EXIT_CONSEQUENCE: &str = exit_unobserved!();
+
 /// What is left undone when an [`open`] cannot go ahead, for the errors it returns: the one open
 /// serves every act on the process.
 #[cfg(unix)]
-pub(crate) const OPEN_CONSEQUENCE: &str = "its exit cannot be observed and no signal was sent";
+pub(crate) const OPEN_CONSEQUENCE: &str = concat!(exit_unobserved!(), " and no signal was sent");
 
 /// What a message calls a child whose pid is not known ([`OsChild::pid`](child::OsChild::pid)).
 pub(crate) const PIDLESS_CHILD: &str = "the child (pid unknown)";
@@ -92,8 +105,8 @@ pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
 #[derive(Debug)]
 pub(crate) enum OpenFailure {
     /// Linux: a pidfd call failed for a reason that says nothing about the target. The call and its
-    /// errno are for a consumer to build its own error from ([`into_open_error`](Self::into_open_error),
-    /// [`into_member_error`](Self::into_member_error)).
+    /// errno are for a consumer to build its own error from: [`into_open_error`](Self::into_open_error)
+    /// is [`Process::open`](crate::Process::open)'s.
     #[cfg(target_os = "linux")]
     Call(crate::identity::FailedCall),
     /// An error already in its final form: every other failure, on every platform.
@@ -114,32 +127,6 @@ impl OpenFailure {
             #[cfg(target_os = "linux")]
             OpenFailure::Call(call) => linux::open::open_error(call),
             OpenFailure::Finished(error) => error,
-        }
-    }
-
-    /// The error a walk gives a member of `pid` that cannot be opened by identity, which leaves
-    /// nothing to send to: the error the walk gives the same pid when it cannot read it
-    /// ([`unqueryable`](crate::identity::unqueryable)). Linux names a failed call by it, and an
-    /// error that is no refusal of a signal (a live thread that leads no group, a `poll` that
-    /// reported `POLLERR`) is [`Error::Unassessable`] with it as its source.
-    pub(crate) fn into_member_error(self, pid: crate::identity::RawPid) -> Error {
-        match self {
-            #[cfg(target_os = "linux")]
-            OpenFailure::Call(call) => crate::identity::call_error(&format!("pid {pid}"), call),
-            #[cfg(target_os = "linux")]
-            OpenFailure::Finished(error @ (Error::Unassessable { .. } | Error::Unsupported { .. })) => error,
-            #[cfg(target_os = "linux")]
-            OpenFailure::Finished(other) => Error::Unassessable {
-                detail: format!(
-                    "pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {other}"
-                ),
-                source: Some(Box::new(other)),
-            },
-            #[cfg(not(target_os = "linux"))]
-            OpenFailure::Finished(error) => {
-                let _ = pid;
-                error
-            }
         }
     }
 }
