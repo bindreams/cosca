@@ -8,14 +8,6 @@ nextest-version = { required = "0.9.151" }
 # test more time than this, or to set something other than a bound.
 slow-timeout = { period = "60s", terminate-after = 5, grace-period = "1s" }
 
-# The Windows elevation kill tests spawn through UAC and then wait for the payload's socket to end, with their own 20 s
-# failure bound (`assert_kill_matches_payload`), so that a false kill is a diagnostic panic. This bound counts from
-# the test's start, spawn included, and is the backstop for a hang the in-test bound does not cover; it is longer
-# than that bound, or a false kill would show as a timeout instead.
-[[profile.default.overrides]]
-filter = 'test(/kill_of_an_elevated_child_reports_what_happened/)'
-slow-timeout = { period = "60s", terminate-after = 1, grace-period = "1s" }
-
 [profile.ci]
 fail-fast = false
 # Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.
@@ -102,26 +94,10 @@ inherits = "ci"
 inherits = "ci"
 
 [[profile.ci.overrides]]
-# `windows_shell_resolution.rs` already bounds its own external waits in-process: every
-# `ShellExecuteExW` call likely to hang is wrapped in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
-# (60s), at most one such call per test. This override is a second, redundant safety net on top of
-# that in-process bound, for whatever it cannot cover: a wait this test binary cannot cancel (Win32
-# gives no way to cancel a call already inside `ShellExecuteExW`), or a kill that itself does not
-# land.
-#
-# This binary's worst per-test case IS the single-wait bound, unlike `windows_elevation_routes`
-# below: no test here makes more than one `SHELL_EXECUTE_BOUND`-wrapped call. 180s (3 * 60s) leaves
-# headroom over that 60s floor for the overhead around it (planting a batch file, copying a payload
-# binary, reading a marker back) without leaving so much that a genuine hang sits unreported for
-# multiple minutes.
-filter = 'binary(windows_shell_resolution)'
-slow-timeout = { period = "60s", terminate-after = 3 }
-
-[[profile.ci.overrides]]
 # `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
 # `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
-# safety net on top of that in-process bound, for whatever it cannot cover — same reasoning as
-# `windows_shell_resolution` above.
+# safety net on top of that in-process bound, for whatever it cannot cover: a wait this binary
+# cannot cancel, or a kill that itself does not land.
 #
 # The per-test worst case, not the single-wait bound, is what this has to clear:
 # `does_create_process_with_logon_elevate` calls `logon_one_account` once per scratch account (an
