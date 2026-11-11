@@ -306,6 +306,7 @@ impl Tree {
     pub(crate) fn teardown_subject(&self) -> String {
         match &self.holder {
             Holder::None => "None".to_owned(),
+            _ if self.released => "None".to_owned(),
             Holder::Delegated => "Delegated".to_owned(),
             Holder::Contained(mechanism) => mechanism.subject(),
         }
@@ -373,6 +374,7 @@ impl crate::child::owned::teardown::Reach for Tree {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
         match &self.holder {
             Holder::None | Holder::Delegated => Ok(false),
+            _ if self.released => Ok(false),
             Holder::Contained(mechanism) => mechanism.reached(child),
         }
     }
