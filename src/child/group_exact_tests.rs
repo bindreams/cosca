@@ -94,11 +94,12 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     assert_eq!(steps, [], "nothing was sent");
 }
 
-/// Below 6.9, after this handle's own reap, a root pid that names no process is still the id of the
-/// root's group while a member is left: the group is killed by that number, right after its check.
-/// Mutant: "after this handle's own reap, a pid that names nothing fails the check".
+/// Below 6.9, after this handle's own reap, a root pid that names no process may be taken once the
+/// group has no member, so `kill_tree` sends nothing by it, answers `Unassessable` with how to end
+/// the descendants, and the group's member lives on.
+/// Mutant: "after this handle's own reap, a pid that names nothing passes the check".
 #[skuld::test]
-fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
+fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() {
     let (child, member) = root_with_a_member();
     kill_own_child(child.pid());
     child.wait().expect("this handle reaps the root");
@@ -107,19 +108,14 @@ fn kill_tree_below_6_9_kills_the_group_by_number_after_this_handles_own_reap() {
     let result = child.kill_tree();
     let steps = capture.group_steps();
     drop(old_kernel);
-    result.expect("the group is killed by its number");
-    assert_eq!(
-        steps.get(..3),
-        Some(
-            &[
-                GroupStep::Group(Route::Pidfd, libc::SIGKILL),
-                GroupStep::Check,
-                GroupStep::Group(Route::Number, libc::SIGKILL)
-            ][..]
-        ),
-        "{steps:?}"
+    let err = result.expect_err("a group the pid no longer names is not assessable");
+    assert!(
+        err.to_string()
+            .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
+        "{err}"
     );
-    member.assert_killed();
+    assert_eq!(steps, [], "nothing was sent to the group");
+    member.assert_survived();
 }
 
 /// 6.9+: a root whose handle cannot say whether it was reaped still names its group exactly through

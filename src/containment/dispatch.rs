@@ -1433,24 +1433,6 @@ impl Attached {
         }
     }
 
-    /// Send `signal` to a macOS fd marker's group and holders, with no walk from the root's pid: for
-    /// a root this process reaped, whose pid names no process. `None` for any other mechanism. The
-    /// caller settles a `Kill`'s answer.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn signal_group_and_holders(
-        &self,
-        signal: TreeSignal,
-        root: &crate::containment::GroupRoot<'_>,
-    ) -> Option<Result<(), Error>> {
-        let Attached::FdMarker(m) = self else {
-            return None;
-        };
-        Some(match signal {
-            TreeSignal::Kill => m.hard_kill_group_and_holders(root),
-            TreeSignal::Term => m.terminate_group_and_holders(root),
-        })
-    }
-
     /// Whether [`signal_tree_untrusted`](Self::signal_tree_untrusted) has a channel left to signal
     /// the tree through: one named by identity rather than by the root's number.
     #[cfg(target_os = "macos")]
