@@ -82,19 +82,61 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail,
-            ..
+            source,
         } => {
             assert!(
                 detail.contains("/nonexistent/sudo"),
                 "detail must name the backend path: {detail}"
             );
             assert!(
-                detail.contains("no such file"),
-                "detail must embed the underlying cause: {detail}"
+                !detail.contains("no such file"),
+                "the cause is the source, not the detail: {detail}"
             );
+            let source = source.expect("the cause is the source");
+            assert!(source.to_string().contains("no such file"), "{source}");
         }
         other => panic!("expected BackendUnavailable, got {other:?}"),
     }
+}
+
+/// An OS code the tests send through a mapper, to find it again down `source()`: a permission
+/// refusal (`ERROR_ACCESS_DENIED`, `EACCES`), the kind both mappers act on.
+const OS_CODE: i32 = if cfg!(windows) { 5 } else { 13 };
+
+/// The OS error of a refused kill of an elevated wrapper is the `Unkillable` error's source, found
+/// by `raw_os_error`; its text is not in the detail.
+#[skuld::test]
+fn an_unkillable_error_has_the_refusal_as_its_cause() {
+    use crate::error::{ElevationErrorKind, Error};
+    let refusal = std::io::Error::from_raw_os_error(OS_CODE);
+    assert_eq!(
+        refusal.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the test's code is a refusal"
+    );
+    let text = refusal.to_string();
+    let e = super::map_elevated_kill_error(refusal, true);
+    assert_eq!(e.raw_os_error(), Some(OS_CODE), "{e:?}");
+    match e {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            detail,
+            ..
+        } => assert!(!detail.contains(&text), "the cause is in the detail: {detail}"),
+        other => panic!("expected Unkillable, got {other:?}"),
+    }
+}
+
+/// The error that made a backend unusable is the `BackendUnavailable` error's source.
+#[skuld::test]
+fn a_backend_unavailable_error_has_the_failed_exec_as_its_cause() {
+    use crate::error::Error;
+    let e = super::remap_derived_spawn_error(
+        Error::Io(std::io::Error::from_raw_os_error(OS_CODE)),
+        std::path::Path::new("/nonexistent/sudo"),
+    );
+    assert!(matches!(e, Error::Elevation { .. }), "{e:?}");
+    assert_eq!(e.raw_os_error(), Some(OS_CODE), "{e:?}");
 }
 
 #[skuld::test]

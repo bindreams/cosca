@@ -20,7 +20,11 @@ impl Drop for OwnedToken {
                     "CloseHandle of an owned token failed: {report}",
                     report = crate::error::Report(&e)
                 );
-                debug_assert!(false, "CloseHandle of an owned token should not fail: {e}");
+                debug_assert!(
+                    false,
+                    "CloseHandle of an owned token should not fail: {}",
+                    crate::error::Report(&e)
+                );
             }
         }
     }
@@ -245,6 +249,12 @@ use crate::identity::ProcessId;
 use crate::identity::{windows_terminate_held, Termination};
 use crate::os_process::windows::WindowsProcess;
 
+/// The failure `code` as the cause of an error: [`win32_io_error`](crate::error::win32_io_error) of
+/// it, so `raw_os_error` finds the Win32 code.
+fn hresult_cause(code: windows::core::HRESULT) -> Box<Error> {
+    Error::io_cause(crate::error::win32_io_error(windows::core::Error::from_hresult(code)))
+}
+
 /// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
 /// [`super::runas_failure::classify`]. A launch that may have happened left no process handle, so
 /// what became of it is unknown.
@@ -253,11 +263,8 @@ pub(crate) fn shell_execute_failure(code: windows::core::HRESULT, inst_app: isiz
 
     let failed = || Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,
-        detail: format!(
-            "ShellExecuteEx(runas) failed: {}",
-            windows::core::Error::from_hresult(code)
-        ),
-        source: None,
+        detail: "ShellExecuteEx(runas) failed".into(),
+        source: Some(hresult_cause(code)),
     };
     match classify(code.0, inst_app) {
         RunasFailure::Declined => SpawnFailure::NotStarted(Error::Elevation {
@@ -333,8 +340,8 @@ impl ComInit {
         } else {
             Err(Error::Elevation {
                 kind: ElevationErrorKind::AuthFailed,
-                detail: format!("CoInitializeEx failed before ShellExecuteEx: {hr:?}"),
-                source: None,
+                detail: "CoInitializeEx failed before ShellExecuteEx".into(),
+                source: Some(hresult_cause(hr)),
             })
         }
     }
@@ -491,36 +498,53 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 /// The detail and fate of a launched child that could not be tracked, after its termination came
 /// back as `outcome`. `pid` is what `GetProcessId` returned: its error when the pid could not be
 /// read, else the pid whose identity could not be resolved. Never waits.
-fn untracked_outcome(pid: Result<u32, windows::core::Error>, outcome: Termination) -> (String, ChildFate) {
+///
+/// The second value is the failed read, the cause of the detail when it is the only failure. When
+/// the termination was refused too, both failures are in the detail's text.
+fn untracked_outcome(
+    pid: Result<u32, windows::core::Error>,
+    outcome: Termination,
+) -> (String, Option<Box<Error>>, ChildFate) {
     let (who, why) = match &pid {
         Ok(pid) => (
             format!("the elevated child (pid {pid})"),
             "its identity could not be resolved".to_string(),
         ),
-        Err(e) => (
+        Err(_) => (
             "the elevated child".to_string(),
-            format!("its pid could not be read (GetProcessId: {e})"),
+            "its pid could not be read (GetProcessId)".to_string(),
         ),
     };
+    let read_failure = pid.err();
+    let cause = |e| Error::io_cause(crate::error::win32_io_error(e));
     match outcome {
         Termination::Terminated => (
             format!("the elevated child launched but {why}; it was terminated"),
+            read_failure.map(cause),
             ChildFate::Killed,
         ),
         Termination::Exited => (
             format!("the elevated child launched but {why}; it exited or is exiting, and its exit was not waited for"),
+            read_failure.map(cause),
             // `Killed` is "dead or dying, exit not collected": it claims no completion. Waiting here
             // would block, and this launch runs inside the async spawn too.
             ChildFate::Killed,
         ),
-        Termination::Failed(e) => (
-            format!(
-                "{who} launched but {why} and {}; it may still be running",
-                crate::child::owned::teardown::kill_refused(&e)
-            ),
-            // Its identity is what could not be resolved.
-            ChildFate::Running { id: None },
-        ),
+        Termination::Failed(e) => {
+            let why = match read_failure {
+                Some(read) => format!("its pid could not be read (GetProcessId: {read})"),
+                None => why,
+            };
+            (
+                format!(
+                    "{who} launched but {why} and {}; it may still be running",
+                    crate::child::owned::teardown::kill_refused(&e)
+                ),
+                None,
+                // Its identity is what could not be resolved.
+                ChildFate::Running { id: None },
+            )
+        }
     }
 }
 
@@ -592,12 +616,12 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     let Some((pid, id)) = tracked else {
         // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        let (detail, fate) = untracked_outcome(pid, windows_terminate_held(handle, granted));
+        let (detail, source, fate) = untracked_outcome(pid, windows_terminate_held(handle, granted));
         return Err(SpawnFailure::started(
             Error::Elevation {
                 kind: ElevationErrorKind::Untracked,
                 detail,
-                source: None,
+                source,
             },
             fate,
             None,

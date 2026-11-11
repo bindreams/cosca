@@ -193,6 +193,7 @@ impl Host {
                     None => reject_backend_unavailable(
                         "/usr/bin/osascript is missing or not executable; \
                          macOS graphical elevation needs it",
+                        None,
                     ),
                 }
             }
@@ -208,7 +209,7 @@ impl Host {
                 } else if let Some(p) = self.available.doas.as_deref() {
                     (Backend::Doas, p.to_path_buf())
                 } else {
-                    return reject_backend_unavailable("no sudo/doas on PATH for Backend::Auto");
+                    return reject_backend_unavailable("no sudo/doas on PATH for Backend::Auto", None);
                 }
             }
             explicit => match self.available.path(explicit) {
@@ -217,9 +218,12 @@ impl Host {
                     let unresolved = (explicit == Backend::Pkexec)
                         .then(|| self.pkexec_version.unresolved())
                         .flatten();
-                    return reject_backend_unavailable(
-                        &unresolved.unwrap_or_else(|| format!("forced backend {explicit:?} is not on PATH")),
-                    );
+                    return match unresolved {
+                        Some(why) => reject_backend_unavailable(&why, self.pkexec_version.cause()),
+                        None => {
+                            reject_backend_unavailable(&format!("forced backend {explicit:?} is not on PATH"), None)
+                        }
+                    };
                 }
             },
         };
@@ -272,12 +276,12 @@ pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: b
     )
 }
 
-fn reject_backend_unavailable(detail: &str) -> Transition {
+fn reject_backend_unavailable(detail: &str, source: Option<Box<Error>>) -> Transition {
     Transition::Reject {
         error: Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
             detail: detail.into(),
-            source: None,
+            source,
         },
     }
 }

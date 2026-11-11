@@ -159,18 +159,62 @@ fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
     }
 }
 
-/// A front whose state or membership cannot be read is closed, and says why.
+/// An OS error the tests send through a gate, to find it again at the other end.
+const CODE: i32 = 5;
+
+fn os_error() -> io::Error {
+    io::Error::from_raw_os_error(CODE)
+}
+
+fn refusal(g: Gate) -> Error {
+    match g {
+        Gate::Closed(error) => error,
+        other => panic!("expected a closed gate, got {other:?}"),
+    }
+}
+
+/// `error` is an `Unkillable` refusal whose `detail` says `words` and not the OS error's text, and
+/// whose cause is the OS error, found down `source()`.
+#[track_caller]
+fn assert_refused_by_one_read(error: &Error, words: &str) {
+    let Error::Elevation {
+        kind: ElevationErrorKind::Unkillable,
+        detail,
+        ..
+    } = error
+    else {
+        panic!("expected Unkillable, got {error:?}");
+    };
+    assert!(detail.contains(words), "{detail}");
+    assert!(
+        !detail.contains(&os_error().to_string()),
+        "the cause is in the detail: {detail}"
+    );
+    assert_eq!(error.raw_os_error(), Some(CODE), "{error:?}");
+}
+
+/// A front whose state or membership cannot be read is closed, and says what it could not read;
+/// the cause is the error's `source()`.
 #[skuld::test]
 fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
-    let sudo = ElevatedVia::Wrapped(Backend::Sudo);
-    let (g, _) = kill_gate_asking(
-        Some(report(sudo.clone())),
-        Err(io::Error::other("peek refused")),
-        Ok(false),
-    );
-    assert!(refusal_detail(g).contains("could not be read: peek refused"));
-    let (g, _) = kill_gate_asking(Some(report(sudo)), Ok(true), Err(io::Error::other("procs refused")));
-    assert!(refusal_detail(g).contains("could not be read: procs refused"));
+    let g = kill_gate(Some(Front::Sudo), PID, || Err(os_error()), || Ok(false));
+    assert_refused_by_one_read(&refusal(g), "whether it had exited could not be read");
+    let g = kill_gate(Some(Front::Sudo), PID, || Ok(true), || Err(os_error()));
+    assert_refused_by_one_read(&refusal(g), "whether its cgroup kill reaches it could not be read");
+}
+
+/// A front whose place after the cgroup kill cannot be read is refused, with the read as the cause.
+#[skuld::test]
+fn a_front_whose_place_cannot_be_read_after_the_kill_has_the_read_as_its_cause() {
+    let (r, _) = reached_asking(Ok(false), Err(os_error()));
+    assert_refused_by_one_read(&r.expect_err("not shown reached"), "its cgroup could not be read");
+}
+
+/// A front whose cgroup kill failed is refused, with the kill's error as the cause.
+#[skuld::test]
+fn a_front_whose_cgroup_kill_failed_has_the_failure_as_its_cause() {
+    let e = super::cgroup_kill_failed(Front::Sudo, PID, Error::Io(os_error()));
+    assert_refused_by_one_read(&e, "its cgroup kill failed");
 }
 
 /// The tracked process is the program itself, or there is no elevation: signalled like any child,
@@ -208,8 +252,8 @@ fn a_sigterm_to_a_live_osascript_is_closed() {
     let detail = refusal_detail(terminate_gate(osascript, PID, || Ok(true)));
     assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
     assert!(detail.contains("no SIGTERM was sent"), "{detail}");
-    let detail = refusal_detail(terminate_gate(osascript, PID, || Err(io::Error::other("peek refused"))));
-    assert!(detail.contains("peek refused"), "{detail}");
+    let error = refusal(terminate_gate(osascript, PID, || Err(os_error())));
+    assert_refused_by_one_read(&error, "whether it had exited could not be read");
     assert!(matches!(terminate_gate(osascript, PID, || Ok(false)), Gate::Open));
 }
 

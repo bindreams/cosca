@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
-use super::pkexec::PkexecVersion;
+use super::pkexec::{IoFailure, PkexecVersion};
 use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
 use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
@@ -313,7 +313,7 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
         probe.spawn()
     };
     match spawned.and_then(std::process::Child::wait_with_output) {
-        Err(e) => PkexecVersion::SpawnFailed(e.to_string()),
+        Err(e) => PkexecVersion::SpawnFailed(IoFailure::of(&e)),
         Ok(out) if !out.status.success() => PkexecVersion::Failed {
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -357,25 +357,22 @@ pub(crate) fn detect_with(
     run: impl FnOnce(std::process::Command) -> PkexecVersion,
 ) -> Host {
     let on_path = |program| path_var.and_then(|p| resolve_in_path_var(p, program));
-    let unresolved = |found: &Path, error: String| PkexecVersion::Unresolved {
+    let unresolved = |found: &Path, error: &std::io::Error| PkexecVersion::Unresolved {
         path: found.display().to_string(),
-        error,
+        error: IoFailure::of(error),
     };
     let (pkexec, pkexec_pin, pkexec_version) = if !launches_pkexec(os, backend, auth, elevated) {
         (on_path("pkexec"), None, PkexecVersion::NotProbed)
     } else {
         match path_var.and_then(|p| pkexec_on(p, canonicalize)) {
             None => (None, None, PkexecVersion::NotProbed),
-            Some(Err((found, e))) => (None, None, unresolved(&found, e.to_string())),
+            Some(Err((found, e))) => (None, None, unresolved(&found, &e)),
             Some(Ok(real)) => match pin(&real) {
                 Ok(pinned) => {
                     let version = probe_pkexec(&real, &pinned, run);
                     (Some(real), Some(std::sync::Arc::new(pinned)), version)
                 }
-                Err(e) => {
-                    let error = format!("opening {}: {e}", real.display());
-                    (None, None, unresolved(&real, error))
-                }
+                Err(e) => (None, None, unresolved(&real, &e)),
             },
         }
     };
@@ -480,11 +477,12 @@ fn wait_writable(writer: &std::io::PipeWriter) -> Result<bool, std::io::Error> {
     }
 }
 
-fn auth_failed(detail: String) -> Error {
+/// The password delivery failed as `detail` says; `cause` is the OS error behind it, if any.
+fn auth_failed(detail: impl Into<String>, cause: Option<std::io::Error>) -> Error {
     Error::Elevation {
         kind: ElevationErrorKind::AuthFailed,
-        detail,
-        source: None,
+        detail: detail.into(),
+        source: cause.map(Error::io_cause),
     }
 }
 
@@ -504,7 +502,8 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Resul
                     Ok(())
                 } else {
                     Err(auth_failed(
-                        "elevation backend closed the password channel after a partial write".into(),
+                        "elevation backend closed the password channel after a partial write",
+                        None,
                     ))
                 };
             }
@@ -522,14 +521,11 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Resul
                     Ok(true) => continue,
                     Ok(false) => {
                         return Err(auth_failed(
-                            "elevation backend closed fd0 after a partial password write".into(),
+                            "elevation backend closed fd0 after a partial password write",
+                            None,
                         ))
                     }
-                    Err(pe) => {
-                        return Err(auth_failed(format!(
-                            "waiting to deliver the sudo -S password failed: {pe}"
-                        )))
-                    }
+                    Err(pe) => return Err(auth_failed("waiting to deliver the sudo -S password failed", Some(pe))),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -540,11 +536,12 @@ fn write_password_bytes(writer: &mut std::io::PipeWriter, bytes: &[u8]) -> Resul
                     );
                     return Ok(());
                 }
-                return Err(auth_failed(format!(
-                    "elevation backend closed fd0 after a partial password write: {e}"
-                )));
+                return Err(auth_failed(
+                    "elevation backend closed fd0 after a partial password write",
+                    Some(e),
+                ));
             }
-            Err(e) => return Err(auth_failed(format!("could not deliver the sudo -S password: {e}"))),
+            Err(e) => return Err(auth_failed("could not deliver the sudo -S password", Some(e))),
         }
     }
     Ok(())

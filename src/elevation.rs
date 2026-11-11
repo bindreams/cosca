@@ -393,8 +393,8 @@ pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: boo
     if elevated_wrapper && err.kind() == std::io::ErrorKind::PermissionDenied {
         Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
-            detail: format!("could not signal the elevated child: {err}"),
-            source: None,
+            detail: "could not signal the elevated child".into(),
+            source: Some(Error::io_cause(err)),
         }
     } else {
         Error::Io(err)
@@ -431,8 +431,8 @@ fn backend_unusable(backend_path: &std::path::Path) -> bool {
 /// elevation backend, but it also carries the caller's `current_dir()` — a bad cwd
 /// yields the same `NotFound`/`PermissionDenied` kinds. So only remap to
 /// `BackendUnavailable` when the backend path itself is unusable (missing, or on unix
-/// present-but-not-executable); otherwise the original `Io` survives. Either way the
-/// underlying `io::Error` and the backend path are embedded so the cause is never lost.
+/// present-but-not-executable); otherwise the original `Io` survives. The remapped error names the
+/// backend path, and the underlying `io::Error` is its `source`.
 // Consumed by the unix sync spawn arm (`crate::child::spawn::spawn`); dead on non-unix,
 // where the Windows arm delegates straight to `windows::spawn_elevated`.
 #[cfg_attr(
@@ -456,11 +456,8 @@ pub(crate) fn remap_derived_spawn_error(
         {
             Error::Elevation {
                 kind: ElevationErrorKind::BackendUnavailable,
-                detail: format!(
-                    "elevation backend {} could not be executed: {e}",
-                    backend_path.display()
-                ),
-                source: None,
+                detail: format!("elevation backend {} could not be executed", backend_path.display()),
+                source: Some(Error::io_cause(e)),
             }
         }
         other => other,

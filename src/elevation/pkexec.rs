@@ -14,6 +14,32 @@ use crate::error::Error;
 /// (--keep-cwd) for pkexec" under polkit 121. Measured: 121 (Fedora 37) honours it.
 pub(crate) const KEEP_CWD_SINCE: u32 = 121;
 
+/// An `io::Error` kept as data, for a type that is `Clone` and `Eq`. [`to_io`](Self::to_io) makes
+/// the error again: the same OS code, or the same kind and text for one that has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoFailure {
+    kind: std::io::ErrorKind,
+    code: Option<i32>,
+    text: String,
+}
+
+impl IoFailure {
+    pub(crate) fn of(e: &std::io::Error) -> IoFailure {
+        IoFailure {
+            kind: e.kind(),
+            code: e.raw_os_error(),
+            text: e.to_string(),
+        }
+    }
+
+    pub(crate) fn to_io(&self) -> std::io::Error {
+        match self.code {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::new(self.kind, self.text.clone()),
+        }
+    }
+}
+
 /// What `pkexec --version` said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PkexecVersion {
@@ -22,11 +48,11 @@ pub enum PkexecVersion {
     /// runs off Linux; or because `PATH` has no `pkexec`.
     /// See [`crate::elevation::plan::Host::pkexec_version`].
     NotProbed,
-    /// `PATH` has a `pkexec` at `path`, but its real file could not be found (`error`), so it is
-    /// neither stored nor asked.
-    Unresolved { path: String, error: String },
+    /// `PATH` has a `pkexec` at `path`, but its real file could not be found or opened (`error`),
+    /// so it is neither stored nor asked.
+    Unresolved { path: String, error: IoFailure },
     /// `pkexec --version` could not be run.
-    SpawnFailed(String),
+    SpawnFailed(IoFailure),
     /// It exited unsuccessfully; both streams are kept, lossily decoded.
     Failed {
         status: String,
@@ -70,12 +96,23 @@ pub(crate) fn parse(stdout: &[u8]) -> PkexecVersion {
 
 impl PkexecVersion {
     /// For [`PkexecVersion::Unresolved`], why no pkexec was stored; the planner reports it in place
-    /// of "not on PATH".
+    /// of "not on PATH". The failure itself is [`cause`](Self::cause).
     pub(crate) fn unresolved(&self) -> Option<String> {
         match self {
-            PkexecVersion::Unresolved { path, error } => Some(format!(
-                "pkexec on PATH at {path} could not be resolved to its real file: {error}"
+            PkexecVersion::Unresolved { path, .. } => Some(format!(
+                "pkexec on PATH at {path} could not be resolved to its real file"
             )),
+            _ => None,
+        }
+    }
+
+    /// The failed read behind [`PkexecVersion::Unresolved`] and [`PkexecVersion::SpawnFailed`], as
+    /// the `source` of the error that reports them.
+    pub(crate) fn cause(&self) -> Option<Box<Error>> {
+        match self {
+            PkexecVersion::Unresolved { error, .. } | PkexecVersion::SpawnFailed(error) => {
+                Some(Error::io_cause(error.to_io()))
+            }
             _ => None,
         }
     }
@@ -86,7 +123,7 @@ impl PkexecVersion {
             PkexecVersion::Parsed { release: Some(n), .. } if *n >= KEEP_CWD_SINCE => return None,
             PkexecVersion::Parsed { version, .. } => format!("pkexec reports version {version}"),
             PkexecVersion::NotProbed => "the pkexec version was not checked".into(),
-            PkexecVersion::SpawnFailed(e) => format!("`pkexec --version` could not be run: {e}"),
+            PkexecVersion::SpawnFailed(_) => "`pkexec --version` could not be run".into(),
             PkexecVersion::Failed { status, stdout, stderr } => {
                 format!("`pkexec --version` exited with {status}, printing {stdout:?} and, to stderr, {stderr:?}")
             }
@@ -104,7 +141,7 @@ impl PkexecVersion {
                  pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit \
                  {KEEP_CWD_SINCE} or later"
             ),
-            source: None,
+            source: self.cause(),
         })
     }
 }

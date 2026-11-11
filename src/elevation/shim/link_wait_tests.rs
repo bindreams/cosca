@@ -257,7 +257,14 @@ fn a_local_poll_error_in_wait_settles_nothing() {
     let mut shim = rig.live();
     rig.probe.fail_next_wait_poll(rustix::io::Errno::NOMEM);
     match rig.link.wait() {
-        Err(WaitError::Poll(e)) => assert_eq!(e.raw_os_error(), Some(libc::ENOMEM)),
+        Err(e @ WaitError::Poll(_)) => {
+            assert_eq!(
+                e.to_string(),
+                "waiting for the shim",
+                "the cause is the source, not the text"
+            );
+            assert_eq!(crate::elevation::shim::fixtures::os_code(&e), Some(libc::ENOMEM));
+        }
         other => panic!("expected a poll error, got {other:?}"),
     }
     assert_eq!(rig.link.observe().unwrap().outcome, None);

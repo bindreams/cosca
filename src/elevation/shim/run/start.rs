@@ -65,7 +65,13 @@ fn open_failure(path: &std::path::Path) -> OwnedFd {
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
-    .unwrap_or_else(|e| panic!("the loop-failure seam: cannot open {}: {e}", path.display()))
+    .unwrap_or_else(|e| {
+        panic!(
+            "the loop-failure seam: cannot open {}: {}",
+            path.display(),
+            crate::error::Report(&e)
+        )
+    })
 }
 
 pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &OwnedFd) -> Result<i32, Exit> {

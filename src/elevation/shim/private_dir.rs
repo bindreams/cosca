@@ -24,7 +24,7 @@ pub(crate) const NAME_LEN: usize = 22;
 pub(crate) enum PrivateDirError {
     #[error("the temp directory {} is not an absolute path", .0.display())]
     TmpdirNotAbsolute(PathBuf),
-    #[error("the temp directory {}: {source}", path.display())]
+    #[error("the temp directory {} could not be resolved or read", path.display())]
     Tmpdir { path: PathBuf, source: io::Error },
     #[error(
         "the temp directory {} is not safe: {} lets another user rename entries on the way to it",
@@ -40,10 +40,10 @@ pub(crate) enum PrivateDirError {
         offender: PathBuf,
         filesystem: &'static str,
     },
-    #[error("cannot create the private directory {}: {source}", path.display())]
+    #[error("cannot create the private directory {}", path.display())]
     Create { path: PathBuf, source: io::Error },
-    #[error("cannot set up the fork guard of the private directory: {0}")]
-    ForkGuard(io::Error),
+    #[error("cannot set up the fork guard of the private directory")]
+    ForkGuard(#[source] io::Error),
 }
 
 /// [`PrivateDir::remove`] refused the caller's origin.

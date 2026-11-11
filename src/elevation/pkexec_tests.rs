@@ -1,5 +1,8 @@
-use super::{parse, PkexecVersion, KEEP_CWD_SINCE};
+use super::{parse, IoFailure, PkexecVersion, KEEP_CWD_SINCE};
 use crate::error::Error;
+
+/// An OS code the tests send through a version, to find it again down a refusal's `source()`.
+const OS_CODE: i32 = 2;
 
 /// `pkexec --version`'s stdout, verbatim (exit 0, empty stderr), measured per image.
 const UBUNTU_22_04: &[u8] = b"pkexec version 0.105\n";
@@ -100,8 +103,8 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         (parse(b"polkit 122\n"), "\"polkit 122\\n\""),
         (parse(b"pkexec version \xff\n"), "non-UTF-8"),
         (
-            PkexecVersion::SpawnFailed("No such file or directory".into()),
-            "could not be run: No such file",
+            PkexecVersion::SpawnFailed(IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE))),
+            "`pkexec --version` could not be run;",
         ),
         (
             PkexecVersion::Failed {
@@ -115,9 +118,9 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         (
             PkexecVersion::Unresolved {
                 path: "/opt/bin/pkexec".into(),
-                error: "denied".into(),
+                error: IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE)),
             },
-            "/opt/bin/pkexec could not be resolved to its real file: denied",
+            "/opt/bin/pkexec could not be resolved to its real file;",
         ),
     ];
     for (v, needle) in cases {
@@ -132,4 +135,39 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         stderr: "boom".into(),
     });
     assert!(failed.contains("\"oops\"") && failed.contains("\"boom\""), "{failed}");
+}
+
+/// A refusal that follows a failed read says what could not be done in its `detail`, and keeps the
+/// failure as its `source()`: the OS code is found down the chain, and its text is not in the
+/// detail.
+#[skuld::test]
+fn a_refusal_that_follows_a_failed_read_has_it_as_its_cause() {
+    let os = || std::io::Error::from_raw_os_error(OS_CODE);
+    for v in [
+        PkexecVersion::SpawnFailed(IoFailure::of(&os())),
+        PkexecVersion::Unresolved {
+            path: "/opt/bin/pkexec".into(),
+            error: IoFailure::of(&os()),
+        },
+    ] {
+        let refusal = v.refusal().expect("a failed read refuses");
+        assert_eq!(refusal.raw_os_error(), Some(OS_CODE), "{v:?}: {refusal:?}");
+        let Error::Unsupported { detail, .. } = &refusal else {
+            panic!("{v:?}: expected Unsupported, got {refusal:?}");
+        };
+        assert!(!detail.contains(&os().to_string()), "{v:?}: {detail}");
+    }
+}
+
+/// A failure kept as data comes back as an equal `io::Error`: the OS code survives, and so does the
+/// kind and text of an error that has none.
+#[skuld::test]
+fn a_kept_failure_comes_back_as_an_equal_io_error() {
+    let os = std::io::Error::from_raw_os_error(OS_CODE);
+    let back = IoFailure::of(&os).to_io();
+    assert_eq!((back.raw_os_error(), back.kind()), (Some(OS_CODE), os.kind()));
+    let plain = std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    let back = IoFailure::of(&plain).to_io();
+    assert_eq!((back.raw_os_error(), back.kind()), (None, plain.kind()));
+    assert_eq!(back.to_string(), "not a regular file");
 }

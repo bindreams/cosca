@@ -1,4 +1,5 @@
-//! Test fixtures shared by the tests of everything that consumes a [`ShimArgs`].
+//! Test fixtures shared by the shim's tests: a [`ShimArgs`] to consume, and the OS code down an
+//! error's `source()` chain.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -20,4 +21,12 @@ pub(crate) fn shim_args(program: &[u8], rest: &[&[u8]]) -> ShimArgs {
         program: OsString::from_vec(program.to_vec()),
         args: rest.iter().map(|a| OsString::from_vec(a.to_vec())).collect(),
     }
+}
+
+/// The first OS code down `error`'s `source()` chain, which every shim error that wraps an OS
+/// failure must reach, whatever words its own layer says.
+pub(crate) fn os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    crate::error::chain(error)
+        .filter_map(|layer| layer.downcast_ref::<std::io::Error>())
+        .find_map(std::io::Error::raw_os_error)
 }

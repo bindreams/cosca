@@ -912,7 +912,7 @@ pub(crate) fn assert_front_refused_by_its_cgroup_kill(err: &crate::error::Error,
     assert!(text.contains("the elevated child could not be terminated"), "{text}");
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
     assert!(text.contains("no kill was sent"), "{text}");
-    assert!(text.contains("(its cgroup kill failed: "), "{text}");
+    assert!(text.contains("(its cgroup kill failed)"), "{text}");
 }
 
 /// A front that has left its leaf is out of the cgroup kill's reach: sent nothing, and refused.

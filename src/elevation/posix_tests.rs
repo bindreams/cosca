@@ -671,6 +671,26 @@ mod rewrite_tests {
         assert_eq!(got[secret_bytes.len()], b'\n');
     }
 
+    /// A password write the OS refuses is an `AuthFailed` that says so in its own words; the
+    /// refusal is its `source()`, found by its OS code.
+    #[skuld::test]
+    fn a_refused_password_write_has_the_refusal_as_its_cause() {
+        use crate::error::ElevationErrorKind;
+        // A descriptor open for reading only: `write(2)` on it fails with `EBADF`.
+        let read_only = std::fs::File::open("/dev/null").unwrap();
+        let mut writer = std::io::PipeWriter::from(std::os::fd::OwnedFd::from(read_only));
+        let error = super::super::write_password_bytes(&mut writer, b"pw").expect_err("the write is refused");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF), "{error:?}");
+        match error {
+            Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail,
+                ..
+            } => assert_eq!(detail, "could not deliver the sudo -S password"),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
     // ===== macOS graphical elevation, planned on ANY unix host =====
 
     pub(super) fn macos_gui_host(elevated: bool) -> Host {
