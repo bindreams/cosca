@@ -957,7 +957,7 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
     #[cfg(not(target_os = "macos"))]
     let _ = root;
     #[cfg(target_os = "macos")]
-    let state = root.state();
+    let state = root.look_state();
     #[cfg(all(test, unix))]
     crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
     #[cfg(target_os = "macos")]
@@ -977,8 +977,8 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
     None
 }
 
-/// [`hard_kill`] from the host's process table, as a tree call decides it for every caller: skipped
-/// where the root's number cannot be trusted ([`skipped_walk`]), else walked.
+/// [`hard_kill`] from the host's process table: skipped where the root's number cannot be trusted
+/// ([`skipped_walk`]), else walked.
 pub(crate) fn kill_tree(root: ProcessId, owner: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
     match skipped_walk(owner) {
         Some(skip) => TreeKillOutcome::Skipped(skip),

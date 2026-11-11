@@ -2,6 +2,8 @@
 
 use crate::containment::{ContainMode, ContainRequest, Containment, Nesting, Skip, TerminateOutcome};
 use crate::error::Error;
+#[cfg(unix)]
+use crate::signal::RootState;
 
 /// The pre-spawn containment decision produced by `prepare` (env-marker root
 /// detection plus per-OS pre-spawn setup).
@@ -156,22 +158,6 @@ impl Attachment {
     }
 }
 
-/// What a drop or a failed-spawn cleanup knows of the root, from its own handle and its number.
-#[cfg(unix)]
-#[derive(Debug)]
-pub(crate) enum RootView {
-    /// The root has been reaped, so its number may name another process: the handle says
-    /// `Reaped`, or the number no longer reads as this root.
-    Reaped,
-    /// The handle could not say whether the root is reaped, and nothing else did.
-    Unknown(std::io::Error),
-    /// This process does not pin the root (macOS: launchd holds its zombie), and nothing else shows
-    /// it reaped. [`UNPINNED_WHY`](crate::signal::UNPINNED_WHY) says why.
-    Unpinned,
-    /// The root is an unreaped child, and its number names it.
-    Trusted,
-}
-
 /// Who tears a child down. The caller prefixes the teardown's log lines and names its own event in
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,14 +202,19 @@ impl TeardownCaller {
     }
 }
 
-/// What a `Child`'s drop knows about its root, for its report and for what it does to the root.
+/// What a `Child`'s drop knows about its root, for its report and for what it does to the root: the
+/// one look at it. The mechanism's kill decides on [`look`](Self::look), the same look the report
+/// is worded from.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DropView {
     /// The caller's name, prefixing its log lines.
     pub(crate) caller: TeardownCaller,
     pub(crate) root_pid: u32,
-    pub(crate) root: RootView,
+    /// The root's state as the look found it: the handle's own answer
+    /// ([`RootState`](crate::signal::RootState)), or `Reaped` when the root's number shows the reap
+    /// the handle could not.
+    pub(crate) root: RootState,
     /// This handle already killed the tree completely.
     pub(crate) tree_killed: bool,
 }
@@ -243,10 +234,9 @@ impl DropView {
         caller: TeardownCaller,
         root_pid: u32,
         id: Option<crate::identity::ProcessId>,
-        root: impl FnOnce() -> crate::signal::RootState,
+        root: impl FnOnce() -> RootState,
         tree_killed: &TreeKilled,
     ) -> DropView {
-        use crate::signal::RootState;
         let label = caller.label();
         let now = crate::child::root_identity_now(root_pid);
         let state = root();
@@ -263,14 +253,13 @@ impl DropView {
                 ),
                 RootState::Unreaped | RootState::Reaped { .. } => {}
             }
-            RootView::Reaped
-        } else {
             match state {
-                RootState::Unreaped => RootView::Trusted,
-                RootState::Unknown(e) => RootView::Unknown(e),
-                RootState::Unpinned => RootView::Unpinned,
-                RootState::Reaped { .. } => RootView::Reaped,
+                reaped @ RootState::Reaped { .. } => reaped,
+                // Only the number shows the reap, so no reap of this handle's own.
+                RootState::Unreaped | RootState::Unknown(_) | RootState::Unpinned => RootState::Reaped { own: false },
             }
+        } else {
+            state
         };
         let view = DropView {
             caller,
@@ -295,34 +284,31 @@ impl DropView {
     /// The handle could not settle whether the root is still ours to act on, and nothing else did:
     /// `Unknown`, or `Unpinned`.
     pub(crate) fn unsettled(&self) -> bool {
-        matches!(self.root, RootView::Unknown(_) | RootView::Unpinned)
+        matches!(self.root, RootState::Unknown(_) | RootState::Unpinned)
     }
 
     /// This process does not pin the root (macOS: launchd holds it), and nothing else shows it
     /// reaped: its pid is not ours to signal or wait on.
     pub(crate) fn unpinned_root(&self) -> bool {
-        matches!(self.root, RootView::Unpinned)
+        matches!(self.root, RootState::Unpinned)
     }
 
     /// Whether the root itself is neither signalled nor waited on: it is reaped, or this process
     /// does not pin it (so its pid is not ours).
     pub(crate) fn leaves_root_alone(&self) -> bool {
-        matches!(self.root, RootView::Reaped | RootView::Unpinned)
+        matches!(self.root, RootState::Reaped { .. } | RootState::Unpinned)
+    }
+
+    /// The look the mechanism's kill decides on: the one this view is worded from.
+    pub(crate) fn look(&self) -> RootState {
+        self.root.duplicate()
     }
 
     /// Why the root's number may not be trusted, for a log line or a note.
     pub(crate) fn why_number_untrusted(&self) -> String {
         match &self.root {
-            RootView::Unknown(e) => format!("the root could not be shown to be unreaped (RootState::Unknown: {e})"),
-            RootView::Unpinned => format!(
-                "the root is not pinned by this process (RootState::Unpinned: {})",
-                crate::signal::UNPINNED_WHY
-            ),
-            RootView::Reaped => "the root is already reaped".to_owned(),
-            RootView::Trusted => {
-                debug_assert!(false, "a trusted root's number is not untrusted");
-                "the root's number is trusted".to_owned()
-            }
+            RootState::Reaped { .. } => "the root is already reaped".to_owned(),
+            untrusted => crate::signal::why_untrusted(untrusted),
         }
     }
 }
@@ -777,7 +763,7 @@ impl TreeKillOutcome {
         let (label, this, action) = (view.caller.label(), view.caller.this_event(), &skip.action);
         if view.tree_killed {
             log::debug!("{label}: {why} and this handle already killed the tree, so {this} does not {action}");
-        } else if !matches!(view.root, RootView::Reaped) {
+        } else if !matches!(view.root, RootState::Reaped { .. }) {
             log::debug!("{label}: {why}, so {this} does not {action}");
         }
     }
@@ -949,8 +935,7 @@ impl Attached {
     /// `root` is the root a mechanism that names its tree by the root's pid (a process group, a macOS
     /// fd marker, a tree walk on macOS) looks at, right before each send by the number, and decides
     /// what to send by it: the outcome says what it did not send, and why ([`Skip`]). Every other
-    /// mechanism ignores it. Every caller, a tree call and a drop alike, gets the same answer for the
-    /// same root.
+    /// mechanism ignores it.
     #[cfg_attr(
         not(unix),
         allow(unused_variables, reason = "only Unix names a group by the root's pid")

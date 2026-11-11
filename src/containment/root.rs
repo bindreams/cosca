@@ -8,14 +8,23 @@ use crate::signal::RootState;
 /// The root of a tree, asked right before each send by its pid: the answer serves that send alone,
 /// so no checked pid outlives the send it was checked for. Every call that takes one takes
 /// `Option<&dyn Root>`; `None` for a caller whose mechanism names no group, which never sends by
-/// the root's pid.
+/// the root's pid. A tree call and a drop alike get the same answer for the same root.
 pub(crate) trait Root {
     #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends by the root's pid"))]
     fn pid(&self) -> u32;
 
-    /// What the root's own handle shows now ([`RootState`]), read live.
+    /// What the root's own handle shows now ([`RootState`]), read live: right before each send by
+    /// the root's pid.
     #[cfg(unix)]
     fn state(&self) -> RootState;
+
+    /// The state a mechanism decides what to send on, asked once per call ([`look`]). It is
+    /// [`state`](Root::state), unless the caller took the look first, to word its report from it
+    /// ([`Seen`]).
+    #[cfg(unix)]
+    fn look_state(&self) -> RootState {
+        self.state()
+    }
 
     /// Linux: the root's pidfd, if it has one. A send through it with `PIDFD_SIGNAL_PROCESS_GROUP`
     /// names the group exactly: the kernel resolves it from the pidfd's process, never from a number.
@@ -23,33 +32,34 @@ pub(crate) trait Root {
     fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
 }
 
-/// A root whose first [`state`](Root::state) is a look already taken (a drop's, which reads the
-/// root's state once, for its own view, before it kills), so one look decides both. Every later
-/// read, and every other question, is the root's own.
+/// A root whose [`look_state`](Root::look_state) is a look its caller already took (a drop's, which
+/// words its report from the same look), so the one look decides the kill and the report. Each send
+/// by the pid still reads the root's own [`state`](Root::state).
 #[cfg(unix)]
-pub(crate) struct Looked<'a> {
+pub(crate) struct Seen<'a> {
     root: &'a dyn Root,
-    first: std::cell::Cell<Option<RootState>>,
+    look: RootState,
 }
 
 #[cfg(unix)]
-impl<'a> Looked<'a> {
-    pub(crate) fn new(root: &'a dyn Root, look: RootState) -> Looked<'a> {
-        Looked {
-            root,
-            first: std::cell::Cell::new(Some(look)),
-        }
+impl<'a> Seen<'a> {
+    pub(crate) fn new(root: &'a dyn Root, look: RootState) -> Seen<'a> {
+        Seen { root, look }
     }
 }
 
 #[cfg(unix)]
-impl Root for Looked<'_> {
+impl Root for Seen<'_> {
     fn pid(&self) -> u32 {
         self.root.pid()
     }
 
     fn state(&self) -> RootState {
-        self.first.take().unwrap_or_else(|| self.root.state())
+        self.root.state()
+    }
+
+    fn look_state(&self) -> RootState {
+        self.look.duplicate()
     }
 
     #[cfg(target_os = "linux")]
@@ -187,7 +197,7 @@ pub(crate) enum NumberLook {
 /// on Linux 6.9+ ([`through_the_pidfd`]).
 #[cfg(unix)]
 pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
-    let state = root.state();
+    let state = root.look_state();
     #[cfg(target_os = "macos")]
     if matches!(state, RootState::Unpinned | RootState::Unknown(_)) {
         return NumberLook::Untrusted(state);

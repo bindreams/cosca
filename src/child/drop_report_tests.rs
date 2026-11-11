@@ -998,7 +998,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 
     fake.assert_peeks_exhausted();
     assert!(
-        matches!(view.root, crate::containment::dispatch::RootView::Reaped),
+        matches!(view.root, crate::signal::RootState::Reaped { .. }),
         "{:?}",
         view.root
     );
@@ -1007,6 +1007,35 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     assert!(
         records[0].0 == log::Level::Debug && records[0].1.starts_with("teardown after a failed run:"),
         "{records:?}"
+    );
+}
+
+/// The kill decides on the look the report is worded from: a handle that could not say, whose
+/// number shows the reap, is `Reaped` to the mechanism too, not the handle's raw `Unknown`.
+///
+/// Mutant: `DropView::look` answers the handle's own state, before the number's evidence.
+#[skuld::test]
+fn the_look_a_kill_decides_on_is_the_one_the_report_is_worded_from() {
+    let (mut child, _writer) = contained_blocker(ContainMode::Session);
+    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 7a1"))]));
+
+    let view = crate::containment::DropView::read(
+        crate::containment::dispatch::TeardownCaller::Drop,
+        child.pid(),
+        child.id,
+        || child.proc.state(),
+        &child.tree_killed,
+    );
+
+    fake.assert_peeks_exhausted();
+    assert!(view.leaves_root_alone());
+    assert!(
+        matches!(view.look(), crate::signal::RootState::Reaped { .. }),
+        "{:?}",
+        view.look()
     );
 }
 
@@ -1020,7 +1049,7 @@ fn asking_why_a_trusted_root_is_untrusted_is_a_contract_breach() {
     let view = crate::containment::DropView {
         caller: crate::containment::dispatch::TeardownCaller::Drop,
         root_pid: 1,
-        root: crate::containment::dispatch::RootView::Trusted,
+        root: crate::signal::RootState::Unreaped,
         tree_killed: false,
     };
 

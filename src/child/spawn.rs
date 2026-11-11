@@ -139,21 +139,14 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
     let gate = child.kill_gate();
-    // The look at the root, right before the tree kill it decides: the one look both tree kills
-    // decide on.
-    let mut look = None;
+    // One look, shared by both tree kills.
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::FinishElevated,
         child.pid(),
         child.id,
-        || {
-            let state = child.proc.state();
-            look = Some(state.duplicate());
-            state
-        },
+        || child.proc.state(),
         &child.tree_killed,
     );
-    let look = look.expect("the view read the root's state");
     let mut report = crate::child::drop_report::DropReport::new(&view);
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
@@ -161,8 +154,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.pid());
         let kill = {
-            let looked = crate::containment::Looked::new(&held, look.duplicate());
-            child.attached.hard_kill(Some(&looked))
+            let seen = crate::containment::Seen::new(&held, view.look());
+            child.attached.hard_kill(Some(&seen))
         };
         drop(held);
         kill.log_skip(&view);

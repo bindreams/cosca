@@ -428,12 +428,13 @@ fn callers() -> Vec<(&'static str, Say)> {
 /// clause into the event's one report and emit it.
 #[cfg(unix)]
 fn say_in_a_report(caller: crate::containment::dispatch::TeardownCaller, torn: TeardownOutcome) {
-    use crate::containment::dispatch::{DropView, RootView};
+    use crate::containment::dispatch::DropView;
+    use crate::signal::RootState;
 
     let view = DropView {
         caller,
         root_pid: PID,
-        root: RootView::Trusted,
+        root: RootState::Unreaped,
         tree_killed: false,
     };
     let mut report = crate::child::drop_report::DropReport::new(&view);

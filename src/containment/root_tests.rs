@@ -1,4 +1,4 @@
-use super::{look, number_holds, NumberLook, Refusal};
+use super::{look, number_holds, NumberLook, Refusal, Root as _};
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::RootState;
 use crate::test_support::stated_root::StatedRoot;
@@ -106,6 +106,26 @@ fn look_answers_an_unpinned_root_untrusted() {
     for read in [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown] {
         assert_eq!(answered(|| RootState::Unpinned, true, read), Answer::Untrusted);
     }
+}
+
+/// A root seen by its caller is decided on that look, and each send's check still reads the root's
+/// own state.
+///
+/// Mutants: `Seen` answers the root's own state for the look; it answers the look for every read.
+#[skuld::test]
+fn a_seen_root_is_decided_on_its_callers_look_and_checked_on_its_own_state() {
+    let _read = crate::child::fault::force_root_reads(Resolved::Gone);
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Unknown(std::io::Error::other("forced")));
+    let seen = super::Seen::new(&root, RootState::Reaped { own: false });
+
+    assert!(matches!(
+        look(&seen, true),
+        NumberLook::MayNameAnother {
+            exact_root: false,
+            refusal: Refusal::ReapedElsewhere(_)
+        }
+    ));
+    assert!(matches!(seen.state(), RootState::Unknown(_)), "{:?}", seen.state());
 }
 
 // number_holds -----

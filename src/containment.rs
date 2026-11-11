@@ -347,11 +347,11 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{attach, prepare, Attached, Attachment, Prepared, RootIdentity, TreeKilled};
-#[cfg(unix)]
-pub(crate) use root::Looked;
 #[cfg(all(test, unix))]
 pub(crate) use root::Refusal;
 pub(crate) use root::Root;
+#[cfg(unix)]
+pub(crate) use root::Seen;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};
 pub(crate) use skip::{Skip, TerminateOutcome};

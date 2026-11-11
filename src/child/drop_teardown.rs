@@ -209,19 +209,8 @@ impl Child {
         // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
         // gate comes first, so the look at the root is right before the kill it decides.
         let gate = self.kill_gate();
-        // The view's read of the root's state is the one look the mechanism decides on too.
-        let mut look = None;
-        let view = crate::containment::DropView::read(
-            caller,
-            self.pid(),
-            self.id,
-            || {
-                let state = self.proc.state();
-                look = Some(state.duplicate());
-                state
-            },
-            &self.tree_killed,
-        );
+        let view =
+            crate::containment::DropView::read(caller, self.pid(), self.id, || self.proc.state(), &self.tree_killed);
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
@@ -240,9 +229,10 @@ impl Child {
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
         let held = self.proc.hold(self.pid());
+        // The kill decides on the view's look, the one its report is worded from.
         let kill = {
-            let looked = crate::containment::Looked::new(&held, look.expect("the view read the root's state"));
-            self.attached.hard_kill(Some(&looked))
+            let seen = crate::containment::Seen::new(&held, view.look());
+            self.attached.hard_kill(Some(&seen))
         };
         drop(held);
         kill.log_skip(&view);
