@@ -118,8 +118,13 @@ impl Contains for Group {
         Ok(false)
     }
 
-    fn release(self) -> Release {
-        Release::nothing()
+    fn release(self) -> (Release, Option<Group>) {
+        (Release::nothing(), Some(self))
+    }
+
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
+        None
     }
 }
 

@@ -4,9 +4,20 @@
 
 use std::fmt;
 
-use crate::containment::dispatch::TreeKillOutcome;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
+use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome};
+
+/// [`Contains::kill_left`] of every mechanism but a tree walk: `result` as it is, with nothing held.
+/// Only a tree walk leaves the root alone (the root's own death then settles it).
+pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> (Result<(), Unkilled>, Vec<Left>) {
+    debug_assert!(
+        !matches!(&result, Err(left) if left.root.is_some()),
+        "only a tree walk leaves the root alone"
+    );
+    (result, Vec::new())
+}
 
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
@@ -28,6 +39,16 @@ pub(crate) trait Contains: fmt::Debug {
     ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
     ///   running is an [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled).
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome;
+
+    /// What a kill's `result` comes to once the members an earlier kill left (`left`, which only a
+    /// tree walk holds) are answered, and the members it leaves now: the tree's settlement calls it
+    /// for every kill, under its one lock ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
+    /// A tree walk's root death reparents a member out of every later walk, so it kills again the
+    /// members whose identity it read ([`with_earlier`](crate::containment::treewalk::with_earlier)).
+    /// Default: [`nothing_held`].
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        nothing_held(result)
+    }
 
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
     /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only.
@@ -66,13 +87,40 @@ pub(crate) trait Contains: fmt::Debug {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool>;
 
     /// The end of the resource it owns, which the caller's wait over the [`Release`] completes: a cgroup
-    /// leaf is killed through, drained and removed. The mechanisms that own nothing a wait ends have
-    /// nothing to wait on. A Job Object is not released: it closes as its `Child` drops.
+    /// leaf is killed through, drained and removed, and its release owns the leaf (`None`); a marker's
+    /// release closes its read end (`None`). A mechanism that owns no resource a release ends is given
+    /// back (`Some(self)`), so the tree that held it still asks it, as a walk's settlement does.
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
-    fn release(self) -> Release
+    fn release(self) -> (Release, Option<Self>)
     where
         Self: Sized;
+
+    /// The steps of [`release`](Self::release) that a caller can await instead of block on, taken with
+    /// the resource left where it is: only a cgroup leaf has any. `None` for every other mechanism.
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<AwaitableRelease<'_>>;
+}
+
+/// The awaitable steps of a mechanism's release ([`Contains::awaitable_release`]): a cgroup leaf's
+/// first step and its drain (see
+/// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain)).
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+pub(crate) struct AwaitableRelease<'a> {
+    leaf: &'a crate::containment::cgroup::CgroupLeaf,
+}
+
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+impl<'a> AwaitableRelease<'a> {
+    pub(crate) fn of_leaf(leaf: &'a crate::containment::cgroup::CgroupLeaf) -> AwaitableRelease<'a> {
+        AwaitableRelease { leaf }
+    }
+
+    /// Take the steps. A future dropped mid-await leaves the rest to the resource's release. `child`
+    /// names it in debug lines.
+    pub(crate) async fn wait(&self, child: u32) {
+        self.leaf.step_and_await_drain(child).await;
+    }
 }
 
 /// The closed set of mechanisms a [`Tree`](crate::containment::Tree) is contained by, each variant
@@ -116,6 +164,22 @@ impl Contains for Mechanism {
             Mechanism::Walk(m) => m.send_kill(root),
             #[cfg(test)]
             Mechanism::Fake(m) => m.send_kill(root),
+        }
+    }
+
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.kill_left(result, left),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.kill_left(result, left),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.kill_left(result, left),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.kill_left(result, left),
+            Mechanism::Walk(m) => m.kill_left(result, left),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.kill_left(result, left),
         }
     }
 
@@ -226,16 +290,42 @@ impl Contains for Mechanism {
     }
 
     #[cfg(unix)]
-    fn release(self) -> Release {
+    fn release(self) -> (Release, Option<Mechanism>) {
         match self {
             #[cfg(target_os = "linux")]
-            Mechanism::Cgroup(m) => m.release(),
-            Mechanism::Group(m) => m.release(),
+            Mechanism::Cgroup(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Cgroup))
+            }
+            Mechanism::Group(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Group))
+            }
             #[cfg(target_os = "macos")]
-            Mechanism::Marker(m) => m.release(),
-            Mechanism::Walk(m) => m.release(),
+            Mechanism::Marker(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Marker))
+            }
+            Mechanism::Walk(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Walk))
+            }
             #[cfg(test)]
-            Mechanism::Fake(m) => m.release(),
+            Mechanism::Fake(m) => {
+                let (release, kept) = m.release();
+                (release, kept.map(Mechanism::Fake))
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tokio", target_os = "linux"))]
+    fn awaitable_release(&self) -> Option<AwaitableRelease<'_>> {
+        match self {
+            Mechanism::Cgroup(m) => m.awaitable_release(),
+            Mechanism::Group(m) => m.awaitable_release(),
+            Mechanism::Walk(m) => m.awaitable_release(),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.awaitable_release(),
         }
     }
 }
@@ -307,9 +397,9 @@ impl Release {
         }
     }
 
-    /// The awaitable steps of [`wait`](Self::wait) (see
-    /// [`CgroupLeaf::step_and_await_drain`](crate::containment::cgroup::CgroupLeaf::step_and_await_drain));
-    /// a future dropped mid-await leaves the rest to `wait`. `child` names it in debug lines.
+    /// The awaitable steps of [`wait`](Self::wait), through the resource's
+    /// [`awaitable_release`](Contains::awaitable_release); a future dropped mid-await leaves the rest
+    /// to `wait`. `child` names it in debug lines.
     #[cfg(feature = "tokio")]
     #[cfg_attr(
         not(target_os = "linux"),
@@ -318,7 +408,10 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            leaf.step_and_await_drain(child).await;
+            leaf.awaitable_release()
+                .expect("a cgroup leaf always has awaitable steps")
+                .wait(child)
+                .await;
         }
     }
 }
