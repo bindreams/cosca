@@ -376,7 +376,7 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
         let mark = crate::log_capture::mark();
         let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(errno));
         let capture = Capture::start();
-        let reached = super::check_or_signal_linux_sigkill(
+        let reached = super::resend_sigkill(
             &kernel,
             id,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -384,7 +384,7 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
 
         assert!(matches!(reached, super::Reached::Unknown), "{errno}: got {reached:?}");
         assert!(capture.group_steps().is_empty(), "{errno}: nothing was sent");
-        let lines = crate::log_capture::records_since_on_current_thread(mark, "open_verified_error_with for pid");
+        let lines = crate::log_capture::records_since_on_current_thread(mark, "could not be opened by identity");
         assert_eq!(lines.len(), 1, "{errno}: {lines:?}");
         assert_eq!(lines[0].0, log::Level::Warn);
         assert!(lines[0].1.contains(text), "{errno}: {lines:?}");
@@ -396,7 +396,7 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
 /// the leader's `stat` is read by the listing, then by the member's identity, then by the look at
 /// its liveness, then by the re-verify before the probe.
 ///
-/// A re-verify the kernel refuses leaves the member unassessable. Mutant: "`check_or_signal`
+/// A re-verify the kernel refuses leaves the member unassessable. Mutant: "`probe_member`
 /// re-verifies through `HostKernel`": the probe reaches it and the group is `Cleared`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -536,7 +536,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
         rustix::process::PidfdFlags::empty(),
         Err(rustix::io::Errno::NOENT),
     );
-    let reached = super::check_or_signal_linux_sigkill(
+    let reached = super::resend_sigkill(
         &kernel,
         id,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),

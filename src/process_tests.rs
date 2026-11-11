@@ -182,3 +182,31 @@ fn a_query_only_handle_is_unknown_while_running_and_dead_after_termination() {
     child.terminate();
     assert_eq!(p.is_alive(), Liveness::Dead);
 }
+
+/// `kill_tree` kills the root through the handle the `Process` holds, not through a second open of
+/// its identity: the held fake is sent the one `SIGKILL`, and the live process it stands in front
+/// of, which a send by identity would kill, runs on.
+///
+/// Mutant: the walk kills the root by its identity.
+#[skuld::test]
+fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
+    use crate::os_process::fake::FakeProcess;
+    use crate::signal::{Sent, Sig};
+
+    let (child, _stdin) = crate::test_child::held_uncontained_blocker(true);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let fake = FakeProcess::new([]).signals([Ok(Sent::Delivered)]);
+    let held = Process {
+        id,
+        os: Box::new(fake.clone()),
+    };
+
+    held.kill_tree_with(&crate::identity::HostKernel)
+        .expect("the held handle took the kill and the root has no descendant");
+
+    assert_eq!(fake.signal_calls(), vec![Sig::Kill]);
+    assert!(
+        child.try_wait().expect("look at the live process").is_none(),
+        "the real process was killed by its identity, not through the held handle"
+    );
+}

@@ -467,10 +467,12 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     };
     // The handle backstop, through the pidfd; after a reap it has nothing to reach. A root whose
     // handle cannot answer is signalled through it by every entry point: it names the root exactly.
+    // A walk's `SIGTERM` reaches its root through a pidfd opened for the root's identity.
     let pidfd = match (cfg!(target_os = "linux"), reaped, op) {
         (false, _, _) => Want::No,
         (true, true, _) => Want::Any,
         (true, false, _) if reap != Reap::None => Want::Yes,
+        (true, false, Op::Terminate) if mechanism.walks() => Want::Yes,
         (true, false, Op::Terminate) => Want::No,
         (true, false, _) => Want::Yes,
     };

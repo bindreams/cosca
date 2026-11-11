@@ -957,8 +957,8 @@ fn pid_is_live_group_member(pid: RawPid, pgid: i32) -> bool {
 ///
 /// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
 /// `group::decide` produces `source: None` when the group WAS listed successfully but one or
-/// more of its individual members could not be confirmed cleared (`check_or_signal` /
-/// `check_or_signal_linux_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
+/// more of its individual members could not be confirmed cleared (`probe_member` /
+/// `resend_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
 /// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
 /// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
 /// reason: a directly and deliberately TESTED input-validation refusal

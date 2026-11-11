@@ -1,10 +1,10 @@
 //! Async mirror of the open [`Process`](crate::Process). Opening and signalling delegate
 //! synchronously; only the death-watch and the graceful pair are async (`tokio::wait`).
 //! NO stdio (its pipes belong to its real parent); acts through the handle reach the process
-//! opened, never a later holder of its pid, while the tree acts signal each member, the root
-//! included, through a pidfd proved to name it on Linux, or a handle on Windows, and check its
-//! identity and then send by number on macOS (see [`Process`](crate::Process)); nothing here reaps
-//! (the real parent collects the zombie).
+//! opened, never a later holder of its pid, while the tree acts signal each member through a
+//! handle opened by its identity: a pidfd proved to name it on Linux, a process handle on Windows,
+//! an audit token on macOS (see [`Process`](crate::Process)); nothing here reaps (the real parent
+//! collects the zombie).
 
 use std::time::Duration;
 

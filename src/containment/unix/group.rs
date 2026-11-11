@@ -339,57 +339,30 @@ fn classify_member(
     }
 }
 
-/// Re-verify `id` is still the SAME identity, deliver-or-probe it, and classify the answer —
-/// the ONE implementation both the `SIGKILL` and `SIGTERM` paths use, differing only in
-/// `signal` (`Some(SIGKILL)` resends for real; `None` probes with `kill(pid, 0)`).
+/// Re-verify `id` is still the SAME identity, probe it with `kill(pid, 0)`, and classify the
+/// answer. The probe sends no signal, which [`OsProcess::signal`](crate::os_process::OsProcess::signal)
+/// cannot express, so it is not sent through an opened handle as the `SIGKILL` resend is
+/// ([`resend_sigkill`]).
 ///
-/// **Why this doesn't reuse `treewalk::kill_by_identity`.** That primitive's
-/// `KillOutcome::NotAttempted` conflates TWO different causes — a denied identity re-verify,
-/// and a genuine `EPERM` from the real `kill(2)` call — into one variant, with nothing in the
-/// return value to tell them apart. Pre-checking identity here and assuming
-/// `kill_by_identity`'s own internal re-check, a moment later, would agree is not reliable: a
-/// transient disagreement in that gap would mislabel "unassessable" as a confirmed refusal.
-/// Reusing `kill_by_identity` here cannot be made precise without changing its return type
-/// (out of scope — it is a sibling module's primitive), so this performs the identity check
-/// AND the `kill(2)` call directly, observing the real errno first-hand. `EPERM` and only
-/// `EPERM` classifies as a confirmed refusal; every other unexpected errno is `Unknown`, not
-/// `No` — conservative, and consistent with every other "not EPERM/ESRCH" disposition in this
-/// module.
+/// `EPERM` and only `EPERM` classifies as a confirmed refusal; every other unexpected errno is
+/// `Unknown`, not `No` — conservative, and consistent with every other "not EPERM/ESRCH"
+/// disposition in this module.
 ///
-/// **The identity check and the act are still two separate syscalls on macOS — a narrowed,
-/// not eliminated, race.** A pid recycled between the listing and this call is not "never
-/// mistakenly signalled": the re-verify and the `kill(2)` below are non-atomic, so a recycle
-/// in THAT gap (not the earlier, listing-to-here gap the re-verify closes) is still possible.
-/// On Linux this is closed for real, not just narrowed: `SIGKILL` delivery goes through
-/// `pidfd_open`+`pidfd_send_signal` (`check_or_signal_linux_sigkill`, below), through
-/// `open_verified_error_with` — the fd itself pins the identity at the kernel level, so a pid reused
-/// after `pidfd_open` cannot be hit even in principle, and `treewalk::kill_by_identity` signals
-/// the same way. Only macOS has the window: it has no pidfd equivalent, so `kill(2)` here and in
-/// `treewalk::kill_by_identity` (re-verify, then `kill(2)`) can reach a pid recycled in that gap,
-/// a documented best-effort limitation of the group and tree sweeps there.
-/// `Process::kill` on macOS does not have it: it signals by audit token
-/// (`os_process::macos::MacProcess::signal`).
-fn check_or_signal(
+/// **The identity check and the probe are two separate syscalls — a narrowed, not eliminated,
+/// race.** A pid recycled between the listing and this call is not "never mistakenly probed":
+/// the re-verify and the `kill(2)` below are non-atomic, so a recycle in THAT gap (not the
+/// earlier, listing-to-here gap the re-verify closes) is still possible. A probe delivers
+/// nothing, so a probe of a recycled pid misreports at worst.
+fn probe_member(
     kernel: &dyn crate::identity::Kernel,
     pid: RawPid,
     id: crate::identity::ProcessId,
-    signal: Option<Signal>,
     root: Option<&dyn Root>,
 ) -> Reached {
-    // Contract (repo-wide policy): this module's whole design rests on
-    // `SIGTERM` never being resent for real (the double-signal-escalation avoidance —
-    // `converge`'s design note above) — only `SIGKILL` may be `Some`, everything else must
-    // probe (`None`). A future caller passing e.g. `Some(Signal::SIGTERM)` through here would
-    // silently violate that without this assert ever making it visible.
-    debug_assert!(
-        matches!(signal, None | Some(Signal::SIGKILL)),
-        "check_or_signal called with {signal:?}; only None (probe) or Some(SIGKILL) (resend) \
-         are ever valid here — SIGTERM must never resend, see converge's design note"
-    );
     // The listing named the root's group only while the group's number is still the root's: the
-    // root's check proves it, for a resend and a probe alike. The member's identity check, after it
-    // and right before the `kill`, guards the send by the member's pid.
-    if let Err(reached) = root_check_before_send(root, pid, signal) {
+    // root's check proves it. The member's identity check, after it and right before the `kill`,
+    // guards the probe by the member's pid.
+    if let Err(reached) = root_check_before_send(root, pid, None) {
         return reached;
     }
     match crate::identity::ProcessId::of_with(kernel, pid).0 {
@@ -407,19 +380,12 @@ fn check_or_signal(
         // above, even though both look like "a pid that no longer names the expected
         // process": `Resolved::Found(_)` is safe BECAUSE identity was resolved and compared
         // (we KNOW it's a different, and therefore not-our-business, process).
-        // `Resolved::Unknown` means the re-verify could not be performed AT ALL — if the pid
-        // was recycled onto a process the caller MAY signal, `kill(2)` returns `Ok(())` and a
-        // completely unrelated process gets killed, not `ESRCH`/`EPERM`. There is no analogy
-        // to lean on; the two cases are opposite, not equivalent. Conservative bail, for BOTH
-        // the resend and the probe: an unverifiable identity is never signalled on this
-        // platform (no atomic handle exists here — `check_or_signal_linux_sigkill`, below, is
-        // the platform where a genuinely atomic alternative exists and is used).
+        // `Resolved::Unknown` means the re-verify could not be performed AT ALL. Conservative
+        // bail: an unverifiable identity is never probed by its bare pid.
         crate::identity::Resolved::Unknown => {
             log::warn!(
                 "containment::unix::group: pid {pid} could not be re-verified (access denied?) \
-                 — treated as unassessable, not signalled (an unverified pid is never signalled \
-                 on this platform: a recycled pid onto an unrelated, signalable process would \
-                 be hit for real, not safely refused)"
+                 — treated as unassessable, not probed"
             );
             return Reached::Unknown;
         }
@@ -432,18 +398,14 @@ fn check_or_signal(
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
         return Reached::Unknown;
     };
-    let sent = match signal {
-        Some(signal) => super::send_signal(super::Target::Member(pid), super::Sys::Process(target), signal),
-        None => super::probe_signal(super::Target::Member(pid), super::Sys::Process(target)),
-    };
-    match sent {
+    match super::probe_signal(super::Target::Member(pid), super::Sys::Process(target)) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
         Err(nix::errno::Errno::EPERM) => {
             // The expected, common case for a genuine refuser — logged at debug (not warn),
             // but logged: every other "member did not clear" branch in this module records
             // its cause, and this is the one that produces the primary, expected outcome of
             // the whole feature (a confirmed refusal), so it should be no less traceable.
-            log::debug!("containment::unix::group: kill({pid}, {signal:?}) refused: EPERM");
+            log::debug!("containment::unix::group: kill({pid}, 0) refused: EPERM");
             Reached::No
         }
         Err(e) => {
@@ -451,7 +413,7 @@ fn check_or_signal(
             // not evidence the tree came down either — the conservative "we don't know"
             // answer, not a guess in either direction.
             log::warn!(
-                "containment::unix::group: kill({pid}, {signal:?}) answered {report}, neither EPERM nor ESRCH",
+                "containment::unix::group: kill({pid}, 0) answered {report}, neither EPERM nor ESRCH",
                 report = crate::error::Report(&e)
             );
             Reached::Unknown
@@ -478,32 +440,31 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
     }
 }
 
-/// Linux-only, `SIGKILL`-only: the atomic version of `check_or_signal`'s resend, via the
-/// crate's `open_verified_error_with` ("open a pidfd for this identity, re-verifying, `Ok(None)` if
-/// already gone"). `pidfd_send_signal` on the returned fd is guaranteed to hit the SAME process the
-/// open just confirmed, even if the pid number is reused by something else in between — no gap
-/// remains, unlike `check_or_signal`'s plain-`kill(2)` path.
+/// The `SIGKILL` resend to a listed member, through the handle
+/// [`open_with`](crate::os_process::open_with) opens for its identity and its
+/// [`signal`](crate::os_process::OsProcess::signal): the handle names the SAME process the open
+/// just confirmed, even if the pid number is reused by something else in between. Linux: a
+/// pidfd; macOS: an audit token, which the kernel checks against the process's `p_idversion`.
 ///
 /// The open's answers map to a [`Reached`] as follows:
 ///
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
-///   `id.exists()` saying `Gone`) and a ptraced zombie thread.
+///   `id.exists()` saying `Gone`) and a ptraced zombie thread, and a macOS pid that names another
+///   process.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
 /// - `Error::Unsupported` (`pidfd_open` refused), `Error::Io` (a transient `pidfd_open` failure,
 ///   or a `poll` failure) and `Error::Unassessable` (identity denied, or the pid overflows the
 ///   pidfd interface) are `Reached::Unknown`, with no fallback to `kill(2)`: the member's identity
-///   is told through a pidfd on every kernel, so without one nothing proves that its pid still
-///   names the listed member, and a bare pid is never signalled on a guess.
+///   is told through the handle, so without one nothing proves that its pid still names the
+///   listed member, and a bare pid is never signalled on a guess.
 ///
-/// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
-/// inside `open_verified_with`.** (That is the path of a `Ticks` id, on a host before Linux 6.9. A
-/// `Pidfs` id is proved by the open pidfd's own inode and reads no `/proc`, so it has no such gap.)
-/// This looks tempting — `pidfd_open` already succeeded, so
-/// *something* is there — but it does not actually close the gap, for the same reason
-/// `check_or_signal`'s own `Resolved::Unknown` arm (above) must never signal a bare pid:
+/// **Why this never signals when `id.exists()` answers `Unknown` inside the open.** (That is the
+/// path of a `Ticks` id, on a Linux host before 6.9. A `Pidfs` id is proved by the open pidfd's
+/// own inode and reads no `/proc`, so it has no such gap.) This looks tempting — `pidfd_open`
+/// already succeeded, so *something* is there — but it does not actually close the gap:
 /// `pidfd_open(pid)` binds to WHATEVER process holds that pid NUMBER at the moment it is
 /// called, exactly like a bare `kill(2)`. If the member `members()` listed at T0 exited and
 /// its pid was recycled onto an unrelated, signalable process before `pidfd_open` runs at T1,
@@ -513,44 +474,57 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
 /// nor a clear "gone"). The pidfd's real safety property is narrower than "identity-pinned
 /// from the moment of listing": it guarantees the target does not change identity AFTER a
 /// successful open, not that the identity was already correct AT open time — exactly the gap
-/// `open_verified_with`'s own `id.exists()` step exists to close, and exactly the gap `Existence::
-/// Unknown` says was NOT closed this time. Signalling anyway would reintroduce, on Linux, the
-/// identical "unrelated-process-killed" failure mode a bare-pid signal has on macOS's
-/// `Resolved::Unknown` arm — not a smaller version of it. Left as a disclosed, asymmetric gap
+/// the open's own `id.exists()` step exists to close, and exactly the gap `Existence::
+/// Unknown` says was NOT closed this time. Left as a disclosed, asymmetric gap
 /// rather than closed with an unsound fix: on a genuinely `hidepid`-restricted host, a live
 /// member whose identity cannot be re-confirmed at delivery time is correctly left unsignalled
 /// and reported `Unassessable`, even though the earlier `Liveness::Unknown`-admitting gate
 /// (`classify_member`) let it through to the attempt.
-#[cfg(target_os = "linux")]
-fn check_or_signal_linux_sigkill(
+fn resend_sigkill(
     kernel: &dyn crate::identity::Kernel,
     id: crate::identity::ProcessId,
     root: Option<&dyn Root>,
 ) -> Reached {
-    use std::os::fd::AsFd as _;
-    match crate::os_process::linux::open::open_verified_error_with(kernel, id) {
+    use crate::signal::{Sent, Sig};
+    match crate::os_process::open_with(kernel, id) {
         Ok(None) => Reached::Yes, // already gone
-        Ok(Some(pidfd)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
+        Ok(Some(os)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
             Err(reached) => reached,
-            Ok(()) => match super::pidfd_signal_member(pidfd.as_fd(), id.pid(), Signal::SIGKILL) {
-                Ok(()) => Reached::Yes,
-                Err(nix::errno::Errno::ESRCH) => Reached::Yes, // exited between open and signal
-                Err(nix::errno::Errno::EPERM) => {
-                    log::debug!(
-                        "containment::unix::group: pidfd_send_signal({}, KILL) refused: EPERM",
-                        id.pid()
-                    );
-                    Reached::No
+            Ok(()) => {
+                let sent = os.signal(Sig::Kill);
+                // Where a test records a send, as the resend before it did.
+                #[cfg(test)]
+                crate::send_log::record_group(crate::send_log::GroupStep::Member(
+                    if cfg!(target_os = "linux") {
+                        crate::send_log::Route::Pidfd
+                    } else {
+                        crate::send_log::Route::Number
+                    },
+                    id.pid(),
+                    libc::SIGKILL,
+                ));
+                match sent {
+                    Ok(Sent::Delivered) => Reached::Yes,
+                    // Exited between the open and the send.
+                    Ok(Sent::Gone) => Reached::Yes,
+                    Ok(Sent::Unverified) => {
+                        debug_assert!(false, "a member opened by identity cannot be unverified");
+                        Reached::Unknown
+                    }
+                    Err(crate::error::Error::Io(refused)) if refused.raw_os_error() == Some(libc::EPERM) => {
+                        log::debug!("containment::unix::group: SIGKILL to pid {} refused: EPERM", id.pid());
+                        Reached::No
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "containment::unix::group: SIGKILL to pid {} answered {report}, neither EPERM nor ESRCH",
+                            id.pid(),
+                            report = crate::error::Report(&e)
+                        );
+                        Reached::Unknown
+                    }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "containment::unix::group: pidfd_send_signal({}, KILL) answered {report}, neither EPERM nor ESRCH",
-                        id.pid(),
-                        report = crate::error::Report(&e)
-                    );
-                    Reached::Unknown
-                }
-            },
+            }
         },
         Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
@@ -565,7 +539,7 @@ fn check_or_signal_linux_sigkill(
         // no kill(2) fallback resolves. Conservative, not a guess.
         Err(e) => {
             log::warn!(
-                "containment::unix::group: open_verified_error_with for pid {}: {report}",
+                "containment::unix::group: pid {} could not be opened by identity: {report}",
                 id.pid(),
                 report = crate::error::Report(&e)
             );
@@ -584,14 +558,14 @@ fn check_or_signal_linux_sigkill(
 /// refuser), so without this re-check a member that finished dying mid-teardown would be
 /// misreported as a survivor. Only `Survivor` is re-checked — `NotASurvivor`/`Unassessable`
 /// need no second look, since neither claims a definite, still-running refuser. A downgrade
-/// is logged: it overturns an `EPERM` already logged once inside `check_or_signal`, and a
+/// is logged: it overturns an `EPERM` already logged once inside `resend_sigkill`, and a
 /// debug session starting from "why did teardown report Cleared/Unassessable despite the
 /// EPERM in the logs" needs this decision to be visible too, not just the original refusal.
 ///
 /// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`.** Downgrading
 /// on `Unknown` too would throw away STRONGER evidence for WEAKER: the `Survivor` this
 /// function receives already carries a REAL, directly-observed `EPERM` from
-/// `check_or_signal`'s own `kill(2)`/`pidfd_send_signal` call — the kernel's authoritative,
+/// `resend_sigkill`'s own send, or `probe_member`'s `kill(2)` — the kernel's authoritative,
 /// first-hand answer to "may this caller signal this process". `recheck`'s liveness query is a
 /// WEAKER, independently-deniable signal (the same class of query that can itself answer
 /// `Unknown` under `hidepid` or a sandboxed runtime); a denied liveness reconfirmation is not
@@ -639,12 +613,11 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// **The group's number, and each resend.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
 /// that exactly, and elsewhere the root's state stands in for it (unreaped). Each `SIGKILL` resend
-/// and `SIGTERM` probe checks the root ([`check_number`]) first. On
-/// Linux a `SIGKILL` resend first pins the member by a pidfd that its identity check vouches for, then
-/// checks the root, then sends through that pidfd; a Linux member whose pidfd cannot be opened is
-/// unassessable and not signalled. A `SIGTERM` probe, and a resend by the member's pid (on macOS),
-/// checks the root, then the member's identity right before the send. A member whose root check
-/// fails is unassessable and not signalled; on
+/// and `SIGTERM` probe checks the root ([`check_number`]) first. A `SIGKILL` resend first opens the
+/// member by its identity (a pidfd on Linux, an audit token on macOS), then checks the root, then
+/// sends through that handle; a member that cannot be opened is unassessable and not signalled. A
+/// `SIGTERM` probe checks the root, then the member's identity right before the probe. A member
+/// whose root check fails is unassessable and not signalled; on
 /// 6.9+, once the group has no member left, it is in another group that took the number, and is not
 /// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
 /// documents.
@@ -677,19 +650,10 @@ pub(crate) fn converge(
                 return Reached::Unknown;
             }
             if signal == Signal::SIGKILL {
-                // Linux: the atomic pidfd path (see its own doc comment). macOS/other Unix:
-                // no pidfd equivalent exists, so `check_or_signal` keeps the residual race
-                // documented on it.
-                #[cfg(target_os = "linux")]
-                {
-                    check_or_signal_linux_sigkill(kernel, id, root)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    check_or_signal(kernel, id.pid(), id, Some(signal), root)
-                }
+                resend_sigkill(kernel, id, root)
             } else {
-                check_or_signal(kernel, id.pid(), id, None, root)
+                // `SIGTERM` is never resent: it is only probed (see this fn's doc).
+                probe_member(kernel, id.pid(), id, root)
             }
         });
         match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {

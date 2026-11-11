@@ -573,6 +573,32 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     );
 }
 
+/// The handle a walk sends a member's kill through is open for the member's exit: it can be waited
+/// on once the kill is sent. A handle opened for `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`
+/// alone cannot (`WaitForSingleObject` answers `ERROR_ACCESS_DENIED`).
+///
+/// Mutant: the walk opens its member without `SYNCHRONIZE`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_walk_members_handle_can_be_waited_on_after_its_kill() {
+    // The blocker's stdin stays open, so only the kill ends it.
+    let (_child, _stdin, id) = crate::test_child::live_blocker();
+    let os = super::open_by_identity(&crate::identity::HostKernel, id)
+        .expect("a live member opens")
+        .expect("a live member is not gone");
+    // A handle without `SYNCHRONIZE` cannot show that a running member is running: its look fails.
+    assert!(
+        matches!(os.exited(), Ok(crate::os_process::Exit::Running(_))),
+        "a live member's handle is waited on, not refused"
+    );
+    let outcome = super::send_to_member(id, &*os, crate::signal::Sig::Kill);
+    assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
+    assert!(
+        crate::os_process::drive::exited_held(&*os, None).expect("the member's handle can be waited on"),
+        "the wait ended on the member's exit"
+    );
+}
+
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.
 #[cfg(windows)]
 #[skuld::test]
@@ -615,12 +641,17 @@ fn hard_kill_of_a_root_whose_open_is_denied_is_an_error_naming_it() {
             ..
         }) if members.is_empty() => {
             assert_eq!(pid, child.pid());
+            // The open drops the terminate right the process refuses, and the kill is the OS's
+            // refusal, with its error.
             assert!(
-                matches!(*source, crate::error::Error::Unassessable { source: Some(_), .. }),
-                "an identity that could not be read is Unassessable, carrying the OS error: {source:?}"
+                matches!(*source, crate::error::Error::Io(_)),
+                "a refused kill is the OS's error: {source:?}"
             );
-            let said = source.to_string();
-            assert!(said.contains("could not be queried"), "{said}");
+            assert_eq!(
+                source.raw_os_error(),
+                Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),
+                "{source:?}"
+            );
         }
         other => panic!("expected MemberNotKilled for the root, got {other:?}"),
     }

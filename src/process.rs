@@ -2,10 +2,10 @@
 //! real parent). The handle is opened from a `ProcessId`, never a bare pid, and every act through
 //! it (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reaches that process or reports it gone,
 //! never a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-//! `graceful_shutdown_tree`) walk by identity and signal each member, the root included (not
-//! through this handle, until the containment boundary takes it), through a pidfd proved to name it
-//! on Linux, or a handle on Windows. On macOS they check each member, then send by number, with the
-//! window principle 4 describes. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
+//! `graceful_shutdown_tree`) walk by identity and signal each member, through a handle opened by
+//! its identity: a pidfd proved to name it on Linux, a process handle on Windows, an audit token on
+//! macOS. `kill_tree` signals the root through this handle instead of a second open of it.
+//! `wait()` is a death-watch yielding no `ExitStatus` (the kernel
 //! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
 
@@ -21,10 +21,9 @@ mod graceful;
 /// An open handle on a process, held since [`open`](Self::open). Acts through the handle
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-/// `graceful_shutdown_tree`) signal each member, the root included (not through this handle, until
-/// the containment boundary takes it), through a pidfd proved to name it on Linux, or a handle on
-/// Windows; on macOS they check its identity, then send by number. Not `Clone`: open the
-/// [`ProcessId`] again.
+/// `graceful_shutdown_tree`) signal each member through a handle opened by its identity (a pidfd
+/// proved to name it on Linux, a process handle on Windows, an audit token on macOS); `kill_tree`
+/// signals the root through this handle. Not `Clone`: open the [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,

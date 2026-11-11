@@ -93,6 +93,8 @@ use crate::containment::Why;
 use crate::containment::{Containment, Skip, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
+use crate::os_process::OsProcess;
+use crate::signal::{Sent, Sig};
 use crate::Recursive;
 
 /// A tree named by parentage: the root's identity, from which its descendants are enumerated and
@@ -105,6 +107,13 @@ pub(crate) struct Walker {
 impl Walker {
     pub(crate) fn new(root: ProcessId) -> Walker {
         Walker { root }
+    }
+
+    /// [`send_kill`](Contains::send_kill) for a caller that holds a handle on the root (a
+    /// [`Process`](crate::Process)): the root's kill goes through `held`, which must name the root,
+    /// not through a second open of its identity. No root to look at, so no number to trust.
+    pub(crate) fn kill_through(&self, kernel: &dyn Kernel, held: &dyn OsProcess) -> TreeKillOutcome {
+        hard_kill_through(kernel, self.root, Some(held))
     }
 
     /// The root the walk starts from.
@@ -460,61 +469,32 @@ pub(crate) fn walk_from(
     }))
 }
 
-/// A kill that sent nothing because the process's identity could not be read at kill time. The
-/// message reads after the pid, which the error of a walk that left it behind names.
-#[cfg(any(all(unix, not(target_os = "linux")), windows))]
-fn identity_unread(detail: String, source: Option<std::io::Error>) -> KillOutcome {
-    KillOutcome::NotAttempted(Error::Unassessable {
-        detail,
-        source: source.map(Error::io_cause),
-    })
-}
-
-/// A kill the OS refused: the error carries the OS error, as `Process::kill` does.
+/// Open `id` by identity, for one send. `Ok(None)`: it is gone, or its pid names another process.
+/// An identity that cannot be read or proved leaves nothing to send to, so it is the error the walk
+/// gives the same pid ([`unqueryable`](crate::identity::unqueryable)).
+///
+/// Linux reads the open's failure by call ([`OpenFailure`]) to build that error, which
+/// [`open_with`](crate::os_process::open_with) does not keep.
 #[cfg(any(unix, windows))]
-fn refused(os: std::io::Error) -> KillOutcome {
-    KillOutcome::NotAttempted(Error::Io(os))
-}
+fn open_by_identity(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::os_process::linux::open::OpenFailure;
 
-/// Linux: signal `id` through a pidfd proved to name it — never a recycled pid. The pidfd pins the
-/// process, so a pid reused after the proof cannot be hit. Already gone (`Ok(None)` from the proof,
-/// or `ESRCH` from the send) is success. A pidfd that cannot be opened or proved leaves no identity,
-/// so nothing is sent: `NotAttempted`, with the error the walk gives the same pid
-/// ([`unqueryable`](crate::identity::unqueryable)). Best-effort.
-#[cfg(target_os = "linux")]
-pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
-    use std::os::fd::AsFd as _;
-
-    use nix::errno::Errno;
-
-    use crate::os_process::linux::open::OpenFailure;
-
-    match crate::os_process::linux::open::open_verified_with(kernel, id) {
-        Ok(None) => {
-            log::debug!(
-                "treewalk: skipping pid {pid} - identity changed or gone since the snapshot",
-                pid = id.pid()
-            );
-            KillOutcome::AlreadyGone
+        match crate::os_process::linux::open::open_verified_with(kernel, id) {
+            Ok(pidfd) => Ok(pidfd.map(|pidfd| {
+                Box::new(crate::os_process::linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>
+            })),
+            Err(OpenFailure::Call(call)) => Err(crate::identity::call_error(&format!("pid {}", id.pid()), call)),
+            Err(OpenFailure::Finished(error)) => Err(match error {
+                error @ (Error::Unassessable { .. } | Error::Unsupported { .. }) => error,
+                other => unproved(id.pid(), other),
+            }),
         }
-        Ok(Some(pidfd)) => {
-            let sent = crate::containment::unix::pidfd_signal_member(pidfd.as_fd(), id.pid(), signal);
-            #[cfg(test)]
-            crate::send_log::record_by_identity(id.pid(), signal as i32);
-            match sent {
-                Ok(()) => KillOutcome::Terminated,
-                // Reaped after the proof - nothing was left to kill.
-                Err(Errno::ESRCH) => KillOutcome::AlreadyGone,
-                Err(e) => refused(e.into()),
-            }
-        }
-        Err(OpenFailure::Call(call)) => {
-            KillOutcome::NotAttempted(crate::identity::call_error(&format!("pid {}", id.pid()), call))
-        }
-        Err(OpenFailure::Finished(error)) => KillOutcome::NotAttempted(match error {
-            error @ (Error::Unassessable { .. } | Error::Unsupported { .. }) => error,
-            other => unproved(id.pid(), other),
-        }),
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::os_process::open_with(kernel, id)
     }
 }
 
@@ -529,96 +509,87 @@ fn unproved(pid: RawPid, error: Error) -> Error {
     }
 }
 
-/// Kill `id` only if the pid STILL resolves to that exact identity — never a
-/// recycled pid. Already-gone (`None`, or `ESRCH`) is success. Best-effort.
-///
-/// Not atomic: the check and the `kill(2)` are two syscalls, so a pid recycled between them is
-/// still hit. This is macOS's residual window (no pidfd); Linux signals through the proved pidfd.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    use crate::identity::Resolved;
-    // Re-verify identity at the instant of the kill. Three outcomes, not two: a denied
-    // re-verify is NOT a confirmed change, and must not be logged as one.
-    match ProcessId::of_with(kernel, id.pid()).0 {
-        Resolved::Found(live) if live == id => {}
-        Resolved::Found(_) | Resolved::Gone => {
-            log::debug!(
-                "treewalk: skipping pid {pid} - identity changed since the snapshot",
-                pid = id.pid()
-            );
-            return KillOutcome::AlreadyGone;
-        }
-        Resolved::Unknown => {
-            return identity_unread("it could not be queried (access denied?)".to_owned(), None);
-        }
+/// `os`'s `sig`, the one send to a walked member, as the outcome of a kill by identity. A refusal
+/// is the OS's own error, as `Process::kill` gives it. Already gone (`ESRCH`, or exited when the
+/// call came) is success.
+#[cfg(any(unix, windows))]
+fn send_to_member(id: ProcessId, os: &dyn OsProcess, sig: Sig) -> KillOutcome {
+    #[cfg(all(test, windows))]
+    fault::run_before_terminate();
+    let sent = os.signal(sig);
+    // Where a test records a send, as the sends before it did.
+    #[cfg(all(test, target_os = "linux"))]
+    {
+        let signo = match sig {
+            Sig::Kill => libc::SIGKILL,
+            Sig::Term => libc::SIGTERM,
+        };
+        crate::send_log::record_by_identity(id.pid(), signo);
+        crate::send_log::record_group(crate::send_log::GroupStep::Member(
+            crate::send_log::Route::Pidfd,
+            id.pid(),
+            signo,
+        ));
     }
-    // `nix::unistd::Pid::from_raw` is infallible and accepts 0, and `kill(0, sig)` signals
-    // the CALLER-S ENTIRE PROCESS GROUP. Use the same total guard the `sig 0` probe uses.
-    let Some(target) = crate::identity::probe::signal_target(id.pid()) else {
-        return identity_unread("it is not a single-process signal target".to_owned(), None);
-    };
-    let sent = kill(Pid::from_raw(target), signal);
-    #[cfg(test)]
-    crate::send_log::record_by_identity(id.pid(), signal as i32);
+    #[cfg(not(all(test, target_os = "linux")))]
+    let _ = id;
     match sent {
-        Ok(()) => KillOutcome::Terminated,
-        // Exited between the re-verify and the signal - nothing was left to kill.
-        Err(nix::errno::Errno::ESRCH) => KillOutcome::AlreadyGone,
-        Err(e) => refused(e.into()),
+        Ok(Sent::Delivered) => KillOutcome::Terminated,
+        Ok(Sent::Gone) => KillOutcome::AlreadyGone,
+        // A handle opened by identity is verified: only an owned child's send is ever unverified.
+        Ok(Sent::Unverified) => {
+            debug_assert!(false, "a member opened by identity cannot be unverified");
+            KillOutcome::NotAttempted(Error::Unassessable {
+                detail: "it could not be verified".to_owned(),
+                source: None,
+            })
+        }
+        Err(refused) => KillOutcome::NotAttempted(refused),
     }
 }
 
-/// Windows: terminate `id` only if the pid STILL resolves to that exact identity.
-/// Opens the process for terminate rights and calls `TerminateProcess`. Already
-/// gone (unresolvable / unopenable, or exiting when the call came) is success. Best-effort.
-#[cfg(windows)]
-pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
-    use windows::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
-
-    use crate::identity::{
-        windows_close, windows_open_classified, windows_terminate_held, HandleIdentity, Opened, Termination,
-    };
-
-    // Open for terminate AND query, so the SAME held handle both pins the kernel object
-    // (pid-reuse-safe) and lets us re-verify identity before terminating, race-free.
-    let rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-    let handle = match windows_open_classified(id.pid(), rights) {
-        Opened::Found(h) => h,
-        Opened::Gone => return KillOutcome::AlreadyGone,
-        Opened::Denied(e) => {
-            return identity_unread(
-                format!("it could not be queried (access denied?) - not opened to terminate ({e})"),
-                Some(crate::error::win32_io_error(e)),
-            );
-        }
-    };
-    let outcome = match crate::identity::windows_handle_identity(handle, id) {
-        HandleIdentity::Same => {
-            #[cfg(test)]
-            fault::run_before_terminate();
-            match windows_terminate_held(handle, rights) {
-                Termination::Terminated => KillOutcome::Terminated,
-                Termination::Exited => KillOutcome::AlreadyGone,
-                Termination::Failed(e) => refused(crate::error::win32_io_error(e)),
-            }
-        }
-        HandleIdentity::Different => {
+/// [`send_to_member`] to what `opened` found: nothing is sent to a process that is gone, or that
+/// another process's pid names now.
+#[cfg(any(unix, windows))]
+fn kill_opened(id: ProcessId, opened: Result<Option<Box<dyn OsProcess>>, Error>, sig: Sig) -> KillOutcome {
+    match opened {
+        Ok(Some(os)) => send_to_member(id, &*os, sig),
+        Ok(None) => {
             log::debug!(
-                "treewalk: skipping pid {} - identity changed since the snapshot",
-                id.pid()
+                "treewalk: skipping pid {pid} - identity changed or gone since the snapshot",
+                pid = id.pid()
             );
             KillOutcome::AlreadyGone
         }
-        HandleIdentity::Unreadable(e) => identity_unread(
-            format!("it opened but its identity could not be read ({e}) - not terminated"),
-            Some(crate::error::win32_io_error(e)),
-        ),
-    };
-    windows_close(handle);
-    outcome
+        Err(error) => KillOutcome::NotAttempted(error),
+    }
+}
+
+/// The [`Sig`] a walk sends for `signal`: SIGKILL or SIGTERM, the only two it sends.
+#[cfg(unix)]
+fn sig_of(signal: Signal) -> Sig {
+    match signal {
+        Signal::SIGKILL => Sig::Kill,
+        Signal::SIGTERM => Sig::Term,
+        other => unreachable!("a walk sends SIGKILL or SIGTERM, not {other}"),
+    }
+}
+
+/// Signal `id` through a handle opened by identity ([`open_by_identity`]) — never a recycled pid.
+/// The handle pins the process, so a pid reused after the open cannot be hit (macOS: by its audit
+/// token, which the kernel checks). Already gone (`Ok(None)` from the open, or the send's own answer)
+/// is success. A process that cannot be opened or proved leaves no identity, so nothing is sent:
+/// `NotAttempted`. Best-effort.
+#[cfg(unix)]
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
+    kill_opened(id, open_by_identity(kernel, id), sig_of(signal))
+}
+
+/// Terminate `id` through a handle opened by identity ([`open_by_identity`]). Already gone
+/// (unresolvable, or exiting when the call came) is success. Best-effort.
+#[cfg(windows)]
+pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
+    kill_opened(id, open_by_identity(&crate::identity::HostKernel, id), Sig::Kill)
 }
 
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute
@@ -642,6 +613,12 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 ///
 /// [`Tree::settle`]: crate::containment::Tree::settle
 pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome {
+    hard_kill_through(kernel, root, None)
+}
+
+/// [`hard_kill`], with the root killed through `held`, an open handle on it, instead of by a second
+/// open of its identity. `held` must name `root`.
+fn hard_kill_through(kernel: &dyn Kernel, root: ProcessId, held: Option<&dyn OsProcess>) -> TreeKillOutcome {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
@@ -685,7 +662,11 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome
     #[cfg(any(unix, windows))]
     {
         if !skip_root {
-            root_left = left_behind(root, kill_one(kernel, root)).or(root_left);
+            let outcome = match held {
+                Some(os) => send_to_member(root, os, Sig::Kill),
+                None => kill_one(kernel, root),
+            };
+            root_left = left_behind(root, outcome).or(root_left);
         }
         for id in descendants {
             if let Some(error) = left_behind(id, kill_one(kernel, id)) {
@@ -695,7 +676,7 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId) -> TreeKillOutcome
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (kernel, root, descendants, skip_root);
+    let _ = (kernel, root, descendants, skip_root, held);
     if left.is_empty() && root_left.is_none() {
         return TreeKillOutcome::Ran(Ok(()));
     }

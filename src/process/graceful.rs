@@ -1,8 +1,8 @@
 //! Foreign `Process` graceful shutdown — the soft-then-hard escalation trio over a process
 //! the crate does not own (no stdio, no reap). Lone ops are identity-bound and surface real
-//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). A tree op
-//! signals the root by number after an identity check, not through the held handle, until the
-//! containment boundary takes the handle.
+//! failures; tree ops are best-effort identity-walk sweeps (the `TreeWalk` contract). `kill_tree`
+//! kills the root through the held handle; `terminate_tree` signals it by identity, through a
+//! second open of it.
 
 use std::time::Duration;
 
@@ -38,7 +38,8 @@ impl Process {
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
-    /// each `(pid, ppid)` before `SIGKILL`/`TerminateProcess`, root then descendants. Cannot be
+    /// each `(pid, ppid)` before `SIGKILL`/`TerminateProcess`, root then descendants. The root is
+    /// killed through this handle, each descendant through a handle opened by its identity. Cannot be
     /// atomic against a forking tree — the `TreeWalk` contract. All platforms. A member it
     /// leaves running is an error. For a single-process kill that surfaces a failure use
     /// [`kill`](Process::kill).
@@ -59,7 +60,8 @@ impl Process {
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         // No handle backstop: the root is left as any member is, and the first member left is the
         // error. This call's one report of the others.
-        crate::containment::treewalk::hard_kill(kernel, self.id)
+        crate::containment::treewalk::Walker::new(self.id)
+            .kill_through(kernel, &*self.os)
             .into_result()
             .or_else(|left| left.unsettled(false))
             .map_err(|left| left.report("Process::kill_tree"))

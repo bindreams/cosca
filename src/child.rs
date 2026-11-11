@@ -585,8 +585,8 @@ impl Child {
     /// what it sends by the root's number. On Linux 6.9+ a process group's signal goes through the
     /// root's pidfd, which names the group exactly, whoever reaps the root. Each send by the group's
     /// number (the `killpg` below 6.9 and on macOS, and the leader's signal) checks the root again
-    /// right before it. Each member's resend checks the root, which shows the listing named the
-    /// root's group, then the member's own identity right before the send by the member's pid.
+    /// right before it. Each member's resend opens the member by its identity, then checks the
+    /// root, which shows the listing named the root's group, then sends through the member's handle.
     /// Nothing goes out once a check fails: on 6.9+ the root's check asks the pidfd whether the
     /// group still has a member, and elsewhere it asks the root's handle whether the root was reaped
     /// elsewhere. A reap by another reaper between such a check and its send is not seen, and the
