@@ -1026,6 +1026,25 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
     assert_eq!(standing(&never), Standing::Unvouched(UnvouchedKind::Earlier));
 }
 
+/// Only a tree walk leaves the root alone, so a kill that leaves it over a handle that is not a walk
+/// asserts in debug.
+///
+/// Mutant: the default `kill_left` hands a root left back without the assertion.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "only a tree walk leaves the root alone"))]
+fn a_root_left_over_a_handle_that_is_not_a_walk_asserts() {
+    use super::{TreeKillOutcome, TreeKilled, Unkilled};
+    _ = TreeKilled::default().settle(
+        Some(&non_walk()),
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: Vec::new(),
+            root: Some(member_left(8)),
+            resolved: Vec::new(),
+        })),
+        false,
+    );
+}
+
 // What a `TreeWalk` handle remembers of the members a kill left =====
 
 /// A `MemberNotKilled` for `pid`, as a walk reports a member it left.

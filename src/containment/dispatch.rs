@@ -830,8 +830,8 @@ impl TreeKilled {
     /// ([`Contains::kill_left`](crate::containment::Contains::kill_left)); the settlement records it.
     /// `mechanism`: what names the tree, `None` for a tree that is none or delegated, which holds
     /// nothing. `root_ended`: the root is not running (killed, or already dead), so a root the walk
-    /// left is not left. The answer is `Ok` when nothing is left. Otherwise it is the first member
-    /// left, and the others as data: it reports none of them.
+    /// left is not left. `Ok` when nothing is left, else the first member left as the error, the rest
+    /// as its data.
     ///
     /// It decides under the one lock of the state, by it and the outcome, and leaves the state
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever

@@ -10,8 +10,7 @@ use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome};
 
 /// [`Contains::kill_left`] of every mechanism but a tree walk: `result` as it is, with nothing held.
-/// Only a tree walk leaves the root alone (the root's own death then settles it), so a result with
-/// the root left is a walk's.
+/// Only a tree walk leaves the root alone (the root's own death then settles it).
 pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> (Result<(), Unkilled>, Vec<Left>) {
     debug_assert!(
         !matches!(&result, Err(left) if left.root.is_some()),
@@ -46,8 +45,7 @@ pub(crate) trait Contains: fmt::Debug {
     /// for every kill, under its one lock ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
     /// A tree walk's root death reparents a member out of every later walk, so it kills again the
     /// members whose identity it read ([`with_earlier`](crate::containment::treewalk::with_earlier)).
-    /// Every other mechanism, and a tree that is none or delegated (it has no mechanism to ask), hands
-    /// `result` back with nothing held ([`nothing_held`]), which is this default.
+    /// Default: [`nothing_held`].
     fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
         nothing_held(result)
     }
@@ -89,10 +87,9 @@ pub(crate) trait Contains: fmt::Debug {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool>;
 
     /// The end of the resource it owns, which the caller's wait over the [`Release`] completes: a cgroup
-    /// leaf is killed through, drained and removed, and its release owns the leaf (`None`). A mechanism
-    /// that owns nothing a wait ends has nothing to wait on and is given back (`Some(self)`), so the
-    /// tree that held it still asks it, as a walk's settlement does. A Job Object is not released: it
-    /// closes as its `Child` drops.
+    /// leaf is killed through, drained and removed, and its release owns the leaf (`None`); a marker's
+    /// release closes its read end (`None`). A mechanism that owns no resource a release ends is given
+    /// back (`Some(self)`), so the tree that held it still asks it, as a walk's settlement does.
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
     fn release(self) -> (Release, Option<Self>)
@@ -411,9 +408,10 @@ impl Release {
     pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
-            if let Some(steps) = leaf.awaitable_release() {
-                steps.wait(child).await;
-            }
+            leaf.awaitable_release()
+                .expect("a cgroup leaf always has awaitable steps")
+                .wait(child)
+                .await;
         }
     }
 }

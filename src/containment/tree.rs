@@ -19,8 +19,11 @@ use crate::error::Error;
 pub(crate) struct Tree {
     holder: Holder,
     killed: TreeKilled,
-    /// What the tree was when its mechanism's release took the resource (a cgroup leaf), which no
-    /// longer holds it: the tree still reports as it was. `None` for a tree whose mechanism stays.
+    /// Whether [`release`](Self::release) ran: a released tree is not one to send to or wait on,
+    /// whether or not its mechanism stays.
+    released: bool,
+    /// The containment a released cgroup leaf or marker had, so the tree still reports it; `None`
+    /// while the mechanism stays.
     released_as: Option<Containment>,
 }
 
@@ -31,7 +34,8 @@ pub(crate) struct Tree {
     reason = "one per child, held inline: a leaf is the largest mechanism, and boxing it would add an allocation to every contained spawn"
 )]
 enum Holder {
-    /// Uncontained: lone-process semantics. Also what a tree holds once its leaf is released.
+    /// Uncontained: lone-process semantics. Also what a tree holds once its mechanism is consumed by
+    /// a release.
     #[default]
     None,
     /// A nested containment member: it joined an ancestor's group/job and owns no teardown mechanism
@@ -77,8 +81,8 @@ impl Tree {
     /// Guard for the `_tree` operations (single-sourced with the async `Child`): they act on the
     /// containment group's teardown mechanism, so a child that holds none has no tree to act on.
     pub(crate) fn require_contained(&self) -> Result<(), Error> {
-        let contained = matches!(self.holder, Holder::Contained(_));
-        if self.released_as.is_none() {
+        let contained = !self.released && matches!(self.holder, Holder::Contained(_));
+        if !self.released {
             debug_assert_eq!(
                 self.containment().can_teardown(),
                 contained,
@@ -106,10 +110,10 @@ impl Tree {
     /// a nested `Delegated` member, or a teardown-only mechanism like a process group or a walk).
     pub(crate) fn drain_edge(&self) -> Option<DrainEdge<'_>> {
         let edge = match &self.holder {
-            Holder::Contained(mechanism) => mechanism.drain_edge(),
-            Holder::None | Holder::Delegated => None,
+            Holder::Contained(mechanism) if !self.released => mechanism.drain_edge(),
+            Holder::Contained(_) | Holder::None | Holder::Delegated => None,
         };
-        if self.released_as.is_none() {
+        if !self.released {
             debug_assert_eq!(
                 self.containment().can_observe_drain(),
                 edge.is_some(),
@@ -162,10 +166,13 @@ impl Tree {
     pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         match &self.holder {
             Holder::None | Holder::Delegated => {
-                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                debug_assert!(!self.released, "a send on a released tree");
                 TreeKillOutcome::Ran(Ok(()))
             }
-            Holder::Contained(mechanism) => mechanism.send_kill(root),
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a send on a released tree");
+                mechanism.send_kill(root)
+            }
         }
     }
 
@@ -194,7 +201,10 @@ impl Tree {
                     earlier: Some("the SIGTERM"),
                 }
             }
-            Holder::Contained(mechanism) => mechanism.send_terminate(pid, root),
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a send on a released tree");
+                mechanism.send_terminate(pid, root)
+            }
         }
     }
 
@@ -204,10 +214,13 @@ impl Tree {
     pub(crate) fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
         match &self.holder {
             Holder::None | Holder::Delegated => {
-                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                debug_assert!(!self.released, "a send on a released tree");
                 Ok(false)
             }
-            Holder::Contained(mechanism) => mechanism.would_reach(pid, pidfd),
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a send on a released tree");
+                mechanism.would_reach(pid, pidfd)
+            }
         }
     }
 
@@ -242,21 +255,26 @@ impl Tree {
     pub(crate) fn disarm(&self) -> std::io::Result<()> {
         match &self.holder {
             Holder::None | Holder::Delegated => {
-                debug_assert!(self.released_as.is_none(), "a send on a released tree");
+                debug_assert!(!self.released, "a send on a released tree");
                 Ok(())
             }
-            Holder::Contained(mechanism) => mechanism.disarm(),
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a send on a released tree");
+                mechanism.disarm()
+            }
         }
     }
 
     /// The end of the tree's resource (see [`Contains::release`]): a mechanism whose release owns it
-    /// (a cgroup leaf) leaves the tree and its [`Release`] holds it until its wait; any other stays,
-    /// so the tree is asked as before (a walk's settlement still re-kills its held members). What
-    /// the kills left stays the tree's ([`TreeKilled`]), and so does what a released leaf was
+    /// (a cgroup leaf, a marker) leaves the tree and its [`Release`] holds it until its wait; any
+    /// other stays, so the tree still asks it (a walk's settlement re-kills its held members). A
+    /// released tree is sent nothing and has no drain edge, whichever stays. What the kills left
+    /// stays the tree's ([`TreeKilled`]), and so does what a consumed mechanism was
     /// ([`containment`](Self::containment)).
     #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
     pub(crate) fn release(&mut self) -> Release {
+        self.released = true;
         match std::mem::take(&mut self.holder) {
             Holder::Contained(mechanism) => {
                 let kind = mechanism.kind();
@@ -300,7 +318,7 @@ impl Tree {
     }
 
     /// What names the tree, for its settlement ([`TreeKilled`]) to ask: `None` for a tree that is
-    /// none or delegated, or whose leaf was released.
+    /// none or delegated, or whose mechanism a release consumed.
     fn named_by(&self) -> Option<&Mechanism> {
         match &self.holder {
             Holder::Contained(mechanism) => Some(mechanism),

@@ -921,8 +921,9 @@ impl Contains for Marker {
         Ok(false)
     }
 
+    /// The marker's read end closes with the release.
     fn release(self) -> (Release, Option<Marker>) {
-        (Release::nothing(), Some(self))
+        (Release::nothing(), None)
     }
 }
 

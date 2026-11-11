@@ -170,7 +170,6 @@ impl Contains for Walker {
         (Release::nothing(), Some(self))
     }
 
-    /// A walk owns nothing a release ends.
     #[cfg(all(feature = "tokio", target_os = "linux"))]
     fn awaitable_release(&self) -> Option<crate::containment::mechanism::AwaitableRelease<'_>> {
         None
