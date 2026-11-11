@@ -4,7 +4,7 @@
 use std::os::unix::process::ExitStatusExt as _;
 
 use super::kill_group;
-use crate::send_log::{GroupStep, Route};
+use crate::send_log::{GroupStep, OrderedStep, Route};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
@@ -39,14 +39,14 @@ fn group_of_three() -> (std::process::Child, std::process::ChildStdin, [u32; 2])
 }
 
 /// Every send whose target is named by the group's number is right after its own check of the
-/// root: the `killpg`, the leader's signal by number after a refused group send, and each member's
-/// resend (a member is the group's by its number, whatever names the member itself).
+/// root: the `killpg` and the leader's signal by number after a refused group send. A member's
+/// resend is a send through its own handle, which the steps do not show.
 #[track_caller]
 fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
     for (i, step) in steps.iter().enumerate() {
         let by_number = matches!(
             step,
-            GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _) | GroupStep::Member(..)
+            GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _)
         );
         if by_number {
             assert!(
@@ -57,10 +57,30 @@ fn assert_each_send_by_number_follows_its_check(steps: &[GroupStep]) {
     }
 }
 
+/// Every send by the group's number, and every `SIGKILL` resend to a listed member through its own
+/// handle, is right after its own check of the root. `steps` merges the two logs in the order the
+/// sends were made.
+#[track_caller]
+fn assert_each_send_follows_its_check(steps: &[OrderedStep]) {
+    for (i, step) in steps.iter().enumerate() {
+        let needs_check = matches!(
+            step,
+            OrderedStep::Group(GroupStep::Group(Route::Number, _) | GroupStep::Leader(Route::Number, _))
+                | OrderedStep::Identity(_, libc::SIGKILL)
+        );
+        if needs_check {
+            assert!(
+                i > 0 && steps[i - 1] == OrderedStep::Group(GroupStep::Check),
+                "step {i} ({step:?}) is not right after a check of the root: {steps:?}"
+            );
+        }
+    }
+}
+
 /// With the group's own send refused, the leader's signal and two members' resends follow it, and
-/// each send by the group's number has a check of its own right before it. Mutants: "check once
-/// before the `killpg` and send the rest on its strength", "no check before the leader's signal",
-/// "check once before the members' resends".
+/// each send by the group's number and each resend has a check of its own right before it. Mutants:
+/// "check once before the `killpg` and send the rest on its strength", "no check before the
+/// leader's signal", "check once before the members' resends".
 #[skuld::test]
 fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     let (mut child, stdin, members) = group_of_three();
@@ -71,21 +91,22 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     kill_group(pgid, Some(&root)).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
+    let ordered = capture.ordered_steps();
     drop(stdin);
 
-    assert_each_send_by_number_follows_its_check(&steps);
+    assert_each_send_follows_its_check(&ordered);
     assert!(
         steps.iter().any(|s| matches!(s, GroupStep::Group(Route::Number, _)))
             && steps.iter().any(|s| matches!(s, GroupStep::Leader(..))),
         "the group's send and the leader's signal were made: {steps:?}"
     );
-    // The leader is resent too when it had not yet exited from its own kill at the listing.
-    let resent: Vec<u32> = steps
-        .iter()
-        .filter_map(|s| match s {
-            GroupStep::Member(_, pid, _) => Some(*pid),
-            _ => None,
-        })
+    // The leader is resent too when it had not yet exited from its own kill at the listing. A
+    // resend is a send through the member's handle, which notes itself by identity.
+    let resent: Vec<u32> = capture
+        .by_identity()
+        .into_iter()
+        .filter(|&(_, signo)| signo == libc::SIGKILL)
+        .map(|(pid, _)| pid)
         .collect();
     for member in members {
         assert_eq!(

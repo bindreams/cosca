@@ -456,6 +456,10 @@ impl crate::containment::Root for ReapHold<'_> {
         self.pid
     }
 
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        ReapHold::signal(self, sig)
+    }
+
     fn state(&self) -> crate::signal::RootState {
         ReapHold::state(self)
     }
@@ -463,6 +467,34 @@ impl crate::containment::Root for ReapHold<'_> {
     #[cfg(target_os = "linux")]
     fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.child.pidfd()
+    }
+}
+
+/// The root of a tree call where nothing is sent by the root's pid (Windows): the call sends the
+/// root its own signal through this handle. It holds no lock and holds off no reap.
+#[cfg(not(unix))]
+pub(crate) struct RootHandle<'a> {
+    child: &'a OwnedChild,
+    pid: u32,
+}
+
+#[cfg(not(unix))]
+impl OwnedChild {
+    /// The root for a tree call, under the name Unix's `hold` has, where it also locks the handle.
+    /// Windows has no reap to hold off, so nothing is locked.
+    pub(crate) fn hold(&self, pid: u32) -> RootHandle<'_> {
+        RootHandle { child: self, pid }
+    }
+}
+
+#[cfg(not(unix))]
+impl crate::containment::Root for RootHandle<'_> {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        self.child.signal(sig)
     }
 }
 

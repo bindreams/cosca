@@ -39,10 +39,10 @@
 //! process's group. On Linux 6.9+ the group's signal goes through the root's pidfd instead, which
 //! names the group exactly. Every send by the group's number (the `killpg` where the kernel refuses
 //! that, and the leader's signal) runs right after its own check of the root ([`check_number`]:
-//! on 6.9+ whether the pidfd's group still has a member). On Linux a member's `SIGKILL` resend pins
-//! the member by a pidfd its identity check vouches for, then checks the root, then sends through
-//! that pidfd. A member's `SIGTERM` probe, and a resend by the member's pid, checks the root, then
-//! the member's identity right before it. Nothing is sent once a check fails; the residual window
+//! on 6.9+ whether the pidfd's group still has a member). A member's `SIGKILL` resend opens the
+//! member by its identity (a pidfd on Linux, an audit token on macOS), then checks the root, then
+//! sends through that handle. A member's `SIGTERM` probe checks the root, then the member's
+//! identity right before it. Nothing is sent once a check fails; the residual window
 //! between a check and its send is documented on `Child::kill_tree`. cgroup v2 names no pid and has
 //! no such hole.
 
@@ -545,7 +545,8 @@ pub(crate) enum Target {
     Group,
     /// A group's leader alone, after the group's send was refused.
     Leader,
-    /// A listed member of a group, by its pid.
+    /// A listed member of a group, by its pid: probed here. A member's `SIGKILL` resend goes
+    /// through the handle opened for its identity, and a test build notes it itself.
     Member(u32),
     /// A member of a cgroup leaf, by its pid, that `CgroupLeaf::terminate` signals. A test build
     /// notes the send, with the route of the syscall made, in `cgroup::fault::take_member_terms`.
@@ -679,19 +680,6 @@ fn pidfd_signal(pidfd: std::os::fd::BorrowedFd<'_>, signal: Signal, through: Thr
     send_signal(target, Sys::Pidfd(pidfd, flags), signal)
 }
 
-/// `signal` to the one process `pidfd` names, whose pid is `pid`: a listed member of a group or a
-/// tree. `pidfd` is a pidfd that [`open_verified_with`](crate::os_process::linux::open::open_verified_with)
-/// (or its error form, `open_verified_error_with`) proved to name that member, so the send reaches it and no process that took its number since.
-/// `ESRCH` is a process that exited and was reaped after the proof.
-#[cfg(target_os = "linux")]
-pub(crate) fn pidfd_signal_member(
-    pidfd: std::os::fd::BorrowedFd<'_>,
-    pid: crate::identity::RawPid,
-    signal: Signal,
-) -> Result<(), nix::errno::Errno> {
-    send_signal(Target::Member(pid), Sys::Pidfd(pidfd, 0), signal)
-}
-
 /// `pidfd_send_signal(pidfd, signo, NULL, flags)`. The kernel's errno is the answer.
 #[cfg(target_os = "linux")]
 fn pidfd_send_syscall(
@@ -766,7 +754,7 @@ fn verify(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Erro
 ///
 /// - **`kill_group` (`SIGKILL`)**: redundant for a member `converge` actually reaches, NOT
 ///   provably redundant overall. `converge` only resends to a member it has classified
-///   `Liveness::Alive` AND successfully re-verified (`classify_member`/`check_or_signal`);
+///   `Liveness::Alive` AND successfully re-verified (`classify_member`/`resend_sigkill`);
 ///   any member whose liveness or identity the OS refuses to confirm (`Liveness::Unknown` /
 ///   `Resolved::Unknown`) is never signalled by `converge` at all — for THOSE, this direct
 ///   call is the only delivery attempt, not a duplicate. It is also not the same check: this

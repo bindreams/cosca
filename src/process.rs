@@ -2,10 +2,10 @@
 //! real parent). The handle is opened from a `ProcessId`, never a bare pid, and every act through
 //! it (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reaches that process or reports it gone,
 //! never a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-//! `graceful_shutdown_tree`) walk by identity and signal each member, the root included (not
-//! through this handle, until the containment boundary takes it), through a pidfd proved to name it
-//! on Linux, or a handle on Windows. On macOS they check each member, then send by number, with the
-//! window principle 4 describes. `wait()` is a death-watch yielding no `ExitStatus` (the kernel
+//! `graceful_shutdown_tree`) walk by identity and signal each member, through a handle opened by
+//! its identity: a pidfd proved to name it on Linux, a process handle on Windows, an audit token on
+//! macOS. The tree acts signal the root through this handle instead of a second open of it.
+//! `wait()` is a death-watch yielding no `ExitStatus` (the kernel
 //! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
 
@@ -21,10 +21,8 @@ mod graceful;
 /// An open handle on a process, held since [`open`](Self::open). Acts through the handle
 /// (`kill`, `terminate`, `wait*`, `graceful_shutdown`) reach this process or report it gone; never
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
-/// `graceful_shutdown_tree`) signal each member, the root included (not through this handle, until
-/// the containment boundary takes it), through a pidfd proved to name it on Linux, or a handle on
-/// Windows; on macOS they check its identity, then send by number. Not `Clone`: open the
-/// [`ProcessId`] again.
+/// `graceful_shutdown_tree`) signal each member through a handle opened by its identity, and the
+/// root through this handle. Not `Clone`: open the [`ProcessId`] again.
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,
@@ -44,15 +42,17 @@ impl Process {
     /// - [`Error::NotThreadGroupLeader`]: on Linux, `id` names a live thread that is not its
     ///   process's leader.
     /// - [`Error::Io`]: the open failed otherwise (on Linux a failed pidfd call: `pidfd_open`, the
-    ///   pidfd's inode read, or its `poll`, prefixed with the call's name; a kqueue that cannot be
-    ///   created or armed on macOS).
+    ///   pidfd's inode read, or its `poll`, prefixed with the call's name). macOS opens no kqueue:
+    ///   the first look at the process does ([`wait`](Self::wait)).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
         Self::open_with(&crate::identity::HostKernel, id)
     }
 
     /// [`open`](Self::open), re-verifying `id` through `kernel`.
     pub(crate) fn open_with(kernel: &dyn crate::identity::Kernel, id: ProcessId) -> Result<Option<Process>, Error> {
-        Ok(crate::os_process::open_with(kernel, id)?.map(|os| Process { id, os }))
+        Ok(crate::os_process::open_with(kernel, id)
+            .map_err(crate::os_process::OpenFailure::into_open_error)?
+            .map(|os| Process { id, os }))
     }
 
     /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid;
@@ -110,7 +110,10 @@ impl Process {
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
     /// parent gets one). Non-reaping. Returns at once for a process that has already exited.
     /// `Err` only on a wait failure; on Windows, for a handle without `SYNCHRONIZE`, while the
-    /// process runs (`ERROR_ACCESS_DENIED`).
+    /// process runs (`ERROR_ACCESS_DENIED`). On macOS the first look at the process (a wait, a
+    /// timed wait or [`is_alive`](Self::is_alive)) arms its exit watch, a kqueue, so a wait there
+    /// can also fail with [`Error::Io`] when the kqueue cannot be created or armed (`EMFILE`), or
+    /// [`Error::Unassessable`] when the process's unique id cannot be read.
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::os_process::drive::exited_held(&*self.os, None)?;
         debug_assert!(exited);
@@ -141,6 +144,28 @@ impl Process {
     #[cfg(feature = "tokio")]
     pub(crate) fn os(&self) -> &dyn OsProcess {
         &*self.os
+    }
+}
+
+/// The root of a tree walk that signals it through this handle. Never reaped by this handle, so
+/// nothing is sent by its pid on its word ([`RootState::unheld`](crate::signal::RootState::unheld)).
+impl crate::containment::Root for Process {
+    fn pid(&self) -> u32 {
+        self.id.pid()
+    }
+
+    fn signal(&self, sig: crate::signal::Sig) -> Result<crate::signal::Sent, Error> {
+        self.os.signal(sig)
+    }
+
+    #[cfg(unix)]
+    fn state(&self) -> crate::signal::RootState {
+        crate::signal::RootState::unheld()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(self.os.os_handle())
     }
 }
 

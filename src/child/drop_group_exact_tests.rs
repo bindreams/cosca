@@ -3,7 +3,7 @@
 //! `kill_tree` does (`group_exact_tests`); below 6.9 nothing goes out by the group's number.
 
 use crate::child::group_exact_tests::root_with_a_member;
-use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture, GroupStep};
+use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
 use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
 use crate::test_groups::{pidfd_group_signal, Group};
 
@@ -276,14 +276,15 @@ fn a_drop_leaves_alone_a_group_that_took_the_number_of_its_emptied_group(
     use crate::child::group_exact_tests::EmptiedGroup;
     crate::log_capture::install();
     let (child, armed) = EmptiedGroup::new().arm();
+    let root = child.pid();
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
     drop(child);
-    let steps = capture.group_steps();
+    let sent = capture.by_identity();
     armed.finish();
     assert!(
-        !steps.iter().any(|step| matches!(step, GroupStep::Member(..))),
-        "nothing was resent: {steps:?}"
+        sent.iter().all(|&(pid, _)| pid == root),
+        "nothing was resent to a member: {sent:?}"
     );
     let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns, Vec::<String>::new(), "the tree is gone");

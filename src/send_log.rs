@@ -8,7 +8,8 @@
 //! [`send_signal`](crate::containment::unix::send_signal) or
 //! [`probe_signal`](crate::containment::unix::probe_signal) after the syscall returned, with the
 //! signal number it handed the syscall. Where a test seam answers in the kernel's place, no syscall
-//! is made, and the step is still recorded.
+//! is made, and the step is still recorded. The group steps and the identity-checked sends are two
+//! logs; [`Capture::ordered_steps`] merges them in the order the thread took them.
 
 use std::cell::RefCell;
 
@@ -76,11 +77,34 @@ pub(crate) enum Route {
     Number,
 }
 
+/// One step in the order this thread took it, across the group steps and the identity-checked
+/// sends, which are kept in separate logs.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderedStep {
+    Group(GroupStep),
+    /// An identity-checked send: the pid, and the signal's number.
+    Identity(u32, i32),
+}
+
 thread_local! {
     static LOG: RefCell<Option<Vec<Entry>>> = const { RefCell::new(None) };
-    static BY_IDENTITY: RefCell<Option<Vec<IdentityEntry>>> = const { RefCell::new(None) };
+    // Each record of the next two carries its place in this thread's one sequence.
+    static BY_IDENTITY: RefCell<Option<Vec<(u64, IdentityEntry)>>> = const { RefCell::new(None) };
     #[cfg(unix)]
-    static GROUP: RefCell<Option<Vec<GroupStep>>> = const { RefCell::new(None) };
+    static GROUP: RefCell<Option<Vec<(u64, GroupStep)>>> = const { RefCell::new(None) };
+    #[cfg(unix)]
+    static SEQUENCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The next place in this thread's sequence of records.
+#[cfg(unix)]
+fn next_place() -> u64 {
+    SEQUENCE.with(|next| {
+        let place = next.get();
+        next.set(place + 1);
+        place
+    })
 }
 
 /// Records one step of a send to a process group on this thread, if a [`Capture`] is live.
@@ -88,7 +112,7 @@ thread_local! {
 pub(crate) fn record_group(step: GroupStep) {
     GROUP.with(|log| {
         if let Some(steps) = log.borrow_mut().as_mut() {
-            steps.push(step);
+            steps.push((next_place(), step));
         }
     });
 }
@@ -98,7 +122,7 @@ pub(crate) fn record_group(step: GroupStep) {
 pub(crate) fn record_by_identity(pid: u32, signo: i32) {
     BY_IDENTITY.with(|log| {
         if let Some(entries) = log.borrow_mut().as_mut() {
-            entries.push((pid, signo));
+            entries.push((next_place(), (pid, signo)));
         }
     });
 }
@@ -141,12 +165,44 @@ impl Capture {
 }
 
 impl Capture {
-    /// The identity-checked sends: the tree walk on every unix (by number on macOS, through the
-    /// proved pidfd on Linux, where [`group_steps`](Self::group_steps) shows the route), and on
-    /// macOS also the signals a held `os_process` sends.
+    /// The identity-checked sends: every signal a held `os_process` sends, written inside that send
+    /// (a pidfd's on Linux, an audit token's on macOS), whatever the kernel answered.
     #[cfg(unix)]
     pub(crate) fn by_identity(&self) -> Vec<IdentityEntry> {
-        BY_IDENTITY.with(|log| log.borrow().clone().expect("a live capture has a log"))
+        BY_IDENTITY.with(|log| {
+            let log = log.borrow();
+            log.as_ref()
+                .expect("a live capture has a log")
+                .iter()
+                .map(|&(_, entry)| entry)
+                .collect()
+        })
+    }
+
+    /// The group steps (no signal-0 probe) and the identity-checked sends together, in the order
+    /// this thread took them.
+    #[cfg(unix)]
+    pub(crate) fn ordered_steps(&self) -> Vec<OrderedStep> {
+        let mut steps: Vec<(u64, OrderedStep)> = GROUP.with(|log| {
+            let log = log.borrow();
+            log.as_ref()
+                .expect("a live capture has a log")
+                .iter()
+                .filter(|(_, step)| !step.is_probe())
+                .map(|&(place, step)| (place, OrderedStep::Group(step)))
+                .collect()
+        });
+        BY_IDENTITY.with(|log| {
+            let log = log.borrow();
+            let sends = log.as_ref().expect("a live capture has a log");
+            steps.extend(
+                sends
+                    .iter()
+                    .map(|&(place, (pid, signo))| (place, OrderedStep::Identity(pid, signo))),
+            );
+        });
+        steps.sort_by_key(|&(place, _)| place);
+        steps.into_iter().map(|(_, step)| step).collect()
     }
 }
 
@@ -162,7 +218,14 @@ impl Capture {
     /// Every step of the sends to process groups, in order, the signal-0 probes included.
     #[cfg(unix)]
     pub(crate) fn group_steps_with_probes(&self) -> Vec<GroupStep> {
-        GROUP.with(|log| log.borrow().clone().expect("a live capture has a log"))
+        GROUP.with(|log| {
+            let log = log.borrow();
+            log.as_ref()
+                .expect("a live capture has a log")
+                .iter()
+                .map(|&(_, step)| step)
+                .collect()
+        })
     }
 }
 
