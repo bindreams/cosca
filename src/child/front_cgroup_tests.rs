@@ -1466,6 +1466,35 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
         .expect("/proc is readable here"));
 }
 
+/// A leaf that holds the child reaches it only through a kill that landed: the leaf names the child
+/// before any kill, and the tree's `Reach` still says no.
+///
+/// Mutant: `Reach for Tree` answers where the child is, without asking whether a kill landed.
+#[skuld::test]
+fn cgroup_a_leaf_holding_the_child_reaches_it_only_once_a_kill_landed(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::owned::teardown::Reach;
+
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.pid();
+    assert!(
+        child
+            .tree
+            .would_reach(pid, child.proc.pidfd())
+            .expect("the pidfd read needs no /proc"),
+        "the leaf holds the child"
+    );
+    assert!(
+        !child.tree.reached(&child.proc).expect("the child is placed"),
+        "no kill landed yet"
+    );
+    child.tree.kill(None).into_result().expect("cgroup.kill");
+    assert!(
+        child.tree.reached(&child.proc).expect("the child is placed"),
+        "the kill landed on a child the leaf holds"
+    );
+    drop(stdin);
+}
+
 /// A front moved out of its leaf is outside it, by its pidfd's cgroup id.
 #[skuld::test]
 fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(#[fixture(cgroup)] _group: &Group) {

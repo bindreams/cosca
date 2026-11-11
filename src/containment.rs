@@ -287,6 +287,9 @@ pub(crate) mod dispatch;
 #[path = "containment/mechanism.rs"]
 pub(crate) mod mechanism;
 
+#[path = "containment/drain_edge.rs"]
+pub(crate) mod drain_edge;
+
 #[cfg(test)]
 #[path = "containment/fake.rs"]
 pub(crate) mod fake;

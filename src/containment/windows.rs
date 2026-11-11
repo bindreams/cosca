@@ -264,22 +264,21 @@ impl crate::containment::Contains for JobHandle {
         }
     }
 
-    fn drain_edge(&self) -> Option<crate::containment::mechanism::DrainEdge<'_>> {
-        Some(crate::containment::mechanism::DrainEdge::Job(self))
+    fn drain_edge(&self) -> Option<crate::containment::drain_edge::DrainEdge<'_>> {
+        Some(crate::containment::drain_edge::DrainEdge::Job(self))
     }
 
     fn kind(&self) -> crate::containment::Containment {
         crate::containment::Containment::JobObject
     }
 
+    fn subject(&self) -> String {
+        format!("JobObject({self:?})")
+    }
+
     /// Clears `KILL_ON_JOB_CLOSE` (see [`disarm`](JobHandle::disarm)).
     fn disarm(&self) -> io::Result<()> {
         JobHandle::disarm(self)
-    }
-
-    /// The close of the handle: it kills the tree unless the job is disarmed.
-    fn release(self) -> crate::containment::mechanism::Release {
-        crate::containment::mechanism::Release::job(self)
     }
 }
 

@@ -218,7 +218,7 @@ fn interpret_read_event(
 /// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
 /// `None`-shaped cases apart otherwise. `drain_kqueue` has two production callers: `probe`, which
 /// doesn't need the distinction and folds `Declined` and `Spurious` back together, and
-/// `crate::tokio::wait`'s `wait_tree_drained_inner`, which DOES distinguish them — only
+/// `drain_edge`'s `wait_tree_drained_inner`, which DOES distinguish them — only
 /// `Declined` fires its `#[cfg(test)]` seam. `block_until_drained` calls `interpret_events`
 /// directly, over `Kqueue::wait`, never `drain_kqueue` itself.
 #[derive(Debug)]
@@ -284,7 +284,7 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
 /// for why this always passes `suppress_drain = true` to `drain_kqueue` while still arming
 /// bounded (`false` for `arm`'s separate `unbounded_wait`).
 ///
-/// Called from `wait_tree_deadline`'s zero-duration case (`crate::tokio::wait`) — a one-shot
+/// Called from `wait_tree_deadline`'s zero-duration case (`drain_edge`) — a one-shot
 /// check never blocks, so it never risks a caller-invisible hang there. That caller lives
 /// behind the crate's `tokio` feature, so this (and its own callee `drain_kqueue`) really is
 /// unreachable without it — `#[allow(dead_code)]` reflects that honestly for a `tokio`-disabled

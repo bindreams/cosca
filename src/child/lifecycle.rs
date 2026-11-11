@@ -344,14 +344,14 @@ impl Child {
     /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Event-driven: no
     /// interval is chosen internally anywhere in this call's path.
     pub fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
-        self.tree.drain_edge()?.wait(None)
+        self.tree.wait_drained(None)
     }
 
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`. `TreeDrain::MembersRemain`
     /// at expiry is not an error. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded, matching [`wait_timeout`](Child::wait_timeout).
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<crate::containment::TreeDrain, Error> {
-        self.tree.drain_edge()?.wait(crate::wait::deadline_from(timeout))
+        self.tree.wait_drained(crate::wait::deadline_from(timeout))
     }
 }
 

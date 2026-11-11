@@ -5,36 +5,60 @@
 #[cfg(unix)]
 use crate::containment::dispatch::{SettleOutcome, Unsettled};
 use crate::containment::dispatch::{SweepFailure, TreeKillOutcome, TreeKilled};
-use crate::containment::mechanism::{Contains, DrainEdge, Mechanism, Release};
+use crate::containment::drain_edge::DrainEdge;
+#[cfg(unix)]
+use crate::containment::mechanism::Release;
+use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::{Containment, Root, TerminateOutcome};
 use crate::error::Error;
 
 /// Owns the OS containment resource for a spawned child; [`kill`](Self::kill) and
 /// [`terminate`](Self::terminate) act on the tree, [`disarm`](Self::disarm) neutralizes teardown for
-/// `detach()`.
+/// `detach()`. `killed` is where the tree stands after the kills and drops that settled it
+/// ([`TreeKilled`]); it is the handle's, whatever it holds, and outlives the mechanism's
+/// [`release`](Self::release).
+#[derive(Debug, Default)]
+pub(crate) struct Tree {
+    holder: Holder,
+    killed: TreeKilled,
+}
+
+/// What holds the tree.
 #[derive(Debug, Default)]
 #[allow(
     clippy::large_enum_variant,
     reason = "one per child, held inline: a leaf is the largest mechanism, and boxing it would add an allocation to every contained spawn"
 )]
-pub(crate) enum Tree {
-    /// Uncontained: lone-process semantics.
+enum Holder {
+    /// Uncontained: lone-process semantics. Also what a released tree holds.
     #[default]
     None,
     /// A nested containment member: it joined an ancestor's group/job and owns no teardown mechanism
     /// of its own (the outermost root tears the tree down). Distinct from `None` (genuinely
     /// uncontained) so `_tree` ops can error honestly.
     Delegated,
-    /// Contained by `mechanism`. `killed` is where the tree stands after the kills and drops that
-    /// settled it ([`TreeKilled`]).
-    Contained { mechanism: Mechanism, killed: TreeKilled },
+    /// Contained by this mechanism.
+    Contained(Mechanism),
 }
 
 impl Tree {
+    /// An uncontained tree, never settled.
+    pub(crate) fn none() -> Tree {
+        Tree::default()
+    }
+
+    /// A nested member's tree, never settled.
+    pub(crate) fn delegated() -> Tree {
+        Tree {
+            holder: Holder::Delegated,
+            killed: TreeKilled::default(),
+        }
+    }
+
     /// A tree contained by `mechanism`, never settled.
     pub(crate) fn contained(mechanism: Mechanism) -> Tree {
-        Tree::Contained {
-            mechanism,
+        Tree {
+            holder: Holder::Contained(mechanism),
             killed: TreeKilled::default(),
         }
     }
@@ -42,17 +66,17 @@ impl Tree {
     /// The teardown mechanism this tree achieved (queried via `Child::containment()`): the one source
     /// of it.
     pub(crate) fn containment(&self) -> Containment {
-        match self {
-            Tree::None => Containment::None,
-            Tree::Delegated => Containment::Delegated,
-            Tree::Contained { mechanism, .. } => mechanism.kind(),
+        match &self.holder {
+            Holder::None => Containment::None,
+            Holder::Delegated => Containment::Delegated,
+            Holder::Contained(mechanism) => mechanism.kind(),
         }
     }
 
     /// Guard for the `_tree` operations (single-sourced with the async `Child`): they act on the
     /// containment group's teardown mechanism, so a child that holds none has no tree to act on.
     pub(crate) fn require_contained(&self) -> Result<(), Error> {
-        if matches!(self, Tree::Contained { .. }) {
+        if matches!(self.holder, Holder::Contained(_)) {
             return Ok(());
         }
         Err(Error::Unsupported {
@@ -71,13 +95,10 @@ impl Tree {
     /// without polling. Everything else (an uncontained child, a nested `Delegated` member, or a
     /// teardown-only mechanism like a process group or a walk) is `Unsupported`.
     pub(crate) fn drain_edge(&self) -> Result<DrainEdge<'_>, Error> {
-        match self {
-            Tree::Contained { mechanism, .. } => {
-                if let Some(edge) = mechanism.drain_edge() {
-                    return Ok(edge);
-                }
+        if let Holder::Contained(mechanism) = &self.holder {
+            if let Some(edge) = mechanism.drain_edge() {
+                return Ok(edge);
             }
-            Tree::None | Tree::Delegated => {}
         }
         Err(Error::Unsupported {
             op: "wait for the contained tree to drain (wait_tree / wait_tree_timeout)".into(),
@@ -92,17 +113,31 @@ impl Tree {
         })
     }
 
+    /// Block until every member has exited, or until `deadline`, through the tree's drain edge
+    /// ([`DrainEdge::wait`]); `Unsupported` where it has none.
+    pub(crate) fn wait_drained(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::containment::TreeDrain, Error> {
+        self.drain_edge()?.wait(deadline)
+    }
+
+    /// [`wait_drained`](Self::wait_drained), awaited ([`DrainEdge::wait_async`]).
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_drained_async(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::containment::TreeDrain, Error> {
+        self.drain_edge()?.wait_async(deadline).await
+    }
+
     /// Hard-kill the contained tree (best-effort; a member that is already gone is success), as the
     /// mechanism's [`send_kill`](Contains::send_kill) decides it from `root`. A tree that is none or
     /// delegated has nothing to kill.
-    #[cfg_attr(
-        not(unix),
-        allow(unused_variables, reason = "only Unix names a group by the root's pid")
-    )]
     pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
-        match self {
-            Tree::None | Tree::Delegated => TreeKillOutcome::Ran(Ok(())),
-            Tree::Contained { mechanism, .. } => mechanism.send_kill(root),
+        match &self.holder {
+            Holder::None | Holder::Delegated => TreeKillOutcome::Ran(Ok(())),
+            Holder::Contained(mechanism) => mechanism.send_kill(root),
         }
     }
 
@@ -118,8 +153,8 @@ impl Tree {
     /// it from `root`: the outcome says what went out, or what was skipped and what the caller does
     /// about it.
     pub(crate) fn terminate(&self, pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
-        match self {
-            Tree::None | Tree::Delegated => {
+        match &self.holder {
+            Holder::None | Holder::Delegated => {
                 debug_assert!(false, "Tree::terminate on a tree that is not contained");
                 TerminateOutcome::Sent {
                     result: Err(Error::Unsupported {
@@ -131,7 +166,7 @@ impl Tree {
                     earlier: Some("the SIGTERM"),
                 }
             }
-            Tree::Contained { mechanism, .. } => mechanism.send_terminate(pid, root),
+            Holder::Contained(mechanism) => mechanism.send_terminate(pid, root),
         }
     }
 
@@ -139,9 +174,9 @@ impl Tree {
     /// [`Contains::would_reach`]): `false` for a tree that is none or delegated.
     #[cfg(unix)]
     pub(crate) fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
-        match self {
-            Tree::None | Tree::Delegated => Ok(false),
-            Tree::Contained { mechanism, .. } => mechanism.would_reach(pid, pidfd),
+        match &self.holder {
+            Holder::None | Holder::Delegated => Ok(false),
+            Holder::Contained(mechanism) => mechanism.would_reach(pid, pidfd),
         }
     }
 
@@ -179,33 +214,37 @@ impl Tree {
     /// Neutralize teardown so `detach()` leaves the tree running (see [`Contains::disarm`]). A tree
     /// that is none or delegated owns nothing to neutralize.
     pub(crate) fn disarm(&self) -> std::io::Result<()> {
-        match self {
-            Tree::None | Tree::Delegated => Ok(()),
-            Tree::Contained { mechanism, .. } => mechanism.disarm(),
+        match &self.holder {
+            Holder::None | Holder::Delegated => Ok(()),
+            Holder::Contained(mechanism) => mechanism.disarm(),
         }
     }
 
-    /// The end of the tree's resource (see [`Contains::release`]). The settlement is not carried: what
-    /// a kill left is settled against the state before the resource is released.
-    #[must_use = "the resource is released only by its wait"]
-    #[cfg_attr(
-        not(any(unix, feature = "tokio")),
-        allow(dead_code, reason = "only a Unix teardown and an awaited one release a tree")
-    )]
-    pub(crate) fn release(self) -> Release {
-        match self {
-            Tree::None | Tree::Delegated => Release::nothing(),
-            Tree::Contained { mechanism, .. } => mechanism.release(),
-        }
-    }
-
-    /// What names this mechanism's tree in a message about its teardown: the mechanism itself (a cgroup
-    /// leaf names its path, since a kill returns the kernel's error unwrapped).
+    /// The end of the tree's resource (see [`Contains::release`]): the mechanism leaves the tree and
+    /// its [`Release`] owns it until its wait. What the kills left stays the tree's ([`TreeKilled`]),
+    /// so a settle after the release is over the real state, with nothing held.
     #[cfg(unix)]
+    #[must_use = "the resource is released only by its wait"]
+    pub(crate) fn release(&mut self) -> Release {
+        match std::mem::take(&mut self.holder) {
+            Holder::None | Holder::Delegated => Release::nothing(),
+            Holder::Contained(mechanism) => mechanism.release(),
+        }
+    }
+
+    /// What names this mechanism's tree in a message about its teardown (see [`Contains::subject`]).
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "only a Unix teardown words its subject; the tests state every kind's"
+        )
+    )]
     pub(crate) fn teardown_subject(&self) -> String {
-        match self {
-            Tree::None | Tree::Delegated => format!("{self:?}"),
-            Tree::Contained { mechanism, .. } => format!("{mechanism:?}"),
+        match &self.holder {
+            Holder::None => "None".to_owned(),
+            Holder::Delegated => "Delegated".to_owned(),
+            Holder::Contained(mechanism) => mechanism.subject(),
         }
     }
 
@@ -213,20 +252,13 @@ impl Tree {
     /// drop reads it ([`DropView`](crate::containment::DropView)), and the tests.
     #[cfg(unix)]
     pub(crate) fn is_killed(&self) -> bool {
-        match self {
-            Tree::None | Tree::Delegated => false,
-            Tree::Contained { killed, .. } => killed.is_set(),
-        }
+        self.killed.is_set()
     }
 
     /// The tree's settlement ([`TreeKilled`]) and whether the tree is a walk's, whose held members
-    /// are the walk's own state, for `f`. A tree that is not contained is settled over a state never
-    /// settled, which nothing holds.
+    /// are the walk's own state, for `f`.
     fn settling<R>(&self, f: impl FnOnce(&TreeKilled, bool) -> R) -> R {
-        match self {
-            Tree::Contained { killed, .. } => f(killed, self.containment() == Containment::TreeWalk),
-            Tree::None | Tree::Delegated => f(&TreeKilled::default(), false),
-        }
+        f(&self.killed, self.containment() == Containment::TreeWalk)
     }
 
     /// What a tree kill's `outcome` comes to once the root's own handle has had its say
@@ -268,19 +300,14 @@ impl Tree {
     }
 }
 
-/// Whether the tree kill of this mechanism reached the child. Only a cgroup leaf's `cgroup.kill` is
-/// shown to, whatever the child's credentials: where the child is says it was in the leaf. A signal to
-/// a group or to walked members is subject to the kernel's permission check, as the child's own kill
-/// is, so it reaches nothing that kill does not. A caller asks after a kill that landed
-/// ([`TreeKillOutcome::completed`]), so the mechanism is asked only where the child is.
+/// Whether the tree kill of this mechanism reached the child ([`Contains::reached`]): `false` for a
+/// tree that is none or delegated.
 #[cfg(unix)]
 impl crate::child::owned::teardown::Reach for Tree {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
-        match child.pid() {
-            Some(pid) => self.would_reach(pid, child.pidfd()),
-            None => Err(std::io::Error::other(
-                "the child's pid is not known, so it cannot be placed",
-            )),
+        match &self.holder {
+            Holder::None | Holder::Delegated => Ok(false),
+            Holder::Contained(mechanism) => mechanism.reached(child),
         }
     }
 }
@@ -313,11 +340,8 @@ impl Tree {
 
     /// The Job Object of this tree, if it is contained by one.
     pub(crate) fn job_for_test(&self) -> Option<&crate::containment::windows::JobHandle> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Job(job),
-                ..
-            } => Some(job),
+        match &self.holder {
+            Holder::Contained(Mechanism::Job(job)) => Some(job),
             _ => None,
         }
     }
@@ -328,11 +352,8 @@ impl Tree {
     /// The cgroup leaf of this tree, if it is contained by one.
     #[cfg(test)]
     pub(crate) fn cgroup_leaf_for_test(&self) -> Option<&crate::containment::cgroup::CgroupLeaf> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Cgroup(leaf),
-                ..
-            } => Some(leaf),
+        match &self.holder {
+            Holder::Contained(Mechanism::Cgroup(leaf)) => Some(leaf),
             _ => None,
         }
     }
@@ -343,27 +364,18 @@ impl Tree {
     /// Whether this tree signals a process group named by the root's pid: a process group, and a
     /// macOS fd marker whose mode made a group.
     pub(crate) fn signals_a_group_for_test(&self) -> bool {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Group(_),
-                ..
-            } => true,
+        match &self.holder {
+            Holder::Contained(Mechanism::Group(_)) => true,
             #[cfg(target_os = "macos")]
-            Tree::Contained {
-                mechanism: Mechanism::Marker(m),
-                ..
-            } => m.pgid().is_some(),
+            Holder::Contained(Mechanism::Marker(m)) => m.pgid().is_some(),
             _ => false,
         }
     }
 
     /// The root a tree walk walks from; `None` for any other tree.
     pub(crate) fn walk_root_for_test(&self) -> Option<crate::identity::ProcessId> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Walk(walk),
-                ..
-            } => Some(walk.root()),
+        match &self.holder {
+            Holder::Contained(Mechanism::Walk(walk)) => Some(walk.root()),
             _ => None,
         }
     }
@@ -375,11 +387,8 @@ impl Tree {
     /// (`tests/*.rs`, which cannot name a `pub(crate)` item) can be TOLD the exact number rather than
     /// inferring it from ambient process state. `None` for any tree not contained by a marker.
     pub(crate) fn marker_fd_for_test(&self) -> Option<i32> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Marker(m),
-                ..
-            } => Some(m.own_fd()),
+        match &self.holder {
+            Holder::Contained(Mechanism::Marker(m)) => Some(m.own_fd()),
             _ => None,
         }
     }
@@ -387,11 +396,8 @@ impl Tree {
     /// The marker pipe's kernel identity, for tests that must sweep this tree.
     #[cfg(test)]
     pub(crate) fn marker_handle_for_test(&self) -> Option<u64> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Marker(m),
-                ..
-            } => Some(m.handle()),
+        match &self.holder {
+            Holder::Contained(Mechanism::Marker(m)) => Some(m.handle()),
             _ => None,
         }
     }
@@ -399,11 +405,8 @@ impl Tree {
     /// The root an fd marker's ppid-walk channel starts from.
     #[cfg(test)]
     pub(crate) fn marker_root_for_test(&self) -> Option<crate::identity::ProcessId> {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Marker(m),
-                ..
-            } => m.root(),
+        match &self.holder {
+            Holder::Contained(Mechanism::Marker(m)) => m.root(),
             _ => None,
         }
     }
@@ -413,11 +416,8 @@ impl Tree {
     /// tree not contained by a marker: a misuse of this seam, not a case to silently no-op past.
     #[cfg(test)]
     pub(crate) fn force_marker_pgid_for_test(&mut self, pgid: i32) {
-        match self {
-            Tree::Contained {
-                mechanism: Mechanism::Marker(m),
-                ..
-            } => m.force_pgid_for_test(pgid),
+        match &mut self.holder {
+            Holder::Contained(Mechanism::Marker(m)) => m.force_pgid_for_test(pgid),
             other => panic!("force_marker_pgid_for_test called on a tree no marker contains: {other:?}"),
         }
     }

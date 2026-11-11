@@ -1,13 +1,12 @@
 //! What a contained tree is made of: the contract every way of naming a tree meets ([`Contains`]),
-//! the closed set of them ([`Mechanism`]), and what a mechanism hands out: the tree's own drain edge
-//! ([`DrainEdge`]) and the end of its resource ([`Release`]).
+//! the closed set of them ([`Mechanism`]), and what a mechanism hands out: the end of its resource
+//! ([`Release`]). Its drain edge is [`DrainEdge`](crate::containment::drain_edge::DrainEdge).
 
 use std::fmt;
-use std::time::Instant;
 
 use crate::containment::dispatch::TreeKillOutcome;
-use crate::containment::{Containment, Root, TerminateOutcome, TreeDrain};
-use crate::error::Error;
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::{Containment, Root, TerminateOutcome};
 
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
@@ -28,7 +27,7 @@ pub(crate) trait Contains: fmt::Debug {
     /// - A tree walk names it by parentage: `Ok` says every descendant of the root at the walk's
     ///   snapshot was killed. A process already reparented away from the root (an orphan), or one the
     ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
-    ///   running is an [`Error::MemberNotKilled`].
+    ///   running is an [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled).
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome;
 
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
@@ -41,6 +40,17 @@ pub(crate) trait Contains: fmt::Debug {
 
     /// What [`Child::containment`](crate::Child::containment) reports.
     fn kind(&self) -> Containment;
+
+    /// What names the tree in a message about its teardown: a cgroup leaf its path (a kill returns
+    /// the kernel's error unwrapped, so the error does not name it), every other mechanism what it is.
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "only a Unix teardown words its subject; the tests state every kind's"
+        )
+    )]
+    fn subject(&self) -> String;
 
     /// Neutralize the resource's own kill on drop (`detach`, `kill_on_drop(false)`): a Job Object's
     /// `KILL_ON_JOB_CLOSE`, a cgroup leaf's `Drop` kill. `Ok` where there is none; only a Job's can
@@ -55,14 +65,18 @@ pub(crate) trait Contains: fmt::Debug {
     #[cfg(unix)]
     fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool>;
 
+    /// Whether a kill through it has landed and reached `child` (see
+    /// [`Reach`](crate::child::owned::teardown::Reach)): only then does the child's exit follow, so
+    /// only then may it be waited for. `false` for every mechanism whose kill is subject to the kernel's
+    /// permission check; an error where the child cannot be placed.
+    #[cfg(unix)]
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool>;
+
     /// The end of the resource it owns, which the caller's wait over the [`Release`] completes: a cgroup
-    /// leaf is killed through, drained and removed, a Job Object is closed. The mechanisms that own
-    /// nothing a wait ends have nothing to wait on.
+    /// leaf is killed through, drained and removed. The mechanisms that own nothing a wait ends have
+    /// nothing to wait on. A Job Object is not released: it closes as its `Child` drops.
+    #[cfg(unix)]
     #[must_use = "the resource is released only by its wait"]
-    #[cfg_attr(
-        not(any(unix, feature = "tokio")),
-        allow(dead_code, reason = "only a Unix teardown and an awaited one release a tree")
-    )]
     fn release(self) -> Release
     where
         Self: Sized;
@@ -71,6 +85,7 @@ pub(crate) trait Contains: fmt::Debug {
 /// The closed set of mechanisms a [`Tree`](crate::containment::Tree) is contained by, each variant
 /// cfg'd as its mechanism is. Only `impl Contains for Mechanism` and the tree's `_for_test`
 /// accessors match on it; everything else goes through [`Contains`].
+#[derive(Debug)]
 pub(crate) enum Mechanism {
     /// Linux cgroup v2 leaf + `cgroup.kill`.
     #[cfg(target_os = "linux")]
@@ -92,24 +107,6 @@ pub(crate) enum Mechanism {
     /// A table of stated answers, for the tests of what consumes a tree.
     #[cfg(test)]
     Fake(crate::containment::fake::FakeContains),
-}
-
-impl fmt::Debug for Mechanism {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            #[cfg(target_os = "linux")]
-            Mechanism::Cgroup(m) => m.fmt(f),
-            #[cfg(windows)]
-            Mechanism::Job(m) => m.fmt(f),
-            #[cfg(unix)]
-            Mechanism::Group(m) => m.fmt(f),
-            #[cfg(target_os = "macos")]
-            Mechanism::Marker(m) => m.fmt(f),
-            Mechanism::Walk(m) => m.fmt(f),
-            #[cfg(test)]
-            Mechanism::Fake(m) => m.fmt(f),
-        }
-    }
 }
 
 impl Contains for Mechanism {
@@ -177,6 +174,22 @@ impl Contains for Mechanism {
         }
     }
 
+    fn subject(&self) -> String {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.subject(),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.subject(),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.subject(),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.subject(),
+            Mechanism::Walk(m) => m.subject(),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.subject(),
+        }
+    }
+
     fn disarm(&self) -> std::io::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
@@ -207,13 +220,25 @@ impl Contains for Mechanism {
         }
     }
 
+    #[cfg(unix)]
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.reached(child),
+            Mechanism::Group(m) => m.reached(child),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.reached(child),
+            Mechanism::Walk(m) => m.reached(child),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.reached(child),
+        }
+    }
+
+    #[cfg(unix)]
     fn release(self) -> Release {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.release(),
-            #[cfg(windows)]
-            Mechanism::Job(m) => m.release(),
-            #[cfg(unix)]
             Mechanism::Group(m) => m.release(),
             #[cfg(target_os = "macos")]
             Mechanism::Marker(m) => m.release(),
@@ -224,147 +249,71 @@ impl Contains for Mechanism {
     }
 }
 
-/// A tree's own kernel edge for "every member has exited", borrowed from the tree that owns the
-/// resource it watches for the child's whole life (a marker's read end must, to keep its pipe's
-/// identity from being reissued). Both waits report the [`TreeDrain`] verdict.
-pub(crate) enum DrainEdge<'a> {
-    /// The leaf's own watch of `cgroup.events`.
-    #[cfg(target_os = "linux")]
-    Cgroup(&'a crate::containment::cgroup::CgroupLeaf),
-    /// The job's live process list.
-    #[cfg(windows)]
-    Job(&'a crate::containment::windows::JobHandle),
-    /// The marker pipe's read end, which reads EOF once the last holder of the write end is gone.
-    #[cfg(target_os = "macos")]
-    Marker(&'a crate::containment::fdmarker::Marker),
-}
-
-impl DrainEdge<'_> {
-    /// Block until every member of the tree has EXITED (not reaped), or until `deadline` (`None`: for
-    /// ever): `MembersRemain` at expiry.
-    pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        match self {
-            #[cfg(target_os = "linux")]
-            DrainEdge::Cgroup(leaf) => leaf.wait_drained(deadline),
-            #[cfg(windows)]
-            DrainEdge::Job(job) => job.wait_drained(deadline, None),
-            #[cfg(target_os = "macos")]
-            DrainEdge::Marker(m) => m.wait_drained(deadline),
-        }
-    }
-
-    /// [`wait`](Self::wait), awaited, with no thread blocked: macOS is reactor-native (`AsyncFd`);
-    /// Linux awaits a broadcast from the pump thread its leaf owns (an `event_listener` future, no
-    /// reactor registration); Windows hands its sync loop to `spawn_blocking` with a cancel event (job
-    /// objects have no pollable handle). `deadline` is on tokio's clock
-    /// ([`deadline_from`](crate::tokio::wait::deadline_from)).
-    #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        match self {
-            #[cfg(target_os = "linux")]
-            DrainEdge::Cgroup(leaf) => crate::tokio::wait::cgroup_wait_tree_drained(leaf, deadline).await,
-            #[cfg(windows)]
-            DrainEdge::Job(job) => crate::tokio::wait::job_wait_tree_drained(job, deadline).await,
-            #[cfg(target_os = "macos")]
-            DrainEdge::Marker(m) => {
-                // Mirrors `Marker::wait_drained`'s own preamble exactly: a reissued read-end fd
-                // would falsely deliver `EV_EOF` instantly here just as readily as it would there,
-                // so this path must not skip the check just because it reads the raw fd directly
-                // instead of going through `Marker::wait_drained`.
-                m.check_read_end_still_valid()?;
-                debug_assert_ne!(
-                    crate::containment::marker_eof::write_end_check(m.read_end()),
-                    crate::containment::marker_eof::WriteEndCheck::HeldByUs,
-                    "the supervisor still holds a copy of the marker write end - the tree-drain edge can never fire"
-                );
-                crate::tokio::wait::wait_tree_deadline(m.read_end(), deadline).await
-            }
-        }
-    }
-}
-
 /// What places an elevation front once its leaf is gone: the leaf's subtree, or why it could not be
 /// read. Linux only; elsewhere there is no leaf to read.
-#[cfg_attr(
-    not(unix),
-    allow(dead_code, reason = "only a Unix teardown looks at an elevation front")
-)]
+#[cfg(unix)]
 pub(crate) struct FrontReach(
     #[cfg(target_os = "linux")] pub(crate) std::io::Result<Option<crate::containment::cgroup::Subtree>>,
 );
 
 /// The end of a mechanism's resource, which [`wait`](Self::wait) completes by dropping it: a cgroup
-/// leaf is killed through, drained and removed; a Job Object is closed. It carries what places an
-/// elevation front once the leaf is gone, read before the first step, which may remove the leaf.
+/// leaf is killed through, drained and removed. [`front_reach`](Self::front_reach) reads what places
+/// an elevation front before that, since the first step may remove the leaf.
+#[cfg(unix)]
 #[must_use = "the resource is released only by its wait"]
-#[cfg_attr(
-    not(any(unix, feature = "tokio")),
-    allow(dead_code, reason = "only a Unix teardown and an awaited one release a tree")
-)]
 pub(crate) struct Release {
-    reach: FrontReach,
     held: Held,
 }
 
 /// The resource a [`Release`] owns until its wait drops it.
-#[cfg_attr(
-    not(any(unix, feature = "tokio")),
-    allow(dead_code, reason = "only a Unix teardown and an awaited one release a tree")
-)]
+#[cfg(unix)]
 enum Held {
     Nothing,
     #[cfg(target_os = "linux")]
     Leaf(crate::containment::cgroup::CgroupLeaf),
-    #[cfg(windows)]
-    Job(crate::containment::windows::JobHandle),
 }
 
-#[cfg_attr(
-    not(any(unix, feature = "tokio")),
-    allow(dead_code, reason = "only a Unix teardown and an awaited one release a tree")
-)]
+#[cfg(unix)]
 impl Release {
     /// The release of a mechanism that owns nothing a wait ends.
     pub(crate) fn nothing() -> Release {
-        Release {
-            #[cfg(target_os = "linux")]
-            reach: FrontReach(Ok(None)),
-            #[cfg(not(target_os = "linux"))]
-            reach: FrontReach(),
-            held: Held::Nothing,
-        }
+        Release { held: Held::Nothing }
     }
 
-    /// The release of a cgroup leaf: its subtree is read now, before any step of its teardown.
+    /// The release of a cgroup leaf.
     #[cfg(target_os = "linux")]
     pub(crate) fn leaf(leaf: crate::containment::cgroup::CgroupLeaf) -> Release {
-        Release {
-            reach: FrontReach(leaf.subtree().map(Some)),
-            held: Held::Leaf(leaf),
-        }
+        Release { held: Held::Leaf(leaf) }
     }
 
-    /// The release of a Job Object, which its close ends (and kills through, unless it is disarmed).
-    #[cfg(windows)]
-    pub(crate) fn job(job: crate::containment::windows::JobHandle) -> Release {
-        Release {
-            reach: FrontReach(),
-            held: Held::Job(job),
+    /// What places an elevation front once the resource is gone, read now: only a caller that looks
+    /// at a front asks, and it asks before the first step of the teardown.
+    pub(crate) fn front_reach(&self) -> FrontReach {
+        match &self.held {
+            Held::Nothing => {
+                #[cfg(target_os = "linux")]
+                {
+                    FrontReach(Ok(None))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    FrontReach()
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Held::Leaf(leaf) => FrontReach(leaf.subtree().map(Some)),
         }
     }
 
     /// Drop the resource: a cgroup leaf is killed through if it is armed and occupied, drained
     /// (blocking, warned past the leaf's threshold) and removed. After [`wait_async`](Self::wait_async)
-    /// it finds nothing left to wait for. Answers what places an elevation front.
-    pub(crate) fn wait(self) -> FrontReach {
+    /// it finds nothing left to wait for. It has no deadline: no caller needs one yet.
+    pub(crate) fn wait(self) {
         match self.held {
             Held::Nothing => {}
             #[cfg(target_os = "linux")]
             Held::Leaf(leaf) => drop(leaf),
-            #[cfg(windows)]
-            Held::Job(job) => drop(job),
         }
-        self.reach
     }
 
     /// The steps of [`wait`](Self::wait) that can be awaited instead of blocked on: a leaf's first
@@ -372,9 +321,13 @@ impl Release {
     /// ([`CgroupLeaf::remove_else_kill`](crate::containment::cgroup::CgroupLeaf::remove_else_kill)),
     /// then the drain a landed kill bounds, so that the drop in `wait` finds it drained. A drain that
     /// cannot be watched is left to `wait`. The resource stays held, so a future dropped mid-await
-    /// leaves the whole of it to `wait`.
+    /// leaves the whole of it to `wait`. `child` is the child's pid, which names it in the debug lines.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(&mut self) {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup leaf has steps to await")
+    )]
+    pub(crate) async fn wait_async(&self, child: u32) {
         #[cfg(target_os = "linux")]
         if let Held::Leaf(leaf) = &self.held {
             // The leaf's drop makes this step again and reports what remains. A leaf that is occupied
@@ -384,8 +337,7 @@ impl Release {
                 let occupied = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTEMPTY));
                 if !occupied && !crate::containment::cgroup::removed_after_drain(&e) {
                     log::debug!(
-                        "cgroup leaf {}: its first rmdir failed ({report})",
-                        leaf.path().display(),
+                        "child {child}: its leaf's first rmdir failed ({report})",
                         report = crate::error::Report(&e)
                     );
                 }
@@ -393,10 +345,9 @@ impl Release {
             if !leaf.kill_landed() {
                 return;
             }
-            if let Err(e) = crate::tokio::wait::cgroup_wait_tree_drained(leaf, None).await {
+            if let Err(e) = DrainEdge::Cgroup(leaf).wait_async(None).await {
                 log::debug!(
-                    "cgroup leaf {}: its leaf's drain cannot be watched ({report}); the teardown waits for it on this thread, blocking",
-                    leaf.path().display(),
+                    "child {child}: its leaf's drain cannot be watched ({report}); the teardown waits for it on this thread, blocking",
                     report = crate::error::Report(&e)
                 );
             }

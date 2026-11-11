@@ -314,12 +314,8 @@ impl Child {
         // best-effort reap is safe after a sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
-        } else if self.containment().can_observe_drain() {
-            let drained = match self.inner.tree.drain_edge() {
-                Ok(edge) => edge.wait_async(crate::tokio::wait::deadline_from(grace)).await,
-                Err(e) => Err(e),
-            };
-            match drained {
+        } else if let Ok(edge) = self.inner.tree.drain_edge() {
+            match edge.wait_async(crate::tokio::wait::deadline_from(grace)).await {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
@@ -447,10 +443,11 @@ impl Child {
             crate::containment::dispatch::TreeSignal::Term,
             None,
         );
-        let drained = match self.inner.tree.drain_edge() {
-            Ok(edge) => edge.wait_async(crate::tokio::wait::deadline_from(grace)).await,
-            Err(e) => Err(e),
-        };
+        let drained = self
+            .inner
+            .tree
+            .wait_drained_async(crate::tokio::wait::deadline_from(grace))
+            .await;
         if let Err(e) = drained {
             call.holders_grace_failed(&e);
         }

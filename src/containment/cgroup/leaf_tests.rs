@@ -1689,7 +1689,7 @@ fn a_parked_async_wait_does_not_hold_up_another() {
         .build()
         .expect("a runtime");
     runtime.block_on(async {
-        let mut parked = std::pin::pin!(crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None));
+        let mut parked = std::pin::pin!(crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, None));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(parked.as_mut().poll(&mut context).is_pending(), "the leaf is populated");
 
@@ -1701,7 +1701,10 @@ fn a_parked_async_wait_does_not_hold_up_another() {
                 .enable_all()
                 .build()
                 .expect("a runtime");
-            runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&other_leaf, None))
+            runtime.block_on(crate::containment::drain_edge::cgroup_wait_tree_drained(
+                &other_leaf,
+                None,
+            ))
         });
         blocking_rx.recv().expect("the second wait blocks");
         FakeLeaf::set_populated(&fake.events, false);
@@ -1738,7 +1741,10 @@ fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
             .enable_all()
             .build()
             .expect("a runtime");
-        runtime.block_on(crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None))
+        runtime.block_on(crate::containment::drain_edge::cgroup_wait_tree_drained(
+            &async_leaf,
+            None,
+        ))
     });
 
     blocking_rx.recv().expect("a waiter blocks");
@@ -1781,7 +1787,7 @@ fn a_cancelled_async_wait_leaves_the_others_waiting() {
             .expect("a runtime");
         runtime.block_on(async {
             ::tokio::select! {
-                drained = crate::tokio::wait::cgroup_wait_tree_drained(&async_leaf, None) => {
+                drained = crate::containment::drain_edge::cgroup_wait_tree_drained(&async_leaf, None) => {
                     panic!("the leaf was never drained, got {drained:?}")
                 }
                 _ = cancelled => {}
@@ -1908,7 +1914,7 @@ fn a_drained_leaf_is_answered_without_a_pump() {
             .expect("a runtime");
         assert_eq!(
             runtime
-                .block_on(crate::tokio::wait::cgroup_wait_tree_drained(&leaf, None))
+                .block_on(crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, None))
                 .expect("wait"),
             TreeDrain::AllMembersExited
         );

@@ -25,7 +25,7 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
         BTreeMap::new(),
         false,
         Attachment {
-            tree: Tree::None,
+            tree: Tree::none(),
             graceful: if cfg!(windows) {
                 GracefulMechanism::None
             } else {

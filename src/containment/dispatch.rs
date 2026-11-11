@@ -151,7 +151,7 @@ impl Attachment {
     /// ever; cosca can make neither claim about a child it did not create.
     pub(crate) fn uac_elevated() -> Attachment {
         Attachment {
-            tree: Tree::None,
+            tree: Tree::none(),
             graceful: crate::graceful::GracefulMechanism::Unknown,
         }
     }
@@ -1376,7 +1376,7 @@ fn attach_tree(
                 // Nested member: it joined the ancestor's cgroup/process group (or the
                 // root's tree-walk) rather than creating its own, so it owns no teardown —
                 // the outermost root tears the whole tree down.
-                return Ok(Tree::Delegated);
+                return Ok(Tree::delegated());
             }
         }
     }
@@ -1440,7 +1440,7 @@ fn attach_tree(
                         "a nested member inherits the root's marker and must never create one"
                     );
                 }
-                return Ok(Tree::Delegated);
+                return Ok(Tree::delegated());
             }
         }
     }
@@ -1485,13 +1485,13 @@ fn attach_tree(
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no
             // new job is created), so it owns no teardown — the outermost root's job tears
             // the whole tree down.
-            return Ok(Tree::Delegated);
+            return Ok(Tree::delegated());
         }
     }
 
     // Uncontained (or unsupported platform).
     let _ = prepared;
-    Ok(Tree::None)
+    Ok(Tree::none())
 }
 
 #[cfg(test)]

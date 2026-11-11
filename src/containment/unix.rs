@@ -51,7 +51,8 @@ use std::io;
 use nix::sys::signal::Signal;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
-use crate::containment::mechanism::{Contains, DrainEdge, Release};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
@@ -104,8 +105,16 @@ impl Contains for Group {
         Ok(())
     }
 
+    fn subject(&self) -> String {
+        format!("ProcessGroup({})", self.pgid)
+    }
+
     /// A signal to a group is subject to the kernel's permission check, as the child's own kill is.
     fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
         Ok(false)
     }
 

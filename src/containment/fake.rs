@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use crate::containment::dispatch::TreeKillOutcome;
-use crate::containment::mechanism::{Contains, DrainEdge, Release};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::Contains;
+#[cfg(unix)]
+use crate::containment::mechanism::Release;
 use crate::containment::{Containment, Root, TerminateOutcome};
 
 /// The sends a [`FakeContains`] was asked for, in order: `"kill"` and `"terminate"`.
@@ -70,11 +73,21 @@ impl Contains for FakeContains {
         Ok(())
     }
 
+    fn subject(&self) -> String {
+        format!("{:?}", self.kind)
+    }
+
     #[cfg(unix)]
     fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
         Ok(self.reaches)
     }
 
+    #[cfg(unix)]
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        Ok(self.reaches)
+    }
+
+    #[cfg(unix)]
     fn release(self) -> Release {
         Release::nothing()
     }

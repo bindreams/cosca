@@ -369,7 +369,7 @@ impl Child {
     /// objects have no pollable handle) with a cancel event so a dropped future releases the
     /// blocking watcher promptly instead of parking out the wait.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
-        self.inner.tree.drain_edge()?.wait_async(None).await
+        self.inner.tree.wait_drained_async(None).await
     }
 
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`.
@@ -379,8 +379,10 @@ impl Child {
         &self,
         timeout: std::time::Duration,
     ) -> Result<crate::containment::TreeDrain, Error> {
-        let edge = self.inner.tree.drain_edge()?;
-        edge.wait_async(super::wait::deadline_from(timeout)).await
+        self.inner
+            .tree
+            .wait_drained_async(super::wait::deadline_from(timeout))
+            .await
     }
 
     /// Leave the child (and its contained tree) running after this handle drops (opt out of

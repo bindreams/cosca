@@ -13,7 +13,7 @@ use crate::error::Error;
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
 /// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
 /// performs — root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
-/// ([`DrainEdge::wait`](crate::containment::mechanism::DrainEdge::wait)). Outside test builds the seam module does
+/// ([`DrainEdge::wait`](crate::containment::drain_edge::DrainEdge::wait)). Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
 pub(crate) fn take_forced_watch_error() -> Option<Error> {
@@ -386,12 +386,8 @@ impl Child {
         // sweep failure.
         let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
             (false, false, Some(e))
-        } else if self.containment().can_observe_drain() {
-            match self
-                .tree
-                .drain_edge()
-                .and_then(|edge| edge.wait(crate::wait::deadline_from(grace)))
-            {
+        } else if let Ok(edge) = self.tree.drain_edge() {
+            match edge.wait(crate::wait::deadline_from(grace)) {
                 Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
                 // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
                 // to the fresh, non-blocking, zero-duration root probe described there.
@@ -580,11 +576,7 @@ impl Child {
             crate::containment::dispatch::TreeSignal::Term,
             None,
         );
-        if let Err(e) = self
-            .tree
-            .drain_edge()
-            .and_then(|edge| edge.wait(crate::wait::deadline_from(grace)))
-        {
+        if let Err(e) = self.tree.wait_drained(crate::wait::deadline_from(grace)) {
             call.holders_grace_failed(&e);
         }
         self.holders_shutdown_error(&call, skip)

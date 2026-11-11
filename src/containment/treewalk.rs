@@ -84,7 +84,10 @@
 //! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
-use crate::containment::mechanism::{Contains, DrainEdge, Release};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::Contains;
+#[cfg(unix)]
+use crate::containment::mechanism::Release;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
 use crate::containment::{Containment, Skip, TerminateOutcome};
@@ -134,6 +137,10 @@ impl Contains for Walker {
         Ok(())
     }
 
+    fn subject(&self) -> String {
+        format!("TreeWalk({:?})", self.root)
+    }
+
     /// A signal to a walked member is subject to the kernel's permission check, as the child's own
     /// kill is.
     #[cfg(unix)]
@@ -141,6 +148,12 @@ impl Contains for Walker {
         Ok(false)
     }
 
+    #[cfg(unix)]
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(unix)]
     fn release(self) -> Release {
         Release::nothing()
     }

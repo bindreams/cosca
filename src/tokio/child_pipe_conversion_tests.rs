@@ -23,7 +23,7 @@ use super::Child;
 /// attached).
 fn a_child_without_a_process() -> Child {
     let attachment = Attachment {
-        tree: Tree::None,
+        tree: Tree::none(),
         graceful: crate::graceful::GracefulMechanism::Process,
     };
     Child::from_sync(crate::Child::from_parts(

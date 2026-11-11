@@ -1,7 +1,6 @@
 use super::{Skip, Why};
 use crate::containment::dispatch::TreeKillOutcome;
-use crate::containment::fake::FakeContains;
-use crate::containment::{Containment, Mechanism, Refusal, Tree};
+use crate::containment::{Refusal, Tree};
 
 const PID: u32 = 999_999;
 
@@ -16,8 +15,7 @@ fn skip(why: Why) -> Skip {
 
 /// A tree a completed kill settled, and a fresh one.
 fn killed(settled: bool) -> Tree {
-    let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
-    let tree = Tree::contained(Mechanism::Fake(fake));
+    let tree = Tree::none();
     if settled {
         tree.settle(TreeKillOutcome::Ran(Ok(())), true)
             .expect("a kill that left nothing");

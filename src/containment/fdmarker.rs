@@ -833,7 +833,8 @@ pub(crate) mod fault {
 use std::io;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
-use crate::containment::mechanism::{Contains, DrainEdge, Release};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, Why};
 use crate::error::Error;
@@ -906,9 +907,17 @@ impl Contains for Marker {
         Ok(())
     }
 
+    fn subject(&self) -> String {
+        format!("FdMarker({self:?})")
+    }
+
     /// A signal to a marker's holders is subject to the kernel's permission check, as the child's own
     /// kill is.
     fn would_reach(&self, _pid: u32, _pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
         Ok(false)
     }
 

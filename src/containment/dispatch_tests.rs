@@ -105,8 +105,8 @@ fn unix_setup_for_none_mode_selects_process_group() {
 fn a_tree_is_actionable() {
     use crate::containment::{Mechanism, Tree};
     // No teardown mechanism -> not actionable (the _tree guard rejects these).
-    assert!(Tree::None.require_contained().is_err()); // uncontained / lone
-    assert!(Tree::Delegated.require_contained().is_err());
+    assert!(Tree::none().require_contained().is_err()); // uncontained / lone
+    assert!(Tree::delegated().require_contained().is_err());
     // Every real mechanism is actionable. Cheap variants are built inline; Cgroup/JobObject
     // need an OS handle, so a test-only constructor builds one (asserted on its own platform).
     let walk = Mechanism::Walk(crate::containment::treewalk::Walker::new(
@@ -241,7 +241,7 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
 #[skuld::test]
 fn nested_attach_is_delegated() {
     use super::{attach, Prepared};
-    use crate::containment::{ContainMode, Containment, Tree};
+    use crate::containment::{ContainMode, Containment};
 
     fn spawn_trivial() -> std::process::Child {
         // attach()'s nested arms don't touch the child, so an exited child is fine. Held for
@@ -300,10 +300,6 @@ fn nested_attach_is_delegated() {
             Containment::Delegated,
             "nested member ({mode:?}) must report Containment::Delegated, got {:?}",
             tree.containment()
-        );
-        assert!(
-            matches!(tree, Tree::Delegated),
-            "nested member ({mode:?}) must be Tree::Delegated, got {tree:?}"
         );
     }
 }
@@ -1566,7 +1562,7 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
     let mark = crate::log_capture::mark();
     let failure = SweepFailure::of(
         "graceful_shutdown_tree",
-        &Tree::None,
+        &Tree::none(),
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![member(1), member(2)],
             root: None,
@@ -1802,7 +1798,7 @@ fn wait_drained_is_unsupported_without_a_marker() {
     // Mirrors `require_contained`: a mechanism that cannot answer says so, rather than
     // implying a guarantee it has not got.
     use crate::containment::Tree;
-    for tree in [Tree::None, Tree::Delegated] {
+    for tree in [Tree::none(), Tree::delegated()] {
         let err = tree
             .drain_edge()
             .err()
@@ -1871,12 +1867,11 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
 #[skuld::test]
 fn uac_elevated_attachment_has_no_in_process_route() {
     use super::Attachment;
-    use crate::containment::{Containment, Tree};
+    use crate::containment::Containment;
     use crate::graceful::GracefulMechanism;
 
     let a = Attachment::uac_elevated();
     assert_eq!(a.tree.containment(), Containment::None);
-    assert!(matches!(a.tree, Tree::None), "got {:?}", a.tree);
     assert_eq!(a.graceful, GracefulMechanism::Unknown);
 }
 

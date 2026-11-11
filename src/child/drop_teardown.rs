@@ -105,12 +105,15 @@ impl Child {
                 remains
             }
         };
-        // The root is reaped and the event reported: what is left is the tree's resource, which for a
-        // leaf is its drain, bounded by its kill. The awaited steps are taken here; the release then
-        // drops the resource in place, which finds nothing left to wait for.
-        let mut released = std::mem::take(&mut self.tree).release();
-        released.wait_async().await;
-        released.wait();
+        // The root is reaped and the event reported: what is left is the leaf's drain, which its kill
+        // bounds. The awaited steps are taken here; the release then drops the leaf in place, which
+        // finds nothing left to wait for. Every other mechanism drops with the handle.
+        #[cfg(target_os = "linux")]
+        {
+            let released = self.tree.release();
+            released.wait_async(self.pid()).await;
+            released.wait();
+        }
         remains
     }
 
@@ -295,17 +298,26 @@ impl Child {
         })
     }
 
+    /// The tree's resource released, with the reach that places the front once it is gone, read before
+    /// any step of the release, which may remove the leaf. What the kills settled stays the handle's.
+    fn release_tree_for_front(&mut self) -> (Release, FrontReach) {
+        let release = self.tree.release();
+        let reach = release.front_reach();
+        (release, reach)
+    }
+
     /// The second half of [`begin_leaf_and_front`](Self::begin_leaf_and_front): the tree's resource is
     /// released, so a leaf is killed through, drained and removed, and then the front is looked at
     /// ([`look_at_front_after_leaf`](Self::look_at_front_after_leaf)), and worded as `why` says it
-    /// was not killed. The release's reach was read before its first step, which may remove the leaf.
+    /// was not killed. The reach is the release's, read before its first step, which may remove the
+    /// leaf.
     fn look_at_front_after_releasing(
         &mut self,
-        release: Release,
+        (release, reach): (Release, FrontReach),
         why: &dyn std::fmt::Display,
         disposition: Disposition,
     ) -> TeardownOutcome {
-        let reach = release.wait();
+        release.wait();
         match self.look_at_front_after_leaf(reach) {
             BeginOutcome::Done(look) => word_front(self.proc.pid(), why, disposition, look),
             BeginOutcome::Wait(wait) => word_front(self.proc.pid(), why, disposition, wait.settle(&self.proc)),
@@ -417,7 +429,7 @@ enum RootWait {
     /// read before its first step. `why` is why the front was not killed.
     #[cfg(all(unix, feature = "tokio"))]
     Releasing {
-        release: Option<Release>,
+        released: Option<(Release, FrontReach)>,
         why: String,
     },
     /// The look at the front is under way, as an awaited teardown leaves it; `why` is why the front
@@ -438,13 +450,13 @@ impl DropWait {
             RootWait::Root(wait) => wait.settle(&child.proc),
             #[cfg(unix)]
             RootWait::Leaf { why } => {
-                let release = std::mem::take(&mut child.tree).release();
-                child.look_at_front_after_releasing(release, &why, parts.disposition)
+                let released = child.release_tree_for_front();
+                child.look_at_front_after_releasing(released, &why, parts.disposition)
             }
             #[cfg(all(unix, feature = "tokio"))]
-            RootWait::Releasing { release, why } => {
-                let release = release.expect("held until its wait completes");
-                child.look_at_front_after_releasing(release, &why, parts.disposition)
+            RootWait::Releasing { released, why } => {
+                let released = released.expect("held until its wait completes");
+                child.look_at_front_after_releasing(released, &why, parts.disposition)
             }
             #[cfg(all(unix, feature = "tokio"))]
             RootWait::Front { wait, why } => {
@@ -463,24 +475,21 @@ impl DropWait {
     async fn settle_async(&mut self, child: &mut Child) -> TeardownOutcome {
         #[cfg(unix)]
         if let RootWait::Leaf { why } = &self.wait {
-            // Held in the wait before the first await: the release reads the subtree before the
-            // leaf's first step, which may remove it, and keeps the leaf until its wait completes.
+            // Held in the wait before the first await: the reach is read before the leaf's first step,
+            // which may remove it, and the leaf is kept until its wait completes.
             self.wait = RootWait::Releasing {
                 why: why.clone(),
-                release: Some(std::mem::take(&mut child.tree).release()),
+                released: Some(child.release_tree_for_front()),
             };
         }
         #[cfg(unix)]
-        if let RootWait::Releasing { release, why } = &mut self.wait {
+        if let RootWait::Releasing { released, why } = &mut self.wait {
             // The leaf is killed through and its drain awaited, so dropping it waits for nothing.
-            release
-                .as_mut()
-                .expect("held until its wait completes")
-                .wait_async()
-                .await;
+            let (release, _) = released.as_ref().expect("held until its wait completes");
+            release.wait_async(child.pid()).await;
             let why = std::mem::take(why);
-            let release = release.take().expect("held until its wait completes");
-            let reach = release.wait();
+            let (release, reach) = released.take().expect("held until its wait completes");
+            release.wait();
             match child.look_at_front_after_leaf(reach) {
                 BeginOutcome::Done(look) => return word_front(child.proc.pid(), &why, self.parts.disposition, look),
                 BeginOutcome::Wait(wait) => self.wait = RootWait::Front { wait, why },

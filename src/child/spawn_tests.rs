@@ -1103,7 +1103,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
-    child.tree = crate::containment::Tree::Delegated;
+    child.tree = crate::containment::Tree::delegated();
     let pid = child.pid();
 
     let (err, fate) = super::finish_elevated(child, failed_write())

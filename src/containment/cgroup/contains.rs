@@ -3,14 +3,16 @@
 use std::os::fd::BorrowedFd;
 
 use super::CgroupLeaf;
+use crate::child::owned::teardown::Reach;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
-use crate::containment::mechanism::{Contains, DrainEdge, Release};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::mechanism::{Contains, Release};
 use crate::containment::{Containment, Root, TerminateOutcome};
 
-/// What names the leaf in a message about its teardown: its path.
+// CgroupLeaf is not Debug; provide a minimal impl.
 impl std::fmt::Debug for CgroupLeaf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cgroup leaf {}", self.path().display())
+        f.debug_struct("CgroupLeaf").finish_non_exhaustive()
     }
 }
 
@@ -36,6 +38,11 @@ impl Contains for CgroupLeaf {
         Containment::CgroupV2
     }
 
+    /// The leaf's path: a kill returns the kernel's error unwrapped, so the error does not name it.
+    fn subject(&self) -> String {
+        format!("cgroup leaf {}", self.path().display())
+    }
+
     /// Stops the leaf's `Drop` firing `cgroup.kill`.
     fn disarm(&self) -> std::io::Result<()> {
         CgroupLeaf::disarm(self);
@@ -47,6 +54,12 @@ impl Contains for CgroupLeaf {
     /// its credentials.
     fn would_reach(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> std::io::Result<bool> {
         self.subtree()?.holds(pid, pidfd)
+    }
+
+    /// A `cgroup.kill` that landed (or found the leaf gone) and where `child` is says it was in the
+    /// leaf (see [`Subtree::reached_by`](super::Subtree::reached_by)).
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+        self.subtree()?.reached(child)
     }
 
     /// The leaf is killed through if it is armed and occupied, drained and removed.
