@@ -99,11 +99,13 @@ pub(crate) fn group_blocker() -> (crate::Child, crate::PipeWriter) {
 pub(crate) fn session_tree() -> (crate::Child, crate::PipeWriter, u32, crate::PipeReader) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
-    // A background job's stdin is `/dev/null` unless it is redirected (see `BLOCKER_ARGV`).
+    // A background job's stdin is `/dev/null` unless it is redirected (see `BLOCKER_ARGV`). The root closes 3
+    // and 4 in a bare `exec` before `exec cat`: macOS's bash 3.2 saves the fds an `exec cmd N>&-` closes to 10
+    // and up, and the command inherits them, so the root would keep the descendant's pipe open.
     cmd.args([
         "sh",
         "-c",
-        "exec 3<&0; cat <&3 3<&- >/dev/null & echo $!; exec cat 3<&- 4>&-",
+        "exec 3<&0; cat <&3 3<&- >/dev/null & echo $!; exec 3<&- 4>&-; exec cat",
     ]);
     cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
