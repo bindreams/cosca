@@ -148,8 +148,8 @@ impl Child {
     /// can be settled without waiting. Nothing that names the tree by the root's number runs once
     /// the root is reaped, or when its handle cannot say: the handle's own answer (`RootState`), or
     /// the number no longer reading as this root. Each send by the group's number checks the root
-    /// again, as for [`kill_tree`](Child::kill_tree). On Linux 6.9+ a process group is decided by the
-    /// root's pidfd ([`Attached::hard_kill_for_drop`](crate::containment::Attached::hard_kill_for_drop)).
+    /// again, as for [`kill_tree`](Child::kill_tree): the drop's tree kill is the mechanism's own,
+    /// the same answer as a tree call's ([`Attached::hard_kill`](crate::containment::Attached::hard_kill)).
     /// An unreaped root stays a zombie, pinning its number, until its teardown settles.
     pub(crate) fn begin_tear_down(
         &mut self,
@@ -229,8 +229,13 @@ impl Child {
         // The hold names the root's group. The handle owns the child outright here, so no reap
         // can land; it is dropped before anything below locks the child.
         let held = self.proc.hold(self.pid());
-        let kill = self.attached.hard_kill_for_drop(&view, Some(&held));
+        // The kill decides on the view's look, the one its report is worded from.
+        let kill = {
+            let seen = crate::containment::Seen::new(&held, view.look());
+            self.attached.hard_kill(Some(&seen))
+        };
         drop(held);
+        kill.log_skip(&view);
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
         // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is

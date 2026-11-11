@@ -14,7 +14,7 @@ use super::identity_macos_tests::{
     std_blocker_with_unique, sync_blocker,
 };
 use super::unique_report;
-use super::{LateTree, Reach};
+use super::{LateTree, Sweep};
 use crate::error::ChildFate;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::os_process::child::PeekOutcome;
@@ -565,7 +565,8 @@ fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() 
 fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
     use crate::containment::dispatch::Unkilled;
     let root_left = || LateTree {
-        reach: Reach::None,
+        attached: None,
+        sweep: Sweep::RootAlive,
         pid: 4242,
         unique: 1,
         id: None,

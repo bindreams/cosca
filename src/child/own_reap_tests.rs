@@ -42,8 +42,16 @@ fn zombie_group_root() -> Arc<crate::Child> {
 /// Runs `op` on `child` with a `wait` started on another thread right after the call's look, and
 /// returns what that wait did first, and the wait. The look's hook does not return until the wait
 /// has either reaped or blocked on the handle's lock: both are events, so nothing waits on time.
-fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&crate::Child)) -> (Waiter, Wait) {
+///
+/// With `reaped_before_the_sweep`, the wait is also waited for at `AfterTerminate`, since the lock is
+/// unfair.
+fn run_with_a_wait_after_the_look(
+    child: &Arc<crate::Child>,
+    reaped_before_the_sweep: bool,
+    op: impl FnOnce(&crate::Child),
+) -> (Waiter, Wait) {
     let (tx, rx) = channel();
+    let rx = Rc::new(rx);
     let _blocked = {
         let tx = tx.clone();
         crate::child::owned::seams::on_lock_contended(move || {
@@ -54,6 +62,7 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
     let _hook = at(HookPoint::AfterRootLook, {
         let child = Arc::clone(child);
         let seen = Rc::clone(&seen);
+        let rx = Rc::clone(&rx);
         move || {
             let wait = std::thread::spawn(move || {
                 let status = child.wait();
@@ -64,6 +73,15 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
             *seen.borrow_mut() = Some((first, wait));
         }
     });
+    let _reaped = reaped_before_the_sweep.then(|| {
+        let seen = Rc::clone(&seen);
+        at(HookPoint::AfterTerminate, move || {
+            let blocked = matches!(seen.borrow().as_ref(), Some((Waiter::Blocked, _)));
+            if blocked {
+                assert_eq!(rx.recv().expect("the waiter reaps"), Waiter::Reaped);
+            }
+        })
+    });
     op(child);
     let seen = seen.borrow_mut().take().expect("the call took its look");
     seen
@@ -71,7 +89,11 @@ fn run_with_a_wait_after_the_look(child: &Arc<crate::Child>, op: impl FnOnce(&cr
 
 /// Mutants: the look and the sends not held against this handle's reaps; the hold dropped after
 /// the look, before the sends.
-fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), on_send: impl FnOnce(Box<dyn FnMut(i32)>)) {
+fn own_wait_lands_after_the_sends(
+    reaped_before_the_sweep: bool,
+    op: impl FnOnce(&crate::Child),
+    on_send: impl FnOnce(Box<dyn FnMut(i32)>),
+) {
     let child = zombie_group_root();
     let pgid = child.pid() as i32;
     // Each send to the group, and whether this thread held the handle's lock at it.
@@ -82,7 +104,7 @@ fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), on_send: impl 
         move |group| sends.borrow_mut().push((group, child.proc.is_held_by_current_thread()))
     }));
 
-    let (first, wait) = run_with_a_wait_after_the_look(&child, op);
+    let (first, wait) = run_with_a_wait_after_the_look(&child, reaped_before_the_sweep, op);
 
     assert_eq!(
         first,
@@ -107,6 +129,7 @@ fn own_wait_lands_after_the_sends(op: impl FnOnce(&crate::Child), on_send: impl 
 fn kill_tree_holds_off_an_own_wait_until_its_sends_are_done() {
     let killed = record_kill_group();
     own_wait_lands_after_the_sends(
+        false,
         |child| child.kill_tree().expect("kill the tree"),
         |hook| killed.on_send(hook),
     );
@@ -116,28 +139,39 @@ fn kill_tree_holds_off_an_own_wait_until_its_sends_are_done() {
 fn terminate_tree_holds_off_an_own_wait_until_its_sends_are_done() {
     let termed = record_term_group();
     own_wait_lands_after_the_sends(
+        false,
         |child| child.terminate_tree().expect("signal the tree"),
         |hook| termed.on_send(hook),
     );
 }
 
-/// The `SIGTERM` is the send the look decides; the sweep after the grace takes its own look. The
-/// wait reaps the root once the `SIGTERM` is out, so the pid names no process and the call ends
-/// `Unassessable` (on Linux the pidfd group signal is refused, as below 6.9: with it the group is
-/// named exactly).
+/// The `SIGTERM` is the send the look decides; the sweep after it takes its own look. The wait reaps
+/// the root once the `SIGTERM` is out, so the call ends `Unassessable` (the pidfd group signal is
+/// refused, as below 6.9), with the remedy, and nothing is sent by the number after the reap.
 #[skuld::test]
 fn graceful_shutdown_tree_holds_off_an_own_wait_until_its_sigterm_is_sent() {
     let termed = record_term_group();
-    let _killed = record_kill_group();
+    let killed = record_kill_group();
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     own_wait_lands_after_the_sends(
+        true,
         |child| {
             let err = child
                 .graceful_shutdown_tree(std::time::Duration::ZERO)
                 .expect_err("a reaped root's group is not signalled by its number");
             assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+            assert!(
+                err.to_string()
+                    .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
+                "the error says how to end the descendants: {err}"
+            );
         },
         |hook| termed.on_send(hook),
+    );
+    assert_eq!(
+        killed.killed(),
+        Vec::<i32>::new(),
+        "the sweep sent no killpg by the reaped root's number"
     );
 }

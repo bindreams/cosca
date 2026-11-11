@@ -215,6 +215,57 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
     assert_eq!(skips.len(), 1, "{skips:?}");
 }
 
+/// 6.9+: a root whose handle cannot say whether it was reaped, but whose number reads as no process
+/// and whose pidfd shows its group has no member, is reaped: the teardown sends nothing, does not
+/// warn of a skipped kill, and the tree counts as killed. The one look that shows the reap decides
+/// the kill and words the report. Mutant: "the kill decides on the handle's raw `Unknown`, the report
+/// on the reap the number showed".
+fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown: Teardown) {
+    use crate::identity::Resolved;
+    crate::log_capture::install();
+    let mut child = session_sleep().spawn().expect("spawn");
+    reap_root(&child, Reap::Foreign);
+    let mark = crate::log_capture::mark();
+    let capture = Capture::start();
+    let _as_gone = crate::child::fault::force_next_root_read(Resolved::Gone);
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+    let detail = match teardown {
+        Teardown::Drop => {
+            let torn = child.tear_down(
+                crate::containment::dispatch::TeardownCaller::FailedRun,
+                crate::child::owned::teardown::Disposition::Leave,
+            );
+            assert!(torn.fate.not_running(), "{:?}", torn.fate);
+            assert!(child.tree_killed.is_set(), "an emptied group is a killed tree");
+            None
+        }
+        Teardown::FinishElevated => tear_down(child, teardown),
+    };
+    fake.assert_peeks_exhausted();
+    assert_eq!(capture.group_steps(), [], "nothing was sent to the group");
+    if let Some(detail) = detail {
+        assert!(!detail.contains("tree was not killed"), "{detail}");
+    }
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns, Vec::<String>::new(), "nothing was left behind");
+}
+
+#[skuld::test]
+fn a_teardown_of_an_unreadable_handle_with_a_gone_number_and_an_empty_group_does_not_warn(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(Teardown::Drop);
+}
+
+#[skuld::test]
+fn a_failed_elevated_spawns_cleanup_of_an_unreadable_handle_with_a_gone_number_and_an_empty_group_does_not_warn(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+) {
+    an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(Teardown::FinishElevated);
+}
+
 /// 6.9+: a drop that finds, listed by its group's number, a process the root's pidfd shows is not a
 /// member sends it nothing and does not warn. Mutant: "a group with no member left leaves the
 /// listed process unassessable".

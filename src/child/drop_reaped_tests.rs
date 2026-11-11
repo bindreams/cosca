@@ -106,6 +106,16 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
     crate::log_capture::records_since_on_current_thread(mark, WARN)
 }
 
+/// The drop's warn over a `TreeWalk` whose walk found no root: the tree call's answer, as the
+/// settlement words it. Not macOS, where a `TreeWalk` root is a groupless marker.
+#[cfg(not(target_os = "macos"))]
+const WALK_WARN: &str = "Child::drop: contained-tree teardown did not fully succeed";
+
+#[cfg(not(target_os = "macos"))]
+fn drop_walk_warns_since(mark: usize) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, WALK_WARN)
+}
+
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
 fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
@@ -258,18 +268,20 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
         .expect("stderr reaches EOF once the cat is gone");
 }
 
-/// A `TreeWalk` names its tree by ppid edges from the root's number. After the reap the only
-/// processes with that ppid belong to whoever reused the number, so the drop walks nothing and
-/// warns naming the root. Mutant: the reaped `TreeWalk` still walks.
+/// A `TreeWalk` proves its root still holds its pid before it walks, as a tree call's does. A reaped
+/// root fails that proof, so the drop walks nothing (the recorder notes a walk only once the proof
+/// passed) and warns that no walk ran. Mutant: the reaped `TreeWalk` still walks. Not macOS: there a
+/// `TreeWalk` root is an fd marker without a group, which
+/// `fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders` pins.
+#[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
+fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran() {
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["true"]);
     cmd.contain_with(ContainMode::TreeWalk);
     let child = cmd.spawn().expect("spawn");
-    let pid = child.pid();
     child.wait().expect("reap the root");
 
     let mark = crate::log_capture::mark();
@@ -280,17 +292,13 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pi
         Vec::<u32>::new(),
         "a reaped root's number names no tree"
     );
-    let warns = drop_warns_since(mark);
+    let warns = drop_walk_warns_since(mark);
     assert_eq!(warns.len(), 1, "exactly one warn, got {warns:?}");
     let (level, text) = &warns[0];
     assert_eq!(*level, log::Level::Warn);
     assert!(
-        text.contains(&format!("root pid {pid}")),
-        "the warn names the root: {text}"
-    );
-    assert!(
-        text.contains("kill_tree()"),
-        "the warn says how to end descendants: {text}"
+        text.contains("no walk ran and nothing was killed"),
+        "the warn says no walk ran: {text}"
     );
 }
 
@@ -315,6 +323,34 @@ fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     let walked = walks.walked();
     assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
     assert_eq!(drop_warns_since(mark), []);
+    blocker.assert_killed();
+}
+
+/// Linux: a `TreeWalk` root whose handle cannot say whether it is reaped is walked and killed by the
+/// drop all the same: the walk proves its root itself, so the unanswered state skips nothing. Mutant:
+/// the walk is skipped on `Unknown` (off macOS), as the group mechanisms skip a number they cannot
+/// trust.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn dropping_a_tree_walk_child_whose_handle_cannot_say_still_walks_from_its_pid() {
+    crate::log_capture::install();
+    let walks = record_walks();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.contain_with(ContainMode::TreeWalk);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let blocker = release_at_drop_kill(child.stdin().expect("stdin pipe"));
+    let pid = child.pid();
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+
+    drop(child);
+
+    fake.assert_peeks_exhausted();
+    let walked = walks.walked();
+    assert!(!walked.is_empty() && walked.iter().all(|w| *w == pid), "{walked:?}");
     blocker.assert_killed();
 }
 
@@ -562,7 +598,7 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     let mark = crate::log_capture::mark();
     drop(child);
 
-    let records = drop_warns_since(mark);
+    let records = drop_walk_warns_since(mark);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn);
 }
@@ -662,9 +698,9 @@ fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
 }
 
 /// A walk that saw the root running and left it, whose backstop then killed it, is `Ok` for the
-/// caller but leaves the tree unvouched (the root may have forked first), so the drop's skip warns
-/// that the tree could not be vouched for, and speaks of no members. Mutant: the tree is marked
-/// killed.
+/// caller but leaves the tree unvouched (the root may have forked first). The drop walks as a tree
+/// call does and finds no root, so it warns that the tree could not be walked from the gone root and
+/// what it forked is unknown, and speaks of no members. Mutant: the tree is marked killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree() {
@@ -678,16 +714,16 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unv
     let mark = crate::log_capture::mark();
     drop(child);
 
-    let warns = drop_warns_since(mark);
+    let warns = drop_walk_warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert_eq!(warns[0].0, log::Level::Warn, "{warns:?}");
-    assert!(warns[0].1.contains("could not be vouched for"), "{warns:?}");
+    assert!(warns[0].1.contains("what it forked is unknown"), "{warns:?}");
     assert!(!warns[0].1.contains("members"), "{warns:?}");
 }
 
 /// A `kill_tree` on a `TreeWalk` whose root this handle reaped finds no root to walk from, so it kills
-/// nothing: it is `Unassessable`, and does not mark the tree killed, so the drop still says it skips
-/// the walk, as it would without the call.
+/// nothing: it is `Unassessable`, and does not mark the tree killed, so the drop still warns that no
+/// walk ran, as it would without the call.
 ///
 /// Mutants: a walk that found no root counts as a kill that ran; it answers `Ok`.
 #[cfg(target_os = "linux")]
@@ -706,7 +742,7 @@ fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_ma
     assert!(!child.tree_killed.is_set(), "a walk that found no root killed nothing");
     let mark = crate::log_capture::mark();
     drop(child);
-    let records = drop_warns_since(mark);
+    let records = drop_walk_warns_since(mark);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, log::Level::Warn, "{records:?}");
 }
@@ -951,22 +987,22 @@ fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
     (pid, child)
 }
 
-/// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs.
-/// Mutant: the walk or the root kill still run for it.
+/// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs, and
+/// that sweep is the whole answer, as for a tree call: it has no group to skip, so the drop warns of
+/// nothing.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
     crate::log_capture::install();
     let walks = record_walks();
-    let (pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
+    let (_pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
 
     let mark = crate::log_capture::mark();
     drop(child);
 
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no ppid walk from the reaped root");
     let warns = drop_warns_since(mark);
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains(&format!("root pid {pid}")), "{warns:?}");
+    assert_eq!(warns, Vec::new(), "the holders' sweep is the whole answer");
 }
 
 /// The same with a group: no `killpg`, no walk, one warn. Mutant: the walk still runs for a marker

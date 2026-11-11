@@ -1,5 +1,4 @@
-//! A [`Root`] that answers from stated facts: a pid, a [`RootState`] and, on Linux, a pidfd. For a
-//! test that sends to a group it owns, or that needs a root whose answer it chooses.
+//! A [`Root`] answering from stated facts (pid, [`RootState`], Linux pidfd).
 
 use crate::containment::Root;
 use crate::signal::RootState;
@@ -13,12 +12,11 @@ pub(crate) struct StatedRoot<'a> {
 }
 
 impl<'a> StatedRoot<'a> {
-    /// An unreaped root, with no pidfd: every send by its number is allowed.
+    /// An unreaped root, with no pidfd.
     pub(crate) fn unreaped() -> StatedRoot<'a> {
         StatedRoot::with_state(std::process::id(), || RootState::Unreaped)
     }
 
-    /// A root with pid `pid`, whose state is `state()`, with no pidfd.
     pub(crate) fn with_state(pid: u32, state: impl Fn() -> RootState + 'a) -> StatedRoot<'a> {
         StatedRoot {
             pid,
@@ -28,7 +26,6 @@ impl<'a> StatedRoot<'a> {
         }
     }
 
-    /// This root, with `pidfd` as its pidfd.
     #[cfg(target_os = "linux")]
     pub(crate) fn with_pidfd(mut self, pidfd: std::os::fd::BorrowedFd<'a>) -> StatedRoot<'a> {
         self.pidfd = Some(pidfd);

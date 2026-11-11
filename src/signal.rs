@@ -121,8 +121,8 @@ pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
 }
 
 /// Refuse `op` if [`is_unpinned`], so the lone `kill` and `terminate` send no signal by number to a
-/// pid launchd may reap and reuse. The tree paths do not refuse outright: see
-/// [`root_number`](crate::child::tree_call::root_number).
+/// pid launchd may reap and reuse. The tree paths do not refuse outright: each mechanism that names
+/// its tree by the root's number sends what it still may and says what it skipped.
 #[cfg(unix)]
 pub(crate) fn refuse_unpinned(
     pid: u32,
@@ -140,7 +140,7 @@ pub(crate) fn refuse_unpinned(
 }
 
 /// Why `state` leaves the root's number untrusted, for a message.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn why_untrusted(state: &RootState) -> String {
     match state {
         RootState::Unpinned => format!("the root is not pinned by this process (RootState::Unpinned: {UNPINNED_WHY})"),
@@ -162,6 +162,17 @@ impl RootState {
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => RootState::Unpinned,
             Ok(PeekOutcome::Foreign(_)) => RootState::Reaped { own: false },
             Err(e) => RootState::Unknown(e),
+        }
+    }
+
+    /// The same answer, for a second reader of one look: an `Unknown`'s error keeps its kind and its
+    /// text, not its source.
+    pub(crate) fn duplicate(&self) -> RootState {
+        match self {
+            RootState::Unreaped => RootState::Unreaped,
+            RootState::Reaped { own } => RootState::Reaped { own: *own },
+            RootState::Unknown(e) => RootState::Unknown(io::Error::new(e.kind(), e.to_string())),
+            RootState::Unpinned => RootState::Unpinned,
         }
     }
 }

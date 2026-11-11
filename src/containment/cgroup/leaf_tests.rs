@@ -666,7 +666,10 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 
     let attached = crate::containment::Attached::Cgroup(leaf);
     assert!(
-        attached.terminate(0, None).is_ok(),
+        matches!(
+            attached.terminate(0, None),
+            crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }
+        ),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
     assert!(attached.hard_kill(None).into_result().is_ok());

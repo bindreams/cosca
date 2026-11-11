@@ -848,3 +848,47 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
 
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }
+
+/// A walk guards itself by proving its root still holds its pid, so off macOS `kill_tree` and
+/// `terminate_tree` walk whatever the root's state says; on macOS they skip a root the handle cannot
+/// vouch for (`Unpinned`, `Unknown`) and walk the rest. The root here holds no such pid, so a walk
+/// that ran finds no root and kills nothing.
+///
+/// Mutant: `skipped_walk` skips on `Unknown` or `Reaped` off macOS.
+#[cfg(unix)]
+#[skuld::test]
+fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::TerminateOutcome;
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
+
+    /// A state, and whether macOS cannot vouch for a root in it.
+    type Case = (&'static str, fn() -> RootState, bool);
+    let states: [Case; 5] = [
+        ("unreaped", || RootState::Unreaped, false),
+        ("reaped, own", || RootState::Reaped { own: true }, false),
+        ("reaped elsewhere", || RootState::Reaped { own: false }, false),
+        ("unknown", || RootState::Unknown(std::io::Error::other("forced")), true),
+        ("unpinned", || RootState::Unpinned, true),
+    ];
+    for (name, state, untrusted) in states {
+        let skipped = untrusted && cfg!(target_os = "macos");
+        let root = StatedRoot::with_state(ROOT_PID, state);
+        let killed = super::kill_tree(self::root(), Some(&root));
+        assert_eq!(
+            matches!(killed, TreeKillOutcome::Skipped(_)),
+            skipped,
+            "kill, {name}: {killed:?}"
+        );
+        if !skipped {
+            assert!(matches!(killed, TreeKillOutcome::NoRoot), "kill, {name}: {killed:?}");
+        }
+        let termed = super::terminate_tree(self::root(), Some(&root));
+        assert_eq!(
+            matches!(termed, TerminateOutcome::End(_)),
+            skipped,
+            "terminate, {name}: {termed:?}"
+        );
+    }
+}
