@@ -9,8 +9,8 @@ use crate::error::Error;
 
 /// A duplicate of a job handle, for the one wait that outlives its borrow of the `JobHandle`: the
 /// async drain's blocking thread, which `spawn_blocking` does not join when its future is dropped.
-/// Closing a job handle only fires `KILL_ON_JOB_CLOSE` if it is the LAST open handle to that job
-/// (Win32 semantics); `JobHandle`'s own is unaffected.
+/// Closing it does not fire `KILL_ON_JOB_CLOSE`: that needs the last handle, and `JobHandle`
+/// still holds its own.
 pub(super) struct OwnedJobDup(HANDLE);
 
 impl OwnedJobDup {

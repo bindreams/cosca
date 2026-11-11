@@ -82,8 +82,12 @@ fn wait_tree_reports_members_remain_then_all_exited() {
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
-/// `kill_tree` keeps the job handle, so `wait_tree` after it waits for the members to exit and
-/// reports the drain.
+/// `wait_tree` after `kill_tree` waits for the members to exit and reports the drain. A member
+/// assigned after the kill is alive when the wait starts and exits only once the wait has blocked
+/// and re-armed, so the verdict comes after its exit, not before.
+///
+/// Mutant: report `AllMembersExited` without waiting for the live members -> no re-arm, and the
+/// member is still alive at the verdict.
 #[skuld::test]
 fn wait_tree_after_kill_tree_waits_for_the_members_and_returns() {
     let mut child = spawn_blocker();
@@ -92,10 +96,28 @@ fn wait_tree_after_kill_tree_waits_for_the_members_and_returns() {
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
 
     job.kill_tree().expect("kill_tree");
+    let mut late = spawn_blocker();
+    job.0.assign_for_test(late.as_raw_handle());
+    let stdin = late.stdin.take().expect("piped stdin");
+    crate::wait::wait_ms_probe::take();
+    let _clamp = crate::wait::wait_clamp_seam::set(5);
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the member exits for real
 
-    let verdict = job.wait_tree().expect("wait_tree after kill_tree");
-    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    let verdict = job.wait_tree_timeout(std::time::Duration::from_secs(3600));
+    let arms = crate::wait::wait_ms_probe::take();
+    let exited = late.try_wait().expect("poll the late member");
     _ = child.wait();
+    late.wait().expect("reap the late member");
+    assert_eq!(
+        verdict.expect("wait_tree after kill_tree"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+    assert!(
+        arms.len() >= 2,
+        "the wait must have blocked and re-armed: {} arm(s)",
+        arms.len()
+    );
+    assert!(exited.is_some(), "the verdict came before the member exited");
 }
 
 #[skuld::test]
@@ -120,7 +142,7 @@ fn job_is_send_and_sync() {
     assert_send_sync::<Job>();
 }
 
-/// `kill_tree` keeps the job handle, so `disarm` after it really clears `KILL_ON_JOB_CLOSE`.
+/// `disarm` after `kill_tree` really clears `KILL_ON_JOB_CLOSE`.
 #[skuld::test]
 fn disarm_after_kill_tree_clears_kill_on_job_close() {
     let mut child = spawn_blocker();

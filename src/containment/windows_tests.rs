@@ -1,6 +1,8 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
+use std::os::windows::io::AsRawHandle;
+
 use crate::test_child::Console;
 
 #[skuld::test]
@@ -11,8 +13,8 @@ fn job_handle_debug_does_not_panic() {
     assert!(s.contains("JobHandle"), "debug output: {s}");
 }
 
-/// `hard_kill` keeps the handle, so a `wait_drained` after it asks the kernel and reports the
-/// drain once the held member has exited.
+/// `wait_drained` after `hard_kill` asks the kernel and reports the drain once the killed member
+/// has exited.
 #[skuld::test]
 fn wait_drained_after_hard_kill_reports_the_drain() {
     let (mut child, job) = spawn_job_member();
@@ -21,6 +23,40 @@ fn wait_drained_after_hard_kill_reports_the_drain() {
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     let status = child.wait().expect("reap the killed member");
     assert!(!status.success(), "the member was killed: {status:?}");
+}
+
+/// `wait_drained` after `hard_kill` really waits: a member assigned after the kill is alive when
+/// the wait starts and exits only once the wait has blocked and re-armed, so the verdict comes
+/// after its exit, not before.
+///
+/// Mutant: report `AllMembersExited` without waiting for the live members -> no re-arm, and the
+/// member is still alive at the verdict.
+#[skuld::test]
+fn wait_drained_after_hard_kill_waits_for_a_live_member() {
+    use std::time::{Duration, Instant};
+    let (mut killed, job) = spawn_job_member();
+    job.hard_kill().expect("hard_kill on a live job");
+    let mut late = spawn_blocker();
+    job.assign_for_test(late.as_raw_handle());
+    let stdin = late.stdin.take().expect("piped stdin");
+    crate::wait::wait_ms_probe::take();
+    let _clamp = crate::wait::wait_clamp_seam::set(5);
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> the member exits for real
+    let verdict = job.wait_drained(Some(Instant::now() + Duration::from_secs(3600)), None);
+    let arms = crate::wait::wait_ms_probe::take();
+    let exited = late.try_wait().expect("poll the late member");
+    killed.wait().expect("reap the killed member");
+    late.wait().expect("reap the late member");
+    assert_eq!(
+        verdict.expect("wait_drained after hard_kill"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+    assert!(
+        arms.len() >= 2,
+        "the wait must have blocked and re-armed: {} arm(s)",
+        arms.len()
+    );
+    assert!(exited.is_some(), "the verdict came before the member exited");
 }
 
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
@@ -98,18 +134,22 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 // Deadline contract for `wait_drained_raw`: never report `MembersRemain` before the real
 // deadline. Seams are documented in `crate::wait`.
 
-/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
-/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
-fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
-    use std::os::windows::io::AsRawHandle;
-    let child = crate::test_spawn::spawn(
+/// `cmd /C more`, blocked reading its own piped stdin until EOF.
+fn spawn_blocker() -> std::process::Child {
+    crate::test_spawn::spawn(
         std::process::Command::new("cmd")
             .args(["/C", "more"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .expect("spawn cmd /C more");
+    .expect("spawn cmd /C more")
+}
+
+/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
+/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
+fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
+    let child = spawn_blocker();
     let raw = child.as_raw_handle();
     let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
     (child, job)
@@ -1342,10 +1382,9 @@ fn disarm_of_an_empty_job_is_ok() {
         .expect("a job made by the crate can be disarmed");
 }
 
-/// `hard_kill` keeps the handle, so a `disarm` after it clears `KILL_ON_JOB_CLOSE`: the flag the
-/// real create path sets.
+/// A `disarm` after `hard_kill` clears `KILL_ON_JOB_CLOSE`: the flag the real create path sets.
 ///
-/// Mutant: `disarm` does nothing -> the flag is still set.
+/// Mutant: `disarm` does nothing.
 #[skuld::test]
 fn disarm_after_hard_kill_clears_the_flag() {
     let (child, job) = spawn_job_member();

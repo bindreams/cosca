@@ -33,10 +33,9 @@ use windows::Win32::System::Threading::{
 /// through a real kernel primitive, not just the immediate child. If it trips, `wait_for` kills the
 /// whole tree, then waits (unboundedly) on the child's OWN process handle for that kill to land, and
 /// only then reports that the tree did not finish; it never silently continues. On that kill/timeout
-/// fallback path, `kill_tree` then `wait_tree` confirm the whole tree (only when `kill_tree` itself
-/// fails is just the immediate child confirmed); on the (common) success path, the whole tree, not
-/// just the immediate child, is confirmed exited before `wait_for` returns, so it is safe for the
-/// caller to touch any file or account any member of the tree might otherwise still hold open.
+/// fallback path the whole tree is confirmed too, unless `kill_tree` or `wait_tree` fails: then
+/// only the immediate child is (see `kill_and_reap`). On success the whole tree is confirmed
+/// exited, so callers may touch files or accounts any member held open.
 ///
 /// A grandchild `[spawn_attempts_with]` spawns is a member of THIS job only if ordinary Windows job
 /// inheritance already carried it into whatever job its own creator belongs to, before
@@ -592,7 +591,7 @@ fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<
             "wait_after_kill={waited:?}. This confirms only the immediate child is gone, never the rest of the tree"
         )
     } else {
-        // `kill_tree` keeps the job handle, so the whole tree can be waited on.
+        // The whole tree can be waited on.
         match job.wait_tree() {
             Ok(drain) => format!("wait_tree={drain:?}"),
             Err(wait_err) => {

@@ -68,10 +68,7 @@ impl Job {
     /// The kernel documents that termination of every member is initiated before
     /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
     /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits for the members
-    /// to exit. The kill terminates every member, including a child created while it runs
-    /// (measured on Windows 10.0.26100). A job accepts an explicit assignment after its kill, and
-    /// dropping the `Job` terminates such a process unless [`disarm`](Job::disarm) cleared
-    /// `KILL_ON_JOB_CLOSE`; cosca never makes one.
+    /// to exit. The kill terminates every member, including a child created while it runs.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.0.hard_kill().map_err(Error::Io)
     }
@@ -103,8 +100,7 @@ impl Job {
         self.wait_tree_deadline(crate::wait::deadline_from(timeout))
     }
 
-    /// Shared body of `wait_tree`/`wait_tree_timeout`. Borrows `self` for the whole wait, and
-    /// only `Drop` closes the handle.
+    /// Shared body of `wait_tree`/`wait_tree_timeout`.
     fn wait_tree_deadline(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
         self.0.wait_drained(deadline, None)
     }

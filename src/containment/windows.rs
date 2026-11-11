@@ -48,8 +48,7 @@ pub(crate) struct JobHandle {
 unsafe impl Send for JobHandle {}
 
 // SAFETY: `raw` is never written after construction, and the job operations are serialised by
-// the kernel. Required rather than incidental: `Job` is public, its methods take `&self`, and
-// callers may share it across threads.
+// the kernel.
 unsafe impl Sync for JobHandle {}
 
 impl std::fmt::Debug for JobHandle {
@@ -116,6 +115,13 @@ impl JobHandle {
         JobHandle::new(handle)
     }
 
+    /// Test-only: assign `process` to this job, which the OS accepts at any time, including after
+    /// [`hard_kill`](JobHandle::hard_kill): the one way a test gets a live member of a killed job.
+    pub(crate) fn assign_for_test(&self, process: std::os::windows::io::RawHandle) {
+        // SAFETY: `self.raw` is open while `self` is borrowed, and the caller keeps `process` open.
+        unsafe { AssignProcessToJobObject(self.raw, HANDLE(process.cast())) }.expect("AssignProcessToJobObject");
+    }
+
     /// Test-only: an empty job reached through a handle without `JOB_OBJECT_SET_ATTRIBUTES`, so the
     /// OS refuses `SetInformationJobObject` on it with `ERROR_ACCESS_DENIED`: a real refusal of
     /// `disarm`, which a handle the crate made itself never gives.
@@ -147,10 +153,8 @@ impl Drop for JobHandle {
     fn drop(&mut self) {
         // If `disarm` did not clear the flag, KILL_ON_JOB_CLOSE fires here when we close the
         // handle, tearing down the tree — the drop backstop for `kill_on_drop=true` semantics.
-        // `hard_kill` already terminates every member, including a child created during it
-        // (measured on Windows 10.0.26100: 0 of 1500 survived). The job still accepts an explicit
-        // assignment after its kill, and closing the handle would kill that process; cosca
-        // assigns only before it hands the job out, so it never makes one.
+        // `hard_kill` terminates every member, including a child created during it, so this close
+        // only reaps what an explicit post-kill assignment added; cosca makes none.
         // SAFETY: `self.raw` is a valid handle we own, closed only here.
         unsafe {
             if let Err(e) = CloseHandle(self.raw) {
@@ -840,11 +844,9 @@ impl JobHandle {
     /// pids and block on `WaitForMultipleObjects(bWaitAll = FALSE)`. A process handle becoming
     /// signaled on exit is an unconditional, always-honored OS guarantee — unlike a job message
     /// — so as long as this round's tree is non-empty, at least one tracked handle WILL
-    /// eventually signal, forcing a fresh re-enumeration next round. This can never falsely
-    /// report `AllMembersExited` (that verdict is only ever reached via a live re-count of
-    /// zero); it can only be slow to *notice* full drain when concurrently-live membership
-    /// exceeds `MAXIMUM_WAIT_OBJECTS - 1` in a single round (this round's un-tracked excess is
-    /// picked up on the NEXT re-enumeration, once a tracked handle signals). The handle stays
+    /// eventually signal, forcing a fresh re-enumeration next round. Never reports
+    /// `AllMembersExited` falsely (only a live re-count of zero does); with more than
+    /// `MAXIMUM_WAIT_OBJECTS - 1` live members it may notice the drain late. The handle stays
     /// open after [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
@@ -871,7 +873,6 @@ impl JobHandle {
         deadline: Option<std::time::Instant>,
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        // `&self` keeps the handle open for the whole wait: only `Drop` closes it.
         wait_drained_raw(self.handle(), deadline, cancel)
     }
 }
@@ -1635,19 +1636,16 @@ pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Re
 /// `IsProcessInJob` against that job handle (not "any job"). Membership is immutable once assigned,
 /// so it is deterministic for a handle-pinned child regardless of run state. Shared by the sync and
 /// async `Child::test_job_handle_contains_self` accessors (both compiled outside `cfg(test)` so
-/// integration crates can call them).
+/// integration crates can call them). Panics, naming the Win32 error, when `OpenProcess` or
+/// `IsProcessInJob` fails, so a failed query is not read as "not a member".
 pub(crate) fn job_contains_pid(job: &JobHandle, pid: u32) -> bool {
     use windows::Win32::System::JobObjects::IsProcessInJob;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
 
     // Open the child process by PID; the backend doesn't expose its handle.
     // SAFETY: standard Win32 call; the handle is closed below.
-    let process_handle = unsafe {
-        match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
-            Ok(h) => h,
-            Err(_) => return false,
-        }
-    };
+    let process_handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) }
+        .unwrap_or_else(|e| panic!("OpenProcess({pid}) failed: {e}"));
 
     let mut in_job = windows::core::BOOL(0);
     // SAFETY: both handles are valid for the duration of the call.
@@ -1656,7 +1654,8 @@ pub(crate) fn job_contains_pid(job: &JobHandle, pid: u32) -> bool {
     unsafe {
         _ = CloseHandle(process_handle);
     }
-    queried.is_ok() && in_job.as_bool()
+    queried.unwrap_or_else(|e| panic!("IsProcessInJob({pid}) failed: {e}"));
+    in_job.as_bool()
 }
 
 /// The limit flags `job` holds now.
