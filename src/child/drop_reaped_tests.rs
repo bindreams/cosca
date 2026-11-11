@@ -4,9 +4,8 @@
 //! process group instead (`drop_group_exact_tests`), so the tests here refuse that flag.
 //!
 //! The recorder tests replace `killpg` with a recorder (`unix::fault::record_kill_group`) and
-//! record the ppid walks (`treewalk::fault::record_walks`), so a mutant that still sends either
-//! never reaches an unrelated process. The behavioural tests use real groups of this test's own
-//! children, all signalled before their root is reaped.
+//! record the ppid walks (`treewalk::fault::record_walks`). The behavioural tests use real groups
+//! of this test's own children, all signalled before their root is reaped.
 
 use std::io::Read as _;
 
@@ -18,7 +17,8 @@ use crate::command::Command;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::cgroup;
+use crate::test_groups::{stray_signal, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 /// [`root_that_leaves_a_cat`]'s shell, with the `cat` in a shell that prints `eof` if the `cat`
@@ -111,7 +111,9 @@ fn drop_walk_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
 #[skuld::test]
-fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -154,7 +156,9 @@ fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_p
 ///
 /// Mutant: the shared text says "this drop", or the label is `Child::drop`.
 #[skuld::test]
-fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call_itself_a_drop() {
+fn tearing_down_a_waited_on_process_group_child_after_a_failed_run_does_not_call_itself_a_drop(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -247,9 +251,15 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let recorder = record_kill_group();
     let (child, mut pipes) = spawn_cat_tree();
     child.wait().expect("reap the root");
     drop(child);
+    assert_eq!(
+        recorder.killed(),
+        Vec::<i32>::new(),
+        "a reaped root's number may name another group: no killpg"
+    );
 
     crate::test_child::assert_echoes(&mut pipes.stdin, &mut pipes.stdout);
 
@@ -268,7 +278,9 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
 /// `fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders` pins.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran() {
+fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_that_no_walk_ran(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = crate::test_child::command(Console::Hidden);
@@ -362,7 +374,9 @@ fn waited_on_blocker_root() -> (u32, crate::Child) {
 /// process on the number would be needed to provoke a real `Unknown`, so the seam forces the read.
 /// Mutants: the own-reap flag is ignored; `wait()` does not set it.
 #[skuld::test]
-fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -410,7 +424,7 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
 
 /// A root reaped by someone else is seen through its number. Mutant: the identity read dropped.
 #[skuld::test]
-fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -441,7 +455,7 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 /// The skip is quiet once this handle has already hard-killed the tree: the warn's own remedy
 /// (`kill_tree()` then `wait()`) must not draw it. Mutant: the tree-killed flag is ignored.
 #[skuld::test]
-fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -465,7 +479,7 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// The root's stdin is released via `release_at` after `terminate_tree` returns; a `terminate_tree`
 /// that sent nothing yields status 0 and fails the status assertion.
 #[skuld::test]
-fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn(#[fixture(stray_signal)] _stray: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
@@ -496,7 +510,7 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 /// the root exits by itself. Mutants: `terminate_tree` sets the tree-killed flag; `terminate_tree`
 /// sends nothing.
 #[skuld::test]
-fn drop_after_terminate_tree_and_wait_still_warns() {
+fn drop_after_terminate_tree_and_wait_still_warns(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -554,7 +568,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
-fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+fn drop_after_a_failed_kill_tree_and_wait_still_warns(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -576,7 +590,7 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 /// on macOS, where `TreeWalk` mode is an fd marker (the test above).
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
+fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns(#[fixture(stray_signal)] _stray: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -603,7 +617,9 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
 /// Mutant: a walk that finds less settles the tree as killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_mark_the_tree() {
+fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_mark_the_tree(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
     let first = child.kill_tree().expect_err("the walk left a member");
@@ -627,7 +643,7 @@ fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_m
 /// Mutant: the drop's walk settles the tree as killed and warns nothing.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
+fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it(#[fixture(stray_signal)] _stray: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -649,7 +665,7 @@ fn a_drop_after_a_kill_tree_that_left_a_member_warns_of_it() {
 /// Mutant: the held members are retried only when the new kill ran.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
+fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left(#[fixture(stray_signal)] _stray: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
     let first = child.kill_tree().expect_err("the walk left a member");
@@ -674,7 +690,7 @@ fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left() {
 /// Mutant: the drop's reaped path does not retry the held members.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
+fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it(#[fixture(stray_signal)] _stray: &Group) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Descendant);
@@ -696,7 +712,9 @@ fn a_drop_after_a_kill_tree_that_left_a_member_and_a_wait_warns_of_it() {
 /// what it forked is unknown, and speaks of no members. Mutant: the tree is marked killed.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree() {
+fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unvouched_tree(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
@@ -721,7 +739,9 @@ fn drop_after_a_walk_that_left_only_the_root_and_a_backstop_kill_warns_of_an_unv
 /// Mutants: a walk that found no root counts as a kill that ran; it answers `Ok`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_mark_the_tree_killed() {
+fn kill_tree_on_a_tree_walk_whose_root_is_reaped_is_unassessable_and_does_not_mark_the_tree_killed(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker();
     drop(stdin);
@@ -800,7 +820,9 @@ fn a_drop_whose_walk_leaves_only_the_root_warns_it_could_not_vouch_for_the_tree(
 /// Mutant: the walk warns of every member it left, the root included, before the root's kill.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone() {
+fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descendant_alone(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
@@ -823,7 +845,9 @@ fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descenda
 /// drop: one report, of the descendant.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
-fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone() {
+fn a_drop_whose_walk_leaves_a_descendant_and_the_root_names_the_descendant_alone(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::RootAndDescendant);
@@ -985,7 +1009,7 @@ fn reaped_blocker_root(mode: ContainMode) -> (u32, crate::Child) {
 /// nothing.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
+fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders(#[fixture(stray_signal)] _stray: &Group) {
     crate::log_capture::install();
     let walks = record_walks();
     let (_pid, child) = reaped_blocker_root(ContainMode::TreeWalk);
@@ -1002,7 +1026,7 @@ fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
 /// that has a group.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() {
+fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks(#[fixture(stray_signal)] _stray: &Group) {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();

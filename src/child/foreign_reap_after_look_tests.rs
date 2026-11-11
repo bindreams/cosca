@@ -6,6 +6,7 @@
 use crate::graceful_hooks::{at, HookPoint};
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::Console;
+use crate::test_groups::{stray_signal, Group};
 
 /// A zombie root leading its own group (its fd marker suppressed on macOS): unreaped at the look.
 pub(crate) fn zombie_group_root() -> crate::Child {
@@ -66,7 +67,7 @@ pub(crate) fn assert_reaped_elsewhere(err: &crate::error::Error) {
 }
 
 #[skuld::test]
-fn kill_tree_checks_the_root_again_before_a_send_by_number() {
+fn kill_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
     let (steps, result) = reaped_after_the_look(child.pid(), || child.kill_tree());
     assert_nothing_by_number(&steps);
@@ -74,7 +75,7 @@ fn kill_tree_checks_the_root_again_before_a_send_by_number() {
 }
 
 #[skuld::test]
-fn terminate_tree_checks_the_root_again_before_a_send_by_number() {
+fn terminate_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
     let (steps, result) = reaped_after_the_look(child.pid(), || child.terminate_tree());
     assert_nothing_by_number(&steps);
@@ -83,7 +84,7 @@ fn terminate_tree_checks_the_root_again_before_a_send_by_number() {
 
 /// The `SIGTERM` is refused by its check; the sweep's own look then sees the reap.
 #[skuld::test]
-fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
+fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
     let (steps, result) =
         reaped_after_the_look(child.pid(), || child.graceful_shutdown_tree(std::time::Duration::ZERO));
@@ -92,14 +93,14 @@ fn graceful_shutdown_tree_checks_the_root_again_before_a_send_by_number() {
 }
 
 #[skuld::test]
-fn a_drop_checks_the_root_again_before_a_send_by_number() {
+fn a_drop_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
     let (steps, ()) = reaped_after_the_look(child.pid(), || drop(child));
     assert_nothing_by_number(&steps);
 }
 
 #[skuld::test]
-fn finish_elevated_checks_the_root_again_before_a_send_by_number() {
+fn finish_elevated_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
     let (steps, failed) = reaped_after_the_look(child.pid(), || {
         crate::child::spawn::finish_elevated(

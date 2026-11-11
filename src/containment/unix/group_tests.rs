@@ -4,6 +4,7 @@ use super::{members, state, GroupState, Member};
 #[cfg(target_os = "linux")]
 use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
 use crate::identity::{HostKernel, Liveness, ProcessId};
+use crate::test_groups::{stray_signal, Group};
 use nix::sys::signal::Signal;
 
 fn is_alive(m: &Member) -> bool {
@@ -302,7 +303,7 @@ fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
 /// **`reachable` is asked directly of the kernel, not derived from a hand-reconstructed
 /// permission rule.**
 #[skuld::test]
-fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable() {
+fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_signal)] _stray: &Group) {
     let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(1)))
         .expect("pid 1 has a process group")
         .as_raw();

@@ -11,6 +11,8 @@ use std::time::Duration;
 #[path = "common/mod.rs"]
 mod common;
 use common::spawn_blocker;
+#[cfg(unix)]
+use common::test_groups::stray_signal;
 
 #[skuld::test]
 fn foreign_wait_returns_when_the_process_exits() {
@@ -275,7 +277,9 @@ fn foreign_kill_terminates_the_process() {
 // `Ok`. The precondition keeps this off root, where the signal could land.
 #[cfg(unix)]
 #[skuld::test(requires = [common::unprivileged_with_root_init])]
-fn foreign_kill_of_a_root_process_surfaces_permission_denied() {
+fn foreign_kill_of_a_root_process_surfaces_permission_denied(
+    #[fixture(stray_signal)] _stray: &common::test_groups::Group,
+) {
     let init = cosca::Process::open_pid(1).expect("open").expect("running");
     assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must be alive");
     let r = init.kill();

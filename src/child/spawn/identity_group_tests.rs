@@ -162,8 +162,11 @@ fn kills_the_group(container: Container) {
 /// is only a `debug`".
 fn below_6_9_sends_nothing_to_the_group(container: Container) {
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let refused = crate::containment::unix::fault::refuse_group_sends();
+    let groups = crate::containment::unix::fault::record_kill_group();
     let failed = failed_spawn(container);
-    drop(old_kernel);
+    drop((old_kernel, refused));
+    assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
     assert!(
         failed
             .steps

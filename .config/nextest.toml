@@ -56,6 +56,12 @@ inherits = "ci"
 [profile.ci-tracer-release]
 inherits = "ci"
 
+[profile.ci-stray-signal]
+inherits = "ci"
+
+[profile.ci-stray-signal-release]
+inherits = "ci"
+
 [profile.ci-cgroup]
 inherits = "ci"
 

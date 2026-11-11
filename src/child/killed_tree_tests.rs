@@ -9,6 +9,7 @@ use crate::containment::unix::fault::{record_kill_group, KillGroupRecorder};
 use crate::identity::Resolved;
 use crate::log_capture::warns_since;
 use crate::test_child::reaped_elsewhere::{kill_own_child, session_cat};
+use crate::test_groups::{stray_signal, Group};
 
 /// A session child whose root this handle reaped, with its pid reading as naming no process, and the
 /// guards that keep that so.
@@ -55,7 +56,7 @@ fn reaped_reading(kill_tree_first: bool, read: Resolved<crate::identity::Process
 }
 
 #[skuld::test]
-fn kill_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
+fn kill_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing(#[fixture(stray_signal)] _stray: &Group) {
     let setup = reaped(true);
     let sent_before = setup.killed.killed().len();
     let mark = crate::log_capture::mark();
@@ -73,7 +74,9 @@ fn kill_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
 /// A pid that cannot be read after the own reap is skipped like one that names no process, so a tree
 /// the handle killed has nothing left for the skip to leave undone.
 #[skuld::test]
-fn kill_tree_after_a_kill_tree_and_the_own_reap_with_an_unreadable_pid_is_ok_and_warns_nothing() {
+fn kill_tree_after_a_kill_tree_and_the_own_reap_with_an_unreadable_pid_is_ok_and_warns_nothing(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     let setup = reaped_reading(true, Resolved::Unknown);
     let sent_before = setup.killed.killed().len();
     let mark = crate::log_capture::mark();
@@ -93,7 +96,7 @@ fn kill_tree_after_a_kill_tree_and_the_own_reap_with_an_unreadable_pid_is_ok_and
 ///
 /// Mutant: a skip is moot whatever reaped the root.
 #[skuld::test]
-fn kill_tree_after_a_kill_tree_and_a_foreign_reap_still_skips_and_warns() {
+fn kill_tree_after_a_kill_tree_and_a_foreign_reap_still_skips_and_warns(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
@@ -117,7 +120,7 @@ fn kill_tree_after_a_kill_tree_and_a_foreign_reap_still_skips_and_warns() {
 }
 
 #[skuld::test]
-fn terminate_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
+fn terminate_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing(#[fixture(stray_signal)] _stray: &Group) {
     let setup = reaped(true);
     let mark = crate::log_capture::mark();
 
@@ -127,7 +130,9 @@ fn terminate_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
 }
 
 #[skuld::test]
-fn graceful_shutdown_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing() {
+fn graceful_shutdown_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_nothing(
+    #[fixture(stray_signal)] _stray: &Group,
+) {
     let setup = reaped(true);
     let mark = crate::log_capture::mark();
 
@@ -142,7 +147,7 @@ fn graceful_shutdown_tree_after_a_kill_tree_and_the_own_reap_is_ok_and_warns_not
 /// A kill that skipped what the pid names is not a kill: the tree stays unkilled, so the drop that
 /// follows warns of it, once.
 #[skuld::test]
-fn a_skipped_kill_tree_leaves_the_tree_unkilled_so_the_drop_warns_once() {
+fn a_skipped_kill_tree_leaves_the_tree_unkilled_so_the_drop_warns_once(#[fixture(stray_signal)] _stray: &Group) {
     let setup = reaped(false);
     setup
         .child
@@ -163,7 +168,7 @@ fn a_skipped_kill_tree_leaves_the_tree_unkilled_so_the_drop_warns_once() {
 /// A cooperative signal is not a kill: a `terminate_tree` that skipped what the pid names does not
 /// mark the tree killed, so `kill_tree` still skips and says so, and the drop still warns.
 #[skuld::test]
-fn terminate_tree_after_the_own_reap_does_not_mark_the_tree_killed() {
+fn terminate_tree_after_the_own_reap_does_not_mark_the_tree_killed(#[fixture(stray_signal)] _stray: &Group) {
     let setup = reaped(false);
     setup
         .child

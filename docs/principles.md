@@ -301,7 +301,8 @@ child got asks for that mechanism and asserts it. The ways to ask: `contain_with
 on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `cgroup` fixture
 (`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests` (`ProcessGroup`,
 in-crate tests only). The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
-promotes every contained request to `FdMarker`.
+promotes every contained request to `FdMarker`. A consent group that gates a risk (principle 10)
+names the risk.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row
@@ -320,13 +321,12 @@ Any other test setting (a path, a knob, an internal marker) is `COSCA_TESTCFG_<N
 
 ## 10. System-affecting tests run in a sandbox
 
-Tests that touch real system state run in a container, VM or CI, never on a developer's host:
-cgroups, Job Objects, elevation, process-group and session signals, `kqueue` or `waitpid` teardown
-of trees, signals to processes the test didn't spawn, and anything under `sudo`. The only exemption
-is a test that spawns this repo's own short-lived children and signals them only through the `Child`
-handle cosca returned for each, before that handle reaps the child, never by process group, session
-or a PID the test computed. On Unix that kill reaches `kill(2)` by number, which is safe while the
-child is unreaped.
+A test runs in a throwaway VM or container, on CI, or with the owner's consent, when either holds:
+
+1. A destructive outcome is possible: some way the test can end could leave the machine harmed.
+2. It does a visible operation on shared resources.
+
+If neither holds, it runs normally on a developer's machine.
 
 Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
 host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
@@ -364,10 +364,10 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
 CI turns each off workflow-wide and opts in only in the step or job that runs it.
 
-**Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
-correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
-4](#4-dont-act-on-a-bare-pid-after-it-may-be-reused)). Principle 9 turns every group on by default,
-so a bare test run would touch real system state without a second, explicit opt-in.
+**Why:** a test that can end in a destructive outcome, or does a visible operation on shared
+resources, harms or disturbs whatever machine it runs on when it goes wrong, so the sandbox, not the
+test's correctness, has to be what protects it. Principle 9 turns every group on by default, so a bare
+test run would reach real system state without a second, explicit opt-in.
 
 **Applies to:** all tests. CI's cgroup lane runs in a fresh cgroup on a throwaway runner
 ([`ci.yaml`](../.github/workflows/ci.yaml)).

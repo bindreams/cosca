@@ -43,6 +43,8 @@ env:
   COSCA_TEST_SHELL_EXECUTE: "0"
   COSCA_TEST_SHELL_PROBES: "0"
   COSCA_TEST_ELEVATION_ROUTES: "0"
+  # The stray-signal tests may signal an unrelated process; only the stray-signal step of the test job runs them.
+  COSCA_TEST_STRAY_SIGNAL: "0"
 
 jobs:
   lint:
@@ -250,6 +252,17 @@ jobs:
           SKULD_LABELS: tracer
         run: ${{ matrix.nextest }} tracer cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
 
+      # Only the Unix lanes have such tests. `binary(cosca)` and `binary(=process)` are the skuld binaries that
+      # hold them; libtest binaries ignore `SKULD_LABELS`.
+      - name: Run the stray-signal tests (Unix)
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 10
+        env:
+          COSCA_TEST_STRAY_SIGNAL: "1"
+          COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
+          SKULD_LABELS: stray_signal
+        run: ${{ matrix.nextest }} stray-signal cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(=process)'
+
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Build tests (serde feature)
@@ -330,6 +343,16 @@ jobs:
           COSCA_TEST_TRACER_CONSENT: "1"
           SKULD_LABELS: tracer
         run: ${{ matrix.nextest }} tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
+
+      # The stray-signal tests with `debug_assertions` off too.
+      - name: Run the stray-signal tests (release — debug_assertions off)
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 10
+        env:
+          COSCA_TEST_STRAY_SIGNAL: "1"
+          COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
+          SKULD_LABELS: stray_signal
+        run: ${{ matrix.nextest }} stray-signal-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
 
 
       # Platform hooks (the Lint job skips them), clippy: `#[cfg(windows)]` and `cfg(target_os = "macos")` code is type-checked
