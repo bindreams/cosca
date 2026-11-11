@@ -128,9 +128,10 @@ In order:
 3. **Containment mechanisms:** a `Child` holds a `Tree`: none, delegated, or contained by one
    `Mechanism` (a cgroup leaf, a Job Object, a process group, an fd marker, a tree walk), which a
    caller drives through the `Contains` trait (send a kill or a terminate, its drain edge, disarm,
-   would a kill reach a pid, did it reach the child, release) and never asks which it is, but for one asker: `Tree::settling`
-   asks whether the mechanism is a walk, for the settlement of its held members; slice 2 moves that
-   into the walk's kill outcome. The per-OS async drivers of the drain waits live in the drain edge
+   would a kill reach a pid, did it reach the child, release) and never asks which it is, but for two
+   askers, both moved by slice 2: `Tree::settling` asks whether the mechanism is a walk, for the
+   settlement of its held members (into the walk's kill outcome), and the Linux awaited teardown's
+   `Tree::step_leaf_and_await_drain` asks whether it is a cgroup leaf. The per-OS async drivers of the drain waits live in the drain edge
    (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
