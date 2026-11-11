@@ -274,7 +274,7 @@ signal dispositions) runs in its own re-exec'd process (`alone()` in
 [`test_support.rs`](../src/containment/cgroup/test_support.rs), `run_fixture_with_cwd()` in
 [`src/test_child.rs`](../src/test_child.rs)), and asserts that it does
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
-an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
+an environment variable.
 
 `#[ignore]` marks only a specific, temporary regression on `main`: the owner (a human) accepts the
 known failure and disables that one test until it's fixed. Never for a group.
@@ -425,6 +425,5 @@ stacked fix PR that resolves it.
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#207]: https://github.com/bindreams/cosca/pull/207
 [#210]: https://github.com/bindreams/cosca/pull/210
-[#223]: https://github.com/bindreams/cosca/issues/223
 [#240]: https://github.com/bindreams/cosca/pull/240
 [#242]: https://github.com/bindreams/cosca/issues/242
