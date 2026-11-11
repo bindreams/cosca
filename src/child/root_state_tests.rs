@@ -264,15 +264,12 @@ mod linux {
             &child.tree_killed,
         );
         fake.assert_peeks_exhausted();
-        assert!(
-            matches!(view.root, crate::containment::dispatch::RootView::Unknown(_)),
-            "{:?}",
-            view.root
-        );
+        assert!(matches!(view.root, RootState::Unknown(_)), "{:?}", view.root);
 
-        let kill = child
-            .attached
-            .hard_kill_for_drop(&view, Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
+        let unsure = crate::test_support::stated_root::StatedRoot::with_state(child.pid(), || {
+            crate::signal::RootState::Unknown(std::io::Error::other("forced peek failure"))
+        });
+        let kill = child.attached.hard_kill(Some(&unsure));
         assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
         child
             .attached

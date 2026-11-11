@@ -5,13 +5,12 @@
 //! [`DropReport`] composes all of it into a single `warn`, or none when nothing is worth one.
 
 use crate::child::owned::teardown::{Remains, TeardownOutcome};
-use crate::containment::dispatch::RootView;
 use crate::containment::DropView;
+use crate::signal::RootState;
 
 /// The remedy for descendants that outlive a root this handle has reaped, in a drop's warn and in a
 /// tree call's error.
-pub(crate) const END_THEM_BEFORE_WAIT: &str =
-    "call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)";
+pub(crate) const END_THEM_BEFORE_WAIT: &str = "call kill_tree() before wait() to end them";
 
 /// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
 /// event reported from something new.
@@ -102,12 +101,12 @@ impl<'a> DropReport<'a> {
                     ));
                 }
             }
-            if matches!(self.view.root, RootView::Unpinned) {
+            if matches!(self.view.root, RootState::Unpinned) {
                 state.push_str("; the root itself is neither signalled nor waited on");
             }
             parts.push((PartKey::Described, state));
         }
-        if let (RootView::Reaped, Some(action)) = (&self.view.root, &self.skipped) {
+        if let (RootState::Reaped { .. }, Some(action)) = (&self.view.root, &self.skipped) {
             let this = self.view.caller.this_event();
             parts.push((
                 PartKey::Described,
@@ -128,15 +127,15 @@ impl<'a> DropReport<'a> {
     /// The root's state, when it is worth a warn: unsettled.
     fn state_text(&self, pid: u32) -> Option<String> {
         match &self.view.root {
-            RootView::Unpinned => Some(format!(
+            RootState::Unpinned => Some(format!(
                 "RootState::Unpinned: the root ({pid}) is not pinned by this process ({})",
                 crate::signal::UNPINNED_WHY
             )),
-            RootView::Unknown(e) => Some(format!(
+            RootState::Unknown(e) => Some(format!(
                 "RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({})",
                 crate::error::Report(e)
             )),
-            RootView::Reaped | RootView::Trusted => None,
+            RootState::Reaped { .. } | RootState::Unreaped => None,
         }
     }
 }

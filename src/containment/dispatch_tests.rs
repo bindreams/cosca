@@ -8,6 +8,17 @@ use crate::test_groups::setuid;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
+/// A kill that skipped `action`, with the sweep of its marker holders, if it made one, ended as
+/// `holders`.
+fn skipped_kill(action: &str, holders: Option<Result<(), crate::error::Error>>) -> super::TreeKillOutcome {
+    super::TreeKillOutcome::Skipped(crate::containment::Skip {
+        action: action.into(),
+        why: crate::containment::skip::Why::MayNameAnother(crate::containment::root::Refusal::ReapedElsewhere(1)),
+        root_alone: false,
+        holders,
+    })
+}
+
 /// A log line has every member left, each with its whole chain; the returned text has no chains.
 #[skuld::test]
 fn unsettled_logs_every_member_with_its_chain() {
@@ -107,31 +118,17 @@ fn attached_is_actionable() {
     assert!(Attached::JobObject(crate::containment::windows::JobHandle::create_empty_for_test()).is_actionable());
 }
 
-/// `kill_tree`/`terminate_tree`'s check of a reaped root (`child::tree_call::root_number`) gates on this
-/// predicate: a mechanism that reaches its tree through the root's number, with nothing of its own
-/// that checks the root first.
-#[cfg(unix)]
-#[skuld::test]
-fn attached_needs_root_check() {
-    use super::Attached;
-    assert!(!Attached::None.needs_root_check());
-    assert!(!Attached::Delegated.needs_root_check());
-    assert!(!Attached::TreeWalk(crate::identity::ProcessId::current()).needs_root_check());
-    assert!(Attached::ProcessGroup(0).needs_root_check());
-    #[cfg(target_os = "linux")]
-    assert!(!Attached::Cgroup(crate::containment::cgroup::CgroupLeaf::placeholder_for_test()).needs_root_check());
-}
-
-/// The macOS half of `attached_needs_root_check`: an `FdMarker` needs the check with or without a
-/// pgid, since every sweep walks from the root's pid.
-///
-/// Mutant: the check gated on the marker's pgid.
+/// A marker with no group has none to skip: once this handle reaped its root, and its pid names no
+/// process, its holders alone are the whole answer. A marker with a group skips what the pid names.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn attached_fd_marker_needs_root_check_with_or_without_a_pgid() {
+fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_alone() {
     use std::os::fd::{AsFd, AsRawFd};
 
-    use super::Attached;
+    use super::{Attached, TreeKillOutcome};
+    use crate::identity::Resolved;
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
 
     fn marker_with_pgid(pgid: Option<i32>) -> crate::containment::fdmarker::Marker {
         let (read, write) = std::io::pipe().expect("pipe");
@@ -150,8 +147,70 @@ fn attached_fd_marker_needs_root_check_with_or_without_a_pgid() {
         )
     }
 
-    assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).needs_root_check());
-    assert!(Attached::FdMarker(marker_with_pgid(None)).needs_root_check());
+    let reaped = || StatedRoot::with_state(1234, || RootState::Reaped { own: true });
+    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+    let ungrouped = Attached::FdMarker(marker_with_pgid(None)).hard_kill(Some(&reaped()));
+    assert!(matches!(ungrouped, TreeKillOutcome::Answered(Ok(()))), "{ungrouped:?}");
+    let grouped = Attached::FdMarker(marker_with_pgid(Some(1234))).hard_kill(Some(&reaped()));
+    assert!(matches!(grouped, TreeKillOutcome::Skipped(_)), "{grouped:?}");
+}
+
+/// macOS: a root launchd holds (`Unpinned`), or one its handle cannot answer for, skips what names
+/// the tree by the root's pid: a tree walk walks nothing, and a marker sweeps its holders alone, the
+/// root excepted when it is not pinned. A root its handle shows unreaped is killed as usual.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use super::{Attached, TreeKillOutcome};
+    use crate::containment::{TerminateOutcome, Why};
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
+
+    let walk = || Attached::TreeWalk(crate::identity::ProcessId::current());
+    let rooted = |state: fn() -> RootState| StatedRoot::with_state(1234, state);
+    let unpinned = || rooted(|| RootState::Unpinned);
+    let unknown = || rooted(|| RootState::Unknown(std::io::Error::other("a failed peek")));
+    for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
+        let killed = walk().hard_kill(Some(&root));
+        assert!(
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && skip.holders.is_none()),
+            "{name}: {killed:?}"
+        );
+        let termed = walk().terminate(1234, Some(&root));
+        assert!(matches!(termed, TerminateOutcome::End(_)), "{name}: {termed:?}");
+    }
+
+    let (read, write) = std::io::pipe().expect("pipe");
+    let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
+    let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
+    let prepared = crate::containment::fdmarker::PreparedMarker {
+        read: std::os::fd::OwnedFd::from(read),
+        handle,
+        read_handle,
+        fd: write.as_fd().as_raw_fd(),
+    };
+    let root_id = crate::containment::fdmarker::fdmarker_tests::inert_root();
+    let marker = Attached::FdMarker(crate::containment::fdmarker::Marker::new(prepared, root_id, Some(1234)));
+    for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
+        let killed = marker.hard_kill(Some(&root));
+        assert!(
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && matches!(skip.holders, Some(Ok(())))),
+            "{name}: {killed:?}"
+        );
+        let termed = marker.terminate(1234, Some(&root));
+        assert!(
+            matches!(
+                termed,
+                TerminateOutcome::Sent {
+                    result: Ok(()),
+                    earlier: Some("the SIGTERM")
+                }
+            ),
+            "{name}: {termed:?}"
+        );
+    }
 }
 
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested
@@ -403,18 +462,22 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
         root: root.map(left),
         resolved: Vec::new(),
     };
-    let skipped = |holders| TreeKillOutcome::Skipped {
-        action: "walk".into(),
-        holders,
-    };
+    let skipped = |holders| skipped_kill("walk", holders);
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
 
     // (outcome, root_ended, answer: Ok(outcome) or Err((first, others)), marked)
     type Answer = Result<SettleOutcome, (u32, Vec<u32>)>;
     let table: Vec<(TreeKillOutcome, bool, Answer, bool)> = vec![
         (TreeKillOutcome::Ran(Ok(())), false, Ok(SettleOutcome::Killed), true),
-        (skipped(Ok(())), true, Ok(SettleOutcome::Skipped), false),
-        (skipped(Err(unkilled(&[7], None))), true, Err((7, vec![])), false),
+        (skipped(Some(Ok(()))), true, Ok(SettleOutcome::Skipped), false),
+        (skipped(None), true, Ok(SettleOutcome::Skipped), false),
+        (skipped(Some(Err(left(7)))), true, Err((7, vec![])), false),
+        (
+            TreeKillOutcome::Answered(Ok(())),
+            false,
+            Ok(SettleOutcome::Killed),
+            true,
+        ),
         (
             TreeKillOutcome::Ran(Err(unkilled(&[], Some(1)))),
             false,
@@ -642,13 +705,7 @@ fn table_outcomes() -> [(&'static str, super::TreeKillOutcome); 5] {
                 source: None,
             }),
         ),
-        (
-            "Skipped",
-            TreeKillOutcome::Skipped {
-                action: "walk the process table".into(),
-                holders: Ok(()),
-            },
-        ),
+        ("Skipped", skipped_kill("walk the process table", None)),
     ]
 }
 
@@ -929,14 +986,7 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
         .settle(&killed, TreeKillOutcome::Ran(Ok(())), true)
         .expect("a complete kill");
     assert_eq!(standing(&killed), Standing::Killed);
-    let skipped_with_a_member = || TreeKillOutcome::Skipped {
-        action: "walk".into(),
-        holders: Err(Unkilled {
-            members: vec![member_left(9)],
-            root: None,
-            resolved: Vec::new(),
-        }),
-    };
+    let skipped_with_a_member = || skipped_kill("walk", Some(Err(member_left(9))));
     attached
         .settle(&killed, skipped_with_a_member(), true)
         .expect_err("a member was left");
@@ -1022,10 +1072,7 @@ fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
             source: None,
         })
     };
-    let skipped = || TreeKillOutcome::Skipped {
-        action: "walk the process table".into(),
-        holders: Ok(()),
-    };
+    let skipped = || skipped_kill("walk the process table", None);
     let outcomes: [(&str, &dyn Fn() -> TreeKillOutcome); 3] = [
         ("NoRoot", &|| TreeKillOutcome::NoRoot),
         ("Unwalked", &unwalked),
@@ -1248,10 +1295,7 @@ fn a_gone_root_over_a_member_that_exited_on_its_own_says_it_is_gone_each_time() 
 fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     use super::{Attached, TreeKillOutcome, TreeKilled, Unkilled};
     let attached = Attached::TreeWalk(crate::identity::ProcessId::current());
-    let skipped = || TreeKillOutcome::Skipped {
-        action: "walk the process table".into(),
-        holders: Ok(()),
-    };
+    let skipped = || skipped_kill("walk the process table", None);
 
     // Held members that the settlement found gone.
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);

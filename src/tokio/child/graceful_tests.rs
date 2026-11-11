@@ -3,6 +3,8 @@
 use std::time::Duration;
 
 use crate::test_child::Console;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 use crate::child::graceful::fault as term_fault;
 use crate::wait::fault;
@@ -612,11 +614,13 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     }
 }
 
-// Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root`; see there for the
-// fixture's rationale (`exited_through_handle`, like the sync wait, does not reap).
+// Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's
+// rationale (`exited_through_handle`, like the sync wait, does not reap) and for `mode` and `swept`.
 #[cfg(unix)]
-#[skuld::test(labels = [crate::test_harness::CGROUP])]
-async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
+async fn members_remain_still_reaps_an_already_exited_root(
+    mode: crate::ContainMode,
+    swept: impl FnOnce(&mut crate::tokio::Child),
+) {
     crate::tokio::test_runtime::assert_current_thread();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -629,7 +633,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
-    cmd.contain();
+    cmd.contain_with(mode);
     let mut child = cmd.spawn().expect("spawn");
     // Held for the test's whole body — see `child::graceful_tests`'s sync twin for why.
     let stdin = child.stdin().expect("piped stdin");
@@ -674,18 +678,8 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
         }
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
-    // call above reaped the root. A cgroup leaf is swept by its own handle. A group the pid no
-    // longer names is not signalled by that number (pidfd group signal refused: Linux below 6.9),
-    // so the cleanup is `Unassessable`.
-    #[cfg(target_os = "linux")]
-    let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    let swept = child.kill_tree();
-    if child.containment() == crate::containment::Containment::CgroupV2 {
-        swept.expect("the leaf is swept by its own handle");
-    } else {
-        let err = swept.expect_err("a reaped root's group is not signalled by its number");
-        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
-    }
+    // call above reaped the root.
+    swept(&mut child);
     // The descendant's stdin is released before the drain wait: it ends by itself when the sweep
     // sent nothing, and the wait cannot be left unbounded.
     drop(stdin);
@@ -693,6 +687,35 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     if drainable {
         child.wait_tree().await.expect("the swept tree drains");
     }
+}
+
+/// The leaf is swept by its own handle.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Strongest, |child| {
+        assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
+        child.kill_tree().expect("the leaf is swept by its own handle");
+    })
+    .await;
+}
+
+/// A reaped root's group is not signalled by its number.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
+    members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
+        // Below Linux 6.9 a group is signalled by its number alone.
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+        let err = child
+            .kill_tree()
+            .expect_err("a reaped root's group is not signalled by its number");
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+    })
+    .await;
 }
 
 // Async twin of `graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_returns_the_error`.

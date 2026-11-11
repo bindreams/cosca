@@ -252,3 +252,148 @@ fn term_group_on_an_all_zombie_group_is_ok() {
     let mut child = child;
     child.wait().expect("reap");
 }
+
+// What a group's kill and terminate decide on one look at the root -----
+
+mod group_kill_and_terminate {
+    use super::super::{fault, kill_group_tree, term_group_tree};
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::{Refusal, TerminateOutcome, Why};
+    use crate::identity::{ProcessId, Resolved};
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
+
+    /// A pgid no test process holds: the recorders stand in for the sends.
+    const PGID: i32 = 999_999;
+
+    /// How the root's own handle and its pid read, for a row.
+    #[derive(Clone, Copy, Debug)]
+    enum Root {
+        Unreaped,
+        ReapedElsewhere,
+        OwnReapGone,
+        OwnReapTaken,
+        OwnReapUnreadable,
+        Unknown,
+    }
+
+    fn stated(root: Root) -> StatedRoot<'static> {
+        StatedRoot::with_state(PGID as u32, move || match root {
+            Root::Unreaped => RootState::Unreaped,
+            Root::ReapedElsewhere => RootState::Reaped { own: false },
+            Root::OwnReapGone | Root::OwnReapTaken | Root::OwnReapUnreadable => RootState::Reaped { own: true },
+            Root::Unknown => RootState::Unknown(std::io::Error::other("a failed peek")),
+        })
+    }
+
+    /// Arms what the root's pid reads as for `root`, until the guard drops.
+    fn read(root: Root) -> Option<crate::child::fault::ForcedRootReads> {
+        let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+        let read = match root {
+            Root::OwnReapGone => Resolved::Gone,
+            Root::OwnReapTaken => Resolved::Found(other),
+            Root::OwnReapUnreadable => Resolved::Unknown,
+            _ => return None,
+        };
+        Some(crate::child::fault::force_root_reads(read))
+    }
+
+    /// What a skipped kill or terminate says it did not do, and why.
+    fn assert_skip(skip: &crate::containment::Skip, verb: &str, root: Root) {
+        assert_eq!(
+            skip.action,
+            format!("{verb} its process group (pgid {PGID})"),
+            "{root:?}"
+        );
+        assert!(skip.holders.is_none(), "a group has no holders: {root:?}");
+        match (&skip.why, root) {
+            (Why::MayNameAnother(Refusal::ReapedElsewhere(_)), Root::ReapedElsewhere)
+            | (Why::MayNameAnother(Refusal::ReapedPidGone(_)), Root::OwnReapGone)
+            | (Why::MayNameAnother(Refusal::ReapedPidUnread(_)), Root::OwnReapUnreadable) => {
+                assert!(!skip.root_alone, "{root:?}");
+            }
+            (Why::MayNameAnother(Refusal::Unsure(..)), Root::Unknown) => {
+                assert_eq!(skip.root_alone, cfg!(target_os = "linux"), "{root:?}");
+            }
+            // macOS trusts no number its root's handle cannot answer for.
+            (Why::Untrusted(_), Root::Unknown) if cfg!(target_os = "macos") => {}
+            (why, _) => panic!("{root:?} was skipped for {why:?}"),
+        }
+    }
+
+    /// The kill: sent as usual while the root's number names it; nothing is sent once the group is
+    /// empty ([`TreeKillOutcome::Answered`]); and skipped, nothing sent by the number, when the number
+    /// may name another process.
+    #[skuld::test]
+    fn a_group_kill_sends_or_skips_by_the_roots_state() {
+        for root in [
+            Root::Unreaped,
+            Root::ReapedElsewhere,
+            Root::OwnReapGone,
+            Root::OwnReapTaken,
+            Root::OwnReapUnreadable,
+            Root::Unknown,
+        ] {
+            let _read = read(root);
+            let recorder = fault::record_kill_group();
+            let outcome = kill_group_tree(PGID, Some(&stated(root)));
+            let sent = recorder.killed();
+            match (root, outcome) {
+                (Root::Unreaped, TreeKillOutcome::Ran(Ok(()))) => assert_eq!(sent, [PGID], "{root:?}"),
+                (Root::OwnReapTaken, TreeKillOutcome::Answered(Ok(()))) => {
+                    assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
+                }
+                (_, TreeKillOutcome::Skipped(skip)) => {
+                    assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
+                    assert_skip(&skip, "kill", root);
+                }
+                (_, outcome) => panic!("{root:?} was answered {outcome:?}"),
+            }
+        }
+    }
+
+    /// The terminate: the same decisions, with a skip ending the call, and on Linux, for a root its
+    /// handle cannot answer for, leaving the root alone to the caller through its handle.
+    #[skuld::test]
+    fn a_group_terminate_sends_or_skips_by_the_roots_state() {
+        for root in [
+            Root::Unreaped,
+            Root::ReapedElsewhere,
+            Root::OwnReapGone,
+            Root::OwnReapTaken,
+            Root::OwnReapUnreadable,
+            Root::Unknown,
+        ] {
+            let _read = read(root);
+            let recorder = fault::record_term_group();
+            let outcome = term_group_tree(PGID, Some(&stated(root)));
+            let sent = recorder.termed();
+            match (root, outcome) {
+                (
+                    Root::Unreaped,
+                    TerminateOutcome::Sent {
+                        result: Ok(()),
+                        earlier: Some("the SIGTERM"),
+                    },
+                ) => assert_eq!(sent, [PGID], "{root:?}"),
+                (
+                    Root::OwnReapTaken,
+                    TerminateOutcome::Sent {
+                        result: Ok(()),
+                        earlier: None,
+                    },
+                ) => assert_eq!(sent, Vec::<i32>::new(), "{root:?}"),
+                // Only Linux has a pidfd to name the root with.
+                (Root::Unknown, TerminateOutcome::RootThroughPidfd(skip)) if cfg!(target_os = "linux") => {
+                    assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
+                    assert_skip(&skip, "signal", root);
+                }
+                (_, TerminateOutcome::End(skip)) => {
+                    assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
+                    assert_skip(&skip, "signal", root);
+                }
+                (_, outcome) => panic!("{root:?} was answered {outcome:?}"),
+            }
+        }
+    }
+}
