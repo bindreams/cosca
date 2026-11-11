@@ -107,9 +107,11 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 }
 
 /// The drop's warn over a `TreeWalk` whose walk found no root: the tree call's answer, as the
-/// settlement words it.
+/// settlement words it. Not macOS, where a `TreeWalk` root is a groupless marker.
+#[cfg(not(target_os = "macos"))]
 const WALK_WARN: &str = "Child::drop: contained-tree teardown did not fully succeed";
 
+#[cfg(not(target_os = "macos"))]
 fn drop_walk_warns_since(mark: usize) -> Vec<(log::Level, String)> {
     crate::log_capture::records_since_on_current_thread(mark, WALK_WARN)
 }
