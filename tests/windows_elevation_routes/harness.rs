@@ -33,11 +33,10 @@ use windows::Win32::System::Threading::{
 /// through a real kernel primitive, not just the immediate child. If it trips, `wait_for` kills the
 /// whole tree, then waits (unboundedly) on the child's OWN process handle for that kill to land, and
 /// only then reports that the tree did not finish; it never silently continues. On that kill/timeout
-/// fallback path, only the immediate child can still be confirmed gone — the job handle is consumed
-/// by `kill_tree` by the time the fallback wait runs, so there is no way to re-confirm the rest of
-/// the tree — but on the (common) success path, the whole tree, not just the immediate child, is
-/// confirmed exited before `wait_for` returns, so it is safe for the caller to touch any file or
-/// account any member of the tree might otherwise still hold open.
+/// fallback path, `kill_tree` then `wait_tree` confirm the whole tree (only when `kill_tree` itself
+/// fails is just the immediate child confirmed); on the (common) success path, the whole tree, not
+/// just the immediate child, is confirmed exited before `wait_for` returns, so it is safe for the
+/// caller to touch any file or account any member of the tree might otherwise still hold open.
 ///
 /// A grandchild `[spawn_attempts_with]` spawns is a member of THIS job only if ordinary Windows job
 /// inheritance already carried it into whatever job its own creator belongs to, before
@@ -511,17 +510,10 @@ impl std::fmt::Display for WaitFailure {
 /// `Job` only ever drives the Job Object channel, so that variant is asserted unreachable rather than
 /// silently matched away — see [`TreeDrain`]'s own doc.
 ///
-/// On [`TreeDrain::MembersRemain`] or an `Err` from `wait_tree_timeout` itself (the job handle was
-/// already consumed by a concurrent `kill_tree`/`Drop`, or the duplicate/wait syscalls failed),
-/// this falls back to killing the whole tree and then waiting (unboundedly) on the CHILD'S OWN
-/// process handle for that kill to land — not `job.wait_tree()` again, which would fail at once:
-/// `Job::kill_tree` closes the underlying job handle as part of tearing the job down (see its
-/// doc), so there is nothing left afterward for a tree-wide wait to act on. That fallback wait has
-/// no bound of its own because it is waiting on a real kernel outcome (the kill taking effect),
-/// not racing a clock — so once it returns, the immediate child is provably gone. It only covers
-/// the immediate child, not the rest of the tree: once the job handle is closed there is no longer
-/// a way to wait on the tree as a whole, which is why the success path above — confirming the
-/// WHOLE tree before ever touching `kill_tree` — is what this function reaches for first.
+/// On [`TreeDrain::MembersRemain`] or an `Err` from `wait_tree_timeout` itself (the wait syscalls
+/// failed), this falls back to killing the whole tree and then waiting (unboundedly) with
+/// `job.wait_tree()` for that kill to land. That wait has no bound of its own because it is
+/// waiting on a real kernel outcome (the kill taking effect), not racing a clock.
 ///
 /// Callers pass [`CHILD_EXIT_BOUND_MS`] for a process they spawned and wait on directly, or
 /// [`GRANDCHILD_EXIT_BOUND_MS`] inside [`spawn_attempts_with`] — see that constant's doc for why
@@ -558,18 +550,19 @@ pub(crate) fn wait_for(pi: &PROCESS_INFORMATION, job: &Job, bound_ms: u32) -> Re
 /// The kill-then-reap fallback [`wait_for`] uses once a tree-wide `wait_tree_timeout` could not
 /// itself confirm the tree had drained. `reason` names what `wait_tree_timeout` reported before
 /// this ran. Kills the whole job, then waits (unboundedly, on a real kernel outcome — not a clock
-/// race) on the CHILD'S OWN process handle for that kill to land; only the immediate child can
-/// still be confirmed gone this way, since `kill_tree` consumes the job handle a tree-wide wait
-/// would otherwise need. The returned message says what happened to the child at every step,
-/// including a `TerminateProcess` failure, rather than only ever blaming the original wait.
+/// race) with `wait_tree`, which `kill_tree` leaves usable, so the whole tree is confirmed gone.
+/// If `kill_tree` itself fails, it terminates the immediate child directly and waits on the
+/// CHILD'S OWN process handle instead; only the immediate child is then confirmed gone. The
+/// returned message says what happened at every step, including a `TerminateProcess` failure,
+/// rather than only ever blaming the original wait.
 ///
-/// Every `Err` this returns therefore leaves the REST of the tree — any grandchild — in an
-/// unconfirmed state, not a confirmed-gone one. A caller that turns this `Err` into a `panic!` and
-/// unwinds through a `TempDir` or a scratch account it owns is racing whatever of the tree could
-/// not be confirmed gone against that resource's removal; each such panic site says so itself.
+/// Every `Err` this returns when `kill_tree` failed leaves the REST of the tree — any grandchild —
+/// in an unconfirmed state. A caller that turns this `Err` into a `panic!` and unwinds through a
+/// `TempDir` or a scratch account it owns is racing whatever of the tree could not be confirmed
+/// gone against that resource's removal; each such panic site says so itself.
 fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<u32, WaitFailure> {
     let killed = job.kill_tree();
-    if let Err(kill_err) = &killed {
+    let confirmed = if let Err(kill_err) = &killed {
         // `kill_tree` itself failed, so nothing has confirmed the job's members were ever
         // actually asked to terminate. Fall back to terminating the immediate child directly,
         // and check THAT result too, rather than waiting INFINITE below on a process nothing
@@ -590,26 +583,27 @@ fn kill_and_reap(pi: &PROCESS_INFORMATION, job: &Job, reason: String) -> Result<
                  races that removal against whatever of the tree is still alive"
             )));
         }
-    }
-    // `kill_tree` already closed the job handle on success, so `job.wait_tree()` would fail
-    // immediately here instead of waiting for anything (see this function's doc comment).
-    // Either `kill_tree` succeeded, or the fallback `TerminateProcess` above did — either way
-    // the child has genuinely been asked to exit, so waiting on its own process handle now
-    // observes a real kernel outcome, not a clock race.
-    // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
-    // not consume or invalidate it, so it is still safe to close below.
-    let waited_after_kill = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+        // SAFETY: `pi.hProcess` is still a valid, open handle to the child; waiting on it does
+        // not invalidate it. The fallback `TerminateProcess` above succeeded, so the child has
+        // genuinely been asked to exit: this observes a real kernel outcome, not a clock race.
+        let waited = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
+        format!(
+            "wait_after_kill={waited:?}. This confirms only the immediate child is gone, never the rest of the tree"
+        )
+    } else {
+        // `kill_tree` keeps the job handle, so the whole tree can be waited on.
+        format!("wait_tree={:?}", job.wait_tree())
+    };
     // SAFETY: the wait above means the immediate child is confirmed gone (or the wait itself
-    // failed, which `waited_after_kill` reports); both handles are closed exactly once.
+    // failed, which `confirmed` reports); both handles are closed exactly once.
     unsafe {
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
     }
     Err(WaitFailure(format!(
-        "{reason}; kill_tree={killed:?} wait_after_kill={waited_after_kill:?}. This confirms only \
-         the immediate child is gone, never the rest of the tree — a caller that unwinds through a \
-         TempDir or scratch account it owns after this Err races that removal against whatever \
-         grandchild could not be confirmed gone"
+        "{reason}; kill_tree={killed:?} {confirmed}. A caller that unwinds through a TempDir or \
+         scratch account it owns after this Err races that removal against whatever grandchild \
+         could not be confirmed gone"
     )))
 }
 

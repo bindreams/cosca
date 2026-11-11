@@ -277,7 +277,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
 ///
 /// Dropping this future does not join the blocking task, so the task owns a `DuplicateHandle` copy
 /// of the job handle (closed on every exit path, panic included) rather than borrowing one the
-/// `Child` may close and the kernel recycle.
+/// `Child` may close, and the kernel recycle, once the borrow ends.
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
@@ -305,16 +305,7 @@ async fn job_wait_tree_drained(
         }
     }
 
-    // Duplicate INSIDE the closure, so the lock is still held when `DuplicateHandle` reads the
-    // handle: returning it out of `with_handle` first would release the guard before the call.
-    let Some(dup) = job
-        .with_handle(crate::containment::windows::duplicate_job)
-        .transpose()?
-    else {
-        // Same early return as `JobHandle::wait_drained` (see `consumed_job_handle_error`).
-        return Err(crate::containment::windows::consumed_job_handle_error());
-    };
-    let job_dup = OwnedJobDup(dup);
+    let job_dup = OwnedJobDup(crate::containment::windows::duplicate_job(job.handle())?);
 
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// releases promptly instead of parking out the deadline, and `Runtime::drop` — which

@@ -47,7 +47,7 @@ fn disarm_clears_kill_on_job_close() {
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
-    let handle = job.0.as_handle().expect("freshly assigned job handle must be live");
+    let handle = job.0.handle();
 
     job.disarm().expect("disarm");
 
@@ -100,23 +100,20 @@ fn wait_tree_reports_members_remain_then_all_exited() {
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
+/// `kill_tree` keeps the job handle, so `wait_tree` after it waits for the members to exit and
+/// reports the drain.
 #[skuld::test]
-fn wait_tree_after_kill_tree_is_unassessable() {
+fn wait_tree_after_kill_tree_waits_for_the_members_and_returns() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
 
     job.kill_tree().expect("kill_tree");
-    _ = child.wait();
 
-    let err = job
-        .wait_tree()
-        .expect_err("wait_tree after kill_tree must not guess a drain verdict");
-    assert!(
-        matches!(err, crate::error::Error::Unassessable { .. }),
-        "expected Unassessable, got {err:?}"
-    );
+    let verdict = job.wait_tree().expect("wait_tree after kill_tree");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    _ = child.wait();
 }
 
 #[skuld::test]
@@ -132,79 +129,27 @@ fn assign_to_an_invalid_handle_is_an_error() {
     );
 }
 
-#[skuld::test]
-fn job_debug_differs_before_and_after_kill_tree() {
-    let mut child = spawn_blocker();
-    let raw = child.as_raw_handle();
-    // SAFETY: `child` outlives this borrow.
-    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
-
-    let live = format!("{job:?}");
-    job.kill_tree().expect("kill_tree");
-    let killed = format!("{job:?}");
-
-    assert_ne!(
-        live, killed,
-        "Debug must reflect the handle being consumed by kill_tree, not print the same thing regardless"
-    );
-    _ = child.wait();
-}
-
-/// `Job` is shared across threads by callers, which is exactly what makes its `&self` methods
-/// racy if the handle is not locked. Pinning the bound here means a future change that makes
-/// `Job` thread-hostile fails at compile time rather than silently narrowing what callers may
-/// do — the same assertion `Process` carries.
+/// `Job` is shared across threads by callers. Pinning the bound here means a future change that
+/// makes `Job` thread-hostile fails at compile time rather than silently narrowing what callers
+/// may do — the same assertion `Process` carries.
 #[skuld::test]
 fn job_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Job>();
 }
 
-/// Both orderings of `disarm` and `kill_tree` on a shared `Job` complete without faulting.
-///
-/// Honest about what this is: a smoke test, not a regression guard. It does NOT fail against
-/// the pre-lock code — provoking a real handle-close-then-recycle interleaving is not portably
-/// possible, because it needs the OS to hand the recycled value to this same process inside a
-/// window measured in instructions. What actually holds the invariant is structural: the lock
-/// makes load-then-use indivisible, and `job_is_send_and_sync` pins the bound that makes the
-/// sharing legal in the first place.
+/// `kill_tree` keeps the job handle, so `disarm` after it really clears `KILL_ON_JOB_CLOSE`.
 #[skuld::test]
-fn disarm_and_kill_tree_from_two_threads_complete() {
-    for _ in 0..64 {
-        let mut child = spawn_blocker();
-        let raw = child.as_raw_handle();
-        // SAFETY: `child` outlives the borrow.
-        let job = std::sync::Arc::new(Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job"));
-
-        let a = std::sync::Arc::clone(&job);
-        let t = std::thread::spawn(move || a.disarm().expect("disarm"));
-        job.kill_tree().expect("kill_tree");
-        t.join().expect("the disarming thread must not panic");
-
-        _ = child.wait();
-    }
-}
-
-/// Once `kill_tree` has consumed the handle, `disarm` must observe that and do nothing.
-///
-/// This is the deterministic half of the concurrency story above, and it is the state the lock
-/// exists to make observable: without it, a `disarm` arriving after the close would read a
-/// stale value and write to whatever kernel object had inherited it.
-#[skuld::test]
-fn disarm_after_kill_tree_does_nothing() {
+fn disarm_after_kill_tree_clears_kill_on_job_close() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives the borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
 
     job.kill_tree().expect("kill_tree");
-    let consumed = format!("{job:?}");
-    job.disarm().expect("a consumed job has nothing to refuse"); // a no-op, not a write through a dangling value
-    assert_eq!(
-        consumed,
-        format!("{job:?}"),
-        "disarm on a consumed job must leave it consumed, not resurrect or mutate it"
-    );
+    job.disarm().expect("disarm after kill_tree");
+
+    assert_eq!(crate::test_frozen::limit_flags(&job.0).0, 0);
 
     _ = child.wait();
 }

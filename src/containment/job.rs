@@ -12,11 +12,7 @@
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::CloseHandle;
-
-use crate::containment::windows::{
-    assign_to_kill_on_close_job, consumed_job_handle_error, wait_drained_raw, JobHandle,
-};
+use crate::containment::windows::{assign_to_kill_on_close_job, JobHandle};
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
@@ -67,14 +63,13 @@ impl Job {
         Ok(Job(assign_to_kill_on_close_job(process.as_raw_handle())?))
     }
 
-    /// Terminate every process still in the job, then close the handle.
+    /// Terminate every process still in the job.
     ///
-    /// Idempotent: calling this (or dropping the `Job`) again is a no-op. The kernel documents that
-    /// termination of every member is initiated before `TerminateJobObject`/`CloseHandle` returns,
-    /// not that their teardown has finished. A subsequent [`wait_tree`](Job::wait_tree) call cannot
-    /// confirm the tree has finished exiting: once this closes the handle there is nothing left to
-    /// watch. Call [`wait_tree`](Job::wait_tree) *before* `kill_tree` if the caller needs the drain
-    /// outcome.
+    /// The kernel documents that termination of every member is initiated before
+    /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
+    /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits for the members
+    /// to exit. The handle closes when the `Job` drops, which terminates any process that joined
+    /// the job after this call unless [`disarm`](Job::disarm) cleared `KILL_ON_JOB_CLOSE`.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.0.hard_kill().map_err(Error::Io)
     }
@@ -88,8 +83,8 @@ impl Job {
     /// # Errors
     ///
     /// [`Error::Io`] with the Win32 code when the OS refuses to clear the flag. The job is then
-    /// still armed: dropping this `Job` kills the tree, as it did before the call. A job already
-    /// consumed by [`kill_tree`](Job::kill_tree) has nothing to clear, and is `Ok`.
+    /// still armed: dropping this `Job` kills the tree, as it did before the call. Also clears the
+    /// flag after [`kill_tree`](Job::kill_tree).
     pub fn disarm(&self) -> Result<(), Error> {
         self.0.disarm().map_err(Error::Io)
     }
@@ -106,31 +101,10 @@ impl Job {
         self.wait_tree_deadline(crate::wait::deadline_from(timeout))
     }
 
-    /// Shared body of `wait_tree`/`wait_tree_timeout`. Waits on a **duplicate** of the job
-    /// handle rather than the live one directly: this call can block for the whole `deadline`,
-    /// and `kill_tree`/`disarm`/`Drop` running concurrently on `&self` from another thread must
-    /// not be able to invalidate the handle value out from under an in-flight wait (a closed
-    /// Windows handle's numeric value can be recycled onto an unrelated kernel object).
-    /// `DuplicateHandle` pins a second, independent reference to the SAME job for the duration
-    /// of this call; closing the original elsewhere cannot touch it.
+    /// Shared body of `wait_tree`/`wait_tree_timeout`. Borrows `self` for the whole wait, and
+    /// only `Drop` closes the handle.
     fn wait_tree_deadline(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        // Duplicated under the lock so a concurrent `kill_tree`/`Drop` cannot close the
-        // original between the read and the `DuplicateHandle` call; the wait itself then
-        // runs on the duplicate, outside the lock.
-        let Some(dup) = self
-            .0
-            .with_handle(crate::containment::windows::duplicate_job)
-            .transpose()?
-        else {
-            return Err(consumed_job_handle_error());
-        };
-        let result = wait_drained_raw(dup, deadline, None);
-        // SAFETY: `dup` is a handle this function alone created and holds; nothing else
-        // references it.
-        unsafe {
-            _ = CloseHandle(dup);
-        }
-        result
+        self.0.wait_drained(deadline, None)
     }
 }
 

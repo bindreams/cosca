@@ -315,9 +315,7 @@ pub(crate) fn inject_running_thread_into_pid(pid: u32) -> InjectedThread {
 
 /// The limit flags `job` holds now.
 pub(crate) fn limit_flags(job: &JobHandle) -> JOB_OBJECT_LIMIT {
-    crate::containment::windows::job_limit_flags(job)
-        .expect("the job handle is live")
-        .expect("query the job's limits")
+    crate::containment::windows::job_limit_flags(job).expect("query the job's limits")
 }
 
 /// The raw process handle of a std child, as `attach` takes it.
