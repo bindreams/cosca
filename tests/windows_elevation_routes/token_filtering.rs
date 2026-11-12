@@ -581,6 +581,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
         exact_image: true,
         no_command_line: true,
         stdio: RawStdio::Null,
+        ..Default::default()
     };
     let res = spawn_locked_raw_with(
         &missing,

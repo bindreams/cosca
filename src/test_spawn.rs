@@ -22,8 +22,7 @@ use std::os::windows::process::CommandExt as _;
 #[path = "../tests/common/console_flags.rs"]
 pub(crate) mod console_flags;
 
-// The integration tests' raw `CreateProcessW` spawn, compiled from its real source with the one
-// other file it names besides `console_flags`.
+// The integration tests' raw spawn, compiled from its real source.
 #[cfg(windows)]
 #[path = "../tests/common/raw_spawn.rs"]
 pub(crate) mod raw_spawn;

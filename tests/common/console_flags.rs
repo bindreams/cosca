@@ -1,9 +1,9 @@
 //! The one place that decides which console a Windows test child gets.
 //!
 //! A console child spawned by a process that has no console opens a visible window of its own, so
-//! every test child is spawned `CREATE_NO_WINDOW` unless its test asks for a console. Included by
-//! `#[path]` into `src/test_spawn.rs` and `tests/common/locked.rs`, the two raw-spawn wrappers, and
-//! used by the `src/test_child` helpers that build a `cosca::Command`.
+//! every test child is spawned `CREATE_NO_WINDOW` unless its test asks for a console. Its consumers
+//! are `raw_spawn.rs` and `locked.rs`, `src/test_spawn.rs` (which mounts it) and the
+//! `src/test_child` helpers that build a `cosca::Command`.
 
 /// Which console a test child gets. Off Windows it changes nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

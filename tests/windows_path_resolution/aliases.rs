@@ -279,16 +279,15 @@ fn launch(path: &Path, args: &[&OsStr]) -> String {
 
     let options = RawOptions {
         exact_image: true,
+        quote_exe: true,
         stdio: RawStdio::Null,
         ..Default::default()
     };
     let child = match spawn_locked_raw_with(path, args, &[], 0, Console::Hidden, options) {
         Ok(child) => child,
         Err(e) => {
-            return format!(
-                "err={}",
-                e.raw_os_error().map_or_else(|| e.to_string(), |c| c.to_string())
-            )
+            let code = e.raw_os_error().expect("a failed spawn carries its Win32 code");
+            return format!("err={code}");
         }
     };
     match child.wait() {

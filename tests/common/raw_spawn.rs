@@ -5,8 +5,8 @@
 //! the same rules apply: the lock is not reentrant, so never call it while holding the lock or from
 //! inside a `cosca::Command` spawn.
 //!
-//! This file is also compiled into the library's Windows tests (`src/test_spawn`). It names two
-//! other files of `tests/common`, `console_flags` and `windows_env`, which that module mounts too.
+//! This file is also compiled into the library's Windows tests (`src/test_spawn`), so it may use
+//! only `console_flags` and `windows_env` beside itself.
 #![cfg(windows)]
 
 use std::ffi::OsStr;
@@ -131,11 +131,13 @@ pub struct RawOptions<'a> {
     /// `CreateProcessW` has no image to run without one of the two.
     #[allow(dead_code, reason = "tests/ set it; the library's tests do not")]
     pub no_command_line: bool,
+    /// Always quote the command line's first token (`exe`), where `join_wide` quotes only a name
+    /// with a blank. For a probe whose recorded input is a quoted argv[0].
+    pub quote_exe: bool,
     pub stdio: RawStdio<'a>,
 }
 
-/// [`spawn_locked_raw_with`] with [`RawOptions::default()`]: the command line names the image and
-/// the child gets our standard handles.
+/// [`spawn_locked_raw_with`] with [`RawOptions::default()`].
 #[allow(dead_code, reason = "tests/ use it; the library's tests use `spawn_locked_raw_with`")]
 pub fn spawn_locked_raw(
     exe: impl AsRef<OsStr>,
@@ -208,17 +210,27 @@ pub fn spawn_locked_raw_with(
     }
 
     debug_assert!(
-        !options.no_command_line || (options.exact_image && args.is_empty()),
-        "no command line needs `exact_image` and no `args`"
+        !options.no_command_line || (options.exact_image && args.is_empty() && !options.quote_exe),
+        "no command line needs `exact_image`, no `args` and no `quote_exe`"
     );
     let exe = exe.as_ref();
     let mut cmdline = (!options.no_command_line).then(|| {
-        let wide_args: Vec<Vec<u16>> = std::iter::once(exe)
-            .chain(args.iter().map(AsRef::as_ref))
-            .map(|a| a.encode_wide().collect())
-            .collect();
+        let wide_exe: Vec<u16> = exe.encode_wide().collect();
+        let wide_args: Vec<Vec<u16>> = args.iter().map(|a| a.as_ref().encode_wide().collect()).collect();
         let refs: Vec<&[u16]> = wide_args.iter().map(Vec::as_slice).collect();
-        let mut cmdline = cosca::quote::windows::join_wide(&refs);
+        let mut cmdline = if options.quote_exe {
+            // An image path has no `"` and, quoted, no trailing-backslash run to double.
+            let mut cmdline: Vec<u16> = [b'"' as u16].into_iter().chain(wide_exe).chain([b'"' as u16]).collect();
+            if !refs.is_empty() {
+                cmdline.push(b' ' as u16);
+                cmdline.extend(cosca::quote::windows::join_wide(&refs));
+            }
+            cmdline
+        } else {
+            let mut all = vec![wide_exe.as_slice()];
+            all.extend(&refs);
+            cosca::quote::windows::join_wide(&all)
+        };
         cmdline.push(0); // `CreateProcessW` requires a NUL-terminated, writable buffer.
         cmdline
     });

@@ -18,8 +18,7 @@
 //! express, uses `spawn_locked_raw` (`raw_spawn.rs`), which hides the window of a console it creates.
 //!
 //! This file is also compiled into the library's tests (`src/test_spawn_tests`, on Unix), which run
-//! the spawn-window scenario against these exact wrappers. It names one other file of `tests/common`,
-//! `console_flags`, which that module mounts too.
+//! the spawn-window scenario against these exact wrappers.
 
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 

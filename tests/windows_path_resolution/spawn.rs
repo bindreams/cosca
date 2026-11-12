@@ -328,7 +328,7 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
 }
 
 /// `CreateProcessW(lpApplicationName = program)` with no arguments, stdout captured to `out_path`.
-/// `Err` is a spawn that did not happen, rendered with its Win32 error (the `io::Error`'s `os error`).
+/// `Err` is a spawn that did not happen, rendered with its Win32 error.
 pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, String), String> {
     use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, RawStdio};
     use std::os::windows::io::AsHandle;
@@ -336,6 +336,7 @@ pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, Stri
     let file = std::fs::File::create(out_path).map_err(|e| format!("could not open the capture file: {e}"))?;
     let options = RawOptions {
         exact_image: true,
+        quote_exe: true,
         stdio: RawStdio::Output(file.as_handle()),
         ..Default::default()
     };

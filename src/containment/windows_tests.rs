@@ -704,13 +704,10 @@ fn fixture_reports_job_breakaway_probe() {
 // ===== initial-thread resume ownership =====
 
 /// A suspended process this test made itself, holding its main thread. It sits in a
-/// kill-on-close job, so the OS kills it however the test process exits; `Drop` kills it sooner.
+/// kill-on-close job, so the OS kills it however the test process exits; `RawChild`'s `Drop` kills
+/// it sooner.
 struct SuspendedHelper {
-    /// `_child`'s initial thread, which `_child` keeps owning.
-    thread: windows::Win32::Foundation::HANDLE,
-    tid: u32,
-    pid: u32,
-    _child: crate::test_spawn::raw_spawn::RawChild,
+    child: crate::test_spawn::raw_spawn::RawChild,
     _job: super::JobHandle,
 }
 
@@ -735,13 +732,7 @@ impl SuspendedHelper {
         .expect("spawn the suspended helper");
         let job =
             super::assign_to_kill_on_close_job(child.process().as_raw_handle()).expect("assign the helper to a job");
-        Self {
-            thread: windows::Win32::Foundation::HANDLE(child.thread().as_raw_handle()),
-            tid: child.thread_id(),
-            pid: child.id(),
-            _child: child,
-            _job: job,
-        }
+        Self { child, _job: job }
     }
 }
 
@@ -789,10 +780,12 @@ fn finish_child(spawned: Result<crate::Child, crate::error::Error>) {
 #[skuld::test]
 fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
     use crate::containment::windows::Visit;
+    use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
     let helper = SuspendedHelper::new();
-    let (spawned, visit) = spawn_with_injected_tid(helper.tid, None);
+    let thread = windows::Win32::Foundation::HANDLE(helper.child.thread().as_raw_handle());
+    let (spawned, visit) = spawn_with_injected_tid(helper.child.thread_id(), None);
     assert!(
         spawned.is_ok(),
         "a snapshot entry for another process's thread must not fail the spawn: {:?}",
@@ -800,18 +793,20 @@ fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
     );
     assert_eq!(
         visit,
-        Some(Some(Visit::Foreign { owner: helper.pid })),
+        Some(Some(Visit::Foreign {
+            owner: helper.child.id()
+        })),
         "the injected entry must be walked and identified as the helper's"
     );
 
-    // SAFETY: `helper.thread` is a live thread handle with suspend rights.
-    let previous = unsafe { SuspendThread(helper.thread) };
+    // SAFETY: `thread` is the helper's live thread handle with suspend rights.
+    let previous = unsafe { SuspendThread(thread) };
     assert_eq!(
         previous, 1,
         "the helper's thread is another process's: the spawn must not have resumed it"
     );
     // SAFETY: as above; restore the count this test added.
-    unsafe { ResumeThread(helper.thread) };
+    unsafe { ResumeThread(thread) };
 
     finish_child(spawned);
 }
@@ -819,16 +814,18 @@ fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
 /// The owner filter drops a snapshot entry listed under another pid before any thread is opened.
 #[skuld::test]
 fn windows_resume_initial_threads_drops_an_entry_owned_by_another_pid() {
+    use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
     let helper = SuspendedHelper::new();
-    let (spawned, visit) = spawn_with_injected_tid(helper.tid, Some(helper.pid));
+    let thread = windows::Win32::Foundation::HANDLE(helper.child.thread().as_raw_handle());
+    let (spawned, visit) = spawn_with_injected_tid(helper.child.thread_id(), Some(helper.child.id()));
     assert_eq!(visit, Some(None), "an entry owned by another pid must be filtered out");
-    // SAFETY: `helper.thread` is a live thread handle with suspend rights.
-    let previous = unsafe { SuspendThread(helper.thread) };
+    // SAFETY: `thread` is the helper's live thread handle with suspend rights.
+    let previous = unsafe { SuspendThread(thread) };
     assert_eq!(previous, 1, "a filtered entry must not be touched");
     // SAFETY: as above.
-    unsafe { ResumeThread(helper.thread) };
+    unsafe { ResumeThread(thread) };
     finish_child(spawned);
 }
 
