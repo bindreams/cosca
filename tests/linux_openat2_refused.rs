@@ -10,6 +10,8 @@ use cosca::identity::{Existence, Liveness, ProcessId, Resolved};
 mod common;
 
 #[cfg(target_os = "linux")]
+use common::os_code;
+#[cfg(target_os = "linux")]
 use common::seccomp::OPENAT2_REFUSALS as REFUSALS;
 
 #[cfg(target_os = "linux")]
@@ -119,16 +121,22 @@ fn refused_detail(errno: &str) -> String {
     format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {errno}")
 }
 
-/// `result` is `Unsupported` carrying exactly the refusal, for the call `what`. Returns its `op`.
+/// `result` is `Unsupported` carrying exactly the refusal `(errno, its name)` and the errno as its
+/// source, for the call `what`. Returns its `op`.
 #[cfg(target_os = "linux")]
-fn assert_unsupported_naming(result: Result<(), cosca::error::Error>, errno: &str, what: &str) -> String {
-    match result {
-        Err(cosca::error::Error::Unsupported { op, detail, .. }) => {
-            assert_eq!(detail, refused_detail(errno), "{what} under {errno}");
-            op
-        }
-        other => panic!("{what} under an openat2 answering {errno} must be Unsupported, got {other:?}"),
-    }
+fn assert_unsupported_naming(result: Result<(), cosca::error::Error>, refusal: (i32, &str), what: &str) -> String {
+    let (errno, name) = refusal;
+    let err = result.expect_err(&format!("{what} under an openat2 answering {name} must fail"));
+    let cosca::error::Error::Unsupported { op, detail, .. } = &err else {
+        panic!("{what} under an openat2 answering {name} must be Unsupported, got {err:?}");
+    };
+    assert_eq!(detail, &refused_detail(name), "{what} under {name}");
+    assert_eq!(
+        os_code(&err),
+        Some(errno),
+        "{what} under {name}: the errno is the source"
+    );
+    op.clone()
 }
 
 /// A child blocked on its control socket, walked by identity (`ContainMode::TreeWalk`).
@@ -159,7 +167,7 @@ fn a_seccomp_refused_openat2_makes_parent_and_children_unsupported_naming_openat
             ]
         });
         for (call, result) in results {
-            let op = assert_unsupported_naming(result, name, call);
+            let op = assert_unsupported_naming(result, (errno, name), call);
             let expected = match call {
                 "parent" => format!("identifying pid {}", me.pid()),
                 _ => "listing the process table".to_owned(),
@@ -196,6 +204,21 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snaps
     );
 }
 
+/// An `openat2` answering `EACCES` is not the requirement: `Unassessable` carrying `EACCES`.
+///
+/// Mutant: the refusal set of `openat2` includes `EACCES`, or the errno is dropped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_seccomp_refused_openat2_with_eacces_is_unassessable_carrying_eacces_for_the_snapshot() {
+    use cosca::identity::Recursive;
+
+    let me = ProcessId::current();
+    let result = with_openat2_refused(libc::EACCES, || me.children(Recursive::No).map(drop));
+    let err = result.expect_err("a /proc that cannot be opened cannot be listed");
+    assert!(matches!(err, cosca::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(os_code(&err), Some(libc::EACCES), "{err:?}");
+}
+
 /// A `Process` kills and terminates its tree by walking the snapshot, so both say the refusal and
 /// signal nothing: the child leaves clean when its control socket is released.
 #[cfg(target_os = "linux")]
@@ -213,7 +236,7 @@ fn a_seccomp_refused_openat2_makes_process_kill_tree_and_terminate_tree_unsuppor
             ]
         });
         for (call, result) in results {
-            assert_unsupported_naming(result, name, call);
+            assert_unsupported_naming(result, (errno, name), call);
         }
         drop(control);
         let status = child.wait().expect("reap the child");
@@ -240,23 +263,28 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
             ]
         });
         for (call, result) in results {
-            match result {
-                Err(cosca::error::Error::Unsupported {
-                    op, platform, detail, ..
-                }) => {
-                    assert_eq!(platform, "linux", "{call} under {name}");
-                    assert_eq!(op, format!("listing process group {pgid}"), "{call} under {name}");
-                    assert_eq!(
-                        detail,
-                        format!(
-                            "containment::unix::group::members: {}, so pgid {pgid} cannot be listed",
-                            refused_detail(name)
-                        ),
-                        "{call} under {name}"
-                    );
-                }
-                other => panic!("{call} under {name}: expected Unsupported, got {other:?}"),
-            }
+            let err = result.expect_err("a refused listing must fail");
+            let cosca::error::Error::Unsupported {
+                op, platform, detail, ..
+            } = &err
+            else {
+                panic!("{call} under {name}: expected Unsupported, got {err:?}");
+            };
+            assert_eq!(*platform, "linux", "{call} under {name}");
+            assert_eq!(op, &format!("listing process group {pgid}"), "{call} under {name}");
+            assert_eq!(
+                detail,
+                &format!(
+                    "containment::unix::group::members: {}, so pgid {pgid} cannot be listed",
+                    refused_detail(name)
+                ),
+                "{call} under {name}"
+            );
+            assert_eq!(
+                os_code(&err),
+                Some(errno),
+                "{call} under {name}: the errno is the source"
+            );
         }
         common::kill_tree_release_reap(&child, control);
     }
@@ -277,6 +305,21 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_a_group_l
     common::kill_tree_release_reap(&child, control);
 }
 
+/// A `Session` child's group listing that fails on `EACCES` is `Unassessable` carrying `EACCES`:
+/// the errno survives the listing's `io::Error`.
+///
+/// Mutant: the listing builds `io::Error::other(message)` and drops the errno.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_seccomp_refused_openat2_with_eacces_is_unassessable_carrying_eacces_for_a_session_kill_tree() {
+    let (child, control) = common::spawn_control("control-block", &["R"], true);
+    let result = with_openat2_refused(libc::EACCES, || child.kill_tree());
+    let err = result.expect_err("a group that cannot be listed was reported as killed");
+    assert!(matches!(err, cosca::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(os_code(&err), Some(libc::EACCES), "{err:?}");
+    common::kill_tree_release_reap(&child, control);
+}
+
 /// The walk could not find the descendants, and killing the root first would reparent them out of
 /// any retry's reach: nothing is killed, the root included, and the error is returned.
 #[cfg(target_os = "linux")]
@@ -285,7 +328,7 @@ fn a_seccomp_refused_openat2_leaves_a_treewalk_roots_kill_tree_an_error_and_the_
     for (errno, name) in REFUSALS {
         let (child, control) = spawn_treewalk_blocker();
         let result = with_openat2_refused(errno, || child.kill_tree());
-        assert_unsupported_naming(result, name, "kill_tree");
+        assert_unsupported_naming(result, (errno, name), "kill_tree");
         drop(control);
         let status = child.wait().expect("reap the root");
         assert!(
@@ -339,7 +382,7 @@ fn a_seccomp_refused_openat2_leaves_an_async_treewalk_roots_kill_tree_an_error_a
                 .join()
                 .expect("the filtered thread")
         });
-        assert_unsupported_naming(result, name, "kill_tree");
+        assert_unsupported_naming(result, (errno, name), "kill_tree");
         assert!(
             status.success(),
             "{name}: the root must not have been killed: {status:?}"

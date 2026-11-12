@@ -742,7 +742,7 @@ fn verify(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Erro
             op: format!("listing process group {pgid}"),
             platform: std::env::consts::OS,
             detail: source.to_string(),
-            source: None,
+            source: Some(Error::io_cause(source)),
         }),
         group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
             detail,

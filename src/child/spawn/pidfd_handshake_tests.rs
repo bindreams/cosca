@@ -27,6 +27,7 @@ use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
+use crate::test_seccomp::PIDFD_OPEN_REFUSALS;
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -113,13 +114,8 @@ fn a_normal_spawn_runs_the_program_and_forks_once() {
 /// Mutant: the probe maps a refusal to another error.
 #[skuld::test]
 fn a_refused_probe_fails_unsupported() {
-    for (errno, name) in [
-        (Errno::PERM, "EPERM"),
-        (Errno::ACCESS, "EACCES"),
-        (Errno::NODEV, "ENODEV"),
-        (Errno::NOSYS, "ENOSYS"),
-    ] {
-        let kernel = FakeKernel::new().on_pidfd_open(std::process::id(), Err(errno));
+    for (errno, name) in PIDFD_OPEN_REFUSALS {
+        let kernel = FakeKernel::new().on_pidfd_open(std::process::id(), Err(Errno::from_raw_os_error(errno)));
         let err = probe_pidfd_support_with(&kernel).expect_err("a refused pidfd_open must fail the probe");
         assert_eq!(
             err.to_string(),
@@ -129,6 +125,7 @@ fn a_refused_probe_fails_unsupported() {
             ),
             "{err:?}"
         );
+        assert_eq!(err.raw_os_error(), Some(errno), "{name}: the errno is the source");
     }
 }
 

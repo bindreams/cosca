@@ -10,6 +10,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::kernel::{Kernel, PIDFD_THREAD};
+use crate::error::Error;
 use crate::identity::RawPid;
 
 #[derive(Debug, Clone, Copy)]
@@ -17,6 +18,7 @@ enum Call {
     PidfdOpen,
     PidfsIno,
     Poll,
+    Openat2,
 }
 
 /// A call that failed, and the errno it answered.
@@ -51,12 +53,21 @@ impl FailedCall {
         }
     }
 
+    /// An `openat2` that answered `errno`.
+    pub(crate) const fn openat2(errno: Errno) -> FailedCall {
+        FailedCall {
+            call: Call::Openat2,
+            errno,
+        }
+    }
+
     /// The call's name, as an error says what failed.
     pub(crate) const fn name(&self) -> &'static str {
         match self.call {
             Call::PidfdOpen => "pidfd_open",
             Call::PidfsIno => "pidfs_ino",
             Call::Poll => "poll",
+            Call::Openat2 => "openat2",
         }
     }
 
@@ -64,17 +75,38 @@ impl FailedCall {
         self.errno
     }
 
-    /// The name of the errno if this call is a refusal: a `pidfd_open` answered as documented on
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported). No other call is refused; its
-    /// failure, with any errno, is its own.
-    pub(crate) fn refusal(&self) -> Option<&'static str> {
-        match (self.call, self.errno) {
-            (Call::PidfdOpen, Errno::NOSYS) => Some("ENOSYS"),
-            (Call::PidfdOpen, Errno::PERM) => Some("EPERM"),
-            (Call::PidfdOpen, Errno::ACCESS) => Some("EACCES"),
-            (Call::PidfdOpen, Errno::NODEV) => Some("ENODEV"),
-            _ => None,
-        }
+    /// What cosca requires of the kernel, when this call is a refusal: the one sentence an
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a refused call carries as its
+    /// `detail`.
+    ///
+    /// Refusal sets per call: see [`Error::Unsupported`](crate::error::Error::Unsupported). No other
+    /// call is refused; its failure, with any errno, is its own.
+    pub(crate) fn requirement(&self) -> Option<String> {
+        let (floor, errno) = match (self.call, self.errno) {
+            (Call::PidfdOpen, Errno::NOSYS) => ("5.3", "ENOSYS"),
+            (Call::PidfdOpen, Errno::PERM) => ("5.3", "EPERM"),
+            (Call::PidfdOpen, Errno::ACCESS) => ("5.3", "EACCES"),
+            (Call::PidfdOpen, Errno::NODEV) => ("5.3", "ENODEV"),
+            (Call::Openat2, Errno::NOSYS) => ("5.6", "ENOSYS"),
+            (Call::Openat2, Errno::PERM) => ("5.6", "EPERM"),
+            (Call::Openat2, Errno::NODEV) => ("5.6", "ENODEV"),
+            _ => return None,
+        };
+        let name = self.name();
+        Some(format!(
+            "cosca requires {name} (Linux \u{2265} {floor}), refused here: {name} answered {errno}"
+        ))
+    }
+
+    /// [`Error::Unsupported`] naming `op` and the [`requirement`](Self::requirement), when this
+    /// call is a refusal. The errno is its `source`.
+    pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
+        self.requirement().map(|detail| Error::Unsupported {
+            op: op.into(),
+            platform: "linux",
+            detail,
+            source: Some(Error::io_cause(std::io::Error::from(self.errno))),
+        })
     }
 }
 

@@ -45,7 +45,10 @@ fn the_error_names_the_view_the_read_failed_on() {
     let (read, cause) = ProcessId::of_with(&kernel, std::process::id());
     match crate::child::spawn::spawn_identity_error(read, cause) {
         Error::Unsupported { detail, .. } => {
-            assert_eq!(detail, crate::identity::openat2_refused_message("ENOSYS"));
+            assert_eq!(
+                detail,
+                "cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered ENOSYS"
+            );
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }

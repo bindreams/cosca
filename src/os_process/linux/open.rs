@@ -108,24 +108,12 @@ pub(crate) fn open_error(call: FailedCall) -> Error {
 /// `call` as [`Error::Unsupported`] naming `op` if the OS refused it (classification: see
 /// [`Error::Unsupported`]), else [`Error::Io`]. The one place this mapping is stated.
 fn io_or_unsupported(op: &str, call: FailedCall) -> Error {
-    match call.refusal() {
-        Some(name) => pidfd_open_unsupported(op, name),
-        None => Error::Io(crate::error::io_context(
+    call.unsupported(op).unwrap_or_else(|| {
+        Error::Io(crate::error::io_context(
             call.name(),
             std::io::Error::from(call.errno()),
-        )),
-    }
-}
-
-pub(crate) fn pidfd_open_unsupported(op: &str, errno_name: &str) -> Error {
-    Error::Unsupported {
-        op: op.into(),
-        platform: "linux",
-        detail: format!(
-            "cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: pidfd_open answered {errno_name}"
-        ),
-        source: None,
-    }
+        ))
+    })
 }
 
 /// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.

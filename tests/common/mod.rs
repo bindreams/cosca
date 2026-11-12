@@ -14,6 +14,21 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+/// The OS code of `err`: the first `io::Error` down its `source()` chain that has one.
+pub fn os_code(err: &cosca::error::Error) -> Option<i32> {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if let Some(code) = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            return Some(code);
+        }
+        source = cause.source();
+    }
+    None
+}
+
 // Shared with `test_groups` (its `StrayLeaves`), which owns the one compilation of the file.
 #[cfg(target_os = "linux")]
 pub use test_groups::cgroup_leaf as cgroup;

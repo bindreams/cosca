@@ -144,7 +144,13 @@ pub enum Error {
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
     ///
-    /// # A refused `pidfd_open` on Linux
+    /// # A refused `pidfd_open` or `openat2` on Linux
+    ///
+    /// A call is refused when it answers an errno that only a seccomp filter or an LSM can produce
+    /// for that call (or `ENOSYS`, an old kernel). Each call has its own set, below. The errno is
+    /// the error's `source`, so `raw_os_error` finds it.
+    ///
+    /// ## `pidfd_open`
     ///
     /// Every Linux operation that opens a process by identity needs a pidfd (kernel 5.3 or
     /// later): [`Process::open`](crate::Process::open), [`open_pid`](crate::Process::open_pid)
@@ -162,8 +168,29 @@ pub enum Error {
     ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
     ///   either way no pidfd is possible.
     ///
-    /// Only a failed `pidfd_open` is refused. Any other failure is [`Error::Io`] prefixed with the
-    /// call's name (`pidfd_open:`, `pidfs_ino:`, `poll:`).
+    /// A failure that is not a refusal is the call's own, with its errno, and depends on the
+    /// operation:
+    ///
+    /// - from [`Process::open`](crate::Process::open) and [`open_pid`](crate::Process::open_pid)
+    ///   (and their `tokio` twins) it is [`Error::Io`] prefixed with the call's name
+    ///   (`pidfd_open:`, `pidfs_ino:`, `poll:`); the inode read (`pidfs_ino`) and `poll` of a
+    ///   pidfd are never refusals;
+    /// - from an identity read or a tree walk it is [`Error::Unassessable`] carrying the errno.
+    ///
+    /// ## `openat2`
+    ///
+    /// The checked `/proc` view needs `openat2` (the kernel needs 5.6), refused with `ENOSYS`,
+    /// `EPERM` or `ENODEV`, as above. `EACCES` is not a refusal here: it is also the kernel's own
+    /// answer to a `/proc` that may not be opened, so it stays [`Error::Unassessable`] carrying
+    /// `EACCES`, as does any other failure of the call (a tree walk's included). A refused `openat2` fails with this
+    /// variant naming `openat2` from:
+    ///
+    /// - a by-pid identity read, wait or kill;
+    /// - [`Process::open`](crate::Process::open) below Linux 6.9;
+    /// - `parent` and `children` of a [`ProcessId`](crate::identity::ProcessId);
+    /// - the group listing of a [`ProcessGroup`](crate::Containment::ProcessGroup) or
+    ///   [`Session`](crate::Containment::Session) child's `kill_tree`;
+    /// - a spawn, where the identity is read through the view.
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this

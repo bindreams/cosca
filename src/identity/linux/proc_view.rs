@@ -29,6 +29,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
 
 use super::kernel::Kernel;
+use super::prove::FailedCall;
 use crate::error::Error;
 
 /// What this process's `/proc` says about its own pid namespace.
@@ -68,9 +69,10 @@ pub(crate) struct ViewUnreadable {
     pub(crate) reason: String,
     /// The OS error behind `reason`, when there was one.
     pub(crate) source: Option<io::Error>,
-    /// `openat2` itself is refused (kernel older than 5.6, or a seccomp filter that answers it
-    /// `ENOSYS`/`EPERM`), so no `/proc` view can ever be established here: the errno's name.
-    openat2_refused: Option<&'static str>,
+    /// The `openat2` of `/proc` that failed, when that is why the view could not be established.
+    /// If [`FailedCall::requirement`] is `Some`, the call was refused and no `/proc` view can ever
+    /// be established here.
+    openat2: Option<FailedCall>,
 }
 
 impl ViewUnreadable {
@@ -78,44 +80,30 @@ impl ViewUnreadable {
         ViewUnreadable {
             reason: reason.into(),
             source,
-            openat2_refused: None,
+            openat2: None,
         }
     }
 
     /// The view that `openat2` of `/proc` failing with `errno` leaves.
     pub(crate) fn from_open_errno(errno: rustix::io::Errno) -> Self {
+        let call = FailedCall::openat2(errno);
         ViewUnreadable {
-            openat2_refused: match errno {
-                rustix::io::Errno::NOSYS => Some("ENOSYS"),
-                rustix::io::Errno::PERM => Some("EPERM"),
-                _ => None,
-            },
-            ..ViewUnreadable::new("/proc could not be opened", Some(errno.into()))
+            openat2: Some(call),
+            ..ViewUnreadable::new("/proc could not be opened", Some(call.errno().into()))
         }
     }
 
     /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
     /// could not be established. `op` is what could not be done.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
-        self.openat2_requirement().map(|detail| Error::Unsupported {
-            op: op.into(),
-            platform: "linux",
-            detail,
-            source: None,
-        })
+        self.openat2?.unsupported(op)
     }
 
     /// The `openat2` requirement text, when `openat2` being refused is why the view could not be
     /// established. For callers whose error type is not [`Error`].
     pub(crate) fn openat2_requirement(&self) -> Option<String> {
-        self.openat2_refused.map(openat2_refused_message)
+        self.openat2?.requirement()
     }
-}
-
-/// The requirement text for an `openat2` refused with the errno named `errno`. The one place the
-/// wording lives: tests build their expectation with it.
-pub(crate) fn openat2_refused_message(errno: &str) -> String {
-    format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}")
 }
 
 impl std::fmt::Display for ViewUnreadable {
