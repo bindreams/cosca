@@ -207,8 +207,9 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
     assert!(report.contains("pidfd_open"), "{report}");
 }
 
-/// Twin for a view that could not be established: the reason is in the message, the view's errno
-/// is the source, and the message notes the `pidfd_open` errno's call.
+/// Twin for a view that could not be established: the reason is in the message, and the view's
+/// errno and the `pidfd_open` errno are both below it, as the members of a `Several`, the view's
+/// first. Mutant: the `pidfd_open` errno is a note in the message, or is dropped.
 #[skuld::test]
 fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
     crate::log_capture::install();
@@ -219,14 +220,20 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .on_pidfd_open(worker.id.pid(), Err(Errno::INVAL))
         .unreadable_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
-    let err = assert_unassessable_with_cause(
-        result,
-        &[UNREADABLE_STATUS_REASON, "(pidfd_open: "],
-        true,
-        &marker,
-        mark,
-    );
+    let err = assert_unassessable_with_cause(result, &[UNREADABLE_STATUS_REASON], true, &marker, mark);
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    assert!(!err.to_string().contains("pidfd_open"), "{err}");
+    let Some(crate::error::Error::Unassessable {
+        source: Some(source), ..
+    }) = Some(&err)
+    else {
+        unreachable!("asserted above");
+    };
+    let crate::error::Error::Several(causes) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EINVAL)]);
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads

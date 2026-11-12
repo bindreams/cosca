@@ -221,15 +221,25 @@ fn classify_member_is_total_over_liveness_and_reached() {
             classify_member(1, liveness, || Reached::Yes),
             MemberOutcome::NotASurvivor
         ));
+        // The cause the answer carried is the member's.
         assert!(matches!(
-            classify_member(1, liveness, || Reached::No),
-            MemberOutcome::Survivor(1)
+            classify_member(1, liveness, || Reached::No(cause(libc::EPERM))),
+            MemberOutcome::Survivor(1, ref why) if first_os_code(why) == Some(libc::EPERM)
         ));
         assert!(matches!(
-            classify_member(1, liveness, || Reached::Unknown),
-            MemberOutcome::Unassessable(1)
+            classify_member(1, liveness, || Reached::Unknown(cause(libc::EIO))),
+            MemberOutcome::Unassessable(1, ref why) if first_os_code(why) == Some(libc::EIO)
         ));
     }
+}
+
+/// An error that says what a member's signal or probe answered: the OS error `code`.
+fn cause(code: i32) -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+fn first_os_code(error: &crate::error::Error) -> Option<i32> {
+    crate::error::first_os_code(error)
 }
 
 /// `reconfirm_survivor`'s pure re-check, isolated from any real signal delivery: a
@@ -243,29 +253,30 @@ fn reconfirm_survivor_downgrades_only_on_dead() {
     use super::{reconfirm_survivor, MemberOutcome};
     use crate::identity::Liveness;
 
+    let survivor = || MemberOutcome::Survivor(1, cause(libc::EPERM));
     assert!(matches!(
-        reconfirm_survivor(MemberOutcome::Survivor(1), || Liveness::Alive),
-        MemberOutcome::Survivor(1)
+        reconfirm_survivor(survivor(), || Liveness::Alive),
+        MemberOutcome::Survivor(1, ref why) if first_os_code(why) == Some(libc::EPERM)
     ));
     assert!(matches!(
-        reconfirm_survivor(MemberOutcome::Survivor(1), || Liveness::Dead),
+        reconfirm_survivor(survivor(), || Liveness::Dead),
         MemberOutcome::NotASurvivor
     ));
     // Unknown does NOT downgrade: a denied reconfirmation is weaker evidence than the
     // already-observed EPERM, not a disagreement with it.
     assert!(matches!(
-        reconfirm_survivor(MemberOutcome::Survivor(1), || Liveness::Unknown),
-        MemberOutcome::Survivor(1)
+        reconfirm_survivor(survivor(), || Liveness::Unknown),
+        MemberOutcome::Survivor(1, ref why) if first_os_code(why) == Some(libc::EPERM)
     ));
     assert!(matches!(
         reconfirm_survivor(MemberOutcome::NotASurvivor, || panic!("must not recheck NotASurvivor")),
         MemberOutcome::NotASurvivor
     ));
     assert!(matches!(
-        reconfirm_survivor(MemberOutcome::Unassessable(1), || panic!(
+        reconfirm_survivor(MemberOutcome::Unassessable(1, cause(libc::EIO)), || panic!(
             "must not recheck Unassessable"
         )),
-        MemberOutcome::Unassessable(1)
+        MemberOutcome::Unassessable(1, _)
     ));
 }
 
@@ -276,26 +287,34 @@ fn reconfirm_survivor_downgrades_only_on_dead() {
 fn decide_prioritizes_refused_over_unassessable_over_cleared() {
     use super::{decide, GroupState};
 
-    assert!(matches!(
-        decide(1, Signal::SIGKILL, vec![], vec![]),
-        GroupState::Cleared
-    ));
-    match decide(1, Signal::SIGKILL, vec![], vec![5]) {
-        GroupState::Unlistable { detail, .. } => assert!(detail.contains('5'), "got {detail:?}"),
-        other => panic!("expected Unlistable, got {other:?}"),
-    }
-    match decide(1, Signal::SIGKILL, vec![7], vec![5]) {
-        GroupState::Refused { refused, unassessable } => {
+    assert!(matches!(decide(vec![], vec![]), GroupState::Cleared));
+    match decide(vec![], vec![(5, cause(libc::EIO))]) {
+        GroupState::Unassessed { members } => {
+            let pids: Vec<_> = members.iter().map(|(pid, _)| *pid).collect();
+            assert_eq!(pids, [5]);
             assert_eq!(
-                refused,
-                vec![7],
+                first_os_code(&members[0].1),
+                Some(libc::EIO),
+                "the member keeps its cause"
+            );
+        }
+        other => panic!("expected Unassessed, got {other:?}"),
+    }
+    match decide(vec![(7, cause(libc::EPERM))], vec![(5, cause(libc::EIO))]) {
+        GroupState::Refused { refused, unassessable } => {
+            let pids = |members: &[(u32, crate::error::Error)]| members.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
+            assert_eq!(
+                pids(&refused),
+                [7],
                 "a known refuser must not be lost to an unassessable member"
             );
             assert_eq!(
-                unassessable,
-                vec![5],
+                pids(&unassessable),
+                [5],
                 "the unassessable member must not be silently dropped either"
             );
+            assert_eq!(first_os_code(&refused[0].1), Some(libc::EPERM));
+            assert_eq!(first_os_code(&unassessable[0].1), Some(libc::EIO));
         }
         other => panic!("expected Refused, got {other:?}"),
     }
@@ -354,7 +373,7 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_
     ) {
         (GroupState::Refused { refused, .. }, false) => {
             assert!(
-                refused.contains(&1),
+                refused.iter().any(|(pid, _)| *pid == 1),
                 "pid 1 must be reported as a refuser, got {refused:?}"
             );
         }
@@ -416,7 +435,11 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         );
 
-        assert!(matches!(reached, super::Reached::Unknown), "{errno}: got {reached:?}");
+        // The member's cause is the open's error, with its errno.
+        assert!(
+            matches!(&reached, super::Reached::Unknown(why) if first_os_code(why) == Some(errno.raw_os_error())),
+            "{errno}: got {reached:?}"
+        );
         assert_eq!(capture.by_identity(), [], "{errno}: nothing was sent");
         assert!(capture.group_steps().is_empty(), "{errno}: nothing was sent by number");
         let lines = crate::log_capture::records_since_on_current_thread(mark, "could not be opened by identity");
@@ -450,7 +473,9 @@ fn converge_re_verifies_a_member_through_its_kernel() {
     );
 
     assert!(
-        matches!(state, Ok(GroupState::Unlistable { source: None, .. })),
+        matches!(&state, Ok(GroupState::Unassessed { members }) if members.len() == 1
+            && members[0].0 == pid
+            && first_os_code(&members[0].1).is_none()),
         "got {state:?}"
     );
     _ = child.kill();
@@ -580,7 +605,13 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
 
-    assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");
+    assert!(
+        matches!(
+            &reached,
+            super::Reached::Unknown(crate::error::Error::NotThreadGroupLeader { .. })
+        ),
+        "got {reached:?}"
+    );
     assert_eq!(
         crate::log_capture::levels_since(mark, &format!("pid {tid} is a live thread, not a thread-group leader")),
         vec![log::Level::Warn]
@@ -614,8 +645,15 @@ fn resend_answer(errno: Option<i32>) -> super::Reached {
 fn a_resends_answer_is_the_members_reached() {
     assert!(matches!(resend_answer(None), super::Reached::Killed), "delivered");
     assert!(matches!(resend_answer(Some(libc::ESRCH)), super::Reached::Yes), "gone");
-    assert!(matches!(resend_answer(Some(libc::EPERM)), super::Reached::No), "EPERM");
-    assert!(matches!(resend_answer(Some(libc::EIO)), super::Reached::Unknown), "EIO");
+    // A refusal and an anomalous answer keep the error the send answered.
+    assert!(
+        matches!(resend_answer(Some(libc::EPERM)), super::Reached::No(ref why) if first_os_code(why) == Some(libc::EPERM)),
+        "EPERM"
+    );
+    assert!(
+        matches!(resend_answer(Some(libc::EIO)), super::Reached::Unknown(ref why) if first_os_code(why) == Some(libc::EIO)),
+        "EIO"
+    );
 }
 
 // Checked /proc view (Linux) =====
@@ -706,10 +744,10 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
-    for (recheck, refused, below) in [
-        (libc::EPERM, true, libc::EPERM),
-        (libc::ENOSYS, true, libc::EPERM),
-        (libc::EMFILE, false, libc::EMFILE),
+    for (recheck, refused, below, peer) in [
+        (libc::EPERM, true, libc::EPERM, libc::EPERM),
+        (libc::ENOSYS, true, libc::EPERM, libc::ENOSYS),
+        (libc::EMFILE, false, libc::EMFILE, libc::EPERM),
     ] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
@@ -724,6 +762,15 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
             "{recheck}: {text}"
         );
         assert_eq!(crate::error::first_os_code(&err), Some(below), "{recheck}: {text}");
+        // The other failure of the pair is a second cause, not dropped: the pid's own `EPERM` beside
+        // a failed re-check, the re-check's error beside the pid's refusal.
+        let (_, second) = text
+            .split_once("(2) ")
+            .unwrap_or_else(|| panic!("{recheck}: the second failure is kept: {text}"));
+        assert!(
+            second.contains(&std::io::Error::from_raw_os_error(peer).to_string()),
+            "{recheck}: the peer's error ({peer}) is the second cause: {text}"
+        );
     }
 }
 

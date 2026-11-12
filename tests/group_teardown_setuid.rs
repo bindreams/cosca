@@ -329,10 +329,22 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixtu
 
     // (1) The teardown reports Err(Containment), not Ok(()).
     match &result {
-        Err(cosca::error::Error::Containment { detail, .. }) => {
+        Err(error @ cosca::error::Error::Containment { .. }) => {
+            // Each member that refused is an error of its own below the variant, naming its pid.
+            use cosca::error::Error;
+            use std::error::Error as _;
+            let members: Vec<&Error> = match error.source().and_then(|source| source.downcast_ref::<Error>()) {
+                Some(Error::Several(list)) => list.iter().map(|member| &**member).collect(),
+                Some(one) => vec![one],
+                None => Vec::new(),
+            };
+            let refusing = format!("pid {priv_pid}: ");
             assert!(
-                detail.contains(&priv_pid.to_string()),
-                "Containment error should name the refusing pid {priv_pid}, got: {detail}"
+                members.iter().any(|member| matches!(
+                    member,
+                    Error::Containment { detail, .. } if detail.starts_with(&refusing)
+                )),
+                "the members of the Containment error should name the refusing pid {priv_pid}, got: {members:?}"
             );
         }
         other => panic!(

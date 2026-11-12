@@ -124,6 +124,10 @@ impl Contains for Walker {
         kill_tree(self.root, root)
     }
 
+    fn root_left(&self, root: Error) -> Error {
+        Error::members_left(crate::error::Failures::new(Arc::new(root), []), None)
+    }
+
     /// Kills again the members an earlier kill left ([`with_earlier`]), and holds the ones this one
     /// leaves.
     fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> KillLeftOutcome {
@@ -140,7 +144,7 @@ impl Contains for Walker {
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
-        terminate_tree(self.root, root)
+        terminate_tree(&crate::identity::HostKernel, self.root, root)
     }
 
     /// No kernel object says "every member has exited".
@@ -253,35 +257,20 @@ pub(crate) struct Walk {
 
 impl Walk {
     /// The members, for a query that must not take a short list for the tree: `Err` when the walk
-    /// could not assess a candidate, the first one's error, with each other's pid and cause in its
-    /// note. It logs nothing; the caller decides.
+    /// could not assess a candidate, the first one's error, with each other's whole error below its
+    /// variant ([`Error::with_peers`]), or below an `Unassessable` when the first is an [`Error::Io`],
+    /// which has no slot for them. It logs nothing; the caller decides.
     pub(crate) fn complete_members(self) -> Result<Vec<ProcessId>, Error> {
         let Walk { members, unassessed } = self;
         let mut unassessed = unassessed.into_iter();
         let Some((_, first)) = unassessed.next() else {
             return Ok(members);
         };
-        // The entry says the candidate's `detail` and its source chain, not the variant's prefix the
-        // first error already carries.
-        let entry = |why: &Error| match why {
-            Error::Unassessable { detail, source: None } => detail.clone(),
-            Error::Unassessable {
-                detail,
-                source: Some(source),
-            } => format!("{detail}: {}", crate::error::Report(source)),
-            other => crate::error::Report(other).to_string(),
-        };
-        let others: Vec<String> = unassessed
-            .map(|(pid, why)| format!("pid {pid} ({})", entry(&why)))
-            .collect();
-        Err(if others.is_empty() {
-            first
-        } else {
-            first.with_note(&format!(
-                "the walk could not assess these either: {}",
-                others.join("; ")
-            ))
-        })
+        Err(first.with_peers_or_unassessable(
+            || "the walk could not assess every candidate".to_owned(),
+            None,
+            unassessed.map(|(_, why)| Arc::new(why)),
+        ))
     }
 }
 
@@ -709,28 +698,22 @@ pub(crate) enum Left {
     Resolved(ProcessId),
     /// The walk never read its identity, so nothing can act on it: a later kill reports it again as
     /// the member it was first reported as, [`Error::MemberNotKilled`] with this `source` (the same
-    /// `Arc`) and `note`.
-    Unread {
-        pid: RawPid,
-        source: Arc<Error>,
-        note: Option<String>,
-    },
+    /// `Arc`).
+    Unread { pid: RawPid, source: Arc<Error> },
 }
 
 impl Left {
-    /// Every member `left` names, in order. A walk that was not made, or found no root, adds its
-    /// error as the last member, an [`Error::Unassessable`] or [`Error::Unsupported`] with no root
-    /// beside it; that names no process, so none is held. Every other member is a
-    /// [`Error::MemberNotKilled`]. A member never read shares its `source` with its `Left`.
+    /// Every member `left` names, in order: each [`Error::MemberNotKilled`]. The error of a walk that
+    /// was not made, or found no root, names no process, so none is held. A member never read shares
+    /// its `source` with its `Left`.
     pub(crate) fn of(left: &Unkilled) -> Vec<Left> {
-        let last = left.members.len().saturating_sub(1);
-        let (root, resolved) = (left.root.is_some(), &left.resolved);
+        let resolved = &left.resolved;
         let mut held = Vec::new();
-        for (at, member) in left.members.iter().enumerate() {
-            let Error::MemberNotKilled { pid, source, note } = member else {
+        for member in &left.members {
+            let Error::MemberNotKilled { pid, source } = member else {
                 debug_assert!(
-                    at == last && !root && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
-                    "only the error of a walk not made is not a `MemberNotKilled`, and it is last: {member:?} in {left:?}"
+                    left.root.is_none() && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
+                    "an error that is no member is the walk's not made, with no root left: {member:?}"
                 );
                 continue;
             };
@@ -739,7 +722,6 @@ impl Left {
                 None => Left::Unread {
                     pid: *pid,
                     source: Arc::clone(source),
-                    note: note.clone(),
                 },
             });
         }
@@ -800,7 +782,7 @@ pub(crate) fn with_earlier(
                 #[cfg(not(any(unix, windows)))]
                 let _ = (kernel, id);
             }
-            Left::Unread { pid, source, note } => members.push(Error::MemberNotKilled { pid, source, note }),
+            Left::Unread { pid, source } => members.push(Error::MemberNotKilled { pid, source }),
         }
     }
     if members.is_empty() && walked.members.is_empty() && walked.root.is_none() {
@@ -816,7 +798,6 @@ fn not_killed(pid: RawPid, source: Error) -> Error {
     Error::MemberNotKilled {
         pid,
         source: Arc::new(source),
-        note: None,
     }
 }
 
@@ -1103,16 +1084,16 @@ pub(crate) fn kill_tree<'a>(root: ProcessId, owner: Option<&dyn Root>) -> TreeKi
     }
 }
 
-/// [`terminate`] from the host's process table, as [`kill_tree`] decides it.
-pub(crate) fn terminate_tree(root: ProcessId, owner: Option<&dyn Root>) -> TerminateOutcome {
+/// [`terminate`] from `kernel`'s process table, as [`kill_tree`] decides it.
+pub(crate) fn terminate_tree(kernel: &dyn Kernel, root: ProcessId, owner: Option<&dyn Root>) -> TerminateOutcome {
     match skipped_walk(owner) {
         Some(skip) => TerminateOutcome::End(skip),
         None => {
-            let kernel = &crate::identity::HostKernel;
-            TerminateOutcome::Sent {
-                result: terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))),
-                earlier: Some("the SIGTERM"),
-            }
+            // `NotSent` is an error that comes before the first signal: the process table could not be
+            // read or the walk made (Unix), or the break could not be sent (Windows). A failed signal to
+            // the root or a member is only warned of, so it is `Sent { Ok }`.
+            let sent = terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)));
+            TerminateOutcome::of(sent.map(Ok), Some("the SIGTERM"))
         }
     }
 }

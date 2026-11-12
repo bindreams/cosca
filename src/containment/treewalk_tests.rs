@@ -46,7 +46,7 @@ fn a_tree_call_given_no_owner_sends_the_roots_term_by_identity() {
     let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
-    match super::terminate_tree(id, None) {
+    match super::terminate_tree(&crate::identity::HostKernel, id, None) {
         crate::containment::TerminateOutcome::Sent { result: Ok(()), .. } => {}
         other => panic!("the walk found the root and signalled it: {other:?}"),
     }
@@ -231,60 +231,95 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
     assert_eq!(pids(got), [400]);
 }
 
-/// `complete_members` is the first unassessed candidate's error, and each other's pid and cause.
-/// Mutant: "the others' causes are dropped".
+/// `complete_members` is the first unassessed candidate's error, its variant and detail kept, with
+/// the first's own cause and every other candidate's whole error below it as a `Several`, in order.
+/// No other candidate's words are in the detail.
+///
+/// Mutants: the others' errors are dropped, or put in the detail as text; the first's own cause is
+/// dropped; a `Several` is built of the others alone.
 #[skuld::test]
-fn complete_members_names_every_unassessed_candidate_with_its_cause() {
+fn complete_members_keeps_every_unassessed_candidate_as_a_cause_in_order() {
     let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
-    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
-        Err(Error::Unassessable {
-            detail: format!("cause of {pid}"),
-            source: None,
-        })
-    });
-    let first = got.unassessed[0].0;
-    let error = got.complete_members().expect_err("three candidates were not assessed");
-    let said = error.to_string();
-    assert!(said.contains(&format!("cause of {first}")), "{said}");
-    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        let entry = note_entry(&said, other);
-        assert_eq!(entry, format!("pid {other} (cause of {other})"), "{said}");
-    }
-}
-
-/// The note's entry for `pid`: from its `pid {pid} (` to the next entry, or the end.
-fn note_entry(said: &str, pid: RawPid) -> &str {
-    let start = said
-        .find(&format!("pid {pid} ("))
-        .unwrap_or_else(|| panic!("no entry for pid {pid} in: {said}"));
-    said[start..].split("; pid ").next().expect("split yields one piece")
-}
-
-/// The note on `complete_members` carries each other candidate's whole chain, its OS error included.
-#[skuld::test]
-fn complete_members_note_keeps_the_os_error_of_each_other_candidate() {
-    let parents = [(200, ROOT_PID), (300, ROOT_PID), (400, ROOT_PID)];
-    // A code per pid, so an entry paired with another candidate's error fails.
-    let os_error = |pid: RawPid| {
-        std::io::Error::from_raw_os_error(match pid {
-            200 => 2,
-            300 => 3,
-            _ => 5,
-        })
+    // A code per pid, so a cause paired with another candidate fails.
+    let os_code = |pid: RawPid| match pid {
+        200 => 2,
+        300 => 3,
+        _ => 5,
     };
     let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
         Err(Error::Unassessable {
             detail: format!("cause of {pid}"),
-            source: Some(Error::io_cause(os_error(pid))),
+            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(os_code(pid)))),
         })
     });
-    let first = got.unassessed[0].0;
+    let order: Vec<RawPid> = got.unassessed.iter().map(|(pid, _)| *pid).collect();
     let error = got.complete_members().expect_err("three candidates were not assessed");
-    let said = error.to_string();
-    for other in [200, 300, 400].into_iter().filter(|pid| *pid != first) {
-        let os_text = os_error(other).to_string();
-        assert!(note_entry(&said, other).contains(&os_text), "{said}");
+
+    let Error::Unassessable {
+        detail,
+        source: Some(source),
+    } = &error
+    else {
+        panic!("the first's variant is kept: {error:?}");
+    };
+    assert_eq!(*detail, format!("cause of {}", order[0]));
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = list
+        .iter()
+        .map(|member| crate::error::first_os_code(&**member))
+        .collect();
+    assert_eq!(codes, order.iter().map(|pid| Some(os_code(*pid))).collect::<Vec<_>>());
+    for other in &order[1..] {
+        let member = list
+            .iter()
+            .nth(order.iter().position(|pid| pid == other).expect("listed"))
+            .expect("a member");
+        assert!(
+            matches!(&**member, Error::Unassessable { detail, .. } if *detail == format!("cause of {other}")),
+            "{member:?}"
+        );
     }
+}
+
+/// When the first unassessed candidate's error is an `Error::Io` (a leaf, with no slot for peers), the
+/// answer is an `Unassessable` with that `Io` and every other candidate's error below it, in order.
+///
+/// Mutants: the others are dropped behind the `Io`; the `Io` is returned bare.
+#[skuld::test]
+fn complete_members_keeps_every_candidate_below_an_unassessable_when_the_first_is_an_io_error() {
+    let parents = [(200, ROOT_PID), (300, ROOT_PID)];
+    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
+        let code = if pid == 200 { 2 } else { 3 };
+        Err(if pid == 200 {
+            Error::Io(std::io::Error::from_raw_os_error(code))
+        } else {
+            Error::Unassessable {
+                detail: "the second".to_owned(),
+                source: Some(Error::io_cause(std::io::Error::from_raw_os_error(code))),
+            }
+        })
+    });
+    let order: Vec<RawPid> = got.unassessed.iter().map(|(pid, _)| *pid).collect();
+    assert_eq!(order, [200, 300]);
+
+    let error = got.complete_members().expect_err("two candidates were not assessed");
+
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &error
+    else {
+        panic!("expected Unassessable, got {error:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = list
+        .iter()
+        .map(|member| crate::error::first_os_code(&**member))
+        .collect();
+    assert_eq!(codes, [Some(2), Some(3)]);
 }
 
 /// A snapshot that lists the unreadable pid twice reads it once and counts it once.
@@ -763,9 +798,14 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
         .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
     let err = left.root.expect("the root was left");
-    // The message reads once: the pid, then the OS's own words.
+    // The message names the pid; the OS's own words are the source. `Report` prints them twice until the
+    // Display-table slice, because `Error::Io` prints its `io::Error` as its own text and as its source.
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
-    assert_eq!(err.to_string(), format!("pid {} was not killed: {os}", child.pid()));
+    assert_eq!(err.to_string(), format!("pid {} was not killed", child.pid()));
+    assert_eq!(
+        crate::error::Report(&err).to_string(),
+        format!("pid {} was not killed: {os}: {os}", child.pid())
+    );
     match err {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
             assert_eq!(pid, child.pid());
@@ -831,11 +871,17 @@ fn process_kill_tree_of_a_root_that_refuses_the_signal_names_the_root(
 
     let err = process.kill_tree().expect_err("the root refuses the kill");
 
-    match err {
+    let crate::error::Error::MembersLeft { members, .. } = &err else {
+        panic!("expected MembersLeft, got {err:?}");
+    };
+    let [member] = &members.iter().collect::<Vec<_>>()[..] else {
+        panic!("the root is the one member left: {members:?}");
+    };
+    match &***member {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
-            assert_eq!(pid, child.pid());
+            assert_eq!(*pid, child.pid());
             assert!(
-                matches!(*source, crate::error::Error::Io(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+                matches!(&**source, crate::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
                 "{source:?}"
             );
         }
@@ -845,13 +891,13 @@ fn process_kill_tree_of_a_root_that_refuses_the_signal_names_the_root(
     assert!(child.wait().expect("the helper exits on EOF").success());
 }
 
-/// `Process::kill_tree` of a tree with two members that refuse the signal: the error names the first,
-/// and the call warns of the other once, under its own name.
+/// `Process::kill_tree` of a tree with two members that refuse the signal: the error holds both, each
+/// named once with the refusal's OS error, and nothing is warned of one by one.
 ///
-/// Mutants: the other member is dropped; it is warned of by the walk as well as by the call.
+/// Mutants: a member is dropped; one is named twice; the members are warned of as well as returned.
 #[cfg(unix)]
 #[skuld::test]
-fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once(
+fn process_kill_tree_returns_every_refusing_member_and_warns_of_none(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
     crate::log_capture::install();
@@ -861,16 +907,22 @@ fn process_kill_tree_names_the_first_refusing_member_and_warns_of_the_other_once
 
     let err = process.kill_tree().expect_err("two members refuse the kill");
 
-    let crate::error::Error::MemberNotKilled { pid: first, .. } = err else {
-        panic!("expected MemberNotKilled, got {err:?}");
+    let crate::error::Error::MembersLeft { members, .. } = &err else {
+        panic!("expected MembersLeft, got {err:?}");
     };
+    let mut pids = Vec::new();
+    for member in members.iter() {
+        let crate::error::Error::MemberNotKilled { pid, .. } = &**member else {
+            panic!("expected MemberNotKilled, got {member:?}");
+        };
+        assert_eq!(crate::error::first_os_code(&**member), Some(libc::EPERM), "{member:?}");
+        pids.push(*pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    assert_eq!(pids.len(), 2, "each refusing member is named once: {members:?}");
     let warned = crate::log_capture::warns_since(mark, "was not killed");
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].starts_with("Process::kill_tree: pid "), "{warned:?}");
-    assert!(
-        !warned[0].contains(&format!("pid {first} ")),
-        "the warn names the other member, not the first: {warned:?}"
-    );
+    assert!(warned.is_empty(), "the members are in the error: {warned:?}");
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
 }
@@ -1045,7 +1097,7 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
         if !skipped {
             assert!(matches!(killed, TreeKillOutcome::NoRoot), "kill, {name}: {killed:?}");
         }
-        let termed = super::terminate_tree(self::root(), Some(&root));
+        let termed = super::terminate_tree(&crate::identity::HostKernel, self::root(), Some(&root));
         assert_eq!(
             matches!(termed, TerminateOutcome::End(_)),
             skipped,
@@ -1058,7 +1110,7 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
 ///
 /// Mutant: the held member copies the cause or drops the note.
 #[skuld::test]
-fn a_member_never_read_is_held_with_its_own_cause_and_note() {
+fn a_member_never_read_is_held_with_its_own_cause() {
     use super::{not_killed, Left};
     use crate::containment::dispatch::Unkilled;
     let code = if cfg!(windows) { 5 } else { 13 };
@@ -1077,7 +1129,6 @@ fn a_member_never_read_is_held_with_its_own_cause_and_note() {
     let member = Error::MemberNotKilled {
         pid,
         source: std::sync::Arc::clone(&source),
-        note: Some("a note".into()),
     };
     let first = Unkilled {
         members: vec![member],
@@ -1087,19 +1138,13 @@ fn a_member_never_read_is_held_with_its_own_cause_and_note() {
 
     let held = Left::of(&first);
 
-    let [Left::Unread {
-        pid: 7,
-        source: held,
-        note,
-    }] = held.as_slice()
-    else {
+    let [Left::Unread { pid: 7, source: held }] = held.as_slice() else {
         panic!("never read: {held:?}");
     };
     assert!(
         std::sync::Arc::ptr_eq(held, &source),
         "the held source is the member's own"
     );
-    assert_eq!(note.as_deref(), Some("a note"));
     assert_eq!(crate::error::first_os_code(&**held), Some(code), "{held:?}");
 }
 
@@ -1107,12 +1152,11 @@ fn a_member_never_read_is_held_with_its_own_cause_and_note() {
 /// first round reported it: the `Report` does not grow a layer per round, and a bare OS error stays an
 /// `Error::Io` with its code on the `io::Error`, where a caller matches it.
 ///
-/// Each round's member is the first round's own: its `source` is the same `Arc`, and its `note` is
-/// carried.
+/// Each round's member is the first round's own: its `source` is the same `Arc`.
 ///
 /// Mutants: a round wraps the held cause in another layer; the held cause is rebuilt as another
 /// variant, so the code is no longer on the `Error::Io`; a round rebuilds the source from parts, so
-/// it is not the first round's; a round drops the member's note.
+/// it is not the first round's.
 #[skuld::test]
 fn a_member_never_read_is_reported_the_same_over_every_round() {
     use super::{not_killed, with_earlier, Left};
@@ -1137,12 +1181,10 @@ fn a_member_never_read_is_reported_the_same_over_every_round() {
         ) else {
             unreachable!("`not_killed` builds a `MemberNotKilled`");
         };
-        let note = Some("the cleanup's note".to_owned());
         let mut round = Unkilled {
             members: vec![Error::MemberNotKilled {
                 pid,
                 source: std::sync::Arc::clone(&source),
-                note: note.clone(),
             }],
             root: None,
             resolved: Vec::new(),
@@ -1154,19 +1196,13 @@ fn a_member_never_read_is_reported_the_same_over_every_round() {
                 .0
                 .expect_err("never read, so never shown killed");
             assert_eq!(Report(&round.members[0]).to_string(), first, "{what}, round {n}");
-            let Error::MemberNotKilled {
-                source: again,
-                note: kept,
-                ..
-            } = &round.members[0]
-            else {
+            let Error::MemberNotKilled { source: again, .. } = &round.members[0] else {
                 panic!("{round:?}");
             };
             assert!(
                 std::sync::Arc::ptr_eq(again, &source),
                 "{what}, round {n}: the first round's source"
             );
-            assert_eq!(*kept, note, "{what}, round {n}");
         }
         assert_eq!(crate::error::first_os_code(&round.members[0]), Some(code), "{what}");
         let Error::MemberNotKilled { source, .. } = &round.members[0] else {

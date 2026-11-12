@@ -192,10 +192,10 @@ impl Tree {
 
     /// [`send_kill`](Self::send_kill) for a caller with no root to kill after it, settled and
     /// reported as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not
-    /// ended. `caller` names the call in the warns of the members it left besides the first.
+    /// ended.
     #[cfg(unix)]
-    pub(crate) fn kill_settled(&self, caller: &str, root: Option<&dyn Root>) -> Result<(), Error> {
-        self.settle_for_kill_tree(caller, self.send_kill(root), false).answer
+    pub(crate) fn kill_settled(&self, root: Option<&dyn Root>) -> Result<(), Error> {
+        self.settle_for_kill_tree(self.send_kill(root), false).answer
     }
 
     /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
@@ -205,15 +205,12 @@ impl Tree {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(false, "Tree::terminate on a tree that is not contained");
-                TerminateOutcome::Sent {
-                    result: Err(Error::Unsupported {
-                        op: "terminate on a non-actionable mechanism".into(),
-                        platform: std::env::consts::OS,
-                        detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
-                        source: None,
-                    }),
-                    earlier: Some("the SIGTERM"),
-                }
+                TerminateOutcome::NotSent(Error::Unsupported {
+                    op: "terminate on a non-actionable mechanism".into(),
+                    platform: std::env::consts::OS,
+                    detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
+                    source: None,
+                })
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
@@ -348,26 +345,31 @@ impl Tree {
         self.killed.settle(self.named_by(), outcome, root_ended)
     }
 
-    /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
-    /// left, and each other is warned of here, once. `caller` names the call in those warns.
+    /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left.
     pub(crate) fn settle_for_kill_tree(
         &self,
-        caller: &str,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
-        self.killed
-            .settle_for_kill_tree(caller, self.named_by(), outcome, root_ended)
+        self.killed.settle_for_kill_tree(self.named_by(), outcome, root_ended)
+    }
+
+    /// [`Contains::root_left`] of this tree's mechanism. A tree that holds none is not reached:
+    /// `kill_tree` requires one ([`require_contained`](Self::require_contained)).
+    pub(crate) fn root_left(&self, root: Error) -> Error {
+        match self.named_by() {
+            Some(mechanism) => mechanism.root_left(root),
+            None => {
+                debug_assert!(false, "a tree kill's backstop failed on a tree that holds no mechanism");
+                crate::containment::mechanism::root_left_alone(root)
+            }
+        }
     }
 
     /// `outcome` for a `kill_tree` that goes on to the root's backstop (see
     /// [`TreeKilled::unless_unwalked`]).
-    pub(crate) fn unless_unwalked(
-        &self,
-        caller: &str,
-        outcome: TreeKillOutcome,
-    ) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
-        self.killed.unless_unwalked(caller, self.named_by(), outcome)
+    pub(crate) fn unless_unwalked(&self, outcome: TreeKillOutcome) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
+        self.killed.unless_unwalked(self.named_by(), outcome)
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded

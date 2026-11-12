@@ -325,7 +325,6 @@ impl Child {
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
-    /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
     /// As the sync [`Child::kill_tree`](crate::Child::kill_tree): same `Ok`, errors and stated limits.
     /// The kill is sent on the calling thread; the wait for the members, the root and the drain edge

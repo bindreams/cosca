@@ -460,9 +460,10 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
     });
 }
 
-/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break. The
-/// checks, including the sender's empty break record, run in `test_child::ctrl_break::console_less`
-/// in a re-exec of this binary spawned detached.
+/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break, and a
+/// job's or a walker's send to a group the caller leads is `NotSent`. The checks, including the
+/// sender's empty break record, run in `test_child::ctrl_break::console_less` in a re-exec of this
+/// binary spawned detached.
 #[skuld::test]
 fn console_less_caller_sends_no_break() {
     ctrl_break::drive_reporter(

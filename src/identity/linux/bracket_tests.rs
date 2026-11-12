@@ -126,6 +126,40 @@ fn a_stat_with_no_readable_ppid_is_unknown_not_another_parent() {
     ));
 }
 
+/// A candidate whose own read failed under a parent whose proof fails too is one error that holds
+/// both: the parent's proof, which decided the answer, is its variant, and the candidate's own read
+/// is a peer below it, after the proof's own cause.
+///
+/// Mutant: the parent's verdict replaces the candidate's failure, which is then in no error.
+#[skuld::test]
+fn a_candidate_that_failed_under_an_unprovable_parent_keeps_its_own_cause() {
+    let parent = ProcessId::from_parts_for_test(7, Key::Pidfs(9));
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pidfd_open(PID, Err(Errno::MFILE))
+        .on_pidfd_open(7, Err(Errno::NFILE));
+
+    let read = ProcessId::of_ordered_with(&kernel, PID, Some(parent), None, None);
+    let error = crate::identity::resolution_of("pid", PID, read).expect_err("neither read could be made");
+
+    let crate::error::Error::Unassessable {
+        detail,
+        source: Some(source),
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(
+        detail.starts_with("ppid 7") && detail.contains("reading pid 4242"),
+        "{detail}"
+    );
+    let crate::error::Error::Several(causes) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
+    assert_eq!(codes, [Some(libc::ENFILE), Some(libc::EMFILE)], "{error:?}");
+}
+
 /// A `stat` that cannot be read at all, for a candidate under a parent that is gone, is `Gone`: the
 /// read is `Unknown` blaming the candidate only once the parent is held.
 ///

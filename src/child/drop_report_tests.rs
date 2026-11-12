@@ -874,20 +874,18 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
         .iter()
         .find(|warn| warn.contains(&leaf_path.display().to_string()))
         .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
-    // Warn uses `Report`, the cause uses `Display`; both start with the early kill's text.
+    // The warn and the returned text both say the early kill through `Report`.
     let cause = cause.to_string();
+    // A failed `cgroup.kill` is a `Containment` over the OS error, which `Report` prints whole.
+    let report = format!(
+        "the drop's tree kill, made early, failed too (process containment failed: the kernel refused the \
+         write of {}/cgroup.kill: {early}: {early})",
+        leaf_path.display()
+    );
     assert!(cause.contains(&first), "the first failure: {cause}");
-    assert!(
-        cause.contains(&format!("the drop's tree kill, made early, failed too ({early})")),
-        "the early kill's Display: {cause}"
-    );
+    assert!(cause.contains(&report), "the early kill's Report: {cause}");
     assert!(warn.contains(&first), "the first failure: {warn}");
-    assert!(
-        warn.contains(&format!(
-            "the drop's tree kill, made early, failed too ({early}: {early})"
-        )),
-        "the early kill's Report: {warn}"
-    );
+    assert!(warn.contains(&report), "the early kill's Report: {warn}");
     handed_back.wait();
 }
 

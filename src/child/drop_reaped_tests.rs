@@ -597,7 +597,7 @@ fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns(#[fixture(stray_
     let left = child
         .kill_tree()
         .expect_err("a tree walk that left a member is an error");
-    assert!(matches!(left, crate::error::Error::MemberNotKilled { .. }), "{left:?}");
+    assert!(matches!(left, crate::error::Error::MembersLeft { .. }), "{left:?}");
     // Released after the kill so a no-op kill fails the assertion, not the wait.
     drop(stdin);
     crate::test_child::assert_killed("the root", child.wait().expect("reap the root"));
@@ -626,7 +626,7 @@ fn a_second_kill_tree_after_a_walk_left_a_member_reports_it_again_and_does_not_m
     let second = child
         .kill_tree()
         .expect_err("the member the first walk left is not shown killed");
-    let pid_of = |error: &crate::error::Error| match error {
+    let pid_of = |error: &crate::error::Error| match error.left_members()[0] {
         crate::error::Error::MemberNotKilled { pid, .. } => *pid,
         other => panic!("expected MemberNotKilled, got {other:?}"),
     };
@@ -676,7 +676,7 @@ fn a_kill_tree_after_wait_reports_the_member_an_earlier_kill_left(#[fixture(stra
         .kill_tree()
         .expect_err("the root is gone, and the member is not shown killed");
 
-    let pid_of = |error: &crate::error::Error| match error {
+    let pid_of = |error: &crate::error::Error| match error.left_members()[0] {
         crate::error::Error::MemberNotKilled { pid, .. } => *pid,
         other => panic!("expected MemberNotKilled, got {other:?}"),
     };
@@ -832,7 +832,7 @@ fn kill_tree_after_a_walk_that_left_a_descendant_and_the_root_names_the_descenda
     let err = child.kill_tree().expect_err("a descendant was left");
 
     assert!(
-        matches!(err, crate::error::Error::MemberNotKilled { pid, .. } if pid == root.wrapping_add(1)),
+        matches!(err.left_members()[..], [crate::error::Error::MemberNotKilled { pid, .. }] if *pid == root.wrapping_add(1)),
         "{err:?}"
     );
     let stale = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {root} was not killed"));

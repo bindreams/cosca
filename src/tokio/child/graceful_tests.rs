@@ -470,23 +470,27 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     let _ = id;
 }
 
-// Async twin of `graceful_tree_unassessable_mechanism_failure_fails_fast`.
+// Async twin of `graceful_tree_unassessable_with_a_source_still_sweeps_and_reaps`.
 #[skuld::test]
-async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
+async fn async_graceful_tree_unassessable_with_a_source_still_sweeps_and_reaps() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = blocker().await;
+    let (mut child, stdin) = kill_only_blocker().await;
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
-    let err = child
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
-        .expect_err("the forced listing-mechanism failure must surface immediately");
-    assert!(
-        matches!(err, crate::error::Error::Unassessable { source: Some(_), .. }),
-        "got {err:?}"
+        .expect("a successful sweep must supersede the forced check failure");
+    crate::test_child::assert_killed("the root", status);
+    #[cfg(unix)]
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "root must be swept AND reaped despite the forced check failure"
     );
-    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
-    assert_still_running(&mut child, stdin).await;
-    cleanup(&mut child).await;
+    #[cfg(windows)]
+    let _ = id;
 }
 
 // Async twin of `child::graceful_tests::drained_tree_sweep_decision`.
@@ -772,7 +776,7 @@ async fn async_graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_
         .await
         .expect_err("a descendant was left");
 
-    assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+    assert!(matches!(err, crate::error::Error::MembersLeft { .. }), "{err:?}");
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,
@@ -965,7 +969,7 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
 
     let (error, ()) = ::tokio::join!(
         async {
-            let error = child.shut_down_holders_only(&skip, Duration::ZERO).await;
+            let error = child.shut_down_holders_only(skip, Duration::ZERO).await;
             done.set(true);
             error
         },
@@ -1013,7 +1017,7 @@ async fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_err
     let child = tokio_child_with(&root, fake.reaching_unobserved(4242));
     let skip = holders_only_skip(&child.inner);
 
-    let error = child.shut_down_holders_only(&skip, Duration::ZERO).await;
+    let error = child.shut_down_holders_only(skip, Duration::ZERO).await;
 
     assert!(
         matches!(&error, crate::error::Error::Unassessable { detail, source: None }

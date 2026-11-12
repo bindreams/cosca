@@ -16,6 +16,7 @@
 use nix::sys::signal::Signal;
 
 use crate::containment::{check_number, Root};
+use crate::error::Error;
 use crate::identity::{ProcessId, RawPid};
 
 /// One process-group member as the listing found it, carrying the identity (built from the
@@ -191,10 +192,15 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                 );
                 continue;
             }
-            // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc).
+            // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc),
+            // and the failure that came with its read is its peer: both are causes of the listing.
             Err(e) => {
                 let message = format!("containment::unix::group::members: process group {pgid} cannot be listed");
-                return Err(listing_error(std::io::ErrorKind::Other, message, Some(e.into())));
+                return Err(listing_error(
+                    std::io::ErrorKind::Other,
+                    message,
+                    Some(Box::new(e.into_cause())),
+                ));
             }
         };
         let Some(g) = parse_pgrp(&stat) else {
@@ -318,16 +324,16 @@ pub(crate) enum GroupState {
     /// overall verdict; a caller reading the error should learn the group's true state may be
     /// WORSE than `refused` alone says, not just that one member refused.
     Refused {
-        refused: Vec<RawPid>,
-        unassessable: Vec<RawPid>,
+        refused: Vec<(RawPid, Error)>,
+        unassessable: Vec<(RawPid, Error)>,
     },
-    /// The group's membership could not be listed (`source: Some`), or a listed member's
-    /// liveness could not be assessed at all (`source: None`) — either way nothing can be
-    /// said about whether the group is down. Mirrors `Error::Unassessable`'s own shape.
-    Unlistable {
-        detail: String,
-        source: Option<std::io::Error>,
-    },
+    /// Listed members' liveness could not be assessed at all, and no member is a confirmed refuser:
+    /// nothing can be said about whether the group is down. Each member is held with the error that
+    /// left it unassessed.
+    Unassessed { members: Vec<(RawPid, Error)> },
+    /// The group's membership could not be listed: nothing can be said about whether the group is
+    /// down.
+    Unlistable { detail: String, source: std::io::Error },
 }
 
 /// Whether a live-confirmed member was actually reached by the signal/probe. A THIRD
@@ -335,15 +341,17 @@ pub(crate) enum GroupState {
 /// `classify_member`: collapsing "could not assess" into a binary `bool` at the boundary
 /// where the distinction matters most (inside `converge`'s `reached` closure) would silently
 /// re-narrow the `Liveness::Unknown` handling `classify_member` otherwise protects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Reached {
     /// Not a survivor, by any evidence: already gone, or not in the group any more.
     Yes,
     /// The `SIGKILL` resend was delivered to it: it is not a survivor, and the kill's wait goes on to
     /// wait for its exit.
     Killed,
-    No,
-    Unknown,
+    /// A confirmed refusal, with the error the signal or probe answered.
+    No(Error),
+    /// Could not be assessed, with the error that says why.
+    Unknown(Error),
 }
 
 /// One listed member's fate, decided from its already-read `Liveness` plus (whenever an
@@ -362,8 +370,8 @@ enum Reached {
 /// unrelated process, however a signal/probe of the raw pid might answer.
 enum MemberOutcome {
     NotASurvivor,
-    Survivor(RawPid),
-    Unassessable(RawPid),
+    Survivor(RawPid, Error),
+    Unassessable(RawPid, Error),
 }
 
 fn classify_member(
@@ -375,8 +383,8 @@ fn classify_member(
         crate::identity::Liveness::Dead => MemberOutcome::NotASurvivor,
         crate::identity::Liveness::Alive | crate::identity::Liveness::Unknown => match reached() {
             Reached::Yes | Reached::Killed => MemberOutcome::NotASurvivor,
-            Reached::No => MemberOutcome::Survivor(pid),
-            Reached::Unknown => MemberOutcome::Unassessable(pid),
+            Reached::No(cause) => MemberOutcome::Survivor(pid, cause),
+            Reached::Unknown(cause) => MemberOutcome::Unassessable(pid, cause),
         },
     }
 }
@@ -429,7 +437,10 @@ fn probe_member(
                 "containment::unix::group: pid {pid} could not be re-verified (access denied?) \
                  — treated as unassessable, not probed"
             );
-            return Reached::Unknown;
+            return Reached::Unknown(Error::Unassessable {
+                detail: "its identity could not be re-verified (access denied?), so it was not probed".to_owned(),
+                source: None,
+            });
         }
     }
     let Some(target) = crate::identity::probe::signal_target(pid) else {
@@ -438,17 +449,20 @@ fn probe_member(
         // (wrongly) cleared — the conservative direction, matching every other "should never
         // happen" branch in this module.
         log::warn!("containment::unix::group: pid {pid} is not a single-process signal target");
-        return Reached::Unknown;
+        return Reached::Unknown(Error::Unassessable {
+            detail: "it is not a single-process signal target".to_owned(),
+            source: None,
+        });
     };
     match super::probe_signal(super::Target::Member(pid), super::Sys::Process(target)) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Reached::Yes,
-        Err(nix::errno::Errno::EPERM) => {
+        Err(e @ nix::errno::Errno::EPERM) => {
             // The expected, common case for a genuine refuser — logged at debug (not warn),
             // but logged: every other "member did not clear" branch in this module records
             // its cause, and this is the one that produces the primary, expected outcome of
             // the whole feature (a confirmed refusal), so it should be no less traceable.
             log::debug!("containment::unix::group: kill({pid}, 0) refused: EPERM");
-            Reached::No
+            Reached::No(Error::Io(e.into()))
         }
         Err(e) => {
             // Neither EPERM nor ESRCH: genuinely anomalous. Not evidence of a refusal, and
@@ -458,7 +472,7 @@ fn probe_member(
                 "containment::unix::group: kill({pid}, 0) answered {report}, neither EPERM nor ESRCH",
                 report = crate::error::Report(&e)
             );
-            Reached::Unknown
+            Reached::Unknown(Error::Io(e.into()))
         }
     }
 }
@@ -483,7 +497,10 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
                 "containment::unix::group: {why}, so pid {pid} is not {send}; it is unassessable",
                 why = crate::error::Report(&why)
             );
-            Err(Reached::Unknown)
+            Err(Reached::Unknown(Error::Unassessable {
+                detail: format!("{why}, so it is not {send}"),
+                source: why.cause(),
+            }))
         }
     }
 }
@@ -528,11 +545,10 @@ fn resend_sigkill(
                     KillOutcome::Terminated => Reached::Killed,
                     // Exited between the open and the send.
                     KillOutcome::AlreadyGone => Reached::Yes,
-                    KillOutcome::NotAttempted(crate::error::Error::Io(refused))
-                        if refused.raw_os_error() == Some(libc::EPERM) =>
+                    KillOutcome::NotAttempted(refused) if matches!(&refused, Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)) =>
                     {
                         log::debug!("containment::unix::group: SIGKILL to pid {} refused: EPERM", id.pid());
-                        Reached::No
+                        Reached::No(refused)
                     }
                     KillOutcome::NotAttempted(e) => {
                         log::warn!(
@@ -540,19 +556,19 @@ fn resend_sigkill(
                             id.pid(),
                             report = crate::error::Report(&e)
                         );
-                        Reached::Unknown
+                        Reached::Unknown(e)
                     }
                 }
             }
         },
-        Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
+        Err(e @ Error::NotThreadGroupLeader { .. }) => {
             log::warn!(
                 "containment::unix::group: pid {} is a live thread, not a thread-group leader, so it \
                  is not signalled: {report}",
                 id.pid(),
                 report = crate::error::Report(&e)
             );
-            Reached::Unknown
+            Reached::Unknown(e)
         }
         // `Error::Unassessable`, or a variant added later: a statement about the PID itself, which
         // no kill(2) fallback resolves. Conservative, not a guess.
@@ -562,7 +578,7 @@ fn resend_sigkill(
                 id.pid(),
                 report = crate::error::Report(&e)
             );
-            Reached::Unknown
+            Reached::Unknown(e)
         }
     }
 }
@@ -596,11 +612,11 @@ fn resend_sigkill(
 /// recheck answer that actually contradicts the `Survivor` verdict; `Unknown` contradicts
 /// nothing.
 fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::identity::Liveness) -> MemberOutcome {
-    let MemberOutcome::Survivor(pid) = outcome else {
+    let MemberOutcome::Survivor(pid, cause) = outcome else {
         return outcome;
     };
     match recheck() {
-        crate::identity::Liveness::Alive => MemberOutcome::Survivor(pid),
+        crate::identity::Liveness::Alive => MemberOutcome::Survivor(pid, cause),
         crate::identity::Liveness::Dead => {
             log::debug!(
                 "containment::unix::group: pid {pid} answered EPERM but has since gone (exited \
@@ -610,7 +626,7 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
         }
         // A denied reconfirmation does NOT overturn an already-observed, authoritative EPERM
         // — see the doc comment above for why this differs from the Dead arm.
-        crate::identity::Liveness::Unknown => MemberOutcome::Survivor(pid),
+        crate::identity::Liveness::Unknown => MemberOutcome::Survivor(pid, cause),
     }
 }
 
@@ -669,11 +685,16 @@ pub(crate) fn converge(
                      actually reached",
                     pid = id.pid()
                 );
-                return Reached::Unknown;
+                return Reached::Unknown(Error::Unassessable {
+                    detail: "it is excluded from the SIGKILL resend (init, or a system process), so it was \
+                             never reached"
+                        .to_owned(),
+                    source: None,
+                });
             }
             if signal == Signal::SIGKILL {
                 let reached = resend_sigkill(kernel, id, root);
-                delivered = reached == Reached::Killed;
+                delivered = matches!(reached, Reached::Killed);
                 reached
             } else {
                 // `SIGTERM` is never resent: it is only probed (see this fn's doc).
@@ -686,11 +707,11 @@ pub(crate) fn converge(
         }
         match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {
             MemberOutcome::NotASurvivor => {}
-            MemberOutcome::Survivor(pid) => refused.push(pid),
-            MemberOutcome::Unassessable(pid) => unassessable.push(pid),
+            MemberOutcome::Survivor(pid, cause) => refused.push((pid, cause)),
+            MemberOutcome::Unassessable(pid, cause) => unassessable.push((pid, cause)),
         }
     }
-    Ok(decide(pgid, signal, refused, unassessable))
+    Ok(decide(refused, unassessable))
 }
 
 /// Mirrors xnu's own `killpg1` exclusion set for the `SIGKILL` resend above: `killpg1` skips
@@ -714,24 +735,12 @@ fn excluded_from_sigkill_resend(pid: RawPid, system: bool) -> bool {
 /// unassessable pids are carried in `Refused`'s own `unassessable` field rather than merely
 /// logged: a debug log line alone would be an incomplete payload on the one issue whose entire
 /// point is not under-reporting teardown state.
-fn decide(pgid: i32, signal: Signal, refused: Vec<RawPid>, unassessable: Vec<RawPid>) -> GroupState {
+fn decide(refused: Vec<(RawPid, Error)>, unassessable: Vec<(RawPid, Error)>) -> GroupState {
     if !refused.is_empty() {
         return GroupState::Refused { refused, unassessable };
     }
     if !unassessable.is_empty() {
-        let list = unassessable
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return GroupState::Unlistable {
-            detail: format!(
-                "{n} member(s) of process group {pgid} could not be assessed after {signal} \
-                 (pid {list})",
-                n = unassessable.len(),
-            ),
-            source: None,
-        };
+        return GroupState::Unassessed { members: unassessable };
     }
     GroupState::Cleared
 }
@@ -758,7 +767,7 @@ pub(crate) fn state(
         Ok(gs) => gs,
         Err(e) => GroupState::Unlistable {
             detail: format!("process group {pgid} could not be listed after {signal}"),
-            source: Some(e),
+            source: e,
         },
     }
 }

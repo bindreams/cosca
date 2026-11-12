@@ -49,8 +49,9 @@ impl Process {
     /// be queried: nothing is killed, the root included. Also when the root is gone, or no longer
     /// holds its pid: no walk ran, and nothing was killed.
     ///
-    /// [`Error::MemberNotKilled`] when the walk killed what it could and left a member running,
-    /// naming the first and why: its identity could not be read, or its kill was refused.
+    /// [`Error::MembersLeft`] when the walk killed what it could and left members running, each a
+    /// [`Error::MemberNotKilled`] naming it and why: its identity could not be read, or its kill was
+    /// refused.
     ///
     /// **`Ok` means every member the walk killed has exited**, and so has the root: the call waits
     /// for each, with no deadline. A member forked after the walk's snapshot is not seen. On Linux
@@ -94,12 +95,8 @@ impl Process {
         kernel: &'a dyn crate::identity::Kernel,
     ) -> (Result<(), Error>, crate::containment::KillWait<'a>) {
         let (outcome, wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
-        // No handle backstop: the root is left as any member is, and the first member left is the
-        // error. This call's one report of the others.
-        let answer = outcome
-            .into_result()
-            .or_else(|left| left.unsettled(false))
-            .map_err(|left| left.report("Process::kill_tree"));
+        // No handle backstop: the root is left as any member is, and the error holds every member.
+        let answer = outcome.into_result().or_else(|left| left.unsettled(false));
         let landed = wait.root_killed();
         (answer, wait.with_root(&*self.os, landed))
     }

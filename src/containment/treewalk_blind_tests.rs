@@ -64,6 +64,22 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
     }
 }
 
+/// The walker's cooperative signal over a failed listing sent nothing: `NotSent`, with the listing's
+/// error, so `graceful_shutdown_tree` ends the call. Mutant: the failure is a `Sent { result: Err(..) }`.
+#[skuld::test]
+fn a_walkers_terminate_over_a_failed_listing_says_nothing_was_sent() {
+    let (child, id) = live_member();
+    let forced = force_blind_snapshot();
+    let outcome = super::terminate_tree(&crate::identity::HostKernel, id, None);
+    drop(forced);
+    match outcome {
+        crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
+            if detail.contains("proc_listallpids") => {}
+        other => panic!("expected NotSent(Unassessable), got {other:?}"),
+    }
+    release(child);
+}
+
 /// Mutant: "`children` maps the snapshot's error to `Ok(vec![])`".
 #[skuld::test]
 fn children_over_a_failed_listing_are_unassessable() {

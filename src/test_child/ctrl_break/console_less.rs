@@ -47,15 +47,66 @@ fn assert_no_console() {
     );
 }
 
+/// A blocker that leads a console process group of its own, which the test made and so may signal.
+/// It is `CREATE_NO_WINDOW` through the test spawn helpers.
+fn spawn_group_leader() -> std::process::Child {
+    use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    crate::test_spawn::spawn_with(
+        &mut crate::test_child::held_std_killable_blocker(),
+        CREATE_NEW_PROCESS_GROUP.0,
+        crate::test_spawn::console_flags::Console::Hidden,
+    )
+    .expect("spawn the group leader")
+}
+
+/// The sends beneath the ops, to a group this process made and leads: with no console the OS
+/// refuses the `CTRL_BREAK`, so each is `NotSent` with nothing sent. A job's send and the walker's
+/// are both checked.
+///
+/// Mutant: a send folds the refusal into `Sent { result: Err(..) }`.
+fn assert_refused_sends_are_not_sent() {
+    use crate::containment::{Contains as _, TerminateOutcome};
+
+    let mut leader = spawn_group_leader();
+    let job = crate::containment::windows::assign_to_kill_on_close_job(
+        std::os::windows::io::AsRawHandle::as_raw_handle(&leader),
+    )
+    .expect("assign the group leader to a job");
+    let outcome = job.send_terminate(leader.id(), None);
+    assert!(
+        matches!(outcome, TerminateOutcome::NotSent(_)),
+        "a job's refused break must be NotSent, got {outcome:?}"
+    );
+    assert_no_break_sent();
+    job.hard_kill().expect("end the group leader");
+    leader.wait().expect("reap the group leader");
+
+    let mut leader = spawn_group_leader();
+    let id = crate::identity::ProcessId::of(leader.id())
+        .found()
+        .expect("the live group leader resolves");
+    let outcome = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None);
+    assert!(
+        matches!(outcome, TerminateOutcome::NotSent(_)),
+        "a walker's refused break must be NotSent, got {outcome:?}"
+    );
+    assert_no_break_sent();
+    leader.kill().expect("end the group leader");
+    leader.wait().expect("reap the group leader");
+}
+
 /// Runs the tree ops and then the lone ops against a contained member that cannot be signalled, from
 /// a caller with no console: each cooperative op fails with `NoConsole` and leaves the member
-/// running, and the forced ops still end it. No op sends a break.
+/// running, and the forced ops still end it. No op sends a break, and the sends beneath them, to a
+/// group the reporter leads, are refused.
 #[skuld::test]
 fn fixture_console_less_reporter() {
     let Some(mut report) = connect_reporter(ADDR_ENV) else {
         return;
     };
     assert_no_console();
+    assert_refused_sends_are_not_sent();
 
     // The tree ops.
     let (child, sock) = spawn_consoleless_root();

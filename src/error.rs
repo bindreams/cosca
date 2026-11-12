@@ -126,6 +126,57 @@ pub enum RecordErrorKind {
     ScopeUnreadable,
 }
 
+/// A non-empty, ordered list of the errors that one operation's failure is made of, built only by
+/// cosca. [`Error::Several`] holds one as the `source` of the variant the failing site returns, and
+/// [`Error::MembersLeft`] holds the members a tree kill left. [`iter`](Failures::iter) gives the
+/// count (`iter().len()`).
+#[derive(Debug)]
+pub struct Failures {
+    // Never empty: `first` reads `members[0]`.
+    members: Vec<Arc<Error>>,
+}
+
+impl Failures {
+    /// The list of `first` and then `rest`.
+    pub(crate) fn new(first: Arc<Error>, rest: impl IntoIterator<Item = Arc<Error>>) -> Failures {
+        Failures {
+            members: std::iter::once(first).chain(rest).collect(),
+        }
+    }
+
+    /// The list of `members`, or `None` when there are none.
+    pub(crate) fn collect(members: impl IntoIterator<Item = Arc<Error>>) -> Option<Failures> {
+        let mut members = members.into_iter();
+        let first = members.next()?;
+        Some(Failures::new(first, members))
+    }
+
+    /// The first failure, the one [`Error::source`](std::error::Error::source) of a list gives.
+    pub fn first(&self) -> &Arc<Error> {
+        &self.members[0]
+    }
+
+    /// Every failure, in order. The iterator's length is the count.
+    pub fn iter(&self) -> std::slice::Iter<'_, Arc<Error>> {
+        self.members.iter()
+    }
+
+    /// This list, then `more`.
+    fn extended(mut self, more: impl IntoIterator<Item = Arc<Error>>) -> Failures {
+        self.members.extend(more);
+        self
+    }
+
+    /// The `source` of the error a site returns for this list: its one member, or a
+    /// [`Error::Several`] of them when there are two or more.
+    pub(crate) fn into_cause(mut self) -> Arc<Error> {
+        if self.members.len() == 1 {
+            return self.members.remove(0);
+        }
+        Arc::new(Error::Several(self))
+    }
+}
+
 /// The crate's top-level error type.
 ///
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
@@ -135,15 +186,14 @@ pub enum RecordErrorKind {
 ///
 /// The OS code of a failure may sit on an `io::Error` down the `source()` chain of any variant,
 /// below context cosca added: walk `source()` and take the first `io::Error` whose
-/// `raw_os_error()` is `Some`.
+/// `raw_os_error()` is `Some`. A [`Error::Several`] and an [`Error::MembersLeft`] give their first
+/// member as the `source`, so the walk finds the first member's code.
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("argument parsing failed: {0}")]
-    Quote(#[from] QuoteError),
+    Quote(QuoteError),
     /// An I/O error.
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     /// An operation isn't available on this platform / in this build.
     ///
     /// # A refused `pidfd_open` or `openat2` on Linux
@@ -203,19 +253,16 @@ pub enum Error {
     ///
     /// A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
     /// for a non-leader thread) is not an error: the operation reports it as exited.
-    #[error("{op} is not supported on {platform}: {detail}")]
     Unsupported {
         op: String,
         platform: &'static str,
         detail: String,
-        #[source]
         source: Option<Arc<Error>>,
     },
-    /// A containment mechanism could not be established or torn down.
-    #[error("process containment failed: {detail}")]
+    /// A containment mechanism could not be established, or could not tear the tree down: a member
+    /// confirmed running, a failed `killpg` or kill write, or the mechanism's own stale bookkeeping.
     Containment {
         detail: String,
-        #[source]
         source: Option<Arc<Error>>,
     },
     /// The calling process has no attached console, so Windows' console-group graceful
@@ -223,14 +270,13 @@ pub enum Error {
     /// a service, or was spawned detached. Every graceful op that reaches a console group is
     /// affected, lone and tree alike; `kill` and `kill_tree` need no console, and a lone or
     /// nested child that has no `kill_tree` still has `kill`.
-    #[error("no attached console for the graceful console-group signal: {detail}")]
-    NoConsole { detail: String },
+    NoConsole {
+        detail: String,
+    },
     /// Privilege elevation could not be completed at runtime.
-    #[error("elevation failed ({kind}): {detail}")]
     Elevation {
         kind: ElevationErrorKind,
         detail: String,
-        #[source]
         source: Option<Arc<Error>>,
     },
     /// The OS refused to establish whether the target process exists or is running, so the
@@ -249,21 +295,16 @@ pub enum Error {
     /// cannot address safely — a pid that names a process *group* rather than a single
     /// process, or one the handle no longer pins against reuse — where nothing was asked of
     /// the OS at all; those carry no `source`.
-    #[error("could not determine the target process's state: {detail}")]
     Unassessable {
         detail: String,
-        #[source]
         source: Option<Arc<Error>>,
     },
-    /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
-    /// it left behind, was not. `source` says why: the member's identity could not be read, at the
-    /// walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when the OS
-    /// refuses the pidfd the identity is read through), or the OS refused the kill
-    /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
-    /// for [`Process::kill`](crate::Process::kill)). It names the first member left; the call warns of
-    /// the others. The root is named only when it is the sole member left. On Linux, any other
-    /// error that opening the member's pidfd finishes with (a live thread that leads no group, a
-    /// `poll` that reports `POLLERR`) is wrapped as [`Error::Unassessable`], the error its source.
+    /// A tree-walk kill killed what it could and left members running, one or more. Each of `members`
+    /// is an [`Error::MemberNotKilled`], in the order the walk found them. `unwalked` is set when the
+    /// walk could not be made, or found no root, after an earlier kill left members: that kill's
+    /// [`Error::Unassessable`] or [`Error::Unsupported`], which names no process. The call returns this
+    /// variant in place of the `Unassessable` that means nothing was killed. Its `source` is the first
+    /// member.
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
@@ -274,34 +315,43 @@ pub enum Error {
     /// sweep, which reports a member it could not reach as [`Error::Containment`] or
     /// [`Error::Unassessable`] without a `source`. This variant comes from the ppid walk alone:
     /// `Process::kill_tree`, and a `TreeWalk` handle on Linux and Windows.
-    #[error("pid {pid} was not killed: {source}{}", .note.as_deref().map(|note| format!("; {note}")).unwrap_or_default())]
+    MembersLeft {
+        members: Failures,
+        unwalked: Option<Arc<Error>>,
+    },
+    /// A member a tree-walk kill left running, and why it was not killed: its identity could not be
+    /// read, at the walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when
+    /// the OS refuses the pidfd the identity is read through), or the OS refused the kill
+    /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
+    /// for [`Process::kill`](crate::Process::kill)). On Linux, any other error that opening the
+    /// member's pidfd finishes with is wrapped as [`Error::Unassessable`], the error its source. It is a member of an
+    /// [`Error::MembersLeft`]. It also names the root that a [`Child::kill_tree`](crate::Child::kill_tree)'s
+    /// handle backstop failed to kill, below the error of a mechanism that is no walk.
+    ///
+    /// Its text names the pid; the cause is its `source`.
     MemberNotKilled {
         pid: u32,
-        #[source]
         source: Arc<Error>,
-        /// What the spawn's cleanup adds of the child's fate, when it is the one that returns the
-        /// error. It leaves `source` as it is, which keeps the refusal's OS error.
-        note: Option<String>,
     },
+    /// Two or more failures of one operation, held as the `source` of the variant the failing site
+    /// returns: what failed decides that variant, not how many things did. [`Failures::first`] is
+    /// this error's own `source`.
+    Several(Failures),
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
     /// Not "gone": the thread is running. `source` is the refusal, an [`Error::Io`]; compare its OS
     /// code (`raw_os_error` down the chain), not the message.
-    #[error("pid {pid} names a live thread, not a thread-group leader; {detail}")]
     NotThreadGroupLeader {
         pid: u32,
         detail: String,
-        #[source]
         source: Arc<Error>,
     },
     /// A persisted process identity could not be produced or restored — see
     /// [`RecordErrorKind`] for why. `source` carries the OS error when the failure was a
     /// failed read of this host's boot session rather than a rejected record.
-    #[error("persisted process identity is not usable here ({kind}): {detail}")]
     IdentityRecord {
         kind: RecordErrorKind,
         detail: String,
-        #[source]
         source: Option<Arc<Error>>,
     },
     /// A spawn failed, and the program may have started: retrying it may run it twice. `source` is
@@ -337,14 +387,12 @@ pub enum Error {
     /// too. The other failed spawns leave a child they could not end running and warn.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
-    #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
     MayHaveStarted {
         fate: ChildFate,
         /// Whether the child is an elevation front (`sudo`, `doas`, `osascript`), whose elevated
         /// program may outlive it: `fate` is then about the front only (see [`ChildFate`]), and the
         /// message says so. A pkexec child is the program itself, so this is `false` for it.
         wrapper_elevated: bool,
-        #[source]
         source: Arc<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
         /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is the one of a child that
@@ -354,6 +402,104 @@ pub enum Error {
         /// (`id: None`). Dropped while its thread is panicking, it is given up, not waited for.
         unreaped: Option<Box<crate::Unreaped>>,
     },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Quote(e) => write!(f, "argument parsing failed: {e}"),
+            Error::Io(e) => write!(f, "{e}"),
+            Error::Unsupported {
+                op, platform, detail, ..
+            } => write!(f, "{op} is not supported on {platform}: {detail}"),
+            Error::Containment { detail, .. } => write!(f, "process containment failed: {detail}"),
+            Error::NoConsole { detail } => {
+                write!(f, "no attached console for the graceful console-group signal: {detail}")
+            }
+            Error::Elevation { kind, detail, .. } => write!(f, "elevation failed ({kind}): {detail}"),
+            Error::Unassessable { detail, .. } => {
+                write!(f, "could not determine the target process's state: {detail}")
+            }
+            Error::MembersLeft { members, .. } => match members.iter().len() {
+                1 => f.write_str("1 member of the tree was left running"),
+                n => write!(f, "{n} members of the tree were left running"),
+            },
+            Error::MemberNotKilled { pid, .. } => write!(f, "pid {pid} was not killed"),
+            Error::Several(failures) => write!(f, "{} failures", failures.iter().len()),
+            Error::NotThreadGroupLeader { pid, detail, .. } => {
+                write!(f, "pid {pid} names a live thread, not a thread-group leader; {detail}")
+            }
+            Error::IdentityRecord { kind, detail, .. } => {
+                write!(f, "persisted process identity is not usable here ({kind}): {detail}")
+            }
+            Error::MayHaveStarted {
+                fate,
+                wrapper_elevated,
+                source,
+                ..
+            } => write!(
+                f,
+                "the program may have started, and {fate}{}: {source}",
+                elevated_note(fate, *wrapper_elevated)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    /// The cause the variant holds; of a [`Error::Several`] and an [`Error::MembersLeft`], their first
+    /// member.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Quote(e) => Some(e),
+            Error::Io(e) => Some(e),
+            Error::Unsupported { source, .. }
+            | Error::Containment { source, .. }
+            | Error::Elevation { source, .. }
+            | Error::Unassessable { source, .. }
+            | Error::IdentityRecord { source, .. } => source.as_deref().map(|source| source as _),
+            Error::NoConsole { .. } => None,
+            Error::MemberNotKilled { source, .. }
+            | Error::NotThreadGroupLeader { source, .. }
+            | Error::MayHaveStarted { source, .. } => Some(&**source),
+            Error::MembersLeft { members: failures, .. } | Error::Several(failures) => Some(&**failures.first()),
+        }
+    }
+}
+
+impl From<QuoteError> for Error {
+    fn from(e: QuoteError) -> Error {
+        Error::Quote(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Error {
+        Error::Io(e)
+    }
+}
+
+impl Error {
+    /// The list of failures this error holds, for a layer of [`Report`]: an [`Error::Several`] and an
+    /// [`Error::MembersLeft`] have one.
+    pub(crate) fn failures(&self) -> Option<&Failures> {
+        match self {
+            Error::Several(failures) | Error::MembersLeft { members: failures, .. } => Some(failures),
+            _ => None,
+        }
+    }
+
+    /// An [`Error::MembersLeft`] of `members`, each a [`Error::MemberNotKilled`] (asserted in debug), with
+    /// the `unwalked` error of a walk that could not be made.
+    pub(crate) fn members_left(members: Failures, unwalked: Option<Arc<Error>>) -> Error {
+        debug_assert!(
+            members
+                .iter()
+                .all(|member| matches!(**member, Error::MemberNotKilled { .. })),
+            "every member of a MembersLeft is a MemberNotKilled: {members:?}"
+        );
+        Error::MembersLeft { members, unwalked }
+    }
 }
 
 /// What a spawn that failed after its program may have started did with its child: the `fate` of
@@ -504,19 +650,54 @@ pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option
 }
 
 /// An error as one line: every layer of its [`chain`], each layer's `Display` joined with `": "`.
-/// The one-line form of std's unstable `std::error::Report`; every cosca log line that prints an
-/// error uses it.
+///
+/// A layer that holds a [`Failures`] ([`Error::Several`], [`Error::MembersLeft`]) is followed by
+/// every member's whole chain, `(1) <chain>; (2) <chain>`, and the walk of the layer's own `source`
+/// ends there: its first member is one of them. An [`Error::MembersLeft`]'s `unwalked` error follows
+/// its members, as `; walk not made: <chain>`. A list in a member's chain reads in brackets, so
+/// the `;` between its members is not taken for the outer list's: `(1) a: 2 failures: [(1) b; (2) c]; (2) d`
+/// is a list of two whose first member holds a list of two.
 pub(crate) struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
-impl std::fmt::Display for Report<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, layer) in chain(self.0).enumerate() {
+impl Report<'_> {
+    fn write(
+        error: &(dyn std::error::Error + 'static),
+        nested: bool,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        for (i, layer) in chain(error).enumerate() {
             if i > 0 {
                 f.write_str(": ")?;
             }
             write!(f, "{layer}")?;
+            let Some(failures) = layer.downcast_ref::<Error>().and_then(Error::failures) else {
+                continue;
+            };
+            f.write_str(if nested { ": [" } else { ": " })?;
+            for (n, member) in failures.iter().enumerate() {
+                if n > 0 {
+                    f.write_str("; ")?;
+                }
+                write!(f, "({}) ", n + 1)?;
+                Report::write(&**member, true, f)?;
+            }
+            if let Some(Error::MembersLeft {
+                unwalked: Some(unwalked),
+                ..
+            }) = layer.downcast_ref::<Error>()
+            {
+                f.write_str("; walk not made: ")?;
+                Report::write(&**unwalked, true, f)?;
+            }
+            return f.write_str(if nested { "]" } else { "" });
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Display for Report<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Report::write(self.0, false, f)
     }
 }
 
@@ -555,6 +736,19 @@ pub(crate) fn shared_io_cause(e: &Arc<std::io::Error>) -> Arc<Error> {
 }
 
 impl Error {
+    /// The error of the one member `pid` of a group or leaf, saying `words` of it, with `cause` as its
+    /// `source`: an [`Error::Unassessable`] when it could not be assessed (`unassessed`), else an
+    /// [`Error::Containment`], for a member that refused or failed.
+    #[cfg(unix)]
+    pub(crate) fn of_member(pid: u32, words: &str, cause: Error, unassessed: bool) -> Error {
+        let (detail, source) = (format!("pid {pid}: {words}"), Some(Arc::new(cause)));
+        if unassessed {
+            Error::Unassessable { detail, source }
+        } else {
+            Error::Containment { detail, source }
+        }
+    }
+
     /// Windows has no per-process graceful-termination signal: what a graceful terminate of a lone
     /// process answers there.
     #[cfg(windows)]
@@ -606,6 +800,129 @@ impl Error {
         }
     }
 
+    /// What a tree kill's error holds, for the tests that read it: the members of an
+    /// [`Error::MembersLeft`] and then its `unwalked` error, or the one error that is no member.
+    #[cfg(test)]
+    pub(crate) fn left_members(&self) -> Vec<&Error> {
+        match self {
+            Error::MembersLeft { members, unwalked } => members
+                .iter()
+                .map(|member| &**member)
+                .chain(unwalked.as_deref())
+                .collect(),
+            other => vec![other],
+        }
+    }
+
+    /// This error with `peers`, the other failures of the same operation, kept: its variant and detail
+    /// stay, and its `source` becomes its own cause, if it has one, then the peers, as a
+    /// [`Error::Several`] when that is two or more. A [`Error::Several`] takes them as more members.
+    ///
+    /// An [`Error::Io`], [`Error::Quote`] and [`Error::NoConsole`] are leaves with no cause to hold
+    /// peers, and the members of an [`Error::MembersLeft`] are a walk's: giving any of them peers is a
+    /// contract breach, asserted in debug, and in release they are returned as they are. A site that
+    /// can have peers returns a variant with a slot at every count.
+    pub(crate) fn with_peers(self, peers: impl IntoIterator<Item = Arc<Error>>) -> Error {
+        let mut peers = peers.into_iter().peekable();
+        if peers.peek().is_none() {
+            return self;
+        }
+        fn joined(own: Option<Arc<Error>>, peers: impl Iterator<Item = Arc<Error>>) -> Arc<Error> {
+            Failures::collect(own.into_iter().chain(peers))
+                .expect("a peer")
+                .into_cause()
+        }
+        match self {
+            Error::Unsupported {
+                op,
+                platform,
+                detail,
+                source,
+            } => Error::Unsupported {
+                op,
+                platform,
+                detail,
+                source: Some(joined(source, peers)),
+            },
+            Error::Containment { detail, source } => Error::Containment {
+                detail,
+                source: Some(joined(source, peers)),
+            },
+            Error::Elevation { kind, detail, source } => Error::Elevation {
+                kind,
+                detail,
+                source: Some(joined(source, peers)),
+            },
+            Error::Unassessable { detail, source } => Error::Unassessable {
+                detail,
+                source: Some(joined(source, peers)),
+            },
+            Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord {
+                kind,
+                detail,
+                source: Some(joined(source, peers)),
+            },
+            Error::MemberNotKilled { pid, source } => Error::MemberNotKilled {
+                pid,
+                source: joined(Some(source), peers),
+            },
+            Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
+                pid,
+                detail,
+                source: joined(Some(source), peers),
+            },
+            Error::MayHaveStarted {
+                fate,
+                wrapper_elevated,
+                source,
+                unreaped,
+            } => Error::MayHaveStarted {
+                fate,
+                wrapper_elevated,
+                source: joined(Some(source), peers),
+                unreaped,
+            },
+            Error::Several(list) => Error::Several(list.extended(peers)),
+            walk @ Error::MembersLeft { .. } => {
+                debug_assert!(
+                    false,
+                    "the members of a MembersLeft are a walk's members, so peers cannot join it: {}",
+                    Report(&walk)
+                );
+                walk
+            }
+            leaf @ (Error::Io(_) | Error::Quote(_) | Error::NoConsole { .. }) => {
+                debug_assert!(
+                    false,
+                    "a leaf has no cause to hold peers, so a site that can have them returns a variant that has \
+                     one: {}",
+                    Report(&leaf)
+                );
+                leaf
+            }
+        }
+    }
+
+    /// [`with_peers`](Error::with_peers) for the first failure of a call that cannot return a leaf: an
+    /// [`Error::Io`] has no slot for peers, so it goes below an [`Error::Unassessable`] of `detail`
+    /// instead, after `own`, the cause that variant has of its own, and before `peers`. Any other
+    /// variant keeps itself, with `peers` and then `own` as its peers, as for `with_peers`.
+    pub(crate) fn with_peers_or_unassessable(
+        self,
+        detail: impl FnOnce() -> String,
+        own: Option<Arc<Error>>,
+        peers: impl IntoIterator<Item = Arc<Error>>,
+    ) -> Error {
+        match self {
+            io @ Error::Io(_) => Error::Unassessable {
+                detail: detail(),
+                source: own,
+            }
+            .with_peers(std::iter::once(Arc::new(io)).chain(peers)),
+            other => other.with_peers(peers.into_iter().chain(own)),
+        }
+    }
+
     /// This error as an [`std::io::Error`]: an [`Error::Io`] as it is, any other variant wrapped.
     pub(crate) fn into_io(self) -> std::io::Error {
         match self {
@@ -625,9 +942,9 @@ impl Error {
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
     /// original error as the [`source`](std::error::Error::source), so the OS code stays where the
-    /// walk described on [`Error`] finds it. An
-    /// [`Error::MemberNotKilled`] takes the note in its own `note`, so its `source` (and the OS error
-    /// that is part of its contract) is untouched.
+    /// walk described on [`Error`] finds it. A compound error ([`Error::MemberNotKilled`],
+    /// [`Error::MembersLeft`], [`Error::Several`]) has no detail of its own to carry a note: it is
+    /// asserted in debug never to be given one.
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
         match self {
@@ -657,17 +974,14 @@ impl Error {
                 detail: append(detail),
                 source,
             },
-            // The note goes beside `source`, not into it: a refused kill's OS error is the contract of
-            // this variant, and wrapping it would hide it (an `io::Error` with a payload has no OS code).
-            Error::MemberNotKilled {
-                pid,
-                source,
-                note: earlier,
-            } => Error::MemberNotKilled {
-                pid,
-                source,
-                note: Some(earlier.map_or_else(|| note.to_owned(), append)),
-            },
+            compound @ (Error::MemberNotKilled { .. } | Error::MembersLeft { .. } | Error::Several(_)) => {
+                debug_assert!(
+                    false,
+                    "a note goes in the site's own variant, never to a compound error: {}",
+                    Report(&compound)
+                );
+                compound
+            }
             Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
                 pid,
                 detail: append(detail),

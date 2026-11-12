@@ -62,22 +62,22 @@ fn ppid_of_stat(pid: RawPid, stat: &[u8]) -> Result<RawPid, Error> {
 }
 
 fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {
-    // `Unreadable` is a layer of the chain (see its doc).
     snapshot_failed(
         "the process snapshot could not be taken".to_owned(),
-        Some(std::io::Error::other(unreadable)),
+        Some(std::sync::Arc::new(unreadable.into_cause())),
     )
 }
 
 fn unassessable(why: &str, source: Option<std::io::Error>) -> Error {
-    snapshot_failed(format!("the process snapshot could not be taken: {why}"), source)
+    snapshot_failed(
+        format!("the process snapshot could not be taken: {why}"),
+        source.map(Error::io_cause),
+    )
 }
 
-fn snapshot_failed(detail: String, source: Option<std::io::Error>) -> Error {
-    let error = Error::Unassessable {
-        detail,
-        source: source.map(Error::io_cause),
-    };
+/// [`Error::Unassessable`] for a snapshot that failed, with the error behind it as its `source`.
+fn snapshot_failed(detail: String, source: Option<std::sync::Arc<Error>>) -> Error {
+    let error = Error::Unassessable { detail, source };
     log::warn!("enumerate::process_parents: {}", crate::error::Report(&error));
     error
 }
