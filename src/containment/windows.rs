@@ -12,6 +12,7 @@
 
 use std::io;
 use std::mem::size_of;
+use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
 
 use windows::Win32::Foundation::{
@@ -31,6 +32,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::error::{io_context, win32_io_error};
+use crate::identity::ProcessId;
 
 /// Owns the Job Object handle. `KILL_ON_JOB_CLOSE` means the whole process tree
 /// is terminated when this handle is closed (by `Drop`, unless [`disarm`](JobHandle::disarm)ed).
@@ -76,6 +78,8 @@ impl JobHandle {
     /// told teardown succeeded while the tree is still running has no way to notice, and the
     /// other containment mechanisms already report this.
     pub(crate) fn hard_kill(&self) -> io::Result<()> {
+        #[cfg(test)]
+        fault::run_before_job_kill();
         // SAFETY: `self.raw` is a valid handle we own for as long as `self` lives.
         unsafe { TerminateJobObject(self.raw, 1) }.map_err(win32_io_error)
     }
@@ -119,20 +123,27 @@ impl JobHandle {
     /// OS refuses `SetInformationJobObject` on it with `ERROR_ACCESS_DENIED`: a real refusal of
     /// `disarm`, which a handle the crate made itself never gives.
     pub(crate) fn create_without_set_access_for_test() -> JobHandle {
-        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS};
         use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+
+        JobHandle::create_empty_for_test().duplicate_with_access_for_test(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE)
+    }
+
+    /// Test-only: another handle to this job with only `access`: without `JOB_OBJECT_TERMINATE` the
+    /// OS refuses `TerminateJobObject` on it with `ERROR_ACCESS_DENIED` while the job and its members
+    /// live on, and without `JOB_OBJECT_QUERY` it cannot list them.
+    pub(crate) fn duplicate_with_access_for_test(&self, access: u32) -> JobHandle {
+        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS};
         use windows::Win32::System::Threading::GetCurrentProcess;
 
-        let full = JobHandle::create_empty_for_test();
         let mut weak = HANDLE::default();
-        // SAFETY: `full`'s handle is live; `weak` is an out-parameter.
+        // SAFETY: `self`'s handle is live; `weak` is an out-parameter.
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                full.raw,
+                self.raw,
                 GetCurrentProcess(),
                 &mut weak,
-                JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE,
+                access,
                 false,
                 DUPLICATE_HANDLE_OPTIONS(0),
             )
@@ -165,9 +176,78 @@ impl Drop for JobHandle {
     }
 }
 
+impl JobHandle {
+    /// The processes the job lists now, for the wait over a kill that follows: each is opened and
+    /// proved a member through its own handle ([`member_to_watch`]), and its identity is read from
+    /// that handle, which is then closed, so no handle is held per member. It is read before
+    /// `TerminateJobObject`, because the job's list does not say that a terminated member's process
+    /// object is signalled: after the kill the list is empty on its first read, whether or not the
+    /// members have exited (`probe-job-pidlist`, case 1: 3000 of 3000). A list read after the kill
+    /// would miss them. After a member's natural exit the list can show its deleted pid for one
+    /// listing (94 of 161882), so [`wait_drained_raw`] lists again and a drain is only an empty
+    /// listing. `root`, the root's pid, is left out: its owner waits for it. A member that cannot
+    /// be named, or the listing itself failing, is returned as an error saying its exit cannot be
+    /// observed; the kill goes ahead regardless.
+    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<crate::error::Error>) {
+        use crate::containment::tree_kill::exit_unobserved;
+        use crate::error::Error;
+
+        let pids = match query_job_pid_list(self.raw) {
+            Ok(pids) => pids,
+            Err(e) => {
+                let why = Error::Unassessable {
+                    detail: "the members of the job could not be listed before the kill, so their exit cannot be \
+                             observed"
+                        .to_owned(),
+                    source: Some(Error::io_cause(e)),
+                };
+                return (Vec::new(), vec![why]);
+            }
+        };
+        let (mut members, mut unobserved) = (Vec::new(), Vec::new());
+        for pid in pids.into_iter().filter(|pid| Some(*pid) != root) {
+            // SAFETY: a standard Win32 call; `member_to_watch` closes the handle unless it returns it.
+            let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+            match member_to_watch(opened, self.raw) {
+                Ok(Some(handle)) => {
+                    let id = crate::identity::windows_identity_from_handle_result(handle, pid);
+                    // SAFETY: opened above, and kept nowhere else.
+                    _ = unsafe { CloseHandle(handle) };
+                    match id {
+                        Ok(id) => members.push(id),
+                        Err(e) => unobserved.push(exit_unobserved(
+                            pid,
+                            Error::Unassessable {
+                                detail: "its start time could not be read".to_owned(),
+                                source: Some(Error::io_cause(win32_io_error(e))),
+                            },
+                        )),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => unobserved.push(exit_unobserved(pid, Error::Io(e))),
+            }
+        }
+        (members, unobserved)
+    }
+}
+
 impl crate::containment::Contains for JobHandle {
-    /// `Ok` says the kernel was told to terminate every member, however it was spawned (see
-    /// [`hard_kill`](JobHandle::hard_kill)); it does not say they have exited.
+    /// `Ok` says the job was told to terminate every member, however it was spawned (see
+    /// [`hard_kill`](JobHandle::hard_kill)). See [`list_members`](JobHandle::list_members) for what
+    /// is named and why.
+    fn kill(&self, root: Option<&dyn crate::containment::Root>) -> crate::containment::TreeKill<'_> {
+        let (members, unobserved) = self.list_members(root.map(crate::containment::Root::pid));
+        let sent = crate::containment::Contains::send_kill(self, root);
+        crate::containment::TreeKill::listed(
+            sent,
+            members,
+            unobserved,
+            crate::containment::drain_edge::DrainEdge::Job(self),
+        )
+    }
+
+    /// The bare `TerminateJobObject`: no member is listed, for a caller that waits for none.
     fn send_kill(&self, _root: Option<&dyn crate::containment::Root>) -> crate::containment::dispatch::TreeKillOutcome {
         use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
         TreeKillOutcome::Ran(
@@ -556,7 +636,7 @@ pub(crate) mod observe {
 /// fail. Take semantics, mirroring `treewalk::fault`.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     thread_local! {
         static FORCE_CONSOLE_PROBE_ERROR: Cell<bool> = const { Cell::new(false) };
     }
@@ -577,6 +657,18 @@ pub(crate) mod fault {
     pub(crate) fn take_force_console_probe_error() -> bool {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.replace(false))
     }
+
+    thread_local! {
+        static BEFORE_JOB_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    }
+    /// Run `hook` once, right before the next `TerminateJobObject` on this thread; the guard clears
+    /// it.
+    pub(crate) fn set_before_job_kill(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&BEFORE_JOB_KILL, hook)
+    }
+    pub(crate) fn run_before_job_kill() {
+        crate::oneshot_hook::fire(&BEFORE_JOB_KILL);
+    }
     pub(crate) fn armed() -> bool {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.get())
     }
@@ -592,6 +684,59 @@ pub(crate) mod fault {
         CreationTime,
         /// The assignment of a Strongest root's job.
         Assign,
+    }
+
+    /// The forced pid lists of this thread.
+    enum ForcedPidLists {
+        Unarmed,
+        /// Answered to the next queries, in order; the real list after them, until the guard drops.
+        Armed(std::collections::VecDeque<Vec<u32>>),
+    }
+    thread_local! {
+        static JOB_PID_LIST: RefCell<ForcedPidLists> = const { RefCell::new(ForcedPidLists::Unarmed) };
+        static JOB_PID_LIST_QUERIES: Cell<u32> = const { Cell::new(0) };
+    }
+    /// [`force_job_pid_lists`] for one list.
+    pub(crate) fn force_job_pid_list(pids: Vec<u32>) -> ForcedList {
+        force_job_pid_lists([pids])
+    }
+    /// Answer `lists`, one per `query_job_pid_list` on this thread in order; counts the queries made
+    /// ([`job_pid_list_queries`]) until dropped.
+    pub(crate) fn force_job_pid_lists(lists: impl IntoIterator<Item = Vec<u32>>) -> ForcedList {
+        JOB_PID_LIST.with(|f| {
+            let mut f = f.borrow_mut();
+            debug_assert!(
+                matches!(*f, ForcedPidLists::Unarmed),
+                "a pid list is forced and its guard is alive"
+            );
+            *f = ForcedPidLists::Armed(lists.into_iter().collect());
+        });
+        JOB_PID_LIST_QUERIES.with(|c| c.set(0));
+        ForcedList(())
+    }
+    /// Consume the next forced pid list, if one is armed; counts every call.
+    pub(crate) fn take_forced_job_pid_list() -> Option<Vec<u32>> {
+        JOB_PID_LIST_QUERIES.with(|c| c.set(c.get() + 1));
+        JOB_PID_LIST.with(|f| {
+            let mut f = f.borrow_mut();
+            let ForcedPidLists::Armed(lists) = &mut *f else {
+                return None;
+            };
+            lists.pop_front()
+        })
+    }
+    /// How many `query_job_pid_list` calls this thread made since [`force_job_pid_list`] or
+    /// [`force_job_pid_lists`] last armed it, or since its guard dropped.
+    pub(crate) fn job_pid_list_queries() -> u32 {
+        JOB_PID_LIST_QUERIES.with(|c| c.get())
+    }
+    #[must_use = "dropping this immediately disarms the forced pid list"]
+    pub(crate) struct ForcedList(());
+    impl Drop for ForcedList {
+        fn drop(&mut self) {
+            JOB_PID_LIST.with(|f| *f.borrow_mut() = ForcedPidLists::Unarmed);
+            JOB_PID_LIST_QUERIES.with(|c| c.set(0));
+        }
     }
 
     thread_local! {
@@ -755,6 +900,10 @@ pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::R
 /// that keeps growing needs an ever-larger buffer, but capping this would silently under-report
 /// live membership rather than fail loudly).
 pub(crate) fn query_job_pid_list(job: HANDLE) -> io::Result<Vec<u32>> {
+    #[cfg(test)]
+    if let Some(forced) = fault::take_forced_job_pid_list() {
+        return Ok(forced);
+    }
     let mut capacity: usize = 64;
     loop {
         let buf_len = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() + capacity.saturating_sub(1) * size_of::<usize>();
@@ -846,12 +995,7 @@ impl JobHandle {
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
-    /// the caller's own remaining time. An already-elapsed (or `Duration::ZERO`) deadline still
-    /// gets one real re-enumeration and, if any member is still live, one real non-blocking
-    /// `WaitForMultipleObjects` poll before a deadline-based verdict is returned — a stale bound
-    /// only ever forecloses looping back for ANOTHER round, never the current one's own
-    /// observation. A drained tree is reported `AllMembersExited` regardless of how late the
-    /// caller arrived to look.
+    /// the caller's own remaining time. What a deadline answers is stated at [`wait_drained_raw`].
     ///
     /// `cancel`, when given, is appended to every round's wait set (one fewer live member
     /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is
@@ -907,8 +1051,7 @@ fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Re
             }
         }
         // ERROR_INVALID_PARAMETER: the pid no longer names a process: it exited in the race
-        // between the enumeration and the open. That is real progress (this round's tree is
-        // shrinking), not a failure: loop back to re-enumerate rather than treating it as denied.
+        // between the enumeration and the open. Not a failure, and not a member either.
         Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
         Err(e) => Err(win32_io_error(e)),
     }
@@ -956,6 +1099,14 @@ fn thread_entries_closing(
 /// The loop body of [`JobHandle::wait_drained`], taking a borrowed handle rather than `&JobHandle`:
 /// the async drain hands in its own duplicate (see `OwnedJobDup`), because its blocking thread
 /// outlives the borrow.
+///
+/// A bounded wait answers from the job's list as of its last look, so `MembersRemain` means the tree
+/// was not seen drained by the deadline. A round that starts past the deadline (an already-elapsed or
+/// `Duration::ZERO` one, or one reached after a wait ended on a member's exit) is the last. It lists:
+/// an empty listing is `AllMembersExited` however late the caller arrived. Live members that a
+/// zero-ms poll finds none signalled are `MembersRemain`. Otherwise the listing may be stale (a
+/// deleted pid shows for one listing after a member's exit, or a polled handle was signalled), and
+/// exactly one more listing is final: empty is `AllMembersExited`, anything else `MembersRemain`.
 pub(crate) fn wait_drained_raw(
     job: BorrowedHandle<'_>,
     deadline: Option<std::time::Instant>,
@@ -967,37 +1118,35 @@ pub(crate) fn wait_drained_raw(
     let job = HANDLE(job.as_raw_handle());
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
-        // Cancellation is checked BEFORE any work this round, including the very first — a
-        // deliberate asymmetry with the deadline check below. Cancellation is a genuine "stop
-        // looking" instruction (the caller's future was dropped; the tree's drain state is no
-        // longer anyone's to observe), so it is honored even before we have ever enumerated the
-        // job once. A deadline, in contrast, is a stale BOUND on how long to keep looking, not
-        // an instruction to skip looking — see below.
-        if let Some(c) = cancel {
-            // SAFETY: `cancel` is a valid handle for the duration of this call (caller-owned).
-            let cancel_state = unsafe { WaitForSingleObject(c, 0) };
-            if cancel_state == WAIT_OBJECT_0 {
-                return Ok(TreeDrain::MembersRemain);
-            }
+        // A round that starts past the deadline is the last: it lists and answers, with at most one
+        // more listing (`final_listing`).
+        let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
+        // Cancellation is checked BEFORE any work this round, including the very first. It is a
+        // genuine "stop looking" instruction (the caller's future was dropped; the tree's drain
+        // state is no longer anyone's to observe), so it is honored even before the job has been
+        // listed once. A deadline, in contrast, is a bound on how long to keep looking, not an
+        // instruction to skip looking: the last round still lists.
+        if cancelled(cancel) {
+            return Ok(TreeDrain::MembersRemain);
         }
 
-        // Re-enumerate BEFORE consulting the deadline for a return. A `Duration::ZERO` (or
-        // already-elapsed) deadline must still observe the tree's ACTUAL current state on the
-        // one round it gets, not conclude `MembersRemain` purely because it arrived too late to
-        // look — a ZERO probe on an already-drained tree must report `AllMembersExited`, the
-        // same verdict an unbounded wait would find. This mirrors `Kqueue::wait` on the macOS
-        // side, which takes one look at an elapsed deadline: the real observation always happens
-        // first; an elapsed deadline only forecloses looping back for ANOTHER round afterward
-        // (see the `handles.is_empty()` branch below, and the `ms` computation for the bounded
-        // wait itself).
-        let pids = query_job_pid_list(job).map_err(Error::Io)?;
-        if pids.is_empty() {
-            return Ok(TreeDrain::AllMembersExited);
-        }
+        // List BEFORE consulting the deadline for a return, so an elapsed deadline (a `Duration::ZERO`
+        // probe) still observes the tree's actual state and an empty listing answers
+        // `AllMembersExited`, as an unbounded wait would. This mirrors `Kqueue::wait` on the macOS
+        // side, which takes one look at an elapsed deadline.
+        let pids = match list_members_or_drained(job)? {
+            ControlFlow::Break(drained) => return Ok(drained),
+            ControlFlow::Continue(pids) => pids,
+        };
 
         let mut handles: Vec<HANDLE> = Vec::new();
         let mut denied: Option<io::Error> = None;
-        for pid in pids.iter().take(budget) {
+        // Every listed pid is looked at unless the wait set is already full: a pid that is gone
+        // does not use up the budget a live member needs.
+        for pid in &pids {
+            if handles.len() == budget {
+                break;
+            }
             // SAFETY: standard Win32 call; the handle is closed by `member_to_watch` unless it is
             // returned. `PROCESS_QUERY_LIMITED_INFORMATION` is required by `IsProcessInJob` there
             // and is NOT implied by `PROCESS_SYNCHRONIZE`; without it every membership check fails
@@ -1012,10 +1161,6 @@ pub(crate) fn wait_drained_raw(
                 Err(e) => denied = Some(e),
             }
         }
-
-        // Computed once per round and reused below for both the empty-handles decision and the
-        // bounded-wait timeout, so the two agree on what "the deadline" means for this round.
-        let remaining = crate::wait::remaining(deadline);
 
         if handles.is_empty() {
             if let Some(e) = denied {
@@ -1032,15 +1177,12 @@ pub(crate) fn wait_drained_raw(
                     source: Some(Error::io_cause(e)),
                 });
             }
-            // Every candidate in this round's batch had already exited by the time we tried
-            // to open it — real progress, but this round's `pids` was non-empty (so
-            // `AllMembersExited` isn't supported by what was actually observed) and looping
-            // straight back to `query_job_pid_list` is itself another round, which a bounded
-            // wait must not be allowed to take once its deadline has already elapsed (the
-            // busy-spin/cancellation-starvation hazard this whole restructuring exists to
-            // close). An elapsed deadline concludes `MembersRemain` here instead of continuing.
-            if remaining == Some(std::time::Duration::ZERO) {
-                return Ok(TreeDrain::MembersRemain);
+            // Every listed pid is gone (`OpenProcess` found no such process) or no longer a
+            // member (its number was reused). That says nothing of a member that joined after the
+            // listing, so a drain is only a fresh listing that is empty: list again. Past the
+            // deadline this was the last round, so that listing is the final one.
+            if last_round {
+                return final_listing(job);
             }
             continue;
         }
@@ -1066,8 +1208,7 @@ pub(crate) fn wait_drained_raw(
             wait_set.push(c);
         }
 
-        // An elapsed deadline arms `ms == 0`, a real non-blocking poll of the handles just
-        // opened, so a ZERO deadline still gets one look before `MembersRemain`.
+        // An elapsed deadline arms `ms == 0`, a real non-blocking poll of the handles just opened.
         // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the
@@ -1110,8 +1251,43 @@ pub(crate) fn wait_drained_raw(
             // like a timeout rather than inventing a verdict.
             return Ok(TreeDrain::MembersRemain);
         }
+        if last_round {
+            // A polled handle was signalled: the listing may have named an exited member. A cancel
+            // signalled meanwhile is not re-checked: only the async future's drop signals it, and
+            // nobody reads that call's answer.
+            return final_listing(job);
+        }
         // A tracked member exited — loop back and re-enumerate the authoritative live set.
     }
+}
+
+/// The one more listing a last round takes when its own is no proof: an empty listing is the drain,
+/// anything else is `MembersRemain`. Nothing follows it.
+fn final_listing(job: HANDLE) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+    use crate::containment::TreeDrain;
+
+    Ok(match list_members_or_drained(job)? {
+        ControlFlow::Break(drained) => drained,
+        ControlFlow::Continue(_) => TreeDrain::MembersRemain,
+    })
+}
+
+/// One listing of the job: an empty one is the drain (`Break`), any other is the listed pids.
+fn list_members_or_drained(
+    job: HANDLE,
+) -> Result<ControlFlow<crate::containment::TreeDrain, Vec<u32>>, crate::error::Error> {
+    let pids = query_job_pid_list(job).map_err(crate::error::Error::Io)?;
+    Ok(if pids.is_empty() {
+        ControlFlow::Break(crate::containment::TreeDrain::AllMembersExited)
+    } else {
+        ControlFlow::Continue(pids)
+    })
+}
+
+/// Whether the caller's cancel handle, if any, is signalled now.
+fn cancelled(cancel: Option<HANDLE>) -> bool {
+    // SAFETY: `cancel` is a valid handle for the duration of the call (caller-owned).
+    cancel.is_some_and(|c| unsafe { WaitForSingleObject(c, 0) } == WAIT_OBJECT_0)
 }
 
 /// What `resume_if_owned` did with one thread id.

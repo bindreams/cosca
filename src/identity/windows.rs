@@ -453,8 +453,16 @@ pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCa
 /// creation-token read. Avoids a second `OpenProcess` (which can fail and would otherwise
 /// force dropping a live elevated child).
 pub(crate) fn windows_identity_from_handle(handle: HANDLE, pid: RawPid) -> Option<crate::identity::ProcessId> {
-    let start = creation_token(handle)?;
-    Some(crate::identity::ProcessId { pid, key: start })
+    windows_identity_from_handle_result(handle, pid).ok()
+}
+
+/// [`windows_identity_from_handle`], with the failure of the read of the creation time.
+pub(crate) fn windows_identity_from_handle_result(
+    handle: HANDLE,
+    pid: RawPid,
+) -> windows::core::Result<crate::identity::ProcessId> {
+    let start = creation_token_result(handle)?;
+    Ok(crate::identity::ProcessId { pid, key: start })
 }
 
 /// This process's own start token, read from the pseudo-handle. `GetCurrentProcess` performs

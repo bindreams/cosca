@@ -190,6 +190,39 @@ fn a_query_only_handle_is_unknown_while_running_and_dead_after_termination() {
 /// Mutant: the walk kills the root by its identity.
 #[skuld::test]
 fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
+    use crate::os_process::fake::{Answer, FakeProcess};
+    use crate::signal::{Sent, Sig};
+    use crate::test_child::STATUS_DLL_INIT_FAILED;
+
+    let (child, _stdin) = crate::test_child::held_uncontained_blocker(true);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    // The kill is delivered, so the call waits for the root through the same handle: it states its exit.
+    let fake = FakeProcess::new([Answer::Exited]).signals([Ok(Sent::Delivered)]);
+    let held = Process {
+        id,
+        os: Box::new(fake.clone()),
+    };
+
+    held.kill_tree_with(&crate::identity::HostKernel)
+        .expect("the held handle took the kill and the root has no descendant");
+
+    assert_eq!(fake.signal_calls(), vec![Sig::Kill]);
+    // On Windows the walk also kills the console host the root owns, and the call waits for it, which
+    // ends the root of its own accord (`STATUS_DLL_INIT_FAILED`): a kill of the root by its identity
+    // would end it with `TerminateProcess`'s code 1.
+    let status = child.try_wait().expect("look at the live process");
+    assert!(
+        status.is_none_or(|status| cfg!(windows) && status.code() == Some(STATUS_DLL_INIT_FAILED)),
+        "the real process was killed by its identity, not through the held handle: {status:?}"
+    );
+}
+
+/// `send_kill_tree` sends the root its kill through the held handle and does not wait for it: the held
+/// fake states no look at the root, so a look would panic.
+///
+/// Mutant: `send_kill_tree` waits for the root.
+#[skuld::test]
+fn send_kill_tree_sends_the_roots_kill_and_waits_for_nothing() {
     use crate::os_process::fake::FakeProcess;
     use crate::signal::{Sent, Sig};
 
@@ -201,12 +234,9 @@ fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
         os: Box::new(fake.clone()),
     };
 
-    held.kill_tree_with(&crate::identity::HostKernel)
+    held.send_kill_tree_with(&crate::identity::HostKernel)
         .expect("the held handle took the kill and the root has no descendant");
 
     assert_eq!(fake.signal_calls(), vec![Sig::Kill]);
-    assert!(
-        child.try_wait().expect("look at the live process").is_none(),
-        "the real process was killed by its identity, not through the held handle"
-    );
+    assert_eq!(fake.looks(), 0, "the call looked at the root it sent its kill to");
 }

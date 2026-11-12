@@ -88,7 +88,7 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{TreeKillOutcome, TreeSignal, Unkilled};
+    use crate::containment::dispatch::{Settled, TreeKillOutcome, TreeSignal, Unkilled};
     use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
@@ -113,8 +113,14 @@ mod call {
         /// marker's holders) was signalled by the mechanism. `root`: the signal to the root through
         /// its handle, if the caller sent one ([`Skip::root_alone`]). One `warn` names what was
         /// skipped and what was sent. The error is the holders' sweep's, the root signal's, or
-        /// `Unassessable`; `Ok` only after this handle's own reap, when it already killed the tree.
-        pub(crate) fn answer(&self, tree: &Tree, skip: Skip, root: Option<Result<Sent, Error>>) -> Result<(), Error> {
+        /// `Unassessable`; `Ok` only after this handle's own reap, when it already killed the tree. The
+        /// [`Settled`] has the members a `Kill`'s settlement killed again.
+        pub(crate) fn answer(
+            &self,
+            tree: &Tree,
+            skip: Skip,
+            root: Option<Result<Sent, Error>>,
+        ) -> Settled<Result<(), Error>> {
             let mut skip = match skip {
                 Skip {
                     why: Why::Untrusted(why),
@@ -127,7 +133,7 @@ mod call {
                         TreeSignal::Kill => {
                             tree.settle_for_kill_tree(self.op, TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
                         }
-                        TreeSignal::Term => Err(error),
+                        TreeSignal::Term => Settled::of(Err(error)),
                     };
                 }
                 skip => skip,
@@ -144,7 +150,7 @@ mod call {
                 );
                 return match self.signal {
                     TreeSignal::Kill => tree.settle_for_kill_tree(self.op, TreeKillOutcome::Skipped(skip), false),
-                    TreeSignal::Term => skip.holders.take().unwrap_or(Ok(())),
+                    TreeSignal::Term => Settled::of(skip.holders.take().unwrap_or(Ok(()))),
                 };
             }
             let (sent_root, failed_root) = match self.signal {
@@ -175,9 +181,12 @@ mod call {
             let detail = self.skipped_detail(&skip, &sent);
             log::warn!("{detail}");
             let swept = skip.holders.is_some();
+            let mut killed_again = Vec::new();
             let holders = match self.signal {
                 TreeSignal::Kill => {
                     let settled = tree.settle_for_kill_tree(self.op, TreeKillOutcome::Skipped(skip), false);
+                    killed_again = settled.killed_again;
+                    let settled = settled.answer;
                     debug_assert!(
                         swept || settled.is_ok(),
                         "a skipped kill that swept nothing leaves nothing to report: {settled:?}"
@@ -186,10 +195,11 @@ mod call {
                 }
                 TreeSignal::Term => skip.holders.take(),
             };
-            match (holders, root) {
+            let answer = match (holders, root) {
                 (Some(Err(e)), _) | (None, Some(Err(e))) => Err(e),
                 _ => Err(Error::Unassessable { detail, source: None }),
-            }
+            };
+            Settled { answer, killed_again }
         }
 
         /// The error of a call that skipped what the root's number names, `skipped`, because the root
@@ -253,13 +263,16 @@ mod call {
         /// macOS: the end of a call that signalled an fd marker's holders alone ([`Skip::holders`] of
         /// `skip` is their `SIGTERM`), after the grace: `kill` is the kill of any holder left, the
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or
-        /// `Unassessable`.
-        pub(crate) fn holders_shutdown_error(&self, tree: &Tree, skip: &Skip, kill: TreeKillOutcome) -> Error {
+        /// `Unassessable`. The [`Settled`] has the members the settlement killed again.
+        pub(crate) fn holders_shutdown_error(&self, tree: &Tree, skip: &Skip, kill: TreeKillOutcome) -> Settled<Error> {
             let term = match &skip.holders {
                 Some(Err(e)) => format!(", which failed ({})", crate::error::Report(e)),
                 _ => String::new(),
             };
-            let settled = tree.settle_for_kill_tree(self.op, kill, false);
+            let Settled {
+                answer: settled,
+                killed_again,
+            } = tree.settle_for_kill_tree(self.op, kill, false);
             let kill_failed = match &settled {
                 Ok(()) => String::new(),
                 Err(e) => format!(", which failed ({})", crate::error::Report(e)),
@@ -269,9 +282,13 @@ mod call {
             );
             let detail = self.skipped_detail(skip, &sent);
             log::warn!("{detail}");
-            match settled {
+            let error = match settled {
                 Err(e) => e,
                 Ok(()) => Error::Unassessable { detail, source: None },
+            };
+            Settled {
+                answer: error,
+                killed_again,
             }
         }
     }

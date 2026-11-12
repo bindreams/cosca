@@ -1000,6 +1000,15 @@ pub(crate) fn windows_identity_from_handle(
     backend::windows_identity_from_handle(handle, pid)
 }
 
+/// [`windows_identity_from_handle`], with the failure of the read.
+#[cfg(windows)]
+pub(crate) fn windows_identity_from_handle_result(
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: RawPid,
+) -> windows::core::Result<ProcessId> {
+    backend::windows_identity_from_handle_result(handle, pid)
+}
+
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;

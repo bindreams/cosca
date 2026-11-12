@@ -334,17 +334,21 @@ impl Child {
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
-    /// Awaits nothing extra: the sync [`Child::kill_tree`](crate::Child::kill_tree), with every case it documents.
+    /// It answers as the sync [`Child::send_kill_tree`](crate::Child::send_kill_tree) does: it sends
+    /// the kill and returns, and `Ok` says every member was reached, not that any has exited. It
+    /// blocks no runtime thread; [`wait_tree`](Self::wait_tree) waits where the mechanism has a drain
+    /// edge.
     pub fn kill_tree(&mut self) -> Result<(), Error> {
-        self.inner.kill_tree()
+        self.kill_tree_after("kill_tree", None).map_err(|failure| failure.error)
     }
 
     /// [`kill_tree`](Self::kill_tree) for the operation `op`, as a step of it that already sent
     /// `earlier`, so an error never claims the whole operation sent nothing. `op` names the call in
     /// what it reports. A failure says whether the root is dead all the same ([`SweepFailure`]): a
-    /// caller may wait for it before it returns the error.
+    /// caller may wait for it before it returns the error. It sends only: no member is read or
+    /// waited for.
     pub(crate) fn kill_tree_after(&mut self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
-        self.inner.kill_tree_after(op, earlier)
+        self.inner.send_kill_tree_after(op, earlier)
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -359,15 +363,19 @@ impl Child {
         self.inner.terminate_tree()
     }
 
-    /// Block until every member of the contained tree has EXITED — not reaped; a status is
-    /// never collected by this call, only the root's own `wait`/`try_wait` does that. Requires
-    /// a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2, a
-    /// Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
-    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). No polling interval:
-    /// macOS waits on the reactor; Linux awaits a broadcast from a thread the leaf owns, started
-    /// by the first wait that blocks and joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job
-    /// objects have no pollable handle) with a cancel event so a dropped future releases the
-    /// blocking watcher promptly instead of parking out the wait.
+    /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
+    /// Windows job whose process list is empty, a macOS marker with no holder left. A status is
+    /// never collected by this call, only the root's own `wait`/`try_wait` does that. This call
+    /// observes the list or the leaf, not each member: on Windows the job's list can empty before
+    /// every member's process object is signalled. A caller that needs the members gone uses
+    /// [`kill_tree`](Self::kill_tree), which waits for each. Requires a mechanism with a real
+    /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
+    /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
+    /// nested-`Delegated` child do not). No polling interval: macOS waits on the reactor; Linux
+    /// awaits a broadcast from a thread the leaf owns, started by the first wait that blocks and
+    /// joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job objects
+    /// have no pollable handle) with a cancel event so a dropped future releases the blocking
+    /// watcher promptly instead of parking out the wait.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.inner.tree.wait_drained_async(None).await
     }
@@ -375,6 +383,9 @@ impl Child {
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`.
     /// `TreeDrain::MembersRemain` at expiry is not an error. A `timeout` so large it would
     /// overflow `Instant` is treated as unbounded, matching [`wait_tree`](Child::wait_tree).
+    /// `MembersRemain` means the tree was not seen drained by the deadline; on Windows the wait
+    /// answers from the job's list as of its last look, in which a member that has just exited can
+    /// still appear.
     pub async fn wait_tree_timeout(
         &self,
         timeout: std::time::Duration,

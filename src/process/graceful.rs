@@ -51,18 +51,49 @@ impl Process {
     ///
     /// [`Error::MemberNotKilled`] when the walk killed what it could and left a member running,
     /// naming the first and why: its identity could not be read, or its kill was refused.
+    ///
+    /// **`Ok` means every member the walk killed has exited**, and so has the root: the call waits
+    /// for each, with no deadline. A member forked after the walk's snapshot is not seen. On Linux
+    /// below 6.9 a member that was killed and reaped, and whose pid was taken again within its own
+    /// start tick, is waited for in its successor's place. A member whose exit cannot be observed is
+    /// an [`Error::Unassessable`] naming it, returned once the others have been waited for. [`send_kill_tree`](Process::send_kill_tree) only sends.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_with(&crate::identity::HostKernel)
     }
 
+    /// [`kill_tree`](Self::kill_tree) that sends and does not wait: `Ok` says every member the walk
+    /// found was sent its kill, not that any has exited.
+    pub fn send_kill_tree(&self) -> Result<(), Error> {
+        self.send_kill_tree_with(&crate::identity::HostKernel)
+    }
+
     /// [`kill_tree`](Self::kill_tree), reading through `kernel`.
     pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel);
+        let waited = wait.wait();
+        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| error)
+    }
+
+    /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
+    pub(crate) fn send_kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        self.sweep(kernel).0
+    }
+
+    /// The walk's kills, the answer they come to, and the wait for what they reached: the members, and
+    /// the root through this handle once its kill landed.
+    fn sweep<'a>(
+        &'a self,
+        kernel: &'a dyn crate::identity::Kernel,
+    ) -> (Result<(), Error>, crate::containment::KillWait<'a>) {
+        let (outcome, wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
         // No handle backstop: the root is left as any member is, and the first member left is the
         // error. This call's one report of the others.
-        crate::containment::treewalk::hard_kill(kernel, self.id, self)
+        let answer = outcome
             .into_result()
             .or_else(|left| left.unsettled(false))
-            .map_err(|left| left.report("Process::kill_tree"))
+            .map_err(|left| left.report("Process::kill_tree"));
+        let landed = wait.root_killed();
+        (answer, wait.with_root(&*self.os, landed))
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root

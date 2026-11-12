@@ -26,6 +26,7 @@ fn a_tree_call_given_no_owner_sends_the_roots_kill_by_identity() {
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
     super::kill_tree(id, None)
+        .outcome()
         .into_result()
         .expect("the walk found the root and killed it");
 
@@ -633,6 +634,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
         "{held} not among {children:?}"
     );
     super::hard_kill(&HostKernel, root, &super::ByIdentity::new(&HostKernel, root))
+        .outcome()
         .into_result()
         .expect("an exited root whose handle is held is walked completely");
 
@@ -717,7 +719,10 @@ fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let kernel = crate::identity::HostKernel;
-    match super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id)).into_result() {
+    match super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id))
+        .outcome()
+        .into_result()
+    {
         Err(super::Unkilled {
             members,
             root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
@@ -753,6 +758,7 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
     let left = super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id))
+        .outcome()
         .into_result()
         .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
@@ -790,6 +796,7 @@ fn hard_kill_of_a_descendant_that_refuses_the_signal_is_an_error_naming_it_with_
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
     let left = super::hard_kill(&kernel, id, &super::ByIdentity::new(&kernel, id))
+        .outcome()
         .into_result()
         .expect_err("the helper refuses the kill");
 
@@ -1025,7 +1032,7 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
     for (name, state, untrusted) in states {
         let skipped = untrusted && cfg!(target_os = "macos");
         let root = StatedRoot::with_state(ROOT_PID, state);
-        let killed = super::kill_tree(self::root(), Some(&root));
+        let killed = super::kill_tree(self::root(), Some(&root)).outcome();
         assert_eq!(
             matches!(killed, TreeKillOutcome::Skipped(_)),
             skipped,

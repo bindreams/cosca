@@ -88,7 +88,7 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
     let root = StatedRoot::unreaped();
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
-    kill_group(pgid, Some(&root)).expect("kill_group on an owned group");
+    kill_group(pgid, Some(&root), &mut Vec::new()).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     let ordered = capture.ordered_steps();
@@ -131,7 +131,7 @@ fn a_failed_check_sends_nothing_by_the_group_number() {
     let pgid = child.id() as i32;
     let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
     let capture = crate::send_log::Capture::start();
-    let err = kill_group(pgid, Some(&root)).expect_err("a failed check is an error");
+    let err = kill_group(pgid, Some(&root), &mut Vec::new()).expect_err("a failed check is an error");
     let steps = capture.group_steps();
 
     assert_eq!(steps, [GroupStep::Check], "nothing was sent");
@@ -156,7 +156,7 @@ fn kill_group_signals_through_the_root_pidfd(#[fixture(pidfd_group_signal)] _gro
     let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
     let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
-    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root), &mut Vec::new()).expect("kill_group on an owned group");
     let steps = capture.group_steps();
     drop(stdin);
 
@@ -193,7 +193,7 @@ fn kill_group_falls_back_to_the_number_when_the_kernel_refuses_the_flag() {
     let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_pidfd_group_flag();
-    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root), &mut Vec::new()).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);
@@ -225,7 +225,7 @@ fn the_leader_signal_goes_through_the_root_pidfd() {
     let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
     let capture = crate::send_log::Capture::start();
     let refused = super::fault::refuse_group_sends();
-    kill_group(child.id() as i32, Some(&root)).expect("kill_group on an owned group");
+    kill_group(child.id() as i32, Some(&root), &mut Vec::new()).expect("kill_group on an owned group");
     drop(refused);
     let steps = capture.group_steps();
     drop(stdin);

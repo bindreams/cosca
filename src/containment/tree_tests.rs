@@ -78,7 +78,7 @@ fn a_consumer_drives_a_tree_only_through_what_its_mechanism_answers() {
 
     assert_eq!(tree.containment(), Containment::ProcessGroup);
     tree.require_contained().expect("a contained tree is actionable");
-    assert!(matches!(tree.kill(None), TreeKillOutcome::Ran(Ok(()))));
+    assert!(matches!(tree.kill(None).outcome(), TreeKillOutcome::Ran(Ok(()))));
     assert_eq!(*sends.lock().unwrap(), ["kill"]);
     assert!(tree.drain_edge().is_none(), "the fake states no drain edge");
     let err = tree.wait_drained(None).expect_err("no edge to wait on");
@@ -157,6 +157,7 @@ fn a_released_tree_keeps_what_its_kills_settled() {
     let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
     let mut tree = Tree::contained(Mechanism::Fake(fake));
     tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a kill that left nothing");
     assert!(tree.is_killed());
 
@@ -187,6 +188,7 @@ fn a_released_tree_keeps_its_kind() {
         tree.release().wait();
         assert_eq!(tree.containment(), kind);
         tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+            .answer
             .expect("a kill that left nothing");
     }
 
@@ -205,10 +207,13 @@ fn a_released_tree_keeps_its_kind() {
             resolved: Vec::new(),
         }))
     };
-    walk.settle(left_running(), true).expect_err("a member is running");
+    walk.settle(left_running(), true)
+        .answer
+        .expect_err("a member is running");
     walk.release().wait();
     assert_eq!(walk.containment(), Containment::TreeWalk);
     walk.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect_err("the walk still holds the member it left running");
 }
 
@@ -269,6 +274,7 @@ fn a_released_cgroup_leaf_leaves_a_tree_that_still_reports_and_settles() {
 
     assert_eq!(tree.containment(), Containment::CgroupV2);
     tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a kill that left nothing");
     #[cfg(feature = "tokio")]
     ::tokio::runtime::Builder::new_current_thread()

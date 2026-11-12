@@ -9,7 +9,8 @@ use crate::containment::drain_edge::DrainEdge;
 #[cfg(feature = "tokio")]
 use crate::containment::mechanism::AwaitableRelease;
 use crate::containment::mechanism::{Contains, Release};
-use crate::containment::{Containment, Root, TerminateOutcome};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::identity::HostKernel;
 
 // The leaf's `Debug` hides its path; `subject` names it.
 impl std::fmt::Debug for CgroupLeaf {
@@ -51,8 +52,33 @@ impl CgroupLeaf {
 }
 
 impl Contains for CgroupLeaf {
-    /// `Ok` says the kernel killed every member, however it was spawned (see
-    /// [`hard_kill`](CgroupLeaf::hard_kill)).
+    /// `Ok` says the kernel was told to kill every member, however it was spawned (see
+    /// [`hard_kill`](CgroupLeaf::hard_kill)). The members `cgroup.procs` lists, in the leaf and in
+    /// every cgroup under it, are read before the kill, each proved through its pidfd and named by
+    /// its identity, so that a wait over it can wait for each member's own exit. The listing is kept
+    /// because the edge alone does not prove each listed member has exited.
+    ///
+    /// Once the kill has landed, each listed member is placed through its pidfd
+    /// ([`reached_by_kill`](CgroupLeaf::reached_by_kill)): one still in the leaf was reached whatever
+    /// its credentials, and is waited for; one found outside is TAKEN to have left before the kill, so
+    /// it is no part of the tree and is not waited for (one moved out after the kill reached it reads
+    /// the same and is not waited for either, though it was sent `SIGKILL`); one that cannot be placed
+    /// is an error saying its exit cannot be observed.
+    fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
+        let (listed, mut unobserved) = self.list_members(root.map(Root::pid));
+        let sent = self.send_kill(root);
+        let members = match sent {
+            TreeKillOutcome::Ran(Ok(())) => {
+                let (reached, unplaced) = self.reached_by_kill(&HostKernel, listed);
+                unobserved.extend(unplaced);
+                reached
+            }
+            _ => listed.into_iter().map(|member| member.id).collect(),
+        };
+        TreeKill::listed(sent, members, unobserved, DrainEdge::Cgroup(self))
+    }
+
+    /// The bare `cgroup.kill`: no member is listed, for a caller that waits for none.
     fn send_kill(&self, _root: Option<&dyn Root>) -> TreeKillOutcome {
         TreeKillOutcome::Ran(self.hard_kill().map_err(Unkilled::from))
     }

@@ -836,7 +836,7 @@ use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
-use crate::containment::{Containment, Root, Skip, TerminateOutcome, Why};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
@@ -849,6 +849,31 @@ enum Scope<'r> {
     /// The marker holders alone, for a root whose number names no one reliably any more. `except`
     /// is a holder to leave alone: the root, when this process does not pin it.
     HoldersOnly { except: Option<ProcessId> },
+}
+
+/// What a sweep carries from one pass to the next ([`Marker::sweep_pass`]).
+struct SweepState<'k> {
+    /// The identities this sweep has signalled, so no later pass signals one again.
+    seen: std::collections::HashSet<ProcessId>,
+    /// The group signals' results folded together across passes: a later pass's success does not
+    /// erase an earlier failure, and vice versa.
+    group_result: Result<(), Error>,
+    /// Whether any pass was blind, any holder could not be resolved, or any signal was refused: checked
+    /// once, by `finish_sweep`, whichever pass it happened on.
+    incomplete: bool,
+    /// The members a `SIGKILL` reached, for the wait after the kill.
+    killed: &'k mut Vec<ProcessId>,
+}
+
+impl<'k> SweepState<'k> {
+    fn new(killed: &'k mut Vec<ProcessId>) -> SweepState<'k> {
+        SweepState {
+            seen: std::collections::HashSet::new(),
+            group_result: Ok(()),
+            incomplete: false,
+            killed,
+        }
+    }
 }
 
 /// The live marker for one contained tree.
@@ -885,7 +910,9 @@ impl std::fmt::Debug for Marker {
 }
 
 impl Contains for Marker {
-    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+    /// No drain edge is named: the marker pipe's EOF waits for holders the kill never reached, so the
+    /// wait is for the identities the sweep killed.
+    fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         self.kill_tree(root)
     }
 
@@ -1104,8 +1131,10 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    fn hard_kill(&self, root: Option<&dyn Root>) -> Result<(), Error> {
-        self.hard_kill_impl(Scope::Full(root))
+    ///
+    /// Every identity the sweep killed is added to `killed`, for the wait over the kill.
+    fn hard_kill(&self, root: Option<&dyn Root>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::Full(root), killed)
     }
 
     /// What `look` at `root` (`None` for a marker made [`without_root`](Self::without_root), whose
@@ -1161,57 +1190,57 @@ impl Marker {
     /// reaped the root and its group is empty or it had none ([`TreeKillOutcome::Answered`]); and the
     /// holders alone, with the rest skipped ([`TreeKillOutcome::Skipped`]), when the number may name
     /// another process or the root is `Unpinned` or `Unknown`.
-    pub(crate) fn kill_tree(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+    pub(crate) fn kill_tree<'a>(&self, root: Option<&dyn Root>) -> TreeKill<'a> {
         let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
-        let holders_only = |except| self.hard_kill_impl(Scope::HoldersOnly { except });
-        let Some((look, except)) = self.look_at(root) else {
+        let mut killed = Vec::new();
+        let outcome = match self.look_at(root) {
             // No look to take: without its root only the holders are the tree.
-            return TreeKillOutcome::Ran(ran(match self.root {
-                None => holders_only(None),
+            None => match self.root {
+                None => TreeKillOutcome::Ran(ran(
+                    self.hard_kill_impl(Scope::HoldersOnly { except: None }, &mut killed)
+                )),
                 Some(_) => {
                     debug_assert!(false, "a marker with a root was given no root to look at");
-                    self.hard_kill(root)
+                    TreeKillOutcome::Ran(ran(self.hard_kill(root, &mut killed)))
                 }
-            }));
+            },
+            Some((look, except)) => {
+                let root_pid = root.map_or(0, Root::pid);
+                match look {
+                    NumberLook::Trusted => TreeKillOutcome::Ran(ran(self.hard_kill(root, &mut killed))),
+                    NumberLook::Empty => TreeKillOutcome::Answered(ran(
+                        self.hard_kill_impl(Scope::HoldersOnly { except: None }, &mut killed)
+                    )),
+                    look => TreeKillOutcome::Skipped(self.skip(
+                        "kill",
+                        root_pid,
+                        look,
+                        self.hard_kill_impl(Scope::HoldersOnly { except }, &mut killed),
+                    )),
+                }
+            }
         };
-        let root_pid = root.map_or(0, Root::pid);
-        match look {
-            NumberLook::Trusted => TreeKillOutcome::Ran(ran(self.hard_kill(root))),
-            NumberLook::Empty => TreeKillOutcome::Answered(ran(holders_only(None))),
-            look => TreeKillOutcome::Skipped(self.skip("kill", root_pid, look, holders_only(except))),
-        }
+        TreeKill::of(outcome).reaching(killed)
     }
 
-    fn hard_kill_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
+    fn hard_kill_impl(&self, scope: Scope<'_>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
-        let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
         // failure must not be erased by a later pass's success or vice versa.
-        let mut group_result: Result<(), Error> = Ok(());
-        // True if ANY pass was blind, ANY marker holder could not be resolved, or ANY signal
-        // attempt was refused by the OS — checked exactly once, by `finish_sweep`, regardless
-        // of which pass it happened on.
-        let mut incomplete = false;
+        let mut state = SweepState::new(killed);
         let mut first_pass = true;
         // Re-snapshots and re-computes after every signalled pass, repeating while a fresh pass
         // BOTH finds identities this sweep has not already signalled AND actually resolves at
         // least one of them (`sweep_pass`'s return value) — no numeric cap (forbidden by this
         // crate's no-arbitrary-loop-limit rule); see `sweep_pass`'s doc for termination.
         loop {
-            let progressed = self.sweep_pass(
-                nix::sys::signal::Signal::SIGKILL,
-                &mut seen,
-                &mut group_result,
-                &mut incomplete,
-                first_pass,
-                scope,
-            );
+            let progressed = self.sweep_pass(nix::sys::signal::Signal::SIGKILL, &mut state, first_pass, scope);
             first_pass = false;
             if !progressed {
                 break;
             }
         }
-        Self::finish_sweep(self.handle, group_result, incomplete)
+        Self::finish_sweep(self.handle, state.group_result, state.incomplete)
     }
 
     /// See [`hard_kill`](Self::hard_kill)'s doc for what `Err` does and does not mean here, and
@@ -1262,18 +1291,11 @@ impl Marker {
 
     fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
-        let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
-        let mut group_result: Result<(), Error> = Ok(());
-        let mut incomplete = false;
-        self.sweep_pass(
-            nix::sys::signal::Signal::SIGTERM,
-            &mut seen,
-            &mut group_result,
-            &mut incomplete,
-            true,
-            scope,
-        );
-        Self::finish_sweep(self.handle, group_result, incomplete)
+        // A `SIGTERM` is not a kill: nothing it reaches is waited for.
+        let mut reached = Vec::new();
+        let mut state = SweepState::new(&mut reached);
+        self.sweep_pass(nix::sys::signal::Signal::SIGTERM, &mut state, true, scope);
+        Self::finish_sweep(self.handle, state.group_result, state.incomplete)
     }
 
     /// CONTRACT, re-checked on every `hard_kill`/`terminate` call, not just at `Marker::new`
@@ -1440,12 +1462,16 @@ impl Marker {
     fn sweep_pass(
         &self,
         signal: nix::sys::signal::Signal,
-        seen: &mut std::collections::HashSet<ProcessId>,
-        group_result: &mut Result<(), Error>,
-        incomplete: &mut bool,
+        state: &mut SweepState<'_>,
         first_pass: bool,
         scope: Scope<'_>,
     ) -> bool {
+        let SweepState {
+            seen,
+            group_result,
+            incomplete,
+            killed,
+        } = state;
         let walk = matches!(scope, Scope::Full(_));
         let group_root = match scope {
             Scope::Full(root) => root,
@@ -1620,7 +1646,7 @@ impl Marker {
                 // `io::Error` (see this fn's doc, and `combine_group_errors` below).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
                     (Some(pgid), nix::sys::signal::Signal::SIGKILL) => {
-                        crate::containment::unix::kill_group(pgid, group_root)
+                        crate::containment::unix::kill_group(pgid, group_root, killed)
                     }
                     (Some(pgid), _) => crate::containment::unix::term_group(pgid, group_root),
                     (None, _) => Ok(()),
@@ -1672,9 +1698,16 @@ impl Marker {
             } else {
                 progressed = true;
             }
+            // The root's owner waits for the root.
+            if matches!(outcome, crate::containment::treewalk::KillOutcome::Terminated)
+                && signal == nix::sys::signal::Signal::SIGKILL
+                && Some(id) != self.root
+            {
+                killed.push(id);
+            }
         }
         for id in new_holders {
-            if self.kill_holder(id, signal) {
+            if self.kill_holder(id, signal, killed) {
                 *incomplete = true; // NotAttempted or Denied
             } else {
                 progressed = true; // NotHeld (resolved) or a signal actually attempted
@@ -1745,7 +1778,9 @@ impl Marker {
     /// caller folds into `incomplete`. `false` covers every other outcome: a confirmed
     /// non-holder (not incomplete, just resolved), or a signal that was actually attempted
     /// (delivered, or already gone, which `kill_by_identity` treats as success).
-    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal) -> bool {
+    ///
+    /// A `SIGKILL` that was delivered adds `id` to `killed`, for the wait over the kill.
+    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal, killed: &mut Vec<ProcessId>) -> bool {
         match holds_marker_query(id.pid(), self.handle) {
             MarkerQuery::NotHeld => {
                 log::debug!(
@@ -1774,6 +1809,9 @@ impl Marker {
                 #[cfg(test)]
                 if matches!(outcome, KillOutcome::Terminated) {
                     fault::note_holder_kill(id.pid(), signal);
+                }
+                if matches!(outcome, KillOutcome::Terminated) && signal == nix::sys::signal::Signal::SIGKILL {
+                    killed.push(id);
                 }
                 matches!(outcome, KillOutcome::NotAttempted(_))
             }

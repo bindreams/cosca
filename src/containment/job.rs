@@ -63,18 +63,48 @@ impl Job {
         Ok(Job(assign_to_kill_on_close_job(process.as_raw_handle())?))
     }
 
-    /// Terminate every process still in the job.
+    /// Terminate every process still in the job, and wait for them to exit.
     ///
-    /// The kernel documents that termination of every member is initiated before
-    /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
-    /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits for the members
-    /// to exit. The kill terminates every member, including a child created while it runs.
+    /// **`Ok` means every member the kill reached has exited**: the members the job listed before
+    /// the kill are waited for one at a time through a handle opened by their identity, and then the
+    /// job's own edge, with no deadline. A child created while the kill ran was not listed: it is
+    /// terminated too, and the call waits for it only until it leaves the job's list. A member whose
+    /// exit cannot be observed is an [`Error::Unassessable`] naming it, returned once the others have
+    /// been waited for. [`send_kill_tree`](Job::send_kill_tree) only sends.
     ///
     /// Whether a killed job accepts an explicit `AssignProcessToJobObject` varies by Windows build
     /// (accepted on 10.0.26100, refused with `ACCESS_DENIED` on the CI's Windows arm64 runner);
     /// cosca never makes one.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.0.hard_kill().map_err(Error::Io)
+        let (sent, wait) = self.kill().split();
+        Self::answer(sent)?;
+        wait.wait()
+    }
+
+    /// [`kill_tree`](Job::kill_tree) that sends and does not wait.
+    ///
+    /// The kernel documents that termination of every member is initiated before
+    /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
+    /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits until the job's list
+    /// is empty. That can come before every member's process object is signalled, so it
+    /// does not promise the members are gone: a caller that needs that uses
+    /// [`kill_tree`](Job::kill_tree). The kill terminates every member, including a child created
+    /// while it runs.
+    pub fn send_kill_tree(&self) -> Result<(), Error> {
+        use crate::containment::Contains as _;
+        Self::answer(self.0.send_kill(None))
+    }
+
+    /// The job's kill, with the wait for what it reached.
+    fn kill(&self) -> crate::containment::TreeKill<'_> {
+        use crate::containment::Contains as _;
+        self.0.kill(None)
+    }
+
+    /// What a kill left: its error, which is the one `TerminateJobObject` failure.
+    fn answer(sent: crate::containment::dispatch::TreeKillOutcome) -> Result<(), Error> {
+        sent.into_result()
+            .map_err(|left| left.members.into_iter().next().expect("a failed kill left an error"))
     }
 
     /// Clear `KILL_ON_JOB_CLOSE`, so that dropping (or having already dropped) this `Job` leaves
@@ -92,14 +122,18 @@ impl Job {
         self.0.disarm().map_err(Error::Io)
     }
 
-    /// Block until every member of the tree has exited, or forever if none ever does.
+    /// Block until the job's process list is empty, or forever if it never is. This call observes
+    /// the list, not each member: the list can empty before every member's process object is
+    /// signalled. A caller that needs the members gone uses [`kill_tree`](Job::kill_tree), which
+    /// waits for each.
     pub fn wait_tree(&self) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(None)
     }
 
     /// Like [`wait_tree`](Job::wait_tree), but give up and report
     /// [`TreeDrain::MembersRemain`](crate::containment::TreeDrain::MembersRemain) once `timeout`
-    /// elapses.
+    /// elapses, the tree not having been seen drained. The answer is the job's process list as of
+    /// its last look, in which a member that has just exited can still appear.
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(crate::wait::deadline_from(timeout))
     }

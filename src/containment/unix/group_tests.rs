@@ -130,7 +130,8 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
             state(
                 pgid,
                 Signal::SIGKILL,
-                Some(&crate::test_support::stated_root::StatedRoot::unreaped())
+                Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+                &mut Vec::new()
             ),
             GroupState::Cleared
         ),
@@ -143,6 +144,36 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
         status.signal(),
         Some(libc::SIGKILL),
         "state() must have actually delivered SIGKILL, not just probed, got {status:?}"
+    );
+}
+
+/// The members a group kill names for the wait after it leave out the root, which its owner waits for:
+/// the group's leader is the root here, and its `SIGKILL` is delivered all the same.
+///
+/// Mutant: `converge` names every member whose resend was delivered, the root's included.
+#[skuld::test]
+fn a_group_kill_names_no_root_among_the_members_it_reached() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pgid = child.id() as i32;
+    let root =
+        crate::test_support::stated_root::StatedRoot::with_state(child.id(), || crate::signal::RootState::Unreaped);
+
+    let mut killed = Vec::new();
+    let verdict = state(pgid, Signal::SIGKILL, Some(&root), &mut killed);
+
+    assert!(matches!(verdict, GroupState::Cleared), "got {verdict:?}");
+    assert_eq!(
+        child.wait().expect("reap").signal(),
+        Some(libc::SIGKILL),
+        "the root was sent its kill"
+    );
+    assert!(
+        killed.is_empty(),
+        "the root is waited for through its owner: {killed:?}"
     );
 }
 
@@ -160,7 +191,8 @@ fn state_of_an_all_zombie_group_is_cleared() {
             state(
                 pid as i32,
                 Signal::SIGKILL,
-                Some(&crate::test_support::stated_root::StatedRoot::unreaped())
+                Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+                &mut Vec::new()
             ),
             GroupState::Cleared
         ),
@@ -316,6 +348,7 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_
             pgid,
             Signal::SIGTERM,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+            &mut Vec::new(),
         ),
         reachable,
     ) {
@@ -413,6 +446,7 @@ fn converge_re_verifies_a_member_through_its_kernel() {
         pid as i32,
         Signal::SIGTERM,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut Vec::new(),
     );
 
     assert!(
@@ -444,7 +478,7 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
         checks.set(checks.get() + 1);
         crate::signal::RootState::Unreaped
     });
-    let state = super::converge(&kernel, pid as i32, Signal::SIGTERM, Some(&root));
+    let state = super::converge(&kernel, pid as i32, Signal::SIGTERM, Some(&root), &mut Vec::new());
 
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
     assert_eq!(checks.get(), 0, "nothing was attempted on a member that is not alive");
@@ -475,6 +509,7 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
         pid as i32,
         Signal::SIGTERM,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut Vec::new(),
     );
     drop(refusing);
 
@@ -503,6 +538,7 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
         pid as i32,
         Signal::SIGKILL,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut Vec::new(),
     );
     let sent = (capture.group_steps(), capture.by_identity());
     drop(capture);
@@ -576,7 +612,7 @@ fn resend_answer(errno: Option<i32>) -> super::Reached {
 /// `Unknown`", "another errno is `No`", "`Gone` is `Unknown`".
 #[skuld::test]
 fn a_resends_answer_is_the_members_reached() {
-    assert!(matches!(resend_answer(None), super::Reached::Yes), "delivered");
+    assert!(matches!(resend_answer(None), super::Reached::Killed), "delivered");
     assert!(matches!(resend_answer(Some(libc::ESRCH)), super::Reached::Yes), "gone");
     assert!(matches!(resend_answer(Some(libc::EPERM)), super::Reached::No), "EPERM");
     assert!(matches!(resend_answer(Some(libc::EIO)), super::Reached::Unknown), "EIO");

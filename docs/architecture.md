@@ -134,7 +134,12 @@ In order:
    (`Contains::kill_left`: a walk kills them again, every other mechanism hands the result back);
    the cgroup leaf's awaitable steps go through `Contains::awaitable_release` from both the Linux
    awaited drop teardown (`Tree::await_release_steps`) and `Release::wait_async`; every mechanism
-   answers it and only the leaf has steps. `Tree`'s only matches on the kind of mechanism are its
+   answers it and only the leaf has steps. A mechanism's `Contains::kill` returns a `TreeKill`: its
+   outcome, and the identities of the members it reached, which `kill_tree` re-opens by identity, one
+   at a time, to wait for each (then the root through its owner's handle, then the tree's own drain
+   edge, where its kill landed on one). The send-only callers (the drop, `send_kill_tree`) call
+   `Contains::send_kill`, which returns the outcome alone: the same kill, and for a cgroup leaf and a
+   Job Object no listing of the members before it. `Tree`'s only matches on the kind of mechanism are its
    `_for_test` accessors. A release ends only what a mechanism owns (the cgroup leaf, which its
    `Release` takes, and the fd marker's read end, which the release closes); any other mechanism is given back and stays in
    the tree, so a walk's settlement after a release still has its identities. A released tree is

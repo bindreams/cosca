@@ -18,6 +18,7 @@ fn killed(settled: bool) -> Tree {
     let tree = Tree::none();
     if settled {
         tree.settle(TreeKillOutcome::Ran(Ok(())), true)
+            .answer
             .expect("a kill that left nothing");
     }
     assert_eq!(tree.is_killed(), settled);

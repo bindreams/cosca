@@ -523,7 +523,9 @@ impl Command {
     /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
     /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
     /// and so does the drop, which waits for that child's whole life and warns once past 1 s.
-    /// The same holds for a process that migrated into the leaf after a landed kill. Neither raises
+    /// The same holds for a process that migrated into the leaf after a landed kill:
+    /// [`kill_tree`](crate::Child::kill_tree), [`wait_tree`](crate::Child::wait_tree) and the drop
+    /// each wait for it until it exits, though the kill did not reach it. Neither raises
     /// an event cosca could re-kill on: `populated` does not change, and a fork writes no file.
     /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown (see
     /// principle 3 for the one early exception in a failed elevation).

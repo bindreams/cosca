@@ -6,6 +6,7 @@ use std::io;
 use std::path::PathBuf;
 
 use super::*;
+use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
 use std::fs::{self, File};
@@ -179,6 +180,17 @@ pub(crate) enum DrainStep {
         listener: event_listener::EventListener,
         deadline: Option<std::time::Instant>,
     },
+}
+
+/// A member [`CgroupLeaf::list_members`] found in the leaf's subtree: its identity, and the cgroup id
+/// that placed it there (`None` where `/proc` did, or the kernel gives no id), which a check made
+/// after a kill compares with the member's id then, so that a member that has not moved is not
+/// walked for.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) id: ProcessId,
+    seen: Option<u64>,
 }
 
 /// A live leaf sub-cgroup created for a single spawned process tree. See
@@ -482,7 +494,8 @@ impl CgroupLeaf {
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
     ///
     /// `Ok` means the kill was delivered, not that the members have exited yet (see
-    /// [`wait_drained`](CgroupLeaf::wait_drained)): either the atomic kill fired, or the leaf was
+    /// [`wait_drained`](CgroupLeaf::wait_drained), and
+    /// [`Contains::kill`](crate::containment::Contains::kill) for the call that waits for them): either the atomic kill fired, or the leaf was
     /// already gone ([`removed_after_drain`]), which is itself proof every member had exited —
     /// `rmdir` on a cgroup v2 leaf succeeds only once `populated` reads 0.
     ///
@@ -749,19 +762,7 @@ impl CgroupLeaf {
         if pids.is_empty() && unproven.is_empty() {
             return Ok(());
         }
-        // One subtree for every member. Where the leaf's id cannot be read, the pidfd route cannot
-        // place a member, and `/proc` does.
-        let subtree = self.subtree_with(match self.id() {
-            Ok(id) => Some(id),
-            Err(e) => {
-                log::debug!(
-                    "cgroup terminate: leaf {}'s cgroup id cannot be read ({report}); its members are placed through /proc",
-                    self.leaf_path.display(),
-                    report = crate::error::Report(&e)
-                );
-                None
-            }
-        });
+        let subtree = self.listing_subtree();
         let mut failed = Vec::new();
         for pid in pids {
             match self.terminate_member(pid, &subtree) {
@@ -801,6 +802,133 @@ impl CgroupLeaf {
         })
     }
 
+    /// The one subtree a pass over the listed members places each of them in. Where the leaf's id
+    /// cannot be read, the pidfd route cannot place a member, and `/proc` does.
+    fn listing_subtree(&self) -> Subtree {
+        self.subtree_with(match self.id() {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log::debug!(
+                    "cgroup: leaf {}'s cgroup id cannot be read ({report}); its members are placed through /proc",
+                    self.leaf_path.display(),
+                    report = crate::error::Report(&e)
+                );
+                None
+            }
+        })
+    }
+
+    /// The members `cgroup.procs` lists now, in the leaf and in every cgroup under it, for the wait
+    /// over a kill that follows: each is proved a member of the leaf through its own pidfd, and its identity is read from that pidfd, which is
+    /// then closed, so no descriptor is held per member. `root`, the root's pid, is left out: its
+    /// owner waits for it. A leaf already gone has no member. A member that cannot be named, or the
+    /// listing itself failing, is returned as an error saying its exit cannot be observed; the kill
+    /// goes ahead regardless.
+    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<Listed>, Vec<crate::error::Error>) {
+        use crate::containment::tree_kill::exit_unobserved;
+        use crate::error::Error;
+
+        let content = match self.dir.read("cgroup.procs") {
+            Ok(c) => c,
+            Err(e) if removed_after_drain(&e) => return (Vec::new(), Vec::new()),
+            Err(e) => {
+                let why = Error::Unassessable {
+                    detail: format!(
+                        "cgroup leaf {}: its members could not be listed before the kill, so their exit cannot be observed",
+                        self.leaf_path.display()
+                    ),
+                    source: Some(Error::io_cause(e)),
+                };
+                return (Vec::new(), vec![why]);
+            }
+        };
+        // `cgroup.kill` reaches the cgroups under the leaf too, so their members are listed as well.
+        let (nested, failure) = self.dir.nested_procs();
+        let subtree = self.listing_subtree();
+        let (mut members, mut unobserved) = (Vec::new(), Vec::new());
+        if let Some(e) = failure {
+            unobserved.push(Error::Unassessable {
+                detail: format!(
+                    "cgroup leaf {}: the cgroups under it could not all be listed before the kill, so the exit of \
+                     their members cannot be observed",
+                    self.leaf_path.display()
+                ),
+                source: Some(Error::io_cause(e)),
+            });
+        }
+        for line in content.lines().chain(nested.iter().map(String::as_str)) {
+            match line.trim().parse::<u32>() {
+                Ok(0) => unobserved.push(Error::Unassessable {
+                    detail: "a member of the leaf in a pid namespace this process cannot see was killed, but its exit \
+                             cannot be observed"
+                        .to_owned(),
+                    source: None,
+                }),
+                Ok(pid) if Some(pid) == root => {}
+                Ok(pid) => match self.listed_member(pid, &subtree) {
+                    Ok(Some(id)) => members.push(id),
+                    Ok(None) => {}
+                    Err(why) => unobserved.push(exit_unobserved(pid, why)),
+                },
+                Err(_) => unobserved.push(Error::Unassessable {
+                    detail: format!("cgroup.procs line {line:?} is no pid, so that member's exit cannot be observed"),
+                    source: None,
+                }),
+            }
+        }
+        (members, unobserved)
+    }
+
+    /// The listed `pid`, if it is a member of the leaf now: `None` for a pid that is gone or not in the
+    /// leaf (it is no member the kill reaches).
+    fn listed_member(&self, pid: u32, subtree: &Subtree) -> Result<Option<Listed>, crate::error::Error> {
+        use std::os::fd::AsFd as _;
+
+        use crate::error::Error;
+        use crate::identity::Resolved;
+
+        let pidfd = match pin_member(pid) {
+            Ok(pidfd) => pidfd,
+            Err(rustix::io::Errno::SRCH) => return Ok(None),
+            Err(e) => return Err(Error::Io(io::Error::from_raw_os_error(e.raw_os_error()))),
+        };
+        let seen = match placed_or_exited(pidfd.as_fd(), subtree.holds_seen(pid, Some(pidfd.as_fd()), None))? {
+            PlacedOrExitedOutcome::Placed((true, seen)) => seen,
+            _ => return Ok(None),
+        };
+        match ProcessId::of_held_with(&crate::identity::HostKernel, pid, pidfd.as_fd()) {
+            (Resolved::Found(id), _) => Ok(Some(Listed { id, seen })),
+            (Resolved::Gone, _) => Ok(None),
+            (Resolved::Unknown, cause) => Err(crate::identity::unqueryable(&format!("pid {pid}"), cause)),
+        }
+    }
+
+    /// Of the `members` [`list_members`](Self::list_members) named before a `cgroup.kill` that landed,
+    /// those the kill reached, which exit whatever their credentials, and the members whose place
+    /// cannot be told, as errors saying their exit cannot be observed. Each is opened by identity and
+    /// placed through its pidfd ([`Subtree::reached_by`]). One still in the leaf or under it was
+    /// reached. One found outside is TAKEN to have left before the kill: it is no part of the tree, so
+    /// it is neither waited for nor, by this check, known to have been killed. One already gone was in
+    /// the tree and has exited: it is kept, and its wait ends at once.
+    pub(crate) fn reached_by_kill(
+        &self,
+        kernel: &dyn crate::identity::Kernel,
+        members: Vec<Listed>,
+    ) -> (Vec<ProcessId>, Vec<crate::error::Error>) {
+        use crate::containment::tree_kill::exit_unobserved;
+
+        let subtree = self.listing_subtree();
+        let (mut reached, mut unobserved) = (Vec::new(), Vec::new());
+        for member in members {
+            match kill_reached(kernel, &subtree, member) {
+                Ok(true) => reached.push(member.id),
+                Ok(false) => {}
+                Err(why) => unobserved.push(exit_unobserved(member.id.pid(), why)),
+            }
+        }
+        (reached, unobserved)
+    }
+
     /// [`terminate`](Self::terminate)'s `SIGTERM` to the listed `pid`, if it is still a running
     /// member of the leaf. `Ok` once sent, or for a pid that is gone or not a running member, which
     /// it logs at `debug`; `Err` says why a pid that may be a member got none.
@@ -818,25 +946,24 @@ impl CgroupLeaf {
         fault::run_after_terminate_pin();
         // The exit check follows the read: a process still running after it held `pid` throughout,
         // so the read was its own and not a reused pid's.
-        let inside = match subtree.holds(pid, Some(pidfd.as_fd())) {
-            Ok(inside) => inside,
-            // A member that exited and was reaped since its pin has no place left to read
-            // (`ENOENT` from `/proc`, `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells it apart.
-            Err(e) => match member_exited(pidfd.as_fd()) {
-                Ok(true) => {
-                    log::debug!(
-                        "cgroup terminate: pid {pid} exited before it was placed ({report}); not signalled",
-                        report = crate::error::Report(&e)
-                    );
-                    return Ok(());
-                }
-                Ok(false) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
-                Err(exited) => {
-                    return Err(Unsignalled::Unproven(format!(
-                        "it could not be placed ({e}), nor its exit read ({exited})"
-                    )))
-                }
-            },
+        let inside = match placed_or_exited(pidfd.as_fd(), subtree.holds(pid, Some(pidfd.as_fd()))) {
+            Ok(PlacedOrExitedOutcome::Placed(inside)) => inside,
+            Ok(PlacedOrExitedOutcome::Exited(placement)) => {
+                log::debug!(
+                    "cgroup terminate: pid {pid} exited before it was placed ({report}); not signalled",
+                    report = crate::error::Report(&placement)
+                );
+                return Ok(());
+            }
+            // A failure with the exit unreadable too keeps its two causes, which only `Report` names;
+            // a plain `Error::Io` is its own text.
+            Err(e @ crate::error::Error::Unassessable { .. }) => {
+                return Err(Unsignalled::Unproven(format!(
+                    "it could not be placed ({report})",
+                    report = crate::error::Report(&e)
+                )))
+            }
+            Err(e) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
         };
         if !inside {
             log::debug!("cgroup terminate: pid {pid} is not a member of the leaf; not signalled");
@@ -858,6 +985,68 @@ impl CgroupLeaf {
             }
             Err(e) => Err(Unsignalled::Failed(format!("{e}"))),
         }
+    }
+}
+
+/// Whether a `cgroup.kill` that landed reached the listed `member`: it is opened by identity and asked
+/// of [`Subtree::reached_by`] through its pidfd, with the cgroup id it had when listed. One that is
+/// gone was in the tree and has exited, so a wait finds nothing to wait on.
+fn kill_reached(
+    kernel: &dyn crate::identity::Kernel,
+    subtree: &Subtree,
+    member: Listed,
+) -> Result<bool, crate::error::Error> {
+    let pid = member.id.pid();
+    let Some(os) =
+        crate::os_process::open_with(kernel, member.id).map_err(crate::os_process::OpenFailure::into_open_error)?
+    else {
+        return Ok(true);
+    };
+    let pidfd = os.os_handle();
+    match placed_or_exited(pidfd, subtree.reached_by(pid, Some(pidfd), member.seen))? {
+        PlacedOrExitedOutcome::Placed(false) => {
+            log::debug!(
+                "cgroup kill: pid {pid} is outside the leaf after the kill, so it is taken to have left it before, \
+                 is no part of the tree and is not waited for"
+            );
+            Ok(false)
+        }
+        PlacedOrExitedOutcome::Placed(true) | PlacedOrExitedOutcome::Exited(_) => Ok(true),
+    }
+}
+
+/// How [`placed_or_exited`] went.
+enum PlacedOrExitedOutcome<T> {
+    /// The placement's answer.
+    Placed(T),
+    /// The placement failed with this error because the process exited and was reaped.
+    Exited(io::Error),
+}
+
+/// `placed`, the answer of a placement of the process `pidfd` pins; `Exited` if it failed because the
+/// process exited and was reaped since its pin, which leaves no place to read (`ENOENT` from `/proc`,
+/// `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells that apart. The one rule for a failed placement.
+/// The error of one that failed while the exit cannot be read either is an `Unassessable` with the
+/// placement's `io::Error` as its source, and the exit read's failure in its detail; a caller
+/// renders it with [`Report`](crate::error::Report) to name both.
+fn placed_or_exited<T>(
+    pidfd: std::os::fd::BorrowedFd<'_>,
+    placed: io::Result<T>,
+) -> Result<PlacedOrExitedOutcome<T>, crate::error::Error> {
+    use crate::error::{Error, Report};
+    match placed {
+        Ok(placed) => Ok(PlacedOrExitedOutcome::Placed(placed)),
+        Err(e) => match member_exited(pidfd) {
+            Ok(true) => Ok(PlacedOrExitedOutcome::Exited(e)),
+            Ok(false) => Err(Error::Io(e)),
+            Err(exited) => Err(Error::Unassessable {
+                detail: format!(
+                    "its exit could not be read ({report}), and its placement could not be read",
+                    report = Report(&exited)
+                ),
+                source: Some(Error::io_cause(e)),
+            }),
+        },
     }
 }
 

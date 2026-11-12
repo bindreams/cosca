@@ -179,9 +179,13 @@ fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_
 
     let reaped = || StatedRoot::with_state(1234, || RootState::Reaped { own: true });
     let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-    let ungrouped = Tree::contained(Mechanism::Marker(marker_with_pgid(None))).kill(Some(&reaped()));
+    let ungrouped = Tree::contained(Mechanism::Marker(marker_with_pgid(None)))
+        .kill(Some(&reaped()))
+        .outcome();
     assert!(matches!(ungrouped, TreeKillOutcome::Answered(Ok(()))), "{ungrouped:?}");
-    let grouped = Tree::contained(Mechanism::Marker(marker_with_pgid(Some(1234)))).kill(Some(&reaped()));
+    let grouped = Tree::contained(Mechanism::Marker(marker_with_pgid(Some(1234))))
+        .kill(Some(&reaped()))
+        .outcome();
     assert!(matches!(grouped, TreeKillOutcome::Skipped(_)), "{grouped:?}");
 }
 
@@ -208,7 +212,7 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
     let unpinned = || rooted(|| RootState::Unpinned);
     let unknown = || rooted(|| RootState::Unknown(std::io::Error::other("a failed peek")));
     for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
-        let killed = walk().kill(Some(&root));
+        let killed = walk().kill(Some(&root)).outcome();
         assert!(
             matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && skip.holders.is_none()),
             "{name}: {killed:?}"
@@ -239,7 +243,7 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
     };
     for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
         let (marker, mut holder) = held();
-        let killed = marker.kill(Some(&root));
+        let killed = marker.kill(Some(&root)).outcome();
         assert!(
             matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && matches!(skip.holders, Some(Ok(())))),
             "{name}: {killed:?}"
@@ -569,7 +573,9 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
 
         let got = killed.settle(Some(&walker()), outcome, root_ended);
 
-        let got = got.map_err(|left| (pid_of(&left.first), left.others.iter().map(pid_of).collect::<Vec<_>>()));
+        let got = got
+            .answer
+            .map_err(|left| (pid_of(&left.first), left.others.iter().map(pid_of).collect::<Vec<_>>()));
         assert_eq!(got, want, "{label}");
         assert_eq!(killed.is_set(), marked, "{label}");
     }
@@ -595,6 +601,7 @@ fn settle_answers_a_walk_that_was_not_made_with_an_error_and_marks_nothing() {
 
         let left = killed
             .settle(Some(&walker()), outcome, true)
+            .answer
             .expect_err("nothing was killed, whatever became of the root");
 
         assert!(matches!(left.first, Error::Unassessable { .. }), "{label}: {left}");
@@ -612,10 +619,12 @@ fn settle_answers_a_gone_root_as_killed_once_the_handle_killed_the_tree() {
     let killed = TreeKilled::default();
     killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), false)
+        .answer
         .expect("the tree is killed");
 
     let later = killed
         .settle(Some(&walker()), TreeKillOutcome::NoRoot, false)
+        .answer
         .expect("the tree was killed already");
 
     assert_eq!(later, SettleOutcome::Killed);
@@ -769,6 +778,7 @@ fn tree_left_with(pid: u32, resolved: Vec<crate::identity::ProcessId>) -> super:
             })),
             true,
         )
+        .answer
         .expect_err("a member was left");
     killed
 }
@@ -794,7 +804,7 @@ fn check_table(
         let (killed, pid, after) = enter();
         let (want_answer, want_standing) = rows(pid).into_iter().nth(at).expect("a row per outcome");
 
-        let got = killed.settle(Some(&walker()), outcome, true).map_err(|left| {
+        let got = killed.settle(Some(&walker()), outcome, true).answer.map_err(|left| {
             std::iter::once(&left.first)
                 .chain(&left.others)
                 .map(name)
@@ -869,6 +879,7 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
             let killed = TreeKilled::default();
             killed
                 .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+                .answer
                 .expect("a complete kill");
             (killed, 0, nothing())
         },
@@ -929,6 +940,7 @@ fn unvouched_tree() -> (super::TreeKilled, Box<dyn FnOnce()>) {
     let killed = tree_left_with(id.pid(), vec![id]);
     killed
         .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+        .answer
         .expect_err("a gone root walked nothing");
     assert_eq!(
         standing(&killed),
@@ -1005,6 +1017,7 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
     let killed = TreeKilled::default();
     killed
         .settle(Some(&non_walk()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a complete kill");
     assert_eq!(standing(&killed), Standing::Killed);
 
@@ -1018,6 +1031,7 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
             })),
             true,
         )
+        .answer
         .expect_err("a member was left");
 
     assert_eq!(pid_left(&left.first), 8);
@@ -1026,11 +1040,13 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
     // The same for a skipped kill whose sweep of the holders left a member.
     killed
         .settle(Some(&non_walk()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a complete kill");
     assert_eq!(standing(&killed), Standing::Killed);
     let skipped_with_a_member = || skipped_kill("walk", Some(Err(member_left(9))));
     killed
         .settle(Some(&non_walk()), skipped_with_a_member(), true)
+        .answer
         .expect_err("a member was left");
     assert_eq!(standing(&killed), Standing::Unvouched(UnvouchedKind::Earlier));
 
@@ -1039,6 +1055,7 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
     let never = TreeKilled::default();
     never
         .settle(None, skipped_with_a_member(), true)
+        .answer
         .expect_err("a member was left");
     assert_eq!(standing(&never), Standing::Unvouched(UnvouchedKind::Earlier));
 }
@@ -1104,17 +1121,20 @@ fn a_member_whose_identity_was_never_read_is_reported_again_until_a_kill_shows_i
 
     let first = killed
         .settle(Some(&walker()), left(&[7]), true)
+        .answer
         .expect_err("a member was left");
     assert_eq!(pid_left(&first.first), 7);
 
     let later = killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect_err("a walk that finds nothing does not show the member killed");
     assert_eq!((pid_left(&later.first), later.others.len()), (7, 0));
     assert!(!killed.is_set());
 
     let named_again = killed
         .settle(Some(&walker()), left(&[7, 8]), true)
+        .answer
         .expect_err("two members are left");
     assert_eq!(pid_left(&named_again.first), 7);
     assert_eq!(named_again.others.iter().map(pid_left).collect::<Vec<_>>(), [8]);
@@ -1150,10 +1170,12 @@ fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
                 })),
                 true,
             )
+            .answer
             .expect_err("a member was left");
 
         let again = killed
             .settle(Some(&walker()), outcome(), true)
+            .answer
             .expect_err("the member is not shown killed");
 
         assert_eq!(pid_left(&again.first), 7, "{label}: {again}");
@@ -1170,6 +1192,7 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
     let killed = TreeKilled::default();
     killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a complete kill");
     assert!(killed.is_set());
     killed
@@ -1182,19 +1205,24 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
             })),
             true,
         )
+        .answer
         .expect_err("a later kill left a member");
 
     let again = killed
         .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+        .answer
         .expect_err("the member is not shown killed");
     assert_eq!(pid_left(&again.first), 7, "{again}");
 
     let nothing_held = TreeKilled::default();
     nothing_held
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a complete kill");
     assert!(matches!(
-        nothing_held.settle(Some(&walker()), TreeKillOutcome::NoRoot, true),
+        nothing_held
+            .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+            .answer,
         Ok(SettleOutcome::Killed)
     ));
 }
@@ -1215,6 +1243,7 @@ fn only_a_walk_not_made_is_answered_before_the_backstop() {
             })),
             true,
         )
+        .answer
         .expect_err("a member was left");
 
     let handed_back = killed.unless_unwalked("kill_tree", Some(&walker()), TreeKillOutcome::Ran(Ok(())));
@@ -1233,6 +1262,7 @@ fn only_a_walk_not_made_is_answered_before_the_backstop() {
     ) else {
         panic!("a walk not made is an error");
     };
+    let failure = failure.answer;
     assert_eq!(pid_left(&failure.error), 7, "{:?}", failure.error);
     assert!(!failure.root_ended);
     assert!(!killed.is_set());
@@ -1258,12 +1288,14 @@ fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled(
             })),
             true,
         )
+        .answer
         .expect_err("the member was left");
     assert_eq!(pid_left(&first.first), id.pid());
     assert!(!killed.is_set());
 
     killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("the retry killed the member by its identity");
 
     assert!(killed.is_set());
@@ -1292,6 +1324,7 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
             })),
             true,
         )
+        .answer
         .expect_err("the member was left");
     let mut held = Some(stdin);
     if exits_on_its_own {
@@ -1303,6 +1336,7 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
         .map(|_| {
             let left = killed
                 .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+                .answer
                 .expect_err("a gone root walked nothing");
             assert!(left.others.is_empty(), "{left}");
             assert_eq!(
@@ -1386,6 +1420,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
             })),
             true,
         )
+        .answer
         .expect_err("a member is running");
     let warn = earlier
         .settle_for_drop(Some(&walker()), skipped(), true)
@@ -1401,6 +1436,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let root_running = TreeKilled::default();
     root_running
         .settle(Some(&walker()), root_left(), false)
+        .answer
         .expect_err("the root is running");
     let warn = root_running
         .settle_for_drop(Some(&walker()), skipped(), true)
@@ -1414,6 +1450,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let root_only = TreeKilled::default();
     root_only
         .settle(Some(&walker()), root_left(), true)
+        .answer
         .expect("the root ended");
     for _ in 0..2 {
         let warn = root_only
@@ -1451,6 +1488,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let killed = TreeKilled::default();
     killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a complete kill");
     assert_eq!(killed.settle_for_drop(Some(&walker()), skipped(), true), None);
     assert_eq!(
@@ -1495,11 +1533,13 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             if matches!(start, "killed") {
                 killed
                     .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+                    .answer
                     .expect("a complete kill");
             }
             if start == "root seen running" {
                 killed
                     .settle(Some(&walker()), root_left(), false)
+                    .answer
                     .expect_err("the root is left");
             }
             if start == "earlier" {
@@ -1513,6 +1553,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
                         })),
                         true,
                     )
+                    .answer
                     .expect_err("a member is running");
             }
             let want_start = match start {
@@ -1526,7 +1567,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
 
             let answer = killed.settle(Some(&walker()), root_left(), root_ended);
 
-            match answer {
+            match answer.answer {
                 Ok(outcome) => {
                     assert!(root_ended, "{label}: the root is running");
                     assert_eq!(
@@ -1553,6 +1594,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             for _ in 0..2 {
                 let gone = killed
                     .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+                    .answer
                     .expect_err("a gone root walked nothing");
                 let text = gone.first.to_string();
                 assert!(!text.contains("nothing was killed"), "{label}: {gone}");
@@ -1590,12 +1632,14 @@ fn a_member_that_exited_since_it_was_left_stops_failing_the_call() {
             })),
             true,
         )
+        .answer
         .expect_err("the member was left");
     drop(stdin);
     blocker.wait().expect("the member exits on its own and is reaped");
 
     killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
+        .answer
         .expect("a member that is gone is not left");
 
     assert!(killed.is_set());
@@ -1631,6 +1675,7 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
         Ok(()),
         false,
     )
+    .answer
     .expect_err("two members were left");
     assert!(
         matches!(failure.error, Error::MemberNotKilled { pid: 1, .. }),

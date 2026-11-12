@@ -423,10 +423,10 @@ impl Child {
             let sweep_result = if fault::take_force_kill_tree_error() {
                 Err(fault::forced_kill_tree_error().into())
             } else {
-                self.kill_tree_after("graceful_shutdown_tree", earlier)
+                self.kill_tree_after("graceful_shutdown_tree", earlier).wait()
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier);
+            let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier).wait();
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
                 if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {
@@ -494,7 +494,7 @@ impl Child {
                     crate::containment::dispatch::TreeSignal::Term,
                     None,
                 );
-                match call.answer(&self.tree, skip, None) {
+                match call.answer(&self.tree, skip, None).answer {
                     Err(e) => SignalTreeCooperativelyOutcome::End(e),
                     // The tree is already killed, as this handle's own reap shows: nothing is left to
                     // signal, and the sweep and the reap go on.
@@ -575,18 +575,34 @@ impl Child {
         if let Err(e) = self.tree.wait_drained(crate::wait::deadline_from(grace)) {
             call.holders_grace_failed(&e);
         }
-        self.holders_shutdown_error(&call, skip)
+        let (error, wait) = self.holders_shutdown_error(&call, skip);
+        // The call's answer is the error, whatever the wait finds: it ends the holders it killed.
+        if let Err(e) = wait.wait() {
+            log::debug!(
+                "graceful_shutdown_tree({}): the wait for the killed marker holders failed: {report}",
+                self.pid(),
+                report = crate::error::Report(&e)
+            );
+        }
+        error
     }
 
     /// The end of [`shut_down_holders_only`](Self::shut_down_holders_only): the mechanism's kill with
-    /// the same root, taken under a hold of its own, which is not held across the grace.
+    /// the same root, taken under a hold of its own, which is not held across the grace. The wait is
+    /// for what that kill reached, for a sync caller to take; an async one lets it go.
     #[cfg(unix)]
-    pub(crate) fn holders_shutdown_error(&self, call: &SkipCall<'_>, skip: &Skip) -> Error {
-        let kill = {
+    pub(crate) fn holders_shutdown_error(
+        &self,
+        call: &SkipCall<'_>,
+        skip: &Skip,
+    ) -> (Error, crate::containment::KillWait<'_>) {
+        let (kill, mut wait) = {
             let held = self.proc.hold(self.pid());
-            self.tree.kill(Some(&held))
+            self.tree.kill(Some(&held)).split()
         };
-        call.holders_shutdown_error(&self.tree, skip, kill)
+        let settled = call.holders_shutdown_error(&self.tree, skip, kill);
+        wait.reaching(settled.killed_again);
+        (settled.answer, wait)
     }
 }
 

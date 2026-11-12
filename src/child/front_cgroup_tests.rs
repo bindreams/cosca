@@ -1431,7 +1431,7 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
     let pid = child.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    child.tree.kill(None).into_result().expect("cgroup.kill");
+    child.tree.kill(None).outcome().into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     let hidden = crate::containment::cgroup::fault::hide_proc();
@@ -1451,7 +1451,7 @@ fn cgroup_without_pidfd_info_a_front_is_placed_through_proc(#[fixture(cgroup)] _
     let pid = killed.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
-    killed.tree.kill(None).into_result().expect("cgroup.kill");
+    killed.tree.kill(None).outcome().into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
     assert!(killed
@@ -1487,7 +1487,7 @@ fn cgroup_a_leaf_holding_the_child_reaches_it_only_once_a_kill_landed(#[fixture(
         !child.tree.reached(&child.proc).expect("the child is placed"),
         "no kill landed yet"
     );
-    child.tree.kill(None).into_result().expect("cgroup.kill");
+    child.tree.kill(None).outcome().into_result().expect("cgroup.kill");
     assert!(
         child.tree.reached(&child.proc).expect("the child is placed"),
         "the kill landed on a child the leaf holds"

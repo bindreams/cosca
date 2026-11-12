@@ -36,6 +36,101 @@ fn assign_then_kill_tree_terminates_the_process() {
     );
 }
 
+/// `kill_tree` returns once the member it terminated has exited: its identity reads `Dead` the moment
+/// the call returns, before any wait of the test's own.
+#[skuld::test]
+fn kill_tree_returns_with_the_member_exited() {
+    let mut child = spawn_blocker();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives this borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+
+    job.kill_tree().expect("kill_tree");
+
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Dead,
+        "the member has exited when kill_tree returns"
+    );
+    _ = child.wait();
+}
+
+/// The wait over a job's listed members blocks on a member that is running, and ends once it has exited
+/// and the job has drained. The kill is stated, not made: a real kill ends the member before the wait
+/// looks at it, so only a member the kill left running shows that the wait blocks.
+#[skuld::test]
+fn the_wait_over_a_jobs_listed_members_blocks_on_a_running_member() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::TreeKill;
+
+    let mut child = spawn_blocker();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives this borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+    let (members, unobserved) = job.0.list_members(None);
+    assert!(members.contains(&id), "the member is listed: {members:?}");
+    let stdin = Cell::new(child.stdin.take());
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            drop(stdin.take());
+        }
+    });
+
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        members,
+        unobserved,
+        DrainEdge::Job(&job.0),
+    )
+    .split();
+    wait.wait().expect("the member exited and the job drained");
+
+    assert!(blocked.get(), "the wait did not block on a member that was running");
+    _ = child.wait();
+}
+
+/// `send_kill_tree` terminates the member and returns without waiting for it: nothing blocks in the
+/// call, and `wait_tree` after it finds the member's exit.
+///
+/// Mutant: `send_kill_tree` waits for the members.
+#[skuld::test]
+fn send_kill_tree_terminates_the_member_and_waits_for_nothing() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut child = spawn_blocker();
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives this borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+
+    let blocked = Rc::new(Cell::new(false));
+    let blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || blocked.set(true)
+    });
+    job.send_kill_tree().expect("send_kill_tree");
+    drop(blocking);
+
+    assert!(!blocked.get(), "send_kill_tree blocked on a member");
+    let verdict = job.wait_tree().expect("wait_tree after send_kill_tree");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    let status = child.wait().expect("reap the killed member");
+    assert!(!status.success(), "the member was killed: {status:?}");
+}
+
 #[skuld::test]
 fn disarm_clears_kill_on_job_close() {
     let mut child = spawn_blocker();

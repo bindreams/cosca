@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::child::owned::teardown::Disposition;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
-use crate::containment::dispatch::{SweepFailure, TeardownCaller};
+use crate::containment::dispatch::{SweepFailure, Swept, TeardownCaller};
 #[cfg(unix)]
 use crate::containment::dispatch::{TreeKillOutcome, TreeSignal};
 use crate::containment::{Containment, TerminateOutcome};
@@ -122,6 +122,13 @@ pub(crate) mod front_kill_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/front_cgroup_tests.rs"]
 pub(crate) mod front_cgroup_tests;
+
+/// Whether a tree kill reads the members its kill will reach, for the wait that follows it.
+#[derive(Clone, Copy)]
+enum KillTree {
+    Waiting,
+    SendOnly,
+}
 
 /// A spawned child process the crate owns.
 #[derive(Debug)]
@@ -593,24 +600,68 @@ impl Child {
     /// send then goes to a number another process may hold; a program with such a reaper should use
     /// [`CgroupV2`](crate::Containment::CgroupV2), whose kill names no pid. An fd marker's walk from
     /// the root's pid checks each process it signals by its identity.
+    ///
+    /// **`Ok` means every member the kill reached has exited**, and so has the root once its kill
+    /// landed: the call waits for them, with no deadline. What it waits on is what its mechanism's
+    /// kill reached, and a member forked after the kill's listing is not seen. On a cgroup leaf, a
+    /// member another process moves across the leaf's boundary while the call runs is a stated
+    /// limit, in both directions. A member found outside the leaf after the kill is taken to have
+    /// left before it, so one moved out after the kill reached it is not waited for, though it was
+    /// sent `SIGKILL`. A process moved into the leaf after the kill is waited for until it exits,
+    /// though it was not killed, as the drop's wait is (see
+    /// [`kill_on_drop`](crate::Command::kill_on_drop)). On Linux below 6.9 a
+    /// member that was killed and reaped, and whose pid was taken again within its own start tick, is
+    /// waited for in its successor's place (a documented limit of the by-identity open there). A
+    /// member whose exit cannot be observed (its identity cannot be read, or it cannot be opened or
+    /// looked at) is an [`Error::Unassessable`](crate::error::Error::Unassessable) naming it, returned
+    /// once the others have been waited for. [`send_kill_tree`](Child::send_kill_tree) is the call
+    /// that only sends.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.kill_tree_after("kill_tree", None).map_err(|failure| failure.error)
+        self.kill_tree_after("kill_tree", None)
+            .wait()
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`kill_tree`](Self::kill_tree) that sends and does not wait: the tree is killed, and the call
+    /// returns once the kill is sent, with the same errors for a kill that could not be sent. `Ok`
+    /// says every member was reached, not that any has exited. A caller that needs the members gone
+    /// uses [`kill_tree`](Self::kill_tree): [`wait_tree`](Child::wait_tree) after a send-only kill
+    /// reports drained once the job's list is empty on Windows, which can come before every member's
+    /// process object is signalled.
+    pub fn send_kill_tree(&self) -> Result<(), Error> {
+        self.send_kill_tree_after("send_kill_tree", None)
+            .map_err(|failure| failure.error)
     }
 
     /// [`kill_tree`](Self::kill_tree) for the operation `op`, as a step of it that already sent
     /// `earlier`, so an error never claims the whole operation sent nothing. `op` names the call in
-    /// what it reports. A failure says whether the root is dead all the same ([`SweepFailure`]): a
-    /// caller may wait for it before it returns the error.
-    pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
+    /// what it reports. The [`Swept`] has the answer, which says whether the root is dead all the same
+    /// on a failure ([`SweepFailure`]), and the wait for what the kill reached: a caller that waits
+    /// [`wait`](Swept::wait)s, and one that sends alone takes the [`answer`](Swept::answer).
+    pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Swept<'_> {
+        self.sweep(op, earlier, KillTree::Waiting)
+    }
+
+    /// [`kill_tree_after`](Self::kill_tree_after) for a caller that sends and does not wait: the tree
+    /// is killed without reading its members first, and the answer is what the kill left.
+    pub(crate) fn send_kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
+        self.sweep(op, earlier, KillTree::SendOnly).answer()
+    }
+
+    /// The sweep behind both: the kill, its settlement and the root's backstop. Only the
+    /// [`Waiting`](KillTree::Waiting) one reads the members its kill will reach.
+    fn sweep(&self, op: &'static str, earlier: Option<&str>, kind: KillTree) -> Swept<'_> {
         #[cfg(not(unix))]
         let _ = earlier;
-        self.require_contained()?;
+        if let Err(e) = self.require_contained() {
+            return Swept::unwaited(Err(e.into()));
+        }
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. It comes before the root's state: a front
         // that may not be signalled is refused whatever the root's number names.
         #[cfg(unix)]
         let front = match self.kill_gate() {
-            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable.into()),
+            crate::elevation::front::Gate::Closed(unkillable) => return Swept::unwaited(Err(unkillable.into())),
             crate::elevation::front::Gate::Open => None,
             crate::elevation::front::Gate::Exited => Some(None),
             crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
@@ -620,16 +671,19 @@ impl Child {
         // look to the end of the sweep's sends.
         let held = self.proc.hold(self.pid());
         let root: Option<&dyn crate::containment::Root> = Some(&held);
-        let group_result = self.tree.kill(root);
+        // What the settlement kills again is waited for with what the send reached.
+        let (group_result, mut wait) = match kind {
+            KillTree::Waiting => self.tree.kill(root).split(),
+            KillTree::SendOnly => (self.tree.send_kill(root), crate::containment::KillWait::none()),
+        };
         #[cfg(unix)]
         let group_result = match group_result {
             // An answer that needs no kill ends the call: no backstop.
             answered @ TreeKillOutcome::Answered(_) => {
                 drop(held);
-                return self
-                    .tree
-                    .settle_for_kill_tree(op, answered, false)
-                    .map_err(SweepFailure::from);
+                let settled = self.tree.settle_for_kill_tree(op, answered, false);
+                wait.reaching(settled.killed_again);
+                return Swept::new(settled.answer.map_err(SweepFailure::from), wait);
             }
             TreeKillOutcome::Skipped(skip) => {
                 // The root's handle names the root even when its number is reused; its kill ends the
@@ -644,32 +698,46 @@ impl Child {
                     .skip_call(op, TreeSignal::Kill, earlier)
                     .answer(&self.tree, skip, sent);
                 drop(held);
-                return answered.map_err(|error| SweepFailure { error, root_ended });
+                wait.reaching(answered.killed_again);
+                return Swept::new(
+                    answered.answer.map_err(|error| SweepFailure { error, root_ended }),
+                    wait.with_root(self.proc.os_process(), root_ended),
+                );
             }
             other => {
                 drop(held);
                 other
             }
         };
-        let group_result = self.tree.unless_unwalked(op, group_result)?;
+        let group_result = match self.tree.unless_unwalked(op, group_result) {
+            Ok(group_result) => group_result,
+            Err(settled) => {
+                wait.reaching(settled.killed_again);
+                return Swept::new(Err(settled.answer), wait);
+            }
+        };
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            return match (self.tree.settle_for_kill_tree(op, group_result, false), in_cgroup) {
+            let settled = self.tree.settle_for_kill_tree(op, group_result, false);
+            let answer = match (settled.answer, in_cgroup) {
                 (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
                 (Err(left), Some(front)) => Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left)),
                 (other, None) => other,
             }
             .map_err(SweepFailure::from);
+            wait.reaching(settled.killed_again);
+            return Swept::new(answer, wait);
         }
         // Backstop for the TreeWalk mechanism: its hard_kill sends the root's kill through this handle,
         // but kills nothing if the walk finds no root or cannot read the process table — this
         // handle-based kill covers that, so its failure is contract-relevant.
         // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
         // launchd holds, so there is nothing left for the backstop to kill.
-        let (backstop, root_ended) = if self.root_is_unpinned() {
+        let unpinned = self.root_is_unpinned();
+        let (backstop, root_ended) = if unpinned {
             log::debug!(
                 "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
                 self.pid()
@@ -681,7 +749,13 @@ impl Child {
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
-        SweepFailure::of(op, &self.tree, group_result, backstop, root_ended)
+        let settled = SweepFailure::of(op, &self.tree, group_result, backstop, root_ended);
+        wait.reaching(settled.killed_again);
+        // A root launchd holds is not ours to wait on: nothing of ours killed it.
+        Swept::new(
+            settled.answer,
+            wait.with_root(self.proc.os_process(), root_ended && !unpinned),
+        )
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -771,12 +845,13 @@ impl Child {
             let call = self.skip_call("terminate_tree", TreeSignal::Term, None);
             match outcome {
                 TerminateOutcome::Sent { result, .. } => result,
+                // A `SIGTERM` settles nothing, so nothing is killed again and nothing waited for.
                 TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
-                    call.answer(&self.tree, skip, None)
+                    call.answer(&self.tree, skip, None).answer
                 }
                 TerminateOutcome::RootThroughPidfd(skip) => {
                     let sent = held.signal(crate::signal::Sig::Term);
-                    call.answer(&self.tree, skip, Some(sent))
+                    call.answer(&self.tree, skip, Some(sent)).answer
                 }
             }
         }

@@ -2,14 +2,12 @@
 //! mechanism, with where that tree stands after the kills that settled it. Everything the child does to
 //! its tree goes through [`Tree`], which asks its mechanism only through [`Contains`].
 
-#[cfg(unix)]
-use crate::containment::dispatch::{SettleOutcome, Unsettled};
-use crate::containment::dispatch::{SweepFailure, TreeKillOutcome, TreeKilled};
+use crate::containment::dispatch::{Settled, SweepFailure, TreeKillOutcome, TreeKilled};
 use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, Mechanism};
-use crate::containment::{Containment, Root, TerminateOutcome};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::error::Error;
 
 /// Owns the OS containment resource for a spawned child. `killed` is where the tree stands after the
@@ -161,9 +159,25 @@ impl Tree {
     }
 
     /// Hard-kill the contained tree (best-effort; a member that is already gone is success), as the
-    /// mechanism's [`send_kill`](Contains::send_kill) decides it from `root`. A tree that is none or
-    /// delegated has nothing to kill.
-    pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+    /// mechanism's [`kill`](Contains::kill) decides it from `root`. A tree that is none or delegated
+    /// has nothing to kill. The [`TreeKill`] has what the kill reached, for a caller that waits; one
+    /// that does not calls [`send_kill`](Self::send_kill).
+    pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
+        match &self.holder {
+            Holder::None | Holder::Delegated => {
+                debug_assert!(!self.released, "a send on a released tree");
+                TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+            }
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a send on a released tree");
+                mechanism.kill(root)
+            }
+        }
+    }
+
+    /// [`kill`](Self::kill) for a caller that waits for nothing: it names no member first, which a
+    /// cgroup leaf and a Job Object otherwise do ([`Contains::send_kill`]).
+    pub(crate) fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(!self.released, "a send on a released tree");
@@ -176,12 +190,12 @@ impl Tree {
         }
     }
 
-    /// [`kill`](Self::kill) for a caller with no root to kill after it, settled and reported as
-    /// [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not ended. `caller`
-    /// names the call in the warns of the members it left besides the first.
+    /// [`send_kill`](Self::send_kill) for a caller with no root to kill after it, settled and
+    /// reported as [`settle_for_kill_tree`](Self::settle_for_kill_tree) does, with the root not
+    /// ended. `caller` names the call in the warns of the members it left besides the first.
     #[cfg(unix)]
     pub(crate) fn kill_settled(&self, caller: &str, root: Option<&dyn Root>) -> Result<(), Error> {
-        self.settle_for_kill_tree(caller, self.kill(root), false)
+        self.settle_for_kill_tree(caller, self.send_kill(root), false).answer
     }
 
     /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
@@ -330,11 +344,7 @@ impl Tree {
     /// What a tree kill's `outcome` comes to once the root's own handle has had its say
     /// ([`TreeKilled::settle`]). Only a Unix cleanup reads the answer itself.
     #[cfg(unix)]
-    pub(crate) fn settle(
-        &self,
-        outcome: impl Into<TreeKillOutcome>,
-        root_ended: bool,
-    ) -> Result<SettleOutcome, Unsettled> {
+    pub(crate) fn settle(&self, outcome: impl Into<TreeKillOutcome>, root_ended: bool) -> Settled {
         self.killed.settle(self.named_by(), outcome, root_ended)
     }
 
@@ -345,7 +355,7 @@ impl Tree {
         caller: &str,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Result<(), Error> {
+    ) -> Settled<Result<(), Error>> {
         self.killed
             .settle_for_kill_tree(caller, self.named_by(), outcome, root_ended)
     }
@@ -356,7 +366,7 @@ impl Tree {
         &self,
         caller: &str,
         outcome: TreeKillOutcome,
-    ) -> Result<TreeKillOutcome, SweepFailure> {
+    ) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
         self.killed.unless_unwalked(caller, self.named_by(), outcome)
     }
 

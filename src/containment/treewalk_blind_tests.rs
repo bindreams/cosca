@@ -23,6 +23,7 @@ fn walks() -> [(&'static str, Walk); 4] {
         ("hard_kill", |p| {
             let hk = &crate::identity::HostKernel;
             super::hard_kill(hk, p.id(), &super::ByIdentity::new(hk, p.id()))
+                .outcome()
                 .into_result()
                 .map_err(crate::containment::dispatch::Unkilled::into_error)
         }),
@@ -141,6 +142,7 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
     let (child, _) = live_member();
     let kernel = crate::identity::HostKernel;
     let result = super::hard_kill(&kernel, stale, &super::ByIdentity::new(&kernel, stale))
+        .outcome()
         .into_result()
         .map_err(crate::containment::dispatch::Unkilled::into_error);
     assert_unassessable_naming(result, "no walk ran");

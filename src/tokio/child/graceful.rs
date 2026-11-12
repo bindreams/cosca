@@ -451,7 +451,8 @@ impl Child {
         if let Err(e) = drained {
             call.holders_grace_failed(&e);
         }
-        self.inner.holders_shutdown_error(&call, skip)
+        // Sends only: an async caller does not wait for the members.
+        self.inner.holders_shutdown_error(&call, skip).0
     }
 }
 

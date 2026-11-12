@@ -25,6 +25,109 @@ fn wait_drained_after_hard_kill_reports_the_drain() {
     assert!(!status.success(), "the member was killed: {status:?}");
 }
 
+/// A kill the OS refuses names no member to wait for: its `Err` is returned, where a wait over members
+/// it did not kill would hang. A handle without `JOB_OBJECT_TERMINATE` lists the live member and is
+/// refused the kill. The wait is made to end the member where it blocks, so a mutant fails by assertion.
+///
+/// Mutant: the members are named whether or not the kill landed.
+#[skuld::test]
+fn a_job_kill_the_os_refuses_waits_for_no_member() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use windows::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+
+    use crate::containment::Contains as _;
+
+    let (mut child, job) = spawn_job_member();
+    let refused = job.duplicate_with_access_for_test(JOB_OBJECT_QUERY);
+
+    let (sent, wait) = refused.kill(None).split();
+    assert!(
+        sent.into_result().is_err(),
+        "a handle without JOB_OBJECT_TERMINATE is refused the kill"
+    );
+    let job = Rc::new(job);
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let (job, blocked) = (job.clone(), blocked.clone());
+        move || {
+            blocked.set(true);
+            job.hard_kill().expect("end the member");
+        }
+    });
+    wait.wait().expect("a kill that failed waits for nothing");
+
+    assert!(!blocked.get(), "the wait blocked on a member the kill did not reach");
+    job.hard_kill().expect("end the member");
+    _ = child.wait();
+}
+
+/// The members are listed before `TerminateJobObject`, not after it: a member that has left the job's
+/// list by the time the kill runs is still named. The member is ended and reaped right before the kill,
+/// so the job's list is empty when the kill runs, whatever order the kernel signals a process in.
+///
+/// Mutant: the list is read after the kill.
+#[skuld::test]
+fn a_job_lists_its_members_before_it_terminates_them() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::containment::Contains as _;
+
+    let (child, job) = spawn_job_member();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    let child = Rc::new(RefCell::new(child));
+    let _ending = super::fault::set_before_job_kill({
+        let child = child.clone();
+        move || {
+            let mut child = child.borrow_mut();
+            child.kill().expect("end the member");
+            child.wait().expect("reap the member");
+        }
+    });
+
+    let (sent, wait) = job.kill(None).split();
+
+    sent.into_result().expect("the job's kill");
+    assert_eq!(
+        wait.members_for_test(),
+        [id],
+        "the member was named before the kill ended it"
+    );
+}
+
+/// A kill that waits for the members reads the job's list once before it, and one that only sends
+/// reads none: the list is work for the wait alone.
+///
+/// Mutant: `send_kill` lists the members first.
+#[skuld::test]
+fn only_a_job_kill_that_waits_reads_the_members_list() {
+    use crate::containment::Contains as _;
+
+    let (mut child, job) = spawn_job_member();
+    {
+        let _forced = super::fault::force_job_pid_list(Vec::new());
+        _ = job.kill(None).split();
+        assert_eq!(
+            super::fault::job_pid_list_queries(),
+            1,
+            "a kill that waits lists the job once, before it terminates it"
+        );
+    }
+    let (mut child2, job2) = spawn_job_member();
+    let _forced = super::fault::force_job_pid_list(Vec::new());
+    job2.send_kill(None).into_result().expect("the job's kill");
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        0,
+        "a kill that only sends reads no list"
+    );
+    _ = (child.wait(), child2.wait());
+}
+
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
 /// path `wait_drained_raw` relies on to return `AllMembersExited` without ever opening a
 /// process handle.
@@ -45,6 +148,169 @@ fn wait_drained_raw_reports_drained_for_an_empty_job() {
     let job_handle = job.handle();
     let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+}
+
+/// A listing whose pids are none a live member does not end the drain: a member may have joined after
+/// it, so the wait lists the job again, and only an empty fresh listing is a drain. The job is empty,
+/// so the second listing says drained; the query count is what tells it from a verdict taken off the
+/// first.
+fn assert_drained_only_by_a_fresh_listing(listed: Vec<u32>) {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(listed);
+    let verdict = super::wait_drained_raw(job.handle(), None, None).expect("wait_drained_raw");
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        2,
+        "the wait ended on a listing of pids that are no live member, without listing again"
+    );
+    drop(forced);
+}
+
+/// A listed pid that names no process (`OpenProcess` answers `ERROR_INVALID_PARAMETER`) is no live
+/// member. Windows ignores a pid's low two bits on lookup, so pids 1-3 resolve to 0, which
+/// `OpenProcess` refuses.
+///
+/// Mutant: a round whose listed pids are all gone answers `AllMembersExited`.
+#[skuld::test]
+fn wait_drained_raw_lists_again_after_a_listing_of_pids_that_are_gone() {
+    assert_drained_only_by_a_fresh_listing(vec![1]);
+}
+
+/// A listed pid that opens but is not in the job (its number was reused) is no longer a member.
+/// This test's own process is that bystander.
+#[skuld::test]
+fn wait_drained_raw_lists_again_after_a_listing_of_pids_that_are_not_members() {
+    assert_drained_only_by_a_fresh_listing(vec![std::process::id()]);
+}
+
+/// A round that starts past the deadline lists; a listing that names only pids that are no live member
+/// (a deleted pid shows for one listing) is followed by exactly one more listing, which is final. Here
+/// the job is empty, so that listing is empty and the tree drained just before the deadline.
+///
+/// Mutant: a stale-only round past the deadline answers `MembersRemain` off its one listing.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_when_the_one_more_listing_is_empty() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(vec![1]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
+    drop(forced);
+}
+
+/// The one more listing is final: a non-empty one answers `MembersRemain` with no open, no poll and no
+/// further round. The real job holds a live member for it.
+///
+/// Mutant: a non-empty final listing is answered `AllMembersExited`.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_when_the_one_more_listing_is_not_empty() {
+    let (child, job) = spawn_job_member();
+    let forced = super::fault::force_job_pid_list(vec![1]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
+    assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
+    drop(forced);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+}
+
+/// Live members that the zero-ms poll finds unsignalled answer `MembersRemain` off the round's own
+/// listing: one query, no final listing. The member blocks on its stdin, which this test holds open.
+///
+/// Mutant: that branch takes the final listing, which is a second query.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_off_its_own_listing_for_live_members() {
+    let (child, job) = spawn_job_member();
+    let forced = super::fault::force_job_pid_lists([]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
+    assert_eq!(super::fault::job_pid_list_queries(), 1, "the round's own listing only");
+    drop(forced);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+}
+
+/// The final listing is the last: when it too names only stale pids, the answer is `MembersRemain` and
+/// nothing lists a third time. A third listing here would be the real, empty job.
+///
+/// Mutant: the one more listing is another round, which lists again.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_lists_no_third_time() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_lists([vec![1], vec![1]]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
+    assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
+    drop(forced);
+}
+
+/// A listed member whose handle the zero-ms poll finds signalled (it has exited, and its process object
+/// is still held, so it still opens as a member) is stale evidence too: exactly one more listing
+/// answers, here the real job, empty.
+///
+/// Mutant: a signalled poll at an elapsed deadline answers `MembersRemain` off the listing.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_lists_once_more_after_a_signalled_poll() {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+
+    let (mut child, job) = spawn_job_member();
+    drop(child.stdin.take());
+    child.wait().expect("the member exits");
+    // The member's own child (`more`) is a member too: the job is empty only once it has gone.
+    assert_eq!(
+        super::wait_drained_raw(job.handle(), None, None).expect("the job drains"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+    // SAFETY: a standard Win32 call; the handle is closed below.
+    let opened = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            child.id(),
+        )
+    };
+    let held = super::member_to_watch(opened, job.raw)
+        .expect("the exited member opens")
+        .expect("the exited member is still a member of its job while its process object is held");
+    // SAFETY: opened above.
+    _ = unsafe { windows::Win32::Foundation::CloseHandle(held) };
+    let forced = super::fault::force_job_pid_list(vec![child.id()]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
+    drop(forced);
+}
+
+/// An empty listing answers `AllMembersExited` whatever the deadline.
+///
+/// Mutant: a round past the deadline answers `MembersRemain` before it reads the listing.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listing() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    assert_eq!(super::fault::job_pid_list_queries(), 1, "exactly one listing");
+    drop(forced);
 }
 
 /// A real, still-running job member reports `MembersRemain` at an already-elapsed deadline —
