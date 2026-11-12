@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::child::spawn::{spawn_lock, SpawnLockGuard};
 use crate::containment::cgroup::test_support::{close_range_except, fork_running_locked, KillOnDrop};
 use crate::identity::ProcessId;
+use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
 
 // Child exit codes ====================================================================
 
@@ -350,12 +351,16 @@ pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderF
         write_all_or_exit(rendezvous_l, b"R", ChildStep::ReportReady.exit_code());
         read_byte_or_exit(rendezvous_l, ChildStep::AwaitRelease.exit_code());
 
-        // SAFETY: L is single-threaded and freshly forked; M runs only async-signal-safe code.
-        let m_pid = unsafe { libc::fork() };
-        if m_pid == -1 {
+        // SAFETY: L comes from a raw clone of this multithreaded process, so glibc still counts its
+        // threads, and a `libc::fork` here would take locks (atfork, stdio list, malloc arenas) that a
+        // thread absent from L may have held: L would block for ever. `fork_with_pidfd` takes none.
+        // L's copy of this thread's `spawn_lock` state says held, as the primitive requires, and M
+        // runs raw system calls only.
+        let m = unsafe { fork_with_pidfd() };
+        let Ok(m) = m else {
             exit_child(ChildStep::ForkM.exit_code());
-        }
-        if m_pid == 0 {
+        };
+        if matches!(m, Fork::Child) {
             // M stays in L's group (inherited pgid). It must not hold `block`'s write end, or the
             // test's close would never EOF it.
             let mut keep = [block_r, m_ready_w];

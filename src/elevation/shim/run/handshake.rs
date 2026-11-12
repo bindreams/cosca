@@ -13,8 +13,8 @@ use rustix::io::Errno;
 use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process::{pidfd_open, Pid, PidfdFlags};
 
-use super::child::Spawned;
 use super::fds::{readable_now, wait_readable};
+use super::reap;
 use super::{Exit, Shim};
 use crate::elevation::shim::codes;
 use crate::elevation::shim::creds::{peer_credentials, recv_with_credentials, set_passcred, Received};
@@ -22,6 +22,7 @@ use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::SOCKET_NAME;
 use crate::elevation::shim::owner_watch::OwnerPidfdFailure;
 use crate::elevation::shim::protocol::{Frame, Refusal, ShimArgs};
+use crate::os_process::linux::fork::NewChild;
 
 /// Sends all of `bytes` without raising `SIGPIPE`.
 pub(super) fn send_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
@@ -198,7 +199,7 @@ impl Shim {
     /// Cosca's exit, or a signal to the shim, between the answer and the program's start means never
     /// start. `held` is the program's process when the clone has happened and the process is held
     /// before `exec`: it is killed and reaped first, so the program never runs.
-    pub(super) fn check_owner(&self, owner: &OwnedFd, held: Option<&Spawned>) -> Result<(), Exit> {
+    pub(super) fn check_owner(&self, owner: &OwnedFd, held: Option<&NewChild>) -> Result<(), Exit> {
         let stop = self.why_stop(owner);
         if !matches!(stop, Ok(None)) {
             if let Some(child) = held {
@@ -219,9 +220,9 @@ impl Shim {
     }
 
     /// Kills the held process and collects it. It cannot have reached `exec`, so the program never ran.
-    fn abandon(&self, child: &Spawned) {
-        child.kill(&self.log);
-        let status = child.reap(false, &self.log);
+    fn abandon(&self, child: &NewChild) {
+        reap::kill(child, &self.log);
+        let status = reap::reap(child, false, &self.log);
         self.log.line(format_args!("held child reaped status {status:?}"));
     }
 

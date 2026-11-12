@@ -44,7 +44,6 @@ thread_local! {
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
     static PROBE_FD_DIR_FAILS: Cell<bool> = const { Cell::new(false) };
-    static BEFORE_PROBE_PIN: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_PROBE_KILL: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
     static PROBE_STEPS: std::cell::RefCell<Vec<ProbeStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -52,15 +51,10 @@ thread_local! {
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static TERMINATE_FAILS: Cell<Option<(TerminateStep, i32, bool)>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
-    static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
-        const { std::cell::RefCell::new(None) };
-    static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static AFTER_FORK_STILL_LOCKED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
     static ON_FORK_RUNNING_LOCK_CONTENDED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
-    static ON_FORK_RUNNING_CLEANUP: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
     static FORK_RUNNING_LOCK_HELD_REPORT_FD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
 }
 
@@ -338,14 +332,8 @@ pub(crate) fn probe_fd_dir_fails() -> bool {
 /// A hook given the probe child's pid; `Some(errno)` makes the guarded syscall fail with it.
 pub(crate) type ProbeHook = crate::oneshot_hook::Armed<libc::pid_t, Option<i32>>;
 
-/// Run `hook` once, in the next placement probe forked from this thread, after the fork and before
-/// the child is pinned by a pidfd. `Some(errno)`: the `pidfd_open` fails with it and is not made.
-pub(crate) fn set_before_probe_pin(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> ProbeHook {
-    crate::oneshot_hook::arm_with(&BEFORE_PROBE_PIN, hook)
-}
-
 /// Run `hook` once, in the next placement probe forked from this thread, right before its child is
-/// killed (through its pidfd, or by its number). `Some(errno)`: the kill fails with it and is not made.
+/// killed through its pidfd. `Some(errno)`: the kill fails with it and is not made.
 pub(crate) fn set_before_probe_kill(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> ProbeHook {
     crate::oneshot_hook::arm_with(&BEFORE_PROBE_KILL, hook)
 }
@@ -354,9 +342,9 @@ pub(crate) fn set_before_probe_kill(hook: impl FnOnce(libc::pid_t) -> Option<i32
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeStep {
     /// A kill of the child (signal number), recorded once the syscall or its seam answered.
-    Kill(crate::send_log::Via, i32),
+    Kill(i32),
     /// The child's reap and how it ended.
-    Reap(crate::send_log::Via, super::reach::ProbeEnd),
+    Reap(super::reach::ProbeEnd),
 }
 
 /// Notes a step of a placement probe's end on this thread.
@@ -372,11 +360,6 @@ pub(crate) fn take_probe_steps() -> Vec<ProbeStep> {
 /// Runs the [`set_before_probe_kill`] hook, if armed: the errno the kill fails with.
 pub(crate) fn run_before_probe_kill(pid: libc::pid_t) -> Option<i32> {
     crate::oneshot_hook::fire_with(&BEFORE_PROBE_KILL, pid).flatten()
-}
-
-/// Runs the [`set_before_probe_pin`] hook, if armed: the errno the `pidfd_open` fails with.
-pub(crate) fn run_before_probe_pin(pid: libc::pid_t) -> Option<i32> {
-    crate::oneshot_hook::fire_with(&BEFORE_PROBE_PIN, pid).flatten()
 }
 
 /// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.
@@ -711,27 +694,6 @@ pub(crate) fn run_fork_running_lock_contended() {
     }
 }
 
-/// RAII: dropping this clears the hook [`set_fork_running_cleanup`] armed.
-#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
-pub(crate) struct ForkRunningCleanupGuard(());
-impl Drop for ForkRunningCleanupGuard {
-    fn drop(&mut self) {
-        ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = None);
-    }
-}
-
-/// Run `hook` in the NEXT `fork_running` call on this thread that fails its `pidfd_open`, at the
-/// start of the cleanup that kills and reaps the child. Runs on the forking thread.
-pub(crate) fn set_fork_running_cleanup(hook: impl FnOnce() + 'static) -> ForkRunningCleanupGuard {
-    ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    ForkRunningCleanupGuard(())
-}
-pub(crate) fn run_fork_running_cleanup() {
-    if let Some(hook) = ON_FORK_RUNNING_CLEANUP.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
-}
-
 /// RAII: dropping this clears the fd [`set_fork_running_lock_held_report_fd`] registered, even if
 /// `fork_running` never consumed it, so it can't leak into a later call on this thread.
 #[must_use = "dropping this immediately clears the registered fd; bind it for the scope that needs it"]
@@ -886,33 +848,6 @@ pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
             _ = notify.send(notified);
         }
     }
-}
-
-/// Make the NEXT `fork_running` on this thread fail its `pidfd_open` (as `RLIMIT_NOFILE` would);
-/// consumed by that call.
-pub(crate) fn set_force_fork_running_pidfd_failure(on: bool) {
-    FORCE_FORK_RUNNING_PIDFD_FAILURE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_fork_running_pidfd_failure() -> bool {
-    FORCE_FORK_RUNNING_PIDFD_FAILURE.with(|f| f.replace(false))
-}
-
-/// The independent pidfd `fork_running`'s failure path opened on the child before killing it, so
-/// a test can confirm the reap without racing pid reuse.
-pub(crate) fn take_fork_running_pidfd_failure_probe() -> Option<std::os::fd::OwnedFd> {
-    FORK_RUNNING_PIDFD_FAILURE_PROBE.with(|p| p.borrow_mut().take())
-}
-pub(crate) fn record_fork_running_pidfd_failure_probe(probe: std::os::fd::OwnedFd) {
-    FORK_RUNNING_PIDFD_FAILURE_PROBE.with(|p| *p.borrow_mut() = Some(probe));
-}
-
-/// Make the NEXT `fork_running` pidfd-failure path's own probe `pidfd_open` fail too, separately
-/// from `set_force_fork_running_pidfd_failure`. Consumed by that call.
-pub(crate) fn set_force_fork_running_probe_pidfd_failure(on: bool) {
-    FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_fork_running_probe_pidfd_failure() -> bool {
-    FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE.with(|f| f.replace(false))
 }
 
 /// Make `KillOnDrop::drop`'s NEXT `waitid` on this thread report one synthetic `EINTR` before its

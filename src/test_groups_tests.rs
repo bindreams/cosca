@@ -2,8 +2,8 @@
 
 use crate::test_groups::{check_group, require_consent, require_enabled};
 use crate::test_harness::{
-    CGROUP, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
-    STRAY_SIGNAL, TRACER, UID_SWITCH, UNPRIVILEGED,
+    CGROUP, CLONE3, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE,
+    SHELL_PROBES, STRAY_SIGNAL, TRACER, UID_SWITCH, UNPRIVILEGED,
 };
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -122,6 +122,7 @@ fn every_group_fixture_carries_exactly_its_label() {
         ("cgroup", CGROUP),
         ("tracer_group", TRACER),
         ("uid_switch", UID_SWITCH),
+        ("clone3", CLONE3),
         ("stray_signal", STRAY_SIGNAL),
         ("unprivileged", UNPRIVILEGED),
     ] {

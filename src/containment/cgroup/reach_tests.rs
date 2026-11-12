@@ -8,9 +8,8 @@ use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::{alone, kill_record};
-use crate::identity::{FakeKernel, HostKernel, UNREADABLE_STATUS_REASON};
+use crate::identity::{FakeKernel, HostKernel, Kernel, ProcDir, ViewUnreadable, UNREADABLE_STATUS_REASON};
 use crate::log_capture::warns_since;
-use crate::send_log::Via;
 use crate::test_groups::{cgroup, Group};
 
 /// A cgroup id with bits above the low 32, as kernfs gives once its 32-bit counter wraps.
@@ -769,10 +768,8 @@ fn probes_children_hold_only_their_own_descriptors_when_a_later_close_range_is_r
     assert_two_probes_hold_only_their_own();
 }
 
-/// The probe's child is killed through a pidfd that names it, never by its number, and reaped
-/// through it. Mutants: "kill the probe's child by pid" (the route is recorded by the helper that
-/// makes the syscall), "the kill is recorded and not made" (the child then exits by itself, unkilled,
-/// once released).
+/// The probe's child is killed through its pidfd and reaped through it. Mutant: "the kill is recorded
+/// and not made" (the child then exits by itself, unkilled, once released).
 #[skuld::test]
 fn the_probe_child_is_killed_through_its_pidfd() {
     let _missing = fault::miss_pidfd_info();
@@ -782,8 +779,8 @@ fn the_probe_child_is_killed_through_its_pidfd() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
 }
@@ -802,59 +799,10 @@ fn no_child_holds(pid: libc::pid_t) -> Result<bool, rustix::io::Errno> {
     }
 }
 
-/// A probe's child that no pidfd can pin (`pidfd_open` fails with `EMFILE`) is killed and reaped by
-/// its number, as before pidfds, and no probe process is left. Mutants: "a failed `pidfd_open`
-/// returns, leaving the probe's child unreaped", "the kill by number is not made".
-#[skuld::test]
-fn a_probe_child_no_pidfd_can_pin_is_killed_and_reaped_by_its_number() {
-    let _missing = fault::miss_pidfd_info();
-    let _hidden = fault::hide_proc();
-    let forked = std::rc::Rc::new(std::cell::Cell::new(None));
-    let _unpinned = fault::set_before_probe_pin({
-        let forked = forked.clone();
-        move |pid| {
-            forked.set(Some(pid));
-            Some(libc::EMFILE)
-        }
-    });
-    fault::take_probe_steps();
-    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
-    let pid = forked.get().expect("the probe forked");
-    assert_eq!(
-        fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(Via::Pid, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pid, ProbeEnd::Signal(libc::SIGKILL))
-        ]
-    );
-    assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
-}
-
-/// A probe's child reaped elsewhere before its pidfd was opened is not this process's to kill: its
-/// number is sent nothing, and the probe fails. Mutant: "a probe reaped elsewhere is killed by its
-/// number".
-#[skuld::test]
-fn a_probe_child_reaped_elsewhere_before_its_pin_is_sent_nothing() {
-    let _missing = fault::miss_pidfd_info();
-    let _reaped = fault::set_before_probe_pin(|pid| {
-        // SAFETY: `pid` is this test's own unreaped child.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
-        crate::test_child::reaped_elsewhere::reap_behind(pid as u32);
-        None
-    });
-    fault::take_probe_steps();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe has no child left");
-    assert_eq!(fault::take_probe_steps(), [], "nothing was sent");
-    assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
-    // The `pidfd_open` that found no process is the source, with its code.
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::ESRCH), "{err:?}");
-}
-
-/// A probe's child whose kill through its pidfd fails other than `ESRCH` is sent nothing by its
-/// number: it is released, exits by itself, and is reaped through the pidfd that still names it.
-/// The failed kill is a `warn` naming the child. Mutants: "a failed kill falls back to the number",
-/// "the failed kill is logged below `warn`", "the child is released only by its socket's close" (it
-/// then exits with another status), "the reap goes by number".
+/// A probe's child whose kill through its pidfd fails other than `ESRCH` is released, exits by
+/// itself, and is reaped through the pidfd that still names it. The failed kill is a `warn` naming
+/// the child. Mutants: "the failed kill is logged below `warn`", "the child is released only by its
+/// socket's close" (it then exits with another status).
 #[skuld::test]
 fn a_probe_child_whose_pidfd_kill_fails_is_released_and_reaped_through_its_pidfd() {
     crate::log_capture::install();
@@ -875,44 +823,8 @@ fn a_probe_child_whose_pidfd_kill_fails_is_released_and_reaped_through_its_pidfd
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::RELEASED))
-        ]
-    );
-    let warns = warns_since(mark, "");
-    assert!(
-        warns.iter().any(|w| w.contains(&format!("child {pid}"))),
-        "a warn names the probe's child {pid}: {warns:?}"
-    );
-    assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
-}
-
-/// A probe's child that no pidfd can pin, and whose kill by number fails, is released and reaped by
-/// its number, and the failed kill is a `warn` naming it. Mutants: "the kill's answer is ignored",
-/// "the child is released only by its socket's close".
-#[skuld::test]
-fn a_probe_child_whose_kill_by_number_fails_is_released_and_warned() {
-    crate::log_capture::install();
-    let _missing = fault::miss_pidfd_info();
-    let _hidden = fault::hide_proc();
-    let forked = std::rc::Rc::new(std::cell::Cell::new(None));
-    let _unpinned = fault::set_before_probe_pin({
-        let forked = forked.clone();
-        move |pid| {
-            forked.set(Some(pid));
-            Some(libc::EMFILE)
-        }
-    });
-    let _failed = fault::set_before_probe_kill(|_| Some(libc::EPERM));
-    fault::take_probe_steps();
-    let mark = crate::log_capture::mark();
-    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
-    let pid = forked.get().expect("the probe forked");
-    assert_eq!(
-        fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(Via::Pid, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pid, ProbeEnd::Exit(super::RELEASED))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Exit(super::RELEASED))
         ]
     );
     let warns = warns_since(mark, "");
@@ -952,8 +864,8 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::RELEASED))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Exit(super::RELEASED))
         ]
     );
     let second = second.borrow_mut().take().expect("the second probe forked");
@@ -967,8 +879,8 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
 }
@@ -1008,35 +920,114 @@ fn a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(
         fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Elsewhere)
-        ]
+        [ProbeStep::Kill(libc::SIGKILL), ProbeStep::Reap(ProbeEnd::Elsewhere)]
     );
 }
 
-/// The same for a child no pidfd pins, killed and reaped by its number. Mutant: "`ECHILD` at the
-/// reap by number fails the probe". Run [`alone`].
+/// A probe's child that dies before it reports, with `SIGCHLD` ignored, is reaped by the kernel as it
+/// exits: the probe's error and the record of its reap say so, and do not blame another reaper
+/// alone. Mutant: "the words name only another reaper". Run [`alone`]: the disposition is
+/// process-wide.
 #[skuld::test]
-fn a_probe_child_no_pidfd_pins_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
-    if !alone(
-        "containment::cgroup::reach::reach_tests::a_probe_child_no_pidfd_pins_reaped_by_an_ignored_sigchld_keeps_the_verdict",
-    ) {
+fn a_probe_child_that_dies_early_with_sigchld_ignored_says_so() {
+    if !alone("containment::cgroup::reach::reach_tests::a_probe_child_that_dies_early_with_sigchld_ignored_says_so") {
         return;
     }
+    crate::log_capture::install();
     let _ignored = ignore_sigchld();
     let _missing = fault::miss_pidfd_info();
-    let _hidden = fault::hide_proc();
-    let _unpinned = fault::set_before_probe_pin(|_| Some(libc::EMFILE));
+    let _no_dir = fault::fail_probe_fd_dir();
     fault::take_probe_steps();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
-    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
+    let mark = crate::log_capture::mark();
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child is gone");
     assert_eq!(
-        fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(Via::Pid, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pid, ProbeEnd::Elsewhere)
-        ]
+        fault::take_probe_steps().last(),
+        Some(&ProbeStep::Reap(ProbeEnd::Elsewhere))
+    );
+    assert!(
+        err.to_string().contains("SIGCHLD"),
+        "the error names the ignored SIGCHLD: {err}"
+    );
+    let records = crate::log_capture::records_since_on_current_thread(mark, "was reaped by another reaper");
+    assert!(
+        records.iter().any(|(_, record)| record.contains("SIGCHLD")),
+        "the record names the ignored SIGCHLD: {records:?}"
+    );
+}
+
+/// A [`Kernel`] over the host's that, once it has read a probe child's `<pid>/cgroup`, kills that
+/// child and waits until it is a zombie, reaping nothing: the child exits between the read and the
+/// probe's confirmation that the read named it. `killed` says it did.
+struct ChildExitsAfterCgroupRead {
+    killed: std::sync::atomic::AtomicBool,
+}
+
+impl Kernel for ChildExitsAfterCgroupRead {
+    fn pidfd_open(
+        &self,
+        target: rustix::process::Pid,
+        flags: rustix::process::PidfdFlags,
+    ) -> Result<OwnedFd, rustix::io::Errno> {
+        HostKernel.pidfd_open(target, flags)
+    }
+
+    fn pidfs_ino(&self, fd: std::os::fd::BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
+        HostKernel.pidfs_ino(fd)
+    }
+
+    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+        HostKernel.open_proc()
+    }
+
+    fn read(&self, dir: &ProcDir, path: &str) -> std::io::Result<Vec<u8>> {
+        let read = HostKernel.read(dir, path);
+        if let Some(pid) = path.strip_suffix("/cgroup").and_then(|pid| pid.parse().ok()) {
+            // SAFETY: `pid` is this test's own unreaped child.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
+            // Waits for the exit itself, and leaves the zombie for the probe's reap.
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).expect("a positive pid")),
+                rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+            )
+            .expect("wait for the probe's child to exit");
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        read
+    }
+
+    fn pids(&self, dir: &ProcDir) -> std::io::Result<Vec<u32>> {
+        HostKernel.pids(dir)
+    }
+
+    fn signal_probe(&self, target: rustix::process::Pid) -> Result<(), rustix::io::Errno> {
+        HostKernel.signal_probe(target)
+    }
+}
+
+/// A probe's child that exits after its cgroup is read, before the probe confirms through its pidfd
+/// that the read named it, is reported as having exited by then, and gives no verdict from the
+/// read. Mutant: "the probe does not confirm" (the read stands, and the probe answers with its
+/// verdict).
+#[skuld::test]
+fn a_probe_child_that_exits_before_the_read_is_confirmed_is_reported_gone() {
+    let _missing = fault::miss_pidfd_info();
+    let kernel = ChildExitsAfterCgroupRead {
+        killed: std::sync::atomic::AtomicBool::new(false),
+    };
+    fault::take_probe_steps();
+    let err = front_placement(&kernel, || Ok(HIGH)).expect_err("the probe's child is gone");
+    assert!(
+        kernel.killed.load(std::sync::atomic::Ordering::SeqCst),
+        "the kernel read the child's cgroup and killed the child"
+    );
+    assert!(
+        err.to_string()
+            .contains("had exited by the time its cgroup read was confirmed"),
+        "the probe reports its child gone: {err}"
+    );
+    assert_eq!(
+        fault::take_probe_steps().last(),
+        Some(&ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL)))
     );
 }
 
@@ -1058,16 +1049,12 @@ fn a_probe_child_reaped_by_another_waiter_keeps_the_verdict() {
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(
         fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Elsewhere)
-        ]
+        [ProbeStep::Kill(libc::SIGKILL), ProbeStep::Reap(ProbeEnd::Elsewhere)]
     );
 }
 
 /// A probe's child that is already dead when its kill through the pidfd answers `ESRCH` is reaped
-/// through that pidfd, and nothing is sent by its number. Mutants: "`ESRCH` returns, leaving the
-/// zombie", "`ESRCH` falls back to the number".
+/// through that pidfd. Mutant: "`ESRCH` returns, leaving the zombie".
 #[skuld::test]
 fn a_probe_child_already_dead_at_its_pidfd_send_is_reaped_through_the_pidfd() {
     let _missing = fault::miss_pidfd_info();
@@ -1089,8 +1076,8 @@ fn a_probe_child_already_dead_at_its_pidfd_send_is_reaped_through_the_pidfd() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
@@ -1143,8 +1130,8 @@ impl Drop for NofileLimit {
 }
 
 /// The placement probe answers its verdict (here that `/proc` hides the child) with only `spare`
-/// descriptor numbers free below the soft limit, and its child is still pinned by a pidfd: killed and
-/// reaped through it, with no `warn`.
+/// descriptor numbers free below the soft limit: its child is killed and reaped through its pidfd,
+/// with no `warn`.
 fn assert_probe_answers_with_spare_descriptors(spare: usize) {
     crate::log_capture::install();
     let _missing = fault::miss_pidfd_info();
@@ -1160,58 +1147,108 @@ fn assert_probe_answers_with_spare_descriptors(spare: usize) {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 
-/// A low `RLIMIT_NOFILE` does not turn the probe's verdict into an `Io` failure, nor cost the child its
-/// pidfd: with 3 descriptor numbers free (the `/proc` handle and the socket's two ends; the child's
-/// end is closed here before the child's pidfd takes its number), the child still reports: it opens
-/// nothing. Mutants: "the child copies its descriptors to the lowest free numbers above its own" (it
-/// then needs three more than its parent holds, and dies `ABANDONED`), "this process's own pidfd
-/// stays open during the probe" (the socket then fails with `EMFILE`). Run [`alone`]: the limit is
-/// process-wide.
+/// A low `RLIMIT_NOFILE` does not turn the probe's verdict into an `Io` failure: with 4 descriptor
+/// numbers free (the `/proc` handle, the socket's two ends, and the child's pidfd, which the clone
+/// makes while the child's end is still open), the child still reports: it opens nothing beyond its
+/// walk's directory. Mutants: "the child copies its descriptors to the lowest free numbers above its
+/// own" (it then needs three more than its parent holds, and dies `ABANDONED`), "this process's own
+/// pidfd stays open during the probe" (the clone then fails with `EMFILE`, as the pidfd needs a
+/// number too). Run [`alone`]: the limit is process-wide.
 #[skuld::test]
 fn the_probe_answers_with_the_fewest_descriptors_its_parent_needs() {
     if !alone("containment::cgroup::reach::reach_tests::the_probe_answers_with_the_fewest_descriptors_its_parent_needs")
     {
         return;
     }
-    assert_probe_answers_with_spare_descriptors(3);
+    assert_probe_answers_with_spare_descriptors(4);
 }
 
-/// A probe's child that exits before its pin, with `SIGCHLD` ignored, is reaped by the kernel as it
-/// exits; the spawn's error says so, and does not blame another reaper alone. Mutant: "the error
-/// names only another reaper". Run [`alone`]: the disposition is process-wide.
+/// One descriptor fewer than that, the clone cannot make the child's pidfd: the probe fails with the
+/// clone's errno, `EMFILE`, before anything runs. Mutant: "the child's pidfd is not made at the fork"
+/// (3 descriptors then suffice, and the probe answers its verdict). Run [`alone`]: the limit is
+/// process-wide.
 #[skuld::test]
-fn a_probe_child_that_exits_early_with_sigchld_ignored_says_so() {
-    if !alone("containment::cgroup::reach::reach_tests::a_probe_child_that_exits_early_with_sigchld_ignored_says_so") {
+fn a_probe_with_no_descriptor_for_its_childs_pidfd_fails_with_the_clones_errno() {
+    if !alone(
+        "containment::cgroup::reach::reach_tests::a_probe_with_no_descriptor_for_its_childs_pidfd_fails_with_the_clones_errno",
+    ) {
         return;
     }
-    let _ignored = ignore_sigchld();
     let _missing = fault::miss_pidfd_info();
-    let _exits = fault::set_before_probe_pin(|pid| {
-        // SAFETY: `pid` is this test's own unreaped child.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
-        // With `SIGCHLD` ignored the wait ends once the child has died and the kernel reaped it: `ECHILD`.
-        let waited = rustix::process::waitid(
-            rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).expect("a positive pid")),
-            rustix::process::WaitIdOptions::EXITED,
-        );
-        assert_eq!(
-            waited.expect_err("the kernel reaps the child"),
-            rustix::io::Errno::CHILD
-        );
-        None
-    });
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe has no child left");
-    assert!(
-        err.to_string().contains("SIGCHLD"),
-        "the error names the ignored SIGCHLD: {err}"
-    );
+    let _hidden = fault::hide_proc();
+    let _limit = limit_nofile(3);
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe cannot fork");
+    assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
+}
+
+/// `keep_only_own` closes the parent's end before it opens the walk's directory, so it needs no
+/// free descriptor number: a child whose table is full (its soft limit lowered to its first free
+/// number, with both ends below it) still closes everything but its own end. The probe cannot show
+/// this: the kernel copies the child's table before it makes the pidfd in the parent, so the probe's
+/// child always has one number free. A child of this test has none. Mutant: "`keep_only_own` opens
+/// `/proc/self/fd` before it closes `ends.parent`" (the directory then fails to open, and the child
+/// answers `false`). Run [`alone`]: the numbers the socket takes must be this process's lowest.
+#[skuld::test]
+fn keep_only_own_needs_no_free_descriptor_number() {
+    use std::os::fd::AsRawFd as _;
+
+    use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+
+    const KEPT: i32 = 0;
+    const WALK_FAILED: i32 = 1;
+    const NOT_FULL: i32 = 2;
+
+    if !alone("containment::cgroup::reach::reach_tests::keep_only_own_needs_no_free_descriptor_number") {
+        return;
+    }
+    let proc = proc_dir();
+    let (parent_end, child_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let ends = super::Ends {
+        child: child_end.as_raw_fd(),
+        parent: parent_end.as_raw_fd(),
+    };
+    let new = {
+        let _lock = crate::child::spawn::spawn_lock();
+        // SAFETY: this thread holds `spawn_lock`, and the child makes only raw system calls and
+        // `keep_only_own`'s, and ends in `_exit`.
+        match unsafe { fork_with_pidfd() }.expect("fork") {
+            // SAFETY: this is the forked child.
+            Fork::Child => unsafe {
+                let mut full: libc::c_int = 0;
+                while libc::fcntl(full, libc::F_GETFD) != -1 {
+                    full += 1;
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: full as libc::rlim_t,
+                    rlim_max: full as libc::rlim_t,
+                };
+                if ends.child >= full || ends.parent >= full || libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    libc::_exit(NOT_FULL);
+                }
+                libc::_exit(if super::keep_only_own(&proc, ends) {
+                    KEPT
+                } else {
+                    WALK_FAILED
+                });
+            },
+            Fork::Parent(new) => new,
+        }
+    };
+    let status = rustix::process::waitid(
+        rustix::process::WaitId::PidFd(new.pidfd.as_fd()),
+        rustix::process::WaitIdOptions::EXITED,
+    )
+    .expect("waitid on the child's pidfd")
+    .expect("a waitid without NOHANG returns a status");
+    assert_eq!(status.exit_status(), Some(KEPT), "{status:?}");
 }
 
 /// A probe dropped before it was ended, as by an unwind between its fork and its end, kills and reaps
@@ -1228,8 +1265,8 @@ fn a_probe_dropped_unended_is_killed_and_reaped() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Signal(libc::SIGKILL))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Signal(libc::SIGKILL))
         ]
     );
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
@@ -1262,8 +1299,8 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
     assert_eq!(
         fault::take_probe_steps(),
         [
-            ProbeStep::Kill(Via::Pidfd, libc::SIGKILL),
-            ProbeStep::Reap(Via::Pidfd, ProbeEnd::Exit(super::ABANDONED))
+            ProbeStep::Kill(libc::SIGKILL),
+            ProbeStep::Reap(ProbeEnd::Exit(super::ABANDONED))
         ]
     );
     let warns = warns_since(mark, "");
@@ -1368,32 +1405,6 @@ fn the_ranges_around_two_descriptors_cover_every_other_number() {
     assert_eq!(ranges_around(2, 5), [Some((0, 1)), Some((3, 4)), Some((6, MAX))]);
     assert_eq!(ranges_around(0, 3), [None, Some((1, 2)), Some((4, MAX))]);
     assert_eq!(ranges_around(MAX, 0), [None, Some((1, MAX - 1)), None]);
-}
-
-/// A pidfd that names a process that is no child of this one (`ECHILD` at its `waitid`) does not pin
-/// the probe's child: it is gone, not killed. Mutant: "`ECHILD` at the pin's `waitid` is a failed pin"
-/// (the child would then be killed by its number).
-#[skuld::test]
-fn a_pidfd_naming_no_child_of_this_process_leaves_the_probe_child_gone() {
-    let own = std::process::id() as libc::pid_t;
-    match super::own_child_pidfd(own) {
-        Err(super::Unpinned::Gone(e)) => assert!(e.to_string().contains(&format!("child {own}")), "{e}"),
-        Err(super::Unpinned::Failed(e)) => panic!("expected Gone, got Failed({e})"),
-        Ok(_) => panic!("expected Gone, got a pidfd"),
-    }
-}
-
-/// A descriptor that cannot be waited on as a pidfd (`EBADF`) is a failed pin, not a gone child: the
-/// number still names the probe's child, which is then held by it. Mutant: "any `waitid` failure at
-/// the pin is a gone child".
-#[skuld::test]
-fn a_descriptor_that_is_no_pidfd_fails_the_pin() {
-    let not_a_pidfd = OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"));
-    match super::confirm_child(4242, not_a_pidfd) {
-        Err(super::Unpinned::Failed(e)) => assert_eq!(e.raw_os_error(), Some(libc::EBADF), "{e}"),
-        Err(super::Unpinned::Gone(e)) => panic!("expected Failed, got Gone({e})"),
-        Ok(_) => panic!("expected Failed, got a pidfd"),
-    }
 }
 
 /// A subtree asked about a child with no pid cannot place it, though its kill landed: it has no

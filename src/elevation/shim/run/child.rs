@@ -1,9 +1,7 @@
 //! Creating the program's process, Linux.
 //!
-//! The child is made by `clone3(CLONE_PIDFD)`, or `clone(CLONE_PIDFD)` where `clone3` is refused
-//! (Docker's default seccomp profile answers `ENOSYS`). The handle exists from the child's first
-//! instant, so no host thread can reap the child and let a stranger take its pid before the shim
-//! has a handle on it, and every signal and reap afterwards goes through the handle.
+//! The child is made by [`fork_with_pidfd`](crate::os_process::linux::fork::fork_with_pidfd); every
+//! signal and reap afterwards goes through its pidfd.
 //!
 //! **The child makes raw system calls only, from the clone to `execve`.** Any host thread may hold a
 //! lock at that instant, and a raw clone runs no atfork handlers, so the child allocates nothing,
@@ -17,13 +15,14 @@
 //! finds that out when it arms `PDEATHSIG` and looks at its parent.
 
 use std::ffi::{CString, OsStr, OsString};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::signals::{Inherited, FAULTS, TERMINATIONS};
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted};
 use crate::elevation::shim::step::ToChild;
+use crate::os_process::linux::fork::{Fork, ForkFn, NewChild};
 
 /// A termination that reached the child before its `exec` (the first one).
 static TERMINATED: AtomicI32 = AtomicI32::new(0);
@@ -156,120 +155,15 @@ impl Prepared {
     }
 }
 
-/// A child with the handle the shim keeps on it.
-pub(in crate::elevation::shim) struct Spawned {
-    pub(in crate::elevation::shim) pid: libc::pid_t,
-    pub(in crate::elevation::shim) pidfd: OwnedFd,
-}
-
-/// The arguments of `clone3`, version 0 (kernel 5.3).
-#[repr(C)]
-#[derive(Default)]
-struct CloneArgs {
-    flags: u64,
-    pidfd: u64,
-    child_tid: u64,
-    parent_tid: u64,
-    exit_signal: u64,
-    stack: u64,
-    stack_size: u64,
-    tls: u64,
-}
-
-const CLONE_PIDFD: u64 = 0x1000;
-
-/// How the child was made.
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::elevation::shim) enum Path {
-    Clone3,
-    Clone,
-}
-
-/// Test seams on the clone.
-#[derive(Clone, Copy, Default)]
-pub(in crate::elevation::shim) struct Faults {
-    /// `clone3` answers `ENOSYS`, as Docker's default seccomp profile does.
-    pub(in crate::elevation::shim) refuse_clone3: bool,
-    /// Every clone fails with `EAGAIN`.
-    pub(in crate::elevation::shim) fail: bool,
-}
-
-/// Creates the child. The caller holds `spawn_lock`. `Err` is the errno, and the program never ran.
-pub(in crate::elevation::shim) fn spawn(prepared: &Prepared, faults: Faults) -> Result<(Spawned, Path), i32> {
-    let mut pidfd: libc::c_int = -1;
-    let mut path = Path::Clone3;
-    let mut pid: libc::c_long = -1;
-    if faults.fail {
-        // SAFETY: `__errno_location` is always valid.
-        unsafe { *libc::__errno_location() = libc::EAGAIN };
-    } else if faults.refuse_clone3 {
-        // SAFETY: `__errno_location` is always valid.
-        unsafe { *libc::__errno_location() = libc::ENOSYS };
-    } else {
-        let args = CloneArgs {
-            flags: CLONE_PIDFD,
-            pidfd: (&mut pidfd as *mut libc::c_int) as u64,
-            exit_signal: libc::SIGCHLD as u64,
-            ..CloneArgs::default()
-        };
-        // SAFETY: `args` is a valid `clone_args` of the size passed; no stack is given, so the child
-        // continues on a copy of this one, as after `fork`.
-        pid = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
-    }
-    if pid < 0 && unsafe { *libc::__errno_location() } == libc::ENOSYS {
-        path = Path::Clone;
-        let flags = CLONE_PIDFD | libc::SIGCHLD as u64;
-        // SAFETY: the legacy `clone` with no stack, as `fork`; the pidfd is stored through the
-        // `parent_tid` argument. The argument order is the architecture's.
-        pid = unsafe { raw_clone(flags, &mut pidfd) };
-    }
-    if pid == 0 {
+/// Creates the child with `fork`: `fork_with_pidfd`, or the clone a test injects in its place. The
+/// caller holds `spawn_lock`. `Err` is the errno, and the program never ran.
+pub(in crate::elevation::shim) fn spawn(prepared: &Prepared, fork: ForkFn) -> Result<NewChild, i32> {
+    // SAFETY: the caller holds `spawn_lock`, and the child runs `child_body`, raw system calls only,
+    // which ends in `execve` or `_exit`.
+    match unsafe { fork() }? {
         // SAFETY: this is the child, and `prepared` was built for it.
-        unsafe { child_body(prepared) }
-    }
-    if pid < 0 {
-        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
-    }
-    debug_assert!(pidfd >= 0, "CLONE_PIDFD stores the descriptor");
-    // SAFETY: the kernel made `pidfd` for this call and nothing else owns it.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-    Ok((
-        Spawned {
-            pid: pid as libc::pid_t,
-            pidfd,
-        },
-        path,
-    ))
-}
-
-#[cfg(not(target_arch = "s390x"))]
-unsafe fn raw_clone(flags: u64, pidfd: &mut libc::c_int) -> libc::c_long {
-    // SAFETY: the caller's contract.
-    unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            flags,
-            0usize,
-            pidfd as *mut libc::c_int,
-            0usize,
-            0usize,
-        )
-    }
-}
-
-/// s390x puts the stack pointer first (`CONFIG_CLONE_BACKWARDS2`).
-#[cfg(target_arch = "s390x")]
-unsafe fn raw_clone(flags: u64, pidfd: &mut libc::c_int) -> libc::c_long {
-    // SAFETY: the caller's contract.
-    unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            0usize,
-            flags,
-            pidfd as *mut libc::c_int,
-            0usize,
-            0usize,
-        )
+        Fork::Child => unsafe { child_body(prepared) },
+        Fork::Parent(child) => Ok(child),
     }
 }
 
@@ -462,9 +356,7 @@ pub(in crate::elevation::shim) fn rustix_signal(to: ToChild) -> rustix::process:
     }
 }
 
-impl Spawned {
-    /// `pidfd_send_signal`: the only way the shim signals the child.
-    pub(in crate::elevation::shim) fn signal(&self, to: ToChild) -> Result<(), rustix::io::Errno> {
-        rustix::process::pidfd_send_signal(&self.pidfd, rustix_signal(to))
-    }
+/// `pidfd_send_signal`: the only way the shim signals the child.
+pub(in crate::elevation::shim) fn signal(child: &NewChild, to: ToChild) -> Result<(), rustix::io::Errno> {
+    rustix::process::pidfd_send_signal(&child.pidfd, rustix_signal(to))
 }

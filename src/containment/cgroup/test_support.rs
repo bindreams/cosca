@@ -1,13 +1,16 @@
 //! Helpers the cgroup module's tests share.
 
+#[cfg(target_os = "linux")]
+use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+
 /// Fork a child that runs `body` and `_exit(0)`s; `body` must be async-signal-safe (this process
 /// has other threads). The child never `exec`s, so an unreaped orphan keeps this binary's
 /// inherited fds (stdout) open. The returned [`KillOnDrop`] SIGKILLs and reaps it on drop unless
 /// [`defused`](KillOnDrop::defuse).
 ///
 /// Forks under [`spawn_lock`], so the never-exec child cannot inherit an fd another spawn holds
-/// transiently non-`CLOEXEC` inside its own `spawn_lock` section. Held across `fork()` until the
-/// parent's `pidfd_open` resolves.
+/// transiently non-`CLOEXEC` inside its own `spawn_lock` section. Held across the fork until the
+/// guard exists.
 ///
 /// The child closes every descriptor above 2 but `keep`, the ones `body` uses, first thing: a
 /// concurrent test's pipe end, made outside `spawn_lock`, is in the fork's copy and would stay open
@@ -64,12 +67,12 @@ fn fork_running_held(held: Held<'_>, keep: Option<&[std::os::fd::RawFd]>, body: 
         kept.dedup();
         kept
     });
-    // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
-    // `_exit`s without unwinding or running destructors.
-    let raw_pid = unsafe { libc::fork() };
-    match raw_pid {
-        -1 => panic!("fork: {}", std::io::Error::last_os_error()),
-        0 => {
+    // SAFETY: `held` is this thread's `spawn_lock`; the child runs only `body`, async-signal-safe by
+    // the caller's contract, then `_exit`s without unwinding or running destructors.
+    let forked = unsafe { fork_with_pidfd() };
+    match forked {
+        Err(errno) => panic!("fork: {}", std::io::Error::from_raw_os_error(errno)),
+        Ok(Fork::Child) => {
             if let Some(kept) = &kept {
                 if !close_range_except(kept) {
                     // SAFETY: async-signal-safe.
@@ -99,76 +102,17 @@ fn fork_running_held(held: Held<'_>, keep: Option<&[std::os::fd::RawFd]>, body: 
             // SAFETY: async-signal-safe.
             unsafe { libc::_exit(0) }
         }
-        raw_pid => {
-            let pid = raw_pid as u32;
-            // Opened right after the fork: only our still-unreaped child can hold this pid now,
-            // so the pidfd names it exactly.
-            let child = rustix::process::Pid::from_raw(raw_pid).expect("fork returned a positive pid");
-            let pidfd = if crate::containment::cgroup::fault::take_force_fork_running_pidfd_failure() {
-                Err(rustix::io::Errno::MFILE)
-            } else {
-                rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty())
+        Ok(Fork::Parent(new)) => {
+            let kod = KillOnDrop {
+                pid: new.pid as u32,
+                pidfd: Some(new.pidfd),
+                closes_fds: keep.is_some(),
             };
-            match pidfd {
-                Ok(pidfd) => {
-                    let kod = KillOnDrop {
-                        pid,
-                        pidfd: Some(pidfd),
-                        closes_fds: keep.is_some(),
-                    };
-                    // Run only once `kod` exists, and only then release the lock: a seam that
-                    // panics still unwinds through `kod`'s `Drop`, which kills and reaps the child.
-                    crate::containment::cgroup::fault::run_after_fork_still_locked();
-                    held.release();
-                    kod
-                }
-                Err(e) => {
-                    held.release();
-                    crate::containment::cgroup::fault::run_fork_running_cleanup();
-                    // The probe pidfd lets the test verify the reap without racing pid reuse. Its
-                    // failure is reported but must not skip the kill/reap.
-                    let probe = if crate::containment::cgroup::fault::take_force_fork_running_probe_pidfd_failure() {
-                        Err(rustix::io::Errno::MFILE)
-                    } else {
-                        rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty())
-                    };
-                    match probe {
-                        Ok(probe) => crate::containment::cgroup::fault::record_fork_running_pidfd_failure_probe(probe),
-                        Err(probe_err) => {
-                            use std::io::Write;
-                            _ = writeln!(std::io::stderr(), "fork_running: probe pidfd_open: {probe_err}");
-                        }
-                    }
-                    // Bare pid is safe: the child is still unreaped, so the pid can't be recycled.
-                    // SAFETY: `raw_pid` is our unreaped child.
-                    let killed = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
-                    let cleanup_err = if killed != 0 {
-                        // The child may still be alive: a blocking reap here could hang forever.
-                        Some(format!("kill: {}", std::io::Error::last_os_error()))
-                    } else {
-                        let mut status = 0;
-                        let reaped = loop {
-                            // SAFETY: `raw_pid` is our unreaped child.
-                            let reaped = unsafe { libc::waitpid(raw_pid, &mut status, 0) };
-                            if reaped == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                            {
-                                continue;
-                            }
-                            break reaped;
-                        };
-                        (reaped != raw_pid).then(|| format!("waitpid: {}", std::io::Error::last_os_error()))
-                    };
-                    // No pre-empting assert: `e` — the reason a guard couldn't be made — is the
-                    // point of this panic, and a cleanup failure is additional detail on it, not
-                    // a replacement for it.
-                    match cleanup_err {
-                        None => panic!("pidfd_open its own just-forked child: {e}"),
-                        Some(cleanup_err) => {
-                            panic!("pidfd_open its own just-forked child: {e} (cleanup also failed: {cleanup_err})")
-                        }
-                    }
-                }
-            }
+            // Run only once `kod` exists, and only then release the lock: a seam that panics still
+            // unwinds through `kod`'s `Drop`, which kills and reaps the child.
+            crate::containment::cgroup::fault::run_after_fork_still_locked();
+            held.release();
+            kod
         }
     }
 }

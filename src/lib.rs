@@ -46,6 +46,10 @@
 //! only the low 32 bits of a pidfs inode number, so a process's identity (its pidfd's inode on 6.9+)
 //! would not be unique.
 //!
+//! Linux on an architecture other than x86_64, aarch64, riscv64, s390x, powerpc64 and loongarch64 is
+//! unsupported too, and cosca does not compile there: its raw `clone`, which gives a child its pidfd
+//! from the fork, is checked to return 0 in the child only on those.
+//!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
 //! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14

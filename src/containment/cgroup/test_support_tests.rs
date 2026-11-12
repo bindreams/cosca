@@ -140,83 +140,6 @@ fn drop_reports_a_kill_failure_without_blocking() {
     reap(child_pid);
 }
 
-/// A `pidfd_open` failure (e.g. `RLIMIT_NOFILE`) happens before any guard exists; `fork_running`
-/// must still kill and reap the child before panicking. Probed via the failure path's recorded
-/// pidfd, since the pid is never returned.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_pidfd_open_failure_still_reaps_the_child() {
-    use std::os::fd::AsFd;
-
-    crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
-    let unwound = std::panic::catch_unwind(|| {
-        _ = fork_running(&[], || {
-            // SAFETY: `pause` is async-signal-safe.
-            unsafe { libc::pause() };
-        });
-    });
-    let payload = unwound.expect_err("the forced pidfd_open failure must panic");
-    let message = payload
-        .downcast_ref::<String>()
-        .expect("panic! with format args produces a String payload");
-    assert!(
-        message.contains("pidfd_open its own just-forked child"),
-        "the panic must name the failure it's about, got {message:?}"
-    );
-    assert!(
-        !crate::containment::cgroup::fault::take_force_fork_running_pidfd_failure(),
-        "the fault must be consumed exactly once"
-    );
-
-    let probe = crate::containment::cgroup::fault::take_fork_running_pidfd_failure_probe()
-        .expect("the failure path recorded a probe pidfd before killing the child");
-    assert_eq!(
-        rustix::process::waitid(
-            rustix::process::WaitId::PidFd(probe.as_fd()),
-            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
-        )
-        .unwrap_err(),
-        rustix::io::Errno::CHILD,
-        "the pidfd_open failure path must have reaped the child before panicking"
-    );
-}
-
-/// The probe `pidfd_open` inside the failure path above can itself fail (the same exhaustion that
-/// failed the main one). That must not skip the kill/reap: the panic still names the original
-/// failure, with no "cleanup also failed" suffix, and nothing is recorded for a later test to read.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_probe_pidfd_open_failure_does_not_skip_the_cleanup() {
-    crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
-    crate::containment::cgroup::fault::set_force_fork_running_probe_pidfd_failure(true);
-    let unwound = std::panic::catch_unwind(|| {
-        _ = fork_running(&[], || {
-            // SAFETY: `pause` is async-signal-safe.
-            unsafe { libc::pause() };
-        });
-    });
-    let payload = unwound.expect_err("the forced pidfd_open failure must still panic");
-    let message = payload
-        .downcast_ref::<String>()
-        .expect("panic! with format args produces a String payload");
-    assert!(
-        message.contains("pidfd_open its own just-forked child") && !message.contains("cleanup also failed"),
-        "the kill/reap must still succeed even though the probe itself failed, got {message:?}"
-    );
-    assert!(
-        !crate::containment::cgroup::fault::take_force_fork_running_pidfd_failure(),
-        "the fault must be consumed exactly once"
-    );
-    assert!(
-        !crate::containment::cgroup::fault::take_force_fork_running_probe_pidfd_failure(),
-        "the probe fault must be consumed exactly once"
-    );
-    assert!(
-        crate::containment::cgroup::fault::take_fork_running_pidfd_failure_probe().is_none(),
-        "a failed probe must not have recorded anything"
-    );
-}
-
 /// A defused guard's `Drop` must neither kill nor reap: the caller took that over by taking the
 /// pid back.
 ///
@@ -488,34 +411,6 @@ fn fork_running_waits_for_a_held_spawn_lock() {
         rx_probe.recv(),
         Ok(LockProbe::Forked { holder_released: true }),
         "fork_running must not fork before the holder released spawn_lock"
-    );
-}
-
-/// The `pidfd_open`-failure path releases `spawn_lock` before it kills and reaps the child, not
-/// at scope exit or unwind. Observed from the cleanup hook, which runs on the forking thread.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel::<bool>();
-    let fork_thread = std::thread::spawn(move || {
-        crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
-        let _cleanup_guard = crate::containment::cgroup::fault::set_fork_running_cleanup(move || {
-            _ = tx.send(crate::child::spawn::spawn_lock_held_by_this_thread());
-        });
-        _ = fork_running(&[], || {
-            // SAFETY: `pause` is async-signal-safe.
-            unsafe { libc::pause() };
-        });
-    });
-    let unwound = fork_thread.join();
-    assert!(unwound.is_err(), "the forced pidfd_open failure must panic");
-
-    let held_during_cleanup = rx.recv().expect("the cleanup hook must have run");
-    assert!(
-        !held_during_cleanup,
-        "spawn_lock must be released before the failure path's kill and reap"
     );
 }
 
