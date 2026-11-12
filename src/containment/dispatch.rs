@@ -238,7 +238,7 @@ impl DropView {
         tree: &Tree,
     ) -> DropView {
         let label = caller.label();
-        let now = crate::child::root_identity_now(root_pid);
+        let (now, _) = crate::child::root_identity_now(root_pid);
         let state = root();
         let handle_reaped = matches!(state, RootState::Reaped { .. });
         let root = if crate::child::root_reaped(handle_reaped, id, now) {

@@ -32,7 +32,7 @@ fn answered(state: impl Fn() -> RootState, has_group: bool, read: Resolved<Proce
             match refusal {
                 Refusal::ReapedPidGone(_) => "gone",
                 Refusal::ReapedPidTaken(_) => "taken",
-                Refusal::ReapedPidUnread(_) => "unread",
+                Refusal::ReapedPidUnread(..) => "unread",
                 Refusal::ReapedElsewhere(_) => "elsewhere",
                 Refusal::Unsure(..) => "unsure",
                 Refusal::Unpinned(_) => "unpinned",
@@ -179,7 +179,7 @@ fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
             .and_then(std::io::Error::raw_os_error)
     };
     assert_eq!(code(&refusal), Some(libc::EPERM));
-    let unproven = NotItsGroup::Unproven(refusal);
+    let unproven = NotItsGroup::unproven(refusal, None);
     assert!(!unproven.to_string().contains(&os_error), "{unproven}");
     assert_eq!(code(&unproven), Some(libc::EPERM));
     assert!(std::error::Error::source(&NotItsGroup::Empty).is_none());
@@ -207,8 +207,30 @@ fn number_holds_reads_own_from_the_state() {
     drop(_found);
     let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
     let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
-    assert!(matches!(err, Refusal::ReapedPidUnread(_)), "{err}");
+    assert!(matches!(err, Refusal::ReapedPidUnread(..)), "{err}");
     assert!(err.to_string().contains("could not be read"), "{err}");
+}
+
+/// A reaped root whose pid could not be read refuses with the read's error as its `source()`, OS code
+/// included, and the send that wraps the check keeps it as its own.
+///
+/// Mutant: the refusal drops the read's cause.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unread_pid_refusal_has_the_reads_error_as_its_source() {
+    use nix::sys::signal::Signal;
+
+    use crate::containment::unix::send_to_group;
+    use crate::error::first_os_code;
+    use crate::identity::FailedCall;
+    use crate::test_support::stated_root::StatedRoot;
+
+    let _read = crate::child::fault::force_root_reads_failing(FailedCall::pidfd_open(rustix::io::Errno::MFILE));
+    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    assert_eq!(first_os_code(&refusal), Some(libc::EMFILE), "{refusal:?}");
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Reaped { own: true });
+    let sent = send_to_group(PGID, Signal::SIGTERM, Some(&root)).expect_err("the check refuses the send");
+    assert_eq!(first_os_code(&sent), Some(libc::EMFILE), "{sent:?}");
 }
 
 // check_number through the root's pidfd -----
@@ -338,6 +360,43 @@ mod pidfd {
             checked.expect_err("reaped elsewhere").to_string(),
             reaped_elsewhere_text(pid)
         );
+    }
+
+    /// A refusal that follows a failed group probe has the probe's errno as a cause: the only one
+    /// when the root's state says nothing of its own, else after the state's.
+    ///
+    /// Mutant: the check drops the probe's errno, or puts it before the state's cause.
+    #[skuld::test]
+    fn a_refusal_after_a_failed_group_probe_keeps_the_probes_errno() {
+        use crate::error::first_os_code;
+
+        let (mut leader, pidfd) = leader();
+        let pid = leader.id();
+        let elsewhere = reaped_elsewhere(pid, pidfd.as_fd());
+        let unsure = StatedRoot::with_state(pid, || {
+            RootState::Unknown(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EACCES)))
+        })
+        .with_pidfd(pidfd.as_fd());
+        let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
+        let alone = check_number(Some(&elsewhere));
+        let beside = check_number(Some(&unsure));
+        drop(answered);
+        leader.kill().expect("kill the leader");
+        leader.wait().expect("reap the leader");
+
+        let alone = alone.expect_err("reaped elsewhere");
+        assert_eq!(first_os_code(&alone), Some(libc::EPERM), "{alone:?}");
+        assert_eq!(alone.to_string(), reaped_elsewhere_text(pid));
+        let beside = beside.expect_err("the handle could not say");
+        let cause = beside.cause().expect("two causes");
+        let codes: Vec<_> = cause
+            .failures()
+            .expect("the state's cause and the probe's")
+            .iter()
+            .map(|member| first_os_code(&**member))
+            .collect();
+        assert_eq!(codes, [Some(libc::EACCES), Some(libc::EPERM)], "{beside:?}");
+        assert_eq!(first_os_code(&beside), Some(libc::EACCES), "{beside:?}");
     }
 
     /// The check's signal-0 group send is a send like any other: recorded, through the root's

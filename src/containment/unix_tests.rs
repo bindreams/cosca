@@ -325,7 +325,7 @@ mod group_kill_and_terminate {
         match (&skip.why, root) {
             (Why::MayNameAnother(Refusal::ReapedElsewhere(_)), Root::ReapedElsewhere)
             | (Why::MayNameAnother(Refusal::ReapedPidGone(_)), Root::OwnReapGone)
-            | (Why::MayNameAnother(Refusal::ReapedPidUnread(_)), Root::OwnReapUnreadable) => {
+            | (Why::MayNameAnother(Refusal::ReapedPidUnread(..)), Root::OwnReapUnreadable) => {
                 assert!(!skip.root_alone, "{root:?}");
             }
             (Why::MayNameAnother(Refusal::Unsure(..)), Root::Unknown) => {

@@ -124,7 +124,7 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
         ),
         (
             "own reap, pid unread",
-            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID, None)),
             true,
         ),
         (

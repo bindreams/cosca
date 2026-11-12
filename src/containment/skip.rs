@@ -31,7 +31,7 @@ impl Skip {
         tree.is_killed()
             && matches!(
                 &self.why,
-                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_))
+                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..))
             )
     }
 
