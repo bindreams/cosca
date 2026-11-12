@@ -171,6 +171,19 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
                     "{recheck}: {text}"
                 );
                 assert_eq!(crate::error::first_os_code(&error), Some(below), "{recheck}: {text}");
+                // The failure that came with it is kept as a second cause, not only worded.
+                let crate::error::Error::Unassessable {
+                    source: Some(source), ..
+                } = &error
+                else {
+                    unreachable!()
+                };
+                let crate::error::Error::Several(causes) = &**source else {
+                    panic!("{recheck}: expected Several, got {source:?}");
+                };
+                let peer = if refused { recheck } else { libc::EPERM };
+                let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
+                assert_eq!(codes, [Some(below), Some(peer)], "{recheck}: {text}");
             }
             other => panic!("{recheck}: expected Unassessable, got {other:?}"),
         }

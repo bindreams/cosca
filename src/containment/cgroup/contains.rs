@@ -82,10 +82,7 @@ impl Contains for CgroupLeaf {
     }
 
     fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {
-        TerminateOutcome::Sent {
-            result: self.terminate(),
-            earlier: Some("the SIGTERM"),
-        }
+        TerminateOutcome::of(self.terminate(), Some("the SIGTERM"))
     }
 
     fn drain_edge(&self) -> Option<DrainEdge<'_>> {
@@ -96,7 +93,6 @@ impl Contains for CgroupLeaf {
         Containment::CgroupV2
     }
 
-    /// The leaf's path: a kill returns the kernel's error unwrapped, so the error does not name it.
     fn subject(&self) -> String {
         format!("cgroup leaf {}", self.path().display())
     }

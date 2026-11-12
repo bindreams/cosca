@@ -174,8 +174,8 @@ impl<'a> KillWait<'a> {
     /// # Errors
     ///
     /// The first member whose exit could not be observed (a failed open or look is not an exit), as
-    /// [`Error::Unassessable`] naming it, with the others in its note, once every other member has been
-    /// waited for.
+    /// [`Error::Unassessable`] naming it, with the others whole below it ([`Error::with_peers`]), once
+    /// every other member has been waited for.
     pub(crate) fn wait(self) -> Result<(), Error> {
         let KillWait {
             members,
@@ -239,22 +239,19 @@ fn once_each(members: Vec<ProcessId>) -> impl Iterator<Item = ProcessId> {
     members.into_iter().filter(move |id| seen.insert(*id))
 }
 
-/// The error of a wait that could not observe every exit: the first, with the rest in its note.
+/// The error of a wait that could not observe every exit: the first, with each other's whole error
+/// below its variant ([`Error::with_peers`]). A first that is an [`Error::Io`] has no slot for them, so
+/// it goes below an `Unassessable` with the others.
 fn answer_of(unobserved: Vec<Error>) -> Result<(), Error> {
     let mut unobserved = unobserved.into_iter();
     let Some(first) = unobserved.next() else {
         return Ok(());
     };
-    let others: Vec<String> = unobserved.map(|why| crate::error::Report(&why).to_string()).collect();
-    Err(if others.is_empty() {
-        first
-    } else {
-        first.with_note(&format!(
-            "the exit of {} more could not be observed either: {}",
-            others.len(),
-            others.join("; ")
-        ))
-    })
+    Err(first.with_peers_or_unassessable(
+        || "the exit of the members a kill reached could not be observed".to_owned(),
+        None,
+        unobserved.map(std::sync::Arc::new),
+    ))
 }
 
 fn root_unobserved(cause: Error) -> Error {

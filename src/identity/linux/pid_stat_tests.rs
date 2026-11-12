@@ -73,6 +73,41 @@ fn a_pid_refused_beside_a_refusing_directory_keeps_its_own_stat_error_as_its_sou
     }
 }
 
+/// The `self/stat` failure that came with a pid's refused `stat` is kept beside it, whichever of the
+/// two is the source: it is the peer the scan's error holds as a second cause.
+///
+/// Mutant: the second failure is named in the words only, or dropped.
+#[skuld::test]
+fn the_other_failure_of_a_refused_pid_is_kept_as_its_peer() {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    for (recheck, source, peer) in [
+        (libc::ENOSYS, libc::EPERM, libc::ENOSYS),
+        (libc::EMFILE, libc::EMFILE, libc::EPERM),
+    ] {
+        let kernel = FakeKernel::new()
+            .on_read("4242/stat", Err(libc::EPERM))
+            .on_read("self/stat", Err(recheck));
+        let Err(mut unreadable) = read_in_scan(&kernel, &dir, 4242) else {
+            panic!("{recheck}: a failed directory is no skip");
+        };
+
+        let kept = unreadable.take_peer().and_then(|e| e.raw_os_error());
+
+        assert_eq!(kept, Some(peer), "{recheck}");
+        assert_eq!(crate::error::first_os_code(&unreadable), Some(source), "{recheck}");
+        assert_eq!(
+            unreadable.take_peer().and_then(|e| e.raw_os_error()),
+            None,
+            "taken once"
+        );
+    }
+    let beyond = FakeKernel::new().on_read("4242/stat", Err(libc::EIO));
+    let Err(mut unreadable) = read_in_scan(&beyond, &dir, 4242) else {
+        panic!("EIO is no skip");
+    };
+    assert!(unreadable.take_peer().is_none(), "a plain failure has no peer");
+}
+
 /// A `self/stat` re-check that fails for another reason (`EMFILE`, `ENOMEM`, `EIO`) is no refusal:
 /// the text says the pid's `stat` was refused and the re-check failed, and the `source()` is the
 /// re-check's own error, the operative cause.

@@ -1037,12 +1037,7 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
     crate::log_capture::install();
-    let failed = || {
-        Some(Err(crate::containment::dispatch::Unsettled {
-            first: Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR)),
-            others: Vec::new(),
-        }))
-    };
+    let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
     for (name, tree, reported) in [
         ("cosca-report-failed", failed(), true),
         (
@@ -1414,13 +1409,10 @@ fn foreign_reap(child: &crate::Child, writer: crate::PipeWriter) {
 #[cfg(unix)]
 #[skuld::test]
 fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the_tree() {
-    use crate::containment::dispatch::{SettleOutcome, Unsettled, UnvouchedKind};
-    let unsettled = || Unsettled {
-        first: Error::Containment {
-            detail: "refused".into(),
-            source: None,
-        },
-        others: Vec::new(),
+    use crate::containment::dispatch::{SettleOutcome, UnvouchedKind};
+    let unsettled = || Error::Containment {
+        detail: "refused".into(),
+        source: None,
     };
     let table = [
         ("none made", None, false),

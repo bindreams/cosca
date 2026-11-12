@@ -837,6 +837,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
+use crate::containment::treewalk::KillOutcome;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -861,6 +862,11 @@ struct SweepState<'k> {
     /// The group signals' result across passes: a later pass's success does not erase an earlier
     /// failure, and two failures fold together (`combine_group_errors`).
     group_result: Result<(), Error>,
+    /// Whether a cooperative group signal went unsent: its failure is in `group_result`, and the pass went
+    /// on through the other channels.
+    group_unsent: bool,
+    /// Whether any signal reached a member by identity or a marker holder.
+    delivered: bool,
     /// Whether any pass was blind, any holder could not be resolved, or any signal was refused: checked
     /// once, by `finish_sweep`, whichever pass it happened on.
     incomplete: bool,
@@ -873,8 +879,29 @@ impl<'k> SweepState<'k> {
         SweepState {
             seen: std::collections::HashSet::new(),
             group_result: Ok(()),
+            group_unsent: false,
+            delivered: false,
             incomplete: false,
             killed,
+        }
+    }
+
+    /// Folds the outcome of a kill of `id` by identity into the sweep, for a walk member and a marker
+    /// holder alike. [`KillOutcome::NotAttempted`] means the OS refused to query or signal an identity
+    /// that was resolved: a known member left running, not a gap in discovery, so the sweep is
+    /// `incomplete`, and it is not retried (see [`Marker::sweep_pass`]). Any delivered signal is
+    /// `delivered`; only a delivered `SIGKILL` adds `id` to `killed` (the members the kill's wait waits
+    /// for), and only when `waited_for` (the root's owner waits for the root).
+    fn record(&mut self, id: ProcessId, signal: nix::sys::signal::Signal, outcome: &KillOutcome, waited_for: bool) {
+        match outcome {
+            KillOutcome::Terminated => {
+                self.delivered = true;
+                if waited_for && signal == nix::sys::signal::Signal::SIGKILL {
+                    self.killed.push(id);
+                }
+            }
+            KillOutcome::NotAttempted(_) => self.incomplete = true,
+            KillOutcome::AlreadyGone => {}
         }
     }
 }
@@ -979,49 +1006,19 @@ fn pid_is_live_group_member(pid: RawPid, pgid: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —
-/// as opposed to `Error::Containment` (a live member refused the signal), both ORDINARY,
-/// expected outcomes after #61's fix and specifically the scenario it exists to report
-/// honestly, not bugs. Used by `combine_group_errors` so the merged variant follows
-/// this one classification.
-///
-/// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
-/// `group::decide` produces `source: None` when the group WAS listed successfully but one or
-/// more of its individual members could not be confirmed cleared (`probe_member` /
-/// `resend_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
-/// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
-/// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
-/// reason: a directly and deliberately TESTED input-validation refusal
-/// (`kill_group_and_term_group_reject_non_positive_pgid`, Task 5), not a "should never
-/// happen" internal contract violation — this function never got as far as attempting
-/// anything, the same way `group::decide`'s per-member case never got a confirmable answer.
-/// Neither provenance indicates the teardown MECHANISM'S OWN plumbing broke, which is the
-/// actual line this classifier draws. `group::state` produces `source: Some(io_error)` when
-/// `converge` itself returned `Err` — the listing syscall (`members()`'s `sysctl`/`/proc`
-/// scan) failed outright, before any member was even examined. THAT is a failure of the
-/// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
-/// statement about any member or any input — so it, alone, is treated as a mechanism failure
-/// here.
-pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
-    matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
-}
-
-/// Fold two `Error`s (the `incomplete` summary and a group signal's failure) into one, choosing
-/// the merged VARIANT by severity rather than by which side happened to be checked first.
-/// `is_teardown_mechanism_failure` (above) is the single source of truth for "is this a genuine
-/// mechanism failure, or an ordinary refusal" — reused here rather than re-derived, so this
-/// function and the classifier can never quietly drift apart on what counts as which.
-///
-/// If EITHER side is a genuine mechanism failure, the merged result must be too: an ordinary
-/// refusal must never mask a real plumbing break on the other side. Only when NEITHER side is a
-/// mechanism failure does the merged result stay in the ordinary (`Containment`) bucket. Either
-/// way, both sides' messages are preserved in the combined `detail`/`io::Error` text.
+/// Fold two `Error`s (the `incomplete` summary and a group signal's failure) into one: both are kept
+/// whole as an [`Error::Several`], the `source` of the merged error. [`Error::Containment`] when
+/// either side is one (the mechanism could not tear the tree down, as its doc says), else
+/// [`Error::Unassessable`].
 fn combine_group_errors(first: Error, latest: Error) -> Error {
-    let detail = format!("{first}; {latest}");
-    if is_teardown_mechanism_failure(&first) || is_teardown_mechanism_failure(&latest) {
-        Error::Io(io::Error::other(detail))
+    let containment = matches!(first, Error::Containment { .. }) || matches!(latest, Error::Containment { .. });
+    let detail = "the teardown failed in more than one way".to_owned();
+    let source =
+        Some(crate::error::Failures::new(std::sync::Arc::new(first), [std::sync::Arc::new(latest)]).into_cause());
+    if containment {
+        Error::Containment { detail, source }
     } else {
-        Error::Containment { detail, source: None }
+        Error::Unassessable { detail, source }
     }
 }
 
@@ -1122,14 +1119,9 @@ impl Marker {
         crate::containment::marker_eof::block_until_drained(self.read_end(), deadline)
     }
 
-    /// `Err` distinguishes a genuine teardown-mechanism failure (`Error::Io`/`Unsupported`,
-    /// or `Unassessable` with a `source`) from an ORDINARY outcome — a live member refused
-    /// the signal, or could not be fully assessed/reached (`Error::Containment` /
-    /// `Error::Unassessable { source: None, .. }`) — the same distinction #61 established
-    /// for `ProcessGroup`/`Session` (`src/containment/unix.rs`'s `verify`). Callers, in
-    /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
-    /// surviving intact through this return value; see `sweep`'s own doc for where it is
-    /// preserved.
+    /// `Err` is [`Error::Containment`] when a live member refused the signal, and
+    /// [`Error::Unassessable`] when a member could not be fully assessed or reached. Same distinction as
+    /// `ProcessGroup`/`Session` `verify`.
     fn hard_kill(&self, root: Option<&dyn Root>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {
         self.hard_kill_impl(Scope::Full(root), killed)
     }
@@ -1240,14 +1232,15 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    fn terminate(&self, root: Option<&dyn Root>) -> Result<(), Error> {
+    fn terminate(&self, root: Option<&dyn Root>) -> Result<Result<(), Error>, Error> {
         self.terminate_impl(Scope::Full(root))
     }
 
     /// The marker's cooperative signal as a tree call decides it, on one look at `root`
     /// ([`kill_tree`](Self::kill_tree)): the holders alone get it when the root's number names no
     /// one, and then, once the number may name another process, the caller waits the grace and
-    /// kills any left ([`TerminateOutcome::HoldersOnly`]).
+    /// kills any left ([`TerminateOutcome::HoldersOnly`]). A signal never sent is
+    /// [`TerminateOutcome::NotSent`].
     pub(crate) fn terminate_tree(&self, root: Option<&dyn Root>) -> TerminateOutcome {
         let holders_only = |except| self.terminate_impl(Scope::HoldersOnly { except });
         let earlier = Some("the SIGTERM");
@@ -1259,33 +1252,37 @@ impl Marker {
                     self.terminate(root)
                 }
             };
-            return TerminateOutcome::Sent { result, earlier };
+            return TerminateOutcome::of(result, earlier);
         };
         let root_pid = root.map_or(0, Root::pid);
         match look {
-            NumberLook::Trusted => TerminateOutcome::Sent {
-                result: self.terminate(root),
-                earlier,
+            NumberLook::Trusted => TerminateOutcome::of(self.terminate(root), earlier),
+            NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
+            NumberLook::Empty => TerminateOutcome::of(holders_only(None), Some("the SIGTERM to any marker holders")),
+            look => match holders_only(None) {
+                Ok(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
+                Err(not_sent) => TerminateOutcome::NotSent(not_sent),
             },
-            NumberLook::Untrusted(_) => TerminateOutcome::Sent {
-                result: holders_only(except),
-                earlier,
-            },
-            NumberLook::Empty => TerminateOutcome::Sent {
-                result: holders_only(None),
-                earlier: Some("the SIGTERM to any marker holders"),
-            },
-            look => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, holders_only(None))),
         }
     }
 
-    fn terminate_impl(&self, scope: Scope<'_>) -> Result<(), Error> {
+    /// One `SIGTERM` pass of `scope`: `Err` is a signal never sent (a read end that no longer names
+    /// its pipe, or a group that cannot be signalled while no other channel sent anything), `Ok` what
+    /// the pass found. A group that cannot be signalled is one failed channel: when another channel
+    /// sent, its failure is among what the pass found.
+    fn terminate_impl(&self, scope: Scope<'_>) -> Result<Result<(), Error>, Error> {
         self.check_read_end_still_valid()?;
         // A `SIGTERM` is not a kill: nothing it reaches is waited for.
         let mut reached = Vec::new();
         let mut state = SweepState::new(&mut reached);
         self.sweep_pass(nix::sys::signal::Signal::SIGTERM, &mut state, true, scope);
-        Self::finish_sweep(self.handle, state.group_result, state.incomplete, false)
+        let swept = Self::finish_sweep(self.handle, state.group_result, state.incomplete, false);
+        match swept {
+            // Nothing was sent: the group's failure and the members that refused or could not be assessed
+            // are all `finish_sweep` found.
+            Err(unsent) if state.group_unsent && !state.delivered => Err(unsent),
+            swept => Ok(swept),
+        }
     }
 
     /// CONTRACT, re-checked on every `hard_kill`/`terminate` call, not just at `Marker::new`
@@ -1333,10 +1330,11 @@ impl Marker {
                 self.handle
             );
             log::error!("{msg}");
-            // A genuine mechanism failure (this process's own bookkeeping is stale, not a
-            // member's refusal) — `Error::Io` is the correct classification here, not
-            // `Containment`/`Unassessable`.
-            return Err(Error::Io(io::Error::other(msg)));
+            // This process's own bookkeeping is stale, not a member's refusal.
+            return Err(Error::Containment {
+                detail: msg,
+                source: None,
+            });
         }
         Ok(())
     }
@@ -1457,8 +1455,10 @@ impl Marker {
         let SweepState {
             seen,
             group_result,
+            group_unsent,
             incomplete,
             killed,
+            ..
         } = state;
         let walk = matches!(scope, Scope::Full(_));
         let group_root = match scope {
@@ -1636,7 +1636,13 @@ impl Marker {
                     (Some(pgid), nix::sys::signal::Signal::SIGKILL) => {
                         crate::containment::unix::kill_group(pgid, group_root, killed)
                     }
-                    (Some(pgid), _) => crate::containment::unix::term_group(pgid, group_root),
+                    (Some(pgid), _) => match crate::containment::unix::term_group_sent(pgid, group_root) {
+                        Ok(checked) => checked,
+                        Err(unsent) => {
+                            *group_unsent = true;
+                            Err(unsent)
+                        }
+                    },
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {
@@ -1675,25 +1681,14 @@ impl Marker {
             if Some(id) == self.root && fault::take_force_root_kill_noop() {
                 continue;
             }
-            // `KillOutcome::NotAttempted` means the OS refused to query or signal an identity
-            // that WAS resolved — a known member left running, not a gap in discovery. Not
-            // retried (see this fn's doc); folded into `incomplete`.
             let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
             crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
-            if matches!(outcome, crate::containment::treewalk::KillOutcome::NotAttempted(_)) {
-                *incomplete = true;
-            }
             // The root's owner waits for the root.
-            if matches!(outcome, crate::containment::treewalk::KillOutcome::Terminated)
-                && signal == nix::sys::signal::Signal::SIGKILL
-                && Some(id) != self.root
-            {
-                killed.push(id);
-            }
+            state.record(id, signal, &outcome, Some(id) != self.root);
         }
         for id in new_holders {
-            if self.kill_holder(id, signal, killed) {
-                *incomplete = true; // NotAttempted or Denied
+            if let Some(outcome) = self.kill_holder(id, signal) {
+                state.record(id, signal, &outcome, true);
             }
         }
         found
@@ -1701,8 +1696,8 @@ impl Marker {
 
     /// Fold `incomplete` and `still_forking` (the sweep ended on a count that did not fall) into
     /// the final `Result` — see `sweep_pass`'s doc for why a blind pass or an unresolved member is
-    /// a real gap, never silently `Ok(())` — merged against `group_result` with the same
-    /// severity-aware rule `combine_group_errors` states.
+    /// a real gap, never silently `Ok(())`. A failed `group_result` stays the error, with the
+    /// incomplete summary as its peer, so the group's OS code is the first one found.
     fn finish_sweep(
         handle: u64,
         group_result: Result<(), Error>,
@@ -1727,22 +1722,14 @@ impl Marker {
                 "fd marker {handle:#x}: teardown may be incomplete — {}",
                 causes.join("; ")
             );
-            // `incomplete` alone (no io::Error anywhere in its own tracking — it is a summary
-            // bool, not a captured syscall failure) is the SAME kind of ordinary, expected
-            // outcome `Error::Unassessable { source: None, .. }` already names for
-            // `ProcessGroup`/`Session` (`unix.rs`'s `verify`, `group::state`'s per-member
-            // `Refused { unassessable, .. }` arm): specific members left running or
-            // unconfirmed, not proof the mechanism's own plumbing broke. `source: None` here
-            // is not a downgrade of real information — this path never had a captured
-            // `io::Error` to attach; `enumerate::snapshot()` already logs a blind pass itself
-            // (see its own module docs) rather than surfacing one to the caller.
+            // `incomplete` is a summary bool with no cause to attach; `snapshot()` logs a blind pass itself.
             let incomplete_err = Error::Unassessable {
                 detail: msg,
                 source: None,
             };
             return match group_result {
                 Ok(()) => Err(incomplete_err),
-                Err(group_err) => Err(combine_group_errors(incomplete_err, group_err)),
+                Err(group_err) => Err(group_err.with_peers([std::sync::Arc::new(incomplete_err)])),
             };
         }
         group_result
@@ -1771,16 +1758,11 @@ impl Marker {
     /// signal (almost always the credential-changing `exec` the module docs name), not the
     /// documented `close(fd)` escape. `holders()`'s own aggregate-only denial logging does not
     /// apply here for exactly that reason: this pid is not an arbitrary host process, it is a
-    /// confirmed candidate, so a denial here is worth a `warn!` on its own.
+    /// confirmed candidate, so a denial here is a [`KillOutcome::NotAttempted`], warned of here.
     ///
-    /// Returns `true` iff this identity was left unsignalled for a reason that means teardown
-    /// may be incomplete — `KillOutcome::NotAttempted` OR a `Denied` re-check — which the
-    /// caller folds into `incomplete`. `false` covers every other outcome: a confirmed
-    /// non-holder (not incomplete, just resolved), or a signal that was actually attempted
-    /// (delivered, or already gone, which `kill_by_identity` treats as success).
-    ///
-    /// Only a delivered `SIGKILL` adds `id` to `killed`, the members the kill's wait waits for.
-    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal, killed: &mut Vec<ProcessId>) -> bool {
+    /// Returns the outcome of the kill for the caller to fold ([`SweepState::record`]), or `None` for a
+    /// confirmed non-holder (nothing to fold: not incomplete, just resolved).
+    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal) -> Option<KillOutcome> {
         match holds_marker_query(id.pid(), self.handle) {
             MarkerQuery::NotHeld => {
                 log::debug!(
@@ -1788,20 +1770,19 @@ impl Marker {
                     self.handle,
                     id.pid()
                 );
-                false
+                None
             }
             MarkerQuery::Denied => {
-                log::warn!(
-                    "fd marker {:#x}: pid {} (a confirmed holder this pass) could not be \
-                     re-queried before signalling (access denied?) - not signaled, left \
-                     running",
+                let detail = format!(
+                    "fd marker {:#x}: pid {} (a confirmed holder this pass) could not be re-queried before \
+                     signalling (access denied?)",
                     self.handle,
                     id.pid()
                 );
-                true
+                log::warn!("{detail} - not signalled, left running");
+                Some(KillOutcome::NotAttempted(Error::Unassessable { detail, source: None }))
             }
             MarkerQuery::Held => {
-                use crate::containment::treewalk::KillOutcome;
                 let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
                 crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
                 // From the outcome, after the call: a kill that re-verified a different process, or
@@ -1810,10 +1791,7 @@ impl Marker {
                 if matches!(outcome, KillOutcome::Terminated) {
                     fault::note_holder_kill(id.pid(), signal);
                 }
-                if matches!(outcome, KillOutcome::Terminated) && signal == nix::sys::signal::Signal::SIGKILL {
-                    killed.push(id);
-                }
-                matches!(outcome, KillOutcome::NotAttempted(_))
+                Some(outcome)
             }
         }
     }

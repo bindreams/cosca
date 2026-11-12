@@ -202,7 +202,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 tree_failure.as_deref(),
             )),
             crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-            gate => child.kill_sent_gated("kill", gate),
+            gate => child.kill_sent_gated(gate),
         };
         match root {
             Ok(crate::signal::Sent::Gone) if exited_front => (
@@ -302,12 +302,13 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 let added = format!("; on the drop's tree kill, made early, {}", kind.unvouched_text());
                 Some((added.clone(), added, Ok(outcome)))
             }
-            // The note is returned (Display); the warn is only logged (every member's chain).
-            Err(again) => Some((
-                format!("; the drop's tree kill, made early, failed too ({again})"),
-                format!("; the drop's tree kill, made early, failed too ({})", again.log_text()),
-                Err(again),
-            )),
+            Err(again) => {
+                let added = format!(
+                    "; the drop's tree kill, made early, failed too ({})",
+                    crate::error::Report(&again)
+                );
+                Some((added.clone(), added, Err(again)))
+            }
         };
         if let Some((added, added_warned, again)) = more {
             tree_note.push_str(&added);
@@ -420,7 +421,7 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 
 /// Report a failed password write's tree teardown, for both `finish_elevated` variants: the note
 /// for the error's `detail`, and the text the cleanup's one `warn` carries (the tree and the root
-/// are one event). `subject` names the tree, because the teardown error itself may not (see
+/// are one event). `subject` names the tree, because not every report carries a kill's error (see
 /// `Tree::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok(Killed))`: the
@@ -428,16 +429,19 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
 /// caller's). None of these is reported here. `Some(Ok(Unvouched { kind }))`: reported as `kind` says.
 #[cfg(unix)]
 pub(crate) fn report_tree_teardown(
-    tree: Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
+    tree: Option<Result<crate::containment::dispatch::SettleOutcome, Error>>,
     subject: &dyn std::fmt::Display,
 ) -> (String, Option<String>) {
     use crate::containment::dispatch::SettleOutcome;
 
     match tree {
-        Some(Err(e)) => (
-            format!("; its contained tree could not be killed ({subject}: {e})"),
-            Some(tree_teardown_warn(subject, &e.log_text())),
-        ),
+        Some(Err(e)) => {
+            let report = crate::error::Report(&e).to_string();
+            (
+                format!("; its contained tree could not be killed ({subject}: {report})"),
+                Some(tree_teardown_warn(subject, &report)),
+            )
+        }
         Some(Ok(SettleOutcome::Unvouched { kind })) => {
             let text = kind.unvouched_text();
             (
@@ -455,7 +459,7 @@ pub(crate) fn report_tree_teardown(
 /// once. A kill that left members, or was skipped and killed nothing, has another to try.
 #[cfg(unix)]
 pub(crate) fn tree_needs_another_kill(
-    tree: &Option<Result<crate::containment::dispatch::SettleOutcome, crate::containment::dispatch::Unsettled>>,
+    tree: &Option<Result<crate::containment::dispatch::SettleOutcome, Error>>,
 ) -> bool {
     use crate::containment::dispatch::SettleOutcome;
 
@@ -1236,7 +1240,7 @@ impl LateTree {
         let mut succeeded_after = false;
         for sweep in self.sweeps.drain(..) {
             match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {
-                (Err(left), None) => failed = Some(left.log_text()),
+                (Err(left), None) => failed = Some(crate::error::Report(&left).to_string()),
                 (Err(_), Some(_)) => succeeded_after = false,
                 (Ok(()), failed) => succeeded_after = failed.is_some(),
             }

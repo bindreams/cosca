@@ -66,6 +66,21 @@ fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _
     }
 }
 
+/// A `pgid <= 0` refusal is a terminate that sent nothing: the tree call ends with it, with no grace.
+///
+/// Mutant: the refusal is a `Sent { result: Err(..) }`, which `graceful_shutdown_tree` holds for.
+#[skuld::test]
+fn term_group_tree_of_a_non_positive_pgid_says_nothing_was_sent(#[fixture(stray_signal)] _stray: &Group) {
+    for pgid in [0, -1, i32::MIN] {
+        match super::term_group_tree(pgid, Some(&StatedRoot::unreaped())) {
+            crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
+                source: None, ..
+            }) => {}
+            other => panic!("pgid {pgid}: expected NotSent(Unassessable), got {other:?}"),
+        }
+    }
+}
+
 /// kill_group on a real owned process group succeeds, and really did kill it.
 #[skuld::test]
 fn kill_group_on_owned_group_succeeds() {
@@ -498,4 +513,111 @@ fn a_skip_over_an_untrusted_root_with_a_context_error_keeps_its_os_code() {
         .expect_err("a skipped call is no success");
 
     assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM), "{answer:?}");
+}
+
+// What a group that was not cleared answers =====
+
+/// A member's cause: the OS error `code`.
+fn member_cause(code: i32) -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+/// The members of the `Several` an error holds as its `source`, as `(pid named, OS code)`.
+fn members_below(error: &crate::error::Error) -> Vec<(String, Option<i32>)> {
+    use std::error::Error as _;
+    let source = error.source().and_then(|s| s.downcast_ref::<crate::error::Error>());
+    let Some(crate::error::Error::Several(list)) = source else {
+        panic!("expected a Several below the variant: {error:?}");
+    };
+    list.iter()
+        .map(|member| (member.to_string(), crate::error::first_os_code(&**member)))
+        .collect()
+}
+
+/// A group with refusers and unassessable members answers `Containment`, with each member's own
+/// cause as a member of the `Several` below it, the refusers first, and none of their words in the
+/// detail.
+///
+/// Mutants: the members are reduced to a list of pids; the unassessable members are dropped when a
+/// refuser settles the verdict; a cause is put in the detail.
+#[skuld::test]
+fn a_group_with_refusers_answers_containment_with_every_members_cause() {
+    use super::group::GroupState;
+    use crate::error::Error;
+
+    let answer = super::answer_of(
+        GroupState::Refused {
+            refused: vec![(7, member_cause(libc::EPERM)), (8, member_cause(libc::EACCES))],
+            unassessable: vec![(9, member_cause(libc::EIO))],
+        },
+        42,
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect_err("the group was not cleared");
+
+    let Error::Containment { detail, .. } = &answer else {
+        panic!("{answer:?}");
+    };
+    assert!(detail.contains("SIGKILL") && detail.contains("42"), "{detail}");
+    assert!(
+        !detail.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+        "{detail}"
+    );
+    let members = members_below(&answer);
+    let codes: Vec<_> = members.iter().map(|(_, code)| *code).collect();
+    assert_eq!(codes, [Some(libc::EPERM), Some(libc::EACCES), Some(libc::EIO)]);
+    for ((said, _), pid) in members.iter().zip([7, 8, 9]) {
+        assert!(said.contains(&format!("pid {pid}")), "{said}");
+    }
+}
+
+/// One member that refused is the whole cause: no list of one.
+#[skuld::test]
+fn a_group_with_one_refuser_has_that_member_as_its_cause() {
+    use super::group::GroupState;
+    use crate::error::Error;
+    use std::error::Error as _;
+
+    let answer = super::answer_of(
+        GroupState::Refused {
+            refused: vec![(7, member_cause(libc::EPERM))],
+            unassessable: vec![],
+        },
+        42,
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect_err("the group was not cleared");
+
+    let source = answer.source().and_then(|s| s.downcast_ref::<Error>());
+    assert!(
+        matches!(source, Some(Error::Containment { detail, .. }) if detail.contains("pid 7")),
+        "{answer:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM));
+}
+
+/// A group whose members could only not be assessed answers `Unassessable`, with each member's cause.
+#[skuld::test]
+fn a_group_with_only_unassessable_members_answers_unassessable_with_every_cause() {
+    use super::group::GroupState;
+    use crate::error::Error;
+
+    let answer = super::answer_of(
+        GroupState::Unassessed {
+            members: vec![(5, member_cause(libc::EIO)), (6, member_cause(libc::EACCES))],
+        },
+        42,
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect_err("the group was not cleared");
+
+    let Error::Unassessable { detail, .. } = &answer else {
+        panic!("{answer:?}");
+    };
+    assert!(
+        !detail.contains(&std::io::Error::from_raw_os_error(libc::EIO).to_string()),
+        "{detail}"
+    );
+    let codes: Vec<_> = members_below(&answer).iter().map(|(_, code)| *code).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EACCES)]);
 }

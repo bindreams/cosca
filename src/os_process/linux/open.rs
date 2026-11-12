@@ -232,24 +232,23 @@ fn view_unreadable(id: ProcessId, why: ViewUnreadable, pidfd_errno: Option<rusti
     }
 }
 
-/// [`Error::Unassessable`] for `id`. `source()` is the OS error behind `why`,
-/// else the `pidfd_open` errno. When both exist, the message names the errno's call.
+/// [`Error::Unassessable`] for `id`. `source()` is the OS error behind `why` and the `pidfd_open`
+/// errno, whichever exist: both, the view's first, as an [`Error::Several`].
 fn unassessable(
     id: ProcessId,
     why: &str,
     source: Option<std::io::Error>,
     pidfd_errno: Option<rustix::io::Errno>,
 ) -> Error {
-    let mut detail = format!("pid {} identity could not be confirmed: {why}", id.pid());
-    if let (Some(_), Some(errno)) = (&source, pidfd_errno) {
-        detail.push_str(&format!(" (pidfd_open: {errno})"));
-    }
-    detail.push_str(&format!("; {OPEN_CONSEQUENCE}"));
+    let causes = source
+        .into_iter()
+        .chain(pidfd_errno.map(|errno| crate::error::io_context("pidfd_open", std::io::Error::from(errno))));
     Error::Unassessable {
-        detail,
-        source: source
-            .or_else(|| pidfd_errno.map(|errno| crate::error::io_context("pidfd_open", std::io::Error::from(errno))))
-            .map(Error::io_cause),
+        detail: format!(
+            "pid {} identity could not be confirmed: {why}; {OPEN_CONSEQUENCE}",
+            id.pid()
+        ),
+        source: crate::error::Failures::collect(causes.map(Error::io_cause)).map(crate::error::Failures::into_cause),
     }
 }
 

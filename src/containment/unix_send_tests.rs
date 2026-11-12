@@ -146,6 +146,30 @@ fn a_failed_check_sends_nothing_by_the_group_number() {
     assert!(status.success(), "nothing killed the leader: {status:?}");
 }
 
+/// A terminate whose check fails sent nothing, and the answer says so: the call ends with the error.
+///
+/// Mutant: the failed check is a `Sent` outcome whose result is an error.
+#[skuld::test]
+fn a_terminate_whose_check_fails_says_nothing_was_sent() {
+    let (mut child, stdin, _) = group_of_three();
+    let pgid = child.id() as i32;
+    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
+    let capture = crate::send_log::Capture::start();
+    let sent = super::term_group_sent(pgid, Some(&root));
+    let steps = capture.group_steps();
+
+    assert_eq!(steps, [GroupStep::Check], "nothing was sent");
+    match sent {
+        Err(crate::error::Error::Unassessable { detail, source: None }) => {
+            assert!(detail.contains("was reaped elsewhere"), "{detail}");
+        }
+        other => panic!("expected NotSent(Unassessable), got {other:?}"),
+    }
+    drop(stdin);
+    let status = child.wait().expect("the leader exits once its stdin closes");
+    assert!(status.success(), "nothing signalled the leader: {status:?}");
+}
+
 /// Linux 6.9+: the group's send goes through the root's pidfd, which names the group exactly, and
 /// nothing goes by its number. Mutant: "always `killpg`".
 #[cfg(target_os = "linux")]
@@ -295,8 +319,13 @@ fn a_member_probe_is_a_recorded_send() {
         );
     }
     match result {
-        Err(crate::error::Error::Containment { detail, .. }) => {
-            assert!(members.iter().all(|m| detail.contains(&m.to_string())), "{detail}");
+        Err(error @ crate::error::Error::Containment { .. }) => {
+            // Each member refused is named below the error, with its own cause.
+            let said = crate::error::Report(&error).to_string();
+            assert!(
+                members.iter().all(|m| said.contains(&format!("pid {m}: refused"))),
+                "{said}"
+            );
         }
         other => panic!("the refused probes leave the members refused, got {other:?}"),
     }

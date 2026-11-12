@@ -1023,13 +1023,14 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
     let err = leaf
         .hard_kill()
         .expect_err("a refused cgroup.kill write must not read as success");
-    // Unwrapped: a message wrapper would erase `raw_os_error()` from the public `kill_tree()`
-    // error, and several errnos share one `ErrorKind`.
-    let crate::error::Error::Io(io) = &err else {
-        panic!("a refused cgroup.kill write must surface as Error::Io, got {err:?}");
-    };
+    // A `Containment` over the kernel's error, not a bare `Io`: a kill that can have peers returns a
+    // variant with a `source`. The errno stays down the chain, and several errnos share one `ErrorKind`.
+    assert!(
+        matches!(&err, crate::error::Error::Containment { source: Some(_), .. }),
+        "a refused cgroup.kill write must surface as Error::Containment over the OS error, got {err:?}"
+    );
     assert_eq!(
-        io.raw_os_error(),
+        crate::error::first_os_code(&err),
         Some(libc::EISDIR),
         "the kernel's errno must reach the caller, got {err}"
     );
@@ -1076,6 +1077,7 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
         "/nonexistent/cosca-terminate-already-gone",
     ));
     leaf.terminate()
+        .expect("an already-removed leaf lists no member")
         .expect("an already-removed leaf has no member left to signal");
 
     let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
@@ -1324,7 +1326,9 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak(#[fix
         .expect("the member reports that it ignores SIGTERM");
     leaf.disarm();
     crate::containment::cgroup::fault::take_member_terms();
-    leaf.terminate().expect("terminate the leaf");
+    leaf.terminate()
+        .expect("cgroup.procs is readable")
+        .expect("terminate the leaf");
     assert_eq!(
         crate::containment::cgroup::fault::take_member_terms(),
         [(Some(pid), crate::send_log::Via::Pidfd, libc::SIGTERM)],
@@ -3205,7 +3209,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
         )),
         Unsignalled::SendFailed => Box::new(fail_terminate(TerminateStep::Send, libc::EIO)),
     };
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     drop(guard);
     // No send was made, so none is noted, a refused one included.
     assert_eq!(take_member_terms(), []);
@@ -3215,11 +3219,11 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     drop(leaf);
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
     let err = result.expect_err("a member got no SIGTERM");
+    // The error names the leaf; the member below it names its pid.
     let detail = err.to_string();
-    assert!(
-        detail.contains(&leaf_name) && detail.contains(&format!("pid {pid}")),
-        "{detail}"
-    );
+    assert!(detail.contains(&leaf_name), "{detail}");
+    let reported = crate::error::Report(&err).to_string();
+    assert!(reported.contains(&format!("pid {pid}")), "{reported}");
     match how {
         Unsignalled::SendFailed => assert!(matches!(err, crate::error::Error::Containment { .. }), "{err:?}"),
         _ => assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}"),
@@ -3275,7 +3279,7 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
         crate::child::front_cgroup_tests::move_out_of_its_leaf(pid);
     });
     crate::containment::cgroup::fault::take_member_terms();
-    leaf.terminate().expect("terminate");
+    leaf.terminate().expect("cgroup.procs is readable").expect("terminate");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
     drop(stdin);
     let status = member.wait().expect("reap the member");
@@ -3293,7 +3297,7 @@ fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group
     let (leaf, mut member, stdin) = entered_real_leaf();
     let pid = member.id();
     crate::containment::cgroup::fault::take_member_terms();
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     let noted = crate::containment::cgroup::fault::take_member_terms();
     drop(stdin);
     let status = member.wait().expect("reap the member");
@@ -3330,7 +3334,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgrou
     });
     crate::containment::cgroup::fault::take_member_terms();
     let mark = crate::log_capture::mark();
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     let gone = crate::log_capture::records_since_on_current_thread(mark, "exited before it was placed");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
@@ -3362,7 +3366,7 @@ fn cgroup_terminate_signals_a_member_when_the_leafs_id_cannot_be_read(#[fixture(
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
     crate::containment::cgroup::fault::take_member_terms();
     let mark = crate::log_capture::mark();
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     let noted = crate::containment::cgroup::fault::take_member_terms();
     let records = crate::log_capture::records_since_on_current_thread(mark, &leaf_name);
     drop(stdin);
@@ -3484,12 +3488,14 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
         "the member after the 0 is signalled: {status:?}"
     );
     match result {
-        Err(crate::error::Error::Unassessable { detail, .. }) => {
-            assert!(detail.contains("pid 0: "), "{detail}");
-            assert!(detail.contains("pid namespace"), "{detail}");
+        // The one member that got no SIGTERM is the call's `source`, with its pid in its own words.
+        Err(error @ crate::error::Error::Unassessable { .. }) => {
+            let said = crate::error::Report(&error).to_string();
+            assert!(said.contains("pid 0: "), "{said}");
+            assert!(said.contains("pid namespace"), "{said}");
             assert!(
-                !detail.contains(&format!("pid {pid}:")),
-                "the signalled member is not reported: {detail}"
+                !said.contains(&format!("pid {pid}:")),
+                "the signalled member is not reported: {said}"
             );
         }
         other => panic!("a listed pid 0 was not signalled: expected Unassessable, got {other:?}"),
@@ -3512,6 +3518,49 @@ fn cgroup_terminate_reports_a_leaf_listing_only_pid_zero(#[fixture(cgroup)] _gro
     );
 }
 
+/// Listed members that got no `SIGTERM` are each a member of the `Several` below the error, in the
+/// order of the listing, each with its own cause; the error's own words count them and carry no
+/// member's pid or cause. Unprivileged: no member is real, as the pin is refused by a fault.
+///
+/// Mutants: the causes are folded into the detail; only one cause is kept when there are several; the
+/// members with no cause of their own are dropped.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn terminate_of_several_members_it_could_not_signal_keeps_every_cause_below_the_error() {
+    use crate::containment::cgroup::fault::{fail_terminate, TerminateStep};
+    use crate::error::Error;
+    let _pin = fail_terminate(TerminateStep::Pin, libc::EMFILE);
+
+    let result = crate::containment::cgroup::CgroupLeaf::placeholder_for_test()
+        .terminate_listed("0\nnot-a-pid\n4000001\n4000002\n");
+
+    let err = result.expect_err("no member got a SIGTERM");
+    let Error::Unassessable {
+        detail,
+        source: Some(source),
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    assert!(detail.contains("4 could not be shown to be members"), "{detail}");
+    assert!(
+        !detail.contains("pid 4000001") && !detail.contains("os error"),
+        "{detail}"
+    );
+    let Error::Several(members) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let said: Vec<_> = members.iter().map(|m| m.to_string()).collect();
+    assert!(said[0].contains("pid 0"), "{said:?}");
+    assert!(said[1].contains("not-a-pid"), "{said:?}");
+    assert!(
+        said[2].contains("pid 4000001") && said[3].contains("pid 4000002"),
+        "{said:?}"
+    );
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(&**m)).collect();
+    assert_eq!(codes, [None, None, Some(libc::EMFILE), Some(libc::EMFILE)]);
+}
+
 /// A member shown to be in the leaf whose exit then cannot be read got no `SIGTERM`, and the error
 /// says its exit could not be read, not that it could not be placed. Mutant: "a failed exit read is
 /// folded into the placement failure".
@@ -3528,7 +3577,7 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     take_member_terms();
     let mark = crate::log_capture::mark();
     let guard = fail_terminate(TerminateStep::Exited, libc::EIO);
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     drop(guard);
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
@@ -3538,15 +3587,15 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
     assert_eq!(noted, []);
     let err = result.expect_err("a member got no SIGTERM");
-    let detail = match &err {
-        crate::error::Error::Unassessable { detail, .. } => detail,
-        other => panic!("expected Unassessable, got {other:?}"),
+    let crate::error::Error::Unassessable { .. } = &err else {
+        panic!("expected Unassessable, got {err:?}");
     };
+    let reported = crate::error::Report(&err).to_string();
     assert!(
-        detail.contains(&format!("pid {pid}: its exit could not be read")),
-        "{detail}"
+        reported.contains(&format!("pid {pid}: its exit could not be read")),
+        "{reported}"
     );
-    assert!(!detail.contains("could not be placed"), "{detail}");
+    assert!(!reported.contains("could not be placed"), "{reported}");
     // The failed read is the source, with its code.
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -3568,7 +3617,7 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
         crate::containment::cgroup::fault::hide_proc(),
         fail_terminate(TerminateStep::Exited, libc::EIO),
     );
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     drop(guard);
     let noted = take_member_terms();
     drop(stdin);
@@ -3577,13 +3626,15 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
     assert_eq!(noted, []);
     let err = result.expect_err("a member got no SIGTERM");
-    let detail = match &err {
-        crate::error::Error::Unassessable { detail, .. } => detail,
-        other => panic!("expected Unassessable, got {other:?}"),
+    let crate::error::Error::Unassessable { .. } = &err else {
+        panic!("expected Unassessable, got {err:?}");
     };
-    assert!(detail.contains("could not be placed"), "{detail}");
     let rendered = crate::error::Report(&err).to_string();
-    assert!(rendered.contains("its placement could not be read"), "{rendered}");
+    assert!(rendered.contains("could not be placed"), "{rendered}");
+    assert!(
+        rendered.contains("its placement and its exit could not be read"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("its exit could not be read") && rendered.contains("(os error 5)"),
         "the failed exit read is in the report too: {rendered}"
@@ -3626,26 +3677,24 @@ fn a_failed_placement_whose_exit_read_fails_too_keeps_its_os_code_as_the_source(
     };
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
     let own = err.to_string();
-    assert!(own.contains("its placement could not be read"), "{own}");
+    assert!(own.contains("its placement and its exit could not be read"), "{own}");
     assert!(!own.contains("process containment failed"), "{own}");
     assert!(
-        !own.contains("(os error 5)"),
-        "the placement's error is the source, not in the error's own text: {own}"
+        !own.contains("(os error"),
+        "both errors are below the error, not in its own text: {own}"
     );
-    let rendered = crate::error::Report(&err).to_string();
-    let (exit, placement) = (
-        rendered.find("its exit could not be read (").expect(&rendered),
-        rendered.find(", and its placement could not be read").expect(&rendered),
-    );
-    assert!(exit < placement, "the report reads in cause order: {rendered}");
-    assert!(
-        rendered.contains("(os error 9)") && rendered[..placement].contains("(os error 9)"),
-        "the exit read's failure is named in the first clause: {rendered}"
-    );
-    assert!(
-        rendered[placement..].contains("(os error 5)"),
-        "the placement's own error ends the report: {rendered}"
-    );
+    // Both failures are kept whole, the placement's first.
+    let crate::error::Error::Unassessable {
+        source: Some(source), ..
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    let crate::error::Error::Several(both) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = both.iter().map(|e| crate::error::first_os_code(&**e)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EBADF)]);
 }
 
 /// A member whose placement fails while it is alive got no `SIGTERM`, and the message names the OS's
@@ -3680,11 +3729,16 @@ fn a_member_whose_placement_fails_is_named_with_the_os_text_once() {
     let Err(super::Unsignalled::Unproven(unsent)) = result else {
         panic!("a placement that failed on a live member is unproven");
     };
-    // The error is the cause, named once, and not in the words.
-    assert_eq!(unsent.words.matches("(os error 5)").count(), 0, "{}", unsent.words);
-    let cause = unsent
-        .cause
-        .expect("a placement that failed has its error as the cause");
+    // The error is the cause, named once, and not in the member's own words.
+    let crate::error::Error::Unassessable {
+        detail,
+        source: Some(cause),
+    } = &unsent
+    else {
+        panic!("a member that could not be placed is an Unassessable with its cause: {unsent:?}");
+    };
+    assert_eq!(detail.matches("(os error 5)").count(), 0, "{detail}");
+    assert!(detail.contains(&format!("pid {}", child.id())), "{detail}");
     let message = cause.to_string();
     assert_eq!(message.matches("(os error 5)").count(), 1, "{message}");
 }
@@ -3761,7 +3815,7 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
     take_member_terms();
     let mark = crate::log_capture::mark();
     let guard = fail_terminate(TerminateStep::Send, libc::ESRCH);
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     drop(guard);
     let noted = take_member_terms();
     let exited =
@@ -3800,7 +3854,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone_through_proc(#[
     crate::containment::cgroup::fault::take_member_terms();
     let _no_info = crate::containment::cgroup::fault::miss_pidfd_info();
     let mark = crate::log_capture::mark();
-    let result = leaf.terminate();
+    let result = leaf.terminate().expect("cgroup.procs is readable");
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     let gone =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} exited before it was placed"));
@@ -3848,18 +3902,19 @@ fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group
         statuses[1]
     );
     assert_eq!(noted, [(Some(pids[1]), crate::send_log::Via::Pidfd, libc::SIGTERM)]);
-    let detail = match result {
-        Err(crate::error::Error::Unassessable { detail, .. }) => detail,
+    let said = match result {
+        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::Report(&error).to_string(),
         other => panic!("expected Unassessable, got {other:?}"),
     };
-    assert!(detail.contains(&format!("pid {}:", pids[0])), "{detail}");
-    assert!(!detail.contains(&format!("pid {}:", pids[1])), "{detail}");
+    assert!(said.contains(&format!("pid {}:", pids[0])), "{said}");
+    assert!(!said.contains(&format!("pid {}:", pids[1])), "{said}");
 }
 
 /// Several members that got no `SIGTERM`, of both kinds, make one error and one `warn`, naming each
-/// pid; a failed send is what makes it `Containment`. Each member's OS cause is in its words, and
-/// the call has no `source`. Mutants: "a mix of failed and unproven members is `Unassessable`", "one
-/// `warn` per member", "only the first member of a kind is named", "a member's cause is dropped".
+/// pid; a failed send is what makes it `Containment`. Each member is an error of its own below the
+/// call, with its OS cause, the failed sends first, and none of them is in the call's detail.
+/// Mutants: "a mix of failed and unproven members is `Unassessable`", "one `warn` per member",
+/// "only the first member of a kind is named", "a member's cause is dropped".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_warn(#[fixture(cgroup)] _group: &Group) {
@@ -3886,27 +3941,28 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
         Err(crate::error::Error::Containment { detail, source }) => (detail, source),
         other => panic!("a failed send makes the call Containment, got {other:?}"),
     };
-    // Two members each have a cause: neither is the call's one, so each says its own in the text and
-    // the call has no `source`.
-    assert!(source.is_none(), "{source:?}");
-    for pid in &pids {
-        let member = detail
-            .split("; ")
-            .find(|segment| segment.contains(&format!("pid {pid}:")))
-            .unwrap_or_else(|| panic!("pid {pid} is not named: {detail}"));
-        assert!(
-            member.contains("(os error 5)"),
-            "pid {pid}'s cause is not in its words: {detail}"
-        );
-    }
-    for needle in [
-        "pid 0:".to_owned(),
-        format!("pid {}:", pids[0]),
-        format!("pid {}:", pids[1]),
-    ] {
-        assert!(detail.contains(&needle), "{needle} is not named: {detail}");
-    }
+    // Three members: the two failed sends first, then the unproven pid 0, each below the call.
+    assert!(
+        !detail.contains("pid 0:") && !detail.contains("os error"),
+        "no member's words are in the detail: {detail}"
+    );
     assert!(detail.contains("failed for 2"), "{detail}");
+    let Some(source) = source else {
+        panic!("the members are the call's source");
+    };
+    let crate::error::Error::Several(members) = &*source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let said: Vec<_> = members.iter().map(|m| m.to_string()).collect();
+    assert_eq!(said.len(), 3, "{said:?}");
+    for (member, pid) in said
+        .iter()
+        .zip([pids[0].to_string(), pids[1].to_string(), "0".to_owned()])
+    {
+        assert!(member.contains(&format!("pid {pid}:")), "{pid}: {said:?}");
+    }
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(&**m)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EIO), None]);
     assert_eq!(warns.len(), 1, "{warns:?}");
     for needle in [format!("pid {}:", pids[0]), format!("pid {}:", pids[1])] {
         assert!(warns[0].contains(&needle), "{needle} is not named: {warns:?}");
@@ -3926,10 +3982,10 @@ fn cgroup_terminate_reports_a_listed_line_that_is_no_pid(#[fixture(cgroup)] _gro
     let result = leaf.terminate_listed("abc\n");
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(leaf);
-    let detail = match result {
-        Err(crate::error::Error::Unassessable { detail, .. }) => detail,
+    let said = match result {
+        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::Report(&error).to_string(),
         other => panic!("expected Unassessable, got {other:?}"),
     };
-    assert!(detail.contains("\"abc\""), "{detail}");
+    assert!(said.contains("\"abc\""), "{said}");
     assert_eq!(warns.len(), 1, "{warns:?}");
 }

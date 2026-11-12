@@ -1466,6 +1466,26 @@ fn hard_kill_failure_carries_the_win32_code() {
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
 
+/// A tree kill whose `TerminateJobObject` fails is an `Error::Containment` over the Win32 error: a
+/// kill that can have peers returns a variant with a `source`, and the code stays down the chain.
+///
+/// Mutant: the failed kill is a bare `Error::Io`.
+#[skuld::test]
+fn a_failed_job_kill_is_a_containment_over_the_win32_error() {
+    use crate::containment::Contains as _;
+    let h = super::JobHandle::new(event_handle());
+    let left = h.send_kill(None).into_result().expect_err("an event is not a job");
+    let [error] = &left.members[..] else {
+        panic!("{left:?}");
+    };
+    assert!(matches!(error, crate::error::Error::Containment { .. }), "{error:?}");
+    assert_eq!(
+        crate::error::first_os_code(error),
+        Some(ERROR_INVALID_HANDLE),
+        "{error:?}"
+    );
+}
+
 /// A `CreateJobObjectW` failure carries the plain Win32 code. The call cannot be made to fail, so
 /// the failure is injected at `owned_job`.
 ///

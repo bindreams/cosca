@@ -250,7 +250,10 @@ impl crate::containment::Contains for JobHandle {
         use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
         TreeKillOutcome::Ran(
             self.hard_kill()
-                .map_err(crate::error::Error::Io)
+                .map_err(|e| crate::error::Error::Containment {
+                    detail: "TerminateJobObject could not terminate the job".to_owned(),
+                    source: Some(crate::error::Error::io_cause(e)),
+                })
                 .map_err(Unkilled::from),
         )
     }
@@ -262,10 +265,8 @@ impl crate::containment::Contains for JobHandle {
         pid: u32,
         _root: Option<&dyn crate::containment::Root>,
     ) -> crate::containment::TerminateOutcome {
-        crate::containment::TerminateOutcome::Sent {
-            result: terminate(pid),
-            earlier: Some("the SIGTERM"),
-        }
+        // One event, so an error is an event that was not sent (`NoConsole` or the OS's refusal).
+        crate::containment::TerminateOutcome::of(terminate(pid).map(Ok), Some("the SIGTERM"))
     }
 
     fn drain_edge(&self) -> Option<crate::containment::drain_edge::DrainEdge<'_>> {

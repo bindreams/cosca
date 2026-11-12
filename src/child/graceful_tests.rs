@@ -443,26 +443,27 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     let _ = id;
 }
 
-// `Error::Unassessable { source: Some(_), .. }` — group::state's OWN listing failed, no
-// signal was ever attempted — must fail fast, the SAME disposition
-// `crate::containment::fdmarker::is_teardown_mechanism_failure` gives the identical error shape reaching
-// `Child::drop`. Regression test: folding this shape into the same hold-and-continue arm as
-// the ordinary per-member case would silently disagree with the classifier for the same
-// underlying error.
+// A failed check after the signal went out, whatever its variant, holds like a refusal does: the
+// grace is waited and the sweep runs. Here the `Unassessable` carries a `source`, as a failed
+// listing of a process group's members does after the `killpg`.
 #[skuld::test]
-fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
-    let (mut child, stdin) = blocker();
+fn graceful_tree_unassessable_with_a_source_still_sweeps_and_reaps() {
+    let (child, stdin) = kill_only_blocker();
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
-    let err = child
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+    let status = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
-        .expect_err("the forced listing-mechanism failure must surface immediately");
-    assert!(
-        matches!(err, crate::error::Error::Unassessable { source: Some(_), .. }),
-        "got {err:?}"
+        .expect("a successful sweep must supersede the forced check failure");
+    crate::test_child::assert_killed("the root", status);
+    #[cfg(unix)]
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Gone,
+        "root must be swept AND reaped despite the forced check failure"
     );
-    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
-    assert_still_running(&mut child, stdin);
-    cleanup(&mut child);
+    #[cfg(windows)]
+    let _ = id;
 }
 
 // The invariant under test: only an AUTHORITATIVE drain-observable mechanism (cgroup v2, Windows
@@ -723,6 +724,30 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(#
     });
 }
 
+/// A cgroup leaf whose only listed member could not be shown to be in it got no `SIGTERM`, and the
+/// call's answer is an `Unassessable` with a `source`. Nothing proves the send did not go out for the
+/// others, so it holds like any failed check: the grace is waited and the sweep's `cgroup.kill` ends
+/// the tree.
+///
+/// Mutant: a failed `terminate` whose `Unassessable` has one cause returns at once.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_tree_with_only_unprovable_members_still_sweeps_in_a_cgroup(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault::{fail_terminate_once, TerminateStep};
+    let (child, stdin) = kill_only_blocker();
+    assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let _pin = fail_terminate_once(TerminateStep::Pin, libc::EMFILE);
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect("the sweep ends the tree the unprovable member left");
+
+    crate::test_child::assert_killed("the root", status);
+    assert_eq!(id.exists(), crate::identity::Existence::Gone, "the root is reaped");
+}
+
 /// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
 /// number its own while the call runs.
 #[cfg(unix)]
@@ -776,7 +801,7 @@ fn graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_r
         .graceful_shutdown_tree(Duration::from_millis(200))
         .expect_err("a descendant was left");
 
-    assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+    assert!(matches!(err, crate::error::Error::MembersLeft { .. }), "{err:?}");
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Gone,
@@ -912,12 +937,10 @@ fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_an
     child.wait().expect("reap the root");
 }
 
-// A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held
-// -- this is the pre-existing, still-documented "no signal sent, no grace waited, tree left
-// running" contract from #46, unrelated to #61, and this task's scoping must not silently
-// rewrite it (see this task's "Scope correction" note above). `Duration::ZERO` here too: the
-// point is that the function returns before ever reaching the watch, at all, regardless of
-// the requested grace, so there is nothing to synchronize on.
+// A terminate_tree error that says nothing was sent (`NotSent`, modelling NoConsole/Unsupported)
+// is not held: no signal went out, so no grace is waited and nothing is swept, and the tree is left
+// running. `Duration::ZERO` here too: the function returns before ever reaching the watch,
+// whatever the requested grace, so there is nothing to synchronize on.
 #[skuld::test]
 fn graceful_tree_non_containment_terminate_error_fails_fast() {
     let (mut child, stdin) = blocker();
@@ -926,6 +949,65 @@ fn graceful_tree_non_containment_terminate_error_fails_fast() {
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("the forced Unsupported error must surface immediately");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
+    assert_still_running(&mut child, stdin);
+    cleanup(&mut child);
+}
+
+/// A stand-in tree in a child's place, disarmed so its drop kills nothing, and the child's own tree put
+/// back when this drops: a failing assertion cannot leave the stand-in to drop with the child, nor drop
+/// the child's own tree early (which would tear the child down).
+#[cfg(target_os = "linux")]
+struct TreeStandIn<'a> {
+    child: &'a mut crate::Child,
+    own: Option<crate::containment::Tree>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> TreeStandIn<'a> {
+    fn new(child: &'a mut crate::Child, stand_in: crate::containment::Tree) -> TreeStandIn<'a> {
+        stand_in.disarm().expect("disarm the stand-in");
+        let own = std::mem::replace(&mut child.tree, stand_in);
+        TreeStandIn { child, own: Some(own) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TreeStandIn<'_> {
+    fn drop(&mut self) {
+        if let Some(own) = self.own.take() {
+            self.child.tree = own;
+        }
+    }
+}
+
+/// A leaf whose `cgroup.procs` cannot be read listed no member, so nothing was sent: `NotSent`, which
+/// `graceful_shutdown_tree` ends the call on, with no grace waited and no sweep, so the tree is left
+/// running. Here `cgroup.procs` is a directory, which a real read of it fails on (`EISDIR`).
+///
+/// Mutant: the leaf's outer `Err` is read as a send that went out (`Sent { result: Err(..) }`), so the call
+/// holds and sweeps and the child is dead.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn graceful_tree_over_a_leaf_whose_procs_cannot_be_read_fails_fast() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unreadable-procs-leaf");
+    std::fs::create_dir_all(leaf_path.join("cgroup.procs")).expect("make cgroup.procs a directory");
+    let (mut child, stdin) = blocker();
+    let in_place = TreeStandIn::new(
+        &mut child,
+        crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
+            crate::containment::cgroup::test_support::entered_leaf_at(leaf_path),
+        )),
+    );
+
+    let err = in_place
+        .child
+        .graceful_shutdown_tree(std::time::Duration::ZERO)
+        .expect_err("a leaf that cannot list its members sent nothing");
+
+    drop(in_place);
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EISDIR), "{err:?}");
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
     assert_still_running(&mut child, stdin);
     cleanup(&mut child);
@@ -952,7 +1034,7 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
     let child = child_with(&root, fake.reaching_unobserved(4242));
     let skip = holders_only_skip(&child);
 
-    let error = child.shut_down_holders_only(&skip, std::time::Duration::ZERO);
+    let error = child.shut_down_holders_only(skip, std::time::Duration::ZERO);
 
     assert!(
         matches!(&error, crate::error::Error::Unassessable { detail, source: None }
@@ -1002,7 +1084,6 @@ fn an_echild_below_a_variant_that_is_not_io_is_not_a_root_reaped_elsewhere() {
         Error::MemberNotKilled {
             pid: 4243,
             source: echild(),
-            note: None,
         },
     ];
     for waited in waits {

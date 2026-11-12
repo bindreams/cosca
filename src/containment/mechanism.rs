@@ -3,11 +3,13 @@
 //! ([`Release`]). Its drain edge is [`DrainEdge`](crate::containment::drain_edge::DrainEdge).
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::error::Error;
 use crate::identity::ProcessId;
 
 /// What [`Contains::kill_left`] comes to.
@@ -35,6 +37,14 @@ pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> KillLeftOutcome {
     }
 }
 
+/// [`Contains::root_left`] of every mechanism but a tree walk.
+pub(crate) fn root_left_alone(root: Error) -> Error {
+    Error::Containment {
+        detail: "the kill was delivered, but the kill of the root through its handle failed".to_owned(),
+        source: Some(Arc::new(root)),
+    }
+}
+
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
 /// as a [`Mechanism`] and asks it nothing about which it is.
@@ -59,7 +69,8 @@ pub(crate) trait Contains: fmt::Debug {
     /// - A tree walk names it by parentage: `Ok` says every descendant of the root at the walk's
     ///   snapshot was killed. A process already reparented away from the root (an orphan), or one the
     ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
-    ///   running is an [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled).
+    ///   running is a [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled), and the
+    ///   `kill_tree` that returns them returns an [`Error::MembersLeft`](crate::error::Error::MembersLeft).
     fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_>;
 
     /// [`kill`](Self::kill) for a caller that waits for nothing: the kill is sent and its outcome
@@ -81,6 +92,14 @@ pub(crate) trait Contains: fmt::Debug {
         nothing_held(result)
     }
 
+    /// What a failed handle backstop, the kill of the root through its own handle, makes of a
+    /// `kill_tree`'s error when the kill left nothing else: for `root`, the root's `MemberNotKilled`,
+    /// a `MembersLeft` of it alone on a walk and an [`Error::Containment`] over it elsewhere. The
+    /// contract for every other case is stated on [`Child::kill_tree`](crate::Child::kill_tree).
+    fn root_left(&self, root: Error) -> Error {
+        root_left_alone(root)
+    }
+
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
     /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only.
     fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> TerminateOutcome;
@@ -92,8 +111,8 @@ pub(crate) trait Contains: fmt::Debug {
     /// What [`Child::containment`](crate::Child::containment) reports.
     fn kind(&self) -> Containment;
 
-    /// What names the tree in a message about its teardown: a cgroup leaf its path (a kill returns
-    /// the kernel's error unwrapped, so the error does not name it), every other mechanism what it is.
+    /// What names the tree in a message about its teardown, which carries no kill's error to name it
+    /// (an unvouched tree): a cgroup leaf its path, every other mechanism what it is.
     #[cfg(unix)]
     fn subject(&self) -> String;
 
@@ -227,6 +246,22 @@ impl Contains for Mechanism {
             Mechanism::Walk(m) => m.kill_left(result, left),
             #[cfg(test)]
             Mechanism::Fake(m) => m.kill_left(result, left),
+        }
+    }
+
+    fn root_left(&self, root: Error) -> Error {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.root_left(root),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.root_left(root),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.root_left(root),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.root_left(root),
+            Mechanism::Walk(m) => m.root_left(root),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.root_left(root),
         }
     }
 

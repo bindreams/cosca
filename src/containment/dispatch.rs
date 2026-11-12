@@ -2,9 +2,10 @@
 
 use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::{ContainMode, ContainRequest, Nesting, Skip, Tree};
-use crate::error::Error;
+use crate::error::{Error, Failures};
 #[cfg(unix)]
 use crate::signal::RootState;
+use std::sync::Arc;
 
 /// The pre-spawn containment decision produced by `prepare` (env-marker root
 /// detection plus per-OS pre-spawn setup).
@@ -461,16 +462,35 @@ impl Unkilled {
     }
 
     /// What is still left once the root's own handle has had its say: `Ok` when nothing is, else the
-    /// first member and the others as data. `root_ended`: the root is not running, so a root the walk
-    /// left is not left.
-    pub(crate) fn unsettled(self, root_ended: bool) -> Result<(), Unsettled> {
-        let mut left = self.members.into_iter().chain(self.root.filter(|_| !root_ended));
-        match left.next() {
-            None => Ok(()),
-            Some(first) => Err(Unsettled {
-                first,
-                others: left.collect(),
-            }),
+    /// error that holds every member left, in order ([`Error::MembersLeft`]), with the errors that
+    /// name no member as its `unwalked` (a [`Error::Several`] when there are two or more). With no
+    /// member, the first error that names none is the answer, in its own variant, with the others as
+    /// its peers ([`Error::with_peers`]) (see
+    /// [`Child::kill_tree`](crate::Child::kill_tree) for the contract).
+    /// `root_ended`: the root is not running, so a root the walk left is not left.
+    pub(crate) fn unsettled(self, root_ended: bool) -> Result<(), Error> {
+        let left = self.members.into_iter().chain(self.root.filter(|_| !root_ended));
+        let (mut members, mut unnamed) = (Vec::new(), Vec::new());
+        for error in left {
+            if matches!(error, Error::MemberNotKilled { .. }) {
+                members.push(Arc::new(error));
+            } else {
+                unnamed.push(error);
+            }
+        }
+        match Failures::collect(members) {
+            Some(members) => {
+                let unnamed = Failures::collect(unnamed.into_iter().map(Arc::new));
+                Err(Error::members_left(members, unnamed.map(Failures::into_cause)))
+            }
+            // No member: the first error is the answer, in its own variant, and the others its peers.
+            None => {
+                let mut unnamed = unnamed.into_iter();
+                match unnamed.next() {
+                    None => Ok(()),
+                    Some(first) => Err(first.with_peers(unnamed.map(Arc::new))),
+                }
+            }
         }
     }
 }
@@ -482,42 +502,6 @@ impl From<Error> for Unkilled {
             root: None,
             resolved: Vec::new(),
         }
-    }
-}
-
-/// What a tree kill left once the root's own death had its say ([`Tree::settle`]): the first
-/// member left, which the caller returns, and the others, as data for the caller's one report.
-#[derive(Debug)]
-pub(crate) struct Unsettled {
-    pub(crate) first: Error,
-    pub(crate) others: Vec<Error>,
-}
-
-impl Unsettled {
-    /// The error a caller returns: the first member left. The caller's one report is that error, and a
-    /// `warn`, led by `caller`, for each of the others.
-    pub(crate) fn report(self, caller: &str) -> Error {
-        for other in &self.others {
-            log::warn!("{caller}: {report}", report = crate::error::Report(other));
-        }
-        self.first
-    }
-
-    /// The text of a log line: every member, the first and then the others after `; `, each with its
-    /// whole chain. A returned text uses [`Display`](std::fmt::Display), which has no chains.
-    pub(crate) fn log_text(&self) -> String {
-        std::iter::once(&self.first)
-            .chain(&self.others)
-            .map(|member| crate::error::Report(member).to_string())
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-}
-
-impl std::fmt::Display for Unsettled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.first)?;
-        self.others.iter().try_for_each(|other| write!(f, "; {other}"))
     }
 }
 
@@ -771,7 +755,7 @@ impl TreeKillOutcome {
 
 /// A settlement's answer and the members it killed again, which the kill's wait adds to its wait
 /// ([`KillWait::reaching`](crate::containment::KillWait::reaching)).
-pub(crate) struct Settled<A = Result<SettleOutcome, Unsettled>> {
+pub(crate) struct Settled<A = Result<SettleOutcome, Error>> {
     pub(crate) answer: A,
     pub(crate) killed_again: Vec<crate::identity::ProcessId>,
 }
@@ -875,28 +859,54 @@ impl SweepFailure {
         (sent.map(drop), ended)
     }
 
-    /// The answer of a `kill_tree` sweep: the walk's error, settled by the root's death
-    /// ([`Tree::settle`]), else the backstop's. `root_ended`: the backstop ended the root. This is
-    /// the call's one report of the members the walk left: the error names the first, and each other
-    /// is warned of here. `op` names the call.
+    /// The answer of a `kill_tree` sweep: the mechanism's error, settled by the root's death
+    /// ([`Tree::settle`]), with the failure of the backstop, the handle's own kill of `root`. The
+    /// backstop is part of the kill, so its failure is a member left like the walk's; the contract is
+    /// [`Child::kill_tree`](crate::Child::kill_tree)'s. `root_ended`: the backstop ended the root.
     pub(crate) fn of(
-        op: &str,
         tree: &Tree,
         walk: TreeKillOutcome,
         backstop: Result<(), Error>,
+        root: u32,
         root_ended: bool,
     ) -> Settled<Result<(), SweepFailure>> {
-        tree.settle_for_kill_tree(op, walk, root_ended).map(|walk| {
-            if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
-                // The backstop's error is dropped: the walk's names the member left.
-                log::debug!(
-                    "{op} handle backstop also failed ({backstop_report}); surfacing the walk's error: {walk_report}",
-                    backstop_report = crate::error::Report(backstop),
-                    walk_report = crate::error::Report(walk)
-                );
-            }
-            walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
+        tree.settle_for_kill_tree(walk, root_ended).map(|walk| {
+            let error = match (walk, backstop) {
+                (Ok(()), Ok(())) => return Ok(()),
+                (Err(walk), Ok(())) => walk,
+                (walk, Err(backstop)) => Self::with_backstop(tree, walk.err(), backstop, root),
+            };
+            Err(SweepFailure { error, root_ended })
         })
+    }
+
+    /// What the mechanism left, `walk`, with the failed `backstop` of `root` (see [`of`](Self::of)).
+    fn with_backstop(tree: &Tree, walk: Option<Error>, backstop: Error, root: u32) -> Error {
+        let backstop = Arc::new(backstop);
+        let root_member = |source| Error::MemberNotKilled { pid: root, source };
+        match walk {
+            Some(Error::MembersLeft { members, unwalked }) => {
+                let mut root_seen = false;
+                let mut members: Vec<Arc<Error>> = members
+                    .iter()
+                    .map(|member| match &**member {
+                        Error::MemberNotKilled { pid, source } if *pid == root => {
+                            root_seen = true;
+                            Arc::new(root_member(
+                                Failures::new(Arc::clone(&backstop), [Arc::clone(source)]).into_cause(),
+                            ))
+                        }
+                        _ => Arc::clone(member),
+                    })
+                    .collect();
+                if !root_seen {
+                    members.push(Arc::new(root_member(backstop)));
+                }
+                Error::members_left(Failures::collect(members).expect("a member was left"), unwalked)
+            }
+            Some(other) => other.with_peers([Arc::new(root_member(backstop))]),
+            None => tree.root_left(root_member(backstop)),
+        }
     }
 }
 
@@ -906,8 +916,8 @@ impl TreeKilled {
     /// ([`Contains::kill_left`](crate::containment::Contains::kill_left)); the settlement records it.
     /// `mechanism`: what names the tree, `None` for a tree that is none or delegated, which holds
     /// nothing. `root_ended`: the root is not running (killed, or already dead), so a root the walk
-    /// left is not left. `Ok` when nothing is left, else the first member left as the error, the rest
-    /// as its data.
+    /// left is not left. `Ok` when nothing is left, else the error that holds every member left
+    /// ([`Unkilled::unsettled`]).
     ///
     /// It decides under the one lock of the state, by it and the outcome, and leaves the state
     /// by the rule on [`TreeState`]. The members a `TreeWalk` state holds are answered first, whatever
@@ -985,17 +995,16 @@ impl TreeKilled {
         Settled { answer, killed_again }
     }
 
-    /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
-    /// left, and each other is warned of here, once. `caller` names the call in those warns.
+    /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left, so the call
+    /// reports each of them once, in it.
     pub(crate) fn settle_for_kill_tree(
         &self,
-        caller: &str,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
         self.settle(mechanism, outcome, root_ended)
-            .map(|answer| answer.map(drop).map_err(|left| left.report(caller)))
+            .map(|answer| answer.map(drop))
     }
 
     /// `outcome` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not
@@ -1003,14 +1012,13 @@ impl TreeKilled {
     /// settled here and returned as the error with the tree intact. Any other `outcome` is handed back.
     pub(crate) fn unless_unwalked(
         &self,
-        caller: &str,
         mechanism: Option<&Mechanism>,
         outcome: TreeKillOutcome,
     ) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
         if !matches!(outcome, TreeKillOutcome::Unwalked(_)) {
             return Ok(outcome);
         }
-        let settled = self.settle_for_kill_tree(caller, mechanism, outcome, false);
+        let settled = self.settle_for_kill_tree(mechanism, outcome, false);
         Err(settled.map(|answer| match answer {
             Err(error) => SweepFailure::from(error),
             // The walk's error is a member left, and the root is not ended.
@@ -1036,7 +1044,7 @@ impl TreeKilled {
             | TreeKillOutcome::Skipped(_) => "",
         };
         let left = match self.settle(mechanism, outcome, root_ended).answer {
-            Err(left) => left.log_text(),
+            Err(left) => crate::error::Report(&left).to_string(),
             Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
         };

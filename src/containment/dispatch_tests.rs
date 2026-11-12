@@ -33,27 +33,193 @@ fn skipped_kill(action: &str, holders: Option<Result<(), crate::error::Error>>) 
     })
 }
 
-/// A log line has every member left, each with its whole chain; the returned text has no chains.
+/// Three OS codes that name three different failures on this platform.
+const CODES: [i32; 3] = if cfg!(windows) { [5, 2, 3] } else { [13, 2, 1] };
+
+/// The member `pid` that a kill left because of the OS error `code`.
+fn left_by(pid: u32, code: i32) -> crate::error::Error {
+    crate::error::Error::MemberNotKilled {
+        pid,
+        source: crate::error::Error::io_cause(std::io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// The `(pid, OS code)` of each member of a `MembersLeft`.
+fn members_of(error: &crate::error::Error) -> Vec<(u32, Option<i32>)> {
+    let crate::error::Error::MembersLeft { members, .. } = error else {
+        panic!("expected MembersLeft, got {error:?}");
+    };
+    members
+        .iter()
+        .map(|member| {
+            let crate::error::Error::MemberNotKilled { pid, .. } = &**member else {
+                panic!("a member of a MembersLeft is a MemberNotKilled: {member:?}");
+            };
+            (*pid, crate::error::first_os_code(&**member))
+        })
+        .collect()
+}
+
+/// The walk that was not made, of a `MembersLeft`.
+fn unwalked_of(error: &crate::error::Error) -> Option<&crate::error::Error> {
+    let crate::error::Error::MembersLeft { unwalked, .. } = error else {
+        panic!("expected MembersLeft, got {error:?}");
+    };
+    unwalked.as_deref()
+}
+
+/// What a tree kill left once the root had its say is one `MembersLeft` of every member, in the order
+/// the walk found them and the root last, each with its own cause. Mutants: only the first member is
+/// kept; a member's cause is put in a text; the root is listed first.
 #[skuld::test]
-fn unsettled_logs_every_member_with_its_chain() {
-    use crate::error::Error;
-    let member = |text: &str| Error::MemberNotKilled {
-        pid: 1,
-        source: std::sync::Arc::new(Error::Containment {
-            detail: text.into(),
-            source: None,
-        }),
-        note: None,
+fn what_a_kill_left_is_one_members_left_of_every_member_with_its_cause() {
+    use super::Unkilled;
+    let [a, b, c] = CODES;
+    let unkilled = || Unkilled {
+        members: vec![left_by(2, a), left_by(3, b)],
+        root: Some(left_by(1, c)),
+        resolved: Vec::new(),
     };
-    let unsettled = super::Unsettled {
-        first: member("one"),
-        others: vec![member("two"), member("three")],
-    };
+
+    let left = unkilled().unsettled(false).expect_err("members were left");
+    assert_eq!(members_of(&left), [(2, Some(a)), (3, Some(b)), (1, Some(c))]);
+    assert_eq!(crate::error::first_os_code(&left), Some(a), "the first member's code");
+
+    let left = unkilled().unsettled(true).expect_err("members were left");
     assert_eq!(
-        unsettled.log_text(),
-        "pid 1 was not killed: process containment failed: one: process containment failed: one; \
-         pid 1 was not killed: process containment failed: two: process containment failed: two; \
-         pid 1 was not killed: process containment failed: three: process containment failed: three"
+        members_of(&left),
+        [(2, Some(a)), (3, Some(b))],
+        "a root that ended is not left"
+    );
+}
+
+/// A kill that left one member is a `MembersLeft` of one, and the answer of a mechanism that is no
+/// walk (one error that names no member) is that error as it is.
+#[skuld::test]
+fn one_member_is_a_members_left_and_one_error_that_is_no_member_stays_as_it_is() {
+    use super::Unkilled;
+    use crate::error::Error;
+    let left = Unkilled::from(left_by(2, CODES[0])).unsettled(false).expect_err("left");
+    assert_eq!(members_of(&left), [(2, Some(CODES[0]))]);
+    assert!(unwalked_of(&left).is_none());
+
+    let refused = Unkilled::from(Error::Containment {
+        detail: "a member refused".into(),
+        source: None,
+    })
+    .unsettled(false)
+    .expect_err("left");
+    assert!(matches!(refused, Error::Containment { .. }), "{refused:?}");
+}
+
+/// The error of a walk that was not made, after an earlier kill left members, is the `unwalked` of
+/// the `MembersLeft`, no member of it.
+#[skuld::test]
+fn the_error_of_a_walk_not_made_is_unwalked_after_earlier_members() {
+    use super::Unkilled;
+    use crate::error::Error;
+    let unkilled = Unkilled {
+        members: vec![
+            left_by(2, CODES[0]),
+            Error::Unassessable {
+                detail: "the snapshot failed".into(),
+                source: None,
+            },
+        ],
+        root: None,
+        resolved: Vec::new(),
+    };
+
+    let left = unkilled.unsettled(false).expect_err("left");
+
+    assert_eq!(members_of(&left), [(2, Some(CODES[0]))]);
+    assert!(
+        matches!(unwalked_of(&left), Some(crate::error::Error::Unassessable { detail, .. }) if detail == "the snapshot failed"),
+        "{left:?}"
+    );
+}
+
+/// Two errors that name no member are both kept, whether or not members were left: the `unwalked` of
+/// the `MembersLeft` is a `Several` of them, and with no member the answer is that `Several`.
+///
+/// Mutant: a later error overwrites the earlier one.
+#[skuld::test]
+fn two_errors_that_name_no_member_are_both_kept() {
+    use super::Unkilled;
+    use crate::error::Error;
+    let unnamed = |detail: &str| Error::Unassessable {
+        detail: detail.into(),
+        source: None,
+    };
+    let details = |error: &Error| {
+        let Error::Several(list) = error else {
+            panic!("expected Several, got {error:?}");
+        };
+        list.iter()
+            .map(|e| match &**e {
+                Error::Unassessable { detail, .. } => detail.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let with_members = Unkilled {
+        members: vec![left_by(2, CODES[0]), unnamed("first"), unnamed("second")],
+        root: None,
+        resolved: Vec::new(),
+    }
+    .unsettled(false)
+    .expect_err("left");
+    assert_eq!(members_of(&with_members), [(2, Some(CODES[0]))]);
+    assert_eq!(
+        details(unwalked_of(&with_members).expect("both kept")),
+        ["first", "second"]
+    );
+
+    let alone = Unkilled {
+        members: vec![unnamed("first"), unnamed("second")],
+        root: None,
+        resolved: Vec::new(),
+    }
+    .unsettled(false)
+    .expect_err("left");
+    // No member: the first is the answer in its own variant, the second its peer below it.
+    let Error::Unassessable { detail, source } = &alone else {
+        panic!("expected the first error's own variant, got {alone:?}");
+    };
+    assert_eq!(detail, "first");
+    let Some(Error::Unassessable { detail: peer, .. }) = source.as_deref() else {
+        panic!("expected the second error below the first, got {source:?}");
+    };
+    assert_eq!(peer, "second");
+}
+
+/// A call's error holds every member left, so none is warned of by itself: a member is reported once.
+/// The pids are this row's own, as the capture is shared by parallel rows.
+#[skuld::test]
+fn a_kill_that_left_several_members_warns_of_none_of_them_by_itself() {
+    use super::{TreeKillOutcome, TreeKilled, Unkilled};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let killed = TreeKilled::default();
+
+    let left = killed
+        .settle_for_kill_tree(
+            Some(&walker()),
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![left_by(71_001, CODES[0]), left_by(71_002, CODES[1])],
+                root: None,
+                resolved: Vec::new(),
+            })),
+            false,
+        )
+        .answer
+        .expect_err("members were left");
+
+    assert_eq!(members_of(&left).len(), 2);
+    assert_eq!(
+        crate::log_capture::records_since(mark, "pid 7100"),
+        Vec::<String>::new()
     );
 }
 
@@ -443,7 +609,7 @@ fn sync_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop() {
             LeftBehind::Root => result.expect("only the root was left, and the backstop killed it"),
             LeftBehind::Descendant | LeftBehind::RootAndDescendant => {
                 let err = result.expect_err("a descendant was left");
-                assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+                assert!(matches!(err, crate::error::Error::MembersLeft { .. }), "{err:?}");
             }
         }
         drop(stdin);
@@ -474,7 +640,7 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
             LeftBehind::Root => result.expect("only the root was left, and the backstop killed it"),
             LeftBehind::Descendant | LeftBehind::RootAndDescendant => {
                 let err = result.expect_err("a descendant was left");
-                assert!(matches!(err, crate::error::Error::MemberNotKilled { .. }), "{err:?}");
+                assert!(matches!(err, crate::error::Error::MembersLeft { .. }), "{err:?}");
             }
         }
         drop(stdin);
@@ -508,7 +674,6 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
             detail: "refused".into(),
             source: None,
         }),
-        note: None,
     };
     let unkilled = |members: &[u32], root: Option<u32>| Unkilled {
         members: members.iter().map(|pid| left(*pid)).collect(),
@@ -563,19 +728,16 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
             false,
         ),
     ];
-    let pid_of = |error: &Error| match error {
-        Error::MemberNotKilled { pid, .. } => *pid,
-        other => panic!("expected MemberNotKilled, got {other:?}"),
-    };
     for (outcome, root_ended, want, marked) in table {
         let label = format!("{outcome:?}, root_ended {root_ended}");
         let killed = TreeKilled::default();
 
         let got = killed.settle(Some(&walker()), outcome, root_ended);
 
-        let got = got
-            .answer
-            .map_err(|left| (pid_of(&left.first), left.others.iter().map(pid_of).collect::<Vec<_>>()));
+        let got = got.answer.map_err(|left| {
+            let pids: Vec<u32> = members_of(&left).iter().map(|(pid, _)| *pid).collect();
+            (pids[0], pids[1..].to_vec())
+        });
         assert_eq!(got, want, "{label}");
         assert_eq!(killed.is_set(), marked, "{label}");
     }
@@ -604,8 +766,7 @@ fn settle_answers_a_walk_that_was_not_made_with_an_error_and_marks_nothing() {
             .answer
             .expect_err("nothing was killed, whatever became of the root");
 
-        assert!(matches!(left.first, Error::Unassessable { .. }), "{label}: {left}");
-        assert!(left.others.is_empty(), "{label}: {left}");
+        assert!(matches!(left, Error::Unassessable { .. }), "{label}: {left}");
         assert!(!killed.is_set(), "{label}");
     }
 }
@@ -690,7 +851,6 @@ fn next_is_the_one_transition_of_state_and_facts() {
             detail: "its identity could not be read".into(),
             source: None,
         }),
-        note: None,
     };
     let prev_names = [
         "Never",
@@ -808,12 +968,10 @@ fn check_table(
         let (killed, pid, after) = enter();
         let (want_answer, want_standing) = rows(pid).into_iter().nth(at).expect("a row per outcome");
 
-        let got = killed.settle(Some(&walker()), outcome, true).answer.map_err(|left| {
-            std::iter::once(&left.first)
-                .chain(&left.others)
-                .map(name)
-                .collect::<Vec<_>>()
-        });
+        let got = killed
+            .settle(Some(&walker()), outcome, true)
+            .answer
+            .map_err(|left| left.left_members().into_iter().map(name).collect::<Vec<_>>());
 
         assert_eq!(got, want_answer, "{state} x {outcome_name}: answer");
         assert_eq!(standing(&killed), want_standing, "{state} x {outcome_name}: next state");
@@ -1038,7 +1196,7 @@ fn a_kill_that_leaves_a_member_after_a_killed_tree_of_a_handle_that_is_not_a_wal
         .answer
         .expect_err("a member was left");
 
-    assert_eq!(pid_left(&left.first), 8);
+    assert_eq!(pid_left(first_left(&left)), 8);
     assert_eq!(standing(&killed), Standing::Unvouched(UnvouchedKind::Earlier));
 
     // The same for a skipped kill whose sweep of the holders left a member.
@@ -1093,8 +1251,12 @@ fn member_left(pid: u32) -> crate::error::Error {
             detail: "its identity could not be read".into(),
             source: None,
         }),
-        note: None,
     }
+}
+
+/// The first member a settlement's answer holds ([`Error::left_members`](crate::error::Error::left_members)).
+fn first_left(error: &crate::error::Error) -> &crate::error::Error {
+    error.left_members()[0]
 }
 
 /// The pid a `MemberNotKilled` names.
@@ -1127,21 +1289,23 @@ fn a_member_whose_identity_was_never_read_is_reported_again_until_a_kill_shows_i
         .settle(Some(&walker()), left(&[7]), true)
         .answer
         .expect_err("a member was left");
-    assert_eq!(pid_left(&first.first), 7);
+    assert_eq!(pid_left(first_left(&first)), 7);
 
     let later = killed
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
         .answer
         .expect_err("a walk that finds nothing does not show the member killed");
-    assert_eq!((pid_left(&later.first), later.others.len()), (7, 0));
+    assert_eq!(later.left_members().into_iter().map(pid_left).collect::<Vec<_>>(), [7]);
     assert!(!killed.is_set());
 
     let named_again = killed
         .settle(Some(&walker()), left(&[7, 8]), true)
         .answer
         .expect_err("two members are left");
-    assert_eq!(pid_left(&named_again.first), 7);
-    assert_eq!(named_again.others.iter().map(pid_left).collect::<Vec<_>>(), [8]);
+    assert_eq!(
+        named_again.left_members().into_iter().map(pid_left).collect::<Vec<_>>(),
+        [7, 8]
+    );
 }
 
 /// Whatever the next kill found, a held member is answered first: a gone root, a walk that could not
@@ -1182,7 +1346,7 @@ fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
             .answer
             .expect_err("the member is not shown killed");
 
-        assert_eq!(pid_left(&again.first), 7, "{label}: {again}");
+        assert_eq!(pid_left(first_left(&again)), 7, "{label}: {again}");
         assert!(!killed.is_set(), "{label}");
     }
 }
@@ -1216,7 +1380,7 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
         .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
         .answer
         .expect_err("the member is not shown killed");
-    assert_eq!(pid_left(&again.first), 7, "{again}");
+    assert_eq!(pid_left(first_left(&again)), 7, "{again}");
 
     let nothing_held = TreeKilled::default();
     nothing_held
@@ -1250,14 +1414,13 @@ fn only_a_walk_not_made_is_answered_before_the_backstop() {
         .answer
         .expect_err("a member was left");
 
-    let handed_back = killed.unless_unwalked("kill_tree", Some(&walker()), TreeKillOutcome::Ran(Ok(())));
+    let handed_back = killed.unless_unwalked(Some(&walker()), TreeKillOutcome::Ran(Ok(())));
     assert!(
         matches!(handed_back, Ok(TreeKillOutcome::Ran(Ok(())))),
         "a walk made is the backstop's to settle"
     );
 
     let Err(failure) = killed.unless_unwalked(
-        "kill_tree",
         Some(&walker()),
         TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
             detail: "the snapshot failed".into(),
@@ -1267,7 +1430,7 @@ fn only_a_walk_not_made_is_answered_before_the_backstop() {
         panic!("a walk not made is an error");
     };
     let failure = failure.answer;
-    assert_eq!(pid_left(&failure.error), 7, "{:?}", failure.error);
+    assert_eq!(pid_left(first_left(&failure.error)), 7, "{:?}", failure.error);
     assert!(!failure.root_ended);
     assert!(!killed.is_set());
 }
@@ -1294,7 +1457,7 @@ fn a_member_whose_kill_was_refused_is_killed_again_by_identity_and_then_settled(
         )
         .answer
         .expect_err("the member was left");
-    assert_eq!(pid_left(&first.first), id.pid());
+    assert_eq!(pid_left(first_left(&first)), id.pid());
     assert!(!killed.is_set());
 
     killed
@@ -1342,12 +1505,12 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
                 .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
                 .answer
                 .expect_err("a gone root walked nothing");
-            assert!(left.others.is_empty(), "{left}");
+            assert_eq!(left.left_members().len(), 1, "{left}");
             assert_eq!(
                 standing(&killed),
                 Standing::Unvouched(super::UnvouchedKind::HeldMembersGone)
             );
-            left.first.to_string()
+            first_left(&left).to_string()
         })
         .collect();
 
@@ -1584,7 +1747,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
                 }
                 Err(left) => {
                     assert!(!root_ended, "{label}: the root ended");
-                    assert_eq!(pid_left(&left.first), 1, "{label}");
+                    assert_eq!(pid_left(first_left(&left)), 1, "{label}");
                 }
             }
             assert_eq!(
@@ -1600,7 +1763,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
                     .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
                     .answer
                     .expect_err("a gone root walked nothing");
-                let text = gone.first.to_string();
+                let text = first_left(&gone).to_string();
                 assert!(!text.contains("nothing was killed"), "{label}: {gone}");
                 assert!(!text.contains("members"), "{label}: {gone}");
                 assert!(text.contains(want), "{label}: {gone}");
@@ -1649,46 +1812,251 @@ fn a_member_that_exited_since_it_was_left_stops_failing_the_call() {
     assert!(killed.is_set());
 }
 
-// A tree call's report names the call =====
+// A sweep's answer over the root's backstop =====
 
-/// The members a call's walk left besides the first are warned of under the name of the call that
-/// made it, not under `kill_tree`. Mutant: `SweepFailure::of` words every call as `kill_tree`.
+/// The answer of `SweepFailure::of` for a root `1`: `walk` is what the mechanism's kill left, and
+/// `backstop` the handle's own kill of the root, which ended it when it is `Ok`.
+fn swept(walk: super::TreeKillOutcome, backstop: Result<(), crate::error::Error>) -> crate::error::Error {
+    swept_in(walker(), walk, backstop)
+}
+
+/// [`swept`] over a tree of `mechanism`.
+fn swept_in(
+    mechanism: crate::containment::mechanism::Mechanism,
+    walk: super::TreeKillOutcome,
+    backstop: Result<(), crate::error::Error>,
+) -> crate::error::Error {
+    let root_ended = backstop.is_ok();
+    let tree = crate::containment::Tree::contained(mechanism);
+    super::SweepFailure::of(&tree, walk, backstop, 1, root_ended)
+        .answer
+        .expect_err("a member was left")
+        .error
+}
+
+fn io_error(code: i32) -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+/// A root that the walk left and the backstop could not kill either is one member, whose cause holds
+/// both failures, the backstop's first. Mutants: the backstop's failure is dropped, or kept beside
+/// the member as a second one; the walk's cause is dropped; the other members are lost.
 #[skuld::test]
-fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
-    use super::{SweepFailure, TreeKillOutcome, Unkilled};
-    use crate::containment::Tree;
-    use crate::error::Error;
-    let member = |pid| Error::MemberNotKilled {
-        pid,
-        source: std::sync::Arc::new(Error::Containment {
-            detail: "refused".into(),
-            source: None,
-        }),
-        note: None,
-    };
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let failure = SweepFailure::of(
-        "graceful_shutdown_tree",
-        &Tree::none(),
+fn a_root_the_walk_left_and_the_backstop_failed_to_kill_is_one_member_with_both_causes() {
+    use super::{TreeKillOutcome, Unkilled};
+    let [a, b, c] = CODES;
+    let error = swept(
         TreeKillOutcome::Ran(Err(Unkilled {
-            members: vec![member(1), member(2)],
+            members: vec![left_by(2, a)],
+            root: Some(left_by(1, c)),
+            resolved: Vec::new(),
+        })),
+        Err(io_error(b)),
+    );
+
+    assert_eq!(members_of(&error), [(2, Some(a)), (1, Some(b))]);
+    let crate::error::Error::MembersLeft { members, .. } = &error else {
+        unreachable!()
+    };
+    let crate::error::Error::MemberNotKilled { source, .. } = &**members.iter().nth(1).expect("the root") else {
+        panic!("{members:?}");
+    };
+    let crate::error::Error::Several(causes) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = causes
+        .iter()
+        .map(|cause| crate::error::first_os_code(&**cause))
+        .collect();
+    assert_eq!(codes, [Some(b), Some(c)], "the backstop's first");
+}
+
+/// A backstop that fails after a walk that left nothing is a `MembersLeft` of the root alone, not the
+/// bare error of the kill.
+#[skuld::test]
+fn a_backstop_failure_after_a_walk_that_left_nothing_is_a_members_left_of_the_root() {
+    let error = swept(super::TreeKillOutcome::Ran(Ok(())), Err(io_error(CODES[1])));
+
+    assert_eq!(members_of(&error), [(1, Some(CODES[1]))]);
+}
+
+/// A member the walk left, with a root it did not leave and the backstop could not kill: the root is
+/// another member, after those the walk named.
+#[skuld::test]
+fn a_backstop_failure_adds_the_root_to_the_members_the_walk_left() {
+    use super::{TreeKillOutcome, Unkilled};
+    let [a, b, _] = CODES;
+    let error = swept(
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![left_by(2, a)],
             root: None,
             resolved: Vec::new(),
         })),
-        Ok(()),
-        false,
-    )
-    .answer
-    .expect_err("two members were left");
-    assert!(
-        matches!(failure.error, Error::MemberNotKilled { pid: 1, .. }),
-        "{:?}",
-        failure.error
+        Err(io_error(b)),
     );
-    let warned = crate::log_capture::records_since_on_current_thread(mark, "pid 2 was not killed");
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(warned[0].1.starts_with("graceful_shutdown_tree: "), "{warned:?}");
+
+    assert_eq!(members_of(&error), [(2, Some(a)), (1, Some(b))]);
+}
+
+/// A walk that left a member and then could not be made again keeps its `unwalked` error; the root the
+/// backstop failed to kill joins the members.
+/// Mutant: the root is dropped, or put in `unwalked`, or `unwalked` is lost.
+#[skuld::test]
+fn a_backstop_failure_adds_the_root_to_the_members_and_keeps_the_unwalked_error() {
+    use super::{TreeKillOutcome, Unkilled};
+    let [a, b, _] = CODES;
+    let error = swept(
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![
+                left_by(2, a),
+                crate::error::Error::Unassessable {
+                    detail: "the walk could not be made".into(),
+                    source: None,
+                },
+            ],
+            root: None,
+            resolved: Vec::new(),
+        })),
+        Err(io_error(b)),
+    );
+
+    assert_eq!(members_of(&error), [(2, Some(a)), (1, Some(b))]);
+    assert!(
+        matches!(unwalked_of(&error), Some(crate::error::Error::Unassessable { detail, .. }) if detail == "the walk could not be made"),
+        "{error:?}"
+    );
+}
+
+/// A mechanism that is no walk answers one error that names no member, and keeps its variant when the
+/// backstop fails too: the root, as a `MemberNotKilled`, comes below it after its own cause.
+///
+/// Mutants: the error becomes a `MembersLeft`; the root's failure is dropped; it comes before the
+/// error's own cause.
+#[skuld::test]
+fn a_backstop_failure_keeps_the_error_of_a_mechanism_that_is_no_walk_with_the_root_below_it() {
+    use super::TreeKillOutcome;
+    use crate::error::Error;
+    let [a, b, _] = CODES;
+    let swept = |source| {
+        swept_in(
+            non_walk(),
+            TreeKillOutcome::Ran(Err(super::Unkilled::from(Error::Containment {
+                detail: "a member refused".into(),
+                source,
+            }))),
+            Err(io_error(b)),
+        )
+    };
+
+    let alone = swept(None);
+    assert!(
+        matches!(&alone, Error::Containment { detail, source: Some(source) }
+            if detail == "a member refused" && matches!(&**source, Error::MemberNotKilled { pid: 1, .. })),
+        "{alone:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&alone), Some(b));
+
+    let with_cause = swept(Some(Error::io_cause(std::io::Error::from_raw_os_error(a))));
+    let Error::Containment {
+        source: Some(source), ..
+    } = &with_cause
+    else {
+        panic!("{with_cause:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    assert!(matches!(
+        &**list.iter().nth(1).expect("the root"),
+        Error::MemberNotKilled { pid: 1, .. }
+    ));
+    assert_eq!(crate::error::first_os_code(&**list.first()), Some(a));
+}
+
+/// A backstop that fails after a kill that left nothing, on a mechanism that is no walk, is a
+/// `Containment` over the root as a `MemberNotKilled`: `MembersLeft` is the walk's variant.
+///
+/// Mutant: the answer is a `MembersLeft`.
+#[skuld::test]
+fn a_backstop_failure_after_a_clean_kill_of_a_mechanism_that_is_no_walk_is_a_containment_over_the_root() {
+    use super::TreeKillOutcome;
+    use crate::error::Error;
+    let error = swept_in(non_walk(), TreeKillOutcome::Ran(Ok(())), Err(io_error(CODES[1])));
+
+    let Error::Containment {
+        source: Some(source), ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(matches!(&**source, Error::MemberNotKilled { pid: 1, .. }), "{source:?}");
+    assert_eq!(crate::error::first_os_code(&error), Some(CODES[1]));
+}
+
+/// A backstop that fails after a walk that left nothing is a `MembersLeft` of the root alone.
+/// Mutant: the answer is the `Containment` of every other mechanism.
+#[skuld::test]
+fn a_backstop_failure_after_a_clean_walk_is_a_members_left_of_the_root_alone() {
+    use super::TreeKillOutcome;
+    use crate::error::Error;
+    let error = swept(TreeKillOutcome::Ran(Ok(())), Err(io_error(CODES[1])));
+
+    let Error::MembersLeft { members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members.iter().len(), 1);
+    assert!(
+        matches!(&**members.first(), Error::MemberNotKilled { pid: 1, .. }),
+        "{error:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&error), Some(CODES[1]));
+}
+
+/// A walk that could not be made, and a backstop that failed too: the walk's `Unassessable` keeps its
+/// variant, with the root as a `MemberNotKilled` below it after its own cause.
+#[skuld::test]
+fn a_walk_not_made_and_a_failed_backstop_keep_the_walks_variant_with_the_root_below_it() {
+    use super::TreeKillOutcome;
+    use crate::error::Error;
+    let [a, b, _] = CODES;
+    let error = swept(
+        TreeKillOutcome::Unwalked(Error::Unassessable {
+            detail: "the table could not be read".into(),
+            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(a))),
+        }),
+        Err(io_error(b)),
+    );
+
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    assert_eq!(crate::error::first_os_code(&**list.first()), Some(a));
+    assert!(matches!(
+        &**list.iter().nth(1).expect("the root"),
+        Error::MemberNotKilled { pid: 1, .. }
+    ));
+}
+
+/// With the root ended by the backstop, the answer is what the walk left, as it was.
+#[skuld::test]
+fn a_walk_that_left_members_stays_the_answer_when_the_backstop_killed_the_root() {
+    use super::{TreeKillOutcome, Unkilled};
+    let error = swept(
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![left_by(2, CODES[0])],
+            root: Some(left_by(1, CODES[2])),
+            resolved: Vec::new(),
+        })),
+        Ok(()),
+    );
+
+    assert_eq!(members_of(&error), [(2, Some(CODES[0]))]);
 }
 
 // fd marker install policy (macOS) =====

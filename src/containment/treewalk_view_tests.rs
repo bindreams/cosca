@@ -24,16 +24,22 @@ use super::treewalk_pidfs_tests::{children_of, descendants};
 /// ([`Error::Unassessable`]), and its message says each of `causes`.
 #[track_caller]
 fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
-    match result {
-        Err(Error::MemberNotKilled { pid: named, source, .. }) => {
-            assert_eq!(named, pid, "the first member left behind");
-            assert!(matches!(*source, Error::Unassessable { .. }), "{source:?}");
+    // A call's error holds every member left ([`Error::MembersLeft`]); a walk's own is the member.
+    let first = match &result {
+        Err(Error::MembersLeft { members, .. }) => Some(&**members.first()),
+        Err(other) => Some(other),
+        Ok(()) => None,
+    };
+    match first {
+        Some(Error::MemberNotKilled { pid: named, source }) => {
+            assert_eq!(*named, pid, "the first member left behind");
+            assert!(matches!(**source, Error::Unassessable { .. }), "{source:?}");
             let said = source.to_string();
             for cause in causes {
                 assert!(said.contains(cause), "the error must name {cause:?}: {said}");
             }
         }
-        other => panic!("expected MemberNotKilled for pid {pid} naming {causes:?}, got {other:?}"),
+        _ => panic!("expected MemberNotKilled for pid {pid} naming {causes:?}, got {result:?}"),
     }
 }
 
@@ -119,6 +125,22 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
             );
             release(child);
         }
+    }
+}
+
+/// The walker's cooperative signal over an untrusted view sent nothing: `NotSent`, with the view's error,
+/// so `graceful_shutdown_tree` ends the call. Mutant: the failure is a `Sent { result: Err(..) }`.
+#[skuld::test]
+fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
+    for view in VIEWS {
+        let (child, id) = live_member();
+        let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
+        match super::terminate_tree(&kernel, id, None) {
+            crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
+                if detail.contains(view.cause()) => {}
+            other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),
+        }
+        release(child);
     }
 }
 
@@ -682,7 +704,6 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
             detail: "its identity could not be read".into(),
             source: None,
         }),
-        note: None,
     };
     let again = with_earlier(&kernel, vec![unread], Ok(()))
         .0

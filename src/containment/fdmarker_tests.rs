@@ -1012,7 +1012,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 }
 
 /// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes
-/// unqueryable at re-check time must be left unsignalled AND reported as incomplete (`true`),
+/// unqueryable at re-check time must be left unsignalled AND reported as a kill not attempted,
 /// never silently treated as resolved. `id` names pid 1 (launchd) — the same real,
 /// unprivileged-EPERM oracle used throughout this file — fed directly to the private method
 /// rather than through a real sweep, since pid 1 can never naturally appear in a real sweep's
@@ -1040,10 +1040,23 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
         ),
     };
 
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let outcome = marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL);
     assert!(
-        marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL, &mut Vec::new()),
-        "a Denied re-check on a supposedly-known holder must report incomplete (true), not \
-         silently succeed"
+        matches!(
+            outcome,
+            Some(crate::containment::treewalk::KillOutcome::NotAttempted(_))
+        ),
+        "a Denied re-check on a supposedly-known holder must be a kill not attempted (which the sweep \
+         folds into `incomplete`), not silently succeed: {outcome:?}"
+    );
+    // The fd marker's own warning, once, naming the pid: the treewalk's text is for its own members.
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "pid 1 (a confirmed holder");
+    assert!(
+        matches!(&warns[..], [(log::Level::Warn, text)]
+            if text.starts_with("fd marker ") && text.contains("not signalled, left running")),
+        "{warns:?}"
     );
 }
 
@@ -1115,6 +1128,35 @@ fn finish_sweep_names_only_the_causes_that_apply() {
     assert!(both.contains(INCOMPLETE) && both.contains(FORKING));
 
     assert!(finish(false, false).is_ok(), "a sweep with neither cause is Ok");
+}
+
+/// A sweep that failed twice, a group send and an incomplete pass, returns the group's failure with the
+/// incomplete summary as its peer, so the group's OS code is the one `first_os_code` finds.
+///
+/// Mutant: the incomplete summary comes first, so the code is lost below it.
+#[skuld::test]
+fn a_sweep_that_failed_twice_leads_with_the_groups_failure() {
+    use crate::error::Error;
+    let group = Error::Containment {
+        detail: "the group could not be signalled".to_owned(),
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
+    };
+    let swept = super::Marker::finish_sweep(0x1, Err(group), true, false).expect_err("both failed");
+    assert!(
+        matches!(&swept, Error::Containment { detail, .. } if detail.contains("group")),
+        "{swept:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&swept), Some(libc::EPERM));
+    let Error::Containment {
+        source: Some(source), ..
+    } = &swept
+    else {
+        panic!("{swept:?}");
+    };
+    assert!(
+        matches!(&**source, Error::Several(list) if list.iter().len() == 2),
+        "the incomplete summary is the group's peer: {source:?}"
+    );
 }
 
 /// A pass counts the identities no earlier pass had seen. Two processes hold the marker (`sh`, and
@@ -1313,38 +1355,66 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     assert_eq!((status.signal(), status.code()), (None, Some(0)));
 }
 
-use super::is_teardown_mechanism_failure;
-
-// Exercises the ACTUAL classifier `combine_group_errors` uses (`is_teardown_mechanism_failure`),
-// not a hand-copied duplicate — a future edit to the real condition is caught here automatically. Cannot force a REAL Containment through a live
-// Drop without root (same constraint as the rest of this plan), so this drives the
-// classifier directly with constructed Error values. Both Unassessable shapes are exercised
-// because they classify oppositely: `source: None` (an ordinary "member unconfirmed" outcome
-// from group::decide) is NOT a mechanism failure; `source: Some(_)` (group::state's listing
-// itself failed) IS one.
+/// Two failures of one teardown fold into one error with both failures whole as the members of the
+/// `Several` below it, and neither's words in the detail. The variant says what failed:
+/// `Containment` when either is one, else `Unassessable`.
+///
+/// Mutants: the two are joined into a text; a `Containment` folds into `Unassessable` because the
+/// other side is not one, or two failures that are none into `Containment`.
 #[skuld::test]
-fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable() {
-    assert!(!is_teardown_mechanism_failure(&crate::error::Error::Containment {
-        detail: "refused".into(),
-        source: None
-    }));
-    assert!(!is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
-        detail: "unknown".into(),
-        source: None
-    }));
-    assert!(is_teardown_mechanism_failure(&crate::error::Error::Io(
-        std::io::Error::other("mechanism failure")
-    )));
-}
+fn two_group_errors_fold_into_one_variant_with_both_below_it() {
+    use crate::error::Error;
+    let ordinary = |detail: &str| Error::Containment {
+        detail: detail.to_owned(),
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
+    };
+    let mechanism = || Error::Io(std::io::Error::from_raw_os_error(libc::EIO));
+    let below = |error: &Error| {
+        let (Error::Containment { source, detail } | Error::Unassessable { source, detail }) = error else {
+            panic!("{error:?}");
+        };
+        let Some(source) = source else {
+            panic!("no cause: {error:?}");
+        };
+        let Error::Several(list) = &**source else {
+            panic!("expected Several, got {source:?}");
+        };
+        (
+            detail.clone(),
+            list.iter()
+                .map(|m| crate::error::first_os_code(&**m))
+                .collect::<Vec<_>>(),
+        )
+    };
 
-#[skuld::test]
-fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
-    assert!(is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
-        detail: "process group 372 could not be listed after SIGKILL".into(),
-        source: Some(std::sync::Arc::new(crate::error::Error::Io(std::io::Error::other(
-            "sysctl KERN_PROC_PGRP failed"
-        ))))
-    }));
+    let both_ordinary = super::combine_group_errors(ordinary("first words"), ordinary("latest words"));
+    assert!(matches!(both_ordinary, Error::Containment { .. }), "{both_ordinary:?}");
+    let (detail, codes) = below(&both_ordinary);
+    assert_eq!(codes, [Some(libc::EPERM), Some(libc::EPERM)]);
+    assert!(!detail.contains("words"), "{detail}");
+
+    let one_containment = super::combine_group_errors(ordinary("first words"), mechanism());
+    assert!(
+        matches!(one_containment, Error::Containment { .. }),
+        "{one_containment:?}"
+    );
+    assert_eq!(below(&one_containment).1, [Some(libc::EPERM), Some(libc::EIO)]);
+
+    let none_containment = super::combine_group_errors(
+        Error::Unassessable {
+            detail: "unknown".to_owned(),
+            source: None,
+        },
+        Error::Unassessable {
+            detail: "unknown too".to_owned(),
+            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EIO))),
+        },
+    );
+    assert!(
+        matches!(none_containment, Error::Unassessable { .. }),
+        "{none_containment:?}"
+    );
+    assert_eq!(below(&none_containment).1, [None, Some(libc::EIO)]);
 }
 
 // Holders-only sweeps (a reaped root) =====
@@ -1355,6 +1425,85 @@ fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -
     let prepared = install_on(&mut cmd, &[]).expect("install a scratch marker");
     drop(cmd);
     super::Marker::new(prepared, root, pgid)
+}
+
+/// A group that cannot be signalled (`pgid` 0, which `signal_group` refuses) means the marker's
+/// terminate sent nothing: the tree call says so, so `graceful_shutdown_tree` ends at once.
+///
+/// Mutant: the refusal folds into `Sent { result: Err(..) }`, which `graceful_shutdown_tree` holds for.
+#[skuld::test]
+fn a_terminate_whose_group_cannot_be_signalled_says_nothing_was_sent() {
+    let _serialize = test_spawn_lock();
+    let marker = marker_without_holders(inert_root(), Some(0));
+    let root = crate::test_support::stated_root::StatedRoot::unreaped();
+    match marker.terminate_tree(Some(&root)) {
+        crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable { source: None, .. }) => {}
+        other => panic!("expected NotSent(Unassessable), got {other:?}"),
+    }
+}
+
+/// A terminate that sent nothing keeps what else went wrong in the pass: the group's refusal is below
+/// the `NotSent` error with the unreadable root's incomplete walk as its peer, as `finish_sweep` says it.
+/// A group refusal with no cause of its own leaves the incomplete summary as its whole cause.
+///
+/// Mutant: `NotSent` carries the group's refusal alone, dropping the members the pass could not reach.
+#[skuld::test]
+fn a_terminate_that_sent_nothing_keeps_the_members_it_could_not_reach() {
+    let _serialize = test_spawn_lock();
+    let root_id = inert_root();
+    let marker = marker_without_holders(root_id, Some(0));
+    let (_kernel, _unreadable) = crate::identity::unreadable(root_id.pid());
+    let root = crate::test_support::stated_root::StatedRoot::unreaped();
+    match marker.terminate_tree(Some(&root)) {
+        crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
+            detail,
+            source: Some(source),
+        }) => {
+            assert!(
+                detail.contains("not a valid group id"),
+                "the group's failure first: {detail}"
+            );
+            assert!(
+                matches!(&*source, crate::error::Error::Unassessable { detail, .. } if detail.contains("incomplete")),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected NotSent(the group's refusal over the incomplete walk), got {other:?}"),
+    }
+}
+
+/// A group that cannot be signalled is one failed channel, not the end of the pass: a marker holder is
+/// still sent the `SIGTERM`, so the signal went out and the answer is `Sent`, with the group's failure
+/// among the errors checked after it (`graceful_shutdown_tree` holds the grace and sweeps for it).
+///
+/// Mutant: the failed group send ends the pass, so the holder is not signalled and the answer is `NotSent`.
+#[skuld::test]
+fn a_group_send_that_fails_while_a_holder_is_signalled_is_sent() {
+    use std::os::unix::process::ExitStatusExt;
+    let _serialize = test_spawn_lock();
+    let mut holder_cmd = member_command(0);
+    let prepared = install_on(&mut holder_cmd, &[]).expect("install the marker on the holder");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut holder = holder_cmd.spawn().expect("spawn the holder");
+    drop(holder_cmd);
+    await_member_ready(&mut holder);
+    let marker = super::Marker::new(prepared, inert_root(), Some(0));
+    let root = crate::test_support::stated_root::StatedRoot::unreaped();
+
+    let outcome = marker.terminate_tree(Some(&root));
+
+    let status = holder.wait().expect("reap the holder");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "the holder was sent the SIGTERM");
+    match outcome {
+        crate::containment::TerminateOutcome::Sent {
+            result: Err(crate::error::Error::Unassessable { source: None, .. }),
+            ..
+        } => {}
+        other => panic!("expected Sent with the group's refusal, got {other:?}"),
+    }
 }
 
 /// A kill skipped because the root was reaped elsewhere names what the marker would have done by the

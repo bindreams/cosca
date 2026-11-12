@@ -201,7 +201,6 @@ fn a_released_tree_keeps_its_kind() {
                     detail: "its identity could not be read".into(),
                     source: None,
                 }),
-                note: None,
             }],
             root: None,
             resolved: Vec::new(),

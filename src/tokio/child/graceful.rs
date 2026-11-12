@@ -149,7 +149,7 @@ impl Child {
             {
                 self.inner.refuse_unpinned("kill", Some("the SIGTERM"))?;
                 let gate = self.inner.kill_gate();
-                self.inner.kill_sent_gated("graceful_shutdown", gate)?;
+                self.inner.kill_sent_gated(gate)?;
             }
             #[cfg(not(unix))]
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
@@ -225,19 +225,18 @@ impl Child {
     /// exit was observed, otherwise the child stays owned for `Drop`).
     ///
     /// **A refused or unconfirmed graceful signal never skips the grace wait and hard sweep
-    /// either.** If the initial group signal reaches a live member that refuses it, or a
-    /// member's post-signal state cannot be confirmed
-    /// ([`Error::Containment`](crate::error::Error::Containment) or
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) with no I/O `source` — see
+    /// either.** If the signal went out and the check after it fails (a live member refuses it, or
+    /// a member's state cannot be confirmed, whatever the error's variant: see
     /// [`terminate_tree`](Child::terminate_tree)), the grace is still waited and the sweep
     /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
     /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
     /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
     /// call reports `Ok`. It resurfaces only indirectly, as the sweep's own error, if the
-    /// sweep then fails too. A genuine listing-mechanism failure (an `Unassessable` with an
-    /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
-    /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
-    /// sweep to act on yet.
+    /// sweep then fails too. A failed group send on an fd marker that still signalled the root, a
+    /// holder or a walked descendant is a signal that went out: the grace is held and the sweep runs. A signal that was not
+    /// sent at all (`NoConsole`, an invalid process group, a root whose number may name another
+    /// process, an fd marker whose group send failed with nothing else signalled) returns at once:
+    /// there is nothing for a grace wait or sweep to act on yet.
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.
@@ -263,7 +262,6 @@ impl Child {
         // what the sweep may say was sent before it.
         let (term_result, earlier) = match self.inner.signal_tree_cooperatively() {
             SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
-            #[cfg(unix)]
             SignalTreeCooperativelyOutcome::End(e) => return Err(e),
             #[cfg(target_os = "linux")]
             SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
@@ -271,16 +269,14 @@ impl Child {
             }
             #[cfg(unix)]
             SignalTreeCooperativelyOutcome::HoldersOnly(skip) => {
-                return Err(self.shut_down_holders_only(&skip, grace).await);
+                return Err(self.shut_down_holders_only(skip, grace).await);
             }
         };
 
-        // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
-        // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
-        // per-member rationale it shares.
+        // The signal went out, so every error of the check after it holds.
         let term = match term_result {
             Ok(()) => Ok(()),
-            Err(e @ Error::Containment { .. }) | Err(e @ Error::Unassessable { source: None, .. }) => {
+            Err(e) => {
                 log::debug!(
                     "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {report}",
                     id = self.pid(),
@@ -288,7 +284,6 @@ impl Child {
                 );
                 Err(e)
             }
-            Err(e) => return Err(e), // unchanged pre-existing behavior: no signal sent, no grace, no sweep
         };
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
@@ -441,7 +436,7 @@ impl Child {
 
     /// As the sync call's `shut_down_holders_only`, with the grace awaited.
     #[cfg(unix)]
-    async fn shut_down_holders_only(&self, skip: &crate::containment::Skip, grace: Duration) -> Error {
+    async fn shut_down_holders_only(&self, skip: crate::containment::Skip, grace: Duration) -> Error {
         let call = self.inner.skip_call(
             "graceful_shutdown_tree",
             crate::containment::dispatch::TreeSignal::Term,

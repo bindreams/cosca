@@ -160,8 +160,18 @@ fn a_front_the_kill_may_not_reach_is_refused_after_the_grace() {
 fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     let forced = || Error::Io(std::io::Error::other("forced term failure"));
     let (err, sent, warns) = run(Gate::Open, Err(forced()), None, Gate::Open, Ok(Sent::Delivered));
+    // An `Io` is a leaf with no slot for peers: the call's `Unassessable` holds it, after the refusal's cause.
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
     assert!(
-        matches!(&err, Error::Io(e) if e.to_string() == "forced term failure"),
+        matches!(&**list.iter().nth(1).expect("the SIGTERM's error"), Error::Io(e) if e.to_string() == "forced term failure"),
         "{err:?}"
     );
     assert_eq!(sent, ["term"]);

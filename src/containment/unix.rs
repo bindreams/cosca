@@ -55,7 +55,8 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
-use crate::error::Error;
+use crate::error::{Error, Failures};
+use std::sync::Arc;
 
 /// A process group or a session, named by the root's pid (`pgid == sid == pid` for a session's
 /// leader): its kill and its terminate send by that number, as the root's own state allows
@@ -370,13 +371,20 @@ pub(crate) mod fault {
 
 /// Send the graceful signal to the whole process group, then confirm no live
 /// member refused it. See [`signal_group`].
+#[cfg(test)]
 pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
+    term_group_sent(pgid, root).flatten()
+}
+
+/// [`term_group`], saying whether the signal went out: `Err` is a send that did not happen, `Ok` what the
+/// check after the send found.
+pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>) -> Result<Result<(), Error>, Error> {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
-        return Ok(());
+        return Ok(Ok(()));
     }
     // A `SIGTERM` is only probed, never resent: no member is reached by a handle of its own.
-    signal_group(pgid, Signal::SIGTERM, root, &mut Vec::new())
+    signal_group_sent(pgid, Signal::SIGTERM, root, &mut Vec::new())
 }
 
 /// What a process group's kill or terminate sends by the root's number, from one look at `root`
@@ -447,21 +455,16 @@ pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKil
 
 /// [`term_group`] as a tree call decides it, on one look at `root` ([`kill_group_tree`]). A skip ends
 /// the call, or, on Linux when the root's handle still names it exactly, leaves the root alone to the
-/// caller ([`TerminateOutcome::RootThroughPidfd`]).
+/// caller ([`TerminateOutcome::RootThroughPidfd`]). A send that did not go out is
+/// [`TerminateOutcome::NotSent`].
 pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOutcome {
-    let earlier = Some("the SIGTERM");
+    let sent = |root: Option<&dyn Root>| TerminateOutcome::of(term_group_sent(pgid, root), Some("the SIGTERM"));
     let Some(root) = root else {
         debug_assert!(false, "a group terminate was given no root to look at");
-        return TerminateOutcome::Sent {
-            result: term_group(pgid, None),
-            earlier,
-        };
+        return sent(None);
     };
     match group_look(root) {
-        NumberLook::Trusted => TerminateOutcome::Sent {
-            result: term_group(pgid, Some(root)),
-            earlier,
-        },
+        NumberLook::Trusted => sent(Some(root)),
         look @ (NumberLook::Empty | NumberLook::GroupGone) => {
             log_empty_group(pgid, &look);
             TerminateOutcome::Sent {
@@ -483,17 +486,28 @@ pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOu
 /// Signal the group and report what was actually achieved. `killpg`'s return value is a
 /// best-effort first delivery attempt, never the final verdict — see the module docs and
 /// `verify` for why none of `Ok`/`ESRCH`/`EPERM` can be trusted alone on either platform.
-///
-/// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
-/// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
-/// the broadcast/double-negation hazard this file's Background measures. A check placed after
-/// the dangerous syscall it claims to guard is not a guard.
 fn signal_group(
     pgid: i32,
     signal: Signal,
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
 ) -> Result<(), Error> {
+    signal_group_sent(pgid, signal, root, killed).flatten()
+}
+
+/// [`signal_group`], saying whether the signal went out: `Err` is a send that did not happen (an
+/// invalid `pgid`, a failed check of the root, a failed `killpg`), `Ok` what `verify` found after it.
+///
+/// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
+/// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
+/// the broadcast/double-negation hazard this file's Background measures. A check placed after
+/// the dangerous syscall it claims to guard is not a guard.
+fn signal_group_sent(
+    pgid: i32,
+    signal: Signal,
+    root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
+) -> Result<Result<(), Error>, Error> {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
@@ -519,9 +533,14 @@ fn signal_group(
         Err(nix::errno::Errno::EPERM) => {
             _ = signal_direct(pgid, signal, root);
         }
-        Err(e) => return Err(Error::Io(io::Error::from(e))),
+        Err(e) => {
+            return Err(Error::Containment {
+                detail: format!("{signal} could not be sent to process group {pgid}"),
+                source: Some(Error::io_cause(io::Error::from(e))),
+            })
+        }
     }
-    verify(pgid, signal, root, killed)
+    Ok(verify(pgid, signal, root, killed))
 }
 
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's
@@ -735,40 +754,69 @@ fn verify(
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
 ) -> Result<(), Error> {
-    match group::state(pgid, signal, root, killed) {
+    answer_of(group::state(pgid, signal, root, killed), pgid, signal)
+}
+
+/// The contract answer for `state`, what `signal` left of the group `pgid`. Each member that refused
+/// or could not be assessed is held as an error of its own, naming its pid, with its cause: the refusers
+/// first, as the `source` of the answer ([`Error::Several`] when there are two or more).
+fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), Error> {
+    let member = |pid: u32, words: &str, cause: Error, unassessed: bool| {
+        Arc::new(Error::of_member(pid, words, cause, unassessed))
+    };
+    match state {
         group::GroupState::Cleared => Ok(()),
         group::GroupState::Refused { refused, unassessable } => {
-            let list = |pids: &[u32]| pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
             let mut detail = format!(
-                "{signal} did not clear {n} member(s) of process group {pgid} (pid {list}); the \
-                 tree is still up and this process cannot bring it down",
+                "{signal} did not clear {n} member(s) of process group {pgid}; the tree is still up \
+                 and this process cannot bring it down",
                 n = refused.len(),
-                list = list(&refused),
             );
             if !unassessable.is_empty() {
                 // The group's true state may be WORSE than `refused` alone says — these
                 // members were never confirmed either way, not confirmed clear.
                 detail.push_str(&format!(
-                    "; additionally, {n} member(s) could not be assessed at all (pid {list})",
+                    "; additionally, {n} member(s) could not be assessed at all",
                     n = unassessable.len(),
-                    list = list(&unassessable),
                 ));
             }
-            Err(Error::Containment { detail, source: None })
+            let members = refused
+                .into_iter()
+                .map(|(pid, cause)| member(pid, "refused the signal", cause, false))
+                .chain(
+                    unassessable
+                        .into_iter()
+                        .map(|(pid, cause)| member(pid, "could not be assessed", cause, true)),
+                );
+            let source = Failures::collect(members).map(Failures::into_cause);
+            Err(Error::Containment { detail, source })
+        }
+        group::GroupState::Unassessed { members } => {
+            let detail = format!(
+                "{n} member(s) of process group {pgid} could not be assessed after {signal}",
+                n = members.len(),
+            );
+            let members = members
+                .into_iter()
+                .map(|(pid, cause)| member(pid, "could not be assessed", cause, true));
+            Err(Error::Unassessable {
+                detail,
+                source: Failures::collect(members).map(Failures::into_cause),
+            })
         }
         // A listing that can never work here (no `openat2`) is the platform's `Unsupported`, as
         // from a wait or a spawn, not an unassessable group.
-        group::GroupState::Unlistable {
-            source: Some(source), ..
-        } if source.kind() == io::ErrorKind::Unsupported => Err(Error::Unsupported {
-            op: format!("listing process group {pgid}"),
-            platform: std::env::consts::OS,
-            detail: source.to_string(),
-            source: Some(Error::io_cause(source)),
-        }),
+        group::GroupState::Unlistable { source, .. } if source.kind() == io::ErrorKind::Unsupported => {
+            Err(Error::Unsupported {
+                op: format!("listing process group {pgid}"),
+                platform: std::env::consts::OS,
+                detail: source.to_string(),
+                source: Some(Error::io_cause(source)),
+            })
+        }
         group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
             detail,
-            source: source.map(Error::io_cause),
+            source: Some(Error::io_cause(source)),
         }),
     }
 }

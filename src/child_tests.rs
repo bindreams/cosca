@@ -1,21 +1,16 @@
 //! Unit tests for `child.rs`.
 
-#[cfg(target_os = "macos")]
-use crate::containment::fdmarker::is_teardown_mechanism_failure;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::test_child::Console;
 
 /// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
-/// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
-/// failure since #61) were being stringified into an opaque `Error::Io` on the way out of
-/// `Marker::sweep`, so an entirely ordinary outcome classified as a teardown-mechanism failure
-/// — reintroducing the bug #61 fixed.
+/// `Error::Unassessable { source: None, .. }`, distinguished from a failed listing since #61) were
+/// being stringified into an opaque `Error::Io` on the way out of `Marker::sweep`.
 ///
 /// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
 /// the tree's dispatch to its marker mechanism where the laundering sat, so none of those tests
 /// could catch this. This test goes through the real public path instead: `Command::spawn` →
-/// the marker mechanism's `Tree` → `Child::kill_tree`/`Drop` →
-/// `is_teardown_mechanism_failure`.
+/// the marker mechanism's `Tree` → `Child::kill_tree`/`Drop`.
 ///
 /// A live cross-uid refuser needs real root to construct (see `tests/group_teardown_setuid.rs`
 /// for why that is not reliably provisionable on macOS: SIP). This instead drives the group
@@ -25,7 +20,7 @@ use crate::test_child::Console;
 /// friends).
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_classifier_path() {
+fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_path() {
     let mut child = crate::test_child::command(Console::Hidden)
         .executable("/usr/bin/true")
         .arg("true") // argv[0]; `executable` alone selects the loaded image, not argv
@@ -42,14 +37,9 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
         "an invalid-pgid refusal is the ORDINARY, expected outcome unix::signal_group's own \
          guard documents — got {err:?} instead"
     );
-    assert!(
-        !is_teardown_mechanism_failure(&err),
-        "an ordinary group-signal refusal must never classify as a teardown MECHANISM \
-         failure — got {err:?}"
-    );
 
     // `Drop` (`kill_on_drop` defaults to true) re-runs the teardown with the forced pgid: it must
-    // return normally. The classification assert above is the sole guard for the laundering bug.
+    // return normally. The variant assert above is the sole guard for the laundering bug.
     drop(child);
 }
 
@@ -80,14 +70,15 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
-    // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
-    // stops reaching the kill.
+    // the `cgroup.kill` write, surfaced as `Error::Containment` over it), so it cannot go vacuous if
+    // the forcing stops reaching the kill.
     let forced = child
         .kill_tree()
         .expect_err("the forced cgroup.kill failure must surface from kill_tree");
     assert!(
-        matches!(&forced, crate::error::Error::Io(io) if io.raw_os_error() == Some(libc::EISDIR)),
-        "the forced failure must be a mechanism-class Error::Io(EISDIR), got {forced:?}"
+        matches!(&forced, crate::error::Error::Containment { .. })
+            && crate::error::first_os_code(&forced) == Some(libc::EISDIR),
+        "the forced failure must be a mechanism-class Error::Containment over EISDIR, got {forced:?}"
     );
 
     let mark = crate::log_capture::mark();

@@ -1,4 +1,4 @@
-use crate::error::{chain, first_os_code, ChildFate, Error, QuoteError, QuoteErrorKind, Report};
+use crate::error::{chain, first_os_code, ChildFate, Error, Failures, QuoteError, QuoteErrorKind, Report};
 use crate::test_child::over_fake::exited_unreaped;
 use std::sync::Arc;
 
@@ -336,7 +336,6 @@ fn first_os_code_walks_the_chain_of_any_variant() {
             detail: "d".into(),
             source: Some(os()),
         }),
-        note: None,
     };
     assert_eq!(first_os_code(&member), Some(code), "through two causes");
     let no_code = Error::Unassessable {
@@ -396,7 +395,6 @@ fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
     let member = Error::MemberNotKilled {
         pid: 1,
         source: Arc::new(Error::Io(os())),
-        note: None,
     };
     assert_eq!(codes_down(&member), [Some(code)]);
     let bare = Error::Containment {
@@ -485,43 +483,6 @@ fn with_note_keeps_each_variant_and_appends() {
         Error::IdentityRecord { kind: RecordErrorKind::ForeignPlatform, detail, .. } if detail == "d; left running"
     ));
     assert_eq!(first_os_code(&e), Some(libc::EACCES));
-}
-
-/// A member left behind by a refused kill takes a note and keeps its OS error as the error's source:
-/// the code is the variant's contract, and the note goes in the variant's own `note`. One that could
-/// not be read takes it the same way, and a second note follows the first.
-///
-/// Mutants: `with_note` wraps the refusal's `io::Error`, which then has no OS code; it drops the note
-/// of a refusal.
-#[cfg(unix)]
-#[skuld::test]
-fn with_note_keeps_the_os_error_of_a_refused_kill_a_member_not_killed() {
-    let refused = Error::MemberNotKilled {
-        pid: 7,
-        source: Arc::new(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM))),
-        note: None,
-    }
-    .with_note("front left");
-    let Error::MemberNotKilled { pid: 7, source, .. } = &refused else {
-        panic!("expected MemberNotKilled, got {refused:?}");
-    };
-    assert!(
-        matches!(&**source, Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
-        "{refused:?}"
-    );
-    assert!(refused.to_string().ends_with("(os error 1); front left"), "{refused}");
-
-    let unread = Error::MemberNotKilled {
-        pid: 7,
-        source: Arc::new(Error::Unassessable {
-            detail: "d".into(),
-            source: None,
-        }),
-        note: None,
-    }
-    .with_note("front left")
-    .with_note("and more");
-    assert!(unread.to_string().ends_with("d; front left; and more"), "{unread}");
 }
 
 /// The elevated-program note belongs to a wrapper-elevated spawn only, and only to a fate that says
@@ -710,4 +671,344 @@ fn report_of_an_io_error_with_context_prints_the_context_and_the_os_error() {
         Some(os_text),
         "the last layer is the OS error"
     );
+}
+
+// Compound errors: `Failures`, `Several`, `MembersLeft` -----
+
+/// Three OS codes that name three different failures on this platform.
+const CODES: [i32; 3] = if cfg!(windows) { [5, 2, 3] } else { [13, 2, 1] };
+
+fn os_text(code: i32) -> String {
+    std::io::Error::from_raw_os_error(code).to_string()
+}
+
+fn coded(code: i32) -> Arc<Error> {
+    Error::io_cause(std::io::Error::from_raw_os_error(code))
+}
+
+fn several(codes: &[i32]) -> Error {
+    Error::Several(failures_of(codes.iter().map(|&code| coded(code))))
+}
+
+fn failures_of(members: impl IntoIterator<Item = Arc<Error>>) -> Failures {
+    Failures::collect(members).expect("a member")
+}
+
+fn not_killed(pid: u32, source: Arc<Error>) -> Arc<Error> {
+    Arc::new(Error::MemberNotKilled { pid, source })
+}
+
+/// Mutant: `iter` skips the first member, or `first` is another than the first.
+#[skuld::test]
+fn failures_hold_their_members_in_order_with_the_count_from_iter() {
+    let members = failures_of(CODES.map(coded));
+    assert_eq!(members.iter().len(), 3);
+    assert!(Arc::ptr_eq(members.first(), members.iter().next().expect("a member")));
+    let codes: Vec<_> = members.iter().map(|m| first_os_code(&**m)).collect();
+    assert_eq!(codes, CODES.map(Some));
+    assert!(
+        Failures::collect(std::iter::empty()).is_none(),
+        "an empty list is not built"
+    );
+}
+
+/// Mutant: one failure is wrapped in a `Several`, which is for two or more.
+#[skuld::test]
+fn one_failure_is_its_own_cause_and_two_or_more_are_a_several() {
+    let one = coded(CODES[0]);
+    let cause = failures_of([Arc::clone(&one)]).into_cause();
+    assert!(Arc::ptr_eq(&cause, &one), "{cause:?}");
+
+    let cause = failures_of([coded(CODES[0]), coded(CODES[1])]).into_cause();
+    let Error::Several(members) = &*cause else {
+        panic!("expected Several, got {cause:?}");
+    };
+    assert_eq!(members.iter().len(), 2);
+}
+
+#[skuld::test]
+fn a_several_says_its_count_and_its_source_is_the_first_member() {
+    let e = several(&CODES);
+    assert_eq!(e.to_string(), "3 failures");
+    let source = std::error::Error::source(&e)
+        .and_then(|source| source.downcast_ref::<Error>())
+        .expect("the first member");
+    let Error::Several(members) = &e else { unreachable!() };
+    assert!(std::ptr::eq(source, &**members.first()));
+}
+
+#[skuld::test]
+fn members_left_says_its_count_and_its_source_is_the_first_member() {
+    let e = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
+        unwalked: None,
+    };
+    assert_eq!(e.to_string(), "2 members of the tree were left running");
+    let source = std::error::Error::source(&e).expect("the first member");
+    assert!(
+        matches!(
+            source.downcast_ref::<Error>(),
+            Some(Error::MemberNotKilled { pid: 7, .. })
+        ),
+        "{source:?}"
+    );
+}
+
+/// The walk that could not be made is no member: the count is of `members`, and one is not "1 members".
+/// Mutants: the count includes the unwalked error; the singular is not worded.
+#[skuld::test]
+fn members_left_counts_its_members_not_the_walk_that_was_not_made() {
+    let one = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0]))]),
+        unwalked: Some(walk_not_made()),
+    };
+    assert_eq!(one.to_string(), "1 member of the tree was left running");
+    let two = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
+        unwalked: Some(walk_not_made()),
+    };
+    assert_eq!(two.to_string(), "2 members of the tree were left running");
+}
+
+fn walk_not_made() -> Arc<Error> {
+    Arc::new(Error::Unassessable {
+        detail: "the table could not be read".into(),
+        source: None,
+    })
+}
+
+#[skuld::test]
+fn the_os_code_of_a_compound_error_is_the_first_members() {
+    assert_eq!(first_os_code(&several(&[CODES[1], CODES[0]])), Some(CODES[1]));
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[2])), not_killed(9, coded(CODES[0]))]),
+        unwalked: None,
+    };
+    assert_eq!(first_os_code(&left), Some(CODES[2]));
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[2]))]),
+        unwalked: Some(walk_not_made()),
+    };
+    assert_eq!(first_os_code(&left), Some(CODES[2]));
+}
+
+/// The members of a `MembersLeft` are only `MemberNotKilled`s: what the walk could not do is `unwalked`.
+///
+/// Mutant: the constructor takes any error as a member, or drops the contract.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "is a MemberNotKilled"))]
+fn a_members_left_of_an_error_that_is_no_member_is_a_contract_breach() {
+    let _ = Error::members_left(failures_of([walk_not_made()]), None);
+}
+
+/// Mutant: `Report` follows `source()` only, so it prints the first member's chain and none of the others.
+#[skuld::test]
+fn report_of_a_several_prints_every_members_chain() {
+    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    assert_eq!(
+        Report(&several(&[CODES[0], CODES[1]])).to_string(),
+        format!("2 failures: (1) {a}: {a}; (2) {b}: {b}")
+    );
+}
+
+#[skuld::test]
+fn report_of_members_left_prints_every_members_chain() {
+    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
+        unwalked: None,
+    };
+    assert_eq!(
+        Report(&left).to_string(),
+        format!(
+            "2 members of the tree were left running: (1) pid 7 was not killed: {a}: {a}; \
+             (2) pid 9 was not killed: {b}: {b}"
+        )
+    );
+}
+
+/// The walk that could not be made follows the members, not numbered among them.
+///
+/// Mutant: `Report` leaves `unwalked` out, or numbers it as a member.
+#[skuld::test]
+fn report_of_members_left_with_an_unwalked_error_prints_it_after_the_members() {
+    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
+        unwalked: Some(walk_not_made()),
+    };
+    assert_eq!(
+        Report(&left).to_string(),
+        format!(
+            "2 members of the tree were left running: (1) pid 7 was not killed: {a}: {a}; \
+             (2) pid 9 was not killed: {b}: {b}; \
+             walk not made: could not determine the target process's state: the table could not be read"
+        )
+    );
+}
+
+/// A list inside a member's chain reads in brackets, so the `;` between its members is not taken
+/// for the outer list's.
+#[skuld::test]
+fn report_of_a_list_in_a_member_brackets_the_inner_list() {
+    let [a, b, c] = CODES.map(os_text);
+    let inner = Arc::new(several(&[CODES[0], CODES[1]]));
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, inner), not_killed(9, coded(CODES[2]))]),
+        unwalked: None,
+    };
+    assert_eq!(
+        Report(&left).to_string(),
+        format!(
+            "2 members of the tree were left running: \
+             (1) pid 7 was not killed: 2 failures: [(1) {a}: {a}; (2) {b}: {b}]; \
+             (2) pid 9 was not killed: {c}: {c}"
+        )
+    );
+}
+
+/// The list is below the site's own variant: its layer's text comes first, and every member after it.
+#[skuld::test]
+fn report_of_a_several_under_a_variant_prints_the_variant_then_every_member() {
+    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let e = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(Arc::new(several(&[CODES[0], CODES[1]]))),
+    };
+    assert_eq!(
+        Report(&e).to_string(),
+        format!("could not determine the target process's state: d: 2 failures: (1) {a}: {a}; (2) {b}: {b}")
+    );
+}
+
+fn codes_of(list: &Failures) -> Vec<Option<i32>> {
+    list.iter().map(|member| first_os_code(&**member)).collect()
+}
+
+/// The other failures of an operation join the error it returns, below its variant, after its own
+/// cause. Mutants: the variant changes; the own cause is dropped or comes after the peers; the
+/// detail takes the peers' text.
+#[skuld::test]
+fn peers_join_the_own_cause_in_a_several_under_the_same_variant() {
+    let e = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(coded(CODES[0])),
+    }
+    .with_peers([coded(CODES[1]), coded(CODES[2])]);
+    let Error::Unassessable {
+        detail,
+        source: Some(source),
+    } = &e
+    else {
+        panic!("the variant is kept: {e:?}");
+    };
+    assert_eq!(detail, "d");
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    assert_eq!(codes_of(list), CODES.map(Some));
+    assert_eq!(first_os_code(&e), Some(CODES[0]));
+}
+
+/// With no cause of its own and one peer, the peer is the cause: a list is for two or more.
+#[skuld::test]
+fn one_peer_and_no_own_cause_makes_the_peer_the_cause() {
+    let e = Error::Containment {
+        detail: "d".into(),
+        source: None,
+    }
+    .with_peers([coded(CODES[1])]);
+    let Error::Containment {
+        source: Some(source), ..
+    } = &e
+    else {
+        panic!("{e:?}");
+    };
+    assert!(
+        matches!(&**source, Error::Io(io) if io.raw_os_error() == Some(CODES[1])),
+        "{source:?}"
+    );
+}
+
+#[skuld::test]
+fn peers_join_a_member_not_killed_and_a_several() {
+    let e = Error::MemberNotKilled {
+        pid: 7,
+        source: coded(CODES[0]),
+    }
+    .with_peers([coded(CODES[1])]);
+    let Error::MemberNotKilled { pid: 7, source } = &e else {
+        panic!("{e:?}");
+    };
+    assert!(matches!(&**source, Error::Several(list) if codes_of(list) == [Some(CODES[0]), Some(CODES[1])]));
+
+    let e = several(&[CODES[0], CODES[1]]).with_peers([coded(CODES[2])]);
+    assert!(
+        matches!(&e, Error::Several(list) if codes_of(list) == CODES.map(Some)),
+        "{e:?}"
+    );
+}
+
+/// An `Error::Io`, `Quote` and `NoConsole` have no cause to hold peers: a site that can have peers
+/// returns a variant that has one, so giving them some is a contract breach, not a silent drop.
+///
+/// Mutant: `with_peers` returns a leaf as it is, or drops the contract.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "has no cause to hold peers"))]
+fn with_peers_on_an_io_error_is_a_contract_breach() {
+    let _ = Error::Io(std::io::Error::from_raw_os_error(CODES[0])).with_peers([coded(CODES[1])]);
+}
+
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "has no cause to hold peers"))]
+fn with_peers_on_a_no_console_error_is_a_contract_breach() {
+    let _ = Error::NoConsole { detail: "d".into() }.with_peers([coded(CODES[1])]);
+}
+
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "has no cause to hold peers"))]
+fn with_peers_on_a_quote_error_is_a_contract_breach() {
+    let _ = Error::Quote(QuoteError::new(7, QuoteErrorKind::TrailingBackslash)).with_peers([coded(CODES[1])]);
+}
+
+/// The members of a `MembersLeft` are a walk's: peers appended to it would read as members left running.
+///
+/// Mutant: `with_peers` adds them as members, or drops the contract.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "are a walk's members"))]
+fn with_peers_on_members_left_is_a_contract_breach() {
+    let _ = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0]))]),
+        unwalked: None,
+    }
+    .with_peers([coded(CODES[1])]);
+}
+
+/// A note goes in a site's own variant. A list has no detail of its own to carry one.
+///
+/// Mutant: `with_note` appends to a compound error as it does to the others, or drops the contract.
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "never to a compound error"))]
+fn with_note_on_a_several_is_a_contract_breach() {
+    let _ = several(&CODES).with_note("n");
+}
+
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "never to a compound error"))]
+fn with_note_on_members_left_is_a_contract_breach() {
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, coded(CODES[0]))]),
+        unwalked: None,
+    };
+    let _ = left.with_note("n");
+}
+
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "never to a compound error"))]
+fn with_note_on_a_member_not_killed_is_a_contract_breach() {
+    let _ = Error::MemberNotKilled {
+        pid: 7,
+        source: coded(CODES[0]),
+    }
+    .with_note("n");
 }

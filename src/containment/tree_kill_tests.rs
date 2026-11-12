@@ -188,9 +188,30 @@ fn a_failed_open_is_not_an_exit() {
     let said = crate::error::Report(&err).to_string();
     assert!(said.contains(&format!("pid {} was killed", first_id.pid())), "{said}");
     assert!(said.contains(&format!("pid {} was killed", second_id.pid())), "{said}");
-    assert!(
-        said.contains("the exit of 1 more"),
-        "the first member is named once, the second as the one more: {said}"
+    // The first member's error stands, with the second below it as a peer: each is named once.
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    let Error::Several(members) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    assert_eq!(
+        members.iter().len(),
+        2,
+        "its own cause and the second member's error: {members:?}"
+    );
+    assert_eq!(
+        said.matches(&format!("pid {} was killed", first_id.pid())).count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(
+        said.matches(&format!("pid {} was killed", second_id.pid())).count(),
+        1,
+        "{said}"
     );
     drop((first_writer, second_writer));
     _ = (first.wait(), second.wait());
@@ -410,26 +431,41 @@ fn an_edge_that_fails_is_the_waits_error() {
 
 #[cfg(any(windows, target_os = "linux"))]
 fn assert_is_the_edges_error(err: &Error) {
-    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    // An `Io` is a leaf with no slot for peers, so the wait's `Unassessable` holds it.
+    assert!(
+        matches!(err, Error::Unassessable { source: Some(source), .. } if matches!(&**source, Error::Io(_))),
+        "{err:?}"
+    );
 }
 
 /// `err` is a wait's error when the root's look and the edge both failed: the root's is first, and the
-/// edge's is in its note.
+/// edge's is a peer of the root's own cause, in a `Several` below it.
 #[cfg(any(windows, target_os = "linux"))]
 fn assert_the_root_comes_before_the_edge(err: &Error) {
+    let Error::Unassessable {
+        detail,
+        source: Some(source),
+    } = err
+    else {
+        panic!("the root's error comes first: {err:?}");
+    };
+    assert!(detail.starts_with("the root was killed"), "{detail}");
     assert!(
-        matches!(err, Error::Unassessable { detail, .. } if detail.starts_with("the root was killed")),
-        "the root's error comes first: {err:?}"
+        !detail.contains("more could not"),
+        "no member's words are in the detail: {detail}"
     );
-    let said = crate::error::Report(err).to_string();
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    assert_eq!(list.iter().len(), 2, "{list:?}");
     assert!(
-        said.contains("the exit of 1 more could not be observed either"),
-        "the edge's error is in its note: {said}"
+        matches!(&**list.iter().nth(1).expect("the edge's error"), Error::Io(_)),
+        "the edge's error is the second: {list:?}"
     );
 }
 
 /// The edge is waited for after the root, so when both fail the first error is the root's and the
-/// edge's is in its note.
+/// edge's is a peer below it.
 ///
 /// Mutant: the edge is waited for before the root.
 #[cfg(any(windows, target_os = "linux"))]
@@ -445,6 +481,39 @@ fn the_roots_error_comes_before_the_edges() {
         .expect_err("neither the root's exit nor the edge could be observed");
 
     assert_the_root_comes_before_the_edge(&err);
+}
+
+/// A wait whose first failure is an `Error::Io` (a leaf, with no slot for peers) answers an
+/// `Unassessable`, with that `Io` and every other failure below it, in order: none is dropped.
+///
+/// Mutants: the peers are dropped behind the `Io`; the `Io` is returned bare.
+#[skuld::test]
+fn a_wait_whose_first_failure_is_an_io_error_keeps_every_failure_below_an_unassessable() {
+    let code = |error: &Error| crate::error::first_os_code(error);
+    let io = |code: i32| Error::Io(std::io::Error::from_raw_os_error(code));
+    let unobserved = vec![
+        io(2),
+        super::exit_unobserved(4242, io(3)),
+        super::root_unobserved(io(5)),
+    ];
+
+    let err = super::answer_of(unobserved).expect_err("three exits could not be observed");
+
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &err
+    else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = list.iter().map(|member| code(member)).collect();
+    assert_eq!(codes, [Some(2), Some(3), Some(5)]);
+
+    let alone = super::answer_of(vec![io(2)]).expect_err("one exit could not be observed");
+    assert!(matches!(&alone, Error::Unassessable { .. }), "{alone:?}");
+    assert_eq!(code(&alone), Some(2));
 }
 
 /// A kill that failed is the call's answer whatever the wait finds, and the members it reached are
@@ -675,7 +744,7 @@ mod awaited {
     }
 
     /// The awaited wait waits for the edge after the root, as the sync one does: when both fail the
-    /// first error is the root's, with the edge's in its note.
+    /// first error is the root's, with the edge's below it.
     ///
     /// Mutant: the edge is awaited before the root.
     #[cfg(any(windows, target_os = "linux"))]

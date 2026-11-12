@@ -204,9 +204,17 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 /// [`unqueryable`] for the ordered read of `pid` that left `Unknown` with `cause`: the subject is
 /// `label pid`, or the parent whose proof failed when `cause` blames it, in which case a note says
 /// which read was left unanswered: `pid`'s. This is the one place that words it.
-pub(crate) fn unqueryable_read(label: &str, pid: RawPid, cause: UnknownCause) -> Error {
+pub(crate) fn unqueryable_read(label: &str, pid: RawPid, mut cause: UnknownCause) -> Error {
     match cause.blamed_parent() {
-        Some(parent) => unqueryable(&format!("ppid {parent}"), cause).with_note(&format!("reading pid {pid}")),
+        Some(parent) => {
+            // The candidate's own failed read, when it had one, is a peer of the parent's proof.
+            let own = cause
+                .take_candidate()
+                .and_then(|own| own.into_error(&format!("{label} {pid}")));
+            unqueryable(&format!("ppid {parent}"), cause)
+                .with_note(&format!("reading pid {pid}"))
+                .with_peers(own.map(std::sync::Arc::new))
+        }
         None => unqueryable(&format!("{label} {pid}"), cause),
     }
 }
@@ -229,6 +237,12 @@ impl Judged {
             Judged::Settled(answer) => answer,
             Judged::IfParentHolds(answer) => match proof() {
                 Ok(()) => answer,
+                // A proof that cannot be made decides the answer, and keeps the candidate's own
+                // failed read beside its cause.
+                Err((Resolved::Unknown, cause)) => match answer {
+                    (Resolved::Unknown, own) => (Resolved::Unknown, cause.beside_candidate(own)),
+                    (_, _) => (Resolved::Unknown, cause),
+                },
                 Err(verdict) => verdict,
             },
         }
@@ -729,6 +743,9 @@ pub(crate) struct UnknownCause {
     /// The `NTSTATUS` of the refused creator-pid query that left the read `Unknown`.
     #[cfg(windows)]
     creator_status: Option<windows::Win32::Foundation::NTSTATUS>,
+    /// The candidate's own failed read, when the proof of its parent failed too and decided the
+    /// answer ([`Judged::proved`]): kept beside the parent's cause, which this one is.
+    candidate: Option<Box<UnknownCause>>,
 }
 
 impl UnknownCause {
@@ -742,6 +759,18 @@ impl UnknownCause {
     fn of_parent(mut self, parent: RawPid) -> UnknownCause {
         self.parent = Some(parent);
         self
+    }
+
+    /// This cause, the failed proof of a parent, with the candidate's own failed read `own` kept
+    /// beside it.
+    fn beside_candidate(mut self, own: UnknownCause) -> UnknownCause {
+        self.candidate = Some(Box::new(own));
+        self
+    }
+
+    /// The candidate's own failed read kept beside this cause, once.
+    fn take_candidate(&mut self) -> Option<UnknownCause> {
+        self.candidate.take().map(|own| *own)
     }
 
     /// This cause, for a read whose creator-pid query was refused with `status`.
@@ -773,6 +802,7 @@ impl UnknownCause {
             view,
             call: None,
             parent: None,
+            candidate: None,
         }
     }
 
@@ -783,6 +813,7 @@ impl UnknownCause {
             view: None,
             call: Some(call),
             parent: None,
+            candidate: None,
         }
     }
 
