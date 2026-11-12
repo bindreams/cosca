@@ -564,8 +564,8 @@ fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
 
 /// A child killed before it reports, with a copy of its end held, and a watch that fails as
 /// `fault` says: the parent still forces EOF, so the spawn does not wait on the holder. Returns the
-/// spawn's error text. The child is reaped here when the watch left it unreaped.
-fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> String {
+/// spawn's error. The child is reaped here when the watch left it unreaped.
+fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> Error {
     let (mut cmd, reader) = marker_command();
     fault::reset_leaked_pid();
     let holder = fault::arm_fork_holder();
@@ -584,9 +584,7 @@ fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> String {
         ends.eof_forced,
         "{fault_kind:?}: only a forced EOF reaches the helper through the copy"
     );
-    let err = err
-        .expect("a child killed before it reports fails the spawn")
-        .to_string();
+    let err = err.expect("a child killed before it reports fails the spawn");
     if let Some(Some(pid)) = fault::take_leaked_pid() {
         // SAFETY: `pid` is this thread's own zombie child, so waiting on it is sound.
         let reaped = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
@@ -607,6 +605,7 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
         fault::WatchFault::Open(Errno::NFILE),
         fault::WatchFault::Open(Errno::NOMEM),
         fault::WatchFault::Move(Errno::MFILE),
+        fault::WatchFault::Move(Errno::INVAL),
         fault::WatchFault::Peek(Errno::INVAL),
         // A same-user process lowering `RLIMIT_NOFILE` below 2 makes `poll` fail so.
         fault::WatchFault::Poll(Errno::INVAL),
@@ -615,12 +614,39 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
         | fault::WatchFault::Move(errno)
         | fault::WatchFault::Peek(errno)
         | fault::WatchFault::Poll(errno)) = fault_kind;
-        let said = killed_child_with_a_failing_watch(fault_kind);
+        let error = killed_child_with_a_failing_watch(fault_kind);
+        let said = error.to_string();
         assert!(
             said.contains("its exit could not be watched") && said.contains(&errno.to_string()),
             "{fault_kind:?}: {said}"
         );
+        // The failure is the error's source, so a caller finds its code by walking the chain.
+        assert_eq!(
+            error.raw_os_error(),
+            Some(errno.raw_os_error()),
+            "{fault_kind:?}: {said}"
+        );
+        // A failure after resolution carries its OS error's kind (`InvalidInput` for an `EINVAL`).
+        let Error::Io(io) = &error else {
+            panic!("{fault_kind:?}: {error:?}")
+        };
+        assert_eq!(io.kind(), std::io::Error::from(errno).kind(), "{fault_kind:?}: {said}");
     }
+}
+
+/// The spawn error wraps the failed watch's raw cause once: below `Error::Io`, the raw `io::Error`
+/// is two `source()` steps down (the context's `io::Error`, then the cause).
+///
+/// Mutant: the cause is wrapped in the watch's context and then in the spawn's.
+#[skuld::test]
+fn a_failed_watch_is_wrapped_once_over_its_raw_cause() {
+    let error = killed_child_with_a_failing_watch(fault::WatchFault::Open(Errno::MFILE));
+    let raw = crate::error::chain(&error).position(|layer| {
+        layer
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.raw_os_error() == Some(Errno::MFILE.raw_os_error()))
+    });
+    assert_eq!(raw, Some(2), "{error:?}");
 }
 
 /// A watch that finds the number names no child of this process (`ESRCH`; `ENOENT` or `EINVAL`
@@ -628,7 +654,7 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
 #[skuld::test]
 fn a_number_that_names_no_child_forces_eof() {
     for errno in [Errno::SRCH, Errno::NOENT, Errno::INVAL] {
-        let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno));
+        let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno)).to_string();
         assert!(said.ends_with("died before it could send its pidfd"), "{errno}: {said}");
     }
 }
@@ -1271,7 +1297,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
     for outcome in [
         Outcome::Failed(Error::Io(io("helper")), None),
         Outcome::NoReport,
-        Outcome::Unwatched("cause".into()),
+        Outcome::Unwatched("what", io("cause")),
     ] {
         let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, None)
             .err()
@@ -1317,7 +1343,7 @@ fn a_returned_child_with_no_pidfd_is_killed() {
     for outcome in [
         Outcome::Failed(Error::Io(std::io::Error::other("helper")), None),
         Outcome::NoReport,
-        Outcome::Unwatched("forced".to_string()),
+        Outcome::Unwatched("what", std::io::Error::other("forced")),
     ] {
         // A `cat` that has already ended, so the child the arm leaves unreaped runs no more.
         let (mut cat, _pidfd) = cat_with_pidfd();
@@ -1398,7 +1424,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
     answered(super::conclude(Err::<NoChild, _>(io("x")), Outcome::NoReport, None)).expect_not_started();
     answered(super::conclude(
         Err::<NoChild, _>(io("x")),
-        Outcome::Unwatched("cause".into()),
+        Outcome::Unwatched("what", io("cause")),
         None,
     ))
     .expect_not_started();
@@ -1457,12 +1483,12 @@ fn conclude_answers_every_remaining_pair() {
         "{error:?}"
     );
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::Unwatched("cause".into()), None)
+    let error = super::conclude(Ok(cat), Outcome::Unwatched("what", io("cause")), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
     assert!(
-        matches!(&error, Error::Io(e) if e.to_string().contains("its exit could not be watched (cause)")),
+        matches!(&error, Error::Io(e) if e.to_string().contains("its exit could not be watched: what: cause")),
         "{error:?}"
     );
 

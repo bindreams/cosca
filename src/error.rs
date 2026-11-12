@@ -432,8 +432,8 @@ fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
     }
 }
 
-/// `source` with `context` prepended to its message and kept as the new error's
-/// [`source`](std::error::Error::source), so its OS code survives: several codes share one
+/// `source` with `context` prepended to its message, of `source`'s own kind, and kept as the new
+/// error's [`source`](std::error::Error::source), so its OS code survives: several codes share one
 /// [`std::io::ErrorKind`], and the code is what tells a caller which failure it was.
 pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(

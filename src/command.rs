@@ -271,6 +271,10 @@ impl Command {
     /// The dividing line is whether a different filesystem could make the name succeed: if
     /// no disk ever could, the refusal is a property of the string, and it is `InvalidInput`.
     ///
+    /// These are the kinds of resolution's answers, not a promise that no other spawn failure has
+    /// them: a failure after resolution carries its OS error's kind, and another refused input (a
+    /// `current_dir` or an argument with an embedded NUL) is `InvalidInput` too.
+    ///
     /// Every Windows spawn refuses a `.bat`/`.cmd` that only Win32's normalisation exposes, such as
     /// `C:\t\setup.bat.` (trailing dot), `C:\t\setup.bat ` (one trailing space) and `C:\t\.bat`,
     /// with [`Error::Unsupported`] (CVE-2024-24576).
@@ -326,7 +330,8 @@ impl Command {
     /// with [`std::io::ErrorKind::InvalidInput`] on every platform. On Windows so is a rooted name
     /// (`\bin\tool.exe`) when this process's cwd is verbatim (`\\?\`), which Win32 completes to
     /// `\\bin\tool.exe`, off that cwd's volume (measured), and a relative one whose `..` Win32
-    /// completes past a verbatim share.
+    /// completes past a verbatim share. As on [`executable`](Self::executable), other spawn
+    /// failures can be `InvalidInput` too.
     ///
     /// On Windows a `.bat`/`.cmd` is refused with [`Error::Unsupported`] (CVE-2024-24576), judged
     /// on the name Win32 loads, so `setup.bat.` and `C:\t\.bat` are refused too.
