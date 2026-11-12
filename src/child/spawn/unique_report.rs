@@ -416,9 +416,9 @@ fn check(pid: u32) -> io::Result<Check> {
             Origin::Ours { parent } => Check::Traced(parent),
             Origin::NotOurs | Origin::Gone => Check::Gone,
             Origin::Refused(errno) => {
-                return Err(io::Error::new(
-                    io::Error::from_raw_os_error(errno).kind(),
-                    format!("pid {pid}: whether it is this process's child could not be read (errno {errno})"),
+                return Err(crate::error::io_context(
+                    format!("pid {pid}: whether it is this process's child could not be read"),
+                    io::Error::from_raw_os_error(errno),
                 ))
             }
             Origin::Unreadable => {
@@ -525,14 +525,14 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
         Report::ReadFailed(e) => not(
             Unadoptable::Unverified,
             Error::Unassessable {
-                detail: format!("pid {pid}: its unique-id report could not be read ({e}); the child was not adopted"),
+                detail: format!("pid {pid}: its unique-id report could not be read; the child was not adopted"),
                 source: Some(Error::io_cause(e)),
             },
         ),
         Report::WaitFailed(e) => not(
             Unadoptable::Unverified,
             Error::Unassessable {
-                detail: format!("pid {pid}: the wait for its unique-id report failed ({e}); the child was not adopted"),
+                detail: format!("pid {pid}: the wait for its unique-id report failed; the child was not adopted"),
                 source: Some(Error::io_cause(e)),
             },
         ),
@@ -574,9 +574,8 @@ pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {
 /// vanish.
 pub(crate) fn refused_error(errno: i32) -> Error {
     Error::Unassessable {
-        detail: format!(
-            "the spawned child could not read its own unique id (errno {errno}); it was stopped before exec, so the program did not start"
-        ),
+        detail: "the spawned child could not read its own unique id; it was stopped before exec, so the program did not start"
+            .into(),
         source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
     }
 }

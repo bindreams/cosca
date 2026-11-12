@@ -114,20 +114,44 @@ fn a_missing_report_is_a_child_that_died_before_exec() {
 fn a_refusal_under_an_ok_spawn_means_the_program_did_not_start() {
     let not_adopted = adopted_id(Report::ChildRefused(libc::EPERM), 9).expect_err("no id");
     assert_eq!(not_adopted.why, Unadoptable::DiedBeforeExec);
+    assert_eq!(
+        not_adopted.error.raw_os_error(),
+        Some(libc::EPERM),
+        "the errno is the source"
+    );
     let Error::Unassessable { detail, .. } = not_adopted.error else {
         panic!("a refusal is Unassessable")
     };
     assert!(detail.contains("did not start"), "{detail}");
+    assert!(
+        !detail.contains("errno"),
+        "the cause is the source, not the detail: {detail}"
+    );
 }
 
 /// Mutant: the parent's own read failure is taken for the child's refusal, or for a program that did
 /// not start.
+///
+/// Mutant: the failure's text is the detail's too, so the chain says it twice.
 #[skuld::test]
 fn a_failed_read_is_unassessable_with_its_error_and_not_a_corpse() {
-    let not_adopted =
-        adopted_id(Report::ReadFailed(std::io::Error::from_raw_os_error(libc::EIO)), 7).expect_err("no id");
-    assert_eq!(not_adopted.why, Unadoptable::Unverified);
-    assert!(matches!(not_adopted.error, Error::Unassessable { source: Some(_), .. }));
+    for failed in [
+        Report::ReadFailed(std::io::Error::from_raw_os_error(libc::EIO)),
+        Report::WaitFailed(std::io::Error::from_raw_os_error(libc::EIO)),
+    ] {
+        let not_adopted = adopted_id(failed, 7).expect_err("no id");
+        assert_eq!(not_adopted.why, Unadoptable::Unverified);
+        assert_eq!(not_adopted.error.raw_os_error(), Some(libc::EIO));
+        let Error::Unassessable { detail, source } = not_adopted.error else {
+            panic!("a failed read is Unassessable")
+        };
+        assert!(source.is_some());
+        let os_text = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+        assert!(
+            !detail.contains(&os_text),
+            "the cause is the source, not the detail: {detail}"
+        );
+    }
 }
 
 /// A report that came after the spawn returned does not show the child died: it ran its hook, and

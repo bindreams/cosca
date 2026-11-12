@@ -136,8 +136,8 @@ enum Outcome {
     /// EOF before any report: the child died before it could report, or never reached its hook.
     NoReport,
     /// [`Outcome::NoReport`], the EOF forced because the child's exit could not be watched. Carries
-    /// why.
-    Unwatched(String),
+    /// what failed, and why.
+    Unwatched(&'static str, io::Error),
 }
 
 /// Registers the hook on `cmd`, as its FIRST `pre_exec` hook where the caller can arrange it: the
@@ -366,8 +366,8 @@ impl Handshake {
                     Watch::Exited => true,
                     // Not knowing is no reason to wait on a copy this process cannot see: with
                     // open stdio the child has execed or died, so nothing is lost by the EOF.
-                    Watch::Unwatchable(cause) => {
-                        unwatched = Some(cause);
+                    Watch::Unwatchable(what, cause) => {
+                        unwatched = Some((what, cause));
                         true
                     }
                 },
@@ -392,7 +392,7 @@ impl Handshake {
                 &seams,
             );
             let outcome = match (outcome, unwatched) {
-                (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
+                (Outcome::NoReport, Some((what, cause))) => Outcome::Unwatched(what, cause),
                 (outcome, _) => outcome,
             };
             conclude(spawned, outcome, warn_after)
@@ -406,8 +406,8 @@ enum Watch {
     Running,
     /// The child exited while the helper still waited, or its number names no child of this one.
     Exited,
-    /// The child could not be watched, for this cause.
-    Unwatchable(String),
+    /// The child could not be watched: what failed, and why.
+    Unwatchable(&'static str, io::Error),
 }
 
 /// After a successful `spawn()`: blocks until the helper is done or the child has exited, and says
@@ -423,20 +423,20 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     use crate::wait::exit_only::{peek, Target};
     use crate::wait::{any_ready_now, poll_ready};
 
-    let unwatchable = |what: &str, e: &(dyn std::error::Error + 'static)| {
+    let unwatchable = |what: &'static str, e: io::Error| {
         log::warn!(
             "{}: the spawned child's exit cannot be watched ({what}: {report}); the wait for its report is ended",
             super::named(pid),
-            report = crate::error::Report(e)
+            report = crate::error::Report(&e)
         );
-        Watch::Unwatchable(format!("{what}: {e}"))
+        Watch::Unwatchable(what, e)
     };
     // Normally the child reported and execed: the helper is done, and nothing needs watching.
     let mut fds = [PollFd::new(done, PollFlags::IN)];
     match any_ready_now(&mut fds) {
         Ok(true) if fds[0].revents().contains(PollFlags::IN) => return Watch::Running,
         Ok(_) => {}
-        Err(e) => return unwatchable("poll on the helper's completion", &e),
+        Err(e) => return unwatchable("poll on the helper's completion", e.into()),
     }
     let Some(raw) = pid
         .and_then(|pid| i32::try_from(pid).ok())
@@ -493,19 +493,19 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         Ok(watch) => {
             #[cfg(test)]
             let moved = match fault::watch_move_errno() {
-                Some(errno) => Err(Error::Io(io::Error::from(errno))),
-                None => above_stdio(watch),
+                Some(errno) => Err(io::Error::from(errno)),
+                None => crate::above_stdio::above_stdio(watch),
             };
             #[cfg(not(test))]
-            let moved = above_stdio(watch);
+            let moved = crate::above_stdio::above_stdio(watch);
             match moved {
                 Ok(watch) => watch,
-                Err(e) => return unwatchable("moving its pidfd above stdio", &e),
+                Err(e) => return unwatchable("moving its pidfd above stdio", e),
             }
         }
         // The child was reaped, and the number is free or names no thread-group leader.
         Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Watch::Exited,
-        Err(e) => return unwatchable("pidfd_open", &e),
+        Err(e) => return unwatchable("pidfd_open", e.into()),
     };
     #[cfg(test)]
     let injected = fault::watch_peek_errno();
@@ -524,7 +524,7 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         Ok(PeekOutcome::Running) => {}
         Err(e) => {
             debug_assert!(injected, "waitid on a spawned child's pidfd failed: {e}");
-            return unwatchable("waitid on its pidfd", &e);
+            return unwatchable("waitid on its pidfd", e);
         }
     }
     #[cfg(test)]
@@ -540,7 +540,7 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     // No contract: a process of the same user can lower `RLIMIT_NOFILE` below the two descriptors
     // polled, and `poll` then fails with `EINVAL`.
     if let Err(e) = polled {
-        return unwatchable("poll on its pidfd", &e);
+        return unwatchable("poll on its pidfd", e.into());
     }
     if !fds[0].revents().contains(PollFlags::IN) && !fds[1].revents().is_empty() {
         Watch::Exited
@@ -838,17 +838,18 @@ fn conclude(
             None => not_started(e),
         },
         // The child reads EOF in place of its verdict, whenever it reaches its hook.
-        (Ok(child), Outcome::Unwatched(cause)) => {
+        (Ok(child), Outcome::Unwatched(what, cause)) => {
             let named = super::named(Some(child.id()));
             abandon_unreported(child, "it sent no pidfd, and its exit could not be watched");
             with_child(
-                Error::Io(io::Error::other(format!(
-                    "the spawned child ({named}) sent no pidfd, and its exit could not be watched ({cause})"
-                ))),
+                Error::Io(crate::error::io_context(
+                    format!("the spawned child ({named}) sent no pidfd, and its exit could not be watched: {what}"),
+                    cause,
+                )),
                 ChildFate::Killed,
             )
         }
-        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => not_started(Error::Io(e)),
+        (Err(e), Outcome::NoReport | Outcome::Unwatched(..)) => not_started(Error::Io(e)),
     }
 }
 
