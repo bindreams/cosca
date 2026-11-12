@@ -710,21 +710,27 @@ struct SuspendedHelper {
     thread: windows::Win32::Foundation::HANDLE,
     tid: u32,
     pid: u32,
-    _child: crate::test_spawn::locked::RawChild,
+    _child: crate::test_spawn::raw_spawn::RawChild,
     _job: super::JobHandle,
 }
 
 impl SuspendedHelper {
     fn new() -> Self {
         use crate::test_spawn::console_flags::Console;
+        use crate::test_spawn::raw_spawn::{spawn_locked_raw_with, RawOptions, RawStdio};
         use std::os::windows::io::AsRawHandle as _;
         use windows::Win32::System::Threading::CREATE_SUSPENDED;
-        let child = crate::test_spawn::locked::spawn_locked_raw(
+        let options = RawOptions {
+            stdio: RawStdio::Null,
+            ..Default::default()
+        };
+        let child = spawn_locked_raw_with(
             "cmd",
             &["/C", "more"],
             &[],
             CREATE_SUSPENDED.0,
             Console::Hidden,
+            options,
         )
         .expect("spawn the suspended helper");
         let job =

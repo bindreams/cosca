@@ -69,6 +69,10 @@ mod factory;
 pub use factory::*;
 mod locked;
 pub use locked::*;
+#[cfg(windows)]
+mod raw_spawn;
+#[cfg(windows)]
+pub use raw_spawn::*;
 
 #[cfg(windows)]
 impl Target for RawChild {

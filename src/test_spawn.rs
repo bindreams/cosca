@@ -22,15 +22,11 @@ use std::os::windows::process::CommandExt as _;
 #[path = "../tests/common/console_flags.rs"]
 pub(crate) mod console_flags;
 
-// The integration tests' raw `CreateProcessW` spawn (`locked::spawn_locked_raw_with`), compiled from
-// its real source with the one other file it names.
+// The integration tests' raw `CreateProcessW` spawn, compiled from its real source with the one
+// other file it names besides `console_flags`.
 #[cfg(windows)]
-#[allow(
-    dead_code,
-    reason = "the lib's tests use the raw spawn only; the file's other wrappers are for tests/"
-)]
-#[path = "../tests/common/locked.rs"]
-pub(crate) mod locked;
+#[path = "../tests/common/raw_spawn.rs"]
+pub(crate) mod raw_spawn;
 #[cfg(windows)]
 #[path = "../tests/common/windows_env.rs"]
 mod windows_env;

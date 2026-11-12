@@ -575,15 +575,22 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
 
     // Absolute, extensionless, NONEXISTENT — the shape `raw_executable("tool")` produces.
     let missing = dir.path().join("tool");
-    let missing = missing.to_str().expect("the temp path is UTF-8");
-    // The image is named by `lpApplicationName`, so no search or extension applies; the command
-    // line only supplies argv[0]. `CREATE_SUSPENDED`: the child must not run before `contain`
-    // assigns it to a kill-on-close job.
+    // `lpApplicationName` is the path and there is no command line, the input the doc names.
+    // `CREATE_SUSPENDED`: the child must not run before `contain` assigns it to a kill-on-close job.
     let options = RawOptions {
-        image: Some(missing),
+        exact_image: true,
+        no_command_line: true,
         stdio: RawStdio::Null,
     };
-    let res = spawn_locked_raw_with(missing, &[], &[], CREATE_SUSPENDED.0, Console::Hidden, options).map(|child| {
+    let res = spawn_locked_raw_with(
+        &missing,
+        &[] as &[&str],
+        &[],
+        CREATE_SUSPENDED.0,
+        Console::Hidden,
+        options,
+    )
+    .map(|child| {
         // `contain` and `wait_for` close the handles themselves.
         let pi = child.into_process_information();
         let job = contain(&pi, "PROBE createprocessw-pathext");

@@ -335,10 +335,11 @@ pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, Stri
 
     let file = std::fs::File::create(out_path).map_err(|e| format!("could not open the capture file: {e}"))?;
     let options = RawOptions {
-        image: Some(program),
+        exact_image: true,
         stdio: RawStdio::Output(file.as_handle()),
+        ..Default::default()
     };
-    let child = spawn_locked_raw_with(program, &[], &[], 0, Console::Hidden, options)
+    let child = spawn_locked_raw_with(program, &[] as &[&str], &[], 0, Console::Hidden, options)
         .map_err(|e| format!("did not spawn: {e}"))?;
     // The wait is unbounded: the child is `cosca_testbin_image`, which exits on its own.
     let code = child.wait().map_err(|e| format!("waiting for the child failed: {e}"))?;
