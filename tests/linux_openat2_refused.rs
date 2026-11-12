@@ -204,8 +204,7 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_the_snaps
     );
 }
 
-/// `EACCES` is also the kernel's own answer to a `/proc` that may not be opened, so an `openat2`
-/// answering it is not the requirement: `Unassessable` carrying `EACCES`.
+/// An `openat2` answering `EACCES` is not the requirement: `Unassessable` carrying `EACCES`.
 ///
 /// Mutant: the refusal set of `openat2` includes `EACCES`, or the errno is dropped.
 #[cfg(target_os = "linux")]
@@ -303,6 +302,21 @@ fn a_seccomp_refused_openat2_with_another_errno_is_not_unsupported_for_a_group_l
         Err(e) => assert!(!e.to_string().contains("cosca requires openat2"), "{e}"),
         Ok(()) => panic!("a group that cannot be listed was reported as killed"),
     }
+    common::kill_tree_release_reap(&child, control);
+}
+
+/// A `Session` child's group listing that fails on `EACCES` is `Unassessable` carrying `EACCES`:
+/// the errno survives the listing's `io::Error`.
+///
+/// Mutant: the listing builds `io::Error::other(message)` and drops the errno.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_seccomp_refused_openat2_with_eacces_is_unassessable_carrying_eacces_for_a_session_kill_tree() {
+    let (child, control) = common::spawn_control("control-block", &["R"], true);
+    let result = with_openat2_refused(libc::EACCES, || child.kill_tree());
+    let err = result.expect_err("a group that cannot be listed was reported as killed");
+    assert!(matches!(err, cosca::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(os_code(&err), Some(libc::EACCES), "{err:?}");
     common::kill_tree_release_reap(&child, control);
 }
 
