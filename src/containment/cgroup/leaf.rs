@@ -494,8 +494,7 @@ impl CgroupLeaf {
     /// Hard-kill all processes in the cgroup via `cgroup.kill` (kernel ≥ 5.14).
     ///
     /// `Ok` means the kill was delivered, not that the members have exited yet (see
-    /// [`wait_drained`](CgroupLeaf::wait_drained), and
-    /// [`Contains::kill`](crate::containment::Contains::kill) for the call that waits for them): either the atomic kill fired, or the leaf was
+    /// [`wait_drained`](CgroupLeaf::wait_drained)): either the atomic kill fired, or the leaf was
     /// already gone ([`removed_after_drain`]), which is itself proof every member had exited —
     /// `rmdir` on a cgroup v2 leaf succeeds only once `populated` reads 0.
     ///
@@ -819,11 +818,12 @@ impl CgroupLeaf {
     }
 
     /// The members `cgroup.procs` lists now, in the leaf and in every cgroup under it, for the wait
-    /// over a kill that follows: each is proved a member of the leaf through its own pidfd, and its identity is read from that pidfd, which is
-    /// then closed, so no descriptor is held per member. `root`, the root's pid, is left out: its
-    /// owner waits for it. A leaf already gone has no member. A member that cannot be named, or the
-    /// listing itself failing, is returned as an error saying its exit cannot be observed; the kill
-    /// goes ahead regardless.
+    /// over a kill that follows. Each is pinned by its own pidfd, shown to be in the leaf through it,
+    /// and its identity read from it, so a pid reused since `cgroup.procs` was read is not listed;
+    /// the pidfd is then closed, so no descriptor is held per member. `root`, the root's pid, is left
+    /// out: its owner waits for it. A leaf already gone has no member. A member that cannot be named,
+    /// or the listing itself failing, is returned as an error saying its exit cannot be observed; the
+    /// kill goes ahead regardless.
     pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<Listed>, Vec<crate::error::Error>) {
         use crate::containment::tree_kill::exit_unobserved;
         use crate::error::Error;
@@ -907,8 +907,10 @@ impl CgroupLeaf {
     /// those the kill reached, which exit whatever their credentials, and the members whose place
     /// cannot be told, as errors saying their exit cannot be observed. Each is opened by identity and
     /// placed through its pidfd ([`Subtree::reached_by`]). One still in the leaf or under it was
-    /// reached. One found outside is TAKEN to have left before the kill: it is no part of the tree, so
-    /// it is neither waited for nor, by this check, known to have been killed. One already gone was in
+    /// reached. One found outside is taken to have left before the kill: it is no part of the tree, so
+    /// it is neither waited for nor, by this check, known to have been killed. One another process
+    /// moved out after the kill reached it reads the same: it was sent `SIGKILL` and is not waited
+    /// for (a stated limit, see [`Child::kill_tree`](crate::Child::kill_tree)). One already gone was in
     /// the tree and has exited: it is kept, and its wait ends at once.
     pub(crate) fn reached_by_kill(
         &self,
@@ -1023,12 +1025,12 @@ enum PlacedOrExitedOutcome<T> {
     Exited(io::Error),
 }
 
-/// `placed`, the answer of a placement of the process `pidfd` pins; `Exited` if it failed because the
-/// process exited and was reaped since its pin, which leaves no place to read (`ENOENT` from `/proc`,
-/// `ESRCH` from `PIDFD_GET_INFO`): its pidfd tells that apart. The one rule for a failed placement.
-/// The error of one that failed while the exit cannot be read either is an `Unassessable` with the
-/// placement's `io::Error` as its source, and the exit read's failure in its detail; a caller
-/// renders it with [`Report`](crate::error::Report) to name both.
+/// `Exited` if the placement of the process `pidfd` pins failed because the process exited and was
+/// reaped since its pin, which leaves no place to read (`ENOENT` from `/proc`, `ESRCH` from
+/// `PIDFD_GET_INFO`): its pidfd tells that apart. The error of one that failed while the exit cannot
+/// be read either is an `Unassessable` with the placement's `io::Error` as its source, and the exit
+/// read's failure in its detail; a caller renders it with [`Report`](crate::error::Report) to name
+/// both.
 fn placed_or_exited<T>(
     pidfd: std::os::fd::BorrowedFd<'_>,
     placed: io::Result<T>,

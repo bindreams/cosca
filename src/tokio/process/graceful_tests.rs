@@ -69,6 +69,9 @@ async fn async_foreign_graceful_watch_error_still_escalates() {
     );
 }
 
+/// The foreign `Process`'s escalation sweeps after a failed watch. Gap: no row shows that this
+/// escalation awaits its wait, because a real member's exit after its `SIGKILL` cannot be held
+/// without a new kernel seam on the escalation (`tokio::Child`'s is shown in `tree_kill_tests.rs`).
 #[skuld::test]
 async fn async_foreign_graceful_tree_watch_error_still_sweeps() {
     let mut child = spawn_term_ignoring_blocker();

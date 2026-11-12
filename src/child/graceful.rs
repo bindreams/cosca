@@ -575,34 +575,61 @@ impl Child {
         if let Err(e) = self.tree.wait_drained(crate::wait::deadline_from(grace)) {
             call.holders_grace_failed(&e);
         }
-        let (error, wait) = self.holders_shutdown_error(&call, skip);
-        // The call's answer is the error, whatever the wait finds: it ends the holders it killed.
-        if let Err(e) = wait.wait() {
-            log::debug!(
-                "graceful_shutdown_tree({}): the wait for the killed marker holders failed: {report}",
-                self.pid(),
-                report = crate::error::Report(&e)
-            );
-        }
-        error
+        self.holders_shutdown(&call, skip).finish()
     }
 
     /// The end of [`shut_down_holders_only`](Self::shut_down_holders_only): the mechanism's kill with
-    /// the same root, taken under a hold of its own, which is not held across the grace. The wait is
-    /// for what that kill reached, for a sync caller to take; an async one lets it go.
+    /// the same root, taken under a hold of its own, which is not held across the grace. The pending
+    /// shutdown is finished by its caller, sync or async, which waits for what that kill reached.
     #[cfg(unix)]
-    pub(crate) fn holders_shutdown_error(
-        &self,
-        call: &SkipCall<'_>,
-        skip: &Skip,
-    ) -> (Error, crate::containment::KillWait<'_>) {
+    pub(crate) fn holders_shutdown(&self, call: &SkipCall<'_>, skip: &Skip) -> HoldersShutdown<'_> {
         let (kill, mut wait) = {
             let held = self.proc.hold(self.pid());
             self.tree.kill(Some(&held)).split()
         };
-        let settled = call.holders_shutdown_error(&self.tree, skip, kill);
+        let settled = call.holders_settled(&self.tree, skip, kill);
         wait.reaching(settled.killed_again);
-        (settled.answer, wait)
+        HoldersShutdown {
+            error: settled.answer,
+            wait,
+        }
+    }
+}
+
+/// The end of a call that signalled only an fd marker's holders: its error, and the wait for the
+/// holders its kill reached. The wait runs only in [`finish`](Self::finish) or
+/// [`finish_async`](Self::finish_async), which a caller must call.
+#[cfg(unix)]
+#[must_use = "the holders its kill reached are waited for only by finish or finish_async"]
+pub(crate) struct HoldersShutdown<'a> {
+    error: Error,
+    wait: crate::containment::KillWait<'a>,
+}
+
+#[cfg(unix)]
+impl HoldersShutdown<'_> {
+    /// The call's error, after the wait. The call's answer is that the tree was not shut down whatever
+    /// the wait finds, so a wait that failed is only logged, as a failed `kill_tree`'s is; the wait
+    /// still ends the holders the kill reached.
+    #[must_use]
+    pub(crate) fn finish(self) -> Error {
+        let HoldersShutdown { error, wait } = self;
+        Self::answered(error, wait.wait())
+    }
+
+    /// [`finish`](Self::finish), awaited: no runtime thread is blocked.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub(crate) async fn finish_async(self) -> Error {
+        let HoldersShutdown { error, wait } = self;
+        Self::answered(error, wait.wait_async().await)
+    }
+
+    fn answered(error: Error, waited: Result<(), Error>) -> Error {
+        if let Err(waited) = waited {
+            crate::containment::tree_kill::log_failed_wait("a holders-only shutdown", &waited);
+        }
+        error
     }
 }
 

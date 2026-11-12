@@ -10,7 +10,7 @@ pub use suspended::SuspendedChild;
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
-use crate::containment::dispatch::SweepFailure;
+use crate::containment::dispatch::Swept;
 use crate::containment::Containment;
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -66,9 +66,9 @@ const EOF_ON_READS: &str = "the child will see EOF on reads";
 /// policy, written once, over the same process handle. Its waits register the process with the
 /// runtime; its signals, its tree operations and its drop are the sync `Child`'s.
 ///
-/// With `kill_on_drop` set (the default), dropping it kills the tree and the root and blocks the
-/// dropping thread, whatever the runtime, until the root is reaped and the tree has drained, and
-/// warns once past 1 s. To wait without blocking, call [`kill`](Child::kill) or
+/// What the drop does, and what it waits for, is stated on
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop): the drop blocks the dropping thread only
+/// when it waits. To wait without blocking, call [`kill`](Child::kill) or
 /// [`kill_tree`](Child::kill_tree), then await [`wait`](Child::wait) (and
 /// [`wait_tree`](Child::wait_tree) for a tree), before dropping.
 #[derive(Debug)]
@@ -334,21 +334,43 @@ impl Child {
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
-    /// It answers as the sync [`Child::send_kill_tree`](crate::Child::send_kill_tree) does: it sends
-    /// the kill and returns, and `Ok` says every member was reached, not that any has exited. It
-    /// blocks no runtime thread; [`wait_tree`](Self::wait_tree) waits where the mechanism has a drain
-    /// edge.
-    pub fn kill_tree(&mut self) -> Result<(), Error> {
-        self.kill_tree_after("kill_tree", None).map_err(|failure| failure.error)
+    /// As the sync [`Child::kill_tree`](crate::Child::kill_tree): same `Ok`, errors and stated limits.
+    /// The kill is sent on the calling thread; the wait for the members, the root and the drain edge
+    /// is awaited, blocking no runtime thread. [`send_kill_tree`](Self::send_kill_tree) is the call
+    /// that only sends.
+    ///
+    /// Dropping the future after the kill was sent leaves the members killed and stops only the
+    /// wait; what the handle's drop then waits for is stated on
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+    ///
+    /// # Runtime
+    ///
+    /// As [`wait`](Self::wait): on Unix it needs a runtime with the IO driver enabled, and on Windows
+    /// the watch of a member or of a Job runs on the blocking pool (one thread per in-flight wait).
+    pub async fn kill_tree(&self) -> Result<(), Error> {
+        self.kill_tree_after("kill_tree", None)
+            .wait_async()
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`kill_tree`](Self::kill_tree) that sends and does not wait, as the sync
+    /// [`Child::send_kill_tree`](crate::Child::send_kill_tree) does: `Ok` says every member was
+    /// reached, not that any has exited. It blocks no runtime thread; [`wait_tree`](Self::wait_tree)
+    /// waits where the mechanism has a drain edge.
+    pub fn send_kill_tree(&self) -> Result<(), Error> {
+        self.inner
+            .send_kill_tree_after("send_kill_tree", None)
+            .map_err(|failure| failure.error)
     }
 
     /// [`kill_tree`](Self::kill_tree) for the operation `op`, as a step of it that already sent
     /// `earlier`, so an error never claims the whole operation sent nothing. `op` names the call in
-    /// what it reports. A failure says whether the root is dead all the same ([`SweepFailure`]): a
-    /// caller may wait for it before it returns the error. It sends only: no member is read or
-    /// waited for.
-    pub(crate) fn kill_tree_after(&mut self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
-        self.inner.send_kill_tree_after(op, earlier)
+    /// what it reports. The [`Swept`] has the answer, which says whether the root is dead all the same
+    /// on a failure (`SweepFailure`), and the wait for what the kill reached, which the caller
+    /// awaits ([`wait_async`](Swept::wait_async)).
+    pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Swept<'_> {
+        self.inner.kill_tree_after(op, earlier)
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via
@@ -398,12 +420,10 @@ impl Child {
 
     /// Leave the child (and its contained tree) running after this handle drops (opt out of
     /// kill-on-drop). Also disarms the containment resource, so its own `Drop` never kills the
-    /// tree itself, though if [`kill_tree`](Self::kill_tree) already returned `Ok` on this handle,
-    /// its `Drop` still waits for that kill's drain before giving up the leaf: on Linux the
-    /// dropping thread blocks until the leaf drains, and warns past 1 s. Await
-    /// [`wait_tree`](Self::wait_tree) first and the drop finds nothing to wait for. A `kill_tree()`
-    /// that returned `Err` leaves nothing to wait for; see
-    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what that leaves behind.
+    /// tree itself, though after a kill on this handle its `Drop` can still wait for that kill's
+    /// drain before giving up the leaf. After a send, await [`wait_tree`](Self::wait_tree) first.
+    /// When the drop waits, and what it leaves behind, is stated on
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     ///
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs

@@ -116,7 +116,7 @@ fn a_leaf_removed_during_the_last_round_is_drained() {
 fn a_leaf_whose_state_cannot_be_read_is_left_to_the_wait() {
     let fake = FakeLeaf::new("cosca-watched", true);
     let mut watch = armed(&fake);
-    std::fs::write(&fake.events, "frozen 0\n").expect("write a cgroup.events with no populated field");
+    FakeLeaf::set_unreadable(&fake.events);
     assert!(drained_by_now(&mut watch));
     assert!(watch.wait().is_err(), "the wait finds the failure the look left it");
 }

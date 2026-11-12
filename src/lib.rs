@@ -29,14 +29,15 @@
 //!   pidfd and not its pid. The one by-pid wait is std's own, inside a spawn that fails after the
 //!   fork.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's start time and to list processes. It is
-//!   refused with `ENOSYS`, `EPERM` or `ENODEV` (see [`Error::Unsupported`](error::Error::Unsupported)).
-//!   Before Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
+//!   checked `/proc` view uses it to read a process's start time and to list processes.
+//!   Before Linux 6.9 a refusal (what counts as one is under
+//!   [`Error::Unsupported`](error::Error::Unsupported)) is that error naming `openat2`,
 //!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. On 6.9+ a by-pid identity read, an open and a spawn need no view; listing a
-//!   process group or the process table, and a start time (`created_at`), still do. [`ProcessId::current`](identity::ProcessId::current) needs only a readable
-//!   `/proc/self/stat` before 6.9, and on 6.9+ no `/proc` at all.
+//!   process group or the process table, and a start time (`created_at`), still do.
+//!   [`ProcessId::current`](identity::ProcessId::current) needs only a readable `/proc/self/stat`
+//!   before 6.9, and on 6.9+ no `/proc` at all.
 //! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
 //!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.

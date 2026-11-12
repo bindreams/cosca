@@ -153,17 +153,31 @@ pub(crate) fn after_grace(watch: Result<bool, Error>, kill: impl FnOnce() -> Res
 /// The tree twin of [`after_grace`]: `sweep` always runs, because a root that exited in grace
 /// does not mean its descendants drained. A sweep error wins; a watch error surfaces only after
 /// the sweep succeeded.
+///
+/// The async twin runs the two halves itself, with its sweep awaited between them: [`note_watch`]
+/// before it, [`after_sweep`] with its answer.
 pub(crate) fn after_tree_grace(
     watch: Result<bool, Error>,
     sweep: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
+    note_watch(&watch);
+    after_sweep(sweep(), watch)
+}
+
+/// What [`after_tree_grace`] does before its sweep: log a watch error, which the sweep may subsume.
+pub(crate) fn note_watch(watch: &Result<bool, Error>) {
     if let Err(ref e) = watch {
         log::debug!(
             "graceful_shutdown_tree watch error before the sweep (may be subsumed): {report}",
             report = crate::error::Report(e)
         );
     }
-    sweep()?;
+}
+
+/// What [`after_tree_grace`] does with the sweep's answer: it wins over a watch error, which
+/// surfaces only after the sweep succeeded.
+pub(crate) fn after_sweep(sweep: Result<(), Error>, watch: Result<bool, Error>) -> Result<(), Error> {
+    sweep?;
     watch.map(|_| ())
 }
 

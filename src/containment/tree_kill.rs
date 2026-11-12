@@ -2,15 +2,13 @@
 //!
 //! A kill names its members, and nothing is held for them past the send: [`KillWait`] holds their
 //! identities, and re-opens each one by identity, one at a time, when it waits. A member whose open
-//! finds nothing has exited. One that cannot be opened or looked at has not: its exit cannot be
-//! observed, and the wait says so after it has waited for the rest.
+//! finds nothing has exited.
 //!
 //! The Linux `Ticks` limit of the by-identity open applies (see [`Child::kill_tree`](crate::Child::kill_tree)).
 
 use std::collections::HashSet;
 
 use crate::containment::dispatch::TreeKillOutcome;
-#[cfg(any(target_os = "linux", windows))]
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::TreeDrain;
 use crate::error::Error;
@@ -37,16 +35,11 @@ pub(crate) struct KillWait<'a> {
     /// Members a send reached but could not name by identity, so their exit cannot be observed.
     unobserved: Vec<Error>,
     /// The tree's own edge for "no member runs", chosen by the mechanism: only a kernel tree whose
-    /// kill landed has one. It is the edge's wait with no deadline.
-    edge: Option<EdgeWait<'a>>,
-    /// What the wait does about the root.
+    /// kill landed has one. It is waited for with no deadline.
+    edge: Option<DrainEdge<'a>>,
     root: RootEnd<'a>,
-    /// What the members are re-opened through.
     kernel: &'a dyn Kernel,
 }
-
-/// A tree's edge waited for with no deadline, and the verdict it comes to.
-type EdgeWait<'a> = Box<dyn FnOnce() -> Result<TreeDrain, Error> + 'a>;
 
 /// What a [`KillWait`] does about the root, which its owner holds.
 enum RootEnd<'a> {
@@ -112,15 +105,8 @@ impl<'a> TreeKill<'a> {
         }
         let mut kill = TreeKill::of(sent).reaching(members);
         kill.wait.unobserved = unobserved;
-        kill.wait.edge = Some(Box::new(move || edge.wait(None)));
+        kill.wait.edge = Some(edge);
         kill
-    }
-
-    /// The kill's wait ends on `edge`, a stated answer.
-    #[cfg(test)]
-    pub(crate) fn until(mut self, edge: impl FnOnce() -> Result<TreeDrain, Error> + 'a) -> TreeKill<'a> {
-        self.wait.edge = Some(Box::new(edge));
-        self
     }
 
     /// Whether the root's kill landed in the mechanism's own kill: the state is `landed`, either way.
@@ -141,7 +127,6 @@ impl<'a> TreeKill<'a> {
 }
 
 impl<'a> KillWait<'a> {
-    /// Nothing to wait for.
     pub(crate) fn none() -> KillWait<'a> {
         KillWait {
             members: Vec::new(),
@@ -199,39 +184,83 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        let mut seen = HashSet::new();
-        for id in members.into_iter().filter(|id| seen.insert(*id)) {
+        for id in once_each(members) {
             if let Err(why) = wait_for_member(kernel, id) {
                 unobserved.push(why);
             }
         }
         if let RootEnd::Waited(root) = root {
             if let Err(why) = wait_for_exit(root) {
-                unobserved.push(Error::Unassessable {
-                    detail: "the root was killed, but its exit cannot be observed".to_owned(),
-                    source: Some(Box::new(why)),
-                });
+                unobserved.push(root_unobserved(why));
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge().and_then(drained) {
+            if let Err(why) = edge.wait(None).and_then(drained) {
                 unobserved.push(why);
             }
         }
-        let mut unobserved = unobserved.into_iter();
-        let Some(first) = unobserved.next() else {
-            return Ok(());
-        };
-        let others: Vec<String> = unobserved.map(|why| crate::error::Report(&why).to_string()).collect();
-        Err(if others.is_empty() {
-            first
-        } else {
-            first.with_note(&format!(
-                "the exit of {} more could not be observed either: {}",
-                others.len(),
-                others.join("; ")
-            ))
-        })
+        answer_of(unobserved)
+    }
+
+    /// [`wait`](Self::wait), awaited: the same members in the same order, with no runtime thread
+    /// blocked, and the same answer. Dropping the future stops the wait only; the kill was sent
+    /// before it.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_async(self) -> Result<(), Error> {
+        let KillWait {
+            members,
+            mut unobserved,
+            edge,
+            root,
+            kernel,
+        } = self;
+        for id in once_each(members) {
+            if let Err(why) = wait_for_member_async(kernel, id).await {
+                unobserved.push(why);
+            }
+        }
+        if let RootEnd::Waited(root) = root {
+            if let Err(why) = wait_for_exit_async(root).await {
+                unobserved.push(root_unobserved(why));
+            }
+        }
+        if let Some(edge) = edge {
+            if let Err(why) = edge.wait_async(None).await.and_then(drained) {
+                unobserved.push(why);
+            }
+        }
+        answer_of(unobserved)
+    }
+}
+
+/// `members`, each one once, in the order they were reached.
+fn once_each(members: Vec<ProcessId>) -> impl Iterator<Item = ProcessId> {
+    let mut seen = HashSet::new();
+    members.into_iter().filter(move |id| seen.insert(*id))
+}
+
+/// The error of a wait that could not observe every exit: the first, with the rest in its note.
+fn answer_of(unobserved: Vec<Error>) -> Result<(), Error> {
+    let mut unobserved = unobserved.into_iter();
+    let Some(first) = unobserved.next() else {
+        return Ok(());
+    };
+    let others: Vec<String> = unobserved.map(|why| crate::error::Report(&why).to_string()).collect();
+    Err(if others.is_empty() {
+        first
+    } else {
+        first.with_note(&format!(
+            "the exit of {} more could not be observed either: {}",
+            others.len(),
+            others.join("; ")
+        ))
+    })
+}
+
+fn root_unobserved(cause: Error) -> Error {
+    Error::Unassessable {
+        detail: "the root was killed, but its exit cannot be observed".to_owned(),
+        source: Some(Box::new(cause)),
     }
 }
 
@@ -250,16 +279,38 @@ fn drained(verdict: TreeDrain) -> Result<(), Error> {
 /// Wait for the member `id` to exit: re-open it by its identity, wait on it, close it. One that cannot
 /// be opened because it is gone has exited.
 fn wait_for_member(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    let os = match crate::os_process::open_with(kernel, id) {
-        Ok(Some(os)) => os,
-        Ok(None) => return Ok(()),
-        Err(failure) => return Err(exit_unobserved(id.pid(), failure.into_open_error())),
-    };
-    wait_for_exit(&*os).map_err(|why| exit_unobserved(id.pid(), why))
+    match open_member(kernel, id)? {
+        Some(os) => wait_for_exit(&*os).map_err(|why| exit_unobserved(id.pid(), why)),
+        None => Ok(()),
+    }
+}
+
+/// [`wait_for_member`], awaited.
+#[cfg(feature = "tokio")]
+async fn wait_for_member_async(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
+    match open_member(kernel, id)? {
+        Some(os) => wait_for_exit_async(&*os)
+            .await
+            .map_err(|why| exit_unobserved(id.pid(), why)),
+        None => Ok(()),
+    }
+}
+
+/// The member `id` re-opened by its identity; `None` if it is gone. One that cannot be opened has
+/// not exited as far as anyone can tell: its exit cannot be observed.
+fn open_member(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
+    crate::os_process::open_with(kernel, id).map_err(|failure| exit_unobserved(id.pid(), failure.into_open_error()))
 }
 
 fn wait_for_exit(os: &dyn OsProcess) -> Result<(), Error> {
     let exited = crate::os_process::drive::exited_until(os, None)?;
+    debug_assert!(exited, "a wait with no deadline ends only on an exit");
+    Ok(())
+}
+
+#[cfg(feature = "tokio")]
+async fn wait_for_exit_async(os: &dyn OsProcess) -> Result<(), Error> {
+    let exited = crate::tokio::drive::exited_held(os, None).await?;
     debug_assert!(exited, "a wait with no deadline ends only on an exit");
     Ok(())
 }
@@ -269,6 +320,18 @@ pub(crate) fn exit_unobserved(pid: u32, cause: Error) -> Error {
         detail: format!("pid {pid} was killed, but its exit cannot be observed"),
         source: Some(Box::new(cause)),
     }
+}
+
+/// [`exit_unobserved`] for a member whose open was refused, the cause the tests state.
+#[cfg(test)]
+pub(crate) fn refused_unobserved(pid: u32) -> Error {
+    exit_unobserved(
+        pid,
+        Error::Unassessable {
+            detail: "refused".to_owned(),
+            source: None,
+        },
+    )
 }
 
 /// The call's answer once its wait has run: a kill that failed is the answer, over a wait that failed
@@ -283,13 +346,19 @@ pub(crate) fn answer_after_wait<F>(
         (Ok(()), waited) => waited.map_err(as_failure),
         (Err(failure), Ok(())) => Err(failure),
         (Err(failure), Err(waited)) => {
-            log::debug!(
-                "the wait after a failed kill_tree also failed: {report}",
-                report = crate::error::Report(&waited)
-            );
+            log_failed_wait("a failed kill_tree", &waited);
             Err(failure)
         }
     }
+}
+
+/// Log the failed wait behind a failed answer, which stays the answer: the one place that policy's
+/// log is written. `after` names what failed first.
+pub(crate) fn log_failed_wait(after: &str, waited: &Error) {
+    log::debug!(
+        "the wait after {after} also failed: {report}",
+        report = crate::error::Report(waited)
+    );
 }
 
 #[cfg(test)]

@@ -137,7 +137,9 @@ In order:
    answers it and only the leaf has steps. A mechanism's `Contains::kill` returns a `TreeKill`: its
    outcome, and the identities of the members it reached, which `kill_tree` re-opens by identity, one
    at a time, to wait for each (then the root through its owner's handle, then the tree's own drain
-   edge, where its kill landed on one). The send-only callers (the drop, `send_kill_tree`) call
+   edge, where its kill landed on one); the async `kill_tree`s and the async `graceful_shutdown_tree`
+   escalations await the same wait (`KillWait::wait_async`, which shares everything but the awaited calls
+   with `wait`). The send-only callers (the drop, `send_kill_tree`, sync or async) call
    `Contains::send_kill`, which returns the outcome alone: the same kill, and for a cgroup leaf and a
    Job Object no listing of the members before it. `Tree`'s only matches on the kind of mechanism are its
    `_for_test` accessors. A release ends only what a mechanism owns (the cgroup leaf, which its

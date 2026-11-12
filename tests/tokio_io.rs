@@ -402,7 +402,9 @@ async fn async_kill_tree_before_wait_tears_down_the_tree() {
         cmd.contain_with(cosca::ContainMode::Session);
     })
     .await;
-    child.kill_tree().expect("kill_tree");
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
+    child.kill_tree().await.expect("kill_tree");
+    common::assert_exited(grand_id, "the grandchild");
     // The root still holds its socket, so a kill that did not come leaves it alive and the wait
     // below unbounded: prove both members dead first.
     common::assert_dead(&mut root, "the root after kill_tree");
@@ -524,8 +526,9 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 /// killed its tree waits for the drain on the dropping thread, so this pins the path that never
 /// blocks, where the caller awaited the drain first and the drop has nothing left to wait for.
 ///
-/// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
-/// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
+/// `kill_tree().await` (which awaits the drain itself), `wait()` for the root, and
+/// `wait_tree().await` once more. After it the leaf reads `populated 0`, so the drop's one `rmdir`
+/// removes it, and nothing is warned.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf(#[fixture(cgroup)] _group: &Group) {
@@ -540,8 +543,13 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
     let leaf = common::cgroup::cgroup_of(grand_pid);
     let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
+    let grand_id = cosca::identity::ProcessId::of(grand_pid)
+        .found()
+        .expect("the live grandchild's identity");
+
     let mark = common::log_mark();
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
+    common::assert_exited(grand_id, "the grandchild");
     common::assert_dead(&mut root, "the root after kill_tree");
     common::assert_dead(&mut grand, "the grandchild after kill_tree");
     child.wait().await.expect("reap the root");

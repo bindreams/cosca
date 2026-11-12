@@ -184,15 +184,18 @@ fn a_query_only_handle_is_unknown_while_running_and_dead_after_termination() {
 }
 
 /// `kill_tree` kills the root through the handle the `Process` holds, not through a second open of
-/// its identity: the held fake is sent the one `SIGKILL`, and the live process it stands in front
-/// of, which a send by identity would kill, runs on.
+/// its identity: the held fake is sent the one `SIGKILL`. On Unix the sends log shows none by
+/// identity, and the live process the fake stands in front of still runs, which a kill by its number
+/// or identity would end.
+///
+/// Gap: on Windows no row shows the real root was not killed by its identity, because the walk's
+/// console-host kill ends the root either way.
 ///
 /// Mutant: the walk kills the root by its identity.
 #[skuld::test]
 fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
     use crate::os_process::fake::{Answer, FakeProcess};
     use crate::signal::{Sent, Sig};
-    use crate::test_child::STATUS_DLL_INIT_FAILED;
 
     let (child, _stdin) = crate::test_child::held_uncontained_blocker(true);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
@@ -203,18 +206,30 @@ fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
         os: Box::new(fake.clone()),
     };
 
+    #[cfg(unix)]
+    let sends = crate::send_log::Capture::start();
+
     held.kill_tree_with(&crate::identity::HostKernel)
         .expect("the held handle took the kill and the root has no descendant");
 
+    // A walk that killed the root by its identity would send the held handle nothing. (On Windows the
+    // real root's own state is not asserted: the walk also kills its console host, which ends the
+    // root of its own accord.)
     assert_eq!(fake.signal_calls(), vec![Sig::Kill]);
-    // On Windows the walk also kills the console host the root owns, and the call waits for it, which
-    // ends the root of its own accord (`STATUS_DLL_INIT_FAILED`): a kill of the root by its identity
-    // would end it with `TerminateProcess`'s code 1.
-    let status = child.try_wait().expect("look at the live process");
-    assert!(
-        status.is_none_or(|status| cfg!(windows) && status.code() == Some(STATUS_DLL_INIT_FAILED)),
-        "the real process was killed by its identity, not through the held handle: {status:?}"
-    );
+    // On Unix the root was sent nothing by its identity, and the real root still runs: its kill went
+    // to the fake handle.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            sends.by_identity(),
+            vec![],
+            "the root was sent a signal by its identity"
+        );
+        assert!(
+            child.try_wait().expect("look at the live process").is_none(),
+            "the real root exited (a kill by its number or identity would do this)"
+        );
+    }
 }
 
 /// `send_kill_tree` sends the root its kill through the held handle and does not wait for it: the held
@@ -235,6 +250,31 @@ fn send_kill_tree_sends_the_roots_kill_and_waits_for_nothing() {
     };
 
     held.send_kill_tree_with(&crate::identity::HostKernel)
+        .expect("the held handle took the kill and the root has no descendant");
+
+    assert_eq!(fake.signal_calls(), vec![Sig::Kill]);
+    assert_eq!(fake.looks(), 0, "the call looked at the root it sent its kill to");
+}
+
+/// [`tokio::Process::send_kill_tree`](crate::tokio::Process::send_kill_tree) sends as the sync one does:
+/// the held fake states no look at the root, so a look would panic.
+///
+/// Mutant: the async `send_kill_tree` waits (it calls `kill_tree`).
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_tokio_send_kill_tree_sends_the_roots_kill_and_waits_for_nothing() {
+    use crate::os_process::fake::FakeProcess;
+    use crate::signal::{Sent, Sig};
+
+    let (child, _stdin) = crate::test_child::held_uncontained_blocker(true);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let fake = FakeProcess::new([]).signals([Ok(Sent::Delivered)]);
+    let held = crate::tokio::Process::from(Process {
+        id,
+        os: Box::new(fake.clone()),
+    });
+
+    held.send_kill_tree()
         .expect("the held handle took the kill and the root has no descendant");
 
     assert_eq!(fake.signal_calls(), vec![Sig::Kill]);

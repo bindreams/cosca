@@ -9,6 +9,8 @@ use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
+#[cfg(unix)]
+use crate::containment::tree_kill::refused_unobserved;
 use crate::containment::treewalk::Left;
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::identity::ProcessId;
@@ -28,6 +30,9 @@ pub(crate) struct FakeContains {
     killed: Vec<ProcessId>,
     /// The members its settlement states it killed again, for the wait over them.
     killed_again: Vec<ProcessId>,
+    /// The pids its kill states it reached but whose exit cannot be observed, which fail the wait.
+    #[cfg(unix)]
+    unobserved: Vec<u32>,
     sends: Sends,
 }
 
@@ -41,6 +46,8 @@ impl FakeContains {
             reaches,
             killed: Vec::new(),
             killed_again: Vec::new(),
+            #[cfg(unix)]
+            unobserved: Vec::new(),
             sends: sends.clone(),
         };
         (fake, sends)
@@ -60,6 +67,14 @@ impl FakeContains {
         self
     }
 
+    /// A mechanism whose kill states that it reached `pid`, whose exit cannot be observed: the wait
+    /// over that kill fails.
+    #[cfg(unix)]
+    pub(crate) fn reaching_unobserved(mut self, pid: u32) -> FakeContains {
+        self.unobserved.push(pid);
+        self
+    }
+
     fn record(&self, send: &'static str) {
         self.sends
             .lock()
@@ -72,7 +87,13 @@ impl Contains for FakeContains {
     /// A kill that leaves nothing running, and states the members it reached.
     fn kill(&self, _root: Option<&dyn Root>) -> TreeKill<'_> {
         self.record("kill");
-        TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied())
+        let kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied());
+        #[cfg(unix)]
+        let kill = self
+            .unobserved
+            .iter()
+            .fold(kill, |kill, &pid| kill.unobserved(refused_unobserved(pid)));
+        kill
     }
 
     fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> KillLeftOutcome {

@@ -626,8 +626,7 @@ impl Child {
     /// returns once the kill is sent, with the same errors for a kill that could not be sent. `Ok`
     /// says every member was reached, not that any has exited. A caller that needs the members gone
     /// uses [`kill_tree`](Self::kill_tree): [`wait_tree`](Child::wait_tree) after a send-only kill
-    /// reports drained once the job's list is empty on Windows, which can come before every member's
-    /// process object is signalled.
+    /// observes the drain, not each member.
     pub fn send_kill_tree(&self) -> Result<(), Error> {
         self.send_kill_tree_after("send_kill_tree", None)
             .map_err(|failure| failure.error)
@@ -917,10 +916,9 @@ impl Child {
 
     /// Consume the handle without killing or waiting for the child (opt out of
     /// kill-on-drop). Also disarms the containment resource, so its own `Drop` never kills the
-    /// tree itself — though if [`kill_tree`](Self::kill_tree) already returned `Ok` on this
-    /// handle, its `Drop` still waits for that kill's drain before giving up the leaf. A
-    /// `kill_tree()` that returned `Err` leaves nothing to wait for; see
-    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop) for what that leaves behind.
+    /// tree itself — though after a kill on this handle its `Drop` can still wait for that kill's
+    /// drain before giving up the leaf. When it waits, and what it leaves behind, is stated on
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     ///
     /// `Ok` promises that cosca no longer kills the tree: not this handle's drop, and not the
     /// containment resource's close. It makes no promise about a job the caller's own process runs

@@ -402,7 +402,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     // Closed right after the kill: a no-op backstop exits 0.
     let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
-    let result = child.kill_tree();
+    let result = child.kill_tree().await;
     assert!(
         !fault::armed(),
         "seam not consumed — hard_kill did not run on the arming thread"
@@ -469,7 +469,7 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
         let stdin = child.stdin().expect("piped stdin");
         fault::set_force_root_kill_noop(true);
         fault::force_incomplete_once(left);
-        let result = child.kill_tree();
+        let result = child.kill_tree().await;
         match left {
             LeftBehind::Root => result.expect("only the root was left, and the backstop killed it"),
             LeftBehind::Descendant | LeftBehind::RootAndDescendant => {

@@ -247,7 +247,7 @@ pub async fn kill_tree_release_reap_async(
     child: &mut cosca::tokio::Child,
     control: TcpStream,
 ) -> std::process::ExitStatus {
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
     drop(control);
     let status = child.wait().await.expect("reap the killed child");
     assert_killed("the killed child", status);
@@ -1050,7 +1050,7 @@ async fn end_async_tree(tree: &mut AsyncTree, grand: Option<cosca::identity::Pro
         let socket = accept_or_die_async_descendant(&tree.listener, grand).await;
         keep_grandchild(&mut tree.socks, socket);
     }
-    let killed = tree.child.kill_tree();
+    let killed = tree.child.kill_tree().await;
     let root = match grand {
         Some(_) => None,
         None => Some(

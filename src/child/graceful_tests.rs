@@ -930,3 +930,39 @@ fn graceful_tree_non_containment_terminate_error_fails_fast() {
     assert_still_running(&mut child, stdin);
     cleanup(&mut child);
 }
+
+/// A holders-only escalation whose wait for the holders it killed fails answers with the
+/// holders-only error, as `kill_tree` answers a failed kill over a failed wait; the wait's failure is
+/// logged at debug (`log_failed_wait`), which also shows the member was waited for.
+///
+/// Mutants: `finish` puts the wait's failure in the error; `finish` returns the error without
+/// waiting.
+#[cfg(unix)]
+#[skuld::test]
+fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::os_process::fake::Answer;
+    use crate::test_child::over_fake::{child_with, holders_only_skip, root_looking};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake.reaching_unobserved(4242));
+    let skip = holders_only_skip(&child);
+
+    let error = child.shut_down_holders_only(&skip, std::time::Duration::ZERO);
+
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, source: None }
+            if detail.contains("sent the SIGTERM only to the marker holders")),
+        "the answer is the holders-only error: {error}"
+    );
+    let waited = crate::log_capture::records_since_on_current_thread(mark, "the wait after a holders-only shutdown");
+    assert!(
+        matches!(&waited[..], [(log::Level::Debug, line)]
+            if line.contains("pid 4242 was killed, but its exit cannot be observed")),
+        "the member was waited for, and its failure is logged at debug: {waited:?}"
+    );
+}

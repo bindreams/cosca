@@ -527,7 +527,8 @@ impl Command {
     /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
     /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
     /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
-    /// and so does the drop, which waits for that child's whole life and warns once past 1 s.
+    /// and so does the drop, which waits for that child's whole life (the async drop warns once past
+    /// 1 s).
     /// The same holds for a process that migrated into the leaf after a landed kill:
     /// [`kill_tree`](crate::Child::kill_tree), [`wait_tree`](crate::Child::wait_tree) and the drop
     /// each wait for it until it exits, though the kill did not reach it. Neither raises
@@ -535,12 +536,12 @@ impl Command {
     /// cosca does not probe for the fix, and writes `cgroup.kill` once per teardown (see
     /// principle 3 for the one early exception in a failed elevation).
     ///
-    /// **Both handles block until the root is reaped and a cgroup leaf has drained**, and warn once
-    /// past 1 s. The async [`Child`](crate::tokio::Child) does so on the dropping thread, which
-    /// may be a tokio worker: a destructor cannot be awaited. Its root's kill bounds the wait, as
-    /// does the tree's `cgroup.kill`, unless a process stays stuck in uninterruptible I/O (D state)
-    /// or a foreign tracer holds the root's zombie. See that `Drop`'s rustdoc. On Windows both
-    /// terminate the root and the tree, and wait for the root.
+    /// **Both handles block until the root is reaped and a cgroup leaf has drained**; only the async
+    /// drop warns, once past 1 s. The async [`Child`](crate::tokio::Child) blocks on the dropping
+    /// thread, which may be a tokio worker: a destructor cannot be awaited. Its root's kill bounds
+    /// the wait, as does the tree's `cgroup.kill`, unless a process stays stuck in uninterruptible
+    /// I/O (D state) or a foreign tracer holds the root's zombie. See that `Drop`'s rustdoc. On
+    /// Windows both terminate the root and the tree, and wait for the root.
     ///
     /// An elevated child this process cannot signal is the one case neither handle blocks on: the
     /// teardown gives up rather than wait forever, and the child is left running. So is an elevated
@@ -557,13 +558,17 @@ impl Command {
     /// down with [`terminate_tree`](crate::Child::terminate_tree) that has not finished exiting —
     /// a `SIGTERM` is catchable, so the tree may outlive it — which
     /// [`wait_tree`](crate::Child::wait_tree) before the drop is what proves either case is done.
-    /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so once it has
-    /// returned `Ok`, a drop after it waits for that kill's drain before giving up the leaf, the
-    /// same as it would with `kill_on_drop` left on. The async drop does too, on the dropping
-    /// thread, warning past 1 s: await [`wait_tree`](crate::tokio::Child::wait_tree) first and the
-    /// drop finds nothing to wait for. A `kill_tree()` that returned `Err` leaves nothing for the
-    /// drop to wait for. cosca does not come back for a leaf it left: the empty `cosca-*` directory stays until
-    /// something else removes it, such as systemd removing a stopped unit's cgroup subtree.
+    /// A kill is different: it is atomic, so once any `cgroup.kill` of the leaf has landed (by a
+    /// tree call, a sweep's escalation or a front's kill), a disarmed leaf's drop, once the child
+    /// entered the leaf, waits for the leaf to drain and removes it, however the call that landed it
+    /// ended. Nothing is left to wait for after a [`kill_tree`](crate::Child::kill_tree) that
+    /// returned `Ok`, or a [`wait_tree`](crate::Child::wait_tree) that saw the drain. Otherwise (after
+    /// [`send_kill_tree`](crate::Child::send_kill_tree), a call that failed after its kill
+    /// landed, or a `kill_tree` future dropped mid-wait) the drop does the waiting, the async one
+    /// on the dropping thread, warning past 1 s: await `wait_tree` first to keep it off that
+    /// thread. A disarmed Job's drop only closes its handle and waits for nothing. cosca does not
+    /// come back for a leaf it left: the empty `cosca-*` directory stays until something else
+    /// removes it, such as systemd removing a stopped unit's cgroup subtree.
     ///
     /// **On Windows, opting out clears `KILL_ON_JOB_CLOSE` on the child's Job Object, and a spawn
     /// whose OS refuses that fails** (`Error::MayHaveStarted`, the refusal as its cause); the

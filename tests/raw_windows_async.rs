@@ -160,7 +160,7 @@ async fn async_contained_raw_child_is_killed_by_kill_tree() {
     assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
     let stdin = child.stdin().expect("piped stdin");
 
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
     drop(stdin);
 
     assert_eq!(
