@@ -879,7 +879,13 @@ impl CgroupLeaf {
                 source: Some(Error::io_cause(e)),
             });
         }
-        for line in content.lines().chain(nested.iter().map(String::as_str)) {
+        // A member listed in a cgroup under the leaf is placed by that cgroup's id, so no walk of the
+        // leaf's descendants is made to find where it is.
+        let listed = content
+            .lines()
+            .map(|line| (line, None))
+            .chain(nested.iter().map(|(line, id)| (line.as_str(), *id)));
+        for (line, in_cgroup) in listed {
             match line.trim().parse::<u32>() {
                 Ok(0) => unobserved.push(Error::Unassessable {
                     detail: "a member of the leaf in a pid namespace this process cannot see was killed, but its exit \
@@ -888,7 +894,7 @@ impl CgroupLeaf {
                     source: None,
                 }),
                 Ok(pid) if Some(pid) == root => {}
-                Ok(pid) => match self.listed_member(pid, &subtree) {
+                Ok(pid) => match self.listed_member(pid, &subtree, in_cgroup) {
                     Ok(Some(id)) => members.push(id),
                     Ok(None) => {}
                     Err(why) => unobserved.push(exit_unobserved(pid, why)),
@@ -903,8 +909,14 @@ impl CgroupLeaf {
     }
 
     /// The listed `pid`, if it is a member of the leaf now: `None` for a pid that is gone or not in the
-    /// leaf (it is no member the kill reaches).
-    fn listed_member(&self, pid: u32, subtree: &Subtree) -> Result<Option<Listed>, crate::error::Error> {
+    /// leaf (it is no member the kill reaches). `in_cgroup` is the id of the cgroup under the leaf that
+    /// listed it, if one did and its id could be read.
+    fn listed_member(
+        &self,
+        pid: u32,
+        subtree: &Subtree,
+        in_cgroup: Option<u64>,
+    ) -> Result<Option<Listed>, crate::error::Error> {
         use std::os::fd::AsFd as _;
 
         use crate::error::Error;
@@ -915,7 +927,7 @@ impl CgroupLeaf {
             Err(rustix::io::Errno::SRCH) => return Ok(None),
             Err(e) => return Err(Error::Io(io::Error::from_raw_os_error(e.raw_os_error()))),
         };
-        let seen = match placed_or_exited(pidfd.as_fd(), subtree.holds_seen(pid, Some(pidfd.as_fd()), None))? {
+        let seen = match placed_or_exited(pidfd.as_fd(), subtree.holds_seen(pid, Some(pidfd.as_fd()), in_cgroup))? {
             PlacedOrExitedOutcome::Placed((true, seen)) => seen,
             _ => return Ok(None),
         };

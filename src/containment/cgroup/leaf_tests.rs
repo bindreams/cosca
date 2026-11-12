@@ -546,6 +546,73 @@ fn a_member_placed_through_proc_is_listed_with_no_cgroup_id(#[fixture(cgroup)] _
     );
 }
 
+/// The members of the cgroups under a leaf are placed by the id of the cgroup the listing read them
+/// in, so the listing walks the leaf's descendants once, for that listing, and not again for each of
+/// them. Three members in a cgroup under the leaf, whose pidfds read that cgroup's id.
+///
+/// Mutant: each listed member of a nested cgroup is placed by a walk of the leaf's descendants.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault;
+
+    let leaf = lane_leaf();
+    let nested = leaf.leaf_path.join("nested");
+    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
+    std::fs::create_dir(nested.join("deeper")).expect("make a cgroup under that");
+    let nested_id = crate::containment::cgroup::cgroup_id(
+        rustix::fs::open(
+            &nested,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open the cgroup under the leaf")
+        .as_fd(),
+    )
+    .expect("its id");
+    let mut members = Vec::new();
+    for _ in 0..3 {
+        let (member, id) = cat_member();
+        place(&member, &nested);
+        members.push((member, id));
+    }
+    let _read = fault::force_pidfd_cgroup_id(nested_id);
+    // Every walk opens the leaf itself first.
+    let walks = Rc::new(Cell::new(0));
+    let _count = fault::set_before_walk_open({
+        let walks = walks.clone();
+        move |at| {
+            if at == std::path::Path::new(".") {
+                walks.set(walks.get() + 1);
+            }
+        }
+    });
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    let mut named: Vec<_> = listed.iter().map(|m| (m.id, m.seen)).collect();
+    let mut expected: Vec<_> = members.iter().map(|(_, id)| (*id, Some(nested_id))).collect();
+    named.sort_by_key(|(id, _)| id.pid());
+    expected.sort_by_key(|(id, _)| id.pid());
+    assert_eq!(
+        named, expected,
+        "every member is named, placed by the nested cgroup's id"
+    );
+    assert_eq!(
+        walks.get(),
+        1,
+        "the listing of the cgroups under the leaf is the one walk of its descendants"
+    );
+    for (mut member, _) in members {
+        member.0.kill().expect("end the member");
+        _ = member.0.wait();
+    }
+}
+
 /// The members are listed before `cgroup.kill`, not after it: a member that has gone from the leaf by
 /// the time the kill is written is still named. The member is ended and reaped right before the write,
 /// so the leaf's `cgroup.procs` is empty when the kill runs.

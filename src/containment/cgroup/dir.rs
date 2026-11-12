@@ -247,7 +247,7 @@ impl LeafDir {
     }
 
     /// [`procs_under`] the leaf.
-    pub(crate) fn nested_procs(&self) -> (Vec<String>, Option<io::Error>) {
+    pub(crate) fn nested_procs(&self) -> (Vec<(String, Option<u64>)>, Option<io::Error>) {
         procs_under(self.dir.as_fd())
     }
 }
@@ -329,13 +329,15 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     }
 }
 
-/// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, and the failure that
-/// ended the listing early. A [`traverse`] of the tree, with the same bounds as [`find_descendant`]:
-/// two descriptors at most, one visit per cgroup. A cgroup removed during the walk has no member
-/// left to list and is skipped, as is `dir` itself gone. A cgroup that could not be read or listed,
-/// or one behind a mount (`EXDEV`), ends the listing with its error; the lines read before it are
-/// returned.
-pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, Option<io::Error>) {
+/// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, each with the id of the
+/// cgroup it was read in (see [`cgroup_id`]; `None` if that cannot be read, which fails nothing: the
+/// line is then placed as one with no id), and the failure that ended the listing early. A
+/// [`traverse`] of the tree, with the same bounds as [`find_descendant`]: two descriptors at most,
+/// one visit per cgroup; the id is read only in a cgroup that lists a member. A cgroup removed during
+/// the walk has no member left to list and is skipped, as is `dir` itself gone. A cgroup that could
+/// not be read or listed, or one behind a mount (`EXDEV`), ends the listing with its error; the lines
+/// read before it are returned.
+pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<(String, Option<u64>)>, Option<io::Error>) {
     use std::io::Read as _;
 
     let mut lines = Vec::new();
@@ -348,7 +350,20 @@ pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, Option<io::Error
             });
         match read {
             Ok(content) => {
-                lines.extend(content.lines().map(str::to_owned));
+                let id = if content.lines().next().is_some() {
+                    cgroup_id(cgroup)
+                        .inspect_err(|e| {
+                            log::debug!(
+                                "cgroup v2: the id of {} cannot be read ({report}), so its members are placed without it",
+                                tree.path(node).display(),
+                                report = crate::error::Report(e)
+                            );
+                        })
+                        .ok()
+                } else {
+                    None
+                };
+                lines.extend(content.lines().map(|line| (line.to_owned(), id)));
                 Ok(Visit::Continue)
             }
             Err(e) if gone_io(&e) => Ok(Visit::Skip),
