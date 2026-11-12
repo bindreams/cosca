@@ -390,7 +390,8 @@ pub(crate) fn arm_proc_exit(id: crate::identity::ProcessId) -> Result<Option<Kqu
     };
     match kq.subscribe(exit) {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(None), // pid already gone
+        // `ESRCH` from `subscribe` means the pid is already gone.
+        Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => return Ok(None),
         Err(e) => return Err(e),
     }
     // An unassessable identity is NOT gone and must not be reported as an exit.

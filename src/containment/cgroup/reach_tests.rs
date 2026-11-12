@@ -139,9 +139,15 @@ fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     match front_placement(&HostKernel, || Ok(HIGH)) {
-        Err(crate::error::Error::Unsupported { detail, .. }) => {
+        Err(err @ crate::error::Error::Unsupported { .. }) => {
+            let crate::error::Error::Unsupported { detail, .. } = &err else {
+                unreachable!()
+            };
             assert!(detail.contains("hidepid"), "{detail}");
             assert!(detail.contains("before anything is spawned"), "{detail}");
+            assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
+            let named = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+            assert!(!detail.contains(&named), "{detail}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -308,6 +314,12 @@ fn a_task_the_walk_cannot_place_is_placed_through_proc() {
         }
         let err = holds_hidden(&leaf, HIGH + 1).expect_err("placed through the hidden /proc");
         assert!(err.to_string().contains("maybe one under it"), "{stat:?} {sub}: {err}");
+        // What `/proc` answered is the cause, with its code.
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(libc::ENOENT),
+            "{stat:?} {sub}: {err:?}"
+        );
     }
 }
 
@@ -507,8 +519,14 @@ fn a_probe_child_that_stays_dumpable_fails_the_probe() {
 fn a_refused_pidfd_info_refuses_naming_it() {
     let _failing = fault::fail_pidfd_info();
     match front_placement(&HostKernel, || Ok(HIGH)) {
-        Err(crate::error::Error::Unsupported { detail, .. }) => {
+        Err(err @ crate::error::Error::Unsupported { .. }) => {
+            let crate::error::Error::Unsupported { detail, .. } = &err else {
+                unreachable!()
+            };
             assert!(detail.contains("PIDFD_GET_INFO failed"), "{detail}");
+            assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+            let named = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+            assert!(!detail.contains(&named), "{detail}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -521,9 +539,13 @@ fn a_refused_pidfd_info_refuses_naming_it() {
 fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
     for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM] {
         match front_placement(&HostKernel, || Err(std::io::Error::from_raw_os_error(errno))) {
-            Err(crate::error::Error::Unsupported { detail, .. }) => {
+            Err(err @ crate::error::Error::Unsupported { .. }) => {
+                let crate::error::Error::Unsupported { detail, .. } = &err else {
+                    unreachable!()
+                };
                 let named = std::io::Error::from_raw_os_error(errno).to_string();
-                assert!(detail.contains(&named), "{errno}: {detail}");
+                assert!(!detail.contains(&named), "{errno}: {detail}");
+                assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
                 assert!(detail.contains("before anything is spawned"), "{errno}: {detail}");
             }
             other => panic!("{errno}: expected Unsupported, got {other:?}"),
@@ -538,6 +560,22 @@ fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("leaf"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
+}
+
+/// A `/proc` view that could not be established fails a read of a task's cgroup with the view's error
+/// as its cause, of its kind, with its OS code.
+///
+/// Mutant: the error keeps the view's kind and drops the error.
+#[skuld::test]
+fn a_task_read_through_an_unusable_view_has_the_views_error_as_its_cause() {
+    let why = crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::MFILE);
+    let kind = std::io::Error::from_raw_os_error(libc::EMFILE).kind();
+
+    let err = super::view_unreadable(7, why);
+
+    assert_eq!(err.kind(), kind);
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
+    assert!(err.to_string().contains("pid 7's cgroup cannot be read"), "{err}");
 }
 
 /// A forked probe, killed and reaped when dropped, so a probe a failing assertion would leave
@@ -808,6 +846,8 @@ fn a_probe_child_reaped_elsewhere_before_its_pin_is_sent_nothing() {
     let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe has no child left");
     assert_eq!(fault::take_probe_steps(), [], "nothing was sent");
     assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
+    // The `pidfd_open` that found no process is the source, with its code.
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ESRCH), "{err:?}");
 }
 
 /// A probe's child whose kill through its pidfd fails other than `ESRCH` is sent nothing by its

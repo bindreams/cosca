@@ -399,7 +399,7 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     };
     assert!(detail.contains("pidfd_open"), "{detail}");
     assert!(source.is_some(), "{why:?}");
-    assert_eq!(why.raw_os_error(), Some(libc::EMFILE), "{why:?}");
+    assert_eq!(crate::error::first_os_code(&why), Some(libc::EMFILE), "{why:?}");
     let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
     let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
@@ -532,11 +532,18 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
 /// A live root with one live descendant, and a kernel in which the descendant's identity cannot be
 /// read (`EMFILE` on its pidfd). The `/proc` path: the root's id is a `starttime` id.
 fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, ProcessId, FakeKernel<'static>) {
+    root_whose_descendants_pidfd_open_answers(rustix::io::Errno::MFILE)
+}
+
+/// [`root_with_an_unreadable_descendant`], where the descendant's `pidfd_open` answers `errno`.
+fn root_whose_descendants_pidfd_open_answers(
+    errno: rustix::io::Errno,
+) -> (std::process::Child, ProcessId, ProcessId, FakeKernel<'static>) {
     let (child, root, descendant) = live_member_with_descendant();
     let root = ticks_id(root.pid());
     let kernel = FakeKernel::over(&HostKernel)
         .live_without_pidfs(root.pid(), pidfd_of(root.pid()))
-        .on_pidfd_open(descendant.pid(), Err(rustix::io::Errno::MFILE));
+        .on_pidfd_open(descendant.pid(), Err(errno));
     (child, root, descendant, kernel)
 }
 
@@ -671,7 +678,11 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
 
     let unread = Left::Unread {
         pid: descendant.pid(),
-        said: "its identity could not be read".into(),
+        source: std::sync::Arc::new(Error::Unassessable {
+            detail: "its identity could not be read".into(),
+            source: None,
+        }),
+        note: None,
     };
     let again = with_earlier(&kernel, vec![unread], Ok(()))
         .0
@@ -683,6 +694,79 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
     );
     assert_eq!(sends.by_identity(), [], "nothing is sent by a bare pid");
     release(child);
+}
+
+/// A member the walk never read is reported again with the cause it was first reported with: its OS
+/// code is where it was, not folded into text.
+///
+/// Mutant: the held member keeps only the text of its first error.
+#[skuld::test]
+fn a_member_never_read_is_reported_again_with_its_os_code() {
+    use super::{with_earlier, Left};
+    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
+    let first = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
+        .into_result()
+        .expect_err("the descendant was left");
+    let code = crate::error::first_os_code(&first.members[0]);
+    assert!(code.is_some(), "the first report carries the OS code: {first:?}");
+    let held = Left::of(&first);
+    assert!(matches!(held[0], Left::Unread { .. }), "{held:?}");
+
+    let again = with_earlier(&kernel, held, Ok(()))
+        .0
+        .expect_err("never read, so never shown killed")
+        .into_error();
+
+    assert_eq!(crate::error::first_os_code(&again), code, "{again:?}");
+    release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
+}
+
+/// A member the walk never read, because the OS refused its pidfd (`Unsupported`, with `EPERM` as its
+/// cause), is reported again as the same kind of failure, with the refusal's text and its `EPERM`
+/// reachable through `source()`: not as `Unassessable`, and not as text alone.
+///
+/// Mutants: the held member keeps only the text of its first error; it keeps only an `Unassessable`'s
+/// cause; the layers between the member's error and its OS error are dropped.
+#[skuld::test]
+fn a_member_whose_pidfd_was_refused_is_reported_again_as_a_refusal_with_its_errno() {
+    use super::{with_earlier, Left};
+    let (child, root, _, kernel) = root_whose_descendants_pidfd_open_answers(rustix::io::Errno::PERM);
+    let first = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
+        .into_result()
+        .expect_err("the descendant was left");
+    let Error::MemberNotKilled { source, .. } = &first.members[0] else {
+        panic!("{first:?}");
+    };
+    let Error::Unsupported { op, detail, .. } = &**source else {
+        panic!("the first report is a refusal: {source:?}");
+    };
+    let (op, detail) = (op.clone(), detail.clone());
+    let held = Left::of(&first);
+
+    let again = with_earlier(&kernel, held, Ok(()))
+        .0
+        .expect_err("never read, so never shown killed");
+
+    let Error::MemberNotKilled { source, .. } = &again.members[0] else {
+        panic!("{again:?}");
+    };
+    let Error::Unsupported {
+        op: again_op,
+        detail: again_detail,
+        ..
+    } = &**source
+    else {
+        panic!("a refusal is reported again as one: {source:?}");
+    };
+    assert_eq!((again_op, again_detail), (&op, &detail));
+    assert_eq!(
+        crate::error::first_os_code(&again.members[0]),
+        Some(libc::EPERM),
+        "{again:?}"
+    );
+    release_with_a_signalled_root("hard_kill", child, libc::SIGKILL);
 }
 
 /// `children` of a root with a descendant the walk cannot read is an error naming that pid and why,
@@ -770,7 +854,7 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
         match (errno, &kill) {
             (None, Error::Unsupported { .. }) => {}
             (Some(errno), Error::Unassessable { .. }) => {
-                assert_eq!(kill.raw_os_error(), Some(errno.raw_os_error()), "{row}")
+                assert_eq!(crate::error::first_os_code(&kill), Some(errno.raw_os_error()), "{row}")
             }
             (_, other) => panic!("{row}: wrong shape: {other:?}"),
         }
@@ -790,7 +874,11 @@ fn assert_unproved(row: &str, outcome: super::KillOutcome, pid: u32) {
         detail.contains(&format!("pid {pid}")) && detail.contains("its pidfd could not be proved to name it"),
         "{row}: {detail}"
     );
-    assert!(source.is_some(), "{row}: the finished error is the source");
+    let Some(source) = source else {
+        panic!("{row}: the finished error is the source");
+    };
+    // The source is not repeated in the text.
+    assert!(!detail.contains(&source.to_string()), "{row}: {detail}");
 }
 
 #[skuld::test]
@@ -848,7 +936,7 @@ fn a_failed_inode_read_is_named_by_the_kill() {
             "{errno}: {detail}"
         );
         assert_eq!(
-            source.and_then(|e| e.raw_os_error()),
+            source.and_then(|e| crate::error::first_os_code(&*e)),
             Some(errno.raw_os_error()),
             "{errno}"
         );

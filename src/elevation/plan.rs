@@ -276,7 +276,7 @@ pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: b
     )
 }
 
-fn reject_backend_unavailable(detail: &str, source: Option<Box<Error>>) -> Transition {
+fn reject_backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>>) -> Transition {
     Transition::Reject {
         error: Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,

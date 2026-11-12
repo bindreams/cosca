@@ -681,7 +681,7 @@ mod rewrite_tests {
                 "password delivery failed",
                 Some(std::io::Error::from_raw_os_error(code)),
             );
-            assert_eq!(error.raw_os_error(), Some(code), "{error:?}");
+            assert_eq!(crate::error::first_os_code(&error), Some(code), "{error:?}");
         }
     }
 
@@ -693,7 +693,7 @@ mod rewrite_tests {
         let read_only = std::fs::File::open("/dev/null").unwrap();
         let mut writer = std::io::PipeWriter::from(std::os::fd::OwnedFd::from(read_only));
         let error = super::super::write_password_bytes(&mut writer, b"pw").expect_err("the write is refused");
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF), "{error:?}");
+        assert_eq!(crate::error::first_os_code(&error), Some(libc::EBADF), "{error:?}");
         match error {
             Error::Elevation {
                 kind: ElevationErrorKind::AuthFailed,

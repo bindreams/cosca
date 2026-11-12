@@ -28,7 +28,10 @@ fn graceful_call() -> SkipCall<'static> {
 fn skip() -> Skip {
     Skip {
         action: format!("signal its process group (pgid {PGID})"),
-        why: Why::MayNameAnother(Refusal::Unsure(PGID as u32, std::io::Error::other("forced"))),
+        why: Why::MayNameAnother(Refusal::Unsure(
+            PGID as u32,
+            std::sync::Arc::new(std::io::Error::other("forced")),
+        )),
         root_alone: true,
         holders: None,
     }
@@ -40,10 +43,12 @@ fn assert_names_the_skip(err: &Error) {
         panic!("{err:?}")
     };
     let said = format!(
-        "graceful_shutdown_tree(): the root's own handle could not say whether it (pid {PGID}) was reaped (forced), \
+        "graceful_shutdown_tree(): the root's own handle could not say whether it (pid {PGID}) was reaped, \
          so its number may name another process; it did not signal its process group (pgid {PGID}), and "
     );
     assert!(detail.starts_with(&said), "{detail}");
+    assert!(!detail.contains("forced"), "{detail}");
+    assert!(crate::error::Report(err).to_string().contains("forced"), "{err:?}");
 }
 
 fn unkillable(what: &str) -> Error {

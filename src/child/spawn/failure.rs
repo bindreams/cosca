@@ -202,7 +202,11 @@ pub(crate) fn error_parts(error: Error) -> (Error, ChildFate, Option<Unreaped>) 
     match error {
         Error::MayHaveStarted {
             fate, source, unreaped, ..
-        } => (*source, fate, unreaped.map(|unreaped| *unreaped)),
+        } => (
+            std::sync::Arc::try_unwrap(source).expect("a spawn's cause has one owner"),
+            fate,
+            unreaped.map(|unreaped| *unreaped),
+        ),
         other => panic!("expected Error::MayHaveStarted, got {other:?}"),
     }
 }
@@ -272,7 +276,7 @@ impl From<SpawnFailure> for Error {
                 Error::MayHaveStarted {
                     fate,
                     wrapper_elevated,
-                    source: Box::new(cause),
+                    source: std::sync::Arc::new(cause),
                     unreaped,
                 }
             }

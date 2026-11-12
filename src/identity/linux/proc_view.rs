@@ -106,12 +106,10 @@ impl ViewUnreadable {
     }
 }
 
+/// The reason alone: the OS error behind it is the [`source`](std::error::Error::source).
 impl std::fmt::Display for ViewUnreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.source {
-            Some(e) => write!(f, "{}: {e}", self.reason),
-            None => f.write_str(&self.reason),
-        }
+        f.write_str(&self.reason)
     }
 }
 

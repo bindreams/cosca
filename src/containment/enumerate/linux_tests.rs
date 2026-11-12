@@ -43,11 +43,21 @@ fn a_diverged_view_is_unassessable_and_warned_about() {
 #[skuld::test]
 fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
     let (got, records) = snapshot_with(&FakeKernel::over(&HostKernel).unreadable_view());
+    // The read's error is the source, with its code, and the text names only the view.
+    match &got {
+        Err(err @ crate::error::Error::Unassessable { detail, .. }) => {
+            assert_eq!(crate::error::first_os_code(err), Some(libc::EIO), "{err:?}");
+            let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+            assert!(!detail.contains(&os_error), "{detail}");
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
     assert_unassessable_naming(got, UNREADABLE_STATUS_REASON);
+    let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
     assert!(
-        records
-            .iter()
-            .any(|(level, m)| *level == log::Level::Warn && m.contains(UNREADABLE_STATUS_REASON)),
+        records.iter().any(|(level, m)| *level == log::Level::Warn
+            && m.contains(UNREADABLE_STATUS_REASON)
+            && m.contains(&os_error)),
         "{records:?}"
     );
 }
@@ -77,9 +87,10 @@ fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
 }
 
 /// Any other failure says nothing about the pid, and skipping it drops its whole subtree from a
-/// walk: the snapshot is `Unassessable` naming `<pid>/stat` and the errno. Mutants: "skip every
-/// read error" (an `EMFILE` from a full fd table hits every pid and yields `Ok(vec![])`); "a mount
-/// crossing is skipped".
+/// walk: the snapshot is `Unassessable`, its chain naming `<pid>/stat` in the `Unreadable` layer and
+/// holding the errno below it. Mutants: "skip every read error" (an `EMFILE` from a full fd table
+/// hits every pid and yields `Ok(vec![])`); "a mount crossing is skipped"; "the `Unreadable` layer
+/// is folded into `detail`".
 #[skuld::test]
 fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
     for errno in [
@@ -92,17 +103,23 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
         libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let text = match process_parents(&kernel) {
-            Err(crate::error::Error::Unassessable { detail, source }) => {
-                assert!(source.is_some(), "errno {errno}: the read's error is the source");
-                detail
-            }
+        let error = match process_parents(&kernel) {
+            Err(error @ crate::error::Error::Unassessable { .. }) => error,
             other => panic!("errno {errno}: expected Unassessable, got {other:?}"),
         };
+        let crate::error::Error::Unassessable { detail, source } = &error else {
+            unreachable!()
+        };
         assert!(
-            text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
-            "{errno}: {text}"
+            !detail.contains("/stat") && !detail.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
+            "{errno}: the layer is not folded into the detail: {detail}"
         );
+        assert_eq!(
+            source.as_deref().and_then(|e| crate::error::first_os_code(e)),
+            Some(errno),
+            "errno {errno}: the read's error is below the layer"
+        );
+        let text = crate::error::Report(&error).to_string();
         if matches!(errno, libc::EXDEV | libc::ELOOP) {
             assert!(text.contains("lies beyond a mount in /proc"), "{errno}: {text}");
         }
@@ -131,20 +148,29 @@ fn the_warn_of_a_failed_stat_read_says_the_os_error() {
 }
 
 /// `EPERM` is `hidepid`'s answer and also a seccomp filter's for an `openat2` installed mid-scan;
-/// only the checked directory still answering tells them apart. Mutant: "skip `EPERM` without the
-/// re-check".
+/// only the checked directory still answering tells them apart. A re-check that refuses is
+/// "refused self/stat too" over the pid's `EPERM`; one that fails otherwise says the re-check failed,
+/// over its own errno. Mutant: "skip `EPERM` without the re-check"; "every failed re-check is a
+/// refusal".
 #[skuld::test]
 fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
-    for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
+    for (recheck, refused, below) in [
+        (libc::EPERM, true, libc::EPERM),
+        (libc::ENOSYS, true, libc::EPERM),
+        (libc::EMFILE, false, libc::EMFILE),
+    ] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         match process_parents(&kernel) {
-            Err(crate::error::Error::Unassessable { detail, .. }) => {
-                assert!(detail.contains("self/stat"), "{recheck}: {detail}");
-                assert!(
-                    detail.contains(&std::io::Error::from_raw_os_error(recheck).to_string()),
-                    "{recheck}: {detail}"
+            Err(error @ crate::error::Error::Unassessable { .. }) => {
+                let text = crate::error::Report(&error).to_string();
+                assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
+                assert_eq!(
+                    text.contains("re-check of self/stat failed"),
+                    !refused,
+                    "{recheck}: {text}"
                 );
+                assert_eq!(crate::error::first_os_code(&error), Some(below), "{recheck}: {text}");
             }
             other => panic!("{recheck}: expected Unassessable, got {other:?}"),
         }
@@ -159,7 +185,7 @@ fn an_unlistable_proc_is_unassessable_naming_the_errno() {
     match process_parents(&kernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("/proc could not be listed"), "{detail}");
-            assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EIO));
+            assert_eq!(source.and_then(|e| crate::error::first_os_code(&*e)), Some(libc::EIO));
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }

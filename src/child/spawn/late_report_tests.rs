@@ -574,7 +574,7 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
             members: Vec::new(),
             root: Some(crate::error::Error::MemberNotKilled {
                 pid: 4242,
-                source: Box::new(crate::error::Error::Containment {
+                source: std::sync::Arc::new(crate::error::Error::Containment {
                     detail: "refused".into(),
                     source: None,
                 }),
@@ -639,7 +639,7 @@ fn a_late_roots_send_whose_open_is_refused_is_the_opens_error() {
     else {
         panic!("expected Unassessable with its cause, got {err:?}");
     };
-    assert_eq!(source.raw_os_error(), Some(libc::EPERM), "{err:?}");
+    assert_eq!(crate::error::first_os_code(source), Some(libc::EPERM), "{err:?}");
     assert_eq!(sends.by_identity(), vec![], "nothing was sent");
     _ = child.kill();
     _ = child.wait();

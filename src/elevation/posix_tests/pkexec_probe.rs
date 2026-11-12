@@ -37,12 +37,10 @@ fn the_probe_runs_in_an_empty_environment() {
     );
     let mut probe = sh(&pkexec);
     probe.arg("--version").env("HOME", "/cosca-probe-home");
-    assert_eq!(
-        run_version_probe(probe),
-        PkexecVersion::Parsed {
-            version: "121".into(),
-            release: Some(121)
-        }
+    let got = run_version_probe(probe);
+    assert!(
+        matches!(&got, PkexecVersion::Parsed { version, release: Some(121) } if version == "121"),
+        "{got:?}"
     );
 }
 
@@ -60,7 +58,7 @@ fn the_probe_execs_the_pinned_file_with_dash_dash_version() {
         assert_eq!(probe.get_args().collect::<Vec<_>>(), ["--version"]);
         PkexecVersion::Unparsed("seen".into())
     });
-    assert_eq!(v, PkexecVersion::Unparsed("seen".into()));
+    assert!(matches!(&v, PkexecVersion::Unparsed(text) if text == "seen"), "{v:?}");
 }
 
 /// Only `Backend::Pkexec` with `Auth::Gui`, from a caller not already root, on Linux, launches
@@ -92,7 +90,7 @@ fn only_a_linux_gui_pkexec_request_from_a_non_root_caller_launches_pkexec() {
 fn a_probe_that_cannot_run_says_so() {
     let v = run_version_probe(std::process::Command::new("/nonexistent/pkexec"));
     assert!(
-        matches!(v, PkexecVersion::SpawnFailed(ref e) if e.to_io().raw_os_error() == Some(libc::ENOENT)),
+        matches!(v, PkexecVersion::SpawnFailed(ref e) if e.raw_os_error() == Some(libc::ENOENT)),
         "{v:?}"
     );
 }
@@ -162,12 +160,10 @@ fn detect_stores_the_pkexec_it_probed() {
         probed.into_inner(),
         Some(PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd())))
     );
-    assert_eq!(
-        host.pkexec_version,
-        PkexecVersion::Parsed {
-            version: "121".into(),
-            release: Some(121)
-        }
+    assert!(
+        matches!(&host.pkexec_version, PkexecVersion::Parsed { version, release: Some(121) } if version == "121"),
+        "{:?}",
+        host.pkexec_version
     );
 }
 
@@ -192,7 +188,11 @@ fn detect_opens_and_probes_only_for_a_request_that_launches_pkexec() {
             |_| panic!("{os:?} {backend:?} {auth:?} {elevated}: canonicalised pkexec"),
             |_| panic!("{os:?} {backend:?} {auth:?} {elevated}: probed pkexec"),
         );
-        assert_eq!(host.pkexec_version, PkexecVersion::NotProbed);
+        assert!(
+            matches!(host.pkexec_version, PkexecVersion::NotProbed),
+            "{:?}",
+            host.pkexec_version
+        );
         assert!(host.pkexec_pin.is_none());
         assert_eq!(host.available.pkexec, Some(bin.join("pkexec")));
         assert_eq!(host.os, os);
@@ -218,7 +218,7 @@ fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
     match host.pkexec_version {
         PkexecVersion::Unresolved { path, error } => {
             assert_eq!(Path::new(&path), bin.join("pkexec"));
-            assert_eq!(error.to_io().raw_os_error(), Some(libc::ELOOP), "{error:?}");
+            assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error:?}");
         }
         other => panic!("expected Unresolved, got {other:?}"),
     }
@@ -243,7 +243,7 @@ fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
     match host.pkexec_version {
         PkexecVersion::Unpinned { path, error } => {
             assert_eq!(Path::new(&path), bin.join("pkexec"));
-            let refusal = error.to_io();
+            let refusal = &*error;
             // Linux's `O_PATH | O_NOFOLLOW` opens the link itself, which is not a regular file;
             // elsewhere `O_NOFOLLOW` fails the open.
             #[cfg(target_os = "linux")]
@@ -281,7 +281,7 @@ fn a_fifo_at_the_canonical_path_is_not_pinned() {
     assert!(host.pkexec_pin.is_none());
     match host.pkexec_version {
         PkexecVersion::Unpinned { error, .. } => {
-            assert!(error.to_io().to_string().contains("not a regular file"), "{error:?}")
+            assert!(error.to_string().contains("not a regular file"), "{error:?}")
         }
         other => panic!("expected Unpinned, got {other:?}"),
     }

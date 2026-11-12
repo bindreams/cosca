@@ -1219,16 +1219,7 @@ impl LateTree {
                 self.notes.push(NOT_SWEPT_AGAIN.to_owned());
             }
             // The root stopped being shown ours between the sweeps: nothing by its pid was sent.
-            TreeKillOutcome::Skipped(skip) => self.sweeps.push(Err(Unkilled::from(match skip.holders {
-                Some(Err(e)) => e,
-                _ => crate::error::Error::Unassessable {
-                    detail: format!(
-                        "the root could not be shown to be ours, so its tree did not {}",
-                        skip.action
-                    ),
-                    source: None,
-                },
-            }))),
+            TreeKillOutcome::Skipped(skip) => self.sweeps.push(Err(Unkilled::from(skip.sweep_error()))),
             other => self.sweeps.push(other.into_result()),
         }
     }

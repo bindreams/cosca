@@ -75,7 +75,7 @@ fn a_pid_that_cannot_be_opened_for_want_of_descriptors_is_unknown_with_the_errno
         let err = cause.into_error("pid 4242").expect("the errno is the cause");
         assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
         assert_eq!(
-            err.raw_os_error(),
+            crate::error::first_os_code(&err),
             Some(errno.raw_os_error()),
             "the errno is in the chain"
         );
@@ -93,7 +93,7 @@ fn a_refused_pidfd_open_is_unknown_and_unsupported() {
         let err = cause.into_error("pid 4242").expect("the refusal is the cause");
         assert!(matches!(err, Error::Unsupported { .. }), "{errno}: {err:?}");
         assert_eq!(
-            err.raw_os_error(),
+            crate::error::first_os_code(&err),
             Some(errno.raw_os_error()),
             "{errno}: the errno is the source"
         );
@@ -122,7 +122,7 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
             other => panic!("{errno}: expected Unsupported, got {other:?}"),
         }
         assert_eq!(
-            refused.raw_os_error(),
+            crate::error::first_os_code(&refused),
             Some(errno.raw_os_error()),
             "{errno}: the errno is the source"
         );
@@ -147,7 +147,7 @@ fn an_openat2_that_answers_eacces_is_unassessable_carrying_eacces() {
         .into_error("pid 4242")
         .expect("the view is the cause");
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(err.raw_os_error(), Some(Errno::ACCESS.raw_os_error()));
+    assert_eq!(crate::error::first_os_code(&err), Some(Errno::ACCESS.raw_os_error()));
 }
 
 /// Each call is refused for its own errnos and no others: `pidfd_open` and `openat2` by the
@@ -197,7 +197,7 @@ fn only_a_failed_pidfd_open_or_openat2_is_a_refusal() {
             let err = cause.into_error("pid 4242").expect("the call is the cause");
             assert!(matches!(err, Error::Unassessable { .. }), "{name} {errno}: {err:?}");
             assert_eq!(
-                err.raw_os_error(),
+                crate::error::first_os_code(&err),
                 Some(errno.raw_os_error()),
                 "{name} {errno}: the errno is in the chain"
             );

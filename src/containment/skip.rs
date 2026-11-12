@@ -34,6 +34,26 @@ impl Skip {
                 Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_))
             )
     }
+
+    /// The error of a sweep that skipped what the root's number names: the holders' sweep's own
+    /// error when it failed, else `Unassessable`, with the error behind [`why`](Skip::why) as its
+    /// `source`.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS's late sweep skips a root it cannot show ours")
+    )]
+    pub(crate) fn sweep_error(self) -> Error {
+        match self.holders {
+            Some(Err(e)) => e,
+            _ => Error::Unassessable {
+                detail: format!(
+                    "the root could not be shown to be ours, so its tree did not {}",
+                    self.action
+                ),
+                source: self.why.cause(),
+            },
+        }
+    }
 }
 
 /// Why the root's number was not used.
@@ -43,10 +63,44 @@ impl Skip {
     allow(dead_code, reason = "only a Unix mechanism skips by the root's number")
 )]
 pub(crate) enum Why {
-    /// macOS: the root is `Unpinned` or `Unknown`; the text says which.
-    Untrusted(String),
+    /// macOS: the root is `Unpinned` or `Unknown`; `why` says which, and `cause` is the error of an
+    /// `Unknown`, shared with the state it came from.
+    Untrusted {
+        why: String,
+        cause: Option<std::sync::Arc<std::io::Error>>,
+    },
     /// The pid may name another process, for this reason.
     MayNameAnother(Refusal),
+}
+
+#[cfg(unix)]
+impl Why {
+    /// [`Why::Untrusted`] for `state`, the root's own handle's answer.
+    pub(crate) fn untrusted(state: &crate::signal::RootState) -> Why {
+        Why::Untrusted {
+            why: crate::signal::why_untrusted(state),
+            cause: match state {
+                crate::signal::RootState::Unknown(e) => Some(std::sync::Arc::clone(e)),
+                _ => None,
+            },
+        }
+    }
+
+    /// The error behind this reason, shared ([`crate::error::shared_io`]).
+    pub(crate) fn cause(&self) -> Option<std::sync::Arc<Error>> {
+        match self {
+            Why::Untrusted { cause, .. } => cause.as_ref().map(crate::error::shared_io_cause),
+            Why::MayNameAnother(refusal) => refusal.cause(),
+        }
+    }
+
+    /// The one `warn` of a skipped call: `detail`, then the chain of the error behind this reason.
+    pub(crate) fn warn(&self, detail: &str) {
+        match self.cause() {
+            Some(cause) => log::warn!("{detail}: {}", crate::error::Report(&*cause)),
+            None => log::warn!("{detail}"),
+        }
+    }
 }
 
 /// What a mechanism's cooperative signal to its tree did, from one look at the root. A tree call that
@@ -122,12 +176,12 @@ mod call {
         ) -> Settled<Result<(), Error>> {
             let mut skip = match skip {
                 Skip {
-                    why: Why::Untrusted(why),
+                    why: Why::Untrusted { why, cause },
                     action,
                     holders,
                     ..
                 } => {
-                    let error = self.untrusted(&action, &why, holders);
+                    let error = self.untrusted(&action, &why, cause, holders);
                     return match self.signal {
                         TreeSignal::Kill => {
                             tree.settle_for_kill_tree(self.op, TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
@@ -145,7 +199,8 @@ mod call {
                     "{}({}): {refusal}, and this handle already killed the tree, so it does not {}",
                     self.op,
                     self.pid,
-                    skip.action
+                    skip.action,
+                    refusal = crate::error::Report(refusal)
                 );
                 return match self.signal {
                     TreeSignal::Kill => tree.settle_for_kill_tree(self.op, TreeKillOutcome::Skipped(skip), false),
@@ -178,7 +233,8 @@ mod call {
                 ),
             };
             let detail = self.skipped_detail(&skip, &sent);
-            log::warn!("{detail}");
+            let cause = skip.why.cause();
+            skip.why.warn(&detail);
             let swept = skip.holders.is_some();
             let mut killed_again = Vec::new();
             let holders = match self.signal {
@@ -196,27 +252,37 @@ mod call {
             };
             let answer = match (holders, root) {
                 (Some(Err(e)), _) | (None, Some(Err(e))) => Err(e),
-                _ => Err(Error::Unassessable { detail, source: None }),
+                _ => Err(Error::Unassessable { detail, source: cause }),
             };
             Settled { answer, killed_again }
         }
 
         /// The error of a call that skipped what the root's number names, `skipped`, because the root
-        /// is `Unpinned` or `Unknown` (macOS), `why`: no `warn`, only a debug line when holders were
-        /// signalled.
-        fn untrusted(&self, skipped: &str, why: &str, holders: Option<Result<(), Error>>) -> Error {
+        /// is `Unpinned` or `Unknown` (macOS), `why`, with the error of an `Unknown` as `cause`: no
+        /// `warn`, only a debug line when holders were signalled.
+        fn untrusted(
+            &self,
+            skipped: &str,
+            why: &str,
+            cause: Option<std::sync::Arc<std::io::Error>>,
+            holders: Option<Result<(), Error>>,
+        ) -> Error {
             let (root_pid, op) = (self.pid, self.op);
             let earlier = self
                 .earlier
                 .map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
+            let said = cause.as_ref().map_or_else(
+                || why.to_owned(),
+                |cause| format!("{why}: {}", crate::error::Report(&**cause)),
+            );
             let unassessable = |sent: &str, because: &str| Error::Unassessable {
                 detail: format!("pid {root_pid}: {why}; {op} {sent}{earlier}: {because}it did not {skipped}"),
-                source: None,
+                source: cause.as_ref().map(crate::error::shared_io_cause),
             };
             match holders {
                 None => unassessable("sent nothing", "its signals are all named by the root's number, so "),
                 Some(swept) => {
-                    log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
+                    log::debug!("{op}: {said}, so it does not {skipped}; it signals the marker holders");
                     match swept {
                         // The holders are not the tree: a kill that skipped the rest is not `Ok`.
                         Ok(()) => unassessable("signalled only the marker holders", ""),
@@ -280,10 +346,13 @@ mod call {
                 "sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}"
             );
             let detail = self.skipped_detail(skip, &sent);
-            log::warn!("{detail}");
+            skip.why.warn(&detail);
             let error = match settled {
                 Err(e) => e,
-                Ok(()) => Error::Unassessable { detail, source: None },
+                Ok(()) => Error::Unassessable {
+                    detail,
+                    source: skip.why.cause(),
+                },
             };
             Settled {
                 answer: error,

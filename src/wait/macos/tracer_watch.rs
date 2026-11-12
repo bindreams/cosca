@@ -114,7 +114,7 @@ impl TracerWatch {
                 self.disarm(kq, at)?;
                 match arm(kq, at) {
                     Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(self.gone()),
+                    Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => return Ok(self.gone()),
                     Err(e) => return Err(WalkError::Watch(e.into_io())),
                 }
                 match uniq_info(at, ReadPurpose::Link) {
@@ -191,7 +191,7 @@ fn watched(pid: u32) -> Subscription {
 /// its one-shot knote.
 fn delete(kq: &Kqueue, pid: u32) -> Result<(), WalkError> {
     match kq.unsubscribe(watched(pid)) {
-        Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(WalkError::Watch(e.into_io())),
+        Err(e) if crate::error::first_os_code(&e) != Some(libc::ENOENT) => Err(WalkError::Watch(e.into_io())),
         _ => Ok(()),
     }
 }

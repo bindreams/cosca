@@ -394,7 +394,7 @@ fn group_look(root: &dyn Root) -> NumberLook {
 /// What a skipped send to the group `pgid` left undone, and why.
 fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
     let (why, root_alone) = match look {
-        NumberLook::Untrusted(state) => (Why::Untrusted(crate::signal::why_untrusted(&state)), false),
+        NumberLook::Untrusted(state) => (Why::untrusted(&state), false),
         NumberLook::MayNameAnother { refusal, exact_root } => (Why::MayNameAnother(refusal), exact_root),
         NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
             unreachable!("a send to a group that is not skipped has no skip to say")
@@ -552,7 +552,7 @@ pub(crate) fn send_to_group(
         detail: format!(
             "process group {pgid}: {why}, so its number may name another group, and {signal} was not sent by it"
         ),
-        source: None,
+        source: why.cause(),
     })?;
     Ok(send_signal(Target::Group, Sys::Group(pgid), signal))
 }
@@ -808,8 +808,11 @@ fn signal_direct(pid: i32, signal: Signal, root: Option<&dyn Root>) -> io::Resul
         Some(sent) => sent,
         None => {
             if let Err(why) = check_number(root) {
-                log::debug!("containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}");
-                return Err(io::Error::other(why.to_string()));
+                log::debug!(
+                    "containment::unix::signal_direct: {why}, so {signal} was not sent to pid {pid}",
+                    why = crate::error::Report(&why)
+                );
+                return Err(io::Error::other(why));
             }
             send_signal(Target::Leader, Sys::Process(pid), signal)
         }

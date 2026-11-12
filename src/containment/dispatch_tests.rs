@@ -39,7 +39,7 @@ fn unsettled_logs_every_member_with_its_chain() {
     use crate::error::Error;
     let member = |text: &str| Error::MemberNotKilled {
         pid: 1,
-        source: Box::new(Error::Containment {
+        source: std::sync::Arc::new(Error::Containment {
             detail: text.into(),
             source: None,
         }),
@@ -210,11 +210,11 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
     let walk = || Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
     let rooted = |state: fn() -> RootState| StatedRoot::with_state(1234, state);
     let unpinned = || rooted(|| RootState::Unpinned);
-    let unknown = || rooted(|| RootState::Unknown(std::io::Error::other("a failed peek")));
+    let unknown = || rooted(|| RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))));
     for (name, root) in [("unpinned", unpinned()), ("unknown", unknown())] {
         let killed = walk().kill(Some(&root)).outcome();
         assert!(
-            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && skip.holders.is_none()),
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted { .. }) && skip.holders.is_none()),
             "{name}: {killed:?}"
         );
         let termed = walk().terminate(1234, Some(&root));
@@ -245,7 +245,7 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
         let (marker, mut holder) = held();
         let killed = marker.kill(Some(&root)).outcome();
         assert!(
-            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted(_)) && matches!(skip.holders, Some(Ok(())))),
+            matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted { .. }) && matches!(skip.holders, Some(Ok(())))),
             "{name}: {killed:?}"
         );
         // A signal ended it, not the stdin's EOF at `wait`, which exits `sh` 1 with none.
@@ -504,7 +504,7 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     use crate::error::Error;
     let left = |pid| Error::MemberNotKilled {
         pid,
-        source: Box::new(Error::Containment {
+        source: std::sync::Arc::new(crate::error::Error::Unassessable {
             detail: "refused".into(),
             source: None,
         }),
@@ -686,7 +686,11 @@ fn next_is_the_one_transition_of_state_and_facts() {
     use crate::containment::treewalk::Left;
     let unread = |pid| Left::Unread {
         pid,
-        said: "its identity could not be read".into(),
+        source: std::sync::Arc::new(crate::error::Error::Unassessable {
+            detail: "its identity could not be read".into(),
+            source: None,
+        }),
+        note: None,
     };
     let prev_names = [
         "Never",
@@ -1085,7 +1089,7 @@ fn a_root_left_over_a_handle_that_is_not_a_walk_asserts() {
 fn member_left(pid: u32) -> crate::error::Error {
     crate::error::Error::MemberNotKilled {
         pid,
-        source: Box::new(crate::error::Error::Unassessable {
+        source: std::sync::Arc::new(crate::error::Error::Unassessable {
             detail: "its identity could not be read".into(),
             source: None,
         }),
@@ -1656,7 +1660,7 @@ fn a_sweeps_report_of_the_other_members_it_left_names_its_call() {
     use crate::error::Error;
     let member = |pid| Error::MemberNotKilled {
         pid,
-        source: Box::new(Error::Containment {
+        source: std::sync::Arc::new(Error::Containment {
             detail: "refused".into(),
             source: None,
         }),
@@ -2201,6 +2205,7 @@ mod frozen_attach {
     use windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_HANDLE: u32 = 6;
 
     fn prepared(mode: Option<ContainMode>, is_root: bool, frozen: bool) -> Prepared {
         Prepared {
@@ -2301,7 +2306,40 @@ mod frozen_attach {
             .err()
             .expect("a frozen attach with no job must fail");
 
-        assert!(matches!(err, Error::Containment { .. }), "got {err:?}");
+        let Error::Containment { detail, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{err:?}"
+        );
+        let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
+        assert!(!detail.contains(&os_text), "{detail}");
+        dispose(child);
+    }
+
+    /// A frozen root whose initial thread cannot be resumed fails the attach with the OS error as the
+    /// source, and not in the text.
+    #[skuld::test]
+    fn attach_whose_resume_fails_has_the_win32_error_as_its_source() {
+        let child = spawn_suspended_blocker();
+        let _forced = force_next(Step::Resume, ERROR_INVALID_HANDLE);
+
+        let err = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, false))
+            .err()
+            .expect("an attach whose resume fails must fail");
+
+        let Error::Containment { detail, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(ERROR_INVALID_HANDLE as i32),
+            "{err:?}"
+        );
+        let os_text = std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).to_string();
+        assert!(!detail.contains(&os_text), "{detail}");
         dispose(child);
     }
 

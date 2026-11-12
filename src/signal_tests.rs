@@ -131,7 +131,10 @@ mod macos {
         match err {
             crate::error::Error::Unassessable { detail, source } => {
                 assert!(detail.contains("pid 77") && !detail.contains("errno"), "{detail}");
-                assert_eq!(source.map(|e| e.raw_os_error()), Some(Some(libc::EPERM)));
+                assert_eq!(
+                    source.map(|e| crate::error::first_os_code(&*e)),
+                    Some(Some(libc::EPERM))
+                );
             }
             other => panic!("expected Unassessable, got {other:?}"),
         }
@@ -313,6 +316,45 @@ mod root_state {
             matches!(&state, RootState::Unknown(e) if e.to_string().contains("peek failure 5d1")),
             "{state:?}"
         );
+    }
+
+    /// A second reader of one look gets the cause of the first, shared: a code is what tells a caller
+    /// which failure it was, and the error handed out for the clone keeps it.
+    ///
+    /// Mutant: the clone rebuilds the error from its kind and text.
+    #[skuld::test]
+    fn a_cloned_unknown_keeps_its_cause() {
+        let state = RootState::Unknown(std::sync::Arc::new(crate::error::io_context(
+            "w",
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        )));
+        let RootState::Unknown(copy) = state.clone() else {
+            panic!("a clone of an Unknown is Unknown");
+        };
+        let RootState::Unknown(original) = &state else {
+            unreachable!()
+        };
+        assert!(std::sync::Arc::ptr_eq(original, &copy));
+        let handed = crate::error::shared_io(&copy);
+        assert_eq!(crate::error::first_os_code(&handed), Some(libc::EPERM));
+        assert_eq!(
+            crate::error::Report(&handed).to_string(),
+            crate::error::Report(&**original).to_string()
+        );
+    }
+
+    /// Why a root's number is untrusted says this layer's words: the error of an `Unknown` root is
+    /// reached through the state, not read in the text.
+    ///
+    /// Mutant: `why_untrusted` formats the error into the text.
+    #[skuld::test]
+    fn why_a_root_is_untrusted_does_not_say_its_cause() {
+        let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
+        let why = crate::signal::why_untrusted(&RootState::Unknown(std::sync::Arc::new(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        )));
+        assert!(why.contains("RootState::Unknown"), "{why}");
+        assert!(!why.contains(&os_error), "{why}");
     }
 
     /// An orphaned zombie (held by launchd) is `Unpinned`.

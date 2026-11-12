@@ -518,6 +518,13 @@ fn an_unusable_view_has_its_os_error_as_its_source() {
     assert!(std::error::Error::source(&ViewUnreadable::new("boom", None)).is_none());
 }
 
+/// An unusable view says its reason and not the OS error behind it, which is its `source()`.
+#[skuld::test]
+fn an_unusable_view_says_its_reason_and_not_its_os_error() {
+    let why = ViewUnreadable::new("boom", Some(io::Error::from_raw_os_error(libc::EIO)));
+    assert_eq!(why.to_string(), "boom");
+}
+
 /// `into_dir` yields the directory of a `Same` view and names the cause of any other.
 #[skuld::test]
 fn into_dir_names_why_a_view_is_not_usable() {

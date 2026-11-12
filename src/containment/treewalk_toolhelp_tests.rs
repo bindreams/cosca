@@ -89,7 +89,8 @@ fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
     let result = me.children(Recursive::No);
     drop(forced);
     let Err(Error::Unassessable {
-        source: Some(source), ..
+        detail,
+        source: Some(source),
     }) = result
     else {
         panic!("expected Unassessable with a source, got {result:?}");
@@ -97,6 +98,10 @@ fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
     let Error::Io(source) = &*source else {
         panic!("expected an Io source, got {source:?}");
     };
+    assert_eq!(
+        detail,
+        "the process snapshot could not be taken: CreateToolhelp32Snapshot failed"
+    );
     assert_eq!(
         source.raw_os_error(),
         Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),

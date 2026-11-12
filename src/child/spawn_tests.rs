@@ -1219,7 +1219,7 @@ fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
     match expect_not_started(err.expect("a refused identity read must fail the spawn")) {
         Error::Unassessable { detail, source } => {
             assert!(detail.contains("did not start"), "{detail}");
-            assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EPERM));
+            assert_eq!(source.and_then(|e| crate::error::first_os_code(&*e)), Some(libc::EPERM));
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }

@@ -637,6 +637,10 @@ fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
     let err = members(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
     assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
+    // The view's read error is the source, with its code, and not repeated in the text.
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+    assert!(!err.to_string().contains(&os_error), "{err}");
 }
 
 // Per-pid stat read failures =====
@@ -676,11 +680,12 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
         let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
-        let text = err.to_string();
-        assert!(
-            text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
-            "{errno}: {text}"
-        );
+        // The listing's own words do not fold in the layer's (`to_string` is this layer alone).
+        let own = err.to_string();
+        assert!(!own.contains("/stat"), "{errno}: {own}");
+        // The read's error is below the `Unreadable` layer, with its code.
+        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {err:?}");
+        let text = crate::error::Report(&err).to_string();
         if matches!(errno, libc::EXDEV | libc::ELOOP) {
             assert!(text.contains("beyond a mount"), "{errno}: {text}");
         }
@@ -695,20 +700,30 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 
 /// EPERM is `hidepid`'s answer, and also a seccomp filter's for `openat2` installed mid-scan. Only
 /// the checked directory answering afterwards tells them apart: if it refuses too, this is a
-/// refusal, not a hidden pid. Mutant: "exclude EPERM without the re-check".
+/// refusal, not a hidden pid, and the pid's `EPERM` is the source. A re-check that fails otherwise
+/// is the re-check's error. Mutant: "exclude EPERM without the re-check"; "every failed re-check is
+/// a refusal".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
-    for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
+    for (recheck, refused, below) in [
+        (libc::EPERM, true, libc::EPERM),
+        (libc::ENOSYS, true, libc::EPERM),
+        (libc::EMFILE, false, libc::EMFILE),
+    ] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
-        let err = members(&kernel, i32::MAX).expect_err("a refusing directory lists nothing");
-        let text = err.to_string();
+        let err =
+            members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
+        let text = crate::error::Report(&err).to_string();
         assert!(text.contains("self/stat"), "{recheck}: {text}");
-        assert!(
-            text.contains(&std::io::Error::from_raw_os_error(recheck).to_string()),
+        assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
+        assert_eq!(
+            text.contains("re-check of self/stat failed"),
+            !refused,
             "{recheck}: {text}"
         );
+        assert_eq!(crate::error::first_os_code(&err), Some(below), "{recheck}: {text}");
     }
 }
 

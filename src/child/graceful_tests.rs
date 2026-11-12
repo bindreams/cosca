@@ -966,3 +966,77 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
         "the member was waited for, and its failure is logged at debug: {waited:?}"
     );
 }
+
+/// A root reaped elsewhere (`ECHILD`) leaves no exit status: the answer is `Unassessable`, with the
+/// `ECHILD` as its `source()`, so a caller can tell this from any other refusal.
+///
+/// Mutant: the answer drops the error of the wait.
+#[cfg(unix)]
+#[skuld::test]
+fn a_root_reaped_elsewhere_answers_unassessable_with_its_echild_as_the_source() {
+    use crate::error::Error;
+
+    let waited = Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD)));
+
+    let answer = super::status_unless_reaped_elsewhere(waited, 4242).expect_err("no exit status was collected");
+
+    assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
+}
+
+/// An `ECHILD` deep in the chain of a variant that is not an `Error::Io` is not a root reaped
+/// elsewhere: the wait's answer is kept as it is.
+///
+/// Mutant: any error with an `ECHILD` anywhere down its chain counts.
+#[cfg(unix)]
+#[skuld::test]
+fn an_echild_below_a_variant_that_is_not_io_is_not_a_root_reaped_elsewhere() {
+    use crate::error::Error;
+
+    let echild = || Error::io_cause(std::io::Error::from_raw_os_error(libc::ECHILD));
+    let waits = [
+        Error::Containment {
+            detail: "the wait's own failure".into(),
+            source: Some(echild()),
+        },
+        Error::MemberNotKilled {
+            pid: 4243,
+            source: echild(),
+            note: None,
+        },
+    ];
+    for waited in waits {
+        let words = waited.to_string();
+
+        let answer = super::status_unless_reaped_elsewhere(Err(waited), 4242).expect_err("the wait failed");
+
+        assert_eq!(answer.to_string(), words, "kept as it is: {answer:?}");
+        assert!(!matches!(answer, Error::Unassessable { .. }), "{answer:?}");
+    }
+}
+
+/// A wait's `ECHILD` below a context or a note is still a reap elsewhere: the answer is the same
+/// `Unassessable`, and the wait's error, words included, is its `source()`.
+///
+/// Mutant: only a bare `Error::Io` with the code itself counts.
+#[cfg(unix)]
+#[skuld::test]
+fn a_wrapped_echild_is_still_a_root_reaped_elsewhere() {
+    use crate::error::Error;
+
+    let echild = || std::io::Error::from_raw_os_error(libc::ECHILD);
+    let waits = [
+        Error::Io(crate::error::io_context("waiting for pid 4242", echild())),
+        Error::Io(echild()).with_note("while tearing down"),
+    ];
+    for waited in waits {
+        let words = waited.to_string();
+
+        let answer = super::status_unless_reaped_elsewhere(Err(waited), 4242).expect_err("no exit status");
+
+        assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
+        assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
+        let report = crate::error::Report(&answer).to_string();
+        assert!(report.contains(&words), "the wait's words are kept: {report}");
+    }
+}

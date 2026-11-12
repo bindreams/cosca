@@ -1077,7 +1077,7 @@ fn a_failed_shell_execute_has_the_windows_error_as_its_cause() {
             SpawnFailure::NotStarted(error) => error,
             SpawnFailure::MayHaveStarted { cause, .. } => cause,
         };
-        assert_eq!(error.raw_os_error(), Some(code as i32), "{error:?}");
+        assert_eq!(crate::error::first_os_code(&error), Some(code as i32), "{error:?}");
         match error {
             Error::Elevation {
                 kind: ElevationErrorKind::AuthFailed,
@@ -1095,7 +1095,7 @@ fn an_hresult_cause_keeps_its_hex_unless_it_is_a_win32_code() {
     use windows::core::HRESULT;
 
     let win32 = super::hresult_cause(HRESULT(0x8007_0005_u32 as i32));
-    assert_eq!(win32.raw_os_error(), Some(5));
+    assert_eq!(crate::error::first_os_code(&*win32), Some(5));
     assert!(!Report(&*win32).to_string().contains("HRESULT"), "{win32}");
 
     let other = super::hresult_cause(HRESULT(0x8000_4005_u32 as i32));
@@ -1137,7 +1137,10 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
         detail.ends_with("and could not be terminated; it may still be running"),
         "{detail}"
     );
-    assert_eq!(source.expect("the refusal is the cause").raw_os_error(), Some(5));
+    assert_eq!(
+        crate::error::first_os_code(&*source.expect("the refusal is the cause")),
+        Some(5)
+    );
 
     // A failed `GetProcessId` has no pid to show, and is not an identity failure.
     let no_pid = || Err(WinError::from_hresult(HRESULT::from_win32(6)));
@@ -1158,7 +1161,10 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     assert_eq!(fate, ChildFate::Killed);
     assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(detail.ends_with("it was terminated"), "{detail}");
-    assert_eq!(source.expect("the failed read is the cause").raw_os_error(), Some(6));
+    assert_eq!(
+        crate::error::first_os_code(&*source.expect("the failed read is the cause")),
+        Some(6)
+    );
 }
 
 /// A spawn that finds the parent already elevated gives its child the `AlreadyElevated` report and

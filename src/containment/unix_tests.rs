@@ -283,7 +283,7 @@ mod group_kill_and_terminate {
             Root::Unreaped => RootState::Unreaped,
             Root::ReapedElsewhere => RootState::Reaped { own: false },
             Root::OwnReapGone | Root::OwnReapTaken | Root::OwnReapUnreadable => RootState::Reaped { own: true },
-            Root::Unknown => RootState::Unknown(std::io::Error::other("a failed peek")),
+            Root::Unknown => RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))),
         })
     }
 
@@ -317,7 +317,7 @@ mod group_kill_and_terminate {
                 assert_eq!(skip.root_alone, cfg!(target_os = "linux"), "{root:?}");
             }
             // macOS trusts no number its root's handle cannot answer for.
-            (Why::Untrusted(_), Root::Unknown) if cfg!(target_os = "macos") => {}
+            (Why::Untrusted { .. }, Root::Unknown) if cfg!(target_os = "macos") => {}
             (why, _) => panic!("{root:?} was skipped for {why:?}"),
         }
     }
@@ -397,4 +397,105 @@ mod group_kill_and_terminate {
             }
         }
     }
+}
+
+/// A group's send refused because its root's handle could not say whether the root was reaped is
+/// `Unassessable` with the handle's error as its `source()`, so the OS code is reachable, and not in
+/// the `detail`. Nothing is sent: the check fails first.
+///
+/// Mutant: the error is folded into the text and no source is kept.
+#[skuld::test]
+fn a_send_refused_for_an_unsure_root_has_the_handles_error_as_its_source() {
+    use super::send_to_group;
+    use crate::error::Error;
+    use crate::signal::RootState;
+
+    let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
+    let root = StatedRoot::with_state(999_999, || {
+        RootState::Unknown(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM)))
+    });
+
+    let refused = send_to_group(999_999, nix::sys::signal::Signal::SIGTERM, Some(&root))
+        .expect_err("a root that cannot say is no check that passes");
+
+    let Error::Unassessable { detail, .. } = &refused else {
+        panic!("got {refused:?}");
+    };
+    assert_eq!(crate::error::first_os_code(&refused), Some(libc::EPERM), "{refused:?}");
+    assert!(!detail.contains(&os_error), "{detail}");
+}
+
+/// A skip over an untrusted root (macOS reads it; the answer is built on every Unix) answers
+/// `Unassessable` with the handle's error as its `source()`, and not in the `detail`.
+#[skuld::test]
+fn a_skip_over_an_untrusted_root_has_the_handles_error_as_its_source() {
+    use super::skipped_group;
+    use crate::containment::dispatch::TreeSignal;
+    use crate::containment::root::NumberLook;
+    use crate::containment::{SkipCall, Tree};
+    use crate::error::Error;
+    use crate::signal::RootState;
+
+    let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
+    let call = SkipCall {
+        op: "skip_untrusted_probe_4c2",
+        pid: 999_999,
+        signal: TreeSignal::Term,
+        earlier: None,
+    };
+    let skip = skipped_group(
+        999_999,
+        "kill",
+        NumberLook::Untrusted(RootState::Unknown(std::sync::Arc::new(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        ))),
+    );
+
+    let answer = call
+        .answer(&Tree::none(), skip, None)
+        .answer
+        .expect_err("a skipped call is no success");
+
+    let Error::Unassessable { detail, .. } = &answer else {
+        panic!("got {answer:?}");
+    };
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM), "{answer:?}");
+    assert!(!detail.contains(&os_error), "{detail}");
+}
+
+/// The handle's error of an untrusted root (macOS: `RootState::Unknown`, whose error is an
+/// `io_context` over the OS error) keeps its OS code in the copy the skip holds, so the answer's
+/// `source()` reaches it.
+///
+/// Mutant: the copy reads the code of the outer error only.
+#[skuld::test]
+fn a_skip_over_an_untrusted_root_with_a_context_error_keeps_its_os_code() {
+    use super::skipped_group;
+    use crate::containment::dispatch::TreeSignal;
+    use crate::containment::root::NumberLook;
+    use crate::containment::{SkipCall, Tree};
+    use crate::signal::RootState;
+
+    let call = SkipCall {
+        op: "skip_untrusted_context_probe",
+        pid: 999_999,
+        signal: TreeSignal::Term,
+        earlier: None,
+    };
+    let handle_error = crate::error::io_context(
+        "the root could not be peeked",
+        std::io::Error::from_raw_os_error(libc::EPERM),
+    );
+    let skip = skipped_group(
+        999_999,
+        "kill",
+        NumberLook::Untrusted(RootState::Unknown(std::sync::Arc::new(handle_error))),
+    );
+
+    let answer = call
+        .answer(&Tree::none(), skip, None)
+        .answer
+        .expect_err("a skipped call is no success");
+
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM), "{answer:?}");
 }

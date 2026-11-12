@@ -311,7 +311,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     };
     match kq.subscribe(child) {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Watch::ChildGone),
+        Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => return Ok(Watch::ChildGone),
         Err(e) => return Err(e.into_io()),
     }
     let mut tracer = TracerWatch::default();

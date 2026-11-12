@@ -293,7 +293,7 @@ fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
     assert!(detail.contains("FIRST"), "{detail}");
     crate::error::assert_detail_is_not_hard_wrapped(detail);
     assert_eq!(
-        out.raw_os_error(),
+        crate::error::first_os_code(&out),
         Some(ACCESS_DENIED),
         "the refused spawn's error is the source"
     );

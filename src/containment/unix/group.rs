@@ -191,15 +191,10 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                 );
                 continue;
             }
-            // Excluding it could clear a live group.
+            // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc).
             Err(e) => {
-                let message =
-                    format!("containment::unix::group::members: {e}, so process group {pgid} cannot be listed");
-                return Err(listing_error(
-                    std::io::ErrorKind::Other,
-                    message,
-                    Some(e.into_source().into()),
-                ));
+                let message = format!("containment::unix::group::members: process group {pgid} cannot be listed");
+                return Err(listing_error(std::io::ErrorKind::Other, message, Some(e.into())));
             }
         };
         let Some(g) = parse_pgrp(&stat) else {
@@ -477,11 +472,17 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
     match check_number(root) {
         Ok(()) => Ok(()),
         Err(why @ crate::containment::NotItsGroup::Empty) => {
-            log::debug!("containment::unix::group: {why}, so pid {pid} is in another group, and is not {send}");
+            log::debug!(
+                "containment::unix::group: {why}, so pid {pid} is in another group, and is not {send}",
+                why = crate::error::Report(&why)
+            );
             Err(Reached::Yes)
         }
         Err(why) => {
-            log::warn!("containment::unix::group: {why}, so pid {pid} is not {send}; it is unassessable");
+            log::warn!(
+                "containment::unix::group: {why}, so pid {pid} is not {send}; it is unassessable",
+                why = crate::error::Report(&why)
+            );
             Err(Reached::Unknown)
         }
     }

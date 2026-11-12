@@ -268,7 +268,11 @@ fn holds_process_of_an_unreadable_handle_carries_the_win32_code() {
         panic!("expected Unassessable, got {err:?}");
     };
     let io = source.expect("the OS error is preserved");
-    assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+    assert_eq!(
+        crate::error::first_os_code(&io),
+        Some(ERROR_INVALID_HANDLE.0 as i32),
+        "{io:?}"
+    );
 }
 
 /// `open_verified` on a live process we may not open is `Unassessable` with the plain Win32 code.
@@ -302,7 +306,8 @@ fn denied_open_source(
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("expected Unassessable, got {err:?}");
     };
-    let Some(crate::error::Error::Io(os)) = source.map(|source| *source) else {
+    let Some(crate::error::Error::Io(os)) = source.map(|source| std::sync::Arc::try_unwrap(source).expect("one owner"))
+    else {
         panic!("the OS error is preserved");
     };
     os

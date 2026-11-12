@@ -471,7 +471,7 @@ fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
     let (_root, _open, path) = loop_then_open();
     match search_tool(&path, true) {
-        Err(e @ Error::Io(_)) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
+        Err(e @ Error::Io(_)) => assert_eq!(crate::error::first_os_code(&e), Some(libc::ELOOP), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
@@ -496,7 +496,7 @@ fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
     }
     let (_root, _locked, _open, path) = locked_then_open();
     match search_tool(&path, true) {
-        Err(e @ Error::Io(_)) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
+        Err(e @ Error::Io(_)) => assert_eq!(crate::error::first_os_code(&e), Some(libc::EACCES), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
