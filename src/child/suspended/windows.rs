@@ -57,23 +57,27 @@ impl Drop for Borrowed<'_> {
     }
 }
 
-/// Spawn `cmd` frozen through `spawn`, which is the sync or the async uncommitted spawn. Returns
-/// what it made and the command's own `kill_on_drop`, which the caller applies on resume: the child
-/// itself is made with `true`.
+/// Why `cmd` cannot be spawned frozen, before anything of it is touched or any runtime is asked
+/// for: both frozen spawns answer with it first.
+pub(crate) fn refusal(cmd: &Command) -> Option<Error> {
+    cmd.elevation_request().enabled.then(|| Error::Unsupported {
+        op: "spawn_suspended() with elevate()".into(),
+        platform: "windows",
+        detail: "an elevated spawn goes through ShellExecuteEx, which cannot create a process \
+                 suspended; drop one of the two"
+            .into(),
+        source: None,
+    })
+}
+
+/// Spawn `cmd`, which [`refusal`] passed, frozen through `spawn`, the uncommitted spawn with the
+/// policy its caller chose. Returns what it made and the command's own `kill_on_drop`, which the
+/// caller applies on resume: the child itself is made with `true`.
 pub(crate) fn spawn_frozen<T>(
     cmd: &mut Command,
     spawn: impl FnOnce(&mut Command) -> Result<T, SpawnFailure>,
-) -> Result<(T, bool), Error> {
-    if cmd.elevation_request().enabled {
-        return Err(Error::Unsupported {
-            op: "spawn_suspended() with elevate()".into(),
-            platform: "windows",
-            detail: "an elevated spawn goes through ShellExecuteEx, which cannot create a process \
-                     suspended; drop one of the two"
-                .into(),
-            source: None,
-        });
-    }
+) -> Result<(T, bool), SpawnFailure> {
+    debug_assert!(refusal(cmd).is_none(), "a refused command is not spawned frozen");
     let wanted_kill_on_drop = cmd.kill_on_drop_flag();
     let borrowed = Borrowed::new(cmd);
     let spawned = spawn(&mut *borrowed.cmd);
@@ -82,6 +86,9 @@ pub(crate) fn spawn_frozen<T>(
 }
 
 pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
+    if let Some(refusal) = refusal(cmd) {
+        return Err(refusal);
+    }
     let (child, wanted_kill_on_drop) = spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, SpawnPolicy::SYNC))?;
     Ok(SuspendedChild {
         child,

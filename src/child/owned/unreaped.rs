@@ -107,7 +107,7 @@ impl Unreaped {
     ///
     /// Needs the `tokio` feature. Portable code needs a runtime with the IO and time drivers (the
     /// `#[tokio::main]` / `#[tokio::test]` defaults): on Unix a runtime missing either makes tokio
-    /// panic. On Windows the wait runs on the blocking pool and needs neither.
+    /// panic. On Windows the wait holds no thread and needs neither.
     #[cfg(feature = "tokio")]
     pub fn wait_async(mut self) -> impl std::future::Future<Output = Result<ExitStatus, Error>> {
         // Before the future exists, so a future dropped unpolled never blocks either.

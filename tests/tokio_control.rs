@@ -258,12 +258,9 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     {
-        // Duration::MAX: the blocking watch cannot time out, the ignore-break members cannot
-        // exit on the soft signal, and the cancel event is unsignaled until the drop — so a
-        // first-poll Ready can only be a genuine watch failure, surfaced loudly with its
-        // value. The drop's guarantee is observable, not timing-based: SignalOnDrop fires,
-        // and the runtime-shutdown join (see the note at the end) would hang loudly if the
-        // release failed.
+        // Duration::MAX: the watch cannot time out and the ignore-break members cannot exit on
+        // the soft signal, so a first-poll Ready can only be a genuine watch failure, surfaced
+        // loudly with its value.
         let mut fut = std::pin::pin!(child.graceful_shutdown_tree(Duration::MAX));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
@@ -278,9 +275,6 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     child.kill_tree().await.expect("explicit sweep after cancel");
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait().await.expect("reap after cancelled graceful");
-    // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
-    // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
-    // the suite slow-timeout).
 }
 
 #[cfg(feature = "tokio")]
@@ -400,7 +394,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
         cmd.args(&argv);
         cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(cosca::Stdio::null()).expect("set stdout null");
-        let mut child = cmd.spawn().expect("spawn async uncontained");
+        let mut child = cmd.spawn().await.expect("spawn async uncontained");
         let stdin = child.stdin().expect("piped stdin");
         (child, stdin)
     };

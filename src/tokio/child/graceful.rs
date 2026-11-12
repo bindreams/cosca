@@ -216,8 +216,8 @@ impl Child {
     /// reaping first could let `killpg` hit a recycled group. A skipped or no-op sweep alike
     /// preserve a graceful exit's status (the lone backstop no-ops on an already-dead root).
     ///
-    /// Dropping this future mid-grace cancels the exit watch (on all platforms — the Windows
-    /// watcher is released via its cancel event) and performs no further signalling — the
+    /// Dropping this future mid-grace cancels the exit watch (on all platforms) and performs no
+    /// further signalling — the
     /// child stays owned, and `Drop`'s teardown still applies.
     ///
     /// A watch failure never skips the sweep and reap; a sweep error wins over it — and over
@@ -250,9 +250,8 @@ impl Child {
     ///
     /// On Unix, needs a runtime with the IO **and** time drivers enabled (the
     /// `#[tokio::main]` / `#[tokio::test]` defaults) — missing either, tokio panics rather
-    /// than returning a typed error. On Windows the grace-wait runs on the blocking pool:
-    /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
-    /// pool accordingly for many long concurrent shutdowns.
+    /// than returning a typed error. On Windows the grace-wait holds no thread and needs
+    /// neither driver.
     ///
     /// **A root reaped by something else, a root its handle cannot vouch for, and one launchd
     /// holds** are answered as for the sync

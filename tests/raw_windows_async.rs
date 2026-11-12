@@ -21,7 +21,7 @@ async fn async_executable_independent_of_argv0() {
         .commandline("pretend-name argv0-report")
         .stdout(cosca::Stdio::pipe())
         .unwrap();
-    let mut child = c.spawn().expect("raw spawn");
+    let mut child = c.spawn().await.expect("raw spawn");
     let mut s = String::new();
     child.stdout().unwrap().read_to_string(&mut s).await.unwrap();
     child.wait().await.unwrap();
@@ -44,7 +44,7 @@ async fn async_fd3_pipe_out_delivers_child_bytes() {
         .args(["cosca_testbin", "write-fd", "3", "hi-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
-    let mut child = c.spawn().expect("raw spawn");
+    let mut child = c.spawn().await.expect("raw spawn");
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
@@ -65,7 +65,7 @@ async fn async_fd3_pipe_in_feeds_child() {
         .unwrap()
         .stdout(cosca::Stdio::pipe())
         .unwrap();
-    let mut child = c.spawn().expect("raw spawn");
+    let mut child = c.spawn().await.expect("raw spawn");
     let mut w = child.fd_write_end(cosca::Fd::from(3)).expect("fd 3 writer");
     w.write_all(b"ping3").await.unwrap();
     drop(w); // child reads to EOF, copies, exits
@@ -86,7 +86,7 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap();
-    let mut child = c.spawn().expect("raw spawn via the argv-only + fd>=3 route");
+    let mut child = c.spawn().await.expect("raw spawn via the argv-only + fd>=3 route");
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
@@ -107,7 +107,7 @@ async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 
     let mut c = common::tokio_command(common::Console::Hidden);
     c.commandline(line).fd(3, cosca::Stdio::pipe_out()).unwrap();
-    let mut child = c.spawn().expect("raw spawn via the commandline + fd>=3 route");
+    let mut child = c.spawn().await.expect("raw spawn via the commandline + fd>=3 route");
     let mut r = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut s = String::new();
     r.read_to_string(&mut s).await.unwrap();
@@ -130,7 +130,7 @@ async fn async_contained_raw_child_is_in_our_job() {
         .fd(3, cosca::Stdio::pipe_out())
         .unwrap()
         .contain();
-    let mut child = c.spawn().expect("contained raw spawn");
+    let mut child = c.spawn().await.expect("contained raw spawn");
     // Fixed at spawn (run-state-independent): the achieved mechanism is the Job Object.
     assert_eq!(child.containment(), cosca::Containment::JobObject);
     assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
@@ -155,7 +155,7 @@ async fn async_contained_raw_child_is_killed_by_kill_tree() {
         .stdout(cosca::Stdio::null())
         .unwrap()
         .contain();
-    let mut child = c.spawn().expect("contained raw spawn");
+    let mut child = c.spawn().await.expect("contained raw spawn");
     assert_eq!(child.containment(), cosca::Containment::JobObject);
     assert!(child.test_job_handle_contains_self(), "child must be inside OUR job");
     let stdin = child.stdin().expect("piped stdin");
@@ -218,7 +218,7 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
         ])
         .stdout(cosca::Stdio::pipe())
         .unwrap();
-    let mut child = c.spawn().expect("spawn the probe helper");
+    let mut child = c.spawn().await.expect("spawn the probe helper");
     let mut s = String::new();
     child.stdout().unwrap().read_to_string(&mut s).await.unwrap();
     child.wait().await.unwrap();
@@ -279,7 +279,7 @@ async fn async_an_unlisted_inheritable_handle_does_not_reach_the_child() {
     let mut c = common::tokio_command(common::Console::Hidden);
     c.executable(common::testbin())
         .args(["cosca_testbin", "write-handle", &format!("{value:x}")]);
-    let mut child = c.spawn().expect("raw spawn");
+    let mut child = c.spawn().await.expect("raw spawn");
     drop(writer);
     let got = tokio::task::spawn_blocking(move || {
         let mut got = Vec::new();
@@ -305,7 +305,7 @@ async fn async_no_inheritable_handle_outlives_a_raw_spawn() {
         for (slot, target) in targets {
             c.fd(slot, target).unwrap();
         }
-        let mut child = c.spawn().unwrap_or_else(|e| panic!("{kind}: raw spawn: {e}"));
+        let mut child = c.spawn().await.unwrap_or_else(|e| panic!("{kind}: raw spawn: {e}"));
         let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();
         child.wait().await.unwrap();
         assert!(leaked.is_empty(), "{kind}: inheritable handles left open: {leaked:x?}");
@@ -326,7 +326,7 @@ async fn async_no_inheritable_handle_outlives_a_failed_raw_spawn() {
             c.fd(slot, target).unwrap();
         }
         assert!(
-            c.spawn().is_err(),
+            c.spawn().await.is_err(),
             "{kind}: spawning a nonexistent executable succeeded"
         );
         let leaked: Vec<_> = common::inheritable::snapshot().difference(&before).copied().collect();

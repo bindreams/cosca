@@ -441,8 +441,8 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_async_fork() {
                     .enable_all()
                     .build()
                     .expect("a current-thread runtime");
-                let _entered = runtime.enter();
-                cmd.spawn()
+                // The pool thread the spawn runs on is made by this thread, so it has the filter too.
+                runtime.block_on(cmd.spawn())
             },
         );
     }

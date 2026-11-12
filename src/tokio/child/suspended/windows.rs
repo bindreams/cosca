@@ -1,10 +1,12 @@
 //! The Windows async frozen spawn: the ordinary async spawn with a suspended request.
 
 use super::{Child, SuspendedChild};
-use crate::child::suspended::platform::spawn_frozen;
+use crate::child::spawn::spawn_uncommitted;
+use crate::child::suspended::platform::{refusal, spawn_frozen};
 use crate::containment::windows::{resume_initial_threads, SuspendCount};
 use crate::error::Error;
-use crate::tokio::spawn::spawn_uncommitted;
+use crate::tokio::child::async_policy;
+use crate::tokio::spawn::{on_pool, spawn_failure};
 use crate::tokio::Command;
 
 /// Test-only accessors, `pub` so integration tests can call them.
@@ -29,10 +31,21 @@ impl SuspendedChild {
     }
 }
 
-pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
-    let (child, wanted_kill_on_drop) = spawn_frozen(cmd.as_sync_mut(), spawn_uncommitted)?;
+pub(super) async fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
+    // Before the runtime is asked for: a refusal is the same verdict inside and outside one.
+    if let Some(refusal) = refusal(cmd.as_sync_mut()) {
+        return Err(refusal);
+    }
+    let policy = async_policy();
+    let (child, wanted_kill_on_drop) = on_pool(
+        cmd.as_sync_mut(),
+        "cosca::tokio::Command::spawn_suspended",
+        move |cmd| spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, policy)),
+    )
+    .await
+    .map_err(spawn_failure)??;
     Ok(SuspendedChild {
-        child,
+        child: Child::from_sync(child),
         wanted_kill_on_drop,
     })
 }

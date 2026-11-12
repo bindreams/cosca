@@ -2,11 +2,11 @@
 //! if not done, wait on the [`WaitFor`] the look returned, or pause for a recheck", and a wake is
 //! never the answer, the next look is. [`exited_held`] runs it over a process's exit.
 //!
-//! The deadline differs per platform, as it does for the other async waits. Unix arms tokio's timer
-//! on [`tokio_now`]'s clock, and when the timer wins there is one final look. Windows has no
-//! pollable process handle: the wait hops to a blocking thread that bounds it with the real
-//! clock, so the deadline is moved there before the hop. A wait released without an exit signal
-//! (the deadline, or the cancel event) ends in one final look on both.
+//! The deadline differs per platform, and when it passes there is one final look. Unix arms tokio's
+//! timer on [`tokio_now`](crate::tokio::wait::tokio_now)'s clock against a descriptor registered with
+//! the reactor. Windows has no pollable process handle: the wait is a
+//! [`registered_wait`](crate::os_process::windows::registered_wait) on it, which carries the
+//! deadline itself. No wait occupies the blocking pool.
 
 use std::time::Duration;
 
@@ -15,7 +15,6 @@ use crate::error::Error;
 use crate::os_process::drive::pause_end;
 use crate::os_process::drive::{wait_ended, Control, Next, ProcessExit, RunOutcome, Step, Waitable};
 use crate::os_process::{OsProcess, WaitFor};
-use crate::tokio::wait::deadline_from;
 
 /// What the entry point does before any open or look: the watch-fault seam.
 fn enter() -> Result<(), Error> {
@@ -44,13 +43,14 @@ async fn exited(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Resu
     ))
 }
 
-/// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Windows
-/// it is on the real clock, which the blocking thread measures.
+/// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Unix it
+/// is on tokio's clock, which the timer measures; on Windows on the real clock, which the registered
+/// wait measures.
 fn absolute(timeout: Option<Duration>) -> Option<std::time::Instant> {
     #[cfg(unix)]
-    return timeout.and_then(deadline_from);
+    return timeout.and_then(crate::tokio::wait::deadline_from);
     #[cfg(windows)]
-    return crate::tokio::wait::to_real_clock(timeout.and_then(deadline_from));
+    return timeout.and_then(crate::wait::deadline_from);
 }
 
 /// What a look asked the driver to do, once it no longer borrows the `Waitable`'s output type: the
@@ -65,7 +65,7 @@ enum Act<'a> {
 /// [`Control`], waiting on the runtime. `deadline` is absolute (from [`absolute`]); `None` waits for
 /// ever. A failed wait goes to [`Waitable::block_failed`], which ends the loop with the error unless
 /// it is survived. Dropping the future releases the wait: the fd is deregistered on Unix, and the
-/// blocking thread is released on Windows.
+/// registered wait is unregistered on Windows. A Windows `deadline` is on the real clock.
 pub(crate) async fn run<W: Waitable>(
     w: &mut W,
     deadline: Option<std::time::Instant>,
@@ -174,20 +174,16 @@ async fn watch(wait_for: &WaitFor<'_>) -> Result<(), Error> {
     }
 }
 
-/// Wait on `wait_for` on the blocking pool until it wakes or the real-clock `deadline` passes.
-/// `Ok(false)` = released without an exit signal: the deadline passed, or the cancel event fired.
-/// Dropping the future signals the thread's cancel event.
+/// Wait on the process handle `wait_for` holds until it is signalled or the real-clock `deadline`
+/// passes. `Ok(false)` = the deadline passed first: the caller's look after it is the final one. The
+/// wait is a [`registered_wait`](crate::os_process::windows::registered_wait).
 #[cfg(windows)]
 async fn wait(wait_for: &WaitFor<'_>, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
-    use std::os::windows::io::AsHandle;
+    use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
     let WaitFor::Signalled(process) = wait_for;
-    // The thread outlives a dropped future, so it gets a handle of its own.
-    let process = process.try_clone_to_owned().map_err(Error::Io)?;
-    crate::tokio::wait::cancellable_blocking("process wait watcher", move |cancel| {
-        crate::os_process::windows::cancel::wait_process_or_cancel(process.as_handle(), deadline, cancel)
-    })
-    .await
+    let woke = wait_any(std::iter::once(*process), deadline).await.map_err(Error::Io)?;
+    Ok(woke == Woke::Signalled)
 }
 
 #[cfg(test)]

@@ -102,14 +102,12 @@ async fn the_final_look_can_find_an_exit() {
 /// Mutant: let `Duration::MAX` overflow the deadline sum.
 #[skuld::test]
 async fn duration_max_is_unbounded() {
+    crate::tokio::test_runtime::assert_current_thread();
     #[cfg(unix)]
     let (tx, armed) = std::sync::mpsc::channel();
     #[cfg(unix)]
-    let _seam = {
-        crate::tokio::test_runtime::assert_current_thread();
-        crate::tokio::wait::armed_deadline_seam::install(tx)
-    };
-    // Windows: the clock reads of the driver and of the blocking half, which arms the wait.
+    let _seam = crate::tokio::wait::armed_deadline_seam::install(tx);
+    // Windows: the clock reads of the driver, which arms the registered wait.
     #[cfg(windows)]
     let (log_tx, reads) = std::sync::mpsc::channel();
     #[cfg(windows)]
@@ -124,17 +122,12 @@ async fn duration_max_is_unbounded() {
         use crate::wait::read_probe::Event;
 
         let reads: Vec<Event> = reads.try_iter().collect();
-        assert!(
-            reads
-                .iter()
-                .any(|event| matches!(event, Event::Read { deadline: None, .. })),
-            "the blocking half arms its own wait: {reads:?}"
-        );
+        assert!(!reads.is_empty(), "the wait reads the clock");
         assert!(
             reads
                 .iter()
                 .all(|event| matches!(event, Event::Read { remaining: None, .. })),
-            "an overflowing timeout arms an unbounded wait: {reads:?}"
+            "an overflowing timeout registers an unbounded wait: {reads:?}"
         );
     }
 }
@@ -160,15 +153,10 @@ async fn a_bounded_wait_arms_the_timer_at_the_deadline() {
     assert!(at >= before + timeout && at <= after + timeout, "{at:?}");
 }
 
-/// A `Running` fake whose wait is dropped, and then the runtime. Mutant: the Windows
-/// watcher is not released by the drop, so the runtime's drop joins a thread parked on the fake
-/// forever; the observer then never hears a release.
+/// A `Running` fake whose wait is dropped, and then the runtime: nothing the wait registered keeps
+/// the runtime from dropping.
 #[skuld::test]
 fn dropped_wait_releases_the_watch() {
-    #[cfg(windows)]
-    let (tx, released) = std::sync::mpsc::channel();
-    #[cfg(windows)]
-    let observer = crate::tokio::wait::fault_observer::install(tx);
     let runtime = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -181,15 +169,6 @@ fn dropped_wait_releases_the_watch() {
             "a running process with nothing fired waits"
         );
     }); // the wait is dropped here
-    #[cfg(windows)]
-    {
-        // The watcher holds its own copy of the observer; ours must go so a missing release ends
-        // the `recv` instead of hanging it.
-        drop(observer);
-        released
-            .recv()
-            .expect("the blocking watcher must return after the drop released it");
-    }
     drop(runtime);
 }
 
@@ -337,175 +316,315 @@ async fn async_run_survives_a_failed_wait_when_the_waitable_does() {
 
 #[cfg(windows)]
 mod windows {
-    //! The blocking half of the Windows arm, `wait_process_or_cancel`: cancel-race and re-arm tests
-    //! on the handle an `OsProcess` hands out.
+    //! The Windows exit wait is a registered wait on the process handle: none occupies the blocking
+    //! pool.
 
-    use std::time::{Duration, Instant};
+    use std::future::Future as _;
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+    use std::time::Duration;
 
-    use std::os::windows::io::BorrowedHandle;
-
-    use crate::os_process::windows::cancel::{new_cancel_event, signal_cancel, wait_process_or_cancel};
-    use crate::os_process::{open, Exit, OsProcess, WaitFor};
-    use crate::wait::test_clock::FrozenClockGuard;
-    use crate::wait::wait_ms_probe;
-    use crate::wait::{remaining_override_seam, wait_clamp_seam};
-
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::windows::JobHandle;
+    use crate::containment::TreeDrain;
+    use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
+    use crate::test_child::{let_member_exit, spawn_job_member};
+    use crate::tokio::test_runtime::single_thread_pool_runtime;
+    use crate::wait::test_clock::FrozenClockGuard;
+    use crate::wait::{instant_near_ceiling, wait_ms_probe, TOKIO_TIMER_ROUNDING_MARGIN};
 
-    /// The handle a look at a live process hands out to wait on.
-    fn wait_handle(p: &dyn OsProcess) -> BorrowedHandle<'_> {
-        match p.exited().unwrap() {
-            Exit::Running(WaitFor::Signalled(handle)) => handle,
-            other => panic!("a live process reads Running(Signalled): {other:?}"),
-        }
-    }
-
-    /// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
-    /// Mutant: ignore the site's grace -> `requested` is not 5ms.
-    #[skuld::test]
-    fn the_blocking_half_arms_the_ceiling_of_the_remaining_duration() {
-        let (child, stdin, id) = blocker();
-        let process = open(id).unwrap().expect("a live process opens");
-        let cancel = new_cancel_event().expect("create cancel event");
-        let (_clock, at) = FrozenClockGuard::install();
-        wait_ms_probe::take();
-        let _override = remaining_override_seam::set(Duration::from_micros(500));
-        let deadline = at + Duration::from_millis(5);
-        let result = wait_process_or_cancel(wait_handle(&*process), Some(deadline), &cancel);
-        let reached = Instant::now() >= deadline;
-        let arms = wait_ms_probe::take();
-        drop(stdin);
-        child.wait().expect("reap the blocker");
-        assert!(
-            !result.expect("a live never-exiting child must not report a wait failure"),
-            "a never-exiting child is still alive when the grace elapses"
-        );
-        assert!(reached, "the call returned before the real deadline");
-        let first = arms.first().expect("at least one armed wait");
-        assert_eq!(first.remaining, Duration::from_micros(500));
-        assert_eq!(first.ms, 1);
-        assert_eq!(
-            first.requested,
-            Duration::from_millis(5),
-            "the site must pass the time left to its own grace (clock frozen at the grace's origin)"
-        );
-    }
-
-    /// An early, unclamped `WAIT_TIMEOUT` hours before the grace ends is not trusted: the site
-    /// re-arms. Exit (`Ok(true)`) proves it, since a cancel or a timeout would both read `Ok(false)`.
+    /// Two children awaited together, the first exiting only after the second's wait has returned,
+    /// both complete: the first's wait does not hold the pool the second's would need.
     ///
-    /// Mutant: return on the first `WAIT_TIMEOUT` -> one arm, wrongly reports alive.
+    /// Mutant: an exit wait runs on the blocking pool.
     #[skuld::test]
-    fn the_blocking_half_never_reports_still_alive_before_the_deadline() {
-        let (child, stdin, id) = blocker();
-        let process = open(id).unwrap().expect("a live process opens");
-        let cancel = new_cancel_event().expect("create cancel event");
-        wait_ms_probe::take();
-        let _override = remaining_override_seam::set(Duration::from_micros(500));
-        wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = wait_process_or_cancel(
-            wait_handle(&*process),
-            Some(Instant::now() + Duration::from_secs(3600)),
-            &cancel,
-        );
-        let arms = wait_ms_probe::take();
-        let exited = result.expect("a genuinely-terminated child must not report a wait failure");
-        child.wait().expect("reap the child after it exits");
-        assert!(exited, "an early WAIT_TIMEOUT was trusted");
-        assert!(arms.len() >= 2, "expected a re-arm, got {} arm(s)", arms.len());
-    }
-
-    /// A wait clamped below the grace re-arms, recomputing `remaining` each round.
-    ///
-    /// Mutant: drop the re-arm loop -> one arm, wrongly reports alive. Mutant: hoist `remaining`
-    /// above the loop -> `remaining` does not shrink.
-    #[skuld::test]
-    fn the_blocking_half_re_arms_past_a_clamped_timeout() {
-        let (child, stdin, id) = blocker();
-        let process = open(id).unwrap().expect("a live process opens");
-        let cancel = new_cancel_event().expect("create cancel event");
-        wait_ms_probe::take();
-        let _clamp = wait_clamp_seam::set(5);
-        wait_ms_probe::on_second_arm(move || drop(stdin));
-        let result = wait_process_or_cancel(
-            wait_handle(&*process),
-            Some(Instant::now() + Duration::from_secs(3600)),
-            &cancel,
-        );
-        let arms = wait_ms_probe::take();
-        let exited = result.expect("a genuinely-terminated child must not report a wait failure");
-        child.wait().expect("reap the child after it exits");
-        assert!(exited, "a clamped WAIT_TIMEOUT was trusted");
-        wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
-    }
-
-    /// A pre-signalled cancel event releases the wait on a live child.
-    #[skuld::test]
-    fn cancel_event_releases_the_blocking_wait() {
-        let (child, _stdin, id) = blocker();
-        let process = open(id).unwrap().expect("a live process opens");
-        let cancel = new_cancel_event().expect("event");
-        signal_cancel(&cancel);
-        let exited = wait_process_or_cancel(wait_handle(&*process), None, &cancel).expect("cancellable wait");
-        assert!(!exited, "a live child with a signaled cancel must report still-alive");
-        child.kill().expect("cleanup");
-        child.wait().expect("reap");
-    }
-
-    /// A cancel signalled while the wait is, or is about to be, in flight releases it. The
-    /// manual-reset event stays set once signalled, so every interleaving releases the watcher.
-    #[skuld::test]
-    fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
-        let (child, _stdin, id) = blocker();
-        let process = open(id).unwrap().expect("a live process opens");
-        let cancel = std::sync::Arc::new(new_cancel_event().expect("event"));
-        let handle = wait_handle(&*process);
-        let exited = std::thread::scope(|scope| {
-            let watcher = scope.spawn(|| wait_process_or_cancel(handle, None, &cancel));
-            signal_cancel(&cancel);
-            watcher.join().expect("watcher thread").expect("cancellable wait")
+    fn two_awaited_children_do_not_queue_behind_each_other() {
+        let rt = single_thread_pool_runtime();
+        let (first, first_stdin, first_id) = blocker();
+        let (second, second_stdin, second_id) = blocker();
+        let first_process = open(first_id).unwrap().expect("a live process opens");
+        let second_process = open(second_id).unwrap().expect("a live process opens");
+        rt.block_on(async {
+            // `join!` polls its first branch first: its wait is the one that would take the thread.
+            ::tokio::join!(
+                async { assert!(super::exited_held(&*first_process, None).await.unwrap()) },
+                async {
+                    drop(second_stdin);
+                    assert!(super::exited_held(&*second_process, None).await.unwrap());
+                    drop(first_stdin);
+                },
+            );
         });
-        assert!(!exited, "a live child with a signaled cancel must report still-alive");
-        child.kill().expect("cleanup");
-        child.wait().expect("reap");
+        first.wait().expect("reap the first");
+        second.wait().expect("reap the second");
     }
 
-    /// `armed_probe` reaches the blocking half through the driver's hop: the armed poll finds the
-    /// fake's event unsignalled, reports it, and force-releases the wait.
+    /// A task awaiting a child's exit does not stop a spawn from completing.
     ///
-    /// Mutant: the hop does not relay the probe -> nothing is reported.
+    /// Mutant: an exit wait runs on the blocking pool, which the spawn needs.
     #[skuld::test]
-    async fn the_armed_probe_reaches_the_blocking_half() {
-        use super::{fake, Answer};
+    fn an_awaited_child_does_not_stop_a_spawn_from_completing() {
+        use crate::test_child::{held_writer_stdin, tokio_command, Console, BLOCKER_ARGV};
 
-        crate::tokio::test_runtime::assert_current_thread();
-        let (tx, armed) = std::sync::mpsc::channel();
-        let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
-        let p = fake([Answer::Running, Answer::Exited]);
-        assert!(super::exited_held(&p, None).await.unwrap());
-        assert_eq!(
-            armed.try_iter().count(),
-            1,
-            "the wait armed on an unsignalled target once"
+        let rt = single_thread_pool_runtime();
+        let (parked, parked_stdin, parked_id) = blocker();
+        let parked_process = open(parked_id).unwrap().expect("a live process opens");
+        rt.block_on(async {
+            ::tokio::join!(
+                async { assert!(super::exited_held(&*parked_process, None).await.unwrap()) },
+                async {
+                    let (stdin, writer) = held_writer_stdin();
+                    let mut cmd = tokio_command(Console::Hidden);
+                    cmd.args(BLOCKER_ARGV.iter().copied());
+                    cmd.stdin(stdin).expect("stdin");
+                    let mut spawned = cmd.spawn().await.expect("the spawn completes beside the wait");
+                    drop(writer);
+                    spawned.wait().await.expect("wait for the spawned child");
+                    drop(parked_stdin);
+                },
+            );
+        });
+        parked.wait().expect("reap the parked child");
+    }
+
+    /// A job's drain wait and a process wait together complete: neither holds the pool the other
+    /// would need.
+    ///
+    /// Mutant: the drain wait or the process wait runs on the blocking pool.
+    #[skuld::test]
+    fn a_drain_wait_and_a_process_wait_complete_together() {
+        let rt = single_thread_pool_runtime();
+        let (parked, parked_stdin, parked_id) = blocker();
+        let parked_process = open(parked_id).unwrap().expect("a live process opens");
+        let (mut member, job) = spawn_job_member();
+        rt.block_on(async {
+            ::tokio::join!(
+                async { assert!(super::exited_held(&*parked_process, None).await.unwrap()) },
+                async {
+                    drop(member.stdin.take());
+                    assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
+                    drop(parked_stdin);
+                },
+            );
+        });
+        member.wait().expect("reap the member");
+        parked.wait().expect("reap the parked child");
+    }
+
+    /// The timeouts the process wait on `process` registers with the OS for one poll of
+    /// `exited_held(process, Some(timeout))`: none for an unbounded wait.
+    fn registered_for(process: &dyn crate::os_process::OsProcess, timeout: Duration) -> Vec<wait_ms_probe::Arm> {
+        wait_ms_probe::take();
+        let polled = super::poll_once(super::exited_held(process, Some(timeout)));
+        assert!(polled.is_pending(), "a live process is waited for");
+        wait_ms_probe::take()
+    }
+
+    /// A timeout that overflows `Instant` is no timeout: the wait registers none.
+    ///
+    /// Mutant: an overflowing timeout becomes a far-future deadline, which the OS times out early.
+    #[skuld::test]
+    async fn a_process_wait_timeout_past_the_clock_registers_no_timeout() {
+        let (child, stdin, id) = blocker();
+        let process = open(id).unwrap().expect("a live process opens");
+        let arms = registered_for(&*process, Duration::MAX);
+        drop(stdin);
+        child.wait().expect("reap the child");
+        assert!(arms.is_empty(), "an unbounded wait registered {arms:?}");
+    }
+
+    /// A timeout landing exactly the timer margin short of `Instant`'s ceiling registers a timeout;
+    /// one nanosecond further registers none.
+    ///
+    /// Mutant: the margin is not applied to the deadline.
+    #[skuld::test]
+    async fn a_process_wait_timeout_at_the_margin_edge_registers_one_and_one_nanosecond_past_it_none() {
+        let (child, stdin, id) = blocker();
+        let process = open(id).unwrap().expect("a live process opens");
+        let (_clock, now) = FrozenClockGuard::install();
+        let edge = instant_near_ceiling(now).saturating_duration_since(now) - TOKIO_TIMER_ROUNDING_MARGIN;
+        let at_edge = registered_for(&*process, edge);
+        let past_edge = registered_for(&*process, edge + Duration::from_nanos(1));
+        drop(stdin);
+        child.wait().expect("reap the child");
+        assert_eq!(at_edge.len(), 1, "{at_edge:?}");
+        assert_eq!(at_edge[0].requested, edge, "{at_edge:?}");
+        assert!(past_edge.is_empty(), "an unbounded wait registered {past_edge:?}");
+    }
+
+    /// A bounded wait on a runtime built without a time driver answers: its deadline is the
+    /// registered wait's own, not a tokio timer, which would panic here.
+    ///
+    /// Mutant: the wait arms tokio's timer.
+    #[skuld::test]
+    fn a_bounded_process_wait_on_a_runtime_without_a_time_driver_answers() {
+        let rt = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a runtime with no drivers");
+        let (child, stdin, id) = blocker();
+        let process = open(id).unwrap().expect("a live process opens");
+        rt.block_on(async {
+            assert!(!super::exited_held(&*process, Some(Duration::from_millis(50)))
+                .await
+                .unwrap());
+        });
+        drop(stdin);
+        child.wait().expect("reap the child");
+    }
+
+    /// The same for a drain wait.
+    ///
+    /// Mutant: the wait arms tokio's timer.
+    #[skuld::test]
+    fn a_bounded_drain_on_a_runtime_without_a_time_driver_answers() {
+        let rt = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a runtime with no drivers");
+        let (member, job) = spawn_job_member();
+        rt.block_on(async {
+            let deadline = crate::wait::deadline_from(Duration::from_millis(50)).expect("a finite deadline");
+            assert_eq!(drain(&job, Some(deadline)).await, TreeDrain::MembersRemain);
+        });
+        let_member_exit(member);
+    }
+
+    /// A child that exits after a pipe write is seen exited on a runtime whose clock is paused: a
+    /// paused clock advances itself to a timer whenever the runtime is idle, which would time the
+    /// wait out before the child could exit. The write waits until the wait is polled once, so the
+    /// runtime goes idle with the child still running.
+    ///
+    /// Mutant: the wait arms tokio's timer, which the paused clock advances to.
+    #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+    async fn a_bounded_process_wait_on_a_paused_clock_sees_the_child_exit() {
+        let (child, stdin, id) = blocker();
+        let process = open(id).unwrap().expect("a live process opens");
+        let (go, written) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            written.recv().expect("told to write");
+            drop(stdin);
+        });
+        let mut wait = pin!(super::exited_held(&*process, Some(Duration::from_secs(60))));
+        assert!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "a running child is waited for"
         );
+        go.send(()).expect("the writer waits");
+        assert!(wait.await.unwrap(), "the child exited, the deadline did not pass");
+        writer.join().expect("the writer ended");
+        child.wait().expect("reap the child");
     }
 
-    /// A release that is neither an exit nor the deadline ends the wait after one final look, which
-    /// answers.
+    /// The same for a drain wait.
     ///
-    /// Mutant: the arm discards the blocking half's verdict, so the loop re-arms and looks again
-    /// past the script.
-    #[skuld::test]
-    async fn a_forced_release_ends_the_wait_after_one_final_look() {
-        use super::{fake, Answer};
+    /// Mutant: the wait arms tokio's timer, which the paused clock advances to.
+    #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+    async fn a_bounded_drain_on_a_paused_clock_sees_the_member_exit() {
+        let (mut member, job) = spawn_job_member();
+        let stdin = member.stdin.take().expect("piped stdin");
+        let (go, written) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            written.recv().expect("told to write");
+            drop(stdin);
+        });
+        let deadline = crate::tokio::wait::deadline_from(Duration::from_secs(60));
+        let mut wait = pin!(drain(&job, deadline));
+        assert!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "a running member is waited for"
+        );
+        go.send(()).expect("the writer waits");
+        assert_eq!(wait.await, TreeDrain::AllMembersExited);
+        writer.join().expect("the writer ended");
+        member.wait().expect("reap the member");
+    }
 
-        crate::tokio::test_runtime::assert_current_thread();
-        let (tx, armed) = std::sync::mpsc::channel();
-        let _guard = crate::os_process::windows::cancel::armed_probe::install(tx);
-        let p = fake([Answer::Running, Answer::Running]);
-        assert!(!super::exited_held(&p, None).await.unwrap());
-        assert_eq!(p.looks(), 2, "one look, one wait, one final look");
-        assert_eq!(armed.try_iter().count(), 1, "the wait armed once");
+    /// The async wait over `job`'s members, until `deadline` (on tokio's clock).
+    async fn drain(job: &JobHandle, deadline: Option<std::time::Instant>) -> TreeDrain {
+        DrainEdge::Job(job).wait_async(deadline).await.expect("the drain wait")
+    }
+
+    /// A drain with no deadline ends when the last member has exited, and not before.
+    ///
+    /// Mutant: a round's wait ends on the first listing, or never re-lists after a member's exit.
+    #[skuld::test]
+    async fn a_drain_with_no_deadline_ends_when_the_member_exits() {
+        let (mut member, job) = spawn_job_member();
+        let mut wait = pin!(drain(&job, None));
+        assert!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "a running member is waited for"
+        );
+        drop(member.stdin.take());
+        assert_eq!(wait.await, TreeDrain::AllMembersExited);
+        member.wait().expect("reap the member");
+    }
+
+    /// An empty job is drained at once, as in the sync wait.
+    #[skuld::test]
+    async fn a_drain_of_an_empty_job_answers_without_waiting() {
+        let job = JobHandle::create_empty_for_test();
+        assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
+    }
+
+    /// A deadline already past is the last round: a live member is polled, not waited for, and the
+    /// drain answers `MembersRemain`.
+    ///
+    /// Mutant: the round registers its handles and waits out the member.
+    #[skuld::test]
+    async fn a_drain_with_a_deadline_already_past_polls_once() {
+        let (member, job) = spawn_job_member();
+        let past = crate::tokio::wait::deadline_from(Duration::ZERO);
+        assert_eq!(drain(&job, past).await, TreeDrain::MembersRemain);
+        let_member_exit(member);
+    }
+
+    /// A deadline already past on a job whose members have all gone: the last round lists and sees
+    /// the job drained, however late the caller came. The drain with no deadline is what says the
+    /// job is empty: the member's own exit is not enough, since its console host (`conhost.exe`)
+    /// is a member too, and outlives it for a moment.
+    ///
+    /// Mutant: a round that starts past the deadline answers `MembersRemain` without looking.
+    #[skuld::test]
+    async fn a_drain_with_a_deadline_already_past_sees_a_drained_job() {
+        let (mut member, job) = spawn_job_member();
+        drop(member.stdin.take());
+        assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
+        member.wait().expect("reap the member");
+        let past = crate::tokio::wait::deadline_from(Duration::ZERO);
+        assert_eq!(drain(&job, past).await, TreeDrain::AllMembersExited);
+    }
+
+    /// A deadline that passes while a member runs answers `MembersRemain`, at or after it.
+    ///
+    /// Mutant: the timer is not armed, so the wait never ends; or it answers before the deadline.
+    #[skuld::test]
+    async fn a_drain_reports_members_remaining_at_its_deadline() {
+        let (member, job) = spawn_job_member();
+        let deadline = crate::tokio::wait::deadline_from(Duration::from_millis(50)).expect("a finite deadline");
+        assert_eq!(drain(&job, Some(deadline)).await, TreeDrain::MembersRemain);
+        assert!(
+            crate::tokio::wait::tokio_now() >= deadline,
+            "answered before its deadline"
+        );
+        let_member_exit(member);
+    }
+
+    /// A drain dropped while it waits unregisters its waits and leaves the job waitable: the next
+    /// drain over it sees the member exit.
+    #[skuld::test]
+    async fn a_dropped_drain_leaves_the_job_waitable() {
+        let (mut member, job) = spawn_job_member();
+        {
+            let mut wait = pin!(drain(&job, None));
+            assert!(
+                wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                "a running member is waited for"
+            );
+        }
+        drop(member.stdin.take());
+        assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
+        member.wait().expect("reap the member");
     }
 }
 

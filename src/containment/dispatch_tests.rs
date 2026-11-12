@@ -398,7 +398,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     #[cfg(windows)]
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain_with(crate::ContainMode::TreeWalk);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     // Closed right after the kill: a no-op backstop exits 0.
     let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
@@ -464,7 +464,7 @@ async fn async_kill_tree_after_an_incomplete_walk_still_runs_the_handle_backstop
         cmd.args(["cat"]);
         cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
         cmd.contain_with(crate::ContainMode::TreeWalk);
-        let mut child = cmd.spawn().expect("spawn");
+        let mut child = cmd.spawn().await.expect("spawn");
         // Closed right after the kill: a no-op backstop exits 0.
         let stdin = child.stdin().expect("piped stdin");
         fault::set_force_root_kill_noop(true);

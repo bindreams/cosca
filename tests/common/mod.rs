@@ -898,7 +898,7 @@ async fn spawn_control_async_on(
         cmd.executable(testbin()).args(&argv); // uncontained → the async raw backend
     }
     configure(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn async control child");
+    let mut child = cmd.spawn().await.expect("spawn async control child");
     let mut sock = accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
@@ -946,7 +946,7 @@ async fn spawn_tree_async_on(
     configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
-    let mut child = cmd.spawn().expect("spawn async tree");
+    let mut child = cmd.spawn().await.expect("spawn async tree");
     let grand = report_grandchild_async(report, &mut child).await;
     let mut socks = Vec::new();
     accept_tree_members_async(&listener, &mut child, grand, &mut socks).await;
@@ -999,7 +999,7 @@ pub async fn spawn_tree_async_ending_a_failure(mode: &str) -> (cosca::tokio::Chi
     cmd.contain();
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
-    let child = cmd.spawn().expect("spawn async tree");
+    let child = cmd.spawn().await.expect("spawn async tree");
     let mut tree = AsyncTree {
         socks: Vec::new(),
         listener,
@@ -1105,7 +1105,7 @@ pub async fn spawn_echo_tree_async_configured(
     configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
-    let mut child = cmd.spawn().expect("spawn async echo tree");
+    let mut child = cmd.spawn().await.expect("spawn async echo tree");
     let watched_grand = report_grandchild_async(report, &mut child).await;
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {

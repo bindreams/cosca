@@ -771,7 +771,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
     use ::tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     mechanism.configure(cmd.as_sync_mut());
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     assert_eq!(child.containment(), mechanism.containment(), "{mechanism:?}");
     let mut line = String::new();
     ::tokio::io::BufReader::new(child.stdout().expect("stdout pipe"))

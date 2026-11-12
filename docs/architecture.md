@@ -82,8 +82,9 @@ In order:
      `exit_only::seams` their tests use. `OwnedChild::tear_down`
      is the one kill-then-settle policy, split at its one wait (`begin_tear_down` returns the
      teardown's end or a pending wait, which `settle` blocks on and `settle_async` awaits), and
-     `Child::drop` uses it. The async spawn is the sync spawn told the async `SpawnPolicy` (the
-     warn threshold of its waits, and what an `Unreaped` it hands back does when dropped). On
+     `Child::drop` uses it. The async spawn is the sync spawn, run whole on tokio's blocking pool,
+     told the async `SpawnPolicy` (the warn threshold of its waits, and what an `Unreaped` it
+     hands back does when dropped). On
      Linux the teardown also ends every spawn failure (the handshake's `conclude`, and the
      identity and attach arms, `held_teardown.rs`), and the cgroup leaf's abandonment of every
      child it is left (`CgroupLeaf::abandon_before_verdict`: the group a child that exec'd outside

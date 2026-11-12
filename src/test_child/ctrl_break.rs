@@ -248,7 +248,7 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
 
 /// [`spawn_consoleless_root`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
-pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
+pub(crate) async fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::tokio_command(Console::Asked);
     cmd.executable(super::testbin("cosca_testbin_gui"))
@@ -256,7 +256,7 @@ pub(crate) fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream)
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();
-    let child = cmd.spawn().expect("spawn the GUI-subsystem root");
+    let child = cmd.spawn().await.expect("spawn the GUI-subsystem root");
     let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
     (child, sock)
 }
@@ -298,14 +298,14 @@ pub(crate) fn spawn_ignoring_root() -> (crate::Child, TcpStream) {
 
 /// [`spawn_ignoring_root`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
-pub(crate) fn spawn_ignoring_root_async() -> (crate::tokio::Child, TcpStream) {
-    let (child, sock, _) = spawn_member_async(Handler::Ignore, None, crate::ContainMode::Strongest, |_| {});
+pub(crate) async fn spawn_ignoring_root_async() -> (crate::tokio::Child, TcpStream) {
+    let (child, sock, _) = spawn_member_async(Handler::Ignore, None, crate::ContainMode::Strongest, |_| {}).await;
     (child, sock)
 }
 
 /// [`spawn_member`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
-pub(crate) fn spawn_member_async(
+pub(crate) async fn spawn_member_async(
     handler: Handler,
     grandchild: Option<Handler>,
     mode: crate::ContainMode,
@@ -321,7 +321,7 @@ pub(crate) fn spawn_member_async(
     }
     cmd.contain_with(mode);
     configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn the root");
+    let child = cmd.spawn().await.expect("spawn the root");
     let mut sock = accept_root(&listener, child.id().expect(IDENTITY_READ));
     let grand = grandchild.map(|_| accept_grandchild(&listener, &mut sock));
     (child, sock, grand)

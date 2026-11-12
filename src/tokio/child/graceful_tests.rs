@@ -10,8 +10,8 @@ use crate::child::graceful::fault as term_fault;
 use crate::wait::fault;
 
 /// Async twin of `child::graceful_tests::blocker`.
-fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe())
+async fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    crate::test_child::held_contained_blocker_on_console_async(crate::Stdio::pipe()).await
 }
 
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.
@@ -28,7 +28,7 @@ async fn kill_only_blocker() -> (crate::tokio::Child, Held) {
     }
     #[cfg(windows)]
     {
-        crate::test_child::ctrl_break::spawn_ignoring_root_async()
+        crate::test_child::ctrl_break::spawn_ignoring_root_async().await
     }
 }
 
@@ -169,7 +169,7 @@ async fn async_graceful_shutdown_graceful_path() {
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
     let status = child
@@ -205,7 +205,7 @@ async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace()
     }
     cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
     cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     #[cfg(unix)]
     {
         use ::tokio::io::AsyncReadExt as _;
@@ -239,7 +239,7 @@ async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
     let _warns = crate::log_capture::warn_watch();
     use std::os::unix::process::ExitStatusExt;
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = crate::test_child::held_contained_blocker_without_cgroup_async(crate::Stdio::pipe());
+    let (mut child, stdin) = crate::test_child::held_contained_blocker_without_cgroup_async(crate::Stdio::pipe()).await;
     let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
     let status = child
         .graceful_shutdown_tree(Duration::from_secs(30))
@@ -269,7 +269,7 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     crate::test_child::contain_without_cgroup_async(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
     let mut ready = [0u8; 2];
@@ -308,7 +308,7 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     crate::test_child::contain_without_cgroup_async(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
     let mut ready = [0u8; 2];
@@ -353,7 +353,7 @@ async fn async_graceful_shutdown_tree_escalates_with_a_surviving_grandchild() {
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     crate::test_child::contain_without_cgroup_async(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
     let mut ready = [0u8; 2];
@@ -474,7 +474,7 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 #[skuld::test]
 async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = blocker();
+    let (mut child, stdin) = blocker().await;
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)
@@ -514,7 +514,7 @@ async fn drained_tree_sweep_decision(contain: impl FnOnce(&mut crate::tokio::Com
         cmd.env(crate::test_child::ack::ACK_ENV, "1");
     }
     contain(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     assert_eq!(child.containment(), expected);
     #[cfg(unix)]
     let stdin = child.stdin().expect("piped stdin");
@@ -655,7 +655,7 @@ async fn members_remain_still_reaps_an_already_exited_root(
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
     cmd.contain_with(mode);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     // Held for the test's whole body — see `child::graceful_tests`'s sync twin for why.
     let stdin = child.stdin().expect("piped stdin");
     let mut exit_gate = child.fd_write_end(4).expect("exit-gate write end");
@@ -750,7 +750,7 @@ async fn async_graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain_with(crate::ContainMode::TreeWalk);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let _stdin = child.stdin().expect("piped stdin");
     let mut readiness = [0u8; 1];
     child
@@ -816,7 +816,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(crate::test_child::ack::ACK_ENV, "1");
     cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     // The fixture exits at once and its group-signal-immune descendant is the one that connects,
     // so the fixture's own pid cannot be watched: the job draining is the death of every possible
     // connector. The connector waits for the ack, so a drain with nothing accepted is a failure.
@@ -865,7 +865,8 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
     const GRACE: Duration = Duration::from_secs(30);
     let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
-    });
+    })
+    .await;
     assert_eq!(
         child.containment(),
         crate::Containment::TreeWalk,
@@ -896,7 +897,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
 #[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
-    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|_| {});
+    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|_| {}).await;
     assert_eq!(
         child.graceful_mechanism(),
         crate::graceful::GracefulMechanism::None,
@@ -914,7 +915,7 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
 #[skuld::test]
 async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin) = blocker();
+    let (mut child, stdin) = blocker().await;
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)

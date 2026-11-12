@@ -1038,7 +1038,7 @@ fn main() {
                 c.args([program.as_str(), "exit", "0"])
                     .fd(3, cosca::Stdio::pipe_out())
                     .unwrap();
-                match c.spawn() {
+                match c.spawn().await {
                     Ok(mut child) => {
                         let _ = child.wait().await;
                         outln!("loaded");

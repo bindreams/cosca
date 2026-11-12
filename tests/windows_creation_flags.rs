@@ -137,7 +137,7 @@ fn probe(backend: Backend, intent: Intent) -> String {
                     }
                 }
                 cmd.env(common::ACK_ENV, "1");
-                let mut child = cmd.spawn().expect("spawn async creation-flag probe child");
+                let mut child = cmd.spawn().await.expect("spawn async creation-flag probe child");
                 let sock = common::accept_or_die_async(&listener, &mut child).await;
                 let report = read_report_line(&sock);
                 drop(sock);
@@ -362,7 +362,7 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
         if hidden {
             cmd.no_window();
         }
-        let mut child = cmd.spawn().expect("spawn contained async raw-backend child");
+        let mut child = cmd.spawn().await.expect("spawn contained async raw-backend child");
         let sock = common::accept_or_die_async(listener, &mut child).await;
         let report = read_report_line(&sock);
         assert_eq!(

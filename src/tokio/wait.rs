@@ -1,10 +1,13 @@
-//! The reactor and blocking-pool halves of the async waits. Linux: the identity-verified pidfd is
-//! registered with the reactor (`AsyncFd`); macOS: a kqueue `EVFILT_PROC|NOTE_EXIT` filter is
-//! armed and its kqueue fd registered; Windows has no pollable process handle, so
-//! [`cancellable_blocking`] waits on the process handle AND a cancel event that a drop-guard
-//! signals — a dropped wait releases its watcher promptly on every platform. The process-exit wait
-//! itself, and its deadline, are in [`crate::tokio::drive`]. Unix needs the runtime's IO + time
-//! drivers (tokio panics otherwise) — documented on the public graceful methods.
+//! The reactor half of the async waits, and the one hop onto the blocking pool. Linux: the
+//! identity-verified pidfd is registered with the reactor (`AsyncFd`); macOS: a kqueue
+//! `EVFILT_PROC|NOTE_EXIT` filter is armed and its kqueue fd registered; Windows has no pollable
+//! process handle, so the wait registers the handle with the OS's wait pool
+//! ([`crate::os_process::windows::registered_wait`]). No exit wait occupies the blocking pool, which
+//! is for bounded work; a dropped wait releases what it registered on every platform. The
+//! process-exit wait itself, and its deadline, are in [`crate::tokio::drive`]. Unix async waits need
+//! the runtime's time and IO drivers (tokio panics otherwise); what the Windows waits need is in
+//! [`registered_wait`](crate::os_process::windows::registered_wait). Documented on the public
+//! graceful methods.
 
 use std::time::Duration;
 
@@ -14,7 +17,7 @@ use crate::error::Error;
 /// Deadlines are `std` instants read off this timeline, so the timer, the "already expired" checks
 /// and [`deadline_from`] agree on what "now" is.
 pub(crate) fn tokio_now() -> std::time::Instant {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(now) = now_override::get() {
         return now;
     }
@@ -24,6 +27,23 @@ pub(crate) fn tokio_now() -> std::time::Instant {
 /// The async twin of [`crate::wait::deadline_from`], on [`tokio_now`]'s clock.
 pub(crate) fn deadline_from(duration: Duration) -> Option<std::time::Instant> {
     crate::wait::deadline_at(tokio_now(), duration)
+}
+
+/// Re-express a [`tokio_now`]-clock `deadline` on the real clock, for the Windows registered waits,
+/// which the OS times in real time. Identical when tokio's clock is unpaused.
+#[cfg(any(windows, test))]
+pub(crate) fn to_real_clock_at(
+    deadline: Option<std::time::Instant>,
+    tokio_now: std::time::Instant,
+    real_now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    deadline.and_then(|at| crate::wait::deadline_at(real_now, at.saturating_duration_since(tokio_now)))
+}
+
+/// [`to_real_clock_at`] from now, on both clocks.
+#[cfg(windows)]
+pub(crate) fn to_real_clock(deadline: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    to_real_clock_at(deadline, tokio_now(), crate::wait::now())
 }
 
 /// The ONLY place a bounded async wait is armed: `tokio::time::timeout_at(at, fut)`, with the
@@ -50,85 +70,122 @@ pub(crate) async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: 
     armed.await.ok()
 }
 
-/// Run `work` on the blocking pool, handing it a cancel event that dropping this future signals. The
-/// blocking `work` must return once the event is signalled, so a dropped wait releases its thread
-/// promptly and `Runtime::drop`, which joins blocking tasks, does not stall. `what` names the work
-/// in the error for a task the runtime's shutdown cancelled.
-#[cfg(windows)]
-pub(crate) async fn cancellable_blocking<T: Send + 'static>(
+/// Why a task on the blocking pool gave no value.
+pub(crate) enum Unjoined {
+    /// The task did not run: the runtime's shutdown cancelled it, or there was no runtime to run it.
+    /// The closure was dropped with what it held: on the calling thread with no runtime, and for a
+    /// `spawn_blocking` call made after the shutdown began; a task that was already queued is dropped
+    /// by the pool's shutdown, on a pool or shutdown thread.
+    NotRun(Error),
+    /// A state of the join tokio does not document today: nothing can be said of what the task did.
+    Unknown(Error),
+}
+
+/// The place a runtime is looked for, and the one hop onto the blocking pool made from it. A caller
+/// that must do something before the hop, but only once a runtime is there (the spawn takes its
+/// command), [`enter`](Self::enter)s first and [`run`](Self::run)s after; the others call
+/// [`on_blocking_pool`].
+pub(crate) struct Hop {
     what: &'static str,
-    work: impl FnOnce(&std::os::windows::io::OwnedHandle) -> Result<T, Error> + Send + 'static,
-) -> Result<T, Error> {
-    /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
-    /// returns promptly instead of parking out the grace.
-    struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
-    impl Drop for SignalOnDrop {
-        fn drop(&mut self) {
-            crate::os_process::windows::cancel::signal_cancel(&self.0);
+}
+
+impl Hop {
+    /// A hop for work called `what` in the errors, or [`Unjoined::NotRun`] with no runtime current:
+    /// `spawn_blocking` panics without one, and the answer here is a typed error on every platform.
+    pub(crate) fn enter(what: &'static str) -> Result<Hop, Unjoined> {
+        if ::tokio::runtime::Handle::try_current().is_err() {
+            return Err(Unjoined::NotRun(Error::Io(std::io::Error::other(format!(
+                "{what} must be called from within a Tokio runtime"
+            )))));
         }
+        Ok(Hop { what })
     }
-    let cancel = std::sync::Arc::new(crate::os_process::windows::cancel::new_cancel_event()?);
-    let _guard = SignalOnDrop(cancel.clone());
-    // Test-only: the probes are thread-local and the closure runs on a blocking-pool thread, so
-    // capture them here, before any yield, and re-install inside.
-    #[cfg(test)]
-    let relay = crate::relayed_probe::capture();
-    let joined = ::tokio::task::spawn_blocking(move || {
+
+    /// Run `work` on the blocking pool and give back its value: the one way a joined task's result
+    /// is read.
+    ///
+    /// When the runtime's shutdown cancels the task, `work` does not run and is dropped:
+    /// [`Unjoined::NotRun`] says on which thread. A caller whose `work` holds a value with a teardown
+    /// in its drop (a child) therefore has it run there.
+    ///
+    /// A panic in `work` is resumed here: it is a bug, not an I/O condition.
+    ///
+    /// The value reaches this future over a channel, not as the join handle's output, because its
+    /// destructor may wait (a child's teardown) and a runtime thread should not run it. Which thread
+    /// drops it, once the task ran, is stated once, for every caller of this hop, in
+    /// [`Command::spawn`](crate::tokio::Command::spawn)'s "Dropping the future".
+    ///
+    /// `work` is bounded: the pool is not for a wait on a process or a tree, which are registered with
+    /// the OS or the reactor instead.
+    pub(crate) async fn run<T: Send + 'static>(self, work: impl FnOnce() -> T + Send + 'static) -> Result<T, Unjoined> {
+        let what = self.what;
+        // Test probes are thread-local: carry them onto the pool thread.
         #[cfg(test)]
-        let _relay = relay.reinstall();
-        let result = work(&cancel);
-        #[cfg(test)]
-        fault_observer::notify_released();
-        result
-    })
-    .await;
-    match joined {
-        Ok(result) => result,
-        // `work` does not panic - a panic here is a bug, not an I/O condition; propagate it
-        // instead of masking it as an error.
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        // Keep the shutdown-cancelled discriminator visible instead of folding it into an
-        // opaque error indistinguishable from a real wait failure. The final arm is
-        // presently unreachable (panic and cancelled are tokio's only variants today) and
-        // exists for type-system conservatism: a future variant surfaces as an Err, never a
-        // false success - with a debug tripwire, mirroring the unexpected-wait-verdict arm.
-        Err(e) if e.is_cancelled() => Err(Error::Io(std::io::Error::other(format!(
-            "{what} cancelled (runtime shutting down)"
-        )))),
-        Err(e) => {
-            debug_assert!(false, "unknown JoinError variant: {e:?}");
-            Err(Error::Io(std::io::Error::other(e)))
+        let relay = crate::relayed_probe::capture();
+        let (tx, rx) = ::tokio::sync::oneshot::channel();
+        let mut landing = Landing { rx };
+        let joined = ::tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _relay = relay.reinstall();
+            // A closed receiver hands the value back, and this thread drops it.
+            _ = tx.send(work());
+        })
+        .await;
+        match joined {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Cancelled is its own error, not folded into a wait failure. The last arm covers a join
+            // state tokio does not document: an Err, never a false success, with a debug assert.
+            Err(e) if e.is_cancelled() => {
+                return Err(Unjoined::NotRun(Error::Io(std::io::Error::other(format!(
+                    "{what} cancelled (runtime shutting down)"
+                )))))
+            }
+            Err(e) => {
+                debug_assert!(false, "unknown JoinError variant: {e:?}");
+                return Err(Unjoined::Unknown(Error::Io(std::io::Error::other(format!(
+                    "{what}: nothing is known of what the task did: {e}"
+                )))));
+            }
         }
+        // The task ended without panicking, so it sent its value, and this receiver was open.
+        Ok(landing
+            .rx
+            .try_recv()
+            .expect("a blocking task that ended without panicking sent its value"))
     }
 }
 
-/// Deliberate test scaffolding (the `wait::fault` pattern): signals when the blocking
-/// watcher RETURNS, so a test can prove drop-release with a plain `recv()` — the
-/// no-time-sync alternative to observing teardown timing. Absent from non-test builds.
-///
-/// A [`crate::relayed_probe`]: `cancellable_blocking` relays it across `spawn_blocking`.
-#[cfg(all(test, windows))]
-pub(crate) mod fault_observer {
-    use crate::relayed_probe::{self, Probe};
-    use std::sync::mpsc::Sender;
+/// [`Hop::enter`] and [`Hop::run`] in one: with no runtime, `work` is dropped unrun on the calling
+/// thread, like a task the runtime's shutdown cancels.
+pub(crate) async fn on_blocking_pool<T: Send + 'static>(
+    what: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Unjoined> {
+    Hop::enter(what)?.run(work).await
+}
 
-    pub(crate) struct Released;
-    impl Probe for Released {
-        type Event = ();
-    }
+/// The receiving end of [`Hop::run`]'s value. Dropped before the value was taken, it closes the
+/// channel, so the task's send fails and the task drops the value, and it hands a value already sent
+/// to the pool. [`Command::spawn`](crate::tokio::Command::spawn)'s "Dropping the future" says which
+/// thread drops the value.
+struct Landing<T: Send + 'static> {
+    rx: ::tokio::sync::oneshot::Receiver<T>,
+}
 
-    pub(crate) type Guard = relayed_probe::Guard<Released>;
-
-    pub(crate) fn install(tx: Sender<()>) -> Guard {
-        relayed_probe::install(tx)
-    }
-
-    pub(crate) fn current() -> Option<Sender<()>> {
-        relayed_probe::current::<Released>()
-    }
-
-    pub(crate) fn notify_released() {
-        relayed_probe::notify::<Released>(());
+impl<T: Send + 'static> Drop for Landing<T> {
+    fn drop(&mut self) {
+        // After `close`, a send that has not happened fails, and one that has is read here. A value
+        // already taken leaves nothing to read.
+        self.rx.close();
+        let Ok(value) = self.rx.try_recv() else { return };
+        match ::tokio::runtime::Handle::try_current() {
+            // A runtime whose shutdown began cancels the hop at once, and the value drops with its
+            // closure on this thread.
+            Ok(runtime) => drop(runtime.spawn_blocking(move || drop(value))),
+            // Not on a runtime there is no pool to hand it to.
+            Err(_) => drop(value),
+        }
     }
 }
 
@@ -210,22 +267,6 @@ where
     }
 }
 
-/// Re-express a [`tokio_now`]-clock `deadline` on the real clock, for the Windows job wait, which
-/// blocks in the kernel and so is measured in real time. Identical when tokio's clock is unpaused.
-#[cfg(any(windows, test))]
-pub(crate) fn to_real_clock_at(
-    deadline: Option<std::time::Instant>,
-    tokio_now: std::time::Instant,
-    real_now: std::time::Instant,
-) -> Option<std::time::Instant> {
-    deadline.and_then(|at| crate::wait::deadline_at(real_now, at.saturating_duration_since(tokio_now)))
-}
-
-#[cfg(windows)]
-pub(crate) fn to_real_clock(deadline: Option<std::time::Instant>) -> Option<std::time::Instant> {
-    to_real_clock_at(deadline, tokio_now(), crate::wait::now())
-}
-
 /// Test-only seam reporting each bounded arm and each unbounded park of the async waits.
 /// Thread-local, so concurrent tests do not see each other; [`install`]'s guard uninstalls on drop.
 #[cfg(all(test, unix))]
@@ -273,7 +314,7 @@ pub(crate) mod armed_deadline_seam {
 }
 
 /// Test-only override of [`tokio_now`], to make a deadline already past on the timer's first poll.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod now_override {
     use std::cell::Cell;
     use std::time::Instant;

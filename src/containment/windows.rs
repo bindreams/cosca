@@ -27,8 +27,8 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
-    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::error::{io_context, win32_io_error};
@@ -995,22 +995,32 @@ impl JobHandle {
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
     /// the caller's own remaining time. What a deadline answers is stated at [`wait_drained_raw`].
     ///
-    /// `cancel`, when given, is appended to every round's wait set (one fewer live member
-    /// tracked per round) so a live `WaitForMultipleObjects` releases the instant it is
-    /// signaled rather than only at the next re-enumeration boundary — the async wrapper's
-    /// drop-cancellation primitive (mirrors `wait_process_or_cancel`'s cancel event). A
-    /// cancellation reports `MembersRemain` (the tree's drain state is simply unknown at that
-    /// point, same as a timeout), never an error. A cancellation seen at a round's start reports
-    /// `MembersRemain`, before the first listing too: unlike the deadline it is a genuine "stop
-    /// looking" instruction, not a stale bound. One signalled during the last round, after its wait
-    /// returned for a member, is not re-checked: the final listing answers, and the answer is
-    /// nobody's.
+    /// The async drain runs the same rounds ([`drain_round`](JobHandle::drain_round)) and awaits each
+    /// round's handles where this blocks on them.
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<std::time::Instant>,
-        cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        wait_drained_raw(self.handle(), deadline, cancel)
+        wait_drained_raw(self.handle(), deadline)
+    }
+
+    /// One round of the drain wait: list the live members, open each (up to the wait-set cap) with
+    /// `SYNCHRONIZE`, and say what the round decided. `last_round` is whether the caller's deadline
+    /// has already passed, on the caller's clock. What a round answers is stated at
+    /// [`wait_drained_raw`].
+    #[cfg(feature = "tokio")]
+    pub(crate) fn drain_round(&self, last_round: bool) -> Result<Round, crate::error::Error> {
+        drain_round(HANDLE(self.handle().as_raw_handle()), last_round)
+    }
+
+    /// What follows a round's wait that ended on a member's handle: the answer if the round was the
+    /// last, `None` if the next round follows.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn after_signalled(
+        &self,
+        watch: &Watch,
+    ) -> Result<Option<crate::containment::TreeDrain>, crate::error::Error> {
+        after_signalled(HANDLE(self.handle().as_raw_handle()), watch)
     }
 }
 
@@ -1094,9 +1104,8 @@ fn thread_entries_closing(
     walked
 }
 
-/// The loop body of [`JobHandle::wait_drained`], taking a borrowed handle rather than `&JobHandle`:
-/// the async drain hands in its own duplicate (see `OwnedJobDup`), because its blocking thread
-/// outlives the borrow.
+/// The blocking driver of the drain wait's rounds ([`drain_round`]), taking a borrowed handle rather
+/// than `&JobHandle`.
 ///
 /// A bounded wait answers from the job's list as of its last look, so `MembersRemain` means the tree
 /// was not seen drained by the deadline. A round that starts past the deadline (an already-elapsed or
@@ -1108,151 +1117,208 @@ fn thread_entries_closing(
 pub(crate) fn wait_drained_raw(
     job: BorrowedHandle<'_>,
     deadline: Option<std::time::Instant>,
-    cancel: Option<HANDLE>,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::TreeDrain;
-    use crate::error::Error;
 
     let job = HANDLE(job.as_raw_handle());
-    let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
         // A round that starts past the deadline is the last: it lists and answers, with at most one
         // more listing (`final_listing`).
         let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
-        // Cancel is checked first, even before the first listing: the future was dropped and nobody
-        // reads the answer. A deadline only bounds the wait, so the last round still lists.
-        if cancelled(cancel) {
-            return Ok(TreeDrain::MembersRemain);
-        }
-
-        // List BEFORE consulting the deadline for a return, so an elapsed deadline (a `Duration::ZERO`
-        // probe) still observes the tree's actual state and an empty listing answers
-        // `AllMembersExited`, as an unbounded wait would. This mirrors `Kqueue::wait` on the macOS
-        // side, which takes one look at an elapsed deadline.
-        let pids = match list_members_or_drained(job)? {
-            ControlFlow::Break(drained) => return Ok(drained),
-            ControlFlow::Continue(pids) => pids,
+        let watch = match drain_round(job, last_round)? {
+            Round::Answer(drain) => return Ok(drain),
+            Round::List => continue,
+            Round::Watch(watch) => watch,
         };
-
-        let mut handles: Vec<HANDLE> = Vec::new();
-        let mut denied: Option<io::Error> = None;
-        // Every listed pid is looked at unless the wait set is already full: a pid that is gone
-        // does not use up the budget a live member needs.
-        for pid in &pids {
-            if handles.len() == budget {
-                break;
-            }
-            // SAFETY: standard Win32 call; the handle is closed by `member_to_watch` unless it is
-            // returned. `PROCESS_QUERY_LIMITED_INFORMATION` is required by `IsProcessInJob` there
-            // and is NOT implied by `PROCESS_SYNCHRONIZE`; without it every membership check fails
-            // ACCESS_DENIED, `handles` stays empty forever, and this loop spins instead of
-            // ever reaching `WaitForMultipleObjects`. (`job_contains_pid` opens for the same
-            // reason.) `LIMITED` rather than full query: it is the least right that works and
-            // is grantable across integrity levels.
-            let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) };
-            match member_to_watch(opened, job) {
-                Ok(Some(h)) => handles.push(h),
-                Ok(None) => {}
-                Err(e) => denied = Some(e),
+        match watch.wait(deadline)? {
+            // `wait_until` returns a timeout only once the real deadline has passed.
+            Ended::Deadline => return Ok(TreeDrain::MembersRemain),
+            Ended::Signalled => {
+                if let Some(drain) = after_signalled(job, &watch)? {
+                    return Ok(drain);
+                }
             }
         }
+        // A tracked member exited: the next round re-enumerates the authoritative live set.
+    }
+}
 
-        if handles.is_empty() {
-            if let Some(e) = denied {
-                // A persistent, actionable open failure (not a benign exit-race): looping
-                // back here without ever holding a real handle to block on would busy-spin.
-                log::warn!(
-                    "wait_tree: could not open any live job member to watch for its exit ({report})",
-                    report = crate::error::Report(&e)
-                );
-                return Err(Error::Unassessable {
-                    detail: "could not open a handle to any live member of the contained tree \
-                                 to observe its exit"
-                        .into(),
-                    source: Some(Error::io_cause(e)),
-                });
-            }
-            // Every listed pid is gone (`OpenProcess` found no such process) or no longer a
-            // member (its number was reused). That says nothing of a member that joined after the
-            // listing, so a drain is only a fresh listing that is empty: list again. Past the
-            // deadline this was the last round, so that listing is the final one.
-            if last_round {
-                return final_listing(job);
-            }
-            continue;
-        }
-        if let Some(e) = &denied {
-            // Some sibling in this round was still openable, so the round proceeds — but an
-            // actionable `OpenProcess` failure on a live member (as opposed to the benign
-            // exit-race above) is otherwise invisible for every round in which that holds,
-            // which can be every round for the tree's whole lifetime. Every other known
-            // failure in this function gets a visible disposition; this one should too, even
-            // though it isn't (yet) fatal to this round's wait.
-            log::debug!(
-                "wait_tree: could not open one live job member to watch for its exit, but \
-                 other members are still trackable this round: {report}",
-                report = crate::error::Report(e)
-            );
-        }
+/// What a round of the drain wait decided.
+pub(crate) enum Round {
+    /// The wait is over, with this answer.
+    Answer(crate::containment::TreeDrain),
+    /// No listed pid is a live member, which says nothing of one that joined after the listing: list
+    /// again.
+    List,
+    /// Wait for one of these handles, then run the next round.
+    Watch(Watch),
+}
 
-        // The cancel handle (if any) is appended AFTER the real member handles, never
-        // closed here (caller-owned) — only `handles` (the freshly opened member handles)
-        // are closed below.
-        let mut wait_set = handles.clone();
-        if let Some(c) = cancel {
-            wait_set.push(c);
-        }
+/// The handles one round waits on: each is open on a listed member, and closed with this.
+pub(crate) struct Watch {
+    handles: Vec<std::os::windows::io::OwnedHandle>,
+    /// The same handles as the array `WaitForMultipleObjects` takes, built once with the round.
+    set: HandleSet,
+    /// The round started past the deadline: its wait is a poll and its answer final.
+    last_round: bool,
+}
 
-        // An elapsed deadline arms `ms == 0`, a real non-blocking poll of the handles just opened.
-        // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
-        // SAFETY: every handle in `handles` was just opened above and stays open for the
-        // duration of this call; `cancel`, if present, is kept alive by its caller for the
-        // same duration.
-        let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&wait_set, false, ms) });
+/// The raw handles of a [`Watch`], which `HANDLE`'s raw pointer would make `!Send` and `!Sync`.
+struct HandleSet(Vec<HANDLE>);
+
+// SAFETY: a handle names a kernel object and has no thread affinity. The set is only read, by
+// `WaitForMultipleObjects`, while the `OwnedHandle`s it mirrors, owned by the same `Watch`, are open.
+unsafe impl Send for HandleSet {}
+// SAFETY: as for `Send`; nothing writes the set after it is built.
+unsafe impl Sync for HandleSet {}
+
+/// How a round's wait ended, when it did not fail.
+pub(crate) enum Ended {
+    /// The deadline passed with no handle signalled.
+    Deadline,
+    /// A member's handle was signalled.
+    Signalled,
+}
+
+impl Watch {
+    /// The handles to wait on: the round ends when any one is signalled.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn handles(&self) -> impl Iterator<Item = BorrowedHandle<'_>> + Clone {
+        use std::os::windows::io::AsHandle as _;
+        self.handles.iter().map(|h| h.as_handle())
+    }
+
+    /// Block until a handle is signalled or the real `deadline` passes. A `WAIT_TIMEOUT` is never
+    /// trusted: the real deadline is rechecked each round (see `win32_timeout_ms`).
+    fn wait(&self, deadline: Option<std::time::Instant>) -> Result<Ended, crate::error::Error> {
+        self.ended(crate::wait::wait_until(deadline, |ms| self.wait_for(ms)))
+    }
+
+    /// Look once, without waiting, for a last round: an elapsed deadline arms `ms == 0` in
+    /// [`wait`](Watch::wait), a real poll of the handles.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn poll(&self) -> Result<Ended, crate::error::Error> {
+        self.ended(self.wait_for(0))
+    }
+
+    fn wait_for(&self, ms: u32) -> windows::Win32::Foundation::WAIT_EVENT {
+        // SAFETY: every handle in `set` is open for the call, owned by `self`.
+        unsafe { WaitForMultipleObjects(&self.set.0, false, ms) }
+    }
+
+    fn ended(&self, waited: windows::Win32::Foundation::WAIT_EVENT) -> Result<Ended, crate::error::Error> {
         let wait_failed = (waited == WAIT_FAILED).then(io::Error::last_os_error);
-        for h in &handles {
-            // SAFETY: each handle was opened above; closing after the wait releases it
-            // regardless of which handle (if any) was signaled.
-            unsafe {
-                _ = CloseHandle(*h);
-            }
-        }
-
         if waited == WAIT_TIMEOUT {
-            // `wait_until` returns WAIT_TIMEOUT only once the real deadline has passed.
-            return Ok(TreeDrain::MembersRemain);
+            return Ok(Ended::Deadline);
         }
         if let Some(e) = wait_failed {
-            return Err(Error::Io(e));
+            return Err(crate::error::Error::Io(e));
         }
         let idx = waited.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
         debug_assert!(
-            idx < wait_set.len(),
+            idx < self.handles.len(),
             "unexpected WaitForMultipleObjects verdict: {waited:?}"
         );
-        if idx >= wait_set.len() {
+        if idx >= self.handles.len() {
             // Same anomaly the debug_assert above catches in debug builds — surfaced here too
             // so a release build does not silently fall through to "treat as a member exit and
             // re-enumerate" without any trace of the OS having returned an unexpected verdict.
             log::warn!(
                 "wait_tree: unexpected WaitForMultipleObjects verdict {waited:?} (index {idx} \
                  outside the {} handles waited on) - re-enumerating regardless",
-                wait_set.len()
+                self.handles.len()
             );
         }
-        if cancel.is_some() && idx == handles.len() {
-            // The cancel handle was signaled — the caller's future was dropped. The
-            // tree's drain state is genuinely unknown at this instant; report it exactly
-            // like a timeout rather than inventing a verdict.
-            return Ok(TreeDrain::MembersRemain);
-        }
-        if last_round {
-            // A polled handle was signalled: the listing may have named an exited member. Cancel is
-            // not re-checked: only the async future's drop signals it, and nobody reads this answer.
-            return final_listing(job);
-        }
-        // A tracked member exited — loop back and re-enumerate the authoritative live set.
+        Ok(Ended::Signalled)
     }
+}
+
+/// What follows a round's wait that ended on a member's handle: the answer if it was the last round,
+/// whose own listing may have named an exited member, and `None` if the next round follows.
+fn after_signalled(job: HANDLE, watch: &Watch) -> Result<Option<crate::containment::TreeDrain>, crate::error::Error> {
+    if watch.last_round {
+        return final_listing(job).map(Some);
+    }
+    Ok(None)
+}
+
+/// One round of the drain wait, shared by the blocking driver ([`wait_drained_raw`]) and the async
+/// one: list the live members, open them, and say what to do next. `last_round` is whether the
+/// caller's deadline has passed, on the caller's clock.
+fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Error> {
+    use crate::error::Error;
+
+    let budget = MAXIMUM_WAIT_OBJECTS - 1;
+    // List BEFORE consulting the deadline for a return, so an elapsed deadline (a `Duration::ZERO`
+    // probe) still observes the tree's actual state and an empty listing answers
+    // `AllMembersExited`, as an unbounded wait would. This mirrors `Kqueue::wait` on the macOS
+    // side, which takes one look at an elapsed deadline.
+    let pids = match list_members_or_drained(job)? {
+        ControlFlow::Break(drained) => return Ok(Round::Answer(drained)),
+        ControlFlow::Continue(pids) => pids,
+    };
+
+    let mut handles: Vec<std::os::windows::io::OwnedHandle> = Vec::new();
+    let mut denied: Option<io::Error> = None;
+    // Every listed pid is looked at unless the wait set is already full: a pid that is gone
+    // does not use up the budget a live member needs.
+    for pid in &pids {
+        if handles.len() == budget {
+            break;
+        }
+        // SAFETY: standard Win32 call; the handle is closed by `member_to_watch` unless it is
+        // returned. `PROCESS_QUERY_LIMITED_INFORMATION` is what `IsProcessInJob` needs and
+        // `PROCESS_SYNCHRONIZE` does not imply it; the least right that works, grantable across
+        // integrity levels.
+        let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) };
+        match member_to_watch(opened, job) {
+            // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
+            Ok(Some(h)) => handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) }),
+            Ok(None) => {}
+            Err(e) => denied = Some(e),
+        }
+    }
+
+    if handles.is_empty() {
+        if let Some(e) = denied {
+            // A persistent, actionable open failure (not a benign exit-race): looping
+            // back here without ever holding a real handle to block on would busy-spin.
+            log::warn!(
+                "wait_tree: could not open any live job member to watch for its exit ({report})",
+                report = crate::error::Report(&e)
+            );
+            return Err(Error::Unassessable {
+                detail: "could not open a handle to any live member of the contained tree \
+                                 to observe its exit"
+                    .into(),
+                source: Some(Error::io_cause(e)),
+            });
+        }
+        // Every listed pid is gone (`OpenProcess` found no such process) or no longer a
+        // member (its number was reused). That says nothing of a member that joined after the
+        // listing, so a drain is only a fresh listing that is empty: list again. Past the
+        // deadline this was the last round, so that listing is the final one.
+        if last_round {
+            return final_listing(job).map(Round::Answer);
+        }
+        return Ok(Round::List);
+    }
+    if let Some(e) = &denied {
+        // A sibling was openable, so the round proceeds; log the actionable open failure, which
+        // would otherwise stay invisible for the tree's lifetime.
+        log::debug!(
+            "wait_tree: could not open one live job member to watch for its exit, but \
+                 other members are still trackable this round: {report}",
+            report = crate::error::Report(e)
+        );
+    }
+
+    let set = HandleSet(handles.iter().map(|h| HANDLE(h.as_raw_handle())).collect());
+    Ok(Round::Watch(Watch {
+        handles,
+        set,
+        last_round,
+    }))
 }
 
 /// The one more listing a last round takes when its own is no proof: an empty listing is the drain,
@@ -1276,12 +1342,6 @@ fn list_members_or_drained(
     } else {
         ControlFlow::Continue(pids)
     })
-}
-
-/// Whether the caller's cancel handle, if any, is signalled now.
-fn cancelled(cancel: Option<HANDLE>) -> bool {
-    // SAFETY: `cancel` is a valid handle for the duration of the call (caller-owned).
-    cancel.is_some_and(|c| unsafe { WaitForSingleObject(c, 0) } == WAIT_OBJECT_0)
 }
 
 /// What `resume_if_owned` did with one thread id.

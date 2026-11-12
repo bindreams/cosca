@@ -7,10 +7,6 @@ use std::time::Instant;
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
-#[cfg(all(feature = "tokio", windows))]
-#[path = "drain_edge/job_dup.rs"]
-mod job_dup;
-
 /// A tree's own kernel edge for "every member has exited", borrowed from the tree that owns the
 /// resource it watches for the child's whole life (a marker's read end must, to keep its pipe's
 /// identity from being reissued). Both waits report the [`TreeDrain`] verdict.
@@ -34,7 +30,7 @@ impl DrainEdge<'_> {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => leaf.wait_drained(deadline),
             #[cfg(windows)]
-            DrainEdge::Job(job) => job.wait_drained(deadline, None),
+            DrainEdge::Job(job) => job.wait_drained(deadline),
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => m.wait_drained(deadline),
         }
@@ -42,8 +38,8 @@ impl DrainEdge<'_> {
 
     /// [`wait`](Self::wait), awaited, with no thread blocked: macOS is reactor-native (`AsyncFd`);
     /// Linux awaits a broadcast from the pump thread its leaf owns (an `event_listener` future, no
-    /// reactor registration); Windows hands its sync loop to `spawn_blocking` with a cancel event (job
-    /// objects have no pollable handle). `deadline` is on tokio's clock
+    /// reactor registration); Windows awaits registered waits on the job's members (job objects
+    /// have no pollable handle). `deadline` is on tokio's clock
     /// ([`deadline_from`](crate::tokio::wait::deadline_from)).
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
@@ -273,85 +269,58 @@ pub(crate) async fn cgroup_wait_tree_drained(
     }
 }
 
-#[cfg(all(feature = "tokio", windows))]
-use job_dup::OwnedJobDup;
-
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
 /// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
-/// arm, awaiting its leaf's pump — this hands the sync `JobHandle::wait_drained` loop to `spawn_blocking`,
-/// releasing the blocking thread promptly on drop via the same cancel-event idiom
-/// [`cancellable_blocking`](crate::tokio::wait::cancellable_blocking) uses for the process wait.
+/// arm, awaiting its leaf's pump — this runs the sync wait's own rounds
+/// ([`JobHandle::drain_round`](crate::containment::windows::JobHandle::drain_round)) and awaits each
+/// round's member handles as registered waits where the sync wait blocks on them. The deadline is
+/// the registrations' own timeout (see [`registered_wait`](crate::os_process::windows::registered_wait));
+/// dropping the future unregisters the round's waits.
 ///
-/// Dropping this future does not join the blocking task, so the task owns a `DuplicateHandle` copy
-/// of the job handle (closed on every exit path, panic included) rather than borrowing one the
-/// `Child` may close, and the kernel recycle, once the borrow ends.
+/// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
+/// exit and is bounded. Every round reaches an await, so a future that is dropped between rounds
+/// is not starved by rounds that find every member gone.
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
 ) -> Result<TreeDrain, Error> {
-    use windows::Win32::Foundation::HANDLE;
+    use crate::containment::windows::{Ended, Round};
+    use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
-    // The kernel wait runs on the real clock, not tokio's.
+    // The registered waits run on the real clock, not tokio's.
     let deadline = crate::tokio::wait::to_real_clock(deadline);
-    // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
-    // call that cannot block.
-    if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
-        return job.wait_drained(deadline, None);
-    }
-    let job_dup = OwnedJobDup::new(job.handle())?;
-
-    /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
-    /// releases promptly instead of parking out the deadline, and `Runtime::drop` — which
-    /// joins blocking tasks — does not stall. Identical idiom to `cancellable_blocking`'s guard.
-    struct SignalOnDrop(std::sync::Arc<std::os::windows::io::OwnedHandle>);
-    impl Drop for SignalOnDrop {
-        fn drop(&mut self) {
-            crate::os_process::windows::cancel::signal_cancel(&self.0);
-        }
-    }
-    let cancel = std::sync::Arc::new(crate::os_process::windows::cancel::new_cancel_event()?);
-    let _guard = SignalOnDrop(cancel.clone());
-    // SAFETY: `cancel`'s OwnedHandle is kept alive by the Arc clone captured in the
-    // spawn_blocking closure below (and by `_guard`/`cancel` here) for the whole wait.
-    let cancel_raw = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&*cancel));
-    let cancel_for_blocking = cancel.clone();
-
-    /// `HANDLE`'s raw pointer is `!Send` by default; a job or event handle (owned or borrowed
-    /// for the task's own full lifetime) is sound to use and close from another thread — the
-    /// kernel serialises handle operations — the same justification as `JobHandle`'s own
-    /// `unsafe impl Send`.
-    struct SendHandles {
-        job: OwnedJobDup,
-        cancel: HANDLE,
-    }
-    unsafe impl Send for SendHandles {}
-    let handles = SendHandles {
-        job: job_dup,
-        cancel: cancel_raw,
-    };
-
-    let joined = ::tokio::task::spawn_blocking(move || {
-        let handles = handles;
-        let result =
-            crate::containment::windows::wait_drained_raw(handles.job.handle(), deadline, Some(handles.cancel));
-        drop(cancel_for_blocking); // keep the handle alive for the full blocking call, explicitly
-        result
-        // `handles.job` (`OwnedJobDup`) drops here on every path, including an early return
-        // from `wait_drained_raw` above, closing our duplicate independently of `JobHandle`.
-    })
-    .await;
-    match joined {
-        Ok(result) => result,
-        // wait_drained_raw does not panic — a panic here is a bug, not an I/O condition;
-        // propagate it instead of masking it as an error.
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) if e.is_cancelled() => Err(Error::Io(std::io::Error::other(
-            "tree-drain watcher cancelled (runtime shutting down)",
-        ))),
-        Err(e) => {
-            debug_assert!(false, "unknown JoinError variant: {e:?}");
-            Err(Error::Io(std::io::Error::other(e)))
+    loop {
+        // A round that starts past the deadline is the last, as in the sync wait.
+        let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
+        let watch = match job.drain_round(last_round)? {
+            Round::Answer(drain) => return Ok(drain),
+            Round::List => {
+                ::tokio::task::yield_now().await;
+                continue;
+            }
+            Round::Watch(watch) => watch,
+        };
+        let ended = if last_round {
+            watch.poll()?
+        } else {
+            match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
+                Woke::Signalled => Ended::Signalled,
+                // The deadline passed first. One look at the handles, as the sync wait's zero-ms
+                // wait is: a member that exited as it passed is seen, and the last round lists.
+                Woke::TimedOut => watch.poll()?,
+            }
+        };
+        match ended {
+            Ended::Deadline => return Ok(TreeDrain::MembersRemain),
+            Ended::Signalled => {
+                if let Some(drain) = job.after_signalled(&watch)? {
+                    return Ok(drain);
+                }
+                // A signal that was already waiting at registration resolves without a pending
+                // poll, so this round may have reached no suspension: yield before listing again.
+                ::tokio::task::yield_now().await;
+            }
         }
     }
 }

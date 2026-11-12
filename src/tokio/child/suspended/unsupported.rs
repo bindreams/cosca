@@ -1,16 +1,13 @@
 //! Off Windows there is no frozen spawn.
 
 use super::{Child, SuspendedChild};
-use crate::child::suspended::platform::spawn_frozen;
+use crate::child::suspended::platform::refusal;
 use crate::error::Error;
 use crate::tokio::Command;
 
-pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
-    let (child, wanted_kill_on_drop) = spawn_frozen(cmd.as_sync_mut(), |_| unreachable!("the refusal never spawns"))?;
-    Ok(SuspendedChild {
-        child,
-        wanted_kill_on_drop,
-    })
+/// Refused before the command is touched, and before any runtime is asked for, so no hop is made.
+pub(super) async fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
+    Err(refusal(cmd.as_sync_mut()))
 }
 
 /// There is no `SuspendedChild` to resume here: `spawn` never returns one.

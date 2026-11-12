@@ -33,9 +33,17 @@ a run-to-completion teardown (`status`, `output`, `read` failing after the spawn
 root's reap and its leaf's drain, and dropped mid-wait it finishes as the `Drop` does. A leaf
 whose drain cannot be watched (the reactor refuses the registration, or the handle reports an
 error) is left to the leaf's `Drop`, which waits for it in place instead of giving up a leaf that
-is ours. Both warn past 1 s, as principle 3 says. A failed async spawn's teardown waits in place
-too (the spawn is the sync one). Exactly these of its blocking waits for something it killed warn
-once past 1 s, as the drop's does, each naming what it waits for:
+is ours. Both warn past 1 s, as principle 3 says.
+
+The async `spawn` and `spawn_suspended` are `async fn`s that run the whole sync spawn on tokio's
+blocking pool: the elevation setup, the wait for `exec`, and a failed spawn's teardown all wait
+there, on a pool thread, not on a runtime thread. The spawn is not cancelled by dropping its
+future: it runs to its end on the pool, and a child that exists is dropped there, also one made
+before the future was dropped. The one hop (`Hop::run` in [`wait.rs`](../src/tokio/wait.rs)) hands
+its value over a channel: a future dropped inside a running runtime gives a finished value to the
+pool, and one dropped outside a runtime, or once the runtime's shutdown began, drops it on the
+dropping thread. Exactly these of the failed spawn's blocking waits for
+something it killed warn once past 1 s, as the drop's does, each naming what it waits for:
 
 - the wait for the root, once the spawn has a child handle;
 - on macOS, the wait for the root of a child whose unique id arrived only after the spawn returned,
@@ -56,21 +64,41 @@ Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed d
 drain do on Unix: it takes the wait as an argument and warns before it if what it waits for has not
 ended within the threshold.
 
-Spawning is the other exception: it blocks until `exec`, as tokio's own `Command::spawn` does.
-That includes cosca's placement report
-([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)), which completes before `exec`. The
-wait is bounded by the child's own progress to `exec`; a child stopped or stuck in D state between
-`fork` and `exec` holds the thread. The wait for macOS's unique-id report
+What the spawn waits for on the pool is bounded by the child's own progress: cosca's placement
+report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)) and the wait for `exec`
+complete before `exec`, so a child stopped or stuck in D state between `fork` and `exec` holds the
+pool thread. The wait for macOS's unique-id report
 ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same way, with
 accepted residuals: if something else reaps the child and another child of this process takes its
 pid before the wait registers its watch, the wait lasts as long as that process; and a tracer
 holding the child's zombie keeps it waiting until the tracer hands the zombie back. It runs after
 `spawn_lock` is released, so it holds up only its own spawn.
 
-[`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is the deferred second half of a spawn,
-so the exception covers it, and it is a sync `fn`. On Windows it walks the system's thread snapshot
-to resume the child's initial thread, as a contained `spawn` already does, and waits for no process
-exit.
+The pool holds bounded work only: no exit wait of cosca's own occupies it, because a wait for a child
+that exits only after another wait returned would queue behind it for ever on a pool of any size.
+Unix registers the wait with the reactor. Windows registers it with the OS's wait pool
+(`RegisterWaitForSingleObject`, as tokio's own child wait does, in
+[`registered_wait.rs`](../src/os_process/windows/registered_wait.rs)): one registration per
+process handle, and one per member handle in each round of a job's drain wait
+([`job_wait_tree_drained`](../src/containment/drain_edge.rs)). The deadline is the registration's
+own timeout, on the real clock, so a Windows wait needs neither tokio's time driver nor its clock (a
+paused clock does not advance it); a timeout the OS counts short registers again for the time that
+is left. A wait owns a duplicate of the handle it waits on, so forgetting it leaks a registration but
+frees nothing the OS can still reach. A dropped wait unregisters, blocking until a callback that is
+running has returned.
+
+[`SuspendedChild::resume`](../src/tokio/child/suspended.rs) is an `async fn` on the same terms. On
+the calling thread it walks one snapshot of the system's threads to resume the child's initial
+thread, which is bounded work that waits for no process exit, and asks the job to disarm for
+`kill_on_drop` the same way, so a resume that needs no teardown needs no runtime. Only a teardown of
+the child (after a failed resume or a refused disarm) runs on the pool, as the spawn's does. With no
+runtime a refused disarm is torn down on the calling thread, as the child's drop would be, and
+reports the teardown's real fate. Otherwise, with no runtime or when the runtime is shutting down and
+cancels the hop, the teardown does not run: its closure is dropped, and the child it held is dropped
+as its handle's drop does (a refused disarm's child is armed first, so the drop kills it). Only a
+`spawn_blocking` call made after the shutdown began drops the closure on the calling thread; a task
+already queued is dropped by the pool's shutdown, on a pool or shutdown thread. The error says so,
+and its fate is `Unknown`, since nothing reports what the drop did.
 
 **Why:** a blocked worker stops every task scheduled on it, and on a `current_thread` runtime it
 stops the runtime. tokio itself panics rather than block when a `Runtime` is dropped in async

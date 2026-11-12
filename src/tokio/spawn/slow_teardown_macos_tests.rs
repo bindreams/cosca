@@ -33,11 +33,11 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     });
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     force(true);
-    let spawned = cmd.spawn();
+    let spawned = crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy());
     force(false);
     let failed = spawned.expect_err("the forced failure fails the spawn");
     assert_peeks_exhausted();
-    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(failed);
+    let (_, fate) = failed.expect_may_have_started_with();
     let pid = pid.get().expect("the hook ran");
     let warns = crate::log_capture::records_since(mark, &format!("child {pid}"))
         .into_iter()

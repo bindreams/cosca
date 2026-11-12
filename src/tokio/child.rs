@@ -82,13 +82,6 @@ impl Child {
         Child { inner }
     }
 
-    /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
-    /// [`crate::Child`]'s `commit_kill_on_drop`). A refused disarm (Windows) fails the commit: the
-    /// child, still armed, is torn down as a failed run's is.
-    pub(super) fn commit_kill_on_drop(self) -> Result<Child, crate::child::spawn::SpawnFailure> {
-        self.inner.commit_kill_on_drop().map(Child::from_sync)
-    }
-
     /// The failed run's teardown, awaited: what became of the child, and the child itself if its
     /// teardown could not end it (a refused kill, a running elevation front).
     pub(super) async fn tear_down_awaiting(self) -> (crate::error::ChildFate, Option<crate::Unreaped>) {
@@ -346,7 +339,7 @@ impl Child {
     /// # Runtime
     ///
     /// As [`wait`](Self::wait): on Unix it needs a runtime with the IO driver enabled, and on Windows
-    /// the watch of a member or of a Job runs on the blocking pool (one thread per in-flight wait).
+    /// the watch of a member or of a Job holds no thread.
     pub async fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after("kill_tree", None)
             .wait_async()
@@ -395,9 +388,8 @@ impl Child {
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
     /// nested-`Delegated` child do not). No polling interval: macOS waits on the reactor; Linux
     /// awaits a broadcast from a thread the leaf owns, started by the first wait that blocks and
-    /// joined when the child is dropped; Windows hands the wait to `spawn_blocking` (job objects
-    /// have no pollable handle) with a cancel event so a dropped future releases the blocking
-    /// watcher promptly instead of parking out the wait.
+    /// joined when the child is dropped; Windows awaits waits on the job's members (job objects have no
+    /// pollable handle), which a dropped future releases. No wait occupies the blocking pool.
     pub async fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.inner.tree.wait_drained_async(None).await
     }

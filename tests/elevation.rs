@@ -603,7 +603,7 @@ async fn async_windows_elevated_child_writes_admin_marker(#[fixture(elevation)] 
         marker.clone().into_os_string(),
     ]);
     c.elevate();
-    let mut child = c.spawn().expect("async runas spawn");
+    let mut child = c.spawn().await.expect("async runas spawn");
     let report = child.elevation().unwrap();
     assert_eq!(report.via, cosca::elevation::ElevatedVia::WindowsUac);
     assert_eq!(report.stdio, cosca::elevation::ElevatedStdio::OwnConsole);
@@ -634,7 +634,7 @@ async fn async_windows_kill_of_an_elevated_child_reports_what_happened(#[fixture
         nonce.clone().into(),
     ])
     .elevate();
-    let mut child = c.spawn().expect("async runas spawn");
+    let mut child = c.spawn().await.expect("async runas spawn");
 
     // `Child::wait` is async and `&mut`, so the race is `select!` here and the helper's exit
     // arm just parks until this test stops watching.

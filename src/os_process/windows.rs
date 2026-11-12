@@ -23,7 +23,10 @@ use crate::identity::{
 use crate::signal::{Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
 
-pub(crate) mod cancel;
+#[cfg(feature = "tokio")]
+pub(crate) mod registered_wait;
+#[cfg(test)]
+pub(crate) mod test_event;
 
 /// What a handle `CreateProcess` returned holds: every right, `SYNCHRONIZE` and `PROCESS_TERMINATE`
 /// among them.

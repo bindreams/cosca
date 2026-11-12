@@ -2,6 +2,7 @@
 //! one instruction. See [`Command::spawn_suspended`](crate::Command::spawn_suspended).
 
 use crate::child::owned::teardown::Disposition;
+use crate::child::spawn::failed_after_teardown;
 use crate::child::Child;
 use crate::command::Command;
 use crate::error::Error;
@@ -112,18 +113,22 @@ impl SuspendedChild {
             }
             Err(e) => {
                 let behind_front = child.front().is_some();
-                let (fate, unreaped) = child.tear_down_or_hand_back(Disposition::Leave);
-                Err(crate::child::spawn::after_the_spawn(
-                    Error::Containment {
-                        detail: "could not resume the frozen child".into(),
-                        source: Some(Error::io_cause(e)),
-                    },
-                    fate,
-                    unreaped,
+                let torn_down = child.tear_down_or_hand_back(Disposition::Leave);
+                Err(Error::from(failed_after_teardown(
+                    could_not_resume(e),
                     behind_front,
-                ))
+                    Ok(torn_down),
+                )))
             }
         }
+    }
+}
+
+/// The cause of a resume that failed to release the child's initial thread, sync and async alike.
+pub(crate) fn could_not_resume(release_error: std::io::Error) -> Error {
+    Error::Containment {
+        detail: "could not resume the frozen child".into(),
+        source: Some(Error::io_cause(release_error)),
     }
 }
 

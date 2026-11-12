@@ -372,7 +372,7 @@ fn run(
                 .build()
                 .expect("build a tokio runtime");
             rt.block_on(async {
-                let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+                let mut child = cmd.spawn().await.map_err(|e| e.to_string())?;
                 match child.wait().await {
                     Ok(s) if s.success() => Ok(()),
                     Ok(s) => Err(format!("exit-{s:?}")),

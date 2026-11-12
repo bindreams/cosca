@@ -21,7 +21,7 @@ async fn the_async_spawn_hands_its_child_the_async_policy() {
 
     crate::tokio::test_runtime::assert_current_thread();
     let _warn = super::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
-    let (child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    let (child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
 
     assert_eq!(
         child.inner.policy,
@@ -42,7 +42,7 @@ async fn the_async_spawn_hands_its_child_the_async_policy() {
 #[skuld::test]
 async fn a_teardown_future_dropped_at_its_wait_settles_as_a_drop_does() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     #[cfg(unix)]
     let pid = child.pid();
@@ -71,7 +71,7 @@ async fn death_watch_wait_closes_the_untaken_stdin() {
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     child.wait().await.expect("the child ends on the EOF wait made");
 }
 
@@ -85,7 +85,7 @@ async fn death_watch_wait_closes_an_untaken_stdin_another_slot_merges_into() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::merge(crate::Fd::STDIN)).expect("merge fd 3");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     child.wait().await.expect("the child ends on the EOF wait made");
 }
 
@@ -100,7 +100,7 @@ async fn death_watch_wait_closes_the_untaken_stdin_beside_an_fd_3_pipe() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe_in()).expect("stdin pipe");
     cmd.fd(3, crate::Stdio::pipe_out()).expect("fd 3 pipe");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     child.wait().await.expect("the child ends on the EOF wait made");
 }
 
@@ -112,7 +112,7 @@ async fn death_watch_wait_closes_the_untaken_stdin_beside_an_fd_3_pipe() {
 async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
     let pid = child.pid();
     child.inner.proc.script_over(|f| f.reaps([ReapAnswer::Running]));
     let mut teardown = Box::pin(child.tear_down_awaiting());
@@ -157,22 +157,24 @@ mod leaf_drain {
         }
 
         /// The held blocker, spawned into the leaf.
-        fn spawn(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-            self.spawn_reporting(None)
+        async fn spawn(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+            self.spawn_reporting(None).await
         }
 
         /// [`spawn`](Self::spawn) as a `sudo` front: the held blocker launched by `sudo`.
-        fn spawn_front(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+        async fn spawn_front(&self) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
             self.spawn_reporting(crate::child::front_kill_tests::sudo_report())
+                .await
         }
 
-        fn spawn_reporting(
+        async fn spawn_reporting(
             &self,
             elevation: Option<crate::elevation::ElevationReport>,
         ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
             let (mut child, stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
                 cmd.set_elevation_report(elevation)
-            });
+            })
+            .await;
             child.inner.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
                 entered_leaf_at(self.fake.leaf.clone()),
             ));
@@ -203,7 +205,7 @@ mod leaf_drain {
     async fn death_watch_a_teardown_of_a_reaped_root_awaits_the_leafs_drain() {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-reaped-root");
-        let (mut child, stdin) = leaf.spawn();
+        let (mut child, stdin) = leaf.spawn().await;
         drop(stdin);
         child.wait().await.expect("the blocker ends at EOF");
         let mut teardown = Box::pin(child.tear_down_awaiting());
@@ -230,7 +232,7 @@ mod leaf_drain {
         let leaf = UndrainedLeaf::new("cosca-awaited-unwatchable");
         // The leaf is never removed: nothing it holds drains.
         leaf_fault::set_rmdir_hook(|_| Err(std::io::Error::from_raw_os_error(libc::EBUSY)));
-        let (mut child, stdin) = leaf.spawn();
+        let (mut child, stdin) = leaf.spawn().await;
         drop(stdin);
         child.wait().await.expect("the blocker ends at EOF");
         std::fs::write(&leaf.fake.events, "garbled\n").expect("garble cgroup.events");
@@ -256,7 +258,7 @@ mod leaf_drain {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-closed-gate");
         // The fake leaf holds no member, so the gate finds no cgroup kill that reaches the front.
-        let (child, _stdin) = leaf.spawn_front();
+        let (child, _stdin) = leaf.spawn_front().await;
         let mut teardown = Box::pin(child.tear_down_awaiting());
 
         let first = poll_once(&mut teardown).await;
@@ -279,7 +281,7 @@ mod leaf_drain {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-empty-leaf");
         leaf.drain();
-        let (child, _stdin) = leaf.spawn_front();
+        let (child, _stdin) = leaf.spawn_front().await;
 
         let (_fate, _unreaped) = child.tear_down_awaiting().await;
 
@@ -298,7 +300,7 @@ mod leaf_drain {
         crate::tokio::test_runtime::assert_current_thread();
         let leaf = UndrainedLeaf::new("cosca-awaited-removed-once");
         leaf.drain();
-        let (child, _stdin) = leaf.spawn_front();
+        let (child, _stdin) = leaf.spawn_front().await;
         leaf_fault::record_leaf_steps();
 
         let (_fate, _unreaped) = child.tear_down_awaiting().await;

@@ -91,26 +91,15 @@ async fn wait_async_waits_for_a_real_exit() {
 }
 
 /// A wait dropped while it waits leaves the state `N` and holds nothing: a sync `wait` reaps the
-/// child, and on Windows the watcher thread is released while the child still runs.
+/// child.
 ///
 /// Mutant: the record is written before the reap.
 #[skuld::test]
 async fn a_dropped_wait_async_leaves_nobody_waiting() {
-    #[cfg(windows)]
-    let (tx, released) = std::sync::mpsc::channel();
-    #[cfg(windows)]
-    let observer = crate::tokio::wait::fault_observer::install(tx);
     let (mut child, stdin) = exits_three_on_eof();
     {
         let mut wait = pin!(child.wait_async());
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
-    }
-    #[cfg(windows)]
-    {
-        drop(observer);
-        released
-            .recv()
-            .expect("the watcher must return once the drop released it");
     }
     assert!(!child.is_reaped());
     drop(stdin);

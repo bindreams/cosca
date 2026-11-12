@@ -139,7 +139,7 @@ impl Job {
 
     /// Shared body of `wait_tree`/`wait_tree_timeout`.
     fn wait_tree_deadline(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        self.0.wait_drained(deadline, None)
+        self.0.wait_drained(deadline)
     }
 }
 

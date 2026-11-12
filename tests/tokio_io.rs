@@ -84,7 +84,7 @@ async fn async_communicate_is_deadlock_free() {
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
     cmd.stderr(cosca::Stdio::pipe()).unwrap();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let payload = common::test_pattern::pattern_bytes(4 * 1024 * 1024);
     let out = child.communicate(Some(payload.clone())).await.expect("communicate");
     assert_eq!(out.stdout, payload);
@@ -101,7 +101,7 @@ async fn async_communicate_tolerates_early_stdin_close() {
         .args(["cosca_testbin", "emit", "2", "0"]); // never reads stdin
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     // 4 MiB > any pipe buffer, so write_all is still in flight when `emit` exits and closes its
     // stdin read end — deterministically forcing the BrokenPipe the tolerance branch handles.
     let out = child
@@ -123,7 +123,7 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
     cmd.stdin(cosca::Stdio::pipe()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
     cmd.stderr(cosca::Stdio::pipe()).unwrap();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let out = child
         .communicate(None)
         .await
@@ -147,7 +147,7 @@ async fn async_communicate_input_without_a_piped_stdin_is_invalid_input() {
         .args(["cosca_testbin", "emit", "3", "0"]);
     cmd.stdin(cosca::Stdio::null()).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let error = child
         .communicate(Some(b"x".to_vec()))
         .await
@@ -179,7 +179,15 @@ async fn async_read_errors_on_invalid_utf8() {
 fn async_spawn_outside_runtime_errors() {
     let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
-    let err = cmd.spawn().expect_err("spawn outside a tokio runtime must Err");
+    // No runtime to run it on: the first poll refuses.
+    let mut spawn = std::pin::pin!(cmd.spawn());
+    let std::task::Poll::Ready(refused) = std::future::Future::poll(
+        spawn.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) else {
+        panic!("a spawn outside a tokio runtime must be refused on its first poll");
+    };
+    let err = refused.expect_err("spawn outside a tokio runtime must Err");
     assert!(matches!(err, cosca::error::Error::Io(_)), "got {err:?}");
 }
 
@@ -207,7 +215,7 @@ fn async_spawn_on_io_disabled_runtime_panics_at_the_first_wait_on_unix() {
                 std::os::fd::OwnedFd::from(reader),
             )))
             .unwrap();
-            let mut child = cmd.spawn().expect("the spawn does not need the IO driver");
+            let mut child = cmd.spawn().await.expect("the spawn does not need the IO driver");
             pid.store(child.pid(), std::sync::atomic::Ordering::Relaxed);
             let _ = child.wait().await;
         })
@@ -246,7 +254,7 @@ fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
     let spawned = rt.block_on(async {
         let mut cmd = common::tokio_command(common::Console::Hidden);
         cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
-        cmd.spawn().is_ok()
+        cmd.spawn().await.is_ok()
     });
     assert!(
         spawned,
@@ -263,7 +271,7 @@ async fn async_chained_merge_is_unsupported() {
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
     cmd.stdout(cosca::Stdio::merge(cosca::Fd::STDIN)).unwrap();
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT)).unwrap();
-    let err = cmd.spawn().expect_err("chained merges are unsupported");
+    let err = cmd.spawn().await.expect_err("chained merges are unsupported");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
 }
 
@@ -276,7 +284,7 @@ async fn async_chained_merge_is_unsupported() {
 async fn an_async_spawn_of_a_missing_program_reports_that_nothing_started() {
     let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.args(["cosca-no-such-program-964"]);
-    let err = cmd.spawn().expect_err("a missing program fails the spawn");
+    let err = cmd.spawn().await.expect_err("a missing program fails the spawn");
     assert_eq!(err.fate(), None, "the program never ran: {err:?}");
     let cosca::error::Error::Io(io_err) = &err else {
         panic!("expected the OS's own error, got {err:?}");
@@ -297,7 +305,10 @@ async fn an_async_spawn_of_a_non_executable_file_reports_that_nothing_started() 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("drop the execute bits");
     let mut cmd = common::tokio_command(common::Console::Hidden);
     cmd.executable(&file).args(["not-executable"]);
-    let err = cmd.spawn().expect_err("a file without the execute bit fails the spawn");
+    let err = cmd
+        .spawn()
+        .await
+        .expect_err("a file without the execute bit fails the spawn");
     assert_eq!(err.fate(), None, "the program never ran: {err:?}");
     let cosca::error::Error::Io(io_err) = &err else {
         panic!("expected the OS's own error, got {err:?}");
@@ -622,7 +633,7 @@ async fn async_unix_fd3_pipe_round_trips() {
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::pipe_in()).expect("fd 3 pipe_in");
-    let mut child = cmd.spawn().expect("spawn with fd 3");
+    let mut child = cmd.spawn().await.expect("spawn with fd 3");
     let mut stdout = child.stdout().expect("stdout reader");
     let mut fd3_writer = child.fd_write_end(cosca::Fd::from(3)).expect("fd 3 writer");
 
@@ -648,7 +659,7 @@ async fn async_unix_fd3_null_is_accepted() {
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
-    let mut child = cmd.spawn().expect("spawn with null fd 3");
+    let mut child = cmd.spawn().await.expect("spawn with null fd 3");
     let mut stdout = child.stdout().expect("stdout reader");
     let mut buf = Vec::new();
     stdout.read_to_end(&mut buf).await.expect("read stdout");
@@ -673,7 +684,7 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "fd3-write", "fd3-token"]);
     cmd.fd(3, cosca::Stdio::pipe_out()).expect("fd 3 pipe_out");
-    let mut child = cmd.spawn().expect("spawn with fd 3 out");
+    let mut child = cmd.spawn().await.expect("spawn with fd 3 out");
     let mut fd3_reader = child.fd_read_end(cosca::Fd::from(3)).expect("fd 3 reader");
     let mut buf = Vec::new();
     fd3_reader.read_to_end(&mut buf).await.expect("read fd 3");
@@ -709,6 +720,7 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
         .expect("fd() itself accepts an out-of-range but representable number");
     let err = cmd
         .spawn()
+        .await
         .expect_err("dup2 onto an unachievable fd number must fail the spawn with Err, not abort");
     let cosca::error::Error::Io(io_err) = err else {
         panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
@@ -735,6 +747,7 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
         .expect("fd() itself accepts i32::MAX — install() does too");
     let err = cmd
         .spawn()
+        .await
         .expect_err("dup2 onto i32::MAX must fail the spawn with Err, not abort");
     let cosca::error::Error::Io(io_err) = err else {
         panic!("expected a plain Io error (propagated via the child's error pipe), got {err:?}");
@@ -770,7 +783,7 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
     cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
     cmd.stderr(cosca::Stdio::pipe()).expect("stderr pipe");
     cmd.fd(3, cosca::Stdio::null()).expect("fd 3 null");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let mut stderr = child.stderr().expect("stderr reader");
     let mut buf = Vec::new();
     stderr.read_to_end(&mut buf).await.expect("read stderr");
@@ -825,6 +838,7 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 
     let err = cmd
         .spawn()
+        .await
         .expect_err("a relocated low parent fd must fail the spawn cleanly, not corrupt it into Ok");
 
     let mut buf = Vec::new();
@@ -854,7 +868,7 @@ async fn async_fd3_wrong_direction_take_puts_the_end_back() {
     cmd.executable(common::testbin()).args(["cosca_testbin", "fd3-echo"]);
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::pipe_in()).expect("fd 3 pipe_in");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     assert!(
         child.fd_read_end(cosca::Fd::from(3)).is_none(),
         "wrong direction is None"
@@ -879,7 +893,7 @@ async fn async_fd3_wrong_direction_take_puts_the_end_back() {
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "fd3-write", "still-here"]);
     cmd.fd(3, cosca::Stdio::pipe_out()).expect("fd 3 pipe_out");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     assert!(
         child.fd_write_end(cosca::Fd::from(3)).is_none(),
         "wrong direction is None"
@@ -907,7 +921,7 @@ async fn async_merge_stderr_onto_stdout_combines_output() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
         .expect("stderr merge");
-    let mut child = cmd.spawn().expect("spawn merged");
+    let mut child = cmd.spawn().await.expect("spawn merged");
     let mut reader = child.stdout().expect("merged stdout reader");
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).await.expect("read merged");
@@ -942,7 +956,7 @@ async fn async_merge_into_unpiped_targets_still_works() {
     cmd.stdout(cosca::Stdio::null()).expect("stdout null");
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
         .expect("stderr merge");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let status = child.wait().await.expect("reap");
     assert_eq!(status.code(), Some(0));
 }
@@ -956,7 +970,7 @@ async fn async_communicate_reads_a_merged_stream() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
         .expect("stderr merge");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let out = child.communicate(None).await.expect("communicate");
     assert_eq!(
         out.stdout.len(),
@@ -977,7 +991,7 @@ async fn async_merged_stream_accessor_has_take_semantics() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDOUT))
         .expect("stderr merge");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let first = child.stdout();
     assert!(first.is_some(), "first stdout() take yields the merged reader");
     assert!(
@@ -1001,7 +1015,7 @@ async fn async_non_merged_stream_accessor_has_take_semantics() {
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(cosca::Stdio::null()).expect("stderr null");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
 
     assert!(child.stdin().is_some(), "first stdin() take");
     assert!(child.stdin().is_none(), "second stdin() take is None");
@@ -1028,7 +1042,7 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(cosca::Stdio::merge(cosca::Fd::STDIN))
         .expect("stderr merges into stdin");
-    let mut child = cmd.spawn().expect("spawn merged-stdin child");
+    let mut child = cmd.spawn().await.expect("spawn merged-stdin child");
     let mut stdin = child.stdin().expect("stdin writer");
     stdin.write_all(b"abcdef").await.expect("write");
     drop(stdin); // buffered data is delivered first, then EOF (verified teardown order)
@@ -1057,7 +1071,7 @@ async fn async_fd3_source_merges_into_piped_stdout() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::merge(cosca::Fd::STDOUT))
         .expect("fd 3 merges into stdout");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let mut buf = Vec::new();
     child
         .stdout()
@@ -1083,7 +1097,7 @@ async fn async_fd3_source_merges_into_piped_stdin() {
     cmd.stdout(cosca::Stdio::pipe()).expect("stdout pipe");
     cmd.fd(3, cosca::Stdio::merge(cosca::Fd::STDIN))
         .expect("fd 3 merges into stdin");
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let mut stdin = child.stdin().expect("stdin writer");
     stdin.write_all(b"via-the-dup").await.expect("write");
     drop(stdin); // the parent writer is the ONLY write end — drop is EOF for the child
@@ -1139,7 +1153,7 @@ async fn death_watch_spawn_tree_async_panics_if_its_death_watch_is_ever_reverted
 }
 
 #[cfg(feature = "tokio")]
-fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
+async fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
     let (listener, addr) = common::bind_async_listener();
     let mut cmd = common::tokio_command(common::Console::Hidden);
     let mut argv = vec![common::testbin().to_string()];
@@ -1148,14 +1162,14 @@ fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca
     if ack {
         cmd.env(common::ACK_ENV, "1");
     }
-    (listener, cmd.spawn().expect("spawn"))
+    (listener, cmd.spawn().await.expect("spawn"))
 }
 
 #[cfg(feature = "tokio")]
 /// A target that dies before connecting makes `accept_or_die_async` panic naming it, not hang.
 #[skuld::test]
 async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_first() {
-    let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
+    let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false).await;
     let pid = child.pid();
     let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
     assert_died_before_connecting(&message, pid);
@@ -1166,7 +1180,7 @@ async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_firs
 /// connection reached the accept queue. The child has exited first (unreaped on Unix).
 #[skuld::test]
 async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
-    let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
+    let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false).await;
     let pid = child.pid();
     #[cfg(unix)]
     let status = common::zombie_exit_status(pid);
@@ -1182,7 +1196,7 @@ async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exi
 #[skuld::test]
 async fn death_watch_accept_or_die_async_acks_the_connection_it_accepts() {
     use std::io::{Read as _, Write as _};
-    let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true);
+    let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true).await;
     let mut sock = common::accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("the acked target sends its tag");
@@ -1202,7 +1216,7 @@ async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead(
     // `hold-until-stdin-eof` ends only when its stdin closes (the panic's unwind closes it).
     cmd.args([common::testbin().to_string(), "hold-until-stdin-eof".to_string()]);
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
-    let mut target = cmd.spawn().expect("spawn the live target");
+    let mut target = cmd.spawn().await.expect("spawn the live target");
     let target_stdin = target.stdin().expect("the target's piped stdin");
     let mut gone = common::spawn_locked(
         std::process::Command::new(common::testbin())

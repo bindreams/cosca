@@ -1,9 +1,9 @@
-//! A failed async spawn's teardown blocks the spawning thread until the child it killed is reaped,
-//! and warns once, naming the child, when that wait passes 1 s (principle 2). The async spawn is the
-//! sync spawn told the async policy (`SpawnPolicy::teardown_warn_after`), so each row fails the spawn
-//! at one arm and pins that the arm passes the policy through to its wait. A foreign tracer holds the
-//! killed child's zombie, so the wait cannot end before the tracer lets go; it lets go only once the
-//! spawning thread sleeps in a blocking `waitid`, which the teardown reaches only after the warn.
+//! A failed async spawn's teardown waits for the killed child and warns once, naming it, past 1 s
+//! (principle 2). Each row fails the spawn at one arm and pins that the arm passes `async_policy` to
+//! its wait. The seams are thread-local, so rows call `spawn_uncommitted(cmd, async_policy())` on
+//! the test thread. A foreign tracer holds the killed child's zombie, so the wait cannot end before
+//! the tracer lets go; it lets go only once the spawning thread sleeps in a blocking `waitid`, which
+//! the teardown reaches only after the warn.
 //!
 //! The tracee ends only by a kill, or by its stdin closing. The teardown's thread holds the stdin
 //! writer and drops it between the teardown's kill and its wait (`release_between_kill_and_wait`),
@@ -18,6 +18,11 @@ use crate::test_groups::{cgroup, tracer_group, Group};
 use crate::test_support::foreign_tracer::{
     self, assert_reaped_by_sigkill, assert_warns_once_before_blocking, Names, Tracer, LET_EXIT, REAP,
 };
+
+/// What the async spawn's hop runs, on this thread: the sync spawn, told the async policy.
+fn spawn_on_this_thread(cmd: &mut crate::tokio::Command) -> Result<(), crate::child::spawn::SpawnFailure> {
+    crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy()).map(drop)
+}
 
 /// Fails the spawn at `point`, with `arm` making it fail from there, and `disarm` undoing `arm`.
 #[derive(Clone, Copy)]
@@ -77,11 +82,6 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
                 _between_kill_and_wait = None;
                 Some(fault::release_between_kill_and_wait(held.take()))
             };
-            let rt = ::tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            let _rt = rt.enter();
             // Kept open until the teardown is done: the tracee's later writes must not stop it on a
             // `SIGPIPE` that only the tracer, which is released after the teardown blocks, could lift.
             let out_open = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -109,7 +109,7 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
             cmd.stdin(stdin).expect("set stdin");
             let out = std::fs::File::from(std::os::fd::OwnedFd::from(out_writer));
             cmd.stdout(crate::stdio::Stdio::from_file(out)).expect("set stdout");
-            let spawned = cmd.spawn().map(drop);
+            let spawned = spawn_on_this_thread(&mut cmd);
             (fail.disarm)();
             (spawned, blocker.map(|blocker| blocker.recorded()).unwrap_or_default())
         },
@@ -171,11 +171,6 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
     let mark = crate::log_capture::mark();
     let (stdin, _stdin_writer) = crate::test_child::held_writer_stdin();
     let (out_reader, out_writer) = std::io::pipe().expect("pipe");
-    let rt = ::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let _rt = rt.enter();
     let _warn = crate::tokio::child::fault::warn_slow_teardowns();
 
     let tracer: Rc<RefCell<Option<Tracer>>> = Rc::default();
@@ -223,7 +218,7 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
     cmd.stdin(stdin).expect("set stdin");
     let out = std::fs::File::from(std::os::fd::OwnedFd::from(out_writer));
     cmd.stdout(crate::stdio::Stdio::from_file(out)).expect("set stdout");
-    let spawned = cmd.spawn().map(drop);
+    let spawned = spawn_on_this_thread(&mut cmd);
     (ATTACH.disarm)();
 
     assert!(spawned.is_err(), "the forced failure fails the spawn");
