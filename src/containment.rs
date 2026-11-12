@@ -61,10 +61,11 @@ pub enum Containment {
     /// created) is signalled by `killpg(pgid)` with no additional re-verification beyond what
     /// the process-group mechanism already does — the same pgid-reuse caveat documented in
     /// `src/containment/unix.rs` applies to the FIRST group signal exactly as it does today.
-    /// `kill_tree` (SIGKILL) re-snapshots the host and repeats until nothing new appears AND
-    /// each pass makes actual progress (no fixed pass count); a LATER pass re-signals the group
-    /// too (closing a gap the single-shot `ProcessGroup` mechanism does not need to close: a
-    /// process joining the group strictly between passes), but ONLY when that pass's own
+    /// `kill_tree` (SIGKILL) re-snapshots the host and repeats until a pass finds nothing or the
+    /// new-identity count stops falling (no fixed pass count). `Err` can then also mean the tree
+    /// was still forking: a process forked during the last pass may be left running. A LATER pass
+    /// re-signals the group too (closing a gap the single-shot `ProcessGroup` mechanism does not
+    /// need to close: a process joining the group strictly between passes), but ONLY when that pass's own
     /// marker-holder scan just confirmed a live, `getpgid`-verified member of the group — proof
     /// the pgid had not yet been recycled at that instant — so a later pass never adds a NEW,
     /// unconditional instance of the reuse risk beyond pass 1's existing one (see
@@ -277,6 +278,10 @@ pub(crate) mod enumerate;
 #[cfg(target_os = "macos")]
 #[path = "containment/fdmarker.rs"]
 pub(crate) mod fdmarker;
+
+#[cfg(any(target_os = "macos", test))]
+#[path = "containment/sweep_passes.rs"]
+pub(crate) mod sweep_passes;
 
 #[path = "containment/treewalk.rs"]
 pub(crate) mod treewalk;

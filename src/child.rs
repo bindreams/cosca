@@ -499,7 +499,8 @@ impl Child {
     /// was left running," which the rest of this doc comment calls acceptable. The tree may
     /// still be partially alive after such an `Err`. This is a real, expected outcome on a
     /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
-    /// to route around by ignoring the `Result`.
+    /// to route around by ignoring the `Result`. `Err` can also mean the tree was still forking
+    /// when the sweep stopped: a process forked during the last pass may be left running.
     ///
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
