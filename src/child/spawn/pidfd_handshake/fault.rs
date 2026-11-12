@@ -11,6 +11,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use rustix::io::Errno;
 
+use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+
 /// What the next child does around its report.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildFault {
@@ -427,28 +429,22 @@ pub(super) fn fork_holder_if_armed() {
     let (r, w) = (release_r.as_raw_fd(), release_w.as_raw_fd());
     // SAFETY: the copy makes only async-signal-safe calls (`close`, `read`, `_exit`), and the
     // caller holds `spawn_lock`.
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
+    let forked = unsafe { fork_with_pidfd() }.unwrap_or_else(|errno| panic!("fork the holder: errno {errno}"));
+    let new = match forked {
         // SAFETY: as above; it waits for the release end's EOF, then exits.
-        unsafe {
+        Fork::Child => unsafe {
             libc::close(w);
             let mut byte = 0u8;
             while libc::read(r, (&raw mut byte).cast(), 1) < 0 && *libc::__errno_location() == libc::EINTR {}
             libc::_exit(0);
-        }
-    }
-    assert!(pid > 0, "fork the holder: {}", io::Error::last_os_error());
+        },
+        Fork::Parent(new) => new,
+    };
     drop(release_r);
-    // Blocked on its release end, so it is this process's unreaped child: its number is its own.
-    let pidfd = rustix::process::pidfd_open(
-        rustix::process::Pid::from_raw(pid).expect("a forked pid is positive"),
-        rustix::process::PidfdFlags::empty(),
-    )
-    .expect("the holder's pidfd");
     HOLDER.with(|h| {
         *h.borrow_mut() = Some(Holder {
             release: release_w,
-            pidfd,
+            pidfd: new.pidfd,
         })
     });
 }

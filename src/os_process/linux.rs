@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::signal::{send_pidfd, Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
 
+pub(crate) mod fork;
 pub(crate) mod open;
 
 #[derive(Debug)]

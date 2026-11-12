@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use rustix::fs::OFlags;
 use rustix::process::{Pid, WaitOptions};
 
-use super::child::{self, Path, Prepared, Spawned};
+use super::child::{self, Prepared};
 use super::fds::replace_stdio;
 use super::run_loop::Loop;
 use super::signals;
@@ -17,6 +17,18 @@ use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::program_path;
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, ShimArgs};
 use crate::elevation::shim::step::{conclude, LoopState};
+use crate::os_process::linux::fork::{clone_with_pidfd, fails_with, fallback, fork_with_pidfd, Fork, ForkFn};
+
+/// `Inject::Clone3Enosys`: the first clone answers `ENOSYS`, as under a seccomp profile that refuses
+/// `clone3`, and the shim's fork falls back to `clone(CLONE_PIDFD)`.
+///
+/// # Safety
+///
+/// As [`fork_with_pidfd`].
+unsafe fn clone3_enosys() -> Result<Fork, i32> {
+    // SAFETY: the caller's contract.
+    unsafe { fallback(|| fails_with(libc::ENOSYS), clone_with_pidfd) }
+}
 
 /// A pipe, both ends close-on-exec.
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
@@ -143,16 +155,19 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     };
 
     shim.gate(Gate::BeforeClone);
-    let faults = child::Faults {
-        refuse_clone3: shim.injected(Inject::Clone3Enosys),
-        fail: shim.injected(Inject::ForkFails),
+    let fork: ForkFn = if shim.injected(Inject::ForkFails) {
+        || fails_with(libc::EAGAIN)
+    } else if shim.injected(Inject::Clone3Enosys) {
+        clone3_enosys
+    } else {
+        fork_with_pidfd
     };
-    let spawned: Result<(Spawned, Path), i32> = {
+    let spawned = {
         let _lock = crate::child::spawn::spawn_lock();
-        child::spawn(&prepared, faults)
+        child::spawn(&prepared, fork)
     };
-    let (child, path) = match spawned {
-        Ok(ok) => ok,
+    let child = match spawned {
+        Ok(child) => child,
         Err(errno) => {
             let e = std::io::Error::from_raw_os_error(errno);
             return Err(shim.not_executed(NotExecuted::ForkFailed(Errno(errno)), "fork", &e));
@@ -160,7 +175,7 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     };
     drop((status_tx, release_rx));
     shim.log
-        .line(format_args!("forked child pid={} via {path:?}", child.pid));
+        .line(format_args!("forked child pid={} via {:?}", child.pid, child.path));
     // The child has its own copy of the blocked mask, and keeps it until its handlers are set up. The
     // shim's own signals are delivered from here on, those that arrived meanwhile first.
     signals::restore(&saved_mask);

@@ -3,20 +3,22 @@
 //!
 //! The loop's blocking calls are these, each commented where it is made:
 //! - the single `poll` of each round;
-//! - the reap after the shim's own SIGKILL ([`Spawned::reap`] with `ready = false`);
+//! - the reap after the shim's own SIGKILL ([`reap`] with `ready = false`);
 //! - the wait for a host thread's reap, when a test hook installed one;
-//! - the traced-zombie wait inside [`Spawned::reap`].
+//! - the traced-zombie wait inside [`reap`].
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use rustix::io::Errno;
 use rustix::net::{recv, RecvFlags};
 
-use super::child::{decode_report, Spawned};
+use super::child::{decode_report, signal};
 use super::fds::wait_readable;
 use super::log::Log;
+use super::reap::{kill, reap};
 use crate::elevation::shim::protocol::NotExecuted;
 use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState};
+use crate::os_process::linux::fork::NewChild;
 
 /// What the loop ended with: the inputs of [`conclude`](crate::elevation::shim::step::conclude).
 pub(super) struct Finished {
@@ -31,7 +33,7 @@ pub(super) struct Loop<'a> {
     pub(super) log: &'a Log,
     pub(super) conn: BorrowedFd<'a>,
     pub(super) owner: BorrowedFd<'a>,
-    pub(super) child: &'a Spawned,
+    pub(super) child: &'a NewChild,
     /// The read end of the pipe the signal handlers write to.
     pub(super) wake: BorrowedFd<'a>,
     /// The read end of the status pipe.
@@ -191,7 +193,7 @@ impl Loop<'_> {
                         ));
                     }
                 }
-                let status = self.child.reap(true, self.log);
+                let status = reap(self.child, true, self.log);
                 self.log.line(format_args!("reaped status {status:?}"));
                 break (status, false);
             }
@@ -214,16 +216,16 @@ impl Loop<'_> {
     fn perform(&self, events: &Events, actions: &Actions) {
         self.log_events(events, actions);
         if let Some(to) = actions.signal {
-            let sent = self.child.signal(to);
+            let sent = signal(self.child, to);
             self.log.line(format_args!("control: signal {to:?} rc={sent:?}"));
         }
     }
 
     /// Supervision failed: kill the child through its handle, reap it, and say so.
     fn kill_and_reap(&self) -> (Option<i32>, bool) {
-        self.child.kill(self.log);
+        kill(self.child, self.log);
         // The child dies of the SIGKILL just sent; this blocks until it has.
-        (self.child.reap(false, self.log), true)
+        (reap(self.child, false, self.log), true)
     }
 
     /// Reads the signal numbers the handlers wrote; whether there were any.
