@@ -148,8 +148,7 @@ pub enum Error {
     ///
     /// A call is refused when it answers an errno that only a seccomp filter or an LSM can produce
     /// for that call (or `ENOSYS`, an old kernel). Each call has its own set, below. The errno is
-    /// the error's `source`, so `raw_os_error` finds it. Another failure of the call is not a
-    /// refusal.
+    /// the error's `source`, so `raw_os_error` finds it.
     ///
     /// ## `pidfd_open`
     ///
@@ -169,16 +168,21 @@ pub enum Error {
     ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
     ///   either way no pidfd is possible.
     ///
-    /// Any other failure of `pidfd_open` is [`Error::Io`] prefixed `pidfd_open:`; the inode read
-    /// (`pidfs_ino`) and `poll` of a pidfd are never refusals, and fail as [`Error::Unassessable`]
-    /// carrying the errno.
+    /// A failure that is not a refusal is the call's own, with its errno, and depends on the
+    /// operation:
+    ///
+    /// - from [`Process::open`](crate::Process::open) and [`open_pid`](crate::Process::open_pid)
+    ///   (and their `tokio` twins) it is [`Error::Io`] prefixed with the call's name
+    ///   (`pidfd_open:`, `pidfs_ino:`, `poll:`); the inode read (`pidfs_ino`) and `poll` of a
+    ///   pidfd are never refusals;
+    /// - from an identity read or a tree walk it is [`Error::Unassessable`] carrying the errno.
     ///
     /// ## `openat2`
     ///
     /// The checked `/proc` view needs `openat2` (the kernel needs 5.6), refused with `ENOSYS`,
     /// `EPERM` or `ENODEV`, as above. `EACCES` is not a refusal here: it is also the kernel's own
     /// answer to a `/proc` that may not be opened, so it stays [`Error::Unassessable`] carrying
-    /// `EACCES`, as does any other failure of the call. A refused `openat2` fails with this
+    /// `EACCES`, as does any other failure of the call (a tree walk's included). A refused `openat2` fails with this
     /// variant naming `openat2` from:
     ///
     /// - a by-pid identity read, wait or kill;

@@ -30,9 +30,8 @@
 //!   fork.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
 //!   checked `/proc` view uses it to read a process's start time and to list processes. It is
-//!   refused with `ENOSYS`, `EPERM` or `ENODEV`; unlike for `pidfd_open`, `EACCES` is no refusal,
-//!   since it is also the kernel's own answer to a `/proc` that may not be opened. Before
-//!   Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
+//!   refused with `ENOSYS`, `EPERM` or `ENODEV` (see [`Error::Unsupported`](error::Error::Unsupported)).
+//!   Before Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
 //!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. On 6.9+ a by-pid identity read, an open and a spawn need no view; listing a

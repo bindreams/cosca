@@ -169,9 +169,12 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                     format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
                     why.source.map(Into::into),
                 ),
-                None => std::io::Error::other(format!(
+                None => {
+                    let message = format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
-                )),
+                );
+                    listing_error(std::io::ErrorKind::Other, message, why.source.map(Into::into))
+                }
             })?;
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
@@ -190,9 +193,13 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             }
             // Excluding it could clear a live group.
             Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "containment::unix::group::members: {e}, so process group {pgid} cannot be listed"
-                )));
+                let message =
+                    format!("containment::unix::group::members: {e}, so process group {pgid} cannot be listed");
+                return Err(listing_error(
+                    std::io::ErrorKind::Other,
+                    message,
+                    Some(e.into_source().into()),
+                ));
             }
         };
         let Some(g) = parse_pgrp(&stat) else {
@@ -231,7 +238,16 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                         crate::error::Error::Unsupported { source, .. } => {
                             listing_error(std::io::ErrorKind::Unsupported, message, source.map(Into::into))
                         }
-                        _ => std::io::Error::other(message),
+                        crate::error::Error::Unassessable { source, .. } => {
+                            listing_error(std::io::ErrorKind::Other, message, source.map(Into::into))
+                        }
+                        other => {
+                            debug_assert!(
+                                false,
+                                "an unreadable identity is Unsupported or Unassessable: {other:?}"
+                            );
+                            listing_error(std::io::ErrorKind::Other, message, None)
+                        }
                     });
                 }
                 None => {
@@ -252,9 +268,8 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
     Ok(out)
 }
 
-/// A listing failure of `kind` that says `message` and keeps `cause`, the refusal's errno, as its
-/// [`source`](std::error::Error::source): [`Error::Unsupported`](crate::error::Error::Unsupported)
-/// from a refused call carries it.
+/// A listing failure of `kind` that says `message` and keeps `cause`, the failed call's errno, as
+/// its [`source`](std::error::Error::source).
 #[cfg(target_os = "linux")]
 fn listing_error(
     kind: std::io::ErrorKind,

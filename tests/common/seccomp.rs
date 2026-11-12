@@ -23,8 +23,7 @@ pub const PIDFD_OPEN_REFUSALS: [(i32, &str); 4] = [
 ];
 
 /// The refusals of `openat2` a host can answer, as `(errno, its name)`: `ENOSYS` before Linux 5.6,
-/// and `EPERM` or `ENODEV` under a seccomp profile or LSM that blocks it. `EACCES` is not one: it is
-/// also the kernel's own answer to a `/proc` that may not be opened.
+/// and `EPERM` or `ENODEV` under a seccomp profile or LSM that blocks it.
 pub const OPENAT2_REFUSALS: [(i32, &str); 3] = [
     (libc::ENOSYS, "ENOSYS"),
     (libc::EPERM, "EPERM"),

@@ -70,8 +70,8 @@ pub(crate) struct ViewUnreadable {
     /// The OS error behind `reason`, when there was one.
     pub(crate) source: Option<io::Error>,
     /// The `openat2` of `/proc` that failed, when that is why the view could not be established.
-    /// If [`FailedCall::refusal`] says it was refused (kernel older than 5.6, or a seccomp filter
-    /// or LSM answering), no `/proc` view can ever be established here.
+    /// If [`FailedCall::requirement`] is `Some`, the call was refused and no `/proc` view can ever
+    /// be established here.
     openat2: Option<FailedCall>,
 }
 
@@ -86,9 +86,10 @@ impl ViewUnreadable {
 
     /// The view that `openat2` of `/proc` failing with `errno` leaves.
     pub(crate) fn from_open_errno(errno: rustix::io::Errno) -> Self {
+        let call = FailedCall::openat2(errno);
         ViewUnreadable {
-            openat2: Some(FailedCall::openat2(errno)),
-            ..ViewUnreadable::new("/proc could not be opened", Some(errno.into()))
+            openat2: Some(call),
+            ..ViewUnreadable::new("/proc could not be opened", Some(call.errno().into()))
         }
     }
 

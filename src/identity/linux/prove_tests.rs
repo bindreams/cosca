@@ -133,9 +133,8 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
     }
 }
 
-/// An `openat2` of `/proc` that answers `EACCES` is the kernel refusing to open `/proc`, not a
-/// filter refusing the syscall: `Unassessable` carrying `EACCES`, never `Unsupported`. The same
-/// errno from `pidfd_open` is a refusal. Mutant: "one errno set decides both calls".
+/// An `openat2` answering `EACCES` is `Unassessable` carrying `EACCES`; the same errno from
+/// `pidfd_open` is a refusal. Mutant: "one errno set decides both calls".
 #[skuld::test]
 fn an_openat2_that_answers_eacces_is_unassessable_carrying_eacces() {
     use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};

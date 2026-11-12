@@ -79,10 +79,8 @@ impl FailedCall {
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a refused call carries as its
     /// `detail`.
     ///
-    /// A refusal is a `pidfd_open` or `openat2` that answered an errno only a filter or LSM can
-    /// produce for that call, as documented on `Error::Unsupported`; each call has its own set and
-    /// its kernel floor. `EACCES` is also the kernel's own answer to an `openat2` of a `/proc` that
-    /// may not be opened. No other call is refused; its failure, with any errno, is its own.
+    /// Refusal sets per call: see [`Error::Unsupported`](crate::error::Error::Unsupported). No other
+    /// call is refused; its failure, with any errno, is its own.
     pub(crate) fn requirement(&self) -> Option<String> {
         let (floor, errno) = match (self.call, self.errno) {
             (Call::PidfdOpen, Errno::NOSYS) => ("5.3", "ENOSYS"),

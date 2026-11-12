@@ -125,6 +125,7 @@ fn a_refused_probe_fails_unsupported() {
             ),
             "{err:?}"
         );
+        assert_eq!(err.raw_os_error(), Some(errno), "{name}: the errno is the source");
     }
 }
 
