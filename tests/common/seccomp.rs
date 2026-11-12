@@ -13,13 +13,21 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
     );
 }
 
-/// The refusals of `openat2` a host can answer, as `(errno, its name)`: `ENOSYS` before Linux 5.6,
-/// and `EPERM`, `EACCES` or `ENODEV` under a seccomp profile or LSM that blocks it. The same set
-/// refuses `pidfd_open`.
-pub const OPENAT2_REFUSALS: [(i32, &str); 4] = [
-    (libc::ENOSYS, "ENOSYS"),
+/// The refusals of `pidfd_open` a host can answer, as `(errno, its name)`: `ENOSYS` before Linux
+/// 5.3, and `EPERM`, `EACCES` or `ENODEV` under a seccomp profile or LSM that blocks it.
+pub const PIDFD_OPEN_REFUSALS: [(i32, &str); 4] = [
     (libc::EPERM, "EPERM"),
     (libc::EACCES, "EACCES"),
+    (libc::ENODEV, "ENODEV"),
+    (libc::ENOSYS, "ENOSYS"),
+];
+
+/// The refusals of `openat2` a host can answer, as `(errno, its name)`: `ENOSYS` before Linux 5.6,
+/// and `EPERM` or `ENODEV` under a seccomp profile or LSM that blocks it. `EACCES` is not one: it is
+/// also the kernel's own answer to a `/proc` that may not be opened.
+pub const OPENAT2_REFUSALS: [(i32, &str); 3] = [
+    (libc::ENOSYS, "ENOSYS"),
+    (libc::EPERM, "EPERM"),
     (libc::ENODEV, "ENODEV"),
 ];
 

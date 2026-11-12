@@ -12,12 +12,7 @@ use cosca::error::Error;
 mod common;
 
 #[cfg(target_os = "linux")]
-const REFUSALS: [(i32, &str); 4] = [
-    (libc::EPERM, "EPERM"),
-    (libc::EACCES, "EACCES"),
-    (libc::ENODEV, "ENODEV"),
-    (libc::ENOSYS, "ENOSYS"),
-];
+use common::seccomp::PIDFD_OPEN_REFUSALS as REFUSALS;
 
 #[cfg(target_os = "linux")]
 fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: &str) {
@@ -179,16 +174,16 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
                 .expect("the filtered thread")
         });
         drop(control);
-        match result {
-            Err(Error::Unsupported { op, detail, .. }) => {
-                assert!(op.starts_with("listing process group"), "{name}: {op}");
-                assert!(
-                    detail.contains(&format!("pidfd_open answered {name}")),
-                    "{name}: the group sweep names the refusal: {detail}"
-                );
-            }
-            other => panic!("{name}: expected the group sweep to be Unsupported, got {other:?}"),
-        }
+        let err = result.expect_err("a group that cannot be listed must fail");
+        let Error::Unsupported { op, detail, .. } = &err else {
+            panic!("{name}: expected the group sweep to be Unsupported, got {err:?}");
+        };
+        assert!(op.starts_with("listing process group"), "{name}: {op}");
+        assert!(
+            detail.contains(&format!("pidfd_open answered {name}")),
+            "{name}: the group sweep names the refusal: {detail}"
+        );
+        assert_eq!(common::os_code(&err), Some(code), "{name}: the errno is the source");
         let status = child.wait().expect("reap the root");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }

@@ -13,6 +13,7 @@ use super::super::kernel::{HostKernel, Kernel, PIDFD_THREAD};
 use crate::error::Error;
 use crate::identity::{Existence, FakeKernel, Key, Liveness, ProcessId};
 use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_seccomp::{OPENAT2_REFUSALS, PIDFD_OPEN_REFUSALS};
 
 const PID: u32 = 4242;
 
@@ -84,71 +85,123 @@ fn a_pid_that_cannot_be_opened_for_want_of_descriptors_is_unknown_with_the_errno
 /// A refused `pidfd_open` is `Unsupported`, never a fallback to `/proc`.
 #[skuld::test]
 fn a_refused_pidfd_open_is_unknown_and_unsupported() {
-    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+    for (errno, _) in PIDFD_OPEN_REFUSALS {
+        let errno = Errno::from_raw_os_error(errno);
         let (existence, cause) = id(100).exists_with(&refusing(errno));
         assert_eq!(existence, Existence::Unknown, "{errno}");
         assert_eq!(id(100).is_alive_with(&refusing(errno)), Liveness::Unknown, "{errno}");
         let err = cause.into_error("pid 4242").expect("the refusal is the cause");
         assert!(matches!(err, Error::Unsupported { .. }), "{errno}: {err:?}");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(errno.raw_os_error()),
+            "{errno}: the errno is the source"
+        );
     }
 }
 
-/// A refused `openat2` of `/proc` is `Unsupported` for the same errnos as a refused `pidfd_open`: a
-/// filter or LSM picks the errno, not the syscall. Mutant: "the view keeps its own narrower errno
-/// set".
+/// A refused `openat2` of `/proc` is `Unsupported` for `ENOSYS`, `EPERM` and `ENODEV`, carrying the
+/// errno as its source. Mutant: "the view keeps its own errno set", or "the source is dropped".
 #[skuld::test]
-fn a_refused_openat2_is_unsupported_for_the_errnos_a_refused_pidfd_open_is() {
-    use crate::identity::{FailedCall, ViewUnreadable};
+fn a_refused_openat2_is_unsupported_carrying_the_errno() {
+    use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};
 
-    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+    for (errno, name) in OPENAT2_REFUSALS {
+        let errno = Errno::from_raw_os_error(errno);
         let call = FailedCall::openat2(errno);
-        assert_eq!(call.refusal(), FailedCall::pidfd_open(errno).refusal(), "{errno}");
-        let name = call.refusal().unwrap_or_else(|| panic!("{errno} refuses openat2"));
+        assert_eq!(call.refusal(), Some(name), "{errno}");
         let want = format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {name}");
         assert_eq!(call.requirement().as_deref(), Some(want.as_str()), "{errno}");
 
         let view = ViewUnreadable::from_open_errno(errno);
         assert_eq!(view.openat2_requirement().as_deref(), Some(want.as_str()), "{errno}");
-        match view.unsupported("identifying pid 4242") {
-            Some(Error::Unsupported { detail, .. }) => assert_eq!(detail, want, "{errno}"),
+        let refused = view
+            .unsupported("identifying pid 4242")
+            .unwrap_or_else(|| panic!("{errno} refuses openat2"));
+        match &refused {
+            Error::Unsupported { detail, .. } => assert_eq!(detail, &want, "{errno}"),
             other => panic!("{errno}: expected Unsupported, got {other:?}"),
         }
-    }
-    // The call's own failure is not a refusal.
-    for errno in [Errno::MFILE, Errno::NFILE, Errno::NOENT] {
-        assert!(FailedCall::openat2(errno).refusal().is_none(), "{errno}");
-        assert!(
-            ViewUnreadable::from_open_errno(errno).unsupported("op").is_none(),
-            "{errno}"
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(errno.raw_os_error()),
+            "{errno}: the errno is the source"
         );
+        let err = UnknownCause::of_view(Some(view))
+            .into_error("pid 4242")
+            .expect("the view is the cause");
+        assert!(matches!(err, Error::Unsupported { .. }), "{errno}: {err:?}");
     }
 }
 
-/// Only a failed `pidfd_open` or `openat2` is a refusal: the same errnos from the inode read or a
-/// `poll` are the call's own failure, `Unassessable` with the raw errno. Mutant: "the refusal rule
-/// ignores the call".
+/// An `openat2` of `/proc` that answers `EACCES` is the kernel refusing to open `/proc`, not a
+/// filter refusing the syscall: `Unassessable` carrying `EACCES`, never `Unsupported`. The same
+/// errno from `pidfd_open` is a refusal. Mutant: "one errno set decides both calls".
+#[skuld::test]
+fn an_openat2_that_answers_eacces_is_unassessable_carrying_eacces() {
+    use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};
+
+    assert!(FailedCall::openat2(Errno::ACCESS).refusal().is_none());
+    assert_eq!(FailedCall::pidfd_open(Errno::ACCESS).refusal(), Some("EACCES"));
+    let view = ViewUnreadable::from_open_errno(Errno::ACCESS);
+    assert!(view.unsupported("op").is_none());
+    let err = UnknownCause::of_view(Some(view))
+        .into_error("pid 4242")
+        .expect("the view is the cause");
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(err.raw_os_error(), Some(Errno::ACCESS.raw_os_error()));
+}
+
+/// Each call is refused for its own errnos and no others: `pidfd_open` and `openat2` by the
+/// shared tables, `pidfs_ino` and `poll` never. A call that is not refused is its own failure,
+/// `Unassessable` carrying the raw errno. Mutant: "the refusal rule ignores the call".
 #[skuld::test]
 fn only_a_failed_pidfd_open_or_openat2_is_a_refusal() {
     use crate::identity::{FailedCall, UnknownCause};
 
-    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+    let in_table = |table: &[(i32, &str)], errno: Errno| table.iter().any(|(e, _)| *e == errno.raw_os_error());
+    for errno in [
+        Errno::PERM,
+        Errno::NOSYS,
+        Errno::ACCESS,
+        Errno::NODEV,
+        Errno::MFILE,
+        Errno::NFILE,
+        Errno::BADF,
+    ] {
+        assert_eq!(
+            FailedCall::pidfd_open(errno).refusal().is_some(),
+            in_table(&PIDFD_OPEN_REFUSALS, errno),
+            "pidfd_open {errno}"
+        );
+        assert_eq!(
+            FailedCall::openat2(errno).refusal().is_some(),
+            in_table(&OPENAT2_REFUSALS, errno),
+            "openat2 {errno}"
+        );
+
         let (fd, _writer) = unreadable();
         let kernel = FakeKernel::new()
             .on_pidfd_open(PID, Ok(fd))
             .on_pidfs_ino(PID, Err(errno));
         let (existence, cause) = id(100).exists_with(&kernel);
         assert_eq!(existence, Existence::Unknown, "pidfs_ino {errno}");
-        let causes = [
-            ("pidfs_ino", cause),
-            ("poll", UnknownCause::of_call(FailedCall::poll(errno))),
+        let calls = [
+            ("pidfs_ino", FailedCall::pidfs_ino(errno), cause),
+            (
+                "poll",
+                FailedCall::poll(errno),
+                UnknownCause::of_call(FailedCall::poll(errno)),
+            ),
         ];
-        for (call, cause) in causes {
+        for (name, call, cause) in calls {
+            assert!(call.refusal().is_none(), "{name} {errno}");
             let err = cause.into_error("pid 4242").expect("the call is the cause");
-            assert!(matches!(err, Error::Unassessable { .. }), "{call} {errno}: {err:?}");
+            assert!(matches!(err, Error::Unassessable { .. }), "{name} {errno}: {err:?}");
             assert_eq!(
                 err.raw_os_error(),
                 Some(errno.raw_os_error()),
-                "{call} {errno}: the errno is in the chain"
+                "{name} {errno}: the errno is in the chain"
             );
         }
     }

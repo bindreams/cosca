@@ -155,12 +155,8 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
     let err = cause_error_of_live_read(&kernel).expect("no openat2 is an error");
     assert_eq!(
         err.to_string(),
-        format!(
-            "identifying the spawned child is not supported on linux: {}",
-            crate::identity::FailedCall::openat2(Errno::NOSYS)
-                .requirement()
-                .expect("ENOSYS refuses openat2")
-        )
+        "identifying the spawned child is not supported on linux: cosca requires openat2 \
+         (Linux \u{2265} 5.6), refused here: openat2 answered ENOSYS"
     );
 }
 
