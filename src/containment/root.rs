@@ -108,20 +108,50 @@ pub(crate) fn check_number(root: Option<&dyn Root>) -> Result<(), NotItsGroup> {
         Ok(Some(true)) => return Ok(()),
         Ok(Some(false)) => return Err(NotItsGroup::Empty),
         Ok(None) => None,
-        Err(errno) => Some(Error::Unassessable {
-            detail: "a signal-0 send to the root's process group through its pidfd failed".to_owned(),
-            source: Some(Error::io_cause(std::io::Error::from(errno))),
-        }),
+        Err(errno) => Some(errno),
     };
     #[cfg(not(target_os = "linux"))]
-    let probe: Option<Error> = None;
+    let probe: Option<nix::errno::Errno> = None;
     match root {
-        Some(root) => number_holds(root.pid(), root.state()).map_err(|refusal| NotItsGroup::unproven(refusal, probe)),
+        Some(root) => match number_holds(root.pid(), root.state()) {
+            Ok(()) => {
+                if let Some(errno) = probe {
+                    log_failed_probe(errno, "the root's state decides, and it holds");
+                }
+                Ok(())
+            }
+            Err(refusal) => Err(NotItsGroup::unproven(refusal, probe.map(probe_error))),
+        },
         None => {
             debug_assert!(false, "a send by the root's number was given no root to check");
             Err(NotItsGroup::NoRoot)
         }
     }
+}
+
+/// The error of a group probe through the root's pidfd that failed with `errno`.
+#[cfg(unix)]
+fn probe_error(errno: nix::errno::Errno) -> Error {
+    Error::Unassessable {
+        detail: "a signal-0 send to the root's process group through its pidfd failed".to_owned(),
+        source: Some(Error::io_cause(std::io::Error::from(errno))),
+    }
+}
+
+/// The one debug line for a group probe that failed with `errno` and did not decide the answer;
+/// `then` says what did.
+#[cfg(unix)]
+fn log_failed_probe(errno: nix::errno::Errno, then: &str) {
+    log::debug!(
+        "a signal-0 send to a process group through its root's pidfd answered {report}, so {then}",
+        report = crate::error::Report(&errno)
+    );
+}
+
+/// `refusal`'s causes with the error of the failed group probe `probe` after them.
+#[cfg(unix)]
+fn causes_with_probe(refusal: &Refusal, probe: Error) -> std::sync::Arc<Error> {
+    Error::joined_cause(refusal.cause(), [std::sync::Arc::new(probe)])
 }
 
 /// Why the root's pid may not be taken to name the root's group: what the root's own handle and the
@@ -227,8 +257,14 @@ pub(crate) enum NumberLook {
     /// group-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
     Empty,
     /// The pid may name another process, for `refusal`'s reason. `exact_root` (Linux): the root's
-    /// handle still reaches the root exactly, if it reaches it at all.
-    MayNameAnother { refusal: Refusal, exact_root: bool },
+    /// handle still reaches the root exactly, if it reaches it at all. `causes` (Linux 6.9+): the
+    /// causes of the refusal when a failed group probe adds its error to the refusal's own
+    /// ([`NotItsGroup::Unproven`]'s second field); `None` leaves the refusal's own.
+    MayNameAnother {
+        refusal: Refusal,
+        exact_root: bool,
+        causes: Option<std::sync::Arc<Error>>,
+    },
     /// Linux 6.9+: the root is reaped, and its pidfd shows its group has no member left, so there is
     /// no tree to signal and nothing is sent.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has a pidfd"))]
@@ -261,6 +297,7 @@ pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
             NumberLook::MayNameAnother {
                 refusal,
                 exact_root: handle_unsure && cfg!(target_os = "linux"),
+                causes: None,
             }
         }
     }
@@ -274,26 +311,33 @@ pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
 /// kernel that cannot say.
 #[cfg(target_os = "linux")]
 pub(crate) fn through_the_pidfd(look: NumberLook, root: &dyn Root) -> NumberLook {
-    let NumberLook::MayNameAnother { refusal, exact_root } = &look else {
+    let NumberLook::MayNameAnother {
+        refusal,
+        exact_root,
+        causes,
+    } = look
+    else {
         return look;
     };
-    match group_has_member(Some(root)) {
+    let causes = match group_has_member(Some(root)) {
         Ok(Some(true)) => {
             log::debug!(
                 "{refusal}, but its pidfd names its process group exactly, which still has a member: it is signalled",
-                refusal = crate::error::Report(refusal)
+                refusal = crate::error::Report(&refusal)
             );
-            NumberLook::Trusted
+            return NumberLook::Trusted;
         }
-        Ok(Some(false)) if !*exact_root => NumberLook::GroupGone,
-        Ok(_) => look,
+        Ok(Some(false)) if !exact_root => return NumberLook::GroupGone,
+        Ok(_) => causes,
         Err(errno) => {
-            log::debug!(
-                "a signal-0 send to a process group through its root's pidfd answered {report}, so the look keeps its refusal",
-                report = crate::error::Report(&errno)
-            );
-            look
+            log_failed_probe(errno, "the look keeps its refusal");
+            Some(causes_with_probe(&refusal, probe_error(errno)))
         }
+    };
+    NumberLook::MayNameAnother {
+        refusal,
+        exact_root,
+        causes,
     }
 }
 
@@ -342,11 +386,7 @@ impl NotItsGroup {
     /// [`Unproven`](NotItsGroup::Unproven) for `refusal`, with the error of the group probe that failed
     /// before it, if one did.
     pub(crate) fn unproven(refusal: Refusal, probe: Option<Error>) -> NotItsGroup {
-        let probe = probe.map(std::sync::Arc::new);
-        let causes = probe.map(|probe| match refusal.cause() {
-            Some(own) => crate::error::Failures::new(own, [probe]).into_cause(),
-            None => probe,
-        });
+        let causes = probe.map(|probe| causes_with_probe(&refusal, probe));
         NotItsGroup::Unproven(refusal, causes)
     }
 

@@ -238,7 +238,7 @@ impl DropView {
         tree: &Tree,
     ) -> DropView {
         let label = caller.label();
-        let (now, _) = crate::child::root_identity_now(root_pid);
+        let (now, unread) = crate::child::root_identity_now(root_pid);
         let state = root();
         let handle_reaped = matches!(state, RootState::Reaped { .. });
         let root = if crate::child::root_reaped(handle_reaped, id, now) {
@@ -268,13 +268,16 @@ impl DropView {
             tree_killed: tree.is_killed(),
         };
         if now.is_unknown() && !handle_reaped {
+            let why = unread
+                .into_error(&format!("pid {root_pid}"))
+                .map_or_else(String::new, |e| format!(": {}", crate::error::Report(&e)));
             if view.unsettled() {
                 log::debug!(
-                    "{label}: the root's number ({root_pid}) could not be read either; kills by that number are skipped"
+                    "{label}: the root's number ({root_pid}) could not be read either; kills by that number are skipped{why}"
                 );
             } else {
                 log::debug!(
-                    "{label}: the root's number ({root_pid}) could not be read; treating the root as not reaped"
+                    "{label}: the root's number ({root_pid}) could not be read; treating the root as not reaped{why}"
                 );
             }
         }

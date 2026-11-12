@@ -1154,8 +1154,6 @@ pub(crate) mod fault {
     impl Drop for ForcedRootReads {
         fn drop(&mut self) {
             FORCED_ALWAYS.with(|f| f.set(None));
-            #[cfg(target_os = "linux")]
-            FORCED_CALL.with(|f| f.set(None));
         }
     }
 
@@ -1164,31 +1162,42 @@ pub(crate) mod fault {
     }
 
     /// Every read of a root's number on THIS thread answers `Unknown`, because `call` failed, until
-    /// the guard drops, after any [`force_next_root_read`].
+    /// the guard drops, after any [`force_next_root_read`] and any [`force_root_reads`] alive with
+    /// it, which it neither inherits from nor clears.
     #[cfg(target_os = "linux")]
-    pub(crate) fn force_root_reads_failing(call: crate::identity::FailedCall) -> ForcedRootReads {
-        FORCED_CALL.with(|f| f.set(Some(call)));
-        force_root_reads(Resolved::Unknown)
+    pub(crate) fn force_root_reads_failing(call: crate::identity::FailedCall) -> ForcedFailingRootReads {
+        FORCED_FAILING.with(|f| f.set(Some(call)));
+        ForcedFailingRootReads(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct ForcedFailingRootReads(());
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForcedFailingRootReads {
+        fn drop(&mut self) {
+            FORCED_FAILING.with(|f| f.set(None));
+        }
     }
 
     #[cfg(target_os = "linux")]
     thread_local! {
-        static FORCED_CALL: Cell<Option<crate::identity::FailedCall>> = const { Cell::new(None) };
+        static FORCED_FAILING: Cell<Option<crate::identity::FailedCall>> = const { Cell::new(None) };
     }
 
     pub(super) fn take_forced_root_read() -> Option<(Resolved<ProcessId>, crate::identity::UnknownCause)> {
-        FORCED
+        let read = FORCED
             .with(|f| f.take())
-            .map(|read| (read, crate::identity::UnknownCause::default()))
-            .or_else(|| {
-                FORCED_ALWAYS.with(|f| f.get()).map(|read| {
-                    #[cfg(target_os = "linux")]
-                    if let Some(call) = FORCED_CALL.with(|f| f.get()) {
-                        return (read, crate::identity::UnknownCause::of_call(call));
-                    }
-                    (read, crate::identity::UnknownCause::default())
-                })
-            })
+            .or_else(|| FORCED_ALWAYS.with(|f| f.get()))
+            .map(|read| (read, crate::identity::UnknownCause::default()));
+        #[cfg(target_os = "linux")]
+        let read = read.or_else(|| {
+            FORCED_FAILING
+                .with(|f| f.get())
+                .map(|call| (Resolved::Unknown, crate::identity::UnknownCause::of_call(call)))
+        });
+        read
     }
 }
 

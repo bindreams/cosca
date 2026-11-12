@@ -403,7 +403,11 @@ fn group_look(root: &dyn Root) -> NumberLook {
 fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
     let (why, root_alone) = match look {
         NumberLook::Untrusted(state) => (Why::untrusted(&state), false),
-        NumberLook::MayNameAnother { refusal, exact_root } => (Why::MayNameAnother(refusal), exact_root),
+        NumberLook::MayNameAnother {
+            refusal,
+            exact_root,
+            causes,
+        } => (Why::MayNameAnother(refusal, causes), exact_root),
         NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
             unreachable!("a send to a group that is not skipped has no skip to say")
         }

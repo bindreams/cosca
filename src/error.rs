@@ -814,9 +814,24 @@ impl Error {
         }
     }
 
+    /// The `source` of an error with `own`, its cause if it has one, and then `peers`, the other
+    /// failures of the same operation: the one error when that is one, else an [`Error::Several`].
+    /// A `Several` own cause is extended with the peers, not nested in a list of its own. Needs one
+    /// of them at least.
+    pub(crate) fn joined_cause(own: Option<Arc<Error>>, peers: impl IntoIterator<Item = Arc<Error>>) -> Arc<Error> {
+        let own = own.into_iter().flat_map(|own| match &*own {
+            Error::Several(list) => list.iter().cloned().collect(),
+            _ => vec![Arc::clone(&own)],
+        });
+        Failures::collect(own.chain(peers))
+            .expect("a cause or a peer")
+            .into_cause()
+    }
+
     /// This error with `peers`, the other failures of the same operation, kept: its variant and detail
     /// stay, and its `source` becomes its own cause, if it has one, then the peers, as a
-    /// [`Error::Several`] when that is two or more. A [`Error::Several`] takes them as more members.
+    /// [`Error::Several`] when that is two or more ([`joined_cause`](Error::joined_cause)). A
+    /// [`Error::Several`] takes them as more members.
     ///
     /// An [`Error::Io`], [`Error::Quote`] and [`Error::NoConsole`] are leaves with no cause to hold
     /// peers, and the members of an [`Error::MembersLeft`] are a walk's: giving any of them peers is a
@@ -827,11 +842,7 @@ impl Error {
         if peers.peek().is_none() {
             return self;
         }
-        fn joined(own: Option<Arc<Error>>, peers: impl Iterator<Item = Arc<Error>>) -> Arc<Error> {
-            Failures::collect(own.into_iter().chain(peers))
-                .expect("a peer")
-                .into_cause()
-        }
+        let joined = Error::joined_cause;
         match self {
             Error::Unsupported {
                 op,

@@ -45,10 +45,10 @@ fn a_skip_over_an_unsure_handle_answers_with_its_error_as_the_source() {
         signal: TreeSignal::Term,
         earlier: None,
     };
-    let why = Why::MayNameAnother(Refusal::Unsure(
-        PID,
-        std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM)),
-    ));
+    let why = Why::MayNameAnother(
+        Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+        None,
+    );
 
     let answer = call
         .answer(&killed(false), skip(why), None)
@@ -76,10 +76,10 @@ fn a_sweep_that_skipped_has_the_handles_error_as_its_source_unless_the_holders_f
 
     let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
     let why = || {
-        Why::MayNameAnother(Refusal::Unsure(
-            PID,
-            std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM)),
-        ))
+        Why::MayNameAnother(
+            Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+            None,
+        )
     };
 
     let answer = skip(why()).sweep_error();
@@ -119,31 +119,31 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
     let whys: [Case; 6] = [
         (
             "own reap, pid gone",
-            || Why::MayNameAnother(Refusal::ReapedPidGone(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidGone(PID), None),
             true,
         ),
         (
             "own reap, pid unread",
-            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID, None)),
+            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID, None), None),
             true,
         ),
         (
             "own reap, pid taken",
-            || Why::MayNameAnother(Refusal::ReapedPidTaken(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidTaken(PID), None),
             false,
         ),
         (
             "reaped elsewhere",
-            || Why::MayNameAnother(Refusal::ReapedElsewhere(PID)),
+            || Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None),
             false,
         ),
         (
             "handle could not say",
             || {
-                Why::MayNameAnother(Refusal::Unsure(
-                    PID,
-                    std::sync::Arc::new(std::io::Error::other("forced")),
-                ))
+                Why::MayNameAnother(
+                    Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::other("forced"))),
+                    None,
+                )
             },
             false,
         ),
@@ -166,10 +166,10 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
 
 /// A skip whose reason holds an error with the code `code`.
 fn unsure(code: i32) -> Why {
-    Why::MayNameAnother(Refusal::Unsure(
-        PID,
-        std::sync::Arc::new(std::io::Error::from_raw_os_error(code)),
-    ))
+    Why::MayNameAnother(
+        Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(code))),
+        None,
+    )
 }
 
 fn term_call(op: &'static str) -> super::SkipCall<'static> {
@@ -268,7 +268,7 @@ fn a_skipped_calls_io_failure_goes_below_the_unassessable_after_the_reason() {
     let alone = term_call("skip_peers_probe_a4")
         .answer(
             &killed(false),
-            skip(Why::MayNameAnother(Refusal::ReapedElsewhere(PID))),
+            skip(Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None)),
             Some(Err(eperm())),
         )
         .answer

@@ -1161,7 +1161,7 @@ impl Marker {
     fn skip(&self, verb: &str, root_pid: u32, look: NumberLook, holders: Result<(), Error>) -> Skip {
         let why = match look {
             NumberLook::Untrusted(state) => Why::untrusted(&state),
-            NumberLook::MayNameAnother { refusal, .. } => Why::MayNameAnother(refusal),
+            NumberLook::MayNameAnother { refusal, causes, .. } => Why::MayNameAnother(refusal, causes),
             NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
                 unreachable!("a send that is not skipped has no skip to say")
             }

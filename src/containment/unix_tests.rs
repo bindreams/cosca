@@ -323,12 +323,12 @@ mod group_kill_and_terminate {
         );
         assert!(skip.holders.is_none(), "a group has no holders: {root:?}");
         match (&skip.why, root) {
-            (Why::MayNameAnother(Refusal::ReapedElsewhere(_)), Root::ReapedElsewhere)
-            | (Why::MayNameAnother(Refusal::ReapedPidGone(_)), Root::OwnReapGone)
-            | (Why::MayNameAnother(Refusal::ReapedPidUnread(..)), Root::OwnReapUnreadable) => {
+            (Why::MayNameAnother(Refusal::ReapedElsewhere(_), _), Root::ReapedElsewhere)
+            | (Why::MayNameAnother(Refusal::ReapedPidGone(_), _), Root::OwnReapGone)
+            | (Why::MayNameAnother(Refusal::ReapedPidUnread(..), _), Root::OwnReapUnreadable) => {
                 assert!(!skip.root_alone, "{root:?}");
             }
-            (Why::MayNameAnother(Refusal::Unsure(..)), Root::Unknown) => {
+            (Why::MayNameAnother(Refusal::Unsure(..), _), Root::Unknown) => {
                 assert_eq!(skip.root_alone, cfg!(target_os = "linux"), "{root:?}");
             }
             // macOS trusts no number its root's handle cannot answer for.
