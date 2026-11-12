@@ -5,11 +5,16 @@
 //! A target's reply cannot show that no break was sent: its handler thread may not have run yet.
 //! The proof is the sender's own record, empty after each op ([`assert_no_break_sent`]): with no
 //! console `GenerateConsoleCtrlEvent` fails at the syscall, so each op reports `NoConsole`. The
-//! members ignore every event, so nothing else would reveal a break sent anyway.
+//! members are GUI-subsystem images ([`spawn_consoleless_root`]), which no break reaches, so
+//! nothing else would reveal a break sent anyway.
+//!
+//! A console-subsystem member would open a visible console window (its parent has none);
+//! `CREATE_NO_WINDOW` would hide it but move the member out of the caller's console group, changing
+//! the asserted mechanism from `ConsoleGroup` to `OtherConsoleGroup`.
 
 use std::time::Duration;
 
-use super::{assert_no_break_sent, connect_reporter, kill_release_reap, report_done, spawn_ignoring_root};
+use super::{assert_no_break_sent, connect_reporter, kill_release_reap, report_done, spawn_consoleless_root};
 use crate::error::Error;
 use crate::identity::Liveness;
 use crate::{Containment, GracefulMechanism};
@@ -53,7 +58,7 @@ fn fixture_console_less_reporter() {
     assert_no_console();
 
     // The tree ops.
-    let (child, sock) = spawn_ignoring_root();
+    let (child, sock) = spawn_consoleless_root();
     assert_eq!(child.containment(), Containment::JobObject);
     assert!(
         matches!(child.terminate_tree(), Err(Error::NoConsole { .. })),
@@ -81,7 +86,7 @@ fn fixture_console_less_reporter() {
     kill_release_reap(&child, sock, true);
 
     // The lone ops. The child's own flags do not exclude delivery; it is the caller that cannot send.
-    let (child, sock) = spawn_ignoring_root();
+    let (child, sock) = spawn_consoleless_root();
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert!(
         matches!(child.terminate(), Err(Error::NoConsole { .. })),
