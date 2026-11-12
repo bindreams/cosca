@@ -12,23 +12,25 @@ use cosca::error::Error;
 mod common;
 
 #[cfg(target_os = "linux")]
-const REFUSALS: [(i32, &str); 4] = [
-    (libc::EPERM, "EPERM"),
-    (libc::EACCES, "EACCES"),
-    (libc::ENODEV, "ENODEV"),
-    (libc::ENOSYS, "ENOSYS"),
-];
+use common::seccomp::PIDFD_OPEN_REFUSALS as REFUSALS;
 
 #[cfg(target_os = "linux")]
-fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: &str) {
+fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, (code, errno): (i32, &str)) {
     match result {
-        Err(e @ Error::Unsupported { .. }) => assert_eq!(
-            e.to_string(),
-            format!(
-                "{op} is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
-                 refused here: pidfd_open answered {errno}"
-            )
-        ),
+        Err(e @ Error::Unsupported { .. }) => {
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{op} is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+                     refused here: pidfd_open answered {errno}"
+                )
+            );
+            assert_eq!(
+                common::os_code(&e),
+                Some(code),
+                "{op} under {errno}: the errno is the source"
+            );
+        }
         other => panic!("{op} under a pidfd_open answering {errno} must be Unsupported, got {other:?}"),
     }
 }
@@ -46,13 +48,13 @@ fn a_seccomp_refused_pidfd_open_fails_the_open_naming_process_open() {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(cosca::Process::open_pid(child.pid()), "process open", name);
+                    assert_refused(cosca::Process::open_pid(child.pid()), "process open", (code, name));
                     assert_refused(
                         cosca::Process::open(child.id().expect("the spawn read the child's identity")),
                         "process open",
-                        name,
+                        (code, name),
                     );
-                    assert_refused(cosca::Process::current(), "process open", name);
+                    assert_refused(cosca::Process::current(), "process open", (code, name));
                 })
                 .join()
                 .expect("the filtered thread");
@@ -179,16 +181,16 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
                 .expect("the filtered thread")
         });
         drop(control);
-        match result {
-            Err(Error::Unsupported { op, detail, .. }) => {
-                assert!(op.starts_with("listing process group"), "{name}: {op}");
-                assert!(
-                    detail.contains(&format!("pidfd_open answered {name}")),
-                    "{name}: the group sweep names the refusal: {detail}"
-                );
-            }
-            other => panic!("{name}: expected the group sweep to be Unsupported, got {other:?}"),
-        }
+        let err = result.expect_err("a group that cannot be listed must fail");
+        let Error::Unsupported { op, detail, .. } = &err else {
+            panic!("{name}: expected the group sweep to be Unsupported, got {err:?}");
+        };
+        assert!(op.starts_with("listing process group"), "{name}: {op}");
+        assert!(
+            detail.contains(&format!("pidfd_open answered {name}")),
+            "{name}: the group sweep names the refusal: {detail}"
+        );
+        assert_eq!(common::os_code(&err), Some(code), "{name}: the errno is the source");
         let status = child.wait().expect("reap the root");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
@@ -205,13 +207,17 @@ fn a_seccomp_refused_pidfd_open_fails_the_async_open_naming_process_open() {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    assert_refused(cosca::tokio::Process::open_pid(child.pid()), "process open", name);
+                    assert_refused(
+                        cosca::tokio::Process::open_pid(child.pid()),
+                        "process open",
+                        (code, name),
+                    );
                     assert_refused(
                         cosca::tokio::Process::open(child.id().expect("the spawn read the child's identity")),
                         "process open",
-                        name,
+                        (code, name),
                     );
-                    assert_refused(cosca::tokio::Process::current(), "process open", name);
+                    assert_refused(cosca::tokio::Process::current(), "process open", (code, name));
                 })
                 .join()
                 .expect("the filtered thread");
@@ -345,7 +351,7 @@ fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
                 .join()
                 .expect("the filtered thread")
         });
-        assert_refused(result, "spawn", name);
+        assert_refused(result, "spawn", (code, name));
     }
 }
 
@@ -384,7 +390,7 @@ fn assert_refusal_found_before_any_fork<C: Send, T: std::fmt::Debug + Send>(
             .join()
             .expect("the filtered thread")
     });
-    assert_refused(result, "spawn", name);
+    assert_refused(result, "spawn", (code, name));
     assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
     drop(cmd);
     let mut out = String::new();

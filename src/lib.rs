@@ -7,7 +7,8 @@
 //!
 //! # Platform requirements
 //!
-//! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
+//! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile or an
+//! LSM.
 //!
 //! Each requirement comes from a different syscall:
 //!
@@ -28,8 +29,9 @@
 //!   pidfd and not its pid. The one by-pid wait is std's own, inside a spawn that fails after the
 //!   fork.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's start time and to list processes. Before
-//!   Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
+//!   checked `/proc` view uses it to read a process's start time and to list processes. It is
+//!   refused with `ENOSYS`, `EPERM` or `ENODEV` (see [`Error::Unsupported`](error::Error::Unsupported)).
+//!   Before Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
 //!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. On 6.9+ a by-pid identity read, an open and a spawn need no view; listing a

@@ -38,6 +38,9 @@ too (the spawn is the sync one). Exactly these of its blocking waits for somethi
 once past 1 s, as the drop's does, each naming what it waits for:
 
 - the wait for the root, once the spawn has a child handle;
+- on macOS, the wait for the root of a child whose unique id arrived only after the spawn returned,
+  where the spawn holds a std `Child` but no cosca handle (`kill_and_reap_unreported` in
+  [`spawn.rs`](../src/child/spawn.rs), through `await_exit_warning`);
 - on Linux, the waits for a child it killed in the pidfd handshake
   ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
   leaf's abandonment, which tears the child down through the pidfd the handshake left it
