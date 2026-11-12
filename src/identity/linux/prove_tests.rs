@@ -109,7 +109,6 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
     for (errno, name) in OPENAT2_REFUSALS {
         let errno = Errno::from_raw_os_error(errno);
         let call = FailedCall::openat2(errno);
-        assert_eq!(call.refusal(), Some(name), "{errno}");
         let want = format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {name}");
         assert_eq!(call.requirement().as_deref(), Some(want.as_str()), "{errno}");
 
@@ -141,8 +140,8 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
 fn an_openat2_that_answers_eacces_is_unassessable_carrying_eacces() {
     use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};
 
-    assert!(FailedCall::openat2(Errno::ACCESS).refusal().is_none());
-    assert_eq!(FailedCall::pidfd_open(Errno::ACCESS).refusal(), Some("EACCES"));
+    assert!(FailedCall::openat2(Errno::ACCESS).requirement().is_none());
+    assert!(FailedCall::pidfd_open(Errno::ACCESS).requirement().is_some());
     let view = ViewUnreadable::from_open_errno(Errno::ACCESS);
     assert!(view.unsupported("op").is_none());
     let err = UnknownCause::of_view(Some(view))
@@ -170,12 +169,12 @@ fn only_a_failed_pidfd_open_or_openat2_is_a_refusal() {
         Errno::BADF,
     ] {
         assert_eq!(
-            FailedCall::pidfd_open(errno).refusal().is_some(),
+            FailedCall::pidfd_open(errno).requirement().is_some(),
             in_table(&PIDFD_OPEN_REFUSALS, errno),
             "pidfd_open {errno}"
         );
         assert_eq!(
-            FailedCall::openat2(errno).refusal().is_some(),
+            FailedCall::openat2(errno).requirement().is_some(),
             in_table(&OPENAT2_REFUSALS, errno),
             "openat2 {errno}"
         );
@@ -195,7 +194,7 @@ fn only_a_failed_pidfd_open_or_openat2_is_a_refusal() {
             ),
         ];
         for (name, call, cause) in calls {
-            assert!(call.refusal().is_none(), "{name} {errno}");
+            assert!(call.requirement().is_none(), "{name} {errno}");
             let err = cause.into_error("pid 4242").expect("the call is the cause");
             assert!(matches!(err, Error::Unassessable { .. }), "{name} {errno}: {err:?}");
             assert_eq!(

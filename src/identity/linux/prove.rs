@@ -75,13 +75,16 @@ impl FailedCall {
         self.errno
     }
 
-    /// The kernel floor and the errno's name, if this call is a refusal: a `pidfd_open` or `openat2`
-    /// answered as documented on [`Error::Unsupported`](crate::error::Error::Unsupported). A refusal
-    /// is an errno only a filter or LSM can produce for that call, so each call has its own set:
-    /// `EACCES` is also the kernel's own answer to an `openat2` of a `/proc` that may not be opened.
-    /// No other call is refused; its failure, with any errno, is its own.
-    fn refusal_of(&self) -> Option<(&'static str, &'static str)> {
-        let (floor, name) = match (self.call, self.errno) {
+    /// What cosca requires of the kernel, when this call is a refusal: the one sentence an
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a refused call carries as its
+    /// `detail`.
+    ///
+    /// A refusal is a `pidfd_open` or `openat2` that answered an errno only a filter or LSM can
+    /// produce for that call, as documented on `Error::Unsupported`; each call has its own set and
+    /// its kernel floor. `EACCES` is also the kernel's own answer to an `openat2` of a `/proc` that
+    /// may not be opened. No other call is refused; its failure, with any errno, is its own.
+    pub(crate) fn requirement(&self) -> Option<String> {
+        let (floor, errno) = match (self.call, self.errno) {
             (Call::PidfdOpen, Errno::NOSYS) => ("5.3", "ENOSYS"),
             (Call::PidfdOpen, Errno::PERM) => ("5.3", "EPERM"),
             (Call::PidfdOpen, Errno::ACCESS) => ("5.3", "EACCES"),
@@ -91,19 +94,6 @@ impl FailedCall {
             (Call::Openat2, Errno::NODEV) => ("5.6", "ENODEV"),
             _ => return None,
         };
-        Some((floor, name))
-    }
-
-    /// The name of the errno if this call is a refusal.
-    pub(crate) fn refusal(&self) -> Option<&'static str> {
-        self.refusal_of().map(|(_, name)| name)
-    }
-
-    /// What cosca requires of the kernel, when this call is a refusal: the one sentence an
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a refused call carries as its
-    /// `detail`.
-    pub(crate) fn requirement(&self) -> Option<String> {
-        let (floor, errno) = self.refusal_of()?;
         let name = self.name();
         Some(format!(
             "cosca requires {name} (Linux \u{2265} {floor}), refused here: {name} answered {errno}"

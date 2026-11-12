@@ -149,7 +149,7 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 /// membership.
 ///
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. Without
-/// `openat2` (Linux < 5.6, or seccomp) no view can be checked: `ErrorKind::Unsupported`. A `stat`
+/// `openat2` (Linux < 5.6, or a seccomp or LSM refusal) no view can be checked: `ErrorKind::Unsupported`. A `stat`
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
 /// (`EACCES`, or `EPERM` while the checked directory still answers). A member whose pidfd cannot
 /// be opened fails the listing too (`ErrorKind::Unsupported` for a refused `pidfd_open`, `Other`
@@ -164,9 +164,10 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         crate::identity::proc_view_with(kernel)
             .into_dir()
             .map_err(|why| match why.openat2_requirement() {
-                Some(requirement) => std::io::Error::new(
+                Some(requirement) => listing_error(
                     std::io::ErrorKind::Unsupported,
                     format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
+                    why.source.map(Into::into),
                 ),
                 None => std::io::Error::other(format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
@@ -224,14 +225,14 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                 Some(why) => {
                     // A refusal stays `Unsupported`, as the `openat2` arm above, so the caller
                     // reports the platform's `Unsupported` and not an unassessable group.
-                    let kind = match why {
-                        crate::error::Error::Unsupported { .. } => std::io::ErrorKind::Unsupported,
-                        _ => std::io::ErrorKind::Other,
-                    };
-                    return Err(std::io::Error::new(
-                        kind,
-                        format!("containment::unix::group::members: {why}, so process group {pgid} cannot be listed"),
-                    ));
+                    let message =
+                        format!("containment::unix::group::members: {why}, so process group {pgid} cannot be listed");
+                    return Err(match why {
+                        crate::error::Error::Unsupported { source, .. } => {
+                            listing_error(std::io::ErrorKind::Unsupported, message, source.map(Into::into))
+                        }
+                        _ => std::io::Error::other(message),
+                    });
                 }
                 None => {
                     log::debug!(
@@ -249,6 +250,33 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         out.push(Member { id, system: false });
     }
     Ok(out)
+}
+
+/// A listing failure of `kind` that says `message` and keeps `cause`, the refusal's errno, as its
+/// [`source`](std::error::Error::source): [`Error::Unsupported`](crate::error::Error::Unsupported)
+/// from a refused call carries it.
+#[cfg(target_os = "linux")]
+fn listing_error(
+    kind: std::io::ErrorKind,
+    message: String,
+    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+) -> std::io::Error {
+    #[derive(Debug)]
+    struct Listing {
+        message: String,
+        cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+    impl std::fmt::Display for Listing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+    impl std::error::Error for Listing {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause.as_deref().map(|cause| cause as _)
+        }
+    }
+    std::io::Error::new(kind, Listing { message, cause })
 }
 
 /// Other Unix: the crate supports Linux, macOS and Windows (see
