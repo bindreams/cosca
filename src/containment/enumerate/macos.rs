@@ -248,8 +248,12 @@ fn collect_pids(
 fn allocate_pids(cap: usize) -> std::io::Result<Vec<libc::c_int>> {
     size_argument_for(cap)?;
     let mut pids: Vec<libc::c_int> = Vec::new();
-    pids.try_reserve_exact(cap)
-        .map_err(|e| std::io::Error::other(format!("a {cap}-pid buffer could not be allocated: {e}")))?;
+    pids.try_reserve_exact(cap).map_err(|e| {
+        crate::error::io_context(
+            format!("a {cap}-pid buffer could not be allocated"),
+            std::io::Error::from(e),
+        )
+    })?;
     pids.resize(cap, 0);
     Ok(pids)
 }
@@ -352,10 +356,10 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
     }
     let mut edges = Vec::new();
     edges.try_reserve_exact(pids.len()).map_err(|e| {
-        std::io::Error::other(format!(
-            "an edge buffer for {} pids could not be allocated: {e}",
-            pids.len()
-        ))
+        crate::error::io_context(
+            format!("an edge buffer for {} pids could not be allocated", pids.len()),
+            std::io::Error::from(e),
+        )
     })?;
     let mut denied = 0usize;
     let mut sample = Vec::new();
@@ -380,20 +384,20 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
 /// edges, and a walk over them would skip it. [`snapshot`] applies its own policy to the same denial.
 pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let raw = try_all_pids().map_err(|e| {
-        let detail = format!("the process snapshot could not be taken: proc_listallpids failed ({e})");
-        log::warn!("enumerate::process_parents: {detail}");
-        Error::Unassessable {
-            detail,
+        let error = Error::Unassessable {
+            detail: "the process snapshot could not be taken: proc_listallpids failed".to_owned(),
             source: Some(Error::io_cause(e)),
-        }
+        };
+        log::warn!("enumerate::process_parents: {}", crate::error::Report(&error));
+        error
     })?;
     let (edges, denied, sample) = join_edges(&raw).map_err(|e| {
-        let detail = format!("the process snapshot could not be taken: {e}");
-        log::warn!("enumerate::process_parents: {detail}");
-        Error::Unassessable {
-            detail,
+        let error = Error::Unassessable {
+            detail: "the process snapshot could not be taken".to_owned(),
             source: Some(Error::io_cause(e)),
-        }
+        };
+        log::warn!("enumerate::process_parents: {}", crate::error::Report(&error));
+        error
     })?;
     if denied > 0 {
         let detail = format!(

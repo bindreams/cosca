@@ -1,5 +1,6 @@
-use crate::error::{chain, ChildFate, Error, QuoteError, QuoteErrorKind, Report};
+use crate::error::{chain, first_os_code, ChildFate, Error, QuoteError, QuoteErrorKind, Report};
 use crate::test_child::over_fake::exited_unreaped;
+use std::sync::Arc;
 
 #[skuld::test]
 fn containment_error_displays_detail() {
@@ -151,7 +152,7 @@ fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
 fn unassessable_reads_as_a_refusal_not_a_failure() {
     let e = crate::error::Error::Unassessable {
         detail: "pid 4 could not be opened".into(),
-        source: Some(Box::new(Error::Io(std::io::Error::from(
+        source: Some(Arc::new(Error::Io(std::io::Error::from(
             std::io::ErrorKind::PermissionDenied,
         )))),
     };
@@ -189,49 +190,102 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
-/// `Error::raw_os_error` finds the OS code of an `Error::Io` wherever the walk from it first meets
-/// one: on the `io::Error` itself, or below the context and the note cosca added. Any other variant
-/// has none.
+/// Mutant: the hand-out is rebuilt from the code or from the text, so the words or the code are lost.
 #[skuld::test]
-fn raw_os_error_walks_an_error_io_to_the_first_os_code() {
+fn a_shared_io_context_cause_reports_as_the_original_and_keeps_its_code() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let shared = Arc::new(crate::error::io_context("w", std::io::Error::from_raw_os_error(code)));
+
+    let handed = crate::error::shared_io(&shared);
+
+    assert_eq!(Report(&handed).to_string(), Report(&*shared).to_string());
+    assert_eq!(first_os_code(&handed), Some(code));
+    assert_eq!(handed.kind(), shared.kind());
+}
+
+/// Mutant: the hand-out wraps the bare error, so its own `raw_os_error()` is `None`.
+#[skuld::test]
+fn a_shared_bare_os_error_is_handed_out_with_its_raw_code() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let shared = Arc::new(std::io::Error::from_raw_os_error(code));
+
+    let handed = crate::error::shared_io(&shared);
+
+    assert_eq!(handed.raw_os_error(), Some(code));
+    assert_eq!(handed.kind(), shared.kind());
+}
+
+/// Mutant: the hand-out takes the words off the end of the original's text.
+#[skuld::test]
+fn a_shared_wrapped_io_error_reports_as_the_original() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || std::io::Error::from_raw_os_error(code);
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "ran out");
+    let ctx = crate::error::io_context;
+    let note = |e: std::io::Error| Error::Io(e).with_note("n").into_io();
+    let originals = [
+        ("a note", note(os()), Some(code)),
+        ("a context and a note", note(ctx("w", os())), Some(code)),
+        ("two contexts", ctx("outer", ctx("w", os())), Some(code)),
+        ("a note and a context", ctx("w", note(os())), Some(code)),
+        ("two notes", note(note(os())), Some(code)),
+        ("no code, plain", timed_out(), None),
+        ("no code, a context", ctx("w", timed_out()), None),
+        ("no code, a note", note(timed_out()), None),
+    ];
+    for (what, original, expected) in originals {
+        let shared = Arc::new(original);
+
+        let handed = crate::error::shared_io(&shared);
+
+        assert_eq!(Report(&handed).to_string(), Report(&*shared).to_string(), "{what}");
+        assert_eq!(first_os_code(&handed), expected, "{what}");
+        assert_eq!(handed.kind(), shared.kind(), "{what}");
+    }
+}
+
+/// `first_os_code` finds the OS code of an `Error::Io` wherever the walk from it first meets one: on
+/// the `io::Error` itself, or below the context and the note cosca added. Any other variant has
+/// none.
+#[skuld::test]
+fn first_os_code_walks_an_error_io_to_the_first_os_code() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let os = || std::io::Error::from_raw_os_error(code);
     let context = || crate::error::io_context("pidfd_open", os());
 
-    assert_eq!(Error::Io(os()).raw_os_error(), Some(code), "bare");
-    assert_eq!(Error::Io(context()).raw_os_error(), Some(code), "io_context");
+    assert_eq!(first_os_code(&Error::Io(os())), Some(code), "bare");
+    assert_eq!(first_os_code(&Error::Io(context())), Some(code), "io_context");
     assert_eq!(
-        Error::Io(os()).with_note("while tearing down").raw_os_error(),
+        first_os_code(&Error::Io(os()).with_note("while tearing down")),
         Some(code),
         "a note"
     );
     assert_eq!(
-        Error::Io(context()).with_note("while tearing down").raw_os_error(),
+        first_os_code(&Error::Io(context()).with_note("while tearing down")),
         Some(code),
         "io_context and a note"
     );
     assert_eq!(
-        Error::Io(std::io::Error::other("no code")).raw_os_error(),
+        first_os_code(&Error::Io(std::io::Error::other("no code"))),
         None,
         "no code anywhere"
     );
     assert_eq!(
-        Error::Containment {
+        first_os_code(&Error::Containment {
             detail: "d".into(),
             source: None
-        }
-        .raw_os_error(),
+        }),
         None,
         "a variant with no cause"
     );
 }
 
 #[skuld::test]
-fn raw_os_error_walks_the_chain_of_any_variant() {
+fn first_os_code_walks_the_chain_of_any_variant() {
     let code = if cfg!(windows) { 5 } else { 13 };
-    let os = || Box::new(Error::Io(std::io::Error::from_raw_os_error(code)));
+    let os = || Arc::new(Error::Io(std::io::Error::from_raw_os_error(code)));
     let context = || {
-        Box::new(Error::Io(crate::error::io_context(
+        Arc::new(Error::Io(crate::error::io_context(
             "pidfd_open",
             std::io::Error::from_raw_os_error(code),
         )))
@@ -241,14 +295,14 @@ fn raw_os_error_walks_the_chain_of_any_variant() {
         detail: "d".into(),
         source: Some(os()),
     };
-    assert_eq!(unassessable.raw_os_error(), Some(code), "Unassessable");
+    assert_eq!(first_os_code(&unassessable), Some(code), "Unassessable");
     let leader = Error::NotThreadGroupLeader {
         pid: 1,
         detail: "d".into(),
         source: context(),
     };
     assert_eq!(
-        leader.raw_os_error(),
+        first_os_code(&leader),
         Some(code),
         "NotThreadGroupLeader, under io_context"
     );
@@ -257,39 +311,39 @@ fn raw_os_error_walks_the_chain_of_any_variant() {
         detail: "d".into(),
         source: Some(os()),
     };
-    assert_eq!(record.raw_os_error(), Some(code), "IdentityRecord");
+    assert_eq!(first_os_code(&record), Some(code), "IdentityRecord");
     let containment = Error::Containment {
         detail: "d".into(),
         source: Some(os()),
     };
-    assert_eq!(containment.raw_os_error(), Some(code), "Containment");
+    assert_eq!(first_os_code(&containment), Some(code), "Containment");
     let unsupported = Error::Unsupported {
         op: "op".into(),
         platform: "p",
         detail: "d".into(),
         source: Some(os()),
     };
-    assert_eq!(unsupported.raw_os_error(), Some(code), "Unsupported");
+    assert_eq!(first_os_code(&unsupported), Some(code), "Unsupported");
     let elevation = Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "d".into(),
         source: Some(os()),
     };
-    assert_eq!(elevation.raw_os_error(), Some(code), "Elevation");
+    assert_eq!(first_os_code(&elevation), Some(code), "Elevation");
     let member = Error::MemberNotKilled {
         pid: 1,
-        source: Box::new(Error::Unassessable {
+        source: Arc::new(Error::Unassessable {
             detail: "d".into(),
             source: Some(os()),
         }),
         note: None,
     };
-    assert_eq!(member.raw_os_error(), Some(code), "through two boxed causes");
+    assert_eq!(first_os_code(&member), Some(code), "through two causes");
     let no_code = Error::Unassessable {
         detail: "d".into(),
-        source: Some(Box::new(Error::Io(std::io::Error::other("no code")))),
+        source: Some(Arc::new(Error::Io(std::io::Error::other("no code")))),
     };
-    assert_eq!(no_code.raw_os_error(), None, "no code anywhere");
+    assert_eq!(first_os_code(&no_code), None, "no code anywhere");
 }
 
 /// Where the OS code sits below an `Error::Io`: its own `source()` is the wrapper cosca added, which
@@ -332,7 +386,7 @@ fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
     let leader = Error::NotThreadGroupLeader {
         pid: 1,
         detail: "d".into(),
-        source: Box::new(Error::Io(os())),
+        source: Arc::new(Error::Io(os())),
     };
     assert!(
         chain(&leader).any(|layer| layer.is::<std::io::Error>()),
@@ -341,7 +395,7 @@ fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
     assert_eq!(codes_down(&leader), [Some(code)]);
     let member = Error::MemberNotKilled {
         pid: 1,
-        source: Box::new(Error::Io(os())),
+        source: Arc::new(Error::Io(os())),
         note: None,
     };
     assert_eq!(codes_down(&member), [Some(code)]);
@@ -359,12 +413,12 @@ fn io_errors_of_any_variant_lists_the_io_errors_of_its_chain() {
 fn with_note_keeps_each_variant_and_appends() {
     use crate::error::{ElevationErrorKind, RecordErrorKind};
     let os = || std::io::Error::from_raw_os_error(libc::EACCES);
-    let cause = || Box::new(Error::Io(os()));
+    let cause = || Arc::new(Error::Io(os()));
     let note = "left running";
 
     let noted = Error::Io(os()).with_note(note);
     assert_eq!(
-        noted.raw_os_error(),
+        first_os_code(&noted),
         Some(libc::EACCES),
         "the original is below the note"
     );
@@ -384,14 +438,14 @@ fn with_note_keeps_each_variant_and_appends() {
     assert!(
         matches!(&e, Error::Unsupported { op, platform: "linux", detail, .. } if op == "op" && detail == "d; left running")
     );
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
     let e = Error::Containment {
         detail: "d".into(),
         source: Some(cause()),
     }
     .with_note(note);
     assert!(matches!(&e, Error::Containment { detail, .. } if detail == "d; left running"));
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
     let e = Error::NoConsole { detail: "d".into() }.with_note(note);
     assert!(matches!(&e, Error::NoConsole { detail } if detail == "d; left running"));
     let e = Error::Elevation {
@@ -404,14 +458,14 @@ fn with_note_keeps_each_variant_and_appends() {
         &e,
         Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail, .. } if detail == "d; left running"
     ));
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
     let e = Error::Unassessable {
         detail: "d".into(),
         source: Some(cause()),
     }
     .with_note(note);
     assert!(matches!(&e, Error::Unassessable { detail, .. } if detail == "d; left running"));
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
     let e = Error::NotThreadGroupLeader {
         pid: 7,
         detail: "d".into(),
@@ -419,7 +473,7 @@ fn with_note_keeps_each_variant_and_appends() {
     }
     .with_note(note);
     assert!(matches!(&e, Error::NotThreadGroupLeader { pid: 7, detail, .. } if detail == "d; left running"));
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
     let e = Error::IdentityRecord {
         kind: RecordErrorKind::ForeignPlatform,
         detail: "d".into(),
@@ -430,7 +484,7 @@ fn with_note_keeps_each_variant_and_appends() {
         &e,
         Error::IdentityRecord { kind: RecordErrorKind::ForeignPlatform, detail, .. } if detail == "d; left running"
     ));
-    assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(first_os_code(&e), Some(libc::EACCES));
 }
 
 /// A member left behind by a refused kill takes a note and keeps its OS error as the error's source:
@@ -444,7 +498,7 @@ fn with_note_keeps_each_variant_and_appends() {
 fn with_note_keeps_the_os_error_of_a_refused_kill_a_member_not_killed() {
     let refused = Error::MemberNotKilled {
         pid: 7,
-        source: Box::new(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM))),
+        source: Arc::new(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM))),
         note: None,
     }
     .with_note("front left");
@@ -459,7 +513,7 @@ fn with_note_keeps_the_os_error_of_a_refused_kill_a_member_not_killed() {
 
     let unread = Error::MemberNotKilled {
         pid: 7,
-        source: Box::new(Error::Unassessable {
+        source: Arc::new(Error::Unassessable {
             detail: "d".into(),
             source: None,
         }),
@@ -482,7 +536,7 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
         Error::MayHaveStarted {
             fate,
             wrapper_elevated,
-            source: Box::new(Error::Io(std::io::Error::other("cause"))),
+            source: Arc::new(Error::Io(std::io::Error::other("cause"))),
             unreaped: None,
         }
         .to_string()
@@ -506,7 +560,7 @@ fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
     let error = |unreaped| Error::MayHaveStarted {
         fate,
         wrapper_elevated: false,
-        source: Box::new(Error::Io(std::io::Error::other("cause"))),
+        source: Arc::new(Error::Io(std::io::Error::other("cause"))),
         unreaped,
     };
     let with_child = error(Some(exited_unreaped(id)));
@@ -523,7 +577,7 @@ fn with_note_keeps_the_unreaped_child() {
     let error = Error::MayHaveStarted {
         fate: ChildFate::Running { id: Some(id) },
         wrapper_elevated: false,
-        source: Box::new(Error::Containment {
+        source: Arc::new(Error::Containment {
             detail: "x".into(),
             source: None,
         }),

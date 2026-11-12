@@ -115,7 +115,7 @@ fn a_refusal_under_an_ok_spawn_means_the_program_did_not_start() {
     let not_adopted = adopted_id(Report::ChildRefused(libc::EPERM), 9).expect_err("no id");
     assert_eq!(not_adopted.why, Unadoptable::DiedBeforeExec);
     assert_eq!(
-        not_adopted.error.raw_os_error(),
+        crate::error::first_os_code(&not_adopted.error),
         Some(libc::EPERM),
         "the errno is the source"
     );
@@ -141,7 +141,7 @@ fn a_failed_read_is_unassessable_with_its_error_and_not_a_corpse() {
     ] {
         let not_adopted = adopted_id(failed, 7).expect_err("no id");
         assert_eq!(not_adopted.why, Unadoptable::Unverified);
-        assert_eq!(not_adopted.error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(crate::error::first_os_code(&not_adopted.error), Some(libc::EIO));
         let Error::Unassessable { detail, source } = not_adopted.error else {
             panic!("a failed read is Unassessable")
         };

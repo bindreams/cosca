@@ -668,7 +668,7 @@ fn a_host_whose_own_pidfd_cannot_be_opened_has_no_scope() {
     assert_eq!(*kind, RecordErrorKind::ScopeUnreadable);
     assert!(detail.contains("pidfd_open"), "{detail}");
     assert_eq!(
-        source.as_ref().expect("cause preserved").raw_os_error(),
+        crate::error::first_os_code(&**source.as_ref().expect("cause preserved")),
         Some(libc::EPERM)
     );
 }
@@ -698,7 +698,7 @@ fn a_host_whose_own_pidfs_ino_cannot_be_read_has_no_scope() {
         "{detail}"
     );
     assert_eq!(
-        source.as_ref().expect("cause preserved").raw_os_error(),
+        crate::error::first_os_code(&**source.as_ref().expect("cause preserved")),
         Some(libc::EBADF)
     );
 }

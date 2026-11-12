@@ -520,7 +520,7 @@ fn a_refused_creator_query_is_worded_with_its_status_in_the_walks_warn_on_window
     assert_eq!(detail, "pid 7 exists but its creator process id query failed");
     // `STATUS_INFO_LENGTH_MISMATCH` as its Win32 code, `ERROR_BAD_LENGTH`.
     assert_eq!(
-        error.raw_os_error(),
+        crate::error::first_os_code(&error),
         Some(windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32)
     );
 }
@@ -736,7 +736,7 @@ fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
                 "a refused kill is the OS's error: {source:?}"
             );
             assert_eq!(
-                source.raw_os_error(),
+                crate::error::first_os_code(&*source),
                 Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32),
                 "{source:?}"
             );
@@ -1026,7 +1026,11 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
         ("unreaped", || RootState::Unreaped, false),
         ("reaped, own", || RootState::Reaped { own: true }, false),
         ("reaped elsewhere", || RootState::Reaped { own: false }, false),
-        ("unknown", || RootState::Unknown(std::io::Error::other("forced")), true),
+        (
+            "unknown",
+            || RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced"))),
+            true,
+        ),
         ("unpinned", || RootState::Unpinned, true),
     ];
     for (name, state, untrusted) in states {
@@ -1048,4 +1052,175 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
             "terminate, {name}: {termed:?}"
         );
     }
+}
+
+/// The held member's `source` is the first report's own `Arc`.
+///
+/// Mutant: the held member copies the cause or drops the note.
+#[skuld::test]
+fn a_member_never_read_is_held_with_its_own_cause_and_note() {
+    use super::{not_killed, Left};
+    use crate::containment::dispatch::Unkilled;
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let Error::MemberNotKilled { pid, source, .. } = not_killed(
+        7,
+        Error::Unassessable {
+            detail: "pid 7 identity could not be confirmed".into(),
+            source: Some(std::sync::Arc::new(Error::Containment {
+                detail: "the middle layer".into(),
+                source: Some(Error::io_cause(std::io::Error::from_raw_os_error(code))),
+            })),
+        },
+    ) else {
+        unreachable!("`not_killed` builds a `MemberNotKilled`");
+    };
+    let member = Error::MemberNotKilled {
+        pid,
+        source: std::sync::Arc::clone(&source),
+        note: Some("a note".into()),
+    };
+    let first = Unkilled {
+        members: vec![member],
+        root: None,
+        resolved: Vec::new(),
+    };
+
+    let held = Left::of(&first);
+
+    let [Left::Unread {
+        pid: 7,
+        source: held,
+        note,
+    }] = held.as_slice()
+    else {
+        panic!("never read: {held:?}");
+    };
+    assert!(
+        std::sync::Arc::ptr_eq(held, &source),
+        "the held source is the member's own"
+    );
+    assert_eq!(note.as_deref(), Some("a note"));
+    assert_eq!(crate::error::first_os_code(&**held), Some(code), "{held:?}");
+}
+
+/// A member the walk never read, held over two later `kill_left` rounds, is reported each time as the
+/// first round reported it: the `Report` does not grow a layer per round, and a bare OS error stays an
+/// `Error::Io` with its code on the `io::Error`, where a caller matches it.
+///
+/// Each round's member is the first round's own: its `source` is the same `Arc`, and its `note` is
+/// carried.
+///
+/// Mutants: a round wraps the held cause in another layer; the held cause is rebuilt as another
+/// variant, so the code is no longer on the `Error::Io`; a round rebuilds the source from parts, so
+/// it is not the first round's; a round drops the member's note.
+#[skuld::test]
+fn a_member_never_read_is_reported_the_same_over_every_round() {
+    use super::{not_killed, with_earlier, Left};
+    use crate::containment::dispatch::Unkilled;
+    use crate::error::Report;
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let bare = || std::io::Error::from_raw_os_error(code);
+    let layered = || Error::Containment {
+        detail: "the middle layer".into(),
+        source: Some(Error::io_cause(crate::error::io_context("w", bare()))),
+    };
+    for (what, below) in [
+        ("a bare OS error", Error::Io(bare())),
+        ("layers over an OS error", layered()),
+    ] {
+        let Error::MemberNotKilled { pid, source, .. } = not_killed(
+            7,
+            Error::Unassessable {
+                detail: "pid 7 identity could not be confirmed".into(),
+                source: Some(std::sync::Arc::new(below)),
+            },
+        ) else {
+            unreachable!("`not_killed` builds a `MemberNotKilled`");
+        };
+        let note = Some("the cleanup's note".to_owned());
+        let mut round = Unkilled {
+            members: vec![Error::MemberNotKilled {
+                pid,
+                source: std::sync::Arc::clone(&source),
+                note: note.clone(),
+            }],
+            root: None,
+            resolved: Vec::new(),
+        };
+        let first = Report(&round.members[0]).to_string();
+        for n in 2..=3 {
+            let held = Left::of(&round);
+            round = with_earlier(&crate::identity::HostKernel, held, Ok(()))
+                .0
+                .expect_err("never read, so never shown killed");
+            assert_eq!(Report(&round.members[0]).to_string(), first, "{what}, round {n}");
+            let Error::MemberNotKilled {
+                source: again,
+                note: kept,
+                ..
+            } = &round.members[0]
+            else {
+                panic!("{round:?}");
+            };
+            assert!(
+                std::sync::Arc::ptr_eq(again, &source),
+                "{what}, round {n}: the first round's source"
+            );
+            assert_eq!(*kept, note, "{what}, round {n}");
+        }
+        assert_eq!(crate::error::first_os_code(&round.members[0]), Some(code), "{what}");
+        let Error::MemberNotKilled { source, .. } = &round.members[0] else {
+            panic!("{round:?}");
+        };
+        let Error::Unassessable {
+            source: Some(cause), ..
+        } = &**source
+        else {
+            panic!("{source:?}");
+        };
+        if what == "a bare OS error" {
+            assert!(
+                matches!(&**cause, Error::Io(e) if e.raw_os_error() == Some(code)),
+                "{cause:?}"
+            );
+        }
+    }
+}
+
+/// A member the walk never read, reported as `Unsupported`, is reported again as `Unsupported`, with
+/// its `op` and `platform`: not as `Unassessable`.
+///
+/// Mutant: the held member is re-reported as `Unassessable` whatever its first error was.
+#[skuld::test]
+fn a_member_never_read_is_reported_again_as_the_variant_it_was() {
+    use super::{not_killed, with_earlier, Left};
+    use crate::containment::dispatch::Unkilled;
+    let first = Unkilled {
+        members: vec![not_killed(
+            7,
+            Error::Unsupported {
+                op: "process open".into(),
+                platform: "linux",
+                detail: "pidfd_open was refused".into(),
+                source: None,
+            },
+        )],
+        root: None,
+        resolved: Vec::new(),
+    };
+    let held = Left::of(&first);
+
+    let again = with_earlier(&crate::identity::HostKernel, held, Ok(()))
+        .0
+        .expect_err("never read, so never shown killed");
+
+    let Error::MemberNotKilled { pid, source, .. } = &again.members[0] else {
+        panic!("{again:?}");
+    };
+    assert_eq!(*pid, 7);
+    assert!(
+        matches!(&**source, Error::Unsupported { op, platform: "linux", detail, .. }
+            if op == "process open" && detail == "pidfd_open was refused"),
+        "{source:?}"
+    );
 }

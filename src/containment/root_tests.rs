@@ -58,7 +58,11 @@ fn look_answers_each_state_own_reap_and_identity_read() {
         }
         for read in reads() {
             assert_eq!(
-                answered(|| RootState::Unknown(std::io::Error::other("forced")), has_group, read),
+                answered(
+                    || RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced"))),
+                    has_group,
+                    read
+                ),
                 unknown_answer,
                 "unknown, group: {has_group}"
             );
@@ -115,7 +119,9 @@ fn look_answers_an_unpinned_root_untrusted() {
 #[skuld::test]
 fn a_seen_root_is_decided_on_its_callers_look_and_checked_on_its_own_state() {
     let _read = crate::child::fault::force_root_reads(Resolved::Gone);
-    let root = StatedRoot::with_state(PGID as u32, || RootState::Unknown(std::io::Error::other("forced")));
+    let root = StatedRoot::with_state(PGID as u32, || {
+        RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced")))
+    });
     let seen = super::Seen::new(&root, RootState::Reaped { own: false });
 
     assert!(matches!(
@@ -138,8 +144,8 @@ fn number_holds_only_for_an_unreaped_root() {
     let refused = [
         (RootState::Reaped { own: false }, "reaped elsewhere"),
         (
-            RootState::Unknown(std::io::Error::other("a failed peek")),
-            "a failed peek",
+            RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))),
+            "could not say whether it",
         ),
         (RootState::Unpinned, "not pinned"),
         // This process holds its own pid, so the number names another process than the root.
@@ -150,6 +156,33 @@ fn number_holds_only_for_an_unreaped_root() {
         let err = number_holds(own, state).expect_err(&label).to_string();
         assert!(err.contains(why), "{label}: {err}");
     }
+}
+
+/// A handle that could not say whether the root was reaped refuses with its error as the `source()`,
+/// with its OS code, and not in the text, for the refusal and for the group's check that wraps it.
+///
+/// Mutant: the refusal formats the error into its text, or drops it.
+#[skuld::test]
+fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
+    use crate::containment::NotItsGroup;
+
+    let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
+    let refusal = number_holds(
+        std::process::id(),
+        RootState::Unknown(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+    )
+    .expect_err("an unsure handle refuses");
+    assert!(!refusal.to_string().contains(&os_error), "{refusal}");
+    let code = |e: &dyn std::error::Error| {
+        e.source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error)
+    };
+    assert_eq!(code(&refusal), Some(libc::EPERM));
+    let unproven = NotItsGroup::Unproven(refusal);
+    assert!(!unproven.to_string().contains(&os_error), "{unproven}");
+    assert_eq!(code(&unproven), Some(libc::EPERM));
+    assert!(std::error::Error::source(&NotItsGroup::Empty).is_none());
 }
 
 /// `number_holds` reads `own` from the state: a reap by someone else refuses whatever the pid's

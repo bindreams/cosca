@@ -62,24 +62,24 @@ fn ppid_of_stat(pid: RawPid, stat: &[u8]) -> Result<RawPid, Error> {
 }
 
 fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {
-    let detail = format!("the process snapshot could not be taken: {unreadable}");
-    log::warn!("enumerate::process_parents: {detail}");
-    Error::Unassessable {
-        detail,
-        source: Some(Error::io_cause(unreadable.into_source())),
-    }
+    // `Unreadable` is a layer of the chain (see its doc).
+    snapshot_failed(
+        "the process snapshot could not be taken".to_owned(),
+        Some(std::io::Error::other(unreadable)),
+    )
 }
 
 fn unassessable(why: &str, source: Option<std::io::Error>) -> Error {
-    let mut detail = format!("the process snapshot could not be taken: {why}");
-    if let Some(source) = &source {
-        detail.push_str(&format!(": {source}"));
-    }
-    log::warn!("enumerate::process_parents: {detail}");
-    Error::Unassessable {
+    snapshot_failed(format!("the process snapshot could not be taken: {why}"), source)
+}
+
+fn snapshot_failed(detail: String, source: Option<std::io::Error>) -> Error {
+    let error = Error::Unassessable {
         detail,
         source: source.map(Error::io_cause),
-    }
+    };
+    log::warn!("enumerate::process_parents: {}", crate::error::Report(&error));
+    error
 }
 
 #[cfg(test)]

@@ -62,10 +62,11 @@ fn fixture_enumerate_stat_overmount() {
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
 
     match process_parents(&HostKernel) {
-        Err(crate::error::Error::Unassessable { detail, .. }) => {
+        Err(error @ crate::error::Error::Unassessable { .. }) => {
+            let text = crate::error::Report(&error).to_string();
             assert!(
-                detail.contains(&format!("{pid}/stat lies beyond a mount in /proc")),
-                "the error must name the pid and the mount: {detail}"
+                text.contains(&format!("{pid}/stat lies beyond a mount in /proc")),
+                "the error must name the pid and the mount: {text}"
             );
         }
         other => panic!("a stat behind a mount must fail the snapshot, got {other:?}"),

@@ -8,14 +8,15 @@
 //! shown to be [`KEEP_CWD_SINCE`] or later is refused, including an older one with the option
 //! backported.
 
-use crate::error::{Error, IoFailure};
+use crate::error::Error;
+use std::sync::Arc;
 
 /// The first polkit release whose pkexec has `--keep-cwd`: polkit NEWS lists "add option
 /// (--keep-cwd) for pkexec" under polkit 121. Measured: 121 (Fedora 37) honours it.
 pub(crate) const KEEP_CWD_SINCE: u32 = 121;
 
 /// What `pkexec --version` said.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PkexecVersion {
     /// Not asked, because the request cannot launch pkexec: it names another backend, pairs
     /// `Backend::Pkexec` with an auth other than `Auth::Gui`, comes from a caller already root, or
@@ -24,12 +25,12 @@ pub enum PkexecVersion {
     NotProbed,
     /// `PATH` has a `pkexec` at `path`, but its real file could not be found (`error`), so it is
     /// neither stored nor asked.
-    Unresolved { path: String, error: IoFailure },
+    Unresolved { path: String, error: Arc<std::io::Error> },
     /// `PATH` has a `pkexec` whose real file is at `path`, but it could not be opened as a pinned
     /// regular file (`error`), so it is neither stored nor asked.
-    Unpinned { path: String, error: IoFailure },
+    Unpinned { path: String, error: Arc<std::io::Error> },
     /// `pkexec --version` could not be run.
-    SpawnFailed(IoFailure),
+    SpawnFailed(Arc<std::io::Error>),
     /// It exited unsuccessfully; both streams are kept, lossily decoded.
     Failed {
         status: String,
@@ -88,11 +89,11 @@ impl PkexecVersion {
 
     /// The failed read behind the unresolved, unpinned or failed-spawn probe, for the reporting
     /// error's `source`.
-    pub(crate) fn cause(&self) -> Option<Box<Error>> {
+    pub(crate) fn cause(&self) -> Option<Arc<Error>> {
         match self {
             PkexecVersion::Unresolved { error, .. }
             | PkexecVersion::Unpinned { error, .. }
-            | PkexecVersion::SpawnFailed(error) => Some(Error::io_cause(error.to_io())),
+            | PkexecVersion::SpawnFailed(error) => Some(crate::error::shared_io_cause(error)),
             _ => None,
         }
     }

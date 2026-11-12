@@ -132,8 +132,8 @@ enum StateUnknown {
 impl std::fmt::Display for StateUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::View(why) => write!(f, "the /proc view cannot be relied on: {why}"),
-            Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
+            Self::View(_) => f.write_str("the /proc view cannot be relied on"),
+            Self::Unreadable(_) => f.write_str("its stat could not be read"),
             Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
         }
     }
@@ -551,9 +551,10 @@ impl CgroupLeaf {
     /// or failed, else the answer of the write [`hard_kill`](Self::hard_kill) makes now. Every
     /// teardown of the leaf asks here.
     pub(crate) fn kill_unless_written(&self) -> KillAnswer {
-        self.kill
-            .answer()
-            .unwrap_or_else(|| self.hard_kill().map_err(|e| e.to_string()))
+        self.kill.answer().unwrap_or_else(|| {
+            self.hard_kill()
+                .map_err(|e| crate::error::Report(&e.into_io()).to_string())
+        })
     }
 
     /// The first step of the leaf's teardown, which [`Drop`] and an awaited teardown both take: the
@@ -682,10 +683,17 @@ impl CgroupLeaf {
             return Ok(Some(TreeDrain::AllMembersExited));
         }
         match self.watch.failure() {
-            Some(why) => Err(crate::error::Error::Io(io::Error::other(format!(
-                "the drain of cgroup leaf {} can no longer be watched: {why}",
-                self.leaf_path.display()
-            )))),
+            Some(failure) => {
+                let context = format!(
+                    "the drain of cgroup leaf {} can no longer be watched: {}",
+                    self.leaf_path.display(),
+                    failure.words
+                );
+                Err(crate::error::Error::Io(crate::error::io_context_or_other(
+                    context,
+                    failure.cause.as_ref().map(crate::error::shared_io),
+                )))
+            }
             None => Ok(None),
         }
     }
@@ -752,10 +760,13 @@ impl CgroupLeaf {
                 // A live member outside this process's pid namespace: it has no number here to
                 // pin or signal.
                 Ok(0) => {
-                    unproven.push("pid 0: it is a member in a pid namespace this process cannot see".to_owned());
+                    unproven.push((
+                        "pid 0: it is a member in a pid namespace this process cannot see".to_owned(),
+                        None,
+                    ));
                 }
                 Ok(pid) => pids.push(pid),
-                Err(_) => unproven.push(format!("cgroup.procs line {line:?} is no pid")),
+                Err(_) => unproven.push((format!("cgroup.procs line {line:?} is no pid"), None)),
             }
         }
         if pids.is_empty() && unproven.is_empty() {
@@ -766,39 +777,68 @@ impl CgroupLeaf {
         for pid in pids {
             match self.terminate_member(pid, &subtree) {
                 Ok(()) => {}
-                Err(Unsignalled::Failed(why)) => failed.push(format!("pid {pid}: {why}")),
-                Err(Unsignalled::Unproven(why)) => unproven.push(format!("pid {pid}: {why}")),
+                Err(Unsignalled::Failed(unsent)) => failed.push((format!("pid {pid}: {}", unsent.words), unsent.cause)),
+                Err(Unsignalled::Unproven(unsent)) => {
+                    unproven.push((format!("pid {pid}: {}", unsent.words), unsent.cause));
+                }
             }
         }
         if failed.is_empty() && unproven.is_empty() {
             return Ok(());
         }
+        // One member's error is the call's `source`. Several members have no one cause: each says its
+        // own in its text.
+        let causes = failed
+            .iter()
+            .chain(&unproven)
+            .filter(|(_, cause)| cause.is_some())
+            .count();
+        let source = if causes == 1 {
+            failed
+                .iter_mut()
+                .chain(&mut unproven)
+                .find_map(|(_, cause)| cause.take())
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        let said = |members: Vec<(String, Option<crate::error::Error>)>| -> Vec<String> {
+            members
+                .into_iter()
+                .map(|(words, cause)| match cause {
+                    Some(cause) => format!("{words} ({})", crate::error::Report(&cause)),
+                    None => words,
+                })
+                .collect()
+        };
+        let (failed_said, unproven_said) = (said(failed), said(unproven));
         let leaf = self.leaf_path.display();
         let mut parts = Vec::new();
-        if !failed.is_empty() {
+        if !failed_said.is_empty() {
             parts.push(format!(
                 "the SIGTERM failed for {} ({})",
-                failed.len(),
-                failed.join("; ")
+                failed_said.len(),
+                failed_said.join("; ")
             ));
         }
-        if !unproven.is_empty() {
+        if !unproven_said.is_empty() {
             parts.push(format!(
                 "{} could not be shown to be members, and were not signalled ({})",
-                unproven.len(),
-                unproven.join("; ")
+                unproven_said.len(),
+                unproven_said.join("; ")
             ));
         }
         let detail = format!(
             "cgroup leaf {leaf}: listed members got no SIGTERM: {}",
             parts.join("; ")
         );
-        log::warn!("cgroup terminate: {detail}");
-        Err(if failed.is_empty() {
-            crate::error::Error::Unassessable { detail, source: None }
+        let error = if failed_said.is_empty() {
+            crate::error::Error::Unassessable { detail, source }
         } else {
-            crate::error::Error::Containment { detail, source: None }
-        })
+            crate::error::Error::Containment { detail, source }
+        };
+        log::warn!("cgroup terminate: {}", crate::error::Report(&error));
+        Err(error)
     }
 
     /// The one subtree a pass over the listed members places each of them in. Where the leaf's id
@@ -942,7 +982,12 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: pid {pid} is gone; not signalled");
                 return Ok(());
             }
-            Err(e) => return Err(Unsignalled::Unproven(format!("it could not be pinned ({e})"))),
+            Err(e) => {
+                return Err(Unsignalled::Unproven(Unsent::of(
+                    "it could not be pinned",
+                    std::io::Error::from(e),
+                )))
+            }
         };
         #[cfg(test)]
         fault::run_after_terminate_pin();
@@ -957,15 +1002,12 @@ impl CgroupLeaf {
                 );
                 return Ok(());
             }
-            // A failure with the exit unreadable too keeps its two causes, which only `Report` names;
-            // a plain `Error::Io` is its own text.
-            Err(e @ crate::error::Error::Unassessable { .. }) => {
-                return Err(Unsignalled::Unproven(format!(
-                    "it could not be placed ({report})",
-                    report = crate::error::Report(&e)
-                )))
+            Err(e) => {
+                return Err(Unsignalled::Unproven(Unsent {
+                    words: "it could not be placed".to_owned(),
+                    cause: Some(e),
+                }))
             }
-            Err(e) => return Err(Unsignalled::Unproven(format!("it could not be placed ({e})"))),
         };
         if !inside {
             log::debug!("cgroup terminate: pid {pid} is not a member of the leaf; not signalled");
@@ -977,7 +1019,7 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: pid {pid} has exited; not signalled");
                 return Ok(());
             }
-            Err(e) => return Err(Unsignalled::Unproven(format!("its exit could not be read ({e})"))),
+            Err(e) => return Err(Unsignalled::Unproven(Unsent::of("its exit could not be read", e))),
         }
         match send_term(pidfd.as_fd(), pid) {
             Ok(()) => Ok(()),
@@ -985,7 +1027,10 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: pid {pid} exited before its SIGTERM");
                 Ok(())
             }
-            Err(e) => Err(Unsignalled::Failed(format!("{e}"))),
+            Err(e) => Err(Unsignalled::Failed(Unsent::of(
+                "the SIGTERM could not be sent",
+                std::io::Error::from(e),
+            ))),
         }
     }
 }
@@ -1093,9 +1138,26 @@ fn send_term(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32) -> nix::Result<()> {
 /// Why [`CgroupLeaf::terminate`] sent a listed pid no `SIGTERM`.
 enum Unsignalled {
     /// The send failed.
-    Failed(String),
+    Failed(Unsent),
     /// Nothing showed the pid to be a running member, so it was not signalled.
-    Unproven(String),
+    Unproven(Unsent),
+}
+
+/// What kept a listed pid from its `SIGTERM`: `words` say what failed, and `cause` is the error of
+/// the call that did.
+struct Unsent {
+    words: String,
+    cause: Option<crate::error::Error>,
+}
+
+impl Unsent {
+    /// `words`, caused by the failed OS call `cause`.
+    fn of(words: &str, cause: std::io::Error) -> Unsent {
+        Unsent {
+            words: words.to_owned(),
+            cause: Some(crate::error::Error::Io(cause)),
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", test))]

@@ -125,7 +125,11 @@ fn a_refused_probe_fails_unsupported() {
             ),
             "{err:?}"
         );
-        assert_eq!(err.raw_os_error(), Some(errno), "{name}: the errno is the source");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(errno),
+            "{name}: the errno is the source"
+        );
     }
 }
 
@@ -622,7 +626,7 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
         );
         // The failure is the error's source, so a caller finds its code by walking the chain.
         assert_eq!(
-            error.raw_os_error(),
+            crate::error::first_os_code(&error),
             Some(errno.raw_os_error()),
             "{fault_kind:?}: {said}"
         );

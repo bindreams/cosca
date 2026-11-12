@@ -260,7 +260,7 @@ fn answer_of(unobserved: Vec<Error>) -> Result<(), Error> {
 fn root_unobserved(cause: Error) -> Error {
     Error::Unassessable {
         detail: "the root was killed, but its exit cannot be observed".to_owned(),
-        source: Some(Box::new(cause)),
+        source: Some(std::sync::Arc::new(cause)),
     }
 }
 
@@ -318,7 +318,7 @@ async fn wait_for_exit_async(os: &dyn OsProcess) -> Result<(), Error> {
 pub(crate) fn exit_unobserved(pid: u32, cause: Error) -> Error {
     Error::Unassessable {
         detail: format!("pid {pid} was killed, but its exit cannot be observed"),
-        source: Some(Box::new(cause)),
+        source: Some(std::sync::Arc::new(cause)),
     }
 }
 

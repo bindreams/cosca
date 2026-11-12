@@ -57,7 +57,8 @@ fn fixture_group_stat_overmount() {
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
 
     let err = members(&HostKernel, pid as i32).expect_err("a stat behind a mount must not be read or skipped");
-    assert!(err.to_string().contains("mount"), "{err}");
+    let text = crate::error::Report(&err).to_string();
+    assert!(text.contains("mount"), "{text}");
 
     _ = child.kill();
     _ = child.wait();

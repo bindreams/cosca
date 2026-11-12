@@ -14,7 +14,6 @@ use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
 use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, CommandInput, EnvOp};
-use crate::error::IoFailure;
 use crate::error::{ElevationErrorKind, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 
@@ -314,7 +313,7 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
         probe.spawn()
     };
     match spawned.and_then(std::process::Child::wait_with_output) {
-        Err(e) => PkexecVersion::SpawnFailed(IoFailure::of(&e)),
+        Err(e) => PkexecVersion::SpawnFailed(std::sync::Arc::new(e)),
         Ok(out) if !out.status.success() => PkexecVersion::Failed {
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -368,7 +367,7 @@ pub(crate) fn detect_with(
                 None,
                 PkexecVersion::Unresolved {
                     path: found.display().to_string(),
-                    error: IoFailure::of(&e),
+                    error: std::sync::Arc::new(e),
                 },
             ),
             Some(Ok(real)) => match pin(&real) {
@@ -381,7 +380,7 @@ pub(crate) fn detect_with(
                     None,
                     PkexecVersion::Unpinned {
                         path: real.display().to_string(),
-                        error: IoFailure::of(&e),
+                        error: std::sync::Arc::new(e),
                     },
                 ),
             },
@@ -774,7 +773,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
             }
             if backend == Backend::Pkexec {
                 debug_assert!(
-                    host.pkexec_version != PkexecVersion::NotProbed,
+                    !matches!(host.pkexec_version, PkexecVersion::NotProbed),
                     "detect asks a pkexec request's pkexec its version"
                 );
                 if let Some(refusal) = host.pkexec_version.refusal() {

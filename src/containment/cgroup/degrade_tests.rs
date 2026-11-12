@@ -4,21 +4,19 @@ use std::path::PathBuf;
 
 use crate::containment::cgroup::{log_degrade, LeafError, NotEntered, NotPlaced, PlacementReport};
 
-/// Every `LeafError` names the step, the path it touched, and the kernel's own reason.
-/// Asserted per variant: a step whose message drops any of the three is the silence this
-/// type exists to remove.
+/// Every `LeafError` names the step and path, and keeps the kernel's reason as its `source()`, not in
+/// its text.
 ///
-/// The reason is asserted as the source error's own rendering, not as `strerror` text: the same
-/// raw code renders differently per host (13 is "Permission denied" on Linux and macOS, "The data
-/// is invalid." on Windows), and "carried verbatim" is the claim.
+/// The same raw code renders differently per host (13 is "Permission denied" on Linux and macOS,
+/// "The data is invalid." on Windows), so the code is asserted, not `strerror` text.
 #[skuld::test]
-fn leaf_error_names_step_path_and_reason() {
+fn leaf_error_names_step_and_path_and_keeps_the_reason_as_its_source() {
     let reason = |code: i32| std::io::Error::from_raw_os_error(code).to_string();
-    let cases: Vec<(LeafError, &[&str], Option<String>)> = vec![
+    let cases: Vec<(LeafError, &[&str], Option<i32>)> = vec![
         (
             LeafError::ReadProcSelfCgroup(std::io::Error::from_raw_os_error(13)),
             &["/proc/self/cgroup"],
-            Some(reason(13)),
+            Some(13),
         ),
         (
             LeafError::NoUnifiedLine {
@@ -34,7 +32,7 @@ fn leaf_error_names_step_path_and_reason() {
                 source: std::io::Error::from_raw_os_error(13),
             },
             &["/sys/fs/cgroup/slice/cosca-7-0"],
-            Some(reason(13)),
+            Some(13),
         ),
         (
             LeafError::KillUnsupported {
@@ -49,7 +47,7 @@ fn leaf_error_names_step_path_and_reason() {
                 source: std::io::Error::from_raw_os_error(13),
             },
             &["/sys/fs/cgroup/slice/cosca-7-0/cgroup.kill"],
-            Some(reason(13)),
+            Some(13),
         ),
         (
             LeafError::OpenProcs {
@@ -57,20 +55,42 @@ fn leaf_error_names_step_path_and_reason() {
                 source: std::io::Error::from_raw_os_error(13),
             },
             &["cgroup.procs"],
-            Some(reason(13)),
+            Some(13),
         ),
         (
             LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
             &["report"],
-            Some(reason(libc::EMFILE)),
+            Some(libc::EMFILE),
+        ),
+        (
+            LeafError::WatchDrain {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.events"),
+                source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+            },
+            &["cgroup.events"],
+            Some(libc::ENOSPC),
         ),
     ];
-    for (err, needles, reason) in cases {
+    for (err, needles, code) in cases {
         let rendered = err.to_string();
-        for needle in needles.iter().copied().chain(reason.as_deref()) {
+        for needle in needles {
             assert!(
                 rendered.contains(needle),
                 "{err:?} renders as {rendered:?}, which does not mention {needle:?}"
+            );
+        }
+        let source = std::error::Error::source(&err);
+        assert_eq!(
+            source
+                .and_then(|s| s.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error),
+            code,
+            "{err:?}"
+        );
+        if let Some(code) = code {
+            assert!(
+                !rendered.contains(&reason(code)),
+                "{err:?} renders its cause, which is its source: {rendered:?}"
             );
         }
     }
@@ -152,9 +172,10 @@ fn placement_absent_distinguishes_a_live_child() {
     assert!(!rendered.contains("zombie"), "a live child must not be called a zombie");
 }
 
-/// An unreadable `cgroup.procs` is reported with its own error, not as an empty file.
+/// An unreadable `cgroup.procs` is reported as unreadable, not as an empty file, and its text does
+/// not repeat the OS error, which is the `source()`.
 #[skuld::test]
-fn placement_unreadable_names_the_io_error() {
+fn placement_unreadable_says_it_could_not_be_read_and_not_the_io_error() {
     let rendered = NotPlaced::Unreadable {
         pid: 4242,
         path: PathBuf::from("/cg/cgroup.procs"),
@@ -163,7 +184,11 @@ fn placement_unreadable_names_the_io_error() {
     }
     .to_string();
     assert!(rendered.contains("/cg/cgroup.procs"));
-    assert!(rendered.contains(&std::io::Error::from_raw_os_error(13).to_string()));
+    assert!(rendered.contains("could not be read"), "{rendered}");
+    assert!(
+        !rendered.contains(&std::io::Error::from_raw_os_error(13).to_string()),
+        "{rendered}"
+    );
 }
 
 /// The `io::Error` of an unreadable `cgroup.procs` is the error's `source()`, so a report of the
@@ -223,6 +248,22 @@ fn the_degrade_warn_of_an_unreadable_placement_says_the_os_error() {
         records[0].contains(&std::io::Error::from_raw_os_error(13).to_string()),
         "{records:?}"
     );
+}
+
+/// The warn of a failed step says the OS error once: the chain prints it, the step's own text does
+/// not.
+#[skuld::test]
+fn the_degrade_warn_of_a_failed_step_says_the_os_error_once() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    log_degrade(&LeafError::CreateLeafDir {
+        path: PathBuf::from("/cg/cosca-once-probe-5b2a"),
+        source: std::io::Error::from_raw_os_error(13),
+    });
+    let records = crate::log_capture::records_since(mark, "cosca-once-probe-5b2a");
+    assert_eq!(records.len(), 1, "{records:?}");
+    let reason = std::io::Error::from_raw_os_error(13).to_string();
+    assert_eq!(records[0].matches(&reason).count(), 1, "{records:?}");
 }
 
 /// A repeated reason warns each time; nothing remembers earlier reports.

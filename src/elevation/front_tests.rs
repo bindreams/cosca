@@ -187,7 +187,7 @@ fn assert_refused_by_one_read(error: &Error, words: &str) {
         !detail.contains(&os_error().to_string()),
         "the cause is in the detail: {detail}"
     );
-    assert_eq!(error.raw_os_error(), Some(CODE), "{error:?}");
+    assert_eq!(crate::error::first_os_code(error), Some(CODE), "{error:?}");
 }
 
 #[skuld::test]

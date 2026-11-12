@@ -1168,7 +1168,7 @@ impl Marker {
     /// What this marker skipped, and why, for `look`: its holders' own signal, `holders`, was sent.
     fn skip(&self, verb: &str, root_pid: u32, look: NumberLook, holders: Result<(), Error>) -> Skip {
         let why = match look {
-            NumberLook::Untrusted(state) => Why::Untrusted(crate::signal::why_untrusted(&state)),
+            NumberLook::Untrusted(state) => Why::untrusted(&state),
             NumberLook::MayNameAnother { refusal, .. } => Why::MayNameAnother(refusal),
             NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
                 unreachable!("a send that is not skipped has no skip to say")

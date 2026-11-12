@@ -143,7 +143,11 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
     let io = source.expect("the OS error is preserved");
-    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io}");
+    assert_eq!(
+        crate::error::first_os_code(&io),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{io}"
+    );
     assert!(child.is_running(), "and it must still be running — nothing killed it");
 }
 
@@ -165,7 +169,11 @@ fn waiting_on_an_access_denied_live_process_is_an_error() {
         panic!("a denial must not read as an I/O failure: {err:?}");
     };
     let io = source.expect("the OS error is preserved");
-    assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io}");
+    assert_eq!(
+        crate::error::first_os_code(&io),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{io}"
+    );
 }
 
 /// The other side of the same branch: `Denied` plus a provably-Dead target must still report
@@ -648,7 +656,7 @@ const REFUSED_CODE: i32 = windows::Win32::Foundation::ERROR_BAD_LENGTH.0 as i32;
 
 /// The Win32 code a read's cause carries as its source.
 fn cause_code(cause: crate::identity::UnknownCause) -> Option<i32> {
-    cause.into_error("pid 7").and_then(|e| e.raw_os_error())
+    cause.into_error("pid 7").and_then(|e| crate::error::first_os_code(&e))
 }
 
 /// Both reads answered: the id's key and the order key, from one handle.
@@ -679,7 +687,11 @@ fn a_refused_sequence_number_on_the_expected_process_is_unknown_with_its_status(
             text.contains("pid 7") && text.contains("process sequence number query failed"),
             "{text}"
         );
-        assert_eq!(error.raw_os_error(), Some(REFUSED_CODE), "the status is the source");
+        assert_eq!(
+            crate::error::first_os_code(&error),
+            Some(REFUSED_CODE),
+            "the status is the source"
+        );
     }
 }
 
@@ -857,7 +869,7 @@ fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_er
         "{text}"
     );
     assert_eq!(
-        error.raw_os_error(),
+        crate::error::first_os_code(&error),
         Some(REFUSED_CODE),
         "the sequence status, not the creator's"
     );

@@ -98,6 +98,7 @@ use crate::os_process::OsProcess;
 use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
 use crate::Recursive;
+use std::sync::Arc;
 
 /// A tree named by parentage: the root's identity, from which its descendants are enumerated and
 /// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]).
@@ -530,8 +531,8 @@ fn member_error(pid: RawPid, failure: crate::os_process::OpenFailure) -> Error {
 #[cfg(target_os = "linux")]
 fn unproved(pid: RawPid, error: Error) -> Error {
     Error::Unassessable {
-        detail: format!("pid {pid} identity could not be confirmed: its pidfd could not be proved to name it: {error}"),
-        source: Some(Box::new(error)),
+        detail: format!("pid {pid} identity could not be confirmed: its pidfd could not be proved to name it"),
+        source: Some(Arc::new(error)),
     }
 }
 
@@ -637,7 +638,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
         let forced_error = |pid| {
             not_killed(
                 pid,
-                Error::Containment {
+                Error::Unassessable {
                     detail: "the walk was forced incomplete".into(),
                     source: None,
                 },
@@ -706,43 +707,43 @@ fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
 pub(crate) enum Left {
     /// The walk read its identity and its kill was refused: a later kill kills it by identity again.
     Resolved(ProcessId),
-    /// The walk never read its identity, so nothing can act on it: a later kill reports it again,
-    /// with `said`, why it could not be read.
-    Unread { pid: RawPid, said: String },
+    /// The walk never read its identity, so nothing can act on it: a later kill reports it again as
+    /// the member it was first reported as, [`Error::MemberNotKilled`] with this `source` (the same
+    /// `Arc`) and `note`.
+    Unread {
+        pid: RawPid,
+        source: Arc<Error>,
+        note: Option<String>,
+    },
 }
 
 impl Left {
     /// Every member `left` names, in order. A walk that was not made, or found no root, adds its
     /// error as the last member, an [`Error::Unassessable`] or [`Error::Unsupported`] with no root
     /// beside it; that names no process, so none is held. Every other member is a
-    /// [`Error::MemberNotKilled`].
+    /// [`Error::MemberNotKilled`]. A member never read shares its `source` with its `Left`.
     pub(crate) fn of(left: &Unkilled) -> Vec<Left> {
         let last = left.members.len().saturating_sub(1);
-        left.members
-            .iter()
-            .enumerate()
-            .filter_map(|(at, member)| {
-                let Error::MemberNotKilled { pid, source, .. } = member else {
-                    debug_assert!(
-                        at == last
-                            && left.root.is_none()
-                            && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
-                        "only the error of a walk not made is not a `MemberNotKilled`, and it is last: {left:?}"
-                    );
-                    return None;
-                };
-                Some(match left.resolved.iter().find(|id| id.pid() == *pid) {
-                    Some(id) => Left::Resolved(*id),
-                    None => Left::Unread {
-                        pid: *pid,
-                        said: match &**source {
-                            Error::Unassessable { detail, .. } => detail.clone(),
-                            other => other.to_string(),
-                        },
-                    },
-                })
-            })
-            .collect()
+        let (root, resolved) = (left.root.is_some(), &left.resolved);
+        let mut held = Vec::new();
+        for (at, member) in left.members.iter().enumerate() {
+            let Error::MemberNotKilled { pid, source, note } = member else {
+                debug_assert!(
+                    at == last && !root && matches!(member, Error::Unassessable { .. } | Error::Unsupported { .. }),
+                    "only the error of a walk not made is not a `MemberNotKilled`, and it is last: {member:?} in {left:?}"
+                );
+                continue;
+            };
+            held.push(match resolved.iter().find(|id| id.pid() == *pid) {
+                Some(id) => Left::Resolved(*id),
+                None => Left::Unread {
+                    pid: *pid,
+                    source: Arc::clone(source),
+                    note: note.clone(),
+                },
+            });
+        }
+        held
     }
 
     fn pid(&self) -> RawPid {
@@ -799,13 +800,7 @@ pub(crate) fn with_earlier(
                 #[cfg(not(any(unix, windows)))]
                 let _ = (kernel, id);
             }
-            Left::Unread { pid, said } => members.push(not_killed(
-                pid,
-                Error::Unassessable {
-                    detail: said,
-                    source: None,
-                },
-            )),
+            Left::Unread { pid, source, note } => members.push(Error::MemberNotKilled { pid, source, note }),
         }
     }
     if members.is_empty() && walked.members.is_empty() && walked.root.is_none() {
@@ -820,7 +815,7 @@ pub(crate) fn with_earlier(
 fn not_killed(pid: RawPid, source: Error) -> Error {
     Error::MemberNotKilled {
         pid,
-        source: Box::new(source),
+        source: Arc::new(source),
         note: None,
     }
 }
@@ -1086,7 +1081,7 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
         ) {
             return Some(Skip {
                 action: format!("walk the process table from the root's pid (root pid {})", root.pid()),
-                why: Why::Untrusted(crate::signal::why_untrusted(&state)),
+                why: Why::untrusted(&state),
                 root_alone: false,
                 holders: None,
             });

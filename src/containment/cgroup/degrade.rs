@@ -5,9 +5,9 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-/// Why a cgroup v2 leaf could not be created. Each variant names the step that failed, the
-/// path it touched, and the kernel's own reason: the caller degrades to a process group
-/// either way, but it degrades *stating which precondition was missing*.
+/// Why a cgroup v2 leaf could not be created. Each variant names its step, and its path where it
+/// has one; a variant for a failed call keeps that call's OS error as its `source`. The caller
+/// degrades to a process group either way, stating which precondition was missing.
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 )]
 pub(crate) enum LeafError {
     /// `/proc/self/cgroup` could not be read (no procfs, or it is not mounted).
-    #[error("could not read /proc/self/cgroup: {0}")]
+    #[error("could not read /proc/self/cgroup")]
     ReadProcSelfCgroup(#[source] io::Error),
     /// `/proc/self/cgroup` has no `0::` line: a v1-only host, or no unified hierarchy.
     ///
@@ -32,7 +32,7 @@ pub(crate) enum LeafError {
     NoUnifiedLine { line_count: usize, controllers: String },
     /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
     /// write to (`EACCES`/`EPERM`), or a read-only cgroupfs (`EROFS`).
-    #[error("could not create the leaf cgroup {}: {source}", path.display())]
+    #[error("could not create the leaf cgroup {}", path.display())]
     CreateLeafDir {
         path: PathBuf,
         #[source]
@@ -47,14 +47,14 @@ pub(crate) enum LeafError {
     )]
     KillUnsupported { path: PathBuf },
     /// Whether the leaf has a `cgroup.kill` could not be determined: the lookup itself failed.
-    #[error("could not check for {}: {source}", path.display())]
+    #[error("could not check for {}", path.display())]
     CheckKill {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
     /// `cgroup.procs` could not be opened for writing, or moved to fd 3 or above.
-    #[error("could not open {} for writing: {source}", path.display())]
+    #[error("could not open {} for writing", path.display())]
     OpenProcs {
         path: PathBuf,
         #[source]
@@ -63,12 +63,12 @@ pub(crate) enum LeafError {
     /// The channel the child reports its self-placement outcome through could not be opened, or
     /// its ends moved to fd 3 or above. Without it the child's own report would be
     /// unobservable, so the leaf is not created half-instrumented.
-    #[error("could not open the placement-report channel shared with the forked child: {0}")]
+    #[error("could not open the placement-report channel shared with the forked child")]
     OpenReportChannel(#[source] io::Error),
     /// The watch the leaf's removal waits on could not be armed: an inotify instance or watch
     /// (`fs.inotify.max_user_instances`, `fs.inotify.max_user_watches`), or `cgroup.events`
     /// itself. It is armed at creation so that no later teardown can find itself without one.
-    #[error("could not watch {} for its drain: {source}", path.display())]
+    #[error("could not watch {} for its drain", path.display())]
     WatchDrain {
         path: PathBuf,
         #[source]
@@ -214,14 +214,9 @@ impl fmt::Display for NotPlaced {
                     path.display()
                 )
             }
-            NotPlaced::Unreadable {
-                pid,
-                path,
-                source,
-                report,
-            } => write!(
+            NotPlaced::Unreadable { pid, path, report, .. } => write!(
                 f,
-                "child {pid} is not in the leaf cgroup: {report}; {} could not be read: {source}",
+                "child {pid} is not in the leaf cgroup: {report}; {} could not be read",
                 path.display()
             ),
         }

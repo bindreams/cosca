@@ -113,7 +113,7 @@ fn an_unkillable_error_has_the_refusal_as_its_cause() {
     );
     let text = refusal.to_string();
     let e = super::map_elevated_kill_error(refusal, true);
-    assert_eq!(e.raw_os_error(), Some(OS_CODE), "{e:?}");
+    assert_eq!(crate::error::first_os_code(&e), Some(OS_CODE), "{e:?}");
     match e {
         Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
@@ -132,7 +132,7 @@ fn a_backend_unavailable_error_has_the_failed_exec_as_its_cause() {
         std::path::Path::new("/nonexistent/sudo"),
     );
     assert!(matches!(e, Error::Elevation { .. }), "{e:?}");
-    assert_eq!(e.raw_os_error(), Some(OS_CODE), "{e:?}");
+    assert_eq!(crate::error::first_os_code(&e), Some(OS_CODE), "{e:?}");
 }
 
 #[skuld::test]

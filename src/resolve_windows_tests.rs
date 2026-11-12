@@ -584,7 +584,7 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
             // The first `io::Error` is `Error::Io`'s own: its kind is the error's kind.
             let kind = e.io_errors().next().map(std::io::Error::kind);
             assert_eq!(kind, Some(std::io::ErrorKind::PermissionDenied), "{e}");
-            assert_eq!(e.raw_os_error(), Some(5), "{e}");
+            assert_eq!(crate::error::first_os_code(&e), Some(5), "{e}");
         }
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }

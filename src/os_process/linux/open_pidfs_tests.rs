@@ -83,7 +83,11 @@ fn a_live_thread_that_leads_no_group_is_not_a_thread_group_leader() {
         match open_verified_error_with(&kernel, id(100)) {
             Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
                 assert_eq!(pid, PID);
-                assert_eq!(source.raw_os_error(), Some(first.raw_os_error()), "{first}");
+                assert_eq!(
+                    crate::error::first_os_code(&*source),
+                    Some(first.raw_os_error()),
+                    "{first}"
+                );
             }
             other => panic!("{first}: expected NotThreadGroupLeader, got {other:?}"),
         }
@@ -161,7 +165,7 @@ fn a_refused_inode_read_is_io_not_unsupported() {
             panic!("{errno}: {result:?}");
         };
         assert!(e.to_string().starts_with("pidfs_ino: "), "{errno}: {e}");
-        assert_eq!(e.raw_os_error(), Some(errno.raw_os_error()), "{errno}");
+        assert_eq!(crate::error::first_os_code(e), Some(errno.raw_os_error()), "{errno}");
     }
 }
 

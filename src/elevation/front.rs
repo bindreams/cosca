@@ -125,7 +125,7 @@ type Unread = Vec<(&'static str, io::Error)>;
 /// A refusal's reason: its words and, if any, its cause.
 struct Reason {
     words: String,
-    cause: Option<Box<Error>>,
+    cause: Option<std::sync::Arc<Error>>,
 }
 
 impl Reason {
@@ -221,7 +221,7 @@ pub(crate) fn cgroup_kill_reached(
 pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error {
     let reason = Reason {
         words: "its cgroup kill failed".to_owned(),
-        cause: Some(Box::new(error)),
+        cause: Some(std::sync::Arc::new(error)),
     };
     refused(front, pid, Signal::Kill, Some(reason))
 }

@@ -260,7 +260,7 @@ fn a_refused_read_at_the_arming_is_unassessable_with_the_errno() {
     let _refused = force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
     let err = p.exited().expect_err("a refused read is an error");
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -279,7 +279,7 @@ fn open_with_a_refused_read_is_unassessable_with_the_errno() {
     else {
         panic!("a refused read is Unassessable with its errno as source: {err:?}");
     };
-    assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+    assert_eq!(crate::error::first_os_code(&**source), Some(libc::EPERM));
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -296,7 +296,7 @@ fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
 }
 
 /// A refused `has_exited` read is `PermissionDenied` with the errno as its OS code, and the

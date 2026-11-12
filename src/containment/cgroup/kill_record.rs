@@ -4,7 +4,8 @@ use std::io;
 use std::sync::Mutex;
 
 /// What one `cgroup.kill` write answered, for a removal that is told it and writes no more: `Ok`
-/// landed or found the leaf gone, `Err` carries why it failed.
+/// landed or found the leaf gone, `Err` carries why it failed, as the text of the error's whole chain:
+/// the removals that read it only print it.
 pub(crate) type KillAnswer = Result<(), String>;
 
 #[derive(Debug, Default)]
@@ -36,7 +37,7 @@ impl KillRecord {
         match (written, &*record) {
             (Ok(()), _) => *record = Written::Landed,
             (Err(_), Written::Landed) => {}
-            (Err(e), _) => *record = Written::Failed(e.to_string()),
+            (Err(e), _) => *record = Written::Failed(crate::error::Report(e).to_string()),
         }
     }
 
@@ -62,3 +63,7 @@ impl KillRecord {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "kill_record_tests.rs"]
+mod kill_record_tests;

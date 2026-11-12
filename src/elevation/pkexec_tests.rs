@@ -1,5 +1,6 @@
 use super::{parse, PkexecVersion, KEEP_CWD_SINCE};
-use crate::error::{Error, IoFailure};
+use crate::error::Error;
+use std::sync::Arc;
 
 const OS_CODE: i32 = 2;
 
@@ -10,20 +11,22 @@ const FEDORA_37: &[u8] = b"pkexec version 121\n";
 const DEBIAN_12: &[u8] = b"pkexec version 122\n";
 const FEDORA_44: &[u8] = b"pkexec version 127\n";
 
-fn parsed(version: &str, release: Option<u32>) -> PkexecVersion {
-    PkexecVersion::Parsed {
-        version: version.into(),
-        release,
-    }
+fn is_parsed(got: &PkexecVersion, version: &str, release: Option<u32>) -> bool {
+    matches!(got, PkexecVersion::Parsed { version: v, release: r } if v == version && *r == release)
 }
 
 #[skuld::test]
 fn the_measured_outputs_parse() {
-    assert_eq!(parse(UBUNTU_22_04), parsed("0.105", None));
-    assert_eq!(parse(ROCKY_9), parsed("0.117", None));
-    assert_eq!(parse(FEDORA_37), parsed("121", Some(121)));
-    assert_eq!(parse(DEBIAN_12), parsed("122", Some(122)));
-    assert_eq!(parse(FEDORA_44), parsed("127", Some(127)));
+    for (out, version, release) in [
+        (UBUNTU_22_04, "0.105", None),
+        (ROCKY_9, "0.117", None),
+        (FEDORA_37, "121", Some(121)),
+        (DEBIAN_12, "122", Some(122)),
+        (FEDORA_44, "127", Some(127)),
+    ] {
+        let got = parse(out);
+        assert!(is_parsed(&got, version, release), "{got:?}");
+    }
 }
 
 /// Pins [`KEEP_CWD_SINCE`] against an accidental edit.
@@ -70,15 +73,20 @@ fn the_pattern_is_strict() {
         "pkexec version 99999999999\n",
         "polkit 122\n",
     ] {
-        assert_eq!(parse(out.as_bytes()), PkexecVersion::Unparsed(out.into()), "{out:?}");
+        let got = parse(out.as_bytes());
+        assert!(
+            matches!(&got, PkexecVersion::Unparsed(text) if text == out),
+            "{out:?}: {got:?}"
+        );
     }
 }
 
 #[skuld::test]
 fn non_utf8_output_is_its_own_case() {
-    assert_eq!(
-        parse(b"pkexec version \xff\n"),
-        PkexecVersion::NonUtf8("pkexec version \u{fffd}\n".into())
+    let got = parse(b"pkexec version \xff\n");
+    assert!(
+        matches!(&got, PkexecVersion::NonUtf8(text) if text == "pkexec version \u{fffd}\n"),
+        "{got:?}"
     );
 }
 
@@ -102,7 +110,7 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         (parse(b"polkit 122\n"), "\"polkit 122\\n\""),
         (parse(b"pkexec version \xff\n"), "non-UTF-8"),
         (
-            PkexecVersion::SpawnFailed(IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE))),
+            PkexecVersion::SpawnFailed(Arc::new(std::io::Error::from_raw_os_error(OS_CODE))),
             "`pkexec --version` could not be run;",
         ),
         (
@@ -117,14 +125,14 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         (
             PkexecVersion::Unresolved {
                 path: "/opt/bin/pkexec".into(),
-                error: IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE)),
+                error: Arc::new(std::io::Error::from_raw_os_error(OS_CODE)),
             },
             "/opt/bin/pkexec could not be resolved to its real file;",
         ),
         (
             PkexecVersion::Unpinned {
                 path: "/opt/bin/pkexec".into(),
-                error: IoFailure::of(&std::io::Error::from_raw_os_error(OS_CODE)),
+                error: Arc::new(std::io::Error::from_raw_os_error(OS_CODE)),
             },
             "pkexec at /opt/bin/pkexec could not be opened as its real file;",
         ),
@@ -147,32 +155,25 @@ fn each_refusal_names_its_case_and_the_raw_text() {
 fn a_refusal_that_follows_a_failed_read_has_it_as_its_cause() {
     let os = || std::io::Error::from_raw_os_error(OS_CODE);
     for v in [
-        PkexecVersion::SpawnFailed(IoFailure::of(&os())),
+        PkexecVersion::SpawnFailed(Arc::new(os())),
         PkexecVersion::Unresolved {
             path: "/opt/bin/pkexec".into(),
-            error: IoFailure::of(&os()),
+            error: Arc::new(os()),
         },
         PkexecVersion::Unpinned {
             path: "/opt/bin/pkexec".into(),
-            error: IoFailure::of(&os()),
+            error: Arc::new(os()),
         },
     ] {
         let refusal = v.refusal().expect("a failed read refuses");
-        assert_eq!(refusal.raw_os_error(), Some(OS_CODE), "{v:?}: {refusal:?}");
+        assert_eq!(
+            crate::error::first_os_code(&refusal),
+            Some(OS_CODE),
+            "{v:?}: {refusal:?}"
+        );
         let Error::Unsupported { detail, .. } = &refusal else {
             panic!("{v:?}: expected Unsupported, got {refusal:?}");
         };
         assert!(!detail.contains(&os().to_string()), "{v:?}: {detail}");
     }
-}
-
-#[skuld::test]
-fn a_kept_failure_comes_back_as_an_equal_io_error() {
-    let os = std::io::Error::from_raw_os_error(OS_CODE);
-    let back = IoFailure::of(&os).to_io();
-    assert_eq!((back.raw_os_error(), back.kind()), (Some(OS_CODE), os.kind()));
-    let plain = std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
-    let back = IoFailure::of(&plain).to_io();
-    assert_eq!((back.raw_os_error(), back.kind()), (None, plain.kind()));
-    assert_eq!(back.to_string(), "not a regular file");
 }

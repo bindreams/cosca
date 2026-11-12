@@ -250,7 +250,7 @@ use crate::identity::{windows_terminate_held, Termination};
 use crate::os_process::windows::WindowsProcess;
 
 /// So `raw_os_error` finds the Win32 code; an HRESULT that is not one carries its hex in the chain.
-fn hresult_cause(code: windows::core::HRESULT) -> Box<Error> {
+fn hresult_cause(code: windows::core::HRESULT) -> std::sync::Arc<Error> {
     let io = crate::error::win32_io_error(windows::core::Error::from_hresult(code));
     let hr = code.0 as u32;
     Error::io_cause(if hr & 0xFFFF_0000 == 0x8007_0000 {
@@ -509,7 +509,7 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 fn untracked_outcome(
     pid: Result<u32, windows::core::Error>,
     outcome: Termination,
-) -> (String, Option<Box<Error>>, ChildFate) {
+) -> (String, Option<std::sync::Arc<Error>>, ChildFate) {
     let (who, why) = match &pid {
         Ok(pid) => (
             format!("the elevated child (pid {pid})"),

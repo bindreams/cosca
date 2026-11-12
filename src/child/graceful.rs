@@ -716,31 +716,36 @@ impl PidfdShutdown {
             (Ok(_), _) => "sent nothing: the root's handle no longer reaches it".to_owned(),
         };
         let detail = call.skipped_detail(skip, &sent);
-        log::warn!("{detail}");
+        skip.why.warn(&detail);
         match (self.term, kill) {
             (Err(e), _) | (_, Some(Err(e))) => e,
-            _ => Error::Unassessable { detail, source: None },
+            _ => Error::Unassessable {
+                detail,
+                source: skip.why.cause(),
+            },
         }
     }
 }
 
 /// `graceful_shutdown_tree`'s answer (sync and async) from the root's reap, `waited`, once the tree is
 /// down. A root reaped elsewhere (`ECHILD`) leaves no exit status for this handle: that is
-/// `Unassessable`, saying the tree is down, as for a root launchd holds. Any other answer stands.
+/// `Unassessable`, saying the tree is down, as for a root launchd holds. Only an [`Error::Io`] says it, bare
+/// or under a context or a note: an `ECHILD` deep in the chain of any other variant is that variant's
+/// own cause. Any other answer stands.
 #[cfg(unix)]
 pub(crate) fn status_unless_reaped_elsewhere(
     waited: Result<ExitStatus, Error>,
     pid: crate::identity::RawPid,
 ) -> Result<ExitStatus, Error> {
     match waited {
-        Err(Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD) => {
+        Err(e @ Error::Io(_)) if crate::error::first_os_code(&e) == Some(libc::ECHILD) => {
             log::debug!("graceful_shutdown_tree({pid}): the tree is down, and the root was reaped elsewhere");
             Err(Error::Unassessable {
                 detail: format!(
                     "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be \
                      collected: the root was reaped elsewhere"
                 ),
-                source: None,
+                source: Some(std::sync::Arc::new(e)),
             })
         }
         other => other,

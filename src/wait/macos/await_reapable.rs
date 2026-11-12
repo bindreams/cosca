@@ -88,7 +88,7 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
     };
     match kq.subscribe(child) {
         Ok(()) => Ok(false),
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(true),
         Err(e) => Err(e.into_io()),
     }
 }

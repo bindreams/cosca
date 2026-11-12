@@ -313,11 +313,11 @@ fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
     let text = refusal.to_string();
     h.pkexec_version = crate::elevation::pkexec::PkexecVersion::Unresolved {
         path: "/opt/bin/pkexec".into(),
-        error: crate::error::IoFailure::of(&refusal),
+        error: std::sync::Arc::new(refusal),
     };
     let error = reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui));
     assert_eq!(
-        error.raw_os_error(),
+        crate::error::first_os_code(&error),
         Some(40),
         "the failed resolution is the cause: {error:?}"
     );

@@ -266,7 +266,7 @@ mod linux {
         assert!(matches!(view.root, RootState::Unknown(_)), "{:?}", view.root);
 
         let unsure = crate::test_support::stated_root::StatedRoot::with_state(child.pid(), || {
-            crate::signal::RootState::Unknown(std::io::Error::other("forced peek failure"))
+            crate::signal::RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced peek failure")))
         });
         let kill = child.tree.kill(Some(&unsure)).outcome();
         assert!(kill.skipped().is_some(), "the number-named kill must be skipped");

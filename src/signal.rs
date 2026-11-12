@@ -3,6 +3,8 @@
 
 #[cfg(unix)]
 use std::io;
+#[cfg(unix)]
+use std::sync::Arc;
 
 /// A signal cosca sends to an owned process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +55,7 @@ pub(crate) enum Sent {
 ///
 /// Unix only: a Windows process handle pins its process, so nothing there asks.
 #[cfg(unix)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum RootState {
     /// The root is an unreaped child (a zombie at worst): its pid names it, and a signal through
     /// its handle reaches it.
@@ -64,7 +66,9 @@ pub(crate) enum RootState {
     /// The handle could not say: a failed peek, or (macOS) a refused unique-id read. Treated as
     /// neither reaped nor unreaped; callers skip what a reuse of the pid could redirect, and act
     /// only through the handle.
-    Unknown(io::Error),
+    ///
+    /// The error is shared, so every clone of the state keeps the original ([`crate::error::shared_io`]).
+    Unknown(Arc<io::Error>),
     /// The root exists, but this process does not pin it (macOS: launchd holds its zombie after
     /// its tracer died, and reaps it on its own schedule). Its pid is not ours: nothing may be
     /// signalled or waited on by it. [`UNPINNED_WHY`] says why.
@@ -139,16 +143,27 @@ pub(crate) fn refuse_unpinned(
     Ok(())
 }
 
-/// Why `state` leaves the root's number untrusted, for a message.
+/// Why `state` leaves the root's number untrusted: this layer's words, without the error of a
+/// [`RootState::Unknown`]. That error is the `source` of an error using these words;
+/// [`why_untrusted_with_cause`] is for a line that is only printed.
 #[cfg(unix)]
 pub(crate) fn why_untrusted(state: &RootState) -> String {
     match state {
         RootState::Unpinned => format!("the root is not pinned by this process (RootState::Unpinned: {UNPINNED_WHY})"),
-        RootState::Unknown(e) => format!("the root could not be shown to be unreaped (RootState::Unknown: {e})"),
+        RootState::Unknown(_) => "the root could not be shown to be unreaped (RootState::Unknown)".to_owned(),
         RootState::Unreaped | RootState::Reaped { .. } => {
             debug_assert!(false, "{state:?} leaves the root's number trusted");
             "the root's number is trusted".to_owned()
         }
+    }
+}
+
+/// [`why_untrusted`], with the error of an `Unknown` state after it, for a log line or a note.
+#[cfg(unix)]
+pub(crate) fn why_untrusted_with_cause(state: &RootState) -> String {
+    match state {
+        RootState::Unknown(e) => format!("{}: {}", why_untrusted(state), crate::error::Report(e)),
+        _ => why_untrusted(state),
     }
 }
 
@@ -161,27 +176,16 @@ impl RootState {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => RootState::Unreaped,
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => RootState::Unpinned,
             Ok(PeekOutcome::Foreign(_)) => RootState::Reaped { own: false },
-            Err(e) => RootState::Unknown(e),
+            Err(e) => RootState::Unknown(Arc::new(e)),
         }
     }
 
     /// What a root that is signalled through a handle but never reaped or peeked says: it cannot say
     /// whether its process was reaped, so nothing is sent by its pid on its word.
     pub(crate) fn unheld() -> RootState {
-        RootState::Unknown(io::Error::other(
+        RootState::Unknown(Arc::new(io::Error::other(
             "the root is held by a handle that does not show whether it was reaped",
-        ))
-    }
-
-    /// The same answer, for a second reader of one look: an `Unknown`'s error keeps its kind and its
-    /// text, not its source.
-    pub(crate) fn duplicate(&self) -> RootState {
-        match self {
-            RootState::Unreaped => RootState::Unreaped,
-            RootState::Reaped { own } => RootState::Reaped { own: *own },
-            RootState::Unknown(e) => RootState::Unknown(io::Error::new(e.kind(), e.to_string())),
-            RootState::Unpinned => RootState::Unpinned,
-        }
+        )))
     }
 }
 

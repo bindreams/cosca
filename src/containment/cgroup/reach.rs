@@ -91,21 +91,22 @@ pub(crate) fn proc_names(
                 crate::identity::DIVERGED_REASON
             )));
         }
-        crate::identity::ProcView::Unassessable(why) => {
-            let kind = why.source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
-            return Err(io::Error::new(
-                kind,
-                format!(
-                    "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
-                    why.reason
-                ),
-            ));
-        }
+        crate::identity::ProcView::Unassessable(why) => return Err(view_unreadable(pid, why)),
     };
     let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
     names_leaf(path, leaf_path, other_id, recorded)
+}
+
+/// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
+/// of the view's error's kind, with that error as its source.
+fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> io::Error {
+    let context = format!(
+        "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
+        why.reason
+    );
+    crate::error::io_context_or_other(context, why.source)
 }
 
 /// What `/proc/<pid>/cgroup` prints after the path of a removed cgroup.
@@ -256,12 +257,12 @@ impl Subtree {
             .map(|inside| (inside, None))
             .map_err(|e| {
                 if elsewhere {
-                    io::Error::new(
-                        e.kind(),
+                    crate::error::io_context(
                         format!(
                             "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
-                             cannot be read ({e})"
+                             cannot be read"
                         ),
+                        e,
                     )
                 } else {
                     e
@@ -370,10 +371,12 @@ pub(crate) fn front_placement(
 
     if let Err(e) = leaf_id() {
         return Err(match e.raw_os_error() {
-            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM) => unplaceable(format!(
-                "this host gives no cgroup's id by name_to_handle_at ({e}), as a kernel without CONFIG_FHANDLE, a \
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM) => unplaceable(
+                "this host gives no cgroup's id by name_to_handle_at, as a kernel without CONFIG_FHANDLE, a \
                  filesystem without export operations or a seccomp filter refuses it"
-            )),
+                    .to_owned(),
+                Some(e),
+            ),
             _ => crate::error::Error::Io(crate::error::io_context(
                 "the cgroup id of the elevated front's leaf",
                 e,
@@ -389,9 +392,10 @@ pub(crate) fn front_placement(
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(e) => {
-            return Err(unplaceable(format!(
-                "PIDFD_GET_INFO failed on this process's own pidfd ({e})"
-            )))
+            return Err(unplaceable(
+                "PIDFD_GET_INFO failed on this process's own pidfd".to_owned(),
+                Some(e),
+            ))
         }
     }
     untraceable_cgroup_readable(kernel).map_err(refusal)
@@ -401,13 +405,16 @@ pub(crate) fn front_placement(
 /// on a kernel with no `PIDFD_GET_INFO`.
 fn refusal(why: Unreadable) -> crate::error::Error {
     match why {
-        Unreadable::Hidden(e) => unplaceable(format!(
+        Unreadable::Hidden(e) => unplaceable(
             "this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and /proc hides the cgroup of a process \
-             this one may not trace ({e}), as a hidepid /proc does: it would hide the elevated front's too"
-        )),
-        Unreadable::View(why) => unplaceable(format!(
-            "this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and {why}"
-        )),
+             this one may not trace, as a hidepid /proc does: it would hide the elevated front's too"
+                .to_owned(),
+            Some(e),
+        ),
+        Unreadable::View(why, cause) => unplaceable(
+            format!("this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and {why}"),
+            cause,
+        ),
         Unreadable::Probe(e) => crate::error::Error::Io(crate::error::io_context(
             "probing whether /proc shows the cgroup of a process this one may not trace",
             e,
@@ -415,7 +422,8 @@ fn refusal(why: Unreadable) -> crate::error::Error {
     }
 }
 
-fn unplaceable(why: String) -> crate::error::Error {
+/// The spawn's refusal for `why`, caused by the failed call `cause`, if there was one.
+fn unplaceable(why: String, cause: Option<io::Error>) -> crate::error::Error {
     crate::error::Error::Unsupported {
         op: "contain() on an elevated command".into(),
         platform: "linux",
@@ -423,7 +431,7 @@ fn unplaceable(why: String) -> crate::error::Error {
             "{why}. cosca could not tell whether a cgroup kill reached the elevated front, so the spawn is \
              refused before anything is spawned"
         ),
-        source: None,
+        source: cause.map(crate::error::Error::io_cause),
     }
 }
 
@@ -432,8 +440,9 @@ fn unplaceable(why: String) -> crate::error::Error {
 enum Unreadable {
     /// `/proc` hid it.
     Hidden(io::Error),
-    /// This process's `/proc` view is not its own pid namespace's, or could not be told.
-    View(String),
+    /// This process's `/proc` view is not its own pid namespace's, or could not be told: what it
+    /// says, and the error behind it, if there is one.
+    View(String, Option<io::Error>),
     /// The probe itself failed: its socket, fork or reap.
     Probe(io::Error),
 }
@@ -757,9 +766,12 @@ fn confirm_child(pid: libc::pid_t, pidfd: OwnedFd) -> Result<OwnedFd, Unpinned> 
 }
 
 fn gone(pid: libc::pid_t, e: rustix::io::Errno) -> Unpinned {
-    Unpinned::Gone(io::Error::other(format!(
-        "the placement probe's child {pid} was reaped before it was pinned, by another reaper in this process or, with SIGCHLD ignored, by the kernel as it exited ({e})"
-    )))
+    Unpinned::Gone(crate::error::io_context(
+        format!(
+            "the placement probe's child {pid} was reaped before it was pinned, by another reaper in this process or, with SIGCHLD ignored, by the kernel as it exited"
+        ),
+        io::Error::from(e),
+    ))
 }
 
 /// How a probe's child ended, as its reap saw it.
@@ -953,16 +965,19 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
     let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
-            return Err(Unreadable::View(format!(
-                "{}, so no process's cgroup can be read by its pid",
-                crate::identity::DIVERGED_REASON
-            )))
+            return Err(Unreadable::View(
+                format!(
+                    "{}, so no process's cgroup can be read by its pid",
+                    crate::identity::DIVERGED_REASON
+                ),
+                None,
+            ))
         }
         crate::identity::ProcView::Unassessable(why) => {
-            return Err(Unreadable::View(format!(
-                "this process's /proc view could not be established ({})",
-                why.reason
-            )))
+            return Err(Unreadable::View(
+                format!("this process's /proc view could not be established ({})", why.reason),
+                why.source,
+            ))
         }
     };
     #[cfg(test)]

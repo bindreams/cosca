@@ -80,9 +80,10 @@ fn an_unknown_state_has_what_it_wraps_as_its_source() {
     );
 }
 
-/// The debug line of an unknown state carries the OS error of the view that could not be used.
+/// The debug line of an unknown state carries the OS error of the view that could not be used, once:
+/// each layer of the chain says only its own words.
 #[skuld::test]
-fn the_line_of_an_unknown_state_says_the_os_error() {
+fn the_line_of_an_unknown_state_says_the_os_error_once() {
     crate::log_capture::install();
     let me = std::process::id();
     let kernel = FakeKernel::over(&HostKernel).open_proc_fails(rustix::io::Errno::MFILE);
@@ -92,7 +93,21 @@ fn the_line_of_an_unknown_state_says_the_os_error() {
 
     let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {me}'s state is unknown"));
     let os_error = std::io::Error::from(rustix::io::Errno::MFILE).to_string();
-    assert!(records.iter().any(|(_, line)| line.contains(&os_error)), "{records:?}");
+    assert!(
+        records.iter().any(|(_, line)| line.matches(&os_error).count() == 1),
+        "{records:?}"
+    );
+}
+
+/// What a stat that could not be read says is its own: the OS error is the `source()`, not
+/// repeated in the text.
+#[skuld::test]
+fn an_unknown_state_says_what_failed_and_not_the_os_error() {
+    let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+    let unreadable = StateUnknown::Unreadable(std::io::Error::from_raw_os_error(libc::EIO)).to_string();
+    assert!(!unreadable.contains(&os_error), "{unreadable}");
+    let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO)).to_string();
+    assert!(!view.contains(&os_error), "{view}");
 }
 
 #[skuld::test]

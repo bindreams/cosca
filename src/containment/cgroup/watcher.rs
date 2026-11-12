@@ -45,9 +45,17 @@ struct Shared {
     gone: AtomicBool,
     /// Why the pump stopped on its own, if it did: waits then report it rather than wait on a
     /// pump that will not broadcast again.
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<PumpFailure>>,
     /// The leaf's name, for reports.
     name: std::ffi::OsString,
+}
+
+/// Why the pump stopped: what failed, and the error of the call that did, which each wait that
+/// reports it shares.
+#[derive(Debug, Clone)]
+pub(crate) struct PumpFailure {
+    pub(crate) words: &'static str,
+    pub(crate) cause: Option<Arc<std::io::Error>>,
 }
 
 /// The running pump.
@@ -87,7 +95,7 @@ impl Watcher {
     }
 
     /// Why the pump stopped on its own, if it did.
-    pub(crate) fn failure(&self) -> Option<String> {
+    pub(crate) fn failure(&self) -> Option<PumpFailure> {
         self.shared.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -144,8 +152,11 @@ impl Drop for Watcher {
 }
 
 /// Record why the pump stops, and wake every wait to read it.
-fn fail(shared: &Shared, why: String) {
-    *shared.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+fn fail(shared: &Shared, words: &'static str, cause: Option<std::io::Error>) {
+    *shared.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(PumpFailure {
+        words,
+        cause: cause.map(Arc::new),
+    });
     shared.changed.notify(usize::MAX);
 }
 
@@ -162,18 +173,23 @@ fn run_pump(shared: &Shared, stop: &OwnedFd) {
                 PollFd::from_borrowed_fd(stop.as_fd(), PollFlags::IN),
             ];
             if let Err(e) = crate::wait::poll_ready(&mut fds) {
-                break fail(shared, format!("its watch could not be polled ({e})"));
+                break fail(shared, "its watch could not be polled", Some(std::io::Error::from(e)));
             }
             if !fds[1].revents().is_empty() {
                 break;
             }
+            // A forced failure is a failed `read` of the inotify instance: `EIO`.
             #[cfg(test)]
             if super::fault::take_force_pump_failure(&shared.name) {
-                break fail(shared, "its watch could not be read (forced)".into());
+                break fail(
+                    shared,
+                    "its watch could not be read",
+                    Some(std::io::Error::from_raw_os_error(libc::EIO)),
+                );
             }
             let changed = match watch.consume() {
                 Ok(changed) => changed,
-                Err(e) => break fail(shared, format!("its watch could not be read ({e})")),
+                Err(e) => break fail(shared, "its watch could not be read", Some(e.into_io())),
             };
             if watch.saw_removal() {
                 shared.gone.store(true, Ordering::Release);
@@ -187,7 +203,7 @@ fn run_pump(shared: &Shared, stop: &OwnedFd) {
     } else {
         // Every leaf a wait can block on holds a watch: a waitable leaf without one reads as
         // drained before any wait listens.
-        fail(shared, "its watch was never armed".into());
+        fail(shared, "its watch was never armed", None);
         debug_assert!(false, "a cgroup leaf's pump started with no watch armed");
     }
     drop(watch);

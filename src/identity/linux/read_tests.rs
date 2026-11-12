@@ -184,7 +184,11 @@ fn the_error_for_an_unopenable_proc_keeps_the_os_error_as_its_source() {
         detail,
         "the spawned child identity could not be read: /proc could not be opened"
     );
-    assert_eq!(err.raw_os_error(), Some(Errno::MFILE.raw_os_error()), "{err:?}");
+    assert_eq!(
+        crate::error::first_os_code(&err),
+        Some(Errno::MFILE.raw_os_error()),
+        "{err:?}"
+    );
 }
 
 #[skuld::test]
@@ -194,7 +198,11 @@ fn the_error_for_a_failed_pidfd_call_keeps_the_errno_as_its_source() {
         panic!("{err:?}");
     };
     assert_eq!(detail, "pid 4242 identity could not be read: pidfd_open");
-    assert_eq!(err.raw_os_error(), Some(Errno::MFILE.raw_os_error()), "{err:?}");
+    assert_eq!(
+        crate::error::first_os_code(&err),
+        Some(Errno::MFILE.raw_os_error()),
+        "{err:?}"
+    );
 }
 
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.

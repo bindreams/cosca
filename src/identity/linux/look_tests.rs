@@ -109,7 +109,7 @@ fn assert_unknown_with(errno: Errno, row: &str, (name, got, cause): (&str, Resol
     let err = cause.into_error("pid 4242").expect("the errno is the cause");
     assert!(matches!(err, Error::Unassessable { .. }), "{row}, {name}: {err:?}");
     assert_eq!(
-        err.raw_os_error(),
+        crate::error::first_os_code(&err),
         Some(errno.raw_os_error()),
         "{row}, {name}: the errno is in the chain"
     );

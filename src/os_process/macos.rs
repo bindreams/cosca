@@ -260,7 +260,7 @@ impl ExitWatch {
         };
         match kq.subscribe(exit) {
             Ok(()) => Ok(Self::new(kq)),
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Self { kq, exited: true }),
+            Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self { kq, exited: true }),
             Err(e) => Err(e),
         }
     }

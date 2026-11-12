@@ -145,7 +145,7 @@ fn open_verified_on_a_live_non_leader_tid_is_not_thread_group_leader_whichever_e
         match open_verified_error_with(&kernel, id) {
             Err(Error::NotThreadGroupLeader { pid, source, .. }) => {
                 assert_eq!(pid, id.pid());
-                assert_eq!(source.raw_os_error(), Some(errno.raw_os_error()));
+                assert_eq!(crate::error::first_os_code(&*source), Some(errno.raw_os_error()));
             }
             other => panic!("{errno} on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
         }
@@ -201,7 +201,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         .diverged_view();
     let result = open_verified_error_with(&kernel, worker.id).map(|fd| fd.is_some());
     let err = assert_unassessable_with_cause(result, &["outer pid namespace"], true, &marker, mark);
-    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
     assert!(!err.to_string().contains("pidfd_open"), "{err}");
     let report = crate::error::Report(&err).to_string();
     assert!(report.contains("pidfd_open"), "{report}");
@@ -226,7 +226,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
         &marker,
         mark,
     );
-    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads
@@ -271,7 +271,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
                 ..
             },
         ) => {
-            assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
+            assert_eq!(crate::error::first_os_code(source), Some(libc::EINVAL));
             let report = crate::error::Report(e).to_string();
             assert!(report.contains("pidfd_open"), "{report}");
         }

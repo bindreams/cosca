@@ -1,5 +1,7 @@
 //! Crate error taxonomy.
 
+use std::sync::Arc;
+
 /// Why splitting a command line failed. `pos` is a 0-based byte offset.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{kind} at offset {pos}")]
@@ -207,14 +209,14 @@ pub enum Error {
         platform: &'static str,
         detail: String,
         #[source]
-        source: Option<Box<Error>>,
+        source: Option<Arc<Error>>,
     },
     /// A containment mechanism could not be established or torn down.
     #[error("process containment failed: {detail}")]
     Containment {
         detail: String,
         #[source]
-        source: Option<Box<Error>>,
+        source: Option<Arc<Error>>,
     },
     /// The calling process has no attached console, so Windows' console-group graceful
     /// signal (`CTRL_BREAK`) cannot be delivered — the caller is a GUI-subsystem binary,
@@ -229,7 +231,7 @@ pub enum Error {
         kind: ElevationErrorKind,
         detail: String,
         #[source]
-        source: Option<Box<Error>>,
+        source: Option<Arc<Error>>,
     },
     /// The OS refused to establish whether the target process exists or is running, so the
     /// operation was not performed. Distinct from a failure of the operation: nothing is
@@ -251,7 +253,7 @@ pub enum Error {
     Unassessable {
         detail: String,
         #[source]
-        source: Option<Box<Error>>,
+        source: Option<Arc<Error>>,
     },
     /// A tree-walk kill left a member running: it killed what it could, and `pid`, the first member
     /// it left behind, was not. `source` says why: the member's identity could not be read, at the
@@ -276,7 +278,7 @@ pub enum Error {
     MemberNotKilled {
         pid: u32,
         #[source]
-        source: Box<Error>,
+        source: Arc<Error>,
         /// What the spawn's cleanup adds of the child's fate, when it is the one that returns the
         /// error. It leaves `source` as it is, which keeps the refusal's OS error.
         note: Option<String>,
@@ -290,7 +292,7 @@ pub enum Error {
         pid: u32,
         detail: String,
         #[source]
-        source: Box<Error>,
+        source: Arc<Error>,
     },
     /// A persisted process identity could not be produced or restored — see
     /// [`RecordErrorKind`] for why. `source` carries the OS error when the failure was a
@@ -300,7 +302,7 @@ pub enum Error {
         kind: RecordErrorKind,
         detail: String,
         #[source]
-        source: Option<Box<Error>>,
+        source: Option<Arc<Error>>,
     },
     /// A spawn failed, and the program may have started: retrying it may run it twice. `source` is
     /// what failed, and `fate` is what the failed spawn did with its child.
@@ -343,7 +345,7 @@ pub enum Error {
         /// message says so. A pkexec child is the program itself, so this is `false` for it.
         wrapper_elevated: bool,
         #[source]
-        source: Box<Error>,
+        source: Arc<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
         /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is the one of a child that
         /// is not known to have been collected: [`ChildFate::Running`], [`ChildFate::Unknown`] when
@@ -445,6 +447,16 @@ pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> 
     )
 }
 
+/// [`io_context`] for a cause that may be absent: without one, an `io::Error` of kind
+/// [`Other`](std::io::ErrorKind::Other) that says `context`.
+#[cfg(target_os = "linux")]
+pub(crate) fn io_context_or_other(context: impl Into<String>, cause: Option<std::io::Error>) -> std::io::Error {
+    match cause {
+        Some(cause) => io_context(context, cause),
+        None => std::io::Error::other(context.into()),
+    }
+}
+
 /// `e` as the `io::Error` std reports for the same failure: a `HRESULT_FROM_WIN32` code unwrapped to
 /// its Win32 code, which `raw_os_error()` and `kind()` classify. Every `windows::core::Error` that
 /// becomes an `io::Error` goes through here: the `windows` crate's own conversion keeps the HRESULT
@@ -481,9 +493,10 @@ pub(crate) fn chain<'a>(
     std::iter::successors(Some(error), |e| e.source())
 }
 
-/// The first OS code down `error`'s [`chain`]: the first `io::Error` layer that has one. `None`
-/// when the chain holds none.
-#[cfg(any(target_os = "macos", test))]
+/// The OS code of a failure, for a look whose failure is told apart by it: the first `io::Error`
+/// down `error`'s [`chain`] that has one. `None` when the chain holds none. The one getter of the
+/// code, for any error: an `io_context` error has none of its own, and its cause below it does.
+#[cfg(any(unix, test))]
 pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
     chain(error)
         .filter_map(|layer| layer.downcast_ref::<std::io::Error>())
@@ -525,31 +538,20 @@ impl std::error::Error for IoContext {
     }
 }
 
-/// An `io::Error` kept as data, for a type that is `Clone` and `Eq`. [`to_io`](Self::to_io) makes
-/// the error again: the same OS code, or the same kind and text for one that has none.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IoFailure {
-    kind: std::io::ErrorKind,
-    code: Option<i32>,
-    text: String,
+/// Hands out a cause kept by a cloneable holder, shared and never rebuilt: an `io::Error` with a
+/// payload becomes one of the same kind over `e` (forwarding its `Display` and `source()`); a bare OS
+/// error is copied exactly. std forwards both through the `Arc` and the payload, so [`Report`] prints
+/// what `e` said and a coded `io::Error` below it stays a layer: the reason it must not rebuild.
+pub(crate) fn shared_io(e: &Arc<std::io::Error>) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(e.kind(), Arc::clone(e)),
+    }
 }
 
-impl IoFailure {
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix pkexec probe keeps a failure"))]
-    pub(crate) fn of(e: &std::io::Error) -> IoFailure {
-        IoFailure {
-            kind: e.kind(),
-            code: e.raw_os_error(),
-            text: e.to_string(),
-        }
-    }
-
-    pub(crate) fn to_io(&self) -> std::io::Error {
-        match self.code {
-            Some(code) => std::io::Error::from_raw_os_error(code),
-            None => std::io::Error::new(self.kind, self.text.clone()),
-        }
-    }
+/// [`shared_io`] as the `source` of an error: an [`Error::Io`] over the handed-out `io::Error`.
+pub(crate) fn shared_io_cause(e: &Arc<std::io::Error>) -> Arc<Error> {
+    Error::io_cause(shared_io(e))
 }
 
 impl Error {
@@ -568,8 +570,8 @@ impl Error {
     }
 
     /// `e` as the `source` of an error it caused.
-    pub(crate) fn io_cause(e: std::io::Error) -> Box<Error> {
-        Box::new(Error::Io(e))
+    pub(crate) fn io_cause(e: std::io::Error) -> Arc<Error> {
+        Arc::new(Error::Io(e))
     }
 
     /// What a failed spawn did with its child, for an error that says the program may have started
@@ -612,14 +614,6 @@ impl Error {
         }
     }
 
-    /// The OS error code of a failure, for a look whose failure is told apart by it: the first
-    /// `io::Error` down the `source()` chain that has one ([`first_os_code`]). `None` when the
-    /// chain holds none.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn raw_os_error(&self) -> Option<i32> {
-        first_os_code(self)
-    }
-
     /// The `io::Error`s down this error's `source()` chain, outermost first. Under [`io_context`]
     /// and [`with_note`](Error::with_note) the first of them is a code-less wrapper and the OS error
     /// comes below it.
@@ -630,20 +624,14 @@ impl Error {
 
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), so the OS code stays where
-    /// `Error::raw_os_error`, the walk described on [`Error`], finds it. An
+    /// original error as the [`source`](std::error::Error::source), so the OS code stays where the
+    /// walk described on [`Error`] finds it. An
     /// [`Error::MemberNotKilled`] takes the note in its own `note`, so its `source` (and the OS error
     /// that is part of its contract) is untouched.
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
         match self {
-            Error::Io(source) => Error::Io(std::io::Error::new(
-                source.kind(),
-                IoNote {
-                    note: note.to_owned(),
-                    source,
-                },
-            )),
+            Error::Io(source) => Error::Io(io_note(note.to_owned(), source)),
             Error::Unsupported {
                 op,
                 platform,
@@ -698,7 +686,15 @@ impl Error {
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
-                source: Box::new(source.with_note(note)),
+                // A freshly built cause has one owner and takes the note; a shared one cannot be
+                // rewritten, so in release it stays as it is.
+                source: match Arc::try_unwrap(source) {
+                    Ok(owned) => Arc::new(owned.with_note(note)),
+                    Err(shared) => {
+                        debug_assert!(false, "a spawn's cause has one owner: {shared:?}");
+                        shared
+                    }
+                },
                 unreaped,
             },
             Error::Quote(e) => {
@@ -711,6 +707,12 @@ impl Error {
             }
         }
     }
+}
+
+/// `source` with `note` after its message, of `source`'s own kind, and kept as the new error's
+/// [`source`](std::error::Error::source).
+fn io_note(note: String, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(source.kind(), IoNote { note, source })
 }
 
 /// An I/O error with a note after its message; the error itself is the source.

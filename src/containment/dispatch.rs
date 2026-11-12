@@ -300,14 +300,15 @@ impl DropView {
 
     /// The look the mechanism's kill decides on: the one this view is worded from.
     pub(crate) fn look(&self) -> RootState {
-        self.root.duplicate()
+        self.root.clone()
     }
 
-    /// Why the root's number may not be trusted, for a log line or a note.
+    /// Why the root's number may not be trusted, for a log line or a note, with the error of a handle
+    /// that could not say after it.
     pub(crate) fn why_number_untrusted(&self) -> String {
         match &self.root {
             RootState::Reaped { .. } => "the root is already reaped".to_owned(),
-            untrusted => crate::signal::why_untrusted(untrusted),
+            untrusted => crate::signal::why_untrusted_with_cause(untrusted),
         }
     }
 }
@@ -1534,8 +1535,8 @@ fn attach_tree(
                 return match crate::containment::windows::assign_held(proc_handle) {
                     Ok(job) => Ok(Tree::contained(Mechanism::Job(job))),
                     Err(e) => Err(Error::Containment {
-                        detail: e.to_string(),
-                        source: None,
+                        detail: "the frozen child could not be assigned to its job".to_owned(),
+                        source: Some(Error::io_cause(e)),
                     }),
                 };
             }
@@ -1550,8 +1551,8 @@ fn attach_tree(
                 }
                 Err(e) => {
                     return Err(Error::Containment {
-                        detail: e.to_string(),
-                        source: None,
+                        detail: "the child's initial threads could not be resumed".to_owned(),
+                        source: Some(Error::io_cause(e)),
                     })
                 }
             }

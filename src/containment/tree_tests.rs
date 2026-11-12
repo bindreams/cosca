@@ -197,7 +197,7 @@ fn a_released_tree_keeps_its_kind() {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![Error::MemberNotKilled {
                 pid: 8,
-                source: Box::new(Error::Unassessable {
+                source: std::sync::Arc::new(Error::Unassessable {
                     detail: "its identity could not be read".into(),
                     source: None,
                 }),

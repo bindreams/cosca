@@ -70,7 +70,7 @@ impl Root for Seen<'_> {
     }
 
     fn look_state(&self) -> RootState {
-        self.look.duplicate()
+        self.look.clone()
     }
 
     #[cfg(target_os = "linux")]
@@ -131,7 +131,7 @@ pub(crate) enum Refusal {
     /// Something else reaped the root.
     ReapedElsewhere(RawPid),
     /// The root's handle could not say whether it was reaped.
-    Unsure(RawPid, std::io::Error),
+    Unsure(RawPid, std::sync::Arc<std::io::Error>),
     /// This process does not pin the root (macOS: launchd holds its zombie).
     Unpinned(RawPid),
 }
@@ -150,11 +150,32 @@ impl std::fmt::Display for Refusal {
                 write!(f, "this handle reaped the root, and its pid ({pid}) could not be read")
             }
             Refusal::ReapedElsewhere(pid) => write!(f, "the root (pid {pid}) was reaped elsewhere"),
-            Refusal::Unsure(pid, e) => write!(
+            Refusal::Unsure(pid, _) => write!(
                 f,
-                "the root's own handle could not say whether it (pid {pid}) was reaped ({e})"
+                "the root's own handle could not say whether it (pid {pid}) was reaped"
             ),
             Refusal::Unpinned(pid) => write!(f, "the root (pid {pid}) is not pinned by this process"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {
+    /// The error of a handle that could not say.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Refusal::Unsure(_, e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Refusal {
+    /// The handle's error, shared ([`crate::error::shared_io`]).
+    pub(crate) fn cause(&self) -> Option<std::sync::Arc<crate::error::Error>> {
+        match self {
+            Refusal::Unsure(_, e) => Some(crate::error::shared_io_cause(e)),
+            _ => None,
         }
     }
 }
@@ -245,7 +266,8 @@ pub(crate) fn through_the_pidfd(look: NumberLook, root: &dyn Root) -> NumberLook
     match group_has_member(Some(root)) {
         Some(true) => {
             log::debug!(
-                "{refusal}, but its pidfd names its process group exactly, which still has a member: it is signalled"
+                "{refusal}, but its pidfd names its process group exactly, which still has a member: it is signalled",
+                refusal = crate::error::Report(refusal)
             );
             NumberLook::Trusted
         }
@@ -275,6 +297,29 @@ impl std::fmt::Display for NotItsGroup {
             NotItsGroup::Empty => f.write_str("the root's process group has no member left"),
             NotItsGroup::Unproven(why) => std::fmt::Display::fmt(why, f),
             NotItsGroup::NoRoot => f.write_str("no root was given to check"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for NotItsGroup {
+    /// An unproven number's refusal says what it says and its error is the source, as the refusal's
+    /// own: this layer adds no words of its own.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            NotItsGroup::Unproven(why) => std::error::Error::source(why),
+            NotItsGroup::Empty | NotItsGroup::NoRoot => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl NotItsGroup {
+    /// The error behind this refusal, as the `source` of an error that says it ([`Refusal::cause`]).
+    pub(crate) fn cause(&self) -> Option<std::sync::Arc<crate::error::Error>> {
+        match self {
+            NotItsGroup::Unproven(why) => why.cause(),
+            NotItsGroup::Empty | NotItsGroup::NoRoot => None,
         }
     }
 }

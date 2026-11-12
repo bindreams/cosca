@@ -99,7 +99,7 @@ fn open_pid_of_a_pid_whose_pidfd_call_failed_is_the_opens_error() {
         panic!("a failed inode read: expected Io, got {result:?}");
     };
     assert!(e.to_string().starts_with("pidfs_ino: "), "{e}");
-    assert_eq!(e.raw_os_error(), Some(Errno::BADF.raw_os_error()));
+    assert_eq!(crate::error::first_os_code(e), Some(Errno::BADF.raw_os_error()));
 }
 
 #[cfg(windows)]
