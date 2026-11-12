@@ -122,7 +122,7 @@ fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
     let p = super::WindowsProcess::for_child(
-        super::cancel::new_cancel_event().expect("create an event handle"),
+        super::test_event::new_test_event().expect("create an event handle"),
         std::process::id(),
     );
     let err = p.signal(Sig::Kill).expect_err("an event cannot be terminated");
@@ -144,7 +144,7 @@ fn a_uac_handle_whose_access_cannot_be_read_is_refused_for_permission() {
 
     let granted = super::access_of_uac_read(Err::<u32, _>(std::io::Error::other("unreadable")));
     assert_eq!(granted, PROCESS_SYNCHRONIZE);
-    let event = super::cancel::new_cancel_event().expect("create an event handle");
+    let event = super::test_event::new_test_event().expect("create an event handle");
     let p = super::WindowsProcess::for_uac(event, std::process::id(), granted);
     assert_eq!(p.kill_refusal(), KillRefusal::Permission);
 }

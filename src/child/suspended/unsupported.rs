@@ -1,16 +1,13 @@
 //! Off Windows there is no frozen spawn.
 
-use crate::child::spawn::SpawnFailure;
 use crate::child::{Child, SuspendedChild};
 use crate::command::Command;
 use crate::error::Error;
 
-/// The refusal both frozen spawns give, before anything of the command is touched.
-pub(crate) fn spawn_frozen<T>(
-    _cmd: &mut Command,
-    _spawn: impl FnOnce(&mut Command) -> Result<T, SpawnFailure>,
-) -> Result<(T, bool), Error> {
-    Err(Error::Unsupported {
+/// The refusal both frozen spawns give, before anything of the command is touched or any runtime
+/// is asked for.
+pub(crate) fn refusal(_cmd: &Command) -> Error {
+    Error::Unsupported {
         op: "spawn_suspended".into(),
         platform: std::env::consts::OS,
         detail: "a suspended spawn is implemented on Windows only: a POSIX child cannot be held \
@@ -18,17 +15,11 @@ pub(crate) fn spawn_frozen<T>(
                  does not allow"
             .into(),
         source: None,
-    })
+    }
 }
 
 pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
-    spawn_frozen(cmd, |cmd| {
-        crate::child::spawn::spawn_uncommitted(cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
-    })
-    .map(|(child, wanted_kill_on_drop)| SuspendedChild {
-        child,
-        wanted_kill_on_drop,
-    })
+    Err(refusal(cmd))
 }
 
 /// There is no `SuspendedChild` to resume here: `spawn` never returns one.

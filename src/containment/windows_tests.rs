@@ -1,9 +1,7 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
-use std::os::windows::io::AsRawHandle;
-
-use crate::test_child::Console;
+use crate::test_child::{let_member_exit, spawn_job_member, Console};
 
 #[skuld::test]
 fn job_handle_debug_does_not_panic() {
@@ -19,7 +17,7 @@ fn job_handle_debug_does_not_panic() {
 fn wait_drained_after_hard_kill_reports_the_drain() {
     let (mut child, job) = spawn_job_member();
     job.hard_kill().expect("hard_kill on a live job");
-    let verdict = job.wait_drained(None, None).expect("wait_drained after hard_kill");
+    let verdict = job.wait_drained(None).expect("wait_drained after hard_kill");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     let status = child.wait().expect("reap the killed member");
     assert!(!status.success(), "the member was killed: {status:?}");
@@ -146,7 +144,7 @@ fn wait_drained_raw_reports_drained_for_an_empty_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
     let job_handle = job.handle();
-    let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
@@ -157,7 +155,7 @@ fn wait_drained_raw_reports_drained_for_an_empty_job() {
 fn assert_drained_only_by_a_fresh_listing(listed: Vec<u32>) {
     let job = super::JobHandle::create_empty_for_test();
     let forced = super::fault::force_job_pid_list(listed);
-    let verdict = super::wait_drained_raw(job.handle(), None, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     assert_eq!(
         super::fault::job_pid_list_queries(),
@@ -195,7 +193,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_when_the_one_more_l
     let forced = super::fault::force_job_pid_list(vec![1]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
@@ -212,7 +210,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_when_the_one
     let forced = super::fault::force_job_pid_list(vec![1]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
@@ -231,7 +229,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_off_its_own_
     let forced = super::fault::force_job_pid_lists([]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
     assert_eq!(super::fault::job_pid_list_queries(), 1, "the round's own listing only");
@@ -250,7 +248,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_lists_no_third_time() {
     let forced = super::fault::force_job_pid_lists([vec![1], vec![1]]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
@@ -271,7 +269,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_lists_once_more_after_a_signalled_p
     child.wait().expect("the member exits");
     // The member's own child (`more`) is a member too: the job is empty only once it has gone.
     assert_eq!(
-        super::wait_drained_raw(job.handle(), None, None).expect("the job drains"),
+        super::wait_drained_raw(job.handle(), None).expect("the job drains"),
         crate::containment::TreeDrain::AllMembersExited
     );
     // SAFETY: a standard Win32 call; the handle is closed below.
@@ -290,7 +288,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_lists_once_more_after_a_signalled_p
     let forced = super::fault::force_job_pid_list(vec![child.id()]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
@@ -306,7 +304,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listin
     let forced = super::fault::force_job_pid_list(Vec::new());
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
-    let verdict = super::wait_drained_raw(job.handle(), zero, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job.handle(), zero).expect("wait_drained_raw");
 
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     assert_eq!(super::fault::job_pid_list_queries(), 1, "exactly one listing");
@@ -350,7 +348,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     // blocking at all, so this assertion is instantaneous — the point under test is that a
     // non-empty live member set reports MembersRemain rather than a guessed drain verdict.
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let verdict = super::wait_drained_raw(job_handle, Some(past), None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, Some(past)).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::MembersRemain);
 
     // Let the child exit on its own terms (EOF on stdin), then confirm the job reports drained
@@ -359,38 +357,12 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     drop(child.stdin.take());
     child.wait().expect("wait for cmd /C more to exit");
 
-    let verdict = super::wait_drained_raw(job_handle, None, None).expect("wait_drained_raw");
+    let verdict = super::wait_drained_raw(job_handle, None).expect("wait_drained_raw");
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
 // Deadline contract for `wait_drained_raw`: never report `MembersRemain` before the real
 // deadline. Seams are documented in `crate::wait`.
-
-/// `cmd /C more`, blocked reading its own piped stdin until EOF.
-fn spawn_blocker() -> std::process::Child {
-    crate::test_spawn::spawn(
-        std::process::Command::new("cmd")
-            .args(["/C", "more"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    )
-    .expect("spawn cmd /C more")
-}
-
-/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
-/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
-fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
-    let child = spawn_blocker();
-    let raw = child.as_raw_handle();
-    let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
-    (child, job)
-}
-
-fn let_member_exit(mut child: std::process::Child) {
-    drop(child.stdin.take());
-    child.wait().expect("wait for cmd /C more to exit");
-}
 
 /// A never-draining job armed with a sub-millisecond remainder rounds up to 1ms, reports
 /// `MembersRemain` only at the deadline, and derives its argument from the site's own deadline.
@@ -406,7 +378,7 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     crate::wait::wait_ms_probe::take();
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
     let deadline = at + Duration::from_millis(5);
-    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline));
     let reached = Instant::now() >= deadline;
     let arms = crate::wait::wait_ms_probe::take();
     let_member_exit(child);
@@ -439,7 +411,7 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> member exits for real
     let deadline = Instant::now() + Duration::from_secs(3600);
-    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline));
     let arms = crate::wait::wait_ms_probe::take();
     child.wait().expect("reap the member after it exits");
     assert_eq!(
@@ -463,7 +435,7 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     let _clamp = crate::wait::wait_clamp_seam::set(5);
     crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
     let deadline = Instant::now() + Duration::from_secs(3600);
-    let verdict = super::wait_drained_raw(job_handle, Some(deadline), None);
+    let verdict = super::wait_drained_raw(job_handle, Some(deadline));
     let arms = crate::wait::wait_ms_probe::take();
     child.wait().expect("reap the member after it exits");
     assert_eq!(

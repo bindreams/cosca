@@ -11,7 +11,9 @@ use crate::child::owned::teardown::{Disposition, Remains, TeardownOutcome};
 #[cfg(unix)]
 use crate::child::owned::ChildWaitOutcome;
 use crate::child::owned::OwnedChild;
-pub(crate) use crate::child::spawn::failure::{after_the_spawn, failed_after_the_spawn, Classify, SpawnFailure};
+#[cfg(unix)]
+pub(crate) use crate::child::spawn::failure::failed_after_the_spawn;
+pub(crate) use crate::child::spawn::failure::{after_the_spawn, failed_after_teardown, Classify, SpawnFailure};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp};
@@ -2739,6 +2741,7 @@ pub(crate) mod fault {
     use std::cell::Cell;
 
     use crate::identity::ProcessId;
+    use crate::relayed_probe::{self, Probe};
 
     thread_local! {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
@@ -2890,9 +2893,43 @@ pub(crate) mod fault {
         crate::oneshot_hook::arm(hook_at(point), hook)
     }
 
+    /// Which thread ran the spawn, and whom it had forked, at each [`SpawnPoint`] it passed: a
+    /// [`relayed_probe`], so it follows the async spawn onto the blocking pool.
+    pub(crate) struct Ran;
+    impl Probe for Ran {
+        type Event = RanAt;
+    }
+
+    /// One report of [`Ran`]: the spawn is at `point` on `thread`, with the child `id` names.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async spawn's tests read it")
+    )]
+    pub(crate) struct RanAt {
+        pub(crate) point: SpawnPoint,
+        pub(crate) thread: std::thread::ThreadId,
+        pub(crate) id: crate::identity::Resolved<ProcessId>,
+    }
+
+    /// Install `tx` as this thread's [`Ran`] probe until the guard drops.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async spawn's tests install it")
+    )]
+    pub(crate) fn install_ran(tx: std::sync::mpsc::Sender<RanAt>) -> relayed_probe::Guard<Ran> {
+        relayed_probe::install(tx)
+    }
+
     /// Fire the hook armed for `point`, if any. Called by both spawns with the child's pid, which
     /// the hook reads through [`spawn_pid`].
     pub(crate) fn run_at(point: SpawnPoint, pid: u32) {
+        if relayed_probe::is_installed::<Ran>() {
+            relayed_probe::notify::<Ran>(RanAt {
+                point,
+                thread: std::thread::current().id(),
+                id: ProcessId::of(pid),
+            });
+        }
         SPAWN_PID.with(|p| p.set(Some(pid)));
         crate::oneshot_hook::fire(hook_at(point));
         SPAWN_PID.with(|p| p.set(None));

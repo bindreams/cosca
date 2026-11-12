@@ -306,6 +306,36 @@ pub(crate) fn live_blocker() -> (crate::Child, crate::PipeWriter, crate::identit
     (child, stdin, id)
 }
 
+/// `cmd /C more`, blocked reading its own piped stdin until EOF: a blocker every Windows host has.
+#[cfg(windows)]
+fn spawn_more_blocker() -> std::process::Child {
+    crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more")
+}
+
+/// A live job with one still-running member: [`spawn_more_blocker`], assigned to a new job.
+#[cfg(windows)]
+pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::windows::JobHandle) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let child = spawn_more_blocker();
+    let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
+    (child, job)
+}
+
+/// End a [`spawn_job_member`]'s member: EOF on its stdin, and reaped once it has exited.
+#[cfg(windows)]
+pub(crate) fn let_member_exit(mut child: std::process::Child) {
+    drop(child.stdin.take());
+    child.wait().expect("wait for cmd /C more to exit");
+}
+
 /// [`held_contained_blocker`], contained by [`contain_without_cgroup`].
 #[cfg(unix)]
 pub(crate) fn held_contained_blocker_without_cgroup(stdout: crate::Stdio) -> (crate::Child, crate::PipeWriter) {
@@ -472,28 +502,30 @@ fn held_blocker(
 
 /// Async twin of [`held_contained_blocker`].
 #[cfg(all(unix, feature = "tokio"))]
-pub(crate) fn held_contained_blocker_async(stdout: crate::Stdio) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, Console::Hidden, |cmd| _ = cmd.contain())
+pub(crate) async fn held_contained_blocker_async(
+    stdout: crate::Stdio,
+) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    held_blocker_async(stdout, Console::Hidden, |cmd| _ = cmd.contain()).await
 }
 
 /// Async twin of [`held_contained_blocker_on_console`].
 #[cfg(feature = "tokio")]
-pub(crate) fn held_contained_blocker_on_console_async(
+pub(crate) async fn held_contained_blocker_on_console_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, Console::Asked, |cmd| _ = cmd.contain())
+    held_blocker_async(stdout, Console::Asked, |cmd| _ = cmd.contain()).await
 }
 
 /// Async twin of [`held_contained_blocker_without_cgroup`].
 #[cfg(all(unix, feature = "tokio"))]
-pub(crate) fn held_contained_blocker_without_cgroup_async(
+pub(crate) async fn held_contained_blocker_without_cgroup_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup_async(cmd))
+    held_blocker_async(stdout, Console::Hidden, |cmd| _ = contain_without_cgroup_async(cmd)).await
 }
 
 #[cfg(feature = "tokio")]
-pub(crate) fn held_blocker_async(
+pub(crate) async fn held_blocker_async(
     stdout: crate::Stdio,
     console: Console,
     contain: impl FnOnce(&mut crate::tokio::Command),
@@ -503,7 +535,7 @@ pub(crate) fn held_blocker_async(
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(stdout).expect("set stdout");
     contain(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     (child, stdin)
 }
@@ -785,7 +817,7 @@ pub(crate) mod shared;
 /// Blocks until either `listener` gets a connection, or `target` exits first, never a bare,
 /// hang-forever `accept()`. The `src/` twin of `tests/common/accept.rs`'s `accept_or_die` (a
 /// separate compilation unit), built on the crate's own identity-verified exit-watch primitives
-/// (`crate::os_process::linux::open::open_verified_with`, `arm_proc_exit`, `wait_process_or_cancel`). The
+/// (`crate::os_process::linux::open::open_verified_with`, and `arm_proc_exit`). The
 /// `target` identity is verified when the watch is armed, so a reissued pid is reported as the
 /// target being gone, never watched.
 ///
@@ -830,7 +862,7 @@ pub(crate) struct DrainSignal {
 impl DrainSignal {
     pub(crate) fn new() -> Self {
         Self {
-            event: crate::os_process::windows::cancel::new_cancel_event().expect("create the drain event"),
+            event: crate::os_process::windows::test_event::new_test_event().expect("create the drain event"),
             outcome: shared::DrainOutcome::default(),
         }
     }
@@ -848,14 +880,14 @@ impl DrainSignal {
     /// Records the result of `wait_tree` and wakes the acceptor.
     pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
         self.outcome.store(result);
-        crate::os_process::windows::cancel::signal_cancel(&self.event);
+        crate::os_process::windows::test_event::signal_test_event(&self.event);
     }
 
     /// Runs `wait` (a `wait_tree`) and records its result; a `wait` that panics records an error.
     pub(crate) fn watch<T: std::fmt::Debug, E: std::fmt::Display>(&self, wait: impl FnOnce() -> Result<T, E>) {
         shared::run_watcher(
             &self.outcome,
-            || crate::os_process::windows::cancel::signal_cancel(&self.event),
+            || crate::os_process::windows::test_event::signal_test_event(&self.event),
             wait,
         );
     }
@@ -874,7 +906,7 @@ pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &Dr
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let accept_event = crate::os_process::windows::cancel::new_cancel_event()
+    let accept_event = crate::os_process::windows::test_event::new_test_event()
         .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     // SAFETY: `sock` is the listener's own live socket; the event is a live, owned handle.
@@ -1043,7 +1075,7 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     };
     // SAFETY: `open_verified` returns a handle the caller owns; this wraps it so it is closed.
     let process = unsafe { OwnedHandle::from_raw_handle(process.0 as _) };
-    let accept_event = crate::os_process::windows::cancel::new_cancel_event()
+    let accept_event = crate::os_process::windows::test_event::new_test_event()
         .expect("create an event for the listener's accept-readiness watch");
     let sock = SOCKET(listener.as_raw_socket() as usize);
     let wsa_event = WSAEVENT(accept_event.as_raw_handle() as _);
@@ -1546,22 +1578,22 @@ fn windows_blocker_with(console: Console) -> (crate::Child, crate::PipeWriter) {
 
 /// Async twin of [`windows_blocker`]; `configure` selects the containment under test.
 #[cfg(all(windows, feature = "tokio"))]
-pub(crate) fn windows_blocker_async(
+pub(crate) async fn windows_blocker_async(
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    windows_blocker_async_with(Console::Hidden, configure)
+    windows_blocker_async_with(Console::Hidden, configure).await
 }
 
 /// [`windows_blocker_async`] on this process's console, for a test of the graceful signals.
 #[cfg(all(windows, feature = "tokio"))]
-pub(crate) fn windows_blocker_on_console_async(
+pub(crate) async fn windows_blocker_on_console_async(
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    windows_blocker_async_with(Console::Asked, configure)
+    windows_blocker_async_with(Console::Asked, configure).await
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-fn windows_blocker_async_with(
+async fn windows_blocker_async_with(
     console: Console,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
@@ -1570,7 +1602,7 @@ fn windows_blocker_async_with(
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     configure(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     (child, stdin)
 }
@@ -1647,7 +1679,7 @@ pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut readiness = [0u8; 1];
     child

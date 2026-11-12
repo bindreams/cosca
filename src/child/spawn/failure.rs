@@ -114,6 +114,22 @@ pub(crate) fn failed_after_the_spawn(
     }
 }
 
+/// [`failed_after_the_spawn`] for a `cause` that called for a teardown of the child, whose result is
+/// `torn_down`. `Err(note)` is a teardown that did not run, because the task that was to run it was
+/// cancelled and dropped the child instead: the `cause` stays, `note` goes beside it, and nothing
+/// reports what the drop did, so the fate is [`ChildFate::Unknown`]. (`Running { id: None }` would
+/// say cosca left the child alone before its identity was read.)
+pub(crate) fn failed_after_teardown(
+    cause: Error,
+    behind_front: bool,
+    torn_down: Result<(ChildFate, Option<Unreaped>), String>,
+) -> SpawnFailure {
+    match torn_down {
+        Ok((fate, unreaped)) => failed_after_the_spawn(cause, fate, unreaped, behind_front),
+        Err(note) => failed_after_the_spawn(cause.with_note(&note), ChildFate::Unknown, None, behind_front),
+    }
+}
+
 // Only the Unix tests take a `SpawnFailure` apart; the rest read the public `Error`.
 #[cfg(all(test, unix))]
 impl SpawnFailure {

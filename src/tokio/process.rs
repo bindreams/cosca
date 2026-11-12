@@ -55,13 +55,13 @@ impl Process {
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
     /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure. Dropping the future cancels the watch on every
-    /// platform (the Windows watcher is released via its cancel event).
+    /// platform (the Windows registered wait is unregistered).
     ///
     /// # Runtime
     ///
     /// Needs a runtime with the IO driver enabled on Unix (the `#[tokio::main]` /
     /// `#[tokio::test]` defaults) — missing it, tokio panics rather than returning a typed
-    /// error. On Windows the watch runs on the blocking pool (one thread per in-flight wait).
+    /// error. On Windows the watch holds no thread.
     pub async fn wait(&self) -> Result<(), Error> {
         let exited = crate::tokio::drive::exited_held(self.inner.os(), None).await?;
         debug_assert!(exited);

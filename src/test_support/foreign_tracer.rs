@@ -396,7 +396,7 @@ pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::
     let mut cmd = tokio_tracee_command();
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    let mut child = cmd.spawn().expect("spawn the tracee");
+    let mut child = cmd.spawn().await.expect("spawn the tracee");
     let stdin = child.stdin().expect("piped stdin");
     let mut lines = ::tokio::io::BufReader::new(child.stdout().expect("piped stdout")).lines();
     loop {

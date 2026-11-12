@@ -1,21 +1,23 @@
-//! Windows: the async twin of `child::disarm_refused_tests`, for what the async `Child` adds to the
-//! sync one: `detach` and `commit_kill_on_drop` return the refusal of the sync `Child` they call. The
-//! refusal is real (a job handle without `JOB_OBJECT_SET_ATTRIBUTES`).
+//! Windows: what the async `Child` adds to `child::disarm_refused_tests`: `detach` returns the
+//! refusal of the sync `Child` it calls. The refusal is real (a job handle without
+//! `JOB_OBJECT_SET_ATTRIBUTES`). A refused disarm in the async spawn's own path (`resume`) is
+//! pinned in `suspended_tests`.
 
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use super::Child;
 use crate::containment::windows::JobHandle;
 use crate::containment::{Mechanism, Tree};
-use crate::error::{ChildFate, Error};
+use crate::error::Error;
 use crate::identity::{Liveness, ProcessId};
-use crate::test_child::{expect_may_have_started_parts, held_blocker_async, Console};
+use crate::test_child::{held_blocker_async, Console};
 
 /// A live blocker whose containment is a job that refuses `disarm`; `kill_on_drop` is the command's.
-fn refusing_child(kill_on_drop: bool) -> (Child, crate::tokio::ChildStdin, ProcessId) {
+async fn refusing_child(kill_on_drop: bool) -> (Child, crate::tokio::ChildStdin, ProcessId) {
     let (mut child, stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
         _ = cmd.kill_on_drop(kill_on_drop);
-    });
+    })
+    .await;
     child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     (child, stdin, id)
@@ -37,7 +39,7 @@ fn assert_access_denied(error: &Error) {
 #[skuld::test]
 async fn a_refused_detach_is_returned_and_leaves_the_child_armed() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin, id) = refusing_child(true);
+    let (mut child, _stdin, id) = refusing_child(true).await;
 
     let error = child.detach().expect_err("the disarm was refused");
 
@@ -54,77 +56,11 @@ async fn a_refused_detach_is_returned_and_leaves_the_child_armed() {
 #[skuld::test]
 async fn detaching_a_child_that_is_already_disarmed_is_ok_without_asking_the_job() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin, id) = refusing_child(false);
+    let (mut child, stdin, id) = refusing_child(false).await;
 
     child.detach().expect("the child was already disarmed");
 
     assert_eq!(id.is_alive(), Liveness::Alive);
     drop(stdin);
-    drop(child);
-}
-
-/// A spawn with `kill_on_drop(false)` whose disarm is refused fails, and its child, still armed, is
-/// torn down.
-///
-/// Mutants: the commit logs the refusal and returns the child; it fails the spawn but leaves the
-/// child running.
-#[skuld::test]
-async fn a_refused_disarm_fails_a_kill_on_drop_false_spawn_and_kills_the_child() {
-    crate::tokio::test_runtime::assert_current_thread();
-    let (child, _stdin, id) = refusing_child(false);
-
-    let failure = child.commit_kill_on_drop().expect_err("the disarm was refused");
-
-    let (cause, fate, handed_back) = expect_may_have_started_parts(failure.into(), ());
-    assert_access_denied(&cause);
-    assert_eq!(fate, ChildFate::Reaped);
-    assert!(handed_back.is_none(), "the teardown handed the child back");
-    assert_eq!(id.is_alive(), Liveness::Dead);
-}
-
-/// Async twin of the sync `a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag`.
-///
-/// Mutants: `commit_kill_on_drop` sets the flag from `report.is_some()` or from
-/// `may_run_as_another_user()`.
-#[skuld::test]
-async fn a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag() {
-    use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
-    crate::tokio::test_runtime::assert_current_thread();
-    for via in VIAS_WITHOUT_A_FRONT {
-        let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
-            _ = cmd.kill_on_drop(false);
-            cmd.set_elevation_report(Some(report(via.clone())));
-        });
-        child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
-
-        let error = Error::from(child.commit_kill_on_drop().expect_err("the disarm was refused"));
-
-        assert!(
-            matches!(
-                error,
-                Error::MayHaveStarted {
-                    wrapper_elevated: false,
-                    ..
-                }
-            ),
-            "{via:?}: {error:?}"
-        );
-        let (_, fate, handed_back) = expect_may_have_started_parts(error, ());
-        assert_eq!(fate, ChildFate::Reaped, "{via:?}");
-        assert!(handed_back.is_none(), "{via:?}: the teardown handed the child back");
-    }
-}
-
-/// A `kill_on_drop(true)` spawn has nothing to disarm, so a job that refuses it changes nothing.
-///
-/// Mutant: the commit disarms whatever `kill_on_drop` says.
-#[skuld::test]
-async fn a_kill_on_drop_spawn_is_not_disarmed() {
-    crate::tokio::test_runtime::assert_current_thread();
-    let (child, _stdin, id) = refusing_child(true);
-
-    let child = child.commit_kill_on_drop().expect("nothing was asked of the job");
-
-    assert_eq!(id.is_alive(), Liveness::Alive);
     drop(child);
 }

@@ -16,6 +16,18 @@ use crate::error::Error;
 
 assert_impl_all!(SuspendedChild: Send);
 
+/// The output of `future`, which must finish on its first poll: a refusal does, and needs no runtime.
+fn answered_at_once<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("the future waited, where an answer at once was expected"),
+    }
+}
+
 /// What `spawn_suspended` is refused with off Windows, before the runtime check: the same verdict
 /// inside and outside a runtime.
 #[cfg(not(windows))]
@@ -24,7 +36,7 @@ fn assert_spawn_suspended_is_refused() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.kill_on_drop(false);
 
-    let err = cmd.spawn_suspended().expect_err("there is no frozen spawn here");
+    let err = answered_at_once(cmd.spawn_suspended()).expect_err("there is no frozen spawn here");
 
     let Error::Unsupported { op, .. } = &err else {
         panic!("expected Unsupported, got {err:?}");
@@ -96,6 +108,28 @@ mod on_windows {
     /// Both spawn backends, so a backend that drops the hold fails its own leg.
     const BACKENDS: [bool; 2] = [false, true];
 
+    /// Whether a kill-on-drop teardown ran on the thread that made this: the hook sits on the
+    /// teardown's kill, and reaches only the arming thread, so a teardown on the pool is not seen.
+    struct TeardownHere {
+        ran: std::rc::Rc<std::cell::Cell<bool>>,
+        _armed: crate::oneshot_hook::Armed,
+    }
+
+    impl TeardownHere {
+        fn get(&self) -> bool {
+            self.ran.get()
+        }
+    }
+
+    fn teardown_on_this_thread() -> TeardownHere {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let armed = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterDropKill, {
+            let ran = std::rc::Rc::clone(&ran);
+            move || ran.set(true)
+        });
+        TeardownHere { ran, _armed: armed }
+    }
+
     /// Kill `child`, then release its stdin: it exits 0 on EOF, so a kill that sent nothing fails
     /// the assertion on how it ended instead of the reap blocking for ever.
     async fn end(mut child: Child) {
@@ -166,7 +200,10 @@ mod on_windows {
         let mut cmd = blocker(false);
         cmd.elevate();
 
-        let err = cmd.spawn_suspended().expect_err("a frozen spawn cannot be elevated");
+        let err = cmd
+            .spawn_suspended()
+            .await
+            .expect_err("a frozen spawn cannot be elevated");
 
         let Error::Unsupported { op, .. } = &err else {
             panic!("expected Unsupported, got {err:?}");
@@ -183,7 +220,10 @@ mod on_windows {
         let mut cmd = blocker(false);
         cmd.contain().breakaway_from_job();
 
-        let err = cmd.spawn_suspended().expect_err("breakaway and contain are refused");
+        let err = cmd
+            .spawn_suspended()
+            .await
+            .expect_err("breakaway and contain are refused");
 
         let Error::Unsupported { op, .. } = &err else {
             panic!("expected Unsupported, got {err:?}");
@@ -199,7 +239,7 @@ mod on_windows {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(kill_on_drop);
 
-            let err = cmd.spawn_suspended().expect_err("there is no runtime");
+            let err = super::answered_at_once(cmd.spawn_suspended()).expect_err("there is no runtime");
 
             assert!(err.fate().is_none(), "nothing started, got {err:?}");
             assert!(matches!(err, Error::Io(_)), "got {err:?}");
@@ -214,11 +254,11 @@ mod on_windows {
     #[skuld::test]
     async fn frozen_child_has_executed_no_instruction_before_resume() {
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+            let frozen = blocker(raw).spawn_suspended().await.expect("spawn suspended");
             let thread = InitialThread::of(frozen.pid());
             assert_eq!(thread.suspend_count(), 1, "raw={raw}: frozen until resumed");
 
-            let child = frozen.resume().expect("resume");
+            let child = frozen.resume().await.expect("resume");
 
             assert_eq!(thread.suspend_count(), 0, "raw={raw}: running after resume");
             end(child).await;
@@ -230,11 +270,12 @@ mod on_windows {
     #[skuld::test]
     async fn resume_succeeds_when_another_party_started_a_running_thread_in_the_frozen_child() {
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+            let frozen = blocker(raw).spawn_suspended().await.expect("spawn suspended");
             let _injected = crate::test_frozen::inject_running_thread_into_pid(frozen.pid());
 
             let child = frozen
                 .resume()
+                .await
                 .unwrap_or_else(|e| panic!("raw={raw}: a running second thread failed the resume: {e:?}"));
 
             end(child).await;
@@ -252,7 +293,7 @@ mod on_windows {
 
         let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+            let frozen = blocker(raw).spawn_suspended().await.expect("spawn suspended");
 
             assert_eq!(
                 frozen.child.inner.policy,
@@ -262,17 +303,17 @@ mod on_windows {
                 },
                 "raw={raw}"
             );
-            end(frozen.resume().expect("resume")).await;
+            end(frozen.resume().await.expect("resume")).await;
         }
     }
 
     #[skuld::test]
     async fn id_recorded_while_frozen_equals_the_resumed_childs_id() {
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+            let frozen = blocker(raw).spawn_suspended().await.expect("spawn suspended");
             let recorded = frozen.id();
 
-            let child = frozen.resume().expect("resume");
+            let child = frozen.resume().await.expect("resume");
 
             assert_eq!(child.id(), recorded, "raw={raw}");
             end(child).await;
@@ -284,13 +325,13 @@ mod on_windows {
         for raw in BACKENDS {
             let mut cmd = blocker(raw);
             cmd.contain();
-            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
             assert!(
                 frozen.test_job_handle_contains_self(),
                 "raw={raw}: in its job while frozen"
             );
 
-            let child = frozen.resume().expect("resume");
+            let child = frozen.resume().await.expect("resume");
 
             assert_eq!(child.containment(), Containment::JobObject, "raw={raw}");
             assert!(child.test_job_handle_contains_self(), "raw={raw}");
@@ -301,11 +342,11 @@ mod on_windows {
     #[skuld::test]
     async fn uncontained_frozen_child_has_no_cosca_job_and_reports_containment_none() {
         for raw in BACKENDS {
-            let frozen = blocker(raw).spawn_suspended().expect("spawn suspended");
+            let frozen = blocker(raw).spawn_suspended().await.expect("spawn suspended");
             assert!(!frozen.test_job_handle_contains_self(), "raw={raw}: no containment job");
             assert_eq!(frozen.test_containment(), Containment::None, "raw={raw}");
 
-            let child = frozen.resume().expect("resume");
+            let child = frozen.resume().await.expect("resume");
 
             assert_eq!(child.containment(), Containment::None, "raw={raw}");
             end(child).await;
@@ -321,8 +362,10 @@ mod on_windows {
 
             let child = cmd
                 .spawn_suspended()
+                .await
                 .expect("spawn suspended")
                 .resume()
+                .await
                 .expect("resume");
 
             assert_eq!(child.inner.kill_on_drop, kill_on_drop);
@@ -349,8 +392,10 @@ mod on_windows {
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             let mut child = cmd
                 .spawn_suspended()
+                .await
                 .expect("spawn suspended")
                 .resume()
+                .await
                 .expect("resume");
             let mut stdin = child.stdin().expect("piped stdin");
             let mut stdout = child.stdout().expect("piped stdout");
@@ -386,8 +431,10 @@ mod on_windows {
             cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
             let mut child = cmd
                 .spawn_suspended()
+                .await
                 .expect("spawn suspended")
                 .resume()
+                .await
                 .expect("resume");
             let mut stdout = child.stdout().expect("piped stdout");
             let mut stderr = child.stderr().expect("piped stderr");
@@ -415,8 +462,10 @@ mod on_windows {
             let (mut cmd, writer) = drop_leg_blocker(kill_on_drop);
             let child = cmd
                 .spawn_suspended()
+                .await
                 .expect("spawn suspended")
                 .resume()
+                .await
                 .expect("resume");
             assert_eq!(child.inner.kill_on_drop, kill_on_drop);
 
@@ -437,8 +486,10 @@ mod on_windows {
                 cmd.contain_with(mode);
                 let child = cmd
                     .spawn_suspended()
+                    .await
                     .expect("spawn suspended")
                     .resume()
+                    .await
                     .expect("resume");
                 assert_eq!(child.inner.kill_on_drop, kill_on_drop, "{mode:?}");
 
@@ -472,9 +523,9 @@ mod on_windows {
                     cmd.executable("cosca-49-no-such-program.exe");
                 }
                 cmd.kill_on_drop(kill_on_drop);
-                let plain = cmd.spawn().expect_err("there is no such program");
+                let plain = cmd.spawn().await.expect_err("there is no such program");
 
-                let err = cmd.spawn_suspended().expect_err("there is no such program");
+                let err = cmd.spawn_suspended().await.expect_err("there is no such program");
 
                 assert_eq!(
                     io_kind(&err),
@@ -529,7 +580,7 @@ mod on_windows {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(kill_on_drop);
             let writer = hold_stdin(&mut cmd);
-            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
 
             drop_frozen_and_expect_it_killed(frozen, writer, "uncontained");
         }
@@ -543,7 +594,7 @@ mod on_windows {
                 let mut cmd = blocker(false);
                 cmd.contain_with(mode).kill_on_drop(kill_on_drop);
                 let writer = hold_stdin(&mut cmd);
-                let frozen = cmd.spawn_suspended().expect("spawn suspended");
+                let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
 
                 drop_frozen_and_expect_it_killed(frozen, writer, &format!("{mode:?}"));
             }
@@ -559,7 +610,7 @@ mod on_windows {
             cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
             cmd.stderr(crate::Stdio::pipe()).expect("stderr pipe");
             let writer = hold_stdin(&mut cmd);
-            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
 
             drop_frozen_and_expect_it_killed(frozen, writer, &format!("raw={raw}"));
         }
@@ -567,19 +618,237 @@ mod on_windows {
 
     // Failure =====
 
+    /// Occupy `rt`'s one blocking thread until the returned sender is used.
+    fn hold_the_pool(
+        rt: &::tokio::runtime::Runtime,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        ::tokio::task::JoinHandle<Result<(), std::sync::mpsc::RecvError>>,
+    ) {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        (release, rt.spawn_blocking(move || held.recv()))
+    }
+
+    /// A resume that needs no teardown needs no runtime: a healthy frozen child is resumed on a
+    /// plain thread, polled by hand.
+    ///
+    /// Mutant: `resume` asks for a runtime before the release.
+    #[skuld::test]
+    fn a_healthy_resume_outside_a_runtime_resumes_the_child() {
+        let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+        let mut cmd = blocker(false);
+        cmd.contain().kill_on_drop(false);
+        let frozen = rt.block_on(cmd.spawn_suspended()).expect("spawn suspended");
+
+        let child = std::thread::spawn(move || super::answered_at_once(frozen.resume()))
+            .join()
+            .expect("resume outside a runtime must not panic")
+            .expect("a healthy resume needs no runtime");
+
+        rt.block_on(end(child));
+    }
+
+    /// With no runtime, a resume that needs a teardown cannot hop: the cancelled hop's task, which
+    /// held the frozen child, is dropped on the calling thread, and the child is dropped as its
+    /// handle's drop does. The release error stays the cause, and the error says there was no
+    /// runtime.
+    ///
+    /// Mutant: `resume` answers the missing runtime in place of the release error.
+    #[skuld::test]
+    async fn a_failed_resume_outside_a_runtime_drops_the_child_on_the_calling_thread() {
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
+        let remote = Remote::open(frozen.pid());
+        let thread = InitialThread::of(frozen.pid());
+
+        let (err, dropped_there) = std::thread::spawn(move || {
+            let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+            let dropped_there = teardown_on_this_thread();
+            let err = super::answered_at_once(frozen.resume()).expect_err("the resume failed");
+            drop(forced);
+            (err, dropped_there.get())
+        })
+        .join()
+        .expect("resume outside a runtime must not panic");
+
+        assert_eq!(err.fate(), Some(ChildFate::Unknown), "{err:?}");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{err:?}"
+        );
+        let said = err.to_string();
+        assert!(said.contains("Tokio runtime"), "{said}");
+        assert!(said.contains("dropped as its handle's drop does"), "{said}");
+        assert!(dropped_there, "the child was not dropped on the calling thread");
+        release_and_expect_it_killed(&thread, writer, &remote, "a resume outside a runtime");
+    }
+
+    /// The commit of `kill_on_drop` after a good release is the disarm, which asks the job one
+    /// question: it runs on the calling thread, so a pool that is busy does not hold the resume up.
+    ///
+    /// Mutant: `resume` commits `kill_on_drop` through the pool.
+    #[skuld::test]
+    fn resume_commits_kill_on_drop_without_the_pool() {
+        let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+        let mut cmd = blocker(false);
+        cmd.contain().kill_on_drop(false);
+        let frozen = rt.block_on(cmd.spawn_suspended()).expect("spawn suspended");
+        let (release, hold) = hold_the_pool(&rt);
+
+        let child = rt
+            .block_on(async { super::answered_at_once(frozen.resume()) })
+            .expect("resume");
+
+        release.send(()).expect("release the held thread");
+        rt.block_on(end(child));
+        drop(hold);
+    }
+
+    /// A failed release whose teardown the runtime's shutdown cancels keeps the release as its cause,
+    /// with the cancellation noted beside it and fate `Unknown`; the dropped child is killed.
+    ///
+    /// The runtime is dropped, and its handle entered: a hop onto its pool is cancelled at once, as
+    /// one made during its shutdown is.
+    ///
+    /// Mutants: `resume` answers the cancellation in place of the release error; it says the
+    /// teardown "did not run"; the fate is `Running` with no identity.
+    #[skuld::test]
+    fn a_failed_resume_whose_teardown_is_cancelled_keeps_the_release_error() {
+        let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let frozen = rt.block_on(cmd.spawn_suspended()).expect("spawn suspended");
+        let remote = Remote::open(frozen.pid());
+        let thread = InitialThread::of(frozen.pid());
+        let handle = rt.handle().clone();
+        drop(rt);
+        let _entered = handle.enter();
+        let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+        let dropped_here = teardown_on_this_thread();
+
+        let err = super::answered_at_once(frozen.resume()).expect_err("the resume failed");
+        drop(forced);
+
+        assert_eq!(err.fate(), Some(ChildFate::Unknown), "{err:?}");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{err:?}"
+        );
+        let said = err.to_string();
+        assert!(said.contains("cancelled"), "{said}");
+        assert!(said.contains("dropped as its handle's drop does"), "{said}");
+        assert!(!said.contains("did not run"), "{said}");
+        assert!(
+            dropped_here.get(),
+            "the cancelled task's child was not dropped on this thread"
+        );
+        release_and_expect_it_killed(&thread, writer, &remote, "a cancelled teardown's child");
+    }
+
+    /// A disarm the job refused, whose teardown the runtime's shutdown cancels, fails as a refused
+    /// disarm does when its teardown ran: the cause is the refusal itself, the cancellation is noted
+    /// beside it, and the child is dropped by the cancelled task as its handle's drop does. This
+    /// child asked for `kill_on_drop(false)`, but its disarm was refused, so the job still holds it
+    /// armed: it is armed before the hop, so that the drop kills it as the teardown would have.
+    ///
+    /// Mutants: the cancelled arm wraps the refusal in a `Containment` cause of its own; the child
+    /// is moved into the hop with `kill_on_drop` still false, so the drop leaves it running.
+    #[skuld::test]
+    fn a_refused_disarm_whose_teardown_is_cancelled_has_the_refusal_for_its_cause() {
+        let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+        let (frozen, writer) = frozen_with_a_refusing_job(&rt);
+        let remote = Remote::open(frozen.pid());
+        let handle = rt.handle().clone();
+        drop(rt);
+        let _entered = handle.enter();
+
+        let err = super::answered_at_once(frozen.resume()).expect_err("the disarm was refused");
+
+        let said = err.to_string();
+        let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
+        assert!(matches!(cause, Error::Io(_)), "{cause:?}");
+        assert_eq!(
+            crate::error::first_os_code(&cause),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{cause:?}"
+        );
+        assert!(said.contains("cancelled"), "{said}");
+        assert!(said.contains("dropped as its handle's drop does"), "{said}");
+        assert_eq!(fate, ChildFate::Unknown);
+        assert!(handed_back.is_none());
+        // The drop killed the child (a kill exits with 1), though it would end with its stdin (0).
+        drop(writer);
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "the cancelled task's drop must kill the child");
+    }
+
+    /// With no runtime a refused disarm cannot hop, so its teardown runs on the calling thread, as the
+    /// drop's does: the error is the refusal alone, with the fate the teardown found, and the child
+    /// is dead.
+    ///
+    /// Mutant: `resume` drops the child on the calling thread with `kill_on_drop` false, so it is
+    /// left running, and the fate says nothing.
+    #[skuld::test]
+    fn a_refused_disarm_outside_a_runtime_is_torn_down_on_the_calling_thread() {
+        let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+        let (frozen, writer) = frozen_with_a_refusing_job(&rt);
+        let remote = Remote::open(frozen.pid());
+
+        let err = std::thread::spawn(move || super::answered_at_once(frozen.resume()))
+            .join()
+            .expect("resume outside a runtime must not panic")
+            .expect_err("the disarm was refused");
+
+        let said = err.to_string();
+        let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
+        assert!(matches!(cause, Error::Io(_)), "{cause:?}");
+        assert_eq!(
+            crate::error::first_os_code(&cause),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "{cause:?}"
+        );
+        assert!(!said.contains("Tokio runtime"), "{said}");
+        assert!(matches!(fate, ChildFate::Killed | ChildFate::Reaped), "{fate:?}");
+        assert!(handed_back.is_none());
+        drop(writer);
+        remote.wait_for_death();
+        assert_eq!(remote.exit_code(), 1, "the teardown must kill the child");
+    }
+
+    /// A resumable frozen `kill_on_drop(false)` child whose job refuses the disarm, and the write end
+    /// of its stdin.
+    fn frozen_with_a_refusing_job(rt: &::tokio::runtime::Runtime) -> (crate::tokio::SuspendedChild, crate::PipeWriter) {
+        let mut cmd = blocker(false);
+        let writer = hold_stdin(&mut cmd);
+        let mut frozen = rt.block_on(cmd.spawn_suspended()).expect("spawn suspended");
+        frozen.child.inner.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Job(
+            crate::containment::windows::JobHandle::create_without_set_access_for_test(),
+        ));
+        frozen.wanted_kill_on_drop = false;
+        (frozen, writer)
+    }
+
     #[skuld::test]
     async fn a_failed_thread_resume_kills_the_child_and_reports_its_fate() {
         crate::tokio::test_runtime::assert_current_thread();
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
-        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
         let remote = Remote::open(frozen.pid());
         let thread = InitialThread::of(frozen.pid());
         let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+        let torn_down_here = teardown_on_this_thread();
 
-        let err = frozen.resume().expect_err("the resume was forced to fail");
+        let err = frozen.resume().await.expect_err("the resume was forced to fail");
         drop(forced);
 
+        assert!(
+            !torn_down_here.get(),
+            "the failed resume's teardown ran on the runtime thread"
+        );
         let fate = err
             .fate()
             .unwrap_or_else(|| panic!("expected MayHaveStarted, got {err:?}"));
@@ -603,12 +872,12 @@ mod on_windows {
             let mut cmd = blocker(false);
             let writer = hold_stdin(&mut cmd);
             cmd.set_elevation_report(Some(report(via.clone())));
-            let frozen = cmd.spawn_suspended().expect("spawn suspended");
+            let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
             let remote = Remote::open(frozen.pid());
             let thread = InitialThread::of(frozen.pid());
             let forced = force_next(Step::Resume, ERROR_ACCESS_DENIED);
 
-            let err = frozen.resume().expect_err("the resume was forced to fail");
+            let err = frozen.resume().await.expect_err("the resume was forced to fail");
             drop(forced);
 
             assert!(
@@ -634,15 +903,20 @@ mod on_windows {
         crate::tokio::test_runtime::assert_current_thread();
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
-        let mut frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let mut frozen = cmd.spawn_suspended().await.expect("spawn suspended");
         frozen.child.inner.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Job(
             crate::containment::windows::JobHandle::create_without_set_access_for_test(),
         ));
         frozen.wanted_kill_on_drop = false;
         let remote = Remote::open(frozen.pid());
+        let torn_down_here = teardown_on_this_thread();
 
-        let err = frozen.resume().expect_err("the disarm was refused");
+        let err = frozen.resume().await.expect_err("the disarm was refused");
 
+        assert!(
+            !torn_down_here.get(),
+            "the refused disarm's teardown ran on the runtime thread"
+        );
         let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
         let Error::Io(io) = &cause else {
             panic!("expected Io, got {cause:?}");
@@ -658,12 +932,51 @@ mod on_windows {
         drop(writer);
     }
 
+    /// Async twin of the sync `a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag`, through
+    /// `resume`: a refused disarm of a child reported as a launch that leaves no front does not say it
+    /// is a front's.
+    ///
+    /// Mutants: `resume` sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+    #[skuld::test]
+    async fn a_refused_disarm_of_a_resumed_child_without_a_front_sets_no_wrapper_flag() {
+        use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
+        crate::tokio::test_runtime::assert_current_thread();
+        for via in VIAS_WITHOUT_A_FRONT {
+            let mut cmd = blocker(false);
+            let writer = hold_stdin(&mut cmd);
+            cmd.set_elevation_report(Some(report(via.clone())));
+            let mut frozen = cmd.spawn_suspended().await.expect("spawn suspended");
+            frozen.child.inner.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Job(
+                crate::containment::windows::JobHandle::create_without_set_access_for_test(),
+            ));
+            frozen.wanted_kill_on_drop = false;
+            let remote = Remote::open(frozen.pid());
+
+            let err = frozen.resume().await.expect_err("the disarm was refused");
+
+            assert!(
+                matches!(
+                    err,
+                    Error::MayHaveStarted {
+                        wrapper_elevated: false,
+                        ..
+                    }
+                ),
+                "{via:?}: {err:?}"
+            );
+            assert_eq!(err.fate(), Some(ChildFate::Reaped), "{via:?}");
+            remote.wait_for_death();
+            assert_eq!(remote.exit_code(), 1, "{via:?}: the teardown must kill the child");
+            drop(writer);
+        }
+    }
+
     /// Something else killed the frozen process. The process is observed dead (its handle is
     /// signalled) before `resume`, so the answer is not a race with the kill: an error with a fate,
     /// and no hang.
     #[skuld::test]
     async fn resume_after_an_external_kill_is_may_have_started_with_a_fate() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
+        let frozen = blocker(false).spawn_suspended().await.expect("spawn suspended");
         // Opened while `frozen` holds the process, so the pid cannot name anything else.
         // SAFETY: plain Win32 calls; the handle is closed below.
         let victim: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, frozen.pid()) }
@@ -676,7 +989,7 @@ mod on_windows {
             _ = CloseHandle(victim);
         }
 
-        let err = frozen.resume().expect_err("a dead child cannot be resumed");
+        let err = frozen.resume().await.expect_err("a dead child cannot be resumed");
 
         let fate = err
             .fate()
@@ -693,12 +1006,15 @@ mod on_windows {
     async fn resume_when_the_initial_thread_was_suspended_twice_kills_the_child_instead_of_returning_ok() {
         let mut cmd = blocker(false);
         let writer = hold_stdin(&mut cmd);
-        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
         let remote = Remote::open(frozen.pid());
         let thread = InitialThread::of(frozen.pid());
         thread.suspend_once();
 
-        let err = frozen.resume().expect_err("the child is still frozen after one resume");
+        let err = frozen
+            .resume()
+            .await
+            .expect_err("the child is still frozen after one resume");
 
         assert!(err.fate().is_some(), "got {err:?}");
         release_and_expect_it_killed(&thread, writer, &remote, "a half-resumed child");
@@ -713,7 +1029,7 @@ mod on_windows {
             let mut cmd = blocker(false);
             cmd.kill_on_drop(kill_on_drop);
 
-            drop(cmd.spawn_suspended().expect("spawn suspended"));
+            drop(cmd.spawn_suspended().await.expect("spawn suspended"));
 
             assert_eq!(cmd.sync().kill_on_drop_flag(), kill_on_drop);
             assert!(!cmd.sync().flags_request().suspended);
@@ -725,11 +1041,11 @@ mod on_windows {
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
         let mut cmd = findstr_blocker(false);
-        drop(cmd.spawn_suspended().expect("spawn suspended"));
+        drop(cmd.spawn_suspended().await.expect("spawn suspended"));
 
         // A spawn takes the stdio configuration out of the command, so the second one is given its own.
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-        let mut child = cmd.spawn().expect("an ordinary spawn");
+        let mut child = cmd.spawn().await.expect("an ordinary spawn");
         drop(child.stdin().expect("piped stdin"));
 
         let status = child.wait().await.expect("await the exit");
@@ -740,10 +1056,10 @@ mod on_windows {
     #[skuld::test]
     async fn two_frozen_children_can_be_held_at_once_and_resumed_in_either_order() {
         for in_spawn_order in [true, false] {
-            let a = blocker(false).spawn_suspended().expect("first");
-            let b = blocker(false).spawn_suspended().expect("second");
+            let a = blocker(false).spawn_suspended().await.expect("first");
+            let b = blocker(false).spawn_suspended().await.expect("second");
             let (x, y) = if in_spawn_order { (a, b) } else { (b, a) };
-            let (cx, cy) = (x.resume().expect("resume x"), y.resume().expect("resume y"));
+            let (cx, cy) = (x.resume().await.expect("resume x"), y.resume().await.expect("resume y"));
             end(cx).await;
             end(cy).await;
         }
@@ -752,18 +1068,21 @@ mod on_windows {
     /// No lock is held across the window: an ordinary spawn completes while another child is frozen.
     #[skuld::test]
     async fn spawning_while_another_child_is_frozen_does_not_block() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
-        let other = blocker(false).spawn().expect("an ordinary spawn while one is frozen");
+        let frozen = blocker(false).spawn_suspended().await.expect("spawn suspended");
+        let other = blocker(false)
+            .spawn()
+            .await
+            .expect("an ordinary spawn while one is frozen");
         end(other).await;
         drop(frozen);
     }
 
     #[skuld::test]
-    async fn a_suspended_child_resumes_on_another_thread() {
-        let frozen = blocker(false).spawn_suspended().expect("spawn suspended");
-        let child = std::thread::spawn(move || frozen.resume().expect("resume on another thread"))
-            .join()
-            .expect("the resuming thread");
+    async fn a_suspended_child_resumes_in_a_spawned_task() {
+        let frozen = blocker(false).spawn_suspended().await.expect("spawn suspended");
+        let child = ::tokio::spawn(async move { frozen.resume().await.expect("resume in a task") })
+            .await
+            .expect("the resuming task");
         end(child).await;
     }
 }

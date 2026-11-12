@@ -154,6 +154,17 @@ pub struct Child {
     pub(crate) policy: SpawnPolicy,
 }
 
+/// What a commit fails with when the disarm of `kill_on_drop` was refused, sync and async alike: the
+/// refusal is the cause, and `torn_down` is the teardown that followed it (see
+/// [`failed_after_teardown`](crate::child::spawn::failed_after_teardown)).
+pub(crate) fn refused_commit(
+    refusal: std::io::Error,
+    behind_front: bool,
+    torn_down: Result<(crate::error::ChildFate, Option<crate::Unreaped>), String>,
+) -> crate::child::spawn::SpawnFailure {
+    crate::child::spawn::failed_after_teardown(Error::Io(refusal), behind_front, torn_down)
+}
+
 impl Child {
     pub(crate) fn from_parts(
         proc: OwnedChild,
@@ -196,19 +207,33 @@ impl Child {
     /// A refused disarm (Windows) fails the commit: the still-armed child is torn down as a failed
     /// run's is (handed back in the error if its kill is refused), with the refusal as the cause.
     pub(crate) fn commit_kill_on_drop(mut self) -> Result<Child, crate::child::spawn::SpawnFailure> {
-        let Err(refusal) = self.tree.honor_kill_on_drop(self.kill_on_drop) else {
-            return Ok(self);
-        };
+        match self.try_commit_kill_on_drop() {
+            Ok(()) => Ok(self),
+            Err(refusal) => {
+                let behind_front = self.front().is_some();
+                Err(refused_commit(
+                    refusal,
+                    behind_front,
+                    Ok(self.tear_down_refused_commit()),
+                ))
+            }
+        }
+    }
+
+    /// The disarm half of [`commit_kill_on_drop`](Self::commit_kill_on_drop): what it asks of the
+    /// containment resource, which is bounded work that waits for nothing. A refusal leaves the child
+    /// armed, for [`tear_down_refused_commit`](Self::tear_down_refused_commit).
+    pub(crate) fn try_commit_kill_on_drop(&mut self) -> std::io::Result<()> {
+        self.tree.honor_kill_on_drop(self.kill_on_drop)
+    }
+
+    /// The teardown half of [`commit_kill_on_drop`](Self::commit_kill_on_drop): the still-armed child
+    /// whose disarm was refused is torn down as a failed run's is (handed back if its kill is
+    /// refused). This waits for the child to be reaped.
+    pub(crate) fn tear_down_refused_commit(mut self) -> (crate::error::ChildFate, Option<crate::Unreaped>) {
         // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
         self.kill_on_drop = true;
-        let behind_front = self.front().is_some();
-        let (fate, unreaped) = self.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
-        Err(crate::child::spawn::failed_after_the_spawn(
-            Error::Io(refusal),
-            fate,
-            unreaped,
-            behind_front,
-        ))
+        self.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack)
     }
 
     /// The achieved elevation state, or `None` if elevation was not requested

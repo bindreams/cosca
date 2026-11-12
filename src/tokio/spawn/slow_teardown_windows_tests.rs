@@ -39,11 +39,11 @@ fn teardown_with_an_exit_under_way(backend: Backend, force: fn(bool)) -> (ChildF
     let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
     let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     force(true);
-    let spawned = cmd.spawn();
+    let spawned = crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy());
     force(false);
-    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(crate::error::Error::from(
         spawned.expect_err("the forced failure fails the spawn"),
-    );
+    ));
     // The refusal stands in for the kill's `TerminateProcess`, so the teardown did send its kill.
     refusal.assert_fired();
     (fate, warns_since(mark, "still waiting"))

@@ -11,40 +11,40 @@ use crate::test_child::ctrl_break::{
 };
 use crate::GracefulMechanism;
 
-fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
-    spawn_root_configured(handler, crate::ContainMode::Strongest, |_| {})
+async fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
+    spawn_root_configured(handler, crate::ContainMode::Strongest, |_| {}).await
 }
 
 /// [`spawn_root`] under `mode`, with `configure` applied to the root's command before the spawn.
-fn spawn_root_configured(
+async fn spawn_root_configured(
     handler: Handler,
     mode: crate::ContainMode,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, TcpStream) {
-    let (child, sock, _) = spawn(handler, None, mode, configure);
+    let (child, sock, _) = spawn(handler, None, mode, configure).await;
     (child, sock)
 }
 
 /// The root's socket keeps the root running while held.
-fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpStream, Grandchild) {
-    let (child, sock, grand) = spawn(root, Some(grandchild), crate::ContainMode::Strongest, |_| {});
+async fn spawn_tree(root: Handler, grandchild: Handler) -> (crate::tokio::Child, TcpStream, Grandchild) {
+    let (child, sock, grand) = spawn(root, Some(grandchild), crate::ContainMode::Strongest, |_| {}).await;
     (child, sock, grand.expect("a grandchild was asked for"))
 }
 
-fn spawn(
+async fn spawn(
     handler: Handler,
     grandchild: Option<Handler>,
     mode: crate::ContainMode,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
-    ctrl_break::spawn_member_async(handler, grandchild, mode, configure)
+    ctrl_break::spawn_member_async(handler, grandchild, mode, configure).await
 }
 
 #[skuld::test]
 async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, mut sock) = spawn_root(Handler::Ack);
+    let (mut child, mut sock) = spawn_root(Handler::Ack).await;
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.pid(), "the root");
     child.terminate().expect("terminate a console-group child");
@@ -61,7 +61,7 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
 #[skuld::test]
 async fn an_async_plain_contained_root_really_receives_the_break() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, mut sock) = spawn_root(Handler::Ack);
+    let (mut child, mut sock) = spawn_root(Handler::Ack).await;
     assert_eq!(child.containment(), Containment::JobObject);
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     assert_in_our_console(child.pid(), "the root");
@@ -77,7 +77,7 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
 async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _sock) = spawn_root(Handler::Default);
+    let (mut child, _sock) = spawn_root(Handler::Default).await;
     let pid = child.pid();
     assert_in_our_console(pid, "the root");
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
@@ -99,7 +99,7 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
 async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default);
+    let (mut child, _root_sock, grand) = spawn_tree(Handler::Default, Handler::Default).await;
     let pid = child.pid();
     assert_in_our_console(pid, "the root");
     let check = term_fault::at_checked(term_fault::HookPoint::AfterTerminate, move || {
@@ -126,7 +126,7 @@ async fn async_child_graceful_shutdown_tree_tears_down_tree_on_windows() {
 async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack);
+    let (mut child, root_sock, mut grand) = spawn_tree(Handler::Ignore, Handler::Ack).await;
     assert_in_our_console(child.pid(), "the root");
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child
@@ -165,7 +165,7 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
 async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore);
+    let (mut child, root_sock, grand) = spawn_tree(Handler::Ignore, Handler::Ignore).await;
     assert_in_our_console(child.pid(), "the root");
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, root_sock);
     let status = child
@@ -209,7 +209,7 @@ async fn assert_false_success(
     use std::io::Write as _;
 
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure).await;
     assert_own_console_route(&child, expected_containment);
     child.terminate_tree().expect("the cooperative op reports success");
     ctrl_break::assert_break_sent_to(child.pid());
@@ -227,7 +227,7 @@ async fn assert_false_success(
     );
     drop(sock);
 
-    let (mut child, sock) = spawn_root_configured(Handler::Default, mode, &configure);
+    let (mut child, sock) = spawn_root_configured(Handler::Default, mode, &configure).await;
     assert_own_console_route(&child, expected_containment);
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
     let status = child
@@ -272,7 +272,7 @@ async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
 async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, sock) = ctrl_break::spawn_consoleless_root_async();
+    let (mut child, sock) = ctrl_break::spawn_consoleless_root_async().await;
     let pid = child.pid();
     assert_eq!(
         child.graceful_mechanism(),

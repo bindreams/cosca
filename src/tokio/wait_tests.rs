@@ -149,151 +149,6 @@ async fn exited_by_id_true_when_child_dies_mid_wait() {
     child.wait().expect("reap");
 }
 
-/// What one `exited_by_id` on a Windows child logged on its blocking thread.
-#[cfg(windows)]
-struct Observed {
-    /// The real clock as `exited_by_id` saw it: frozen a second behind the actual now.
-    real_start: std::time::Instant,
-    exited: bool,
-    log: Vec<crate::wait::read_probe::Event>,
-}
-
-/// Runs `exited_by_id(id, Some(grace))` with tokio's clock pinned at `pin` and the real clock frozen behind the
-/// blocking thread's, so a deadline `exited_by_id` fixes on this thread differs from any a
-/// blocking thread would derive itself. Logs every `remaining` read and the identity step.
-/// With `release`, closes the child's stdin after the first read, so the wait ends by exit.
-#[cfg(windows)]
-async fn observed_exited_by_id(
-    child: &mut std::process::Child,
-    pin: std::time::Instant,
-    grace: Duration,
-    release: bool,
-) -> Observed {
-    use crate::wait::read_probe::{install, Event};
-    use crate::wait::test_clock::FrozenClockGuard;
-
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _log = install(tx);
-    let _tokio_now = super::now_override::install(pin);
-    let (_clock, real_start) = FrozenClockGuard::install_lagging(Duration::from_secs(1));
-    let mut log = Vec::new();
-    let exited = if release {
-        // A live child's watch always logs a read before it can end, so the `recv` returns.
-        let (exited, ()) = ::tokio::join!(exited_by_id(id, Some(grace)), async {
-            loop {
-                let event = rx.recv().expect("the blocking watch logs a read");
-                log.push(event);
-                if matches!(event, Event::Read { .. }) {
-                    break;
-                }
-            }
-            drop(child.stdin.take());
-        });
-        exited
-    } else {
-        exited_by_id(id, Some(grace)).await
-    };
-    // The join has returned, so every send happened before this.
-    log.extend(rx.try_iter());
-    Observed {
-        real_start,
-        exited: exited.expect("exited_by_id"),
-        log,
-    }
-}
-
-/// Asserts identity was verified before the first `remaining` read, and that every read was made
-/// against `deadline`. Returns the reads' results.
-#[cfg(windows)]
-#[track_caller]
-fn assert_reads_of(
-    log: &[crate::wait::read_probe::Event],
-    deadline: Option<std::time::Instant>,
-) -> Vec<Option<Duration>> {
-    use crate::wait::read_probe::Event;
-
-    let mark = log
-        .iter()
-        .position(|e| *e == Event::Mark("identity verified"))
-        .expect("the blocking thread verified identity");
-    let mut results = Vec::new();
-    for (i, event) in log.iter().enumerate() {
-        if let Event::Read {
-            deadline: used,
-            remaining,
-        } = event
-        {
-            assert!(i > mark, "a remaining read preceded identity verification: {log:?}");
-            assert_eq!(
-                *used, deadline,
-                "a read was made against a re-derived deadline: {log:?}"
-            );
-            results.push(*remaining);
-        }
-    }
-    assert!(!results.is_empty(), "the blocking thread never read remaining: {log:?}");
-    results
-}
-
-// `exited_by_id` must arm the blocking wait from the deadline it fixed before `spawn_blocking`.
-// Tokio's clock is pinned and the real clock frozen a second behind the blocking thread's, so a
-// blocking thread deriving its own deadline reads a later instant and fails the equality.
-// The deadline is already past: the wait is one non-blocking probe.
-#[cfg(windows)]
-#[skuld::test]
-async fn exited_by_id_windows_arms_from_a_past_deadline_fixed_before_spawn_blocking() {
-    let mut child = std_blocker();
-    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
-    kill_and_reap(&mut child);
-    assert!(!seen.exited, "a live child at ZERO grace must report still-alive");
-    let reads = assert_reads_of(&seen.log, Some(seen.real_start));
-    assert!(reads.iter().all(|r| *r == Some(Duration::ZERO)), "{reads:?}");
-}
-
-// A genuinely future deadline crossing `spawn_blocking`: the blocking thread's remaining time is
-// what is left of the caller's deadline, not a fresh grace.
-#[cfg(windows)]
-#[skuld::test]
-async fn exited_by_id_windows_arms_from_a_future_deadline_fixed_before_spawn_blocking() {
-    let grace = Duration::from_secs(3600);
-    let mut child = std_blocker();
-    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), grace, true).await;
-    child.wait().expect("reap");
-    assert!(seen.exited, "the child exited after its stdin closed");
-    let reads = assert_reads_of(&seen.log, Some(seen.real_start + grace));
-    for r in reads {
-        let r = r.expect("a bounded deadline has a remaining time");
-        assert!(r > Duration::ZERO && r <= grace, "{r:?}");
-    }
-}
-
-// A grace that overflows `Instant` is unbounded: not expired, not a panic, not a fixed fallback.
-#[cfg(windows)]
-#[skuld::test]
-async fn exited_by_id_windows_treats_an_overflowing_grace_as_unbounded() {
-    let mut child = std_blocker();
-    let seen = observed_exited_by_id(&mut child, std::time::Instant::now(), Duration::MAX, true).await;
-    child.wait().expect("reap");
-    assert!(seen.exited, "an unbounded watch ends only by the exit");
-    assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
-}
-
-// As above for a grace landing inside tokio's timer margin of `Instant`'s ceiling, which
-// `deadline_at` also makes unbounded.
-#[cfg(windows)]
-#[skuld::test]
-async fn exited_by_id_windows_treats_a_grace_inside_the_timer_margin_of_the_ceiling_as_unbounded() {
-    let mut child = std_blocker();
-    let pin = std::time::Instant::now();
-    // 500us short of the ceiling: inside the 1ms margin, but not overflowing outright.
-    let grace = crate::wait::instant_near_ceiling(pin).saturating_duration_since(pin) - Duration::from_micros(500);
-    let seen = observed_exited_by_id(&mut child, pin, grace, true).await;
-    child.wait().expect("reap");
-    assert!(seen.exited, "an unbounded watch ends only by the exit");
-    assert!(assert_reads_of(&seen.log, None).iter().all(Option::is_none));
-}
-
 // Drive the REAL macOS watch loop through its clear_ready + re-await cycle with genuine
 // kernel events: a DECOY second NOTE_EXIT filter on the same kqueue supplies the first wake;
 // the scripted drain consumes it (keeping the kqueue level low, so clear_ready cannot miss a
@@ -423,128 +278,14 @@ async fn exited_by_id_unbounded_cancel_leaves_child_untouched() {
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
-    } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
+    }
     assert_child_still_alive(&mut child); // a cancelled watch must not affect the child
     kill_and_reap(&mut child);
 }
 
-// Proves release without a timeout: the watcher signals a channel when it returns; recv()
-// blocks until that happens.
-#[cfg(windows)]
-#[skuld::test]
-async fn exited_by_id_unbounded_drop_releases_the_windows_watcher() {
-    crate::tokio::test_runtime::assert_current_thread();
-    use std::future::Future;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let guard = super::fault_observer::install(tx);
-    let mut child = std_blocker_with_stdout();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    {
-        let mut fut = std::pin::pin!(exited_by_id(id, None));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
-            panic!("unbounded watch resolved at first poll on a live child: {r:?}");
-        }
-        // Release our sender so `recv()` returns Ok only from the blocking closure's notification.
-        drop(guard);
-    } // <- drop signals the cancel event
-    rx.recv()
-        .expect("the blocking watcher must return after the drop released it");
-    assert_child_still_alive(&mut child); // release must be signal-free
-    kill_and_reap(&mut child);
-}
-
-// Mutant: make `relayed_probe::Guard::drop` a no-op -> the slot stays installed after the scope.
-#[cfg(windows)]
-#[skuld::test]
-fn fault_observer_guard_uninstalls_on_drop() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    {
-        let _guard = super::fault_observer::install(tx);
-    }
-    super::fault_observer::notify_released();
-    assert_eq!(rx.try_iter().count(), 0);
-    assert!(super::fault_observer::current().is_none());
-}
-
-// Mutant: delete the `debug_assert!` in `relayed_probe::insert` -> no panic.
-#[cfg(all(windows, debug_assertions))]
-#[skuld::test]
-#[should_panic(expected = "nested on the same thread")]
-fn fault_observer_install_panics_when_nested() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let _outer = super::fault_observer::install(tx.clone());
-    let _inner = super::fault_observer::install(tx);
-}
-
-/// `exited_by_id(id, None)` on a live `child`, killed only after the driver's first look found it
-/// running and hopped to the blocking pool. A child killed before that look is `Exited` at the
-/// first look and no watch is ever armed, so a test of what a watch notifies must kill from here.
-#[cfg(windows)]
-async fn watch_then_kill(id: ProcessId, child: &mut std::process::Child) {
-    use std::future::Future as _;
-    let mut watch = std::pin::pin!(exited_by_id(id, None));
-    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx))).await;
-    assert!(first.is_pending(), "a live child must not resolve at the first look");
-    child.kill().expect("kill");
-    assert!(
-        watch.await.expect("watch"),
-        "the watch must resolve on the child's exit"
-    );
-}
-
-// The relay's pool-thread guard must not outlive the closure: on a pool pinned to ONE thread, a
-// watch without an observer that runs after one with an observer must not reach the first's
-// channel, and the pool thread's slot must be empty afterwards.
-//
-// Mutant: `mem::forget` the `_relay` guard in `cancellable_blocking`'s closure -> the second
-// watch's release reaches the first's channel.
-#[cfg(windows)]
-#[skuld::test]
-fn the_relayed_observer_does_not_outlive_its_blocking_call() {
-    let rt = ::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        // The same pool thread must serve every call below; asserted via its id.
-        .thread_keep_alive(Duration::from_secs(3600))
-        .build()
-        .expect("build a runtime with a one-thread blocking pool");
-    rt.block_on(async {
-        let pool_thread = ::tokio::task::spawn_blocking(|| std::thread::current().id())
-            .await
-            .expect("probe the pool thread");
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let mut first = std_blocker();
-        let first_id = ProcessId::of(first.id()).found().expect("identity of live child");
-        let guard = super::fault_observer::install(tx);
-        watch_then_kill(first_id, &mut first).await;
-        drop(guard);
-        first.wait().expect("reap");
-        assert_eq!(rx.try_iter().count(), 1, "the first watch releases exactly once");
-
-        let mut second = std_blocker();
-        let second_id = ProcessId::of(second.id()).found().expect("identity of live child");
-        watch_then_kill(second_id, &mut second).await;
-        second.wait().expect("reap");
-        assert_eq!(
-            rx.try_iter().count(),
-            0,
-            "a watch with no observer must not notify the previous watch's"
-        );
-
-        let (thread, empty) =
-            ::tokio::task::spawn_blocking(|| (std::thread::current().id(), super::fault_observer::current().is_none()))
-                .await
-                .expect("probe the pool thread");
-        assert_eq!(thread, pool_thread, "the pool must have reused its one thread");
-        assert!(empty, "the pool thread's slot must be empty after the call");
-    });
-}
-
 // A live child watched under an identity naming its pid but a wrong start token is `Opened::Found`
 // + `HandleIdentity::Different` on every run, with no dependence on pid-recycling timing. The
-// watch resolves as exited without reaching the real wait.
+// watch resolves as exited at its first poll, without waiting.
 #[cfg(windows)]
 #[skuld::test]
 async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
@@ -552,66 +293,22 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
     let stale = real.with_other_value();
 
-    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let _armed_guard = crate::os_process::windows::cancel::armed_probe::install(armed_tx);
-
-    let exited = exited_by_id(stale, Some(Duration::from_secs(30)))
-        .await
-        .expect("an identity mismatch must resolve, not error");
+    let mut watch = std::pin::pin!(exited_by_id(stale, Some(Duration::from_secs(30))));
+    let std::task::Poll::Ready(answer) = std::future::Future::poll(
+        watch.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) else {
+        panic!("an identity mismatch waits for nothing");
+    };
     assert!(
-        exited,
+        answer.expect("an identity mismatch must resolve, not error"),
         "HandleIdentity::Different must report exited — the original identity is gone"
-    );
-    assert!(
-        armed_rx.try_recv().is_err(),
-        "the identity-mismatch fast path must never reach the real wait — armed_probe must not fire"
     );
 
     // The watch resolved on the STALE identity, so it must not have touched this live child.
     assert_child_still_alive(&mut child);
     // A `std` `Child` neither kills nor reaps on drop.
     kill_and_reap(&mut child);
-}
-
-// `fault_observer` is thread-local: a watch on another thread must not notify this thread's
-// observer. Deterministic: the other watch is joined on its own OS thread and runtime before the
-// channel is checked.
-//
-// Mutant: make `relayed_probe`'s slot process-global -> this thread's channel receives the other's release.
-// Mutant: skip `notify_released` in `cancellable_blocking` -> the other thread's channel is empty.
-#[cfg(windows)]
-#[skuld::test]
-async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
-    crate::tokio::test_runtime::assert_current_thread();
-    let (own_tx, own_rx) = std::sync::mpsc::channel();
-    let _guard = super::fault_observer::install(own_tx);
-
-    let mut other = std_blocker();
-    let other_id = ProcessId::of(other.id()).found().expect("identity of live child");
-    // A separate OS thread with its own runtime; a task on this runtime would poll on this thread.
-    // It kills `other` itself, once its watch is armed.
-    let handle = std::thread::spawn(move || {
-        let (other_tx, other_rx) = std::sync::mpsc::channel();
-        let _guard = super::fault_observer::install(other_tx);
-        let rt = ::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build a current-thread runtime for the other thread");
-        rt.block_on(watch_then_kill(other_id, &mut other));
-        (other_rx, other)
-    });
-    let (other_rx, mut other) = handle.join().expect("other thread panicked");
-    other.wait().expect("reap");
-
-    assert_eq!(
-        other_rx.try_iter().count(),
-        1,
-        "the other thread's own observer receives exactly its own release"
-    );
-    assert!(
-        own_rx.try_recv().is_err(),
-        "an unrelated watch's release on another thread must never notify this thread's observer"
-    );
 }
 
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
@@ -1026,8 +723,8 @@ async fn arm_at_waits_unbounded_for_a_deadline_inside_the_timer_margin_in_releas
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![Armed::Unbounded; 2]);
 }
 
-/// The Windows job wait is measured on the real clock: a tokio-clock deadline keeps its remaining
-/// time, an expired one keeps none, and unbounded stays unbounded.
+/// The Windows registered waits are timed by the OS in real time: a tokio-clock deadline keeps its
+/// remaining time, an expired one keeps none, and unbounded stays unbounded.
 #[skuld::test]
 fn to_real_clock_preserves_the_remaining_time_across_clocks() {
     let real = std::time::Instant::now();
@@ -1037,6 +734,19 @@ fn to_real_clock_preserves_the_remaining_time_across_clocks() {
     assert_eq!(super::to_real_clock_at(Some(tokio), tokio, real), Some(real));
     assert_eq!(super::to_real_clock_at(Some(real), tokio, real), Some(real));
     assert_eq!(super::to_real_clock_at(None, tokio, real), None);
+}
+
+/// A tokio-clock deadline the real clock would put inside the timer margin of `Instant`'s ceiling
+/// is unbounded, as `deadline_from` makes it.
+///
+/// Mutant: the conversion adds the remaining time unchecked, or keeps a deadline inside the margin.
+#[skuld::test]
+fn to_real_clock_makes_a_deadline_inside_the_timer_margin_unbounded() {
+    let tokio = std::time::Instant::now();
+    let edge = crate::wait::instant_near_ceiling(tokio) - crate::wait::TOKIO_TIMER_ROUNDING_MARGIN;
+    assert_eq!(super::to_real_clock_at(Some(edge), tokio, tokio), Some(edge));
+    let later = tokio + Duration::from_nanos(1);
+    assert_eq!(super::to_real_clock_at(Some(edge), tokio, later), None);
 }
 
 /// The wait runs on tokio's clock: virtual time advanced BEFORE the call must not eat the grace.
@@ -1111,4 +821,50 @@ async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
 
     drop(stdin);
     child.wait().expect("reap /bin/sh");
+}
+
+/// The thread a value was dropped on, reported when it drops.
+struct DroppedOn(std::sync::mpsc::Sender<std::thread::ThreadId>);
+
+impl Drop for DroppedOn {
+    fn drop(&mut self) {
+        _ = self.0.send(std::thread::current().id());
+    }
+}
+
+/// The thread that dropped a [`DroppedOn`] that `on_blocking_pool` handed over after its task had
+/// finished, and whose future was dropped before its next poll, on a runtime with one blocking
+/// thread (held, so the first poll is `Pending` and the task finishes after it).
+fn thread_that_dropped_a_finished_value() -> (std::thread::ThreadId, std::thread::ThreadId) {
+    let (tx, dropped) = std::sync::mpsc::channel();
+    let rt = crate::tokio::test_runtime::single_thread_pool_runtime();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let hold = rt.spawn_blocking(move || held.recv());
+    rt.block_on(async {
+        let (waker, finished) = crate::tokio::test_runtime::counting_waker();
+        let mut hop = Box::pin(super::on_blocking_pool("the value", move || DroppedOn(tx)));
+        assert!(
+            std::future::Future::poll(hop.as_mut(), &mut std::task::Context::from_waker(&waker)).is_pending(),
+            "the hop is queued behind the held thread"
+        );
+        release.send(()).expect("release the held thread");
+        finished.recv().expect("the task finished");
+        drop(hop);
+    });
+    drop(hold);
+    drop(rt);
+    (
+        std::thread::current().id(),
+        dropped.recv().expect("the value was dropped"),
+    )
+}
+
+/// A value whose drop can wait (a spawn's child) is dropped on the pool, not on the runtime thread
+/// that drops the future.
+///
+/// Mutant: `Landing` drops a value it received on the dropping thread.
+#[skuld::test]
+fn a_finished_value_that_can_block_is_dropped_on_the_pool() {
+    let (runtime_thread, dropped_on) = thread_that_dropped_a_finished_value();
+    assert_ne!(dropped_on, runtime_thread, "dropped on the runtime thread");
 }

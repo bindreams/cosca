@@ -134,8 +134,7 @@ pub(crate) enum Next {
 pub(crate) enum Ended {
     /// The wait ended on a signal from the source, or failed and the [`Waitable`] survived it.
     NotReleased,
-    /// Released without an exit signal: the deadline passed (or, in the async Windows wait, the
-    /// cancel event fired).
+    /// Released without an exit signal: the deadline passed.
     Released,
 }
 

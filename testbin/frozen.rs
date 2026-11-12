@@ -113,7 +113,7 @@ pub fn spawn_frozen_report_async(addr: &str, backend: &str) -> ! {
     let frozen = rt.block_on(async {
         let mut cmd = mode_command_async(backend, "control-block", &["127.0.0.1:9", "G"]);
         cmd.contain();
-        cmd.spawn_suspended().expect("spawn the async frozen grandchild")
+        cmd.spawn_suspended().await.expect("spawn the async frozen grandchild")
     });
     let child_pid = frozen.pid();
     writeln!(
@@ -277,11 +277,13 @@ fn spawn_measured_child_async(
         apply_shape_async(&mut cmd, shape);
         let mut child = if frozen {
             cmd.spawn_suspended()
+                .await
                 .expect("spawn the child frozen")
                 .resume()
+                .await
                 .expect("resume the child")
         } else {
-            cmd.spawn().expect("spawn the child")
+            cmd.spawn().await.expect("spawn the child")
         };
         writeln!(
             sock,
@@ -338,11 +340,13 @@ fn spawn_breakaway_child_async(addr: &str, backend: &str, shape: &str, frozen: b
         apply_shape_async(&mut cmd, shape);
         let mut child = if frozen {
             cmd.spawn_suspended()
+                .await
                 .expect("spawn the child frozen")
                 .resume()
+                .await
                 .expect("resume the child")
         } else {
-            cmd.spawn().expect("spawn the child")
+            cmd.spawn().await.expect("spawn the child")
         };
         child.wait().await.expect("reap the child");
     });

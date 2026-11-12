@@ -199,8 +199,8 @@ async fn an_async_resumed_child_runs() {
         let (listener, addr) = bind_async_listener();
         let mut cmd = testbin_command_async(backend, "control-echo-pid", &addr, &["C"]);
 
-        let frozen = cmd.spawn_suspended().expect("spawn suspended");
-        let mut child = frozen.resume().expect("resume");
+        let frozen = cmd.spawn_suspended().await.expect("spawn suspended");
+        let mut child = frozen.resume().await.expect("resume");
 
         let mut sock = accept_or_die_async(&listener, &mut child).await;
         let (tag, pid) = common::read_tag_and_pid(&mut sock);
@@ -368,8 +368,10 @@ async fn async_resumed_then_detached_child_is_alive(backend: &str, shape: &str) 
     }
     let mut child = cmd
         .spawn_suspended()
+        .await
         .expect("spawn suspended")
         .resume()
+        .await
         .expect("resume");
     let mut sock = accept_or_die_async(&listener, &mut child).await;
     let (tag, pid) = common::read_tag_and_pid(&mut sock);

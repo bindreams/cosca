@@ -198,7 +198,12 @@ impl Command {
         self
     }
 
-    /// Spawn the child. Spawn is synchronous; the returned `Child`'s waits are async.
+    /// Spawn the child. The returned `Child`'s waits are async.
+    ///
+    /// The whole sync spawn runs on tokio's blocking pool, so nothing in it blocks the runtime: not
+    /// an elevation backend's setup (`pkexec --version`, the UAC consent prompt, the password
+    /// delivered to `sudo -S`), not the wait for `exec`, and not the teardown of a spawn that fails
+    /// after its child exists (a cgroup leaf's drain among it).
     ///
     /// # Runtime
     ///
@@ -213,31 +218,53 @@ impl Command {
     /// `status`/`output`/`read` and the [`run`](crate::tokio::run)/[`run_line`](crate::tokio::run_line)
     /// free functions spawn eagerly, so the same applies to them.
     ///
-    /// # Blocking under elevation
+    /// # Dropping the future
     ///
-    /// An [`elevate`](Self::elevate)d spawn does its setup on the calling thread, blocking that
-    /// runtime worker (and, on a `current_thread` runtime, every task) until it finishes:
+    /// A future that is never polled does nothing, and leaves the command as it was. The first poll
+    /// moves the command into the blocking task. When the spawn completes, it succeeded or not, the
+    /// command is moved back, as the sync spawn leaves it: the fds taken, the arguments, environment
+    /// and the rest kept. A future dropped after its first poll leaves the command as
+    /// [`Command::new`] makes it: rebuild it before a reuse. So does a spawn that ends without
+    /// moving the command back: one that panics (the panic is resumed) and one the runtime's
+    /// shutdown cancels. Called with no runtime, `spawn` leaves the command as it was.
     ///
-    /// - `Backend::Pkexec` with `Auth::Gui` runs `pkexec --version` first, a few milliseconds;
-    /// - Windows waits for the user to answer the UAC consent prompt;
-    /// - `Auth::Stdin` delivers the password to `sudo -S`, waiting until sudo reads it.
+    /// The spawn is not cancelled by the drop: it runs to its end on the pool, and a child it made
+    /// (also one finished before the drop, or started by a UAC yes) is dropped there as a dropped
+    /// [`Child`] is: killed and reaped with [`kill_on_drop`](Self::kill_on_drop) (the default), left
+    /// running without. An elevated child the drop cannot kill is warned about and left. A failed
+    /// spawn's teardown finishes on the pool too, and a UAC prompt stays on screen until it is
+    /// answered.
     ///
-    /// # Blocking on a failed contained spawn
+    /// The thread that drops a finished spawn's child depends on where the future is dropped. The
+    /// child reaches the future over a channel, so that a runtime thread need not run its
+    /// destructor, which may wait. A future dropped before the task finished leaves the child to the
+    /// task, which drops it on the pool. One dropped after the task finished hands the child to the
+    /// pool when the drop is inside a running runtime, and drops it on the dropping thread outside a
+    /// runtime or once the runtime's shutdown began.
     ///
-    /// A [`contain`](Self::contain)ed spawn that fails after its child entered a cgroup v2 leaf
-    /// tears the leaf down on the calling thread. While a member remains, that is `cgroup.kill`,
-    /// then a wait for the leaf to drain, then its removal. The wait is brief unless a member
-    /// outlives the kill (see [`Containment::CgroupV2`]), and blocks the thread as above until it
-    /// ends.
+    /// # Runtime shutdown
     ///
-    /// [`Containment::CgroupV2`]: crate::Containment::CgroupV2
+    /// Dropping the runtime waits for a spawn that is running on the pool (tokio's blocking pool is
+    /// joined; `shutdown_timeout` and `shutdown_background` are the caller's way out). A spawn the
+    /// shutdown cancels before it ran started nothing, and fails with
+    /// [`Error::Io`](crate::error::Error::Io) saying so. A task that is already queued is dropped,
+    /// with what it holds, by the pool's shutdown on a pool or shutdown thread; a spawn made after
+    /// the shutdown began is dropped on the calling thread. A panic in the spawn is resumed here.
+    ///
+    /// # Per-thread state
+    ///
+    /// The child is forked on a pool thread, so it inherits that thread's per-thread state (signal
+    /// mask, seccomp filter, namespaces, capabilities, nice/affinity; on Windows its impersonation
+    /// token and COM apartment), not the caller's. Process-wide state is the process's. To use a
+    /// thread's own state, spawn with the sync [`Command::spawn`](SyncCommand::spawn) on that
+    /// thread.
     ///
     /// # Errors
     ///
     /// The errors are the sync [`Command::spawn`](SyncCommand::spawn)'s: this is the same spawn, and
     /// every error says whether the program could have started.
-    pub fn spawn(&mut self) -> Result<Child, Error> {
-        Ok(super::spawn::spawn(&mut self.inner)?)
+    pub async fn spawn(&mut self) -> Result<Child, Error> {
+        Ok(super::spawn::spawn(&mut self.inner).await?)
     }
 
     /// Forwards to the sync command's `set_elevation_report`.
@@ -247,13 +274,13 @@ impl Command {
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// Spawns as [`spawn`](Self::spawn) does, on the blocking pool. Fails as `spawn`
     /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn status(&mut self) -> Result<std::process::ExitStatus, Error> {
         self.inner.stdin(Stdio::inherit())?;
         self.inner.stdout(Stdio::inherit())?;
         self.inner.stderr(Stdio::inherit())?;
-        let mut child = self.spawn()?;
+        let mut child = self.spawn().await?;
         match child.wait().await {
             Ok(status) => Ok(status),
             Err(e) => Err(after_the_spawn(e, child).await),
@@ -261,13 +288,13 @@ impl Command {
     }
 
     /// Run to completion, capturing stdout and stderr (stdin is `/dev/null`).
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// Spawns as [`spawn`](Self::spawn) does, on the blocking pool. Fails as `spawn`
     /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn output(&mut self) -> Result<crate::Output, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
         self.inner.stderr(Stdio::pipe())?;
-        let mut child = self.spawn()?;
+        let mut child = self.spawn().await?;
         match child.communicate(None).await {
             Ok(output) => Ok(output),
             Err(e) => Err(after_the_spawn(e, child).await),
@@ -275,12 +302,12 @@ impl Command {
     }
 
     /// Run to completion, capturing stdout as a UTF-8 string (stdin is `/dev/null`).
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// Spawns as [`spawn`](Self::spawn) does, on the blocking pool. Fails as `spawn`
     /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn read(&mut self) -> Result<String, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
-        let mut child = self.spawn()?;
+        let mut child = self.spawn().await?;
         let out = match child.communicate(None).await {
             Ok(out) => out,
             Err(e) => return Err(after_the_spawn(e, child).await),
