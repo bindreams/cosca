@@ -57,6 +57,26 @@ async fn graceful_futures_are_send() {
     assert_send(child.graceful_shutdown_tree(grace));
 }
 
+/// The `kill_tree` futures and the foreign `Process`'s graceful tree shutdown, which awaits the same
+/// wait, are `Send`: the wait's state (the members' handles, the root's, the tree's edge) is held across
+/// its awaits.
+///
+/// Mutants: a `!Send` value held across the wait's awaits; `kill_tree` or `send_kill_tree` takes
+/// `&mut self` (each fails to compile).
+#[skuld::test]
+async fn kill_tree_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    let (child, _stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {});
+    assert_send(child.kill_tree());
+    // Never called: it only has to compile through a shared reference.
+    let _send_only = || drop(child.send_kill_tree());
+    let process = crate::tokio::Process::open(crate::identity::ProcessId::current())
+        .expect("open")
+        .expect("this process is running");
+    assert_send(process.kill_tree());
+    assert_send(process.graceful_shutdown_tree(std::time::Duration::ZERO));
+}
+
 #[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
     let mut c = crate::test_child::tokio_command(Console::Hidden);

@@ -180,14 +180,12 @@ impl JobHandle {
     /// The processes the job lists now, for the wait over a kill that follows: each is opened and
     /// proved a member through its own handle ([`member_to_watch`]), and its identity is read from
     /// that handle, which is then closed, so no handle is held per member. It is read before
-    /// `TerminateJobObject`, because the job's list does not say that a terminated member's process
-    /// object is signalled: after the kill the list is empty on its first read, whether or not the
-    /// members have exited (`probe-job-pidlist`, case 1: 3000 of 3000). A list read after the kill
-    /// would miss them. After a member's natural exit the list can show its deleted pid for one
-    /// listing (94 of 161882), so [`wait_drained_raw`] lists again and a drain is only an empty
-    /// listing. `root`, the root's pid, is left out: its owner waits for it. A member that cannot
-    /// be named, or the listing itself failing, is returned as an error saying its exit cannot be
-    /// observed; the kill goes ahead regardless.
+    /// `TerminateJobObject`: the job's list is empty on its first read after the kill, whether or not
+    /// the members have exited, so a list read after the kill would miss them. A member that exited
+    /// naturally can still show its deleted pid for one listing, so [`wait_drained_raw`] lists again
+    /// and a drain is only an empty listing. `root`, the root's pid, is left out: its owner waits for
+    /// it. A member that cannot be named, or the listing itself failing, is returned as an error
+    /// saying its exit cannot be observed; the kill goes ahead regardless.
     pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<crate::error::Error>) {
         use crate::containment::tree_kill::exit_unobserved;
         use crate::error::Error;
@@ -1002,11 +1000,11 @@ impl JobHandle {
     /// signaled rather than only at the next re-enumeration boundary — the async wrapper's
     /// drop-cancellation primitive (mirrors `wait_process_or_cancel`'s cancel event). A
     /// cancellation reports `MembersRemain` (the tree's drain state is simply unknown at that
-    /// point, same as a timeout), never an error. Unlike the deadline, cancellation IS checked
-    /// before that first re-enumeration too: it is a genuine "stop looking" instruction, not a
-    /// stale bound on how long to keep looking, so a caller who cancels before this call ever
-    /// enumerates the job once still gets a prompt `MembersRemain` rather than being forced
-    /// through one more round first.
+    /// point, same as a timeout), never an error. A cancellation seen at a round's start reports
+    /// `MembersRemain`, before the first listing too: unlike the deadline it is a genuine "stop
+    /// looking" instruction, not a stale bound. One signalled during the last round, after its wait
+    /// returned for a member, is not re-checked: the final listing answers, and the answer is
+    /// nobody's.
     pub(crate) fn wait_drained(
         &self,
         deadline: Option<std::time::Instant>,
@@ -1121,11 +1119,8 @@ pub(crate) fn wait_drained_raw(
         // A round that starts past the deadline is the last: it lists and answers, with at most one
         // more listing (`final_listing`).
         let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
-        // Cancellation is checked BEFORE any work this round, including the very first. It is a
-        // genuine "stop looking" instruction (the caller's future was dropped; the tree's drain
-        // state is no longer anyone's to observe), so it is honored even before the job has been
-        // listed once. A deadline, in contrast, is a bound on how long to keep looking, not an
-        // instruction to skip looking: the last round still lists.
+        // Cancel is checked first, even before the first listing: the future was dropped and nobody
+        // reads the answer. A deadline only bounds the wait, so the last round still lists.
         if cancelled(cancel) {
             return Ok(TreeDrain::MembersRemain);
         }
@@ -1252,9 +1247,8 @@ pub(crate) fn wait_drained_raw(
             return Ok(TreeDrain::MembersRemain);
         }
         if last_round {
-            // A polled handle was signalled: the listing may have named an exited member. A cancel
-            // signalled meanwhile is not re-checked: only the async future's drop signals it, and
-            // nobody reads that call's answer.
+            // A polled handle was signalled: the listing may have named an exited member. Cancel is
+            // not re-checked: only the async future's drop signals it, and nobody reads this answer.
             return final_listing(job);
         }
         // A tracked member exited — loop back and re-enumerate the authoritative live set.

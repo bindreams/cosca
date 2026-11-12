@@ -345,8 +345,7 @@ impl Child {
     /// [`kill_tree`](Child::kill_tree), which waits for each. Requires a mechanism with a real
     /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
-    /// nested-`Delegated` child do not). Event-driven: no interval is chosen internally anywhere in
-    /// this call's path.
+    /// nested-`Delegated` child do not).
     pub fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.tree.wait_drained(None)
     }

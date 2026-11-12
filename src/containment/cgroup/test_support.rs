@@ -503,6 +503,11 @@ impl FakeLeaf {
             .expect("flip populated");
     }
 
+    /// Make the leaf's state unreadable: a `cgroup.events` with no `populated` field.
+    pub(crate) fn set_unreadable(events: &std::path::Path) {
+        std::fs::write(events, "frozen 0\n").expect("write a cgroup.events with no populated field");
+    }
+
     pub(crate) fn is_populated(events: &std::path::Path) -> bool {
         let contents = std::fs::read_to_string(events).expect("read cgroup.events");
         contents.lines().any(|l| l.trim() == "populated 1")

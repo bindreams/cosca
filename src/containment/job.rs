@@ -86,9 +86,8 @@ impl Job {
     /// The kernel documents that termination of every member is initiated before
     /// `TerminateJobObject` returns, not that their teardown has finished: this does not wait.
     /// The job handle stays open, so [`wait_tree`](Job::wait_tree) after it waits until the job's list
-    /// is empty. That can come before every member's process object is signalled, so it
-    /// does not promise the members are gone: a caller that needs that uses
-    /// [`kill_tree`](Job::kill_tree). The kill terminates every member, including a child created
+    /// is empty, which does not promise the members are gone (see there): a caller that needs that
+    /// uses [`kill_tree`](Job::kill_tree). The kill terminates every member, including a child created
     /// while it runs.
     pub fn send_kill_tree(&self) -> Result<(), Error> {
         use crate::containment::Contains as _;

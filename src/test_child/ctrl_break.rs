@@ -363,7 +363,7 @@ pub(crate) fn kill_release_reap(child: &crate::Child, sock: TcpStream, tree: boo
 #[cfg(feature = "tokio")]
 pub(crate) async fn kill_release_reap_async(child: &mut crate::tokio::Child, sock: TcpStream, tree: bool) {
     if tree {
-        child.kill_tree().expect("kill_tree");
+        child.kill_tree().await.expect("kill_tree");
     } else {
         child.kill().expect("kill");
     }

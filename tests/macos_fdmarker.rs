@@ -203,9 +203,9 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_spawn() {
-    let (mut child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest).await;
+    let (child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest).await;
     assert_escaped(child.pid(), grand.pid);
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
     grand.assert_dead("the reparented setsid orphan (tokio spawn path)");
 }
 

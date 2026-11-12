@@ -1131,8 +1131,6 @@ impl Marker {
     /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
-    ///
-    /// Every identity the sweep killed is added to `killed`, for the wait over the kill.
     fn hard_kill(&self, root: Option<&dyn Root>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {
         self.hard_kill_impl(Scope::Full(root), killed)
     }
@@ -1779,7 +1777,7 @@ impl Marker {
     /// non-holder (not incomplete, just resolved), or a signal that was actually attempted
     /// (delivered, or already gone, which `kill_by_identity` treats as success).
     ///
-    /// A `SIGKILL` that was delivered adds `id` to `killed`, for the wait over the kill.
+    /// Only a delivered `SIGKILL` adds `id` to `killed`, the members the kill's wait waits for.
     fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal, killed: &mut Vec<ProcessId>) -> bool {
         match holds_marker_query(id.pid(), self.handle) {
             MarkerQuery::NotHeld => {

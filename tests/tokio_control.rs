@@ -54,7 +54,7 @@ async fn async_kill_on_exited_unreaped_child_is_ok() {
 #[skuld::test]
 async fn async_tree_ops_unsupported_when_uncontained() {
     let (mut child, sock) = common::spawn_blocker_async().await;
-    let err = child.kill_tree().expect_err("uncontained kill_tree");
+    let err = child.kill_tree().await.expect_err("uncontained kill_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     let err = child.terminate_tree().expect_err("uncontained terminate_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
@@ -75,7 +75,9 @@ async fn async_kill_tree_tears_down_tree() {
         common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
-    child.kill_tree().expect("kill_tree");
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
+    child.kill_tree().await.expect("kill_tree");
+    common::assert_exited(grand_id, "the grandchild");
     // A kill that did not come fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let status = child.wait().await.expect("reap root");
@@ -142,7 +144,9 @@ async fn async_contain_with_treewalk_tears_down_tree() {
         common::Member::new(root, child.pid()),
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
-    child.kill_tree().expect("treewalk kill_tree");
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
+    child.kill_tree().await.expect("treewalk kill_tree");
+    common::assert_exited(grand_id, "the grandchild");
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait().await.expect("reap");
 }
@@ -271,7 +275,7 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
         cosca::identity::Liveness::Alive,
         "cancelled tree graceful must not have escalated"
     );
-    child.kill_tree().expect("explicit sweep after cancel");
+    child.kill_tree().await.expect("explicit sweep after cancel");
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait().await.expect("reap after cancelled graceful");
     // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
@@ -309,7 +313,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
         cosca::identity::Liveness::Alive,
         "cancelled tree graceful must not have escalated"
     );
-    child.kill_tree().expect("explicit sweep after cancel");
+    child.kill_tree().await.expect("explicit sweep after cancel");
     common::assert_dead(&mut root, "the root after the sweep");
     common::assert_dead(&mut grand, "the grandchild after the sweep");
     let _ = child.wait().await.expect("reap");

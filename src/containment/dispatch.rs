@@ -768,8 +768,8 @@ impl TreeKillOutcome {
     }
 }
 
-/// What a settlement `answer`ed, and the members it killed again, which a call that waits for what its
-/// kill reached adds to its wait ([`KillWait::reaching`](crate::containment::KillWait::reaching)).
+/// A settlement's answer and the members it killed again, which the kill's wait adds to its wait
+/// ([`KillWait::reaching`](crate::containment::KillWait::reaching)).
 pub(crate) struct Settled<A = Result<SettleOutcome, Unsettled>> {
     pub(crate) answer: A,
     pub(crate) killed_again: Vec<crate::identity::ProcessId>,
@@ -839,10 +839,23 @@ impl<'a> Swept<'a> {
     pub(crate) fn wait(self) -> Result<(), SweepFailure> {
         let root_ended = self.wait.waits_for_root();
         let waited = self.wait.wait();
-        crate::containment::tree_kill::answer_after_wait(self.answer, waited, |error| SweepFailure {
-            error,
-            root_ended,
-        })
+        Self::after_wait(self.answer, waited, root_ended)
+    }
+
+    /// [`wait`](Self::wait), awaited, with no runtime thread blocked.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_async(self) -> Result<(), SweepFailure> {
+        let root_ended = self.wait.waits_for_root();
+        let waited = self.wait.wait_async().await;
+        Self::after_wait(self.answer, waited, root_ended)
+    }
+
+    fn after_wait(
+        answer: Result<(), SweepFailure>,
+        waited: Result<(), Error>,
+        root_ended: bool,
+    ) -> Result<(), SweepFailure> {
+        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| SweepFailure { error, root_ended })
     }
 }
 
@@ -904,9 +917,6 @@ impl TreeKilled {
     ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
-    ///
-    /// The [`Settled`] also has the members the mechanism killed again in the settlement, for a
-    /// caller that goes on to wait for what its kill reached.
     pub(crate) fn settle(
         &self,
         mechanism: Option<&Mechanism>,

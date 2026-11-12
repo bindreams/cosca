@@ -352,9 +352,14 @@ impl Child {
                 Err(fault::forced_kill_tree_error().into())
             } else {
                 self.kill_tree_after("graceful_shutdown_tree", earlier)
+                    .wait_async()
+                    .await
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after("graceful_shutdown_tree", earlier);
+            let sweep_result = self
+                .kill_tree_after("graceful_shutdown_tree", earlier)
+                .wait_async()
+                .await;
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
                 if (root_exited || sweep.root_ended) && !self.inner.root_is_unpinned() {
@@ -451,8 +456,7 @@ impl Child {
         if let Err(e) = drained {
             call.holders_grace_failed(&e);
         }
-        // Sends only: an async caller does not wait for the members.
-        self.inner.holders_shutdown_error(&call, skip).0
+        self.inner.holders_shutdown(&call, skip).finish_async().await
     }
 }
 

@@ -152,7 +152,7 @@ async fn async_child_graceful_shutdown_signals_the_group_but_only_kills_the_chil
         "the escalation must not have reached the group"
     );
     // Released after the kill: code 1 is the kill's.
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
     let Grandchild { sock, exit } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");

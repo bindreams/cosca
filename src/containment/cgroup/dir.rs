@@ -246,8 +246,7 @@ impl LeafDir {
         remove_children(self.dir.as_fd(), &self.swept)
     }
 
-    /// The `cgroup.procs` lines of every cgroup under the leaf, not the leaf's own, and the failure
-    /// that ended the listing early, if one did (see [`procs_under`]).
+    /// [`procs_under`] the leaf.
     pub(crate) fn nested_procs(&self) -> (Vec<String>, Option<io::Error>) {
         procs_under(self.dir.as_fd())
     }

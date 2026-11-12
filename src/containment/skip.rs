@@ -113,8 +113,7 @@ mod call {
         /// marker's holders) was signalled by the mechanism. `root`: the signal to the root through
         /// its handle, if the caller sent one ([`Skip::root_alone`]). One `warn` names what was
         /// skipped and what was sent. The error is the holders' sweep's, the root signal's, or
-        /// `Unassessable`; `Ok` only after this handle's own reap, when it already killed the tree. The
-        /// [`Settled`] has the members a `Kill`'s settlement killed again.
+        /// `Unassessable`; `Ok` only after this handle's own reap, when it already killed the tree.
         pub(crate) fn answer(
             &self,
             tree: &Tree,
@@ -263,8 +262,8 @@ mod call {
         /// macOS: the end of a call that signalled an fd marker's holders alone ([`Skip::holders`] of
         /// `skip` is their `SIGTERM`), after the grace: `kill` is the kill of any holder left, the
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or
-        /// `Unassessable`. The [`Settled`] has the members the settlement killed again.
-        pub(crate) fn holders_shutdown_error(&self, tree: &Tree, skip: &Skip, kill: TreeKillOutcome) -> Settled<Error> {
+        /// `Unassessable`.
+        pub(crate) fn holders_settled(&self, tree: &Tree, skip: &Skip, kill: TreeKillOutcome) -> Settled<Error> {
             let term = match &skip.holders {
                 Some(Err(e)) => format!(", which failed ({})", crate::error::Report(e)),
                 _ => String::new(),

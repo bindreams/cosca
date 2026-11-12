@@ -97,9 +97,11 @@ never blocks: the drop then finds nothing to wait for.
 The wait is bounded by a kill that landed, not by who sent it. A disarmed drop (`detach()`,
 `kill_on_drop(false)`) kills nothing, but if a `kill_tree()` or `send_kill_tree()` on the handle
 returned `Ok`, its `cgroup.kill` landed, and the drop waits for that leaf's drain, warning past 1 s,
-before it removes the leaf ([#194]). The sync `kill_tree()` waits for the drain itself, so its drop
-finds the leaf drained; `send_kill_tree()`, and the async `Child`'s `kill_tree()`, leave the wait to
-the drop, which blocks the dropping thread: await `wait_tree()` first.
+before it removes the leaf ([#194]). `kill_tree()` waits for the drain itself, sync, and async as an
+`async fn` that awaits it, so its drop finds the leaf drained; `send_kill_tree()`, sync or async,
+leaves the wait to the drop, which blocks the dropping thread: await `wait_tree()` first. So does an
+async `kill_tree()` future dropped after its kill was sent: the members stay killed, and only the
+wait stops.
 
 A drop with no landed kill does bounded work only: disarmed and never killed, or armed with a root
 kill that failed or could not be sent, so the root may still run. It may send a bounded number of

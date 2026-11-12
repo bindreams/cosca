@@ -384,7 +384,7 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
 
     for (mut child, sock) in [(plain, plain_sock), (hidden, hidden_sock)] {
         drop(sock);
-        let _ = child.kill_tree();
+        let _ = child.kill_tree().await;
         child.wait().await.expect("reap");
     }
 }

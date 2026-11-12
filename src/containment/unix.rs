@@ -157,8 +157,8 @@ pub(crate) fn set_session(steps: &mut crate::child::spawn::in_child::InChild) {
 /// verdict. A cgroup (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
 ///
-/// The members it listed and sent a `SIGKILL` through their own handle are added to `killed`, which a
-/// wait over the kill goes on to wait for.
+/// `killed` gets the listed members whose `SIGKILL` resend was delivered, which the kill's wait waits
+/// for; never the root (its owner waits for it), and not a member that was already gone.
 pub(crate) fn kill_group(
     pgid: i32,
     root: Option<&dyn Root>,

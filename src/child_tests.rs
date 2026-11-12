@@ -182,15 +182,16 @@ fn drop_closes_the_childs_untaken_stdout() {
 
 /// A `TreeWalk` child's `kill_tree` sends the root's kill through the child's own handle, with no
 /// second open of the root's identity: the walk's send, then the backstop's. The scripted handle
-/// answers both, and the live process behind it, which a send by identity would kill, runs on.
-/// Not macOS, where a `TreeWalk` root is an fd marker.
+/// answers both. On Unix the sends log shows none by identity, and the live process behind the handle
+/// still runs, which a kill by its number or identity would end.
+/// Not macOS, where a `TreeWalk` root is an fd marker. Gap: on Windows no row shows the real root was
+/// not killed by its identity, because the walk's console-host kill ends the root either way.
 ///
 /// Mutant: the walk opens its root by identity (the handle is sent only the backstop's kill).
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
     use crate::signal::{Sent, Sig};
-    use crate::test_child::STATUS_DLL_INIT_FAILED;
 
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
@@ -204,21 +205,33 @@ fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
             .exits([crate::os_process::fake::Answer::Exited])
     });
 
+    #[cfg(unix)]
+    let sends = crate::send_log::Capture::start();
+
     child.kill_tree().expect("the handle took both kills");
 
+    // A walk that opened the root by identity would leave the handle only the backstop's kill. (On
+    // Windows the real root's own state is not asserted: the walk also kills its console host, which
+    // ends the root of its own accord.)
     assert_eq!(
         fake.signal_calls(),
         vec![Sig::Kill, Sig::Kill],
         "the walk's, then the backstop's"
     );
-    // On Windows the walk also kills the console host the root owns, and the call waits for it, which
-    // ends the root of its own accord (`STATUS_DLL_INIT_FAILED`): a kill of the root by its identity
-    // would end it with `TerminateProcess`'s code 1.
-    let status = child.try_wait().expect("look at the live process");
-    assert!(
-        status.is_none_or(|status| cfg!(windows) && status.code() == Some(STATUS_DLL_INIT_FAILED)),
-        "the real process was killed by its identity, not through the child's handle: {status:?}"
-    );
+    // On Unix the root was sent nothing by its identity, and the real root still runs: its kills went
+    // to the fake handle.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            sends.by_identity(),
+            vec![],
+            "the root was sent a signal by its identity"
+        );
+        assert!(
+            child.try_wait().expect("look at the live process").is_none(),
+            "the real root exited (a kill by its number or identity would do this)"
+        );
+    }
 }
 
 /// A `TreeWalk` child's `terminate_tree` sends the root's `SIGTERM` through the child's own handle.
@@ -235,12 +248,20 @@ fn a_tree_walk_terminate_tree_sends_the_roots_term_through_the_childs_handle() {
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
     let fake = child.proc.script_over(|f| f.signals([Ok(Sent::Delivered)]));
+    let sends = crate::send_log::Capture::start();
 
     child.terminate_tree().expect("the handle took the SIGTERM");
 
     assert_eq!(fake.signal_calls(), vec![Sig::Term]);
+    // A `SIGTERM` the walk sent the root by its identity is a send the log holds at once; the root's
+    // exit, below, follows it only when the kernel gets to it.
+    assert_eq!(
+        sends.by_identity(),
+        vec![],
+        "the root was sent a signal by its identity"
+    );
     assert!(
         child.try_wait().expect("look at the live process").is_none(),
-        "the real process was terminated by its identity, not through the child's handle"
+        "the real root exited (a SIGTERM by its identity would do this)"
     );
 }

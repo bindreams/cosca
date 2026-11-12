@@ -74,12 +74,12 @@ async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate:
 async fn cleanup(child: &mut crate::tokio::Child) {
     #[cfg(unix)]
     {
-        child.kill_tree().expect("cleanup sweep");
+        child.kill_tree().await.expect("cleanup sweep");
         child.wait().await.expect("reap");
     }
     #[cfg(windows)]
     {
-        _ = child.kill_tree();
+        _ = child.kill_tree().await;
         _ = child.wait().await;
     }
 }
@@ -590,7 +590,7 @@ async fn drained_tree_sweep_decision(contain: impl FnOnce(&mut crate::tokio::Com
         );
         drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-        _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        _ = child.kill_tree().await; // cleanup: the forced failure means the real sweep never ran
         let status = child
             .wait()
             .await
@@ -713,7 +713,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
 ) {
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Strongest, |child| {
         assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
-        child.kill_tree().expect("the leaf is swept by its own handle");
+        child.send_kill_tree().expect("the leaf is swept by its own handle");
     })
     .await;
 }
@@ -729,7 +729,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
         let err = child
-            .kill_tree()
+            .send_kill_tree()
             .expect_err("a reaped root's group is not signalled by its number");
         assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
     })
@@ -847,7 +847,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     );
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    _ = child.kill_tree();
+    _ = child.kill_tree().await;
 }
 
 // `TreeWalk` has no drain edge to observe, so the grace-wait of `graceful_shutdown_tree` watches the
@@ -924,4 +924,105 @@ async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
     assert_still_running(&mut child, stdin).await;
     cleanup(&mut child).await;
+}
+
+/// The holders-only escalation of `graceful_shutdown_tree` (a macOS fd marker whose root's number may
+/// name another process) awaits each member its kill reached: the sibling that ends the member finds
+/// the call still pending, and no runtime thread blocks on it. The call is made on the escalation
+/// itself, over a mechanism that states the member, because only an fd marker ends in it and nothing
+/// holds a real marker member after its `SIGKILL`.
+///
+/// Mutants: `finish_async` returns the error without its wait; `finish_async` waits through the
+/// blocking `wait`.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::identity::Liveness;
+    use crate::os_process::fake::Answer;
+    use crate::test_child::over_fake::{holders_only_skip, live_member, root_looking, tokio_child_reaching};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (member, writer, id) = live_member();
+    let root = root_looking([Answer::Exited]);
+    let child = tokio_child_reaching(&root, &[id]);
+    let skip = holders_only_skip(&child.inner);
+    let writer = Rc::new(Cell::new(Some(writer)));
+    let blocked = Rc::new(Cell::new(false));
+    // A wait that blocks the thread ends the member from inside the block, so the row fails instead of
+    // hanging.
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let (writer, blocked) = (writer.clone(), blocked.clone());
+        move || {
+            blocked.set(true);
+            drop(writer.take());
+        }
+    });
+    let done = Cell::new(false);
+
+    let (error, ()) = ::tokio::join!(
+        async {
+            let error = child.shut_down_holders_only(&skip, Duration::ZERO).await;
+            done.set(true);
+            error
+        },
+        async {
+            ::tokio::task::yield_now().await;
+            assert!(
+                !done.get(),
+                "the escalation resolved while a member its kill reached was running"
+            );
+            drop(writer.take());
+        }
+    );
+
+    assert!(!blocked.get(), "the escalation blocked a runtime thread");
+    assert!(
+        matches!(error, crate::error::Error::Unassessable { .. }),
+        "the holders alone are not the tree: {error}"
+    );
+    assert_eq!(
+        id.is_alive(),
+        Liveness::Dead,
+        "the member has exited when the escalation resolves"
+    );
+    _ = member.wait();
+}
+
+/// A holders-only escalation whose wait for the holders it killed fails answers with the
+/// holders-only error, as `kill_tree` answers a failed kill over a failed wait; the wait's failure is
+/// logged at debug (`log_failed_wait`), which also shows the member was waited for.
+///
+/// Mutants: `finish_async` puts the wait's failure in the error; `finish_async` returns the error
+/// without waiting.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::os_process::fake::Answer;
+    use crate::test_child::over_fake::{holders_only_skip, root_looking, tokio_child_with};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = tokio_child_with(&root, fake.reaching_unobserved(4242));
+    let skip = holders_only_skip(&child.inner);
+
+    let error = child.shut_down_holders_only(&skip, Duration::ZERO).await;
+
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, source: None }
+            if detail.contains("sent the SIGTERM only to the marker holders")),
+        "the answer is the holders-only error: {error}"
+    );
+    let waited = crate::log_capture::records_since_on_current_thread(mark, "the wait after a holders-only shutdown");
+    assert!(
+        matches!(&waited[..], [(log::Level::Debug, line)]
+            if line.contains("pid 4242 was killed, but its exit cannot be observed")),
+        "the member was waited for, and its failure is logged at debug: {waited:?}"
+    );
 }

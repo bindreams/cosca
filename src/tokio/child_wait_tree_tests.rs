@@ -36,7 +36,7 @@ fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdi
 
 /// Async twin of `child::lifecycle_tests::kill_then_release`.
 async fn kill_then_release(mut child: crate::tokio::Child, stdin: crate::tokio::ChildStdin) {
-    child.kill_tree().expect("kill_tree");
+    child.kill_tree().await.expect("kill_tree");
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap the blocker"));
 }

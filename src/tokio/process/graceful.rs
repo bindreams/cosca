@@ -39,7 +39,9 @@ impl Process {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        crate::graceful::after_tree_grace(self.wait_timeout(grace).await, || self.kill_tree())
+        let watch = self.wait_timeout(grace).await;
+        crate::graceful::note_watch(&watch);
+        crate::graceful::after_sweep(self.kill_tree().await, watch)
     }
 }
 

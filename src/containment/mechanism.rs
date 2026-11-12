@@ -39,12 +39,12 @@ pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> KillLeftOutcome {
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
 /// as a [`Mechanism`] and asks it nothing about which it is.
 pub(crate) trait Contains: fmt::Debug {
-    /// Kill every member it names, and name them for a caller that waits: the [`TreeKill`] returned
-    /// has the members it reached, and the edge of its own that says when they have all exited. A
-    /// cgroup leaf and a Job Object read their members before the kill, so this costs a pass over
-    /// the tree there: a caller that waits for none calls [`send_kill`](Self::send_kill). `root` is read right before each send by a mechanism
-    /// that names its tree by the root's pid, which decides from it what to send; the outcome says
-    /// what was skipped and why ([`Skip`](crate::containment::Skip)). Others ignore it.
+    /// Kill every member and return a [`TreeKill`] with the members reached and, for a kernel tree
+    /// (a cgroup leaf, a Job Object) whose kill landed, its drain edge.
+    /// A cgroup leaf and a Job Object list members first, which costs a pass over the tree; a caller
+    /// that waits for none uses [`send_kill`](Self::send_kill). `root` is read right before each send
+    /// by a mechanism that names its tree by the root's pid, which decides from it what to send; the
+    /// outcome says what was skipped and why ([`Skip`](crate::containment::Skip)). Others ignore it.
     ///
     /// What `Ok` says depends on how the mechanism names the tree:
     ///

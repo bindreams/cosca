@@ -374,7 +374,7 @@ fn a_seccomp_refused_openat2_leaves_an_async_treewalk_roots_kill_tree_an_error_a
                     ));
                     assert_eq!(child.containment(), cosca::Containment::TreeWalk);
                     common::seccomp::deny_openat2_on_this_thread(errno);
-                    let result = child.kill_tree();
+                    let result = runtime.block_on(child.kill_tree());
                     drop(control);
                     let status = runtime.block_on(child.wait()).expect("reap the root");
                     (result, status)

@@ -152,7 +152,9 @@ async fn async_foreign_kill_tree_tears_down_tree() {
         common::Member::new(grand, common::last_reported_grandchild().expect("the grandchild's pid")),
     );
     let p = Process::open_pid(child.pid()).expect("open").expect("running");
-    p.kill_tree().expect("kill_tree");
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
+    p.kill_tree().await.expect("kill_tree");
+    common::assert_exited(grand_id, "the grandchild");
     // A kill that sent nothing fails here by assertion.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
     let _ = child.wait();

@@ -92,9 +92,25 @@ impl Process {
     /// contract — see [`Process::kill_tree`](crate::Process::kill_tree), which says what a member it
     /// leaves running is).
     ///
-    /// It sends the kills and returns, as [`Process::send_kill_tree`](crate::Process::send_kill_tree)
-    /// does, so that no runtime thread is blocked on the members' exit.
-    pub fn kill_tree(&self) -> Result<(), Error> {
+    /// As the sync [`Process::kill_tree`](crate::Process::kill_tree): same `Ok`, errors and stated
+    /// limits. The kill is sent on the calling thread; the wait for the members and the root is
+    /// awaited, blocking no runtime thread. [`send_kill_tree`](Self::send_kill_tree) is the call that
+    /// only sends.
+    ///
+    /// Dropping the future after the kills were sent leaves the members killed and stops only the
+    /// wait.
+    ///
+    /// # Runtime
+    ///
+    /// As [`wait`](Process::wait).
+    pub async fn kill_tree(&self) -> Result<(), Error> {
+        self.inner.kill_tree_with_async(&crate::identity::HostKernel).await
+    }
+
+    /// [`kill_tree`](Self::kill_tree) that sends and does not wait, as the sync
+    /// [`Process::send_kill_tree`](crate::Process::send_kill_tree) does: `Ok` says every member the
+    /// walk found was sent its kill, not that any has exited.
+    pub fn send_kill_tree(&self) -> Result<(), Error> {
         self.inner.send_kill_tree()
     }
 

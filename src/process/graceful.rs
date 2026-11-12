@@ -74,6 +74,14 @@ impl Process {
         crate::containment::tree_kill::answer_after_wait(answer, waited, |error| error)
     }
 
+    /// [`kill_tree_with`](Self::kill_tree_with), awaited, with no runtime thread blocked.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn kill_tree_with_async(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel);
+        let waited = wait.wait_async().await;
+        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| error)
+    }
+
     /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
     pub(crate) fn send_kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         self.sweep(kernel).0

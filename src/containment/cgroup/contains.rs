@@ -60,10 +60,8 @@ impl Contains for CgroupLeaf {
     ///
     /// Once the kill has landed, each listed member is placed through its pidfd
     /// ([`reached_by_kill`](CgroupLeaf::reached_by_kill)): one still in the leaf was reached whatever
-    /// its credentials, and is waited for; one found outside is TAKEN to have left before the kill, so
-    /// it is no part of the tree and is not waited for (one moved out after the kill reached it reads
-    /// the same and is not waited for either, though it was sent `SIGKILL`); one that cannot be placed
-    /// is an error saying its exit cannot be observed.
+    /// its credentials, and is waited for; one found outside is not waited for (see there); one that
+    /// cannot be placed is an error saying its exit cannot be observed.
     fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         let (listed, mut unobserved) = self.list_members(root.map(Root::pid));
         let sent = self.send_kill(root);
