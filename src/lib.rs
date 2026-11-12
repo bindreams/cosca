@@ -28,7 +28,8 @@
 //!   pidfd and not its pid. The one by-pid wait is std's own, inside a spawn that fails after the
 //!   fork.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's start time and to list processes. Before
+//!   checked `/proc` view uses it to read a process's start time and to list processes. It is
+//!   refused as `pidfd_open` is (`ENOSYS`, `EPERM`, `EACCES`, `ENODEV`). Before
 //!   Linux 6.9 a refusal is [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`,
 //!   from a by-pid identity read, wait or kill, and from a spawn inside
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the

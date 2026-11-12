@@ -14,12 +14,18 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
 }
 
 /// The refusals of `openat2` a host can answer, as `(errno, its name)`: `ENOSYS` before Linux 5.6,
-/// `EPERM` under a seccomp profile that blocks it.
-pub const OPENAT2_REFUSALS: [(i32, &str); 2] = [(libc::ENOSYS, "ENOSYS"), (libc::EPERM, "EPERM")];
+/// and `EPERM`, `EACCES` or `ENODEV` under a seccomp profile or LSM that blocks it. The same set
+/// refuses `pidfd_open`.
+pub const OPENAT2_REFUSALS: [(i32, &str); 4] = [
+    (libc::ENOSYS, "ENOSYS"),
+    (libc::EPERM, "EPERM"),
+    (libc::EACCES, "EACCES"),
+    (libc::ENODEV, "ENODEV"),
+];
 
 /// Make `openat2` fail with `errno` (a positive `libc` constant) on the calling thread and every
-/// process it forks, as a kernel before 5.6 (`ENOSYS`) or a seccomp-filtered container (`EPERM`)
-/// does. Run the denied code on its own thread to keep the test's own `openat2`.
+/// process it forks, as a kernel before 5.6 (`ENOSYS`) or a seccomp-filtered container does. Run
+/// the denied code on its own thread to keep the test's own `openat2`.
 pub fn deny_openat2_on_this_thread(errno: i32) {
     use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD};
 

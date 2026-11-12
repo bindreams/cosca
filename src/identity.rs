@@ -845,9 +845,6 @@ pub(crate) mod seams {
     }
 }
 
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::openat2_refused_message;
-
 #[cfg(target_os = "linux")]
 impl ProcessId {
     /// The inode of the process's pidfd, when this id is of the `pidfs` kind: the proof of it is

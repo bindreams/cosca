@@ -93,10 +93,42 @@ fn a_refused_pidfd_open_is_unknown_and_unsupported() {
     }
 }
 
-/// Only a failed `pidfd_open` is a refusal: the same errnos from the inode read or a `poll` are the
-/// call's own failure, `Unassessable` with the raw errno. Mutant: "the refusal rule ignores the call".
+/// A refused `openat2` of `/proc` is `Unsupported` for the same errnos as a refused `pidfd_open`: a
+/// filter or LSM picks the errno, not the syscall. Mutant: "the view keeps its own narrower errno
+/// set".
 #[skuld::test]
-fn only_a_failed_pidfd_open_is_a_refusal() {
+fn a_refused_openat2_is_unsupported_for_the_errnos_a_refused_pidfd_open_is() {
+    use crate::identity::{FailedCall, ViewUnreadable};
+
+    for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {
+        let call = FailedCall::openat2(errno);
+        assert_eq!(call.refusal(), FailedCall::pidfd_open(errno).refusal(), "{errno}");
+        let name = call.refusal().unwrap_or_else(|| panic!("{errno} refuses openat2"));
+        let want = format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {name}");
+        assert_eq!(call.requirement().as_deref(), Some(want.as_str()), "{errno}");
+
+        let view = ViewUnreadable::from_open_errno(errno);
+        assert_eq!(view.openat2_requirement().as_deref(), Some(want.as_str()), "{errno}");
+        match view.unsupported("identifying pid 4242") {
+            Some(Error::Unsupported { detail, .. }) => assert_eq!(detail, want, "{errno}"),
+            other => panic!("{errno}: expected Unsupported, got {other:?}"),
+        }
+    }
+    // The call's own failure is not a refusal.
+    for errno in [Errno::MFILE, Errno::NFILE, Errno::NOENT] {
+        assert!(FailedCall::openat2(errno).refusal().is_none(), "{errno}");
+        assert!(
+            ViewUnreadable::from_open_errno(errno).unsupported("op").is_none(),
+            "{errno}"
+        );
+    }
+}
+
+/// Only a failed `pidfd_open` or `openat2` is a refusal: the same errnos from the inode read or a
+/// `poll` are the call's own failure, `Unassessable` with the raw errno. Mutant: "the refusal rule
+/// ignores the call".
+#[skuld::test]
+fn only_a_failed_pidfd_open_or_openat2_is_a_refusal() {
     use crate::identity::{FailedCall, UnknownCause};
 
     for errno in [Errno::PERM, Errno::NOSYS, Errno::ACCESS, Errno::NODEV] {

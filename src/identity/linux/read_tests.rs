@@ -157,7 +157,9 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
         err.to_string(),
         format!(
             "identifying the spawned child is not supported on linux: {}",
-            crate::identity::openat2_refused_message("ENOSYS")
+            crate::identity::FailedCall::openat2(Errno::NOSYS)
+                .requirement()
+                .expect("ENOSYS refuses openat2")
         )
     );
 }

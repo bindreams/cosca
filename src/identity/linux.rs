@@ -500,13 +500,11 @@ pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error
 /// [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`] naming the call
 /// and carrying the errno.
 pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
-    match call.refusal() {
-        Some(name) => crate::os_process::linux::open::pidfd_open_unsupported(&format!("identifying {subject}"), name),
-        None => Error::Unassessable {
+    call.unsupported(format!("identifying {subject}"))
+        .unwrap_or_else(|| Error::Unassessable {
             detail: format!("{subject} identity could not be read: {}", call.name()),
             source: Some(Error::io_cause(std::io::Error::from(call.errno()))),
-        },
-    }
+        })
 }
 
 fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>) -> Error {
