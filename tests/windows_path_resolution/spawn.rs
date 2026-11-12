@@ -4,14 +4,12 @@ use crate::dots_and_spaces::WEIRD_NAMES;
 use crate::harness::canary;
 use crate::pure::{all_succeeded, payload_outcome, reap_after_terminate, verbatim_spelling, PayloadOutcome};
 use crate::test_groups::{path_probes, Group};
-use crate::winapi::{outcome, wide};
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
+use crate::winapi::outcome;
+use windows::core::PWSTR;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_NAME_WIN32, STARTF_USESTDHANDLES,
-    STARTUPINFOW,
+    QueryFullProcessImageNameW, TerminateProcess, CREATE_SUSPENDED, PROCESS_NAME_WIN32,
 };
 
 /// Canary: an image under a verbatim dots-and-spaces name LOADS through `std::process`, and the
@@ -330,69 +328,20 @@ pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
 }
 
 /// `CreateProcessW(lpApplicationName = program)` with no arguments, stdout captured to `out_path`.
-/// `Err` is a spawn that did not happen, rendered with its Win32 error.
+/// `Err` is a spawn that did not happen, rendered with its Win32 error (the `io::Error`'s `os error`).
 pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, String), String> {
-    use std::os::windows::io::AsRawHandle;
+    use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, RawStdio};
+    use std::os::windows::io::AsHandle;
 
     let file = std::fs::File::create(out_path).map_err(|e| format!("could not open the capture file: {e}"))?;
-    let handle = HANDLE(file.as_raw_handle());
-    // SAFETY: `handle` is a live handle owned by `file` for the whole call.
-    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
-        .map_err(|e| format!("could not make the capture handle inheritable: {e}"))?;
-
-    let program_w = wide(program);
-    let mut cmdline_w = wide(&format!("\"{program}\""));
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdOutput: handle,
-        hStdError: handle,
-        ..Default::default()
+    let options = RawOptions {
+        image: Some(program),
+        stdio: RawStdio::Output(file.as_handle()),
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: both wide buffers are nul-terminated and outlive the call; `cmdline_w` is writable,
-    // as CreateProcessW requires; `si` and `pi` are live and correctly sized.
-    let spawned = unsafe {
-        CreateProcessW(
-            PCWSTR(program_w.as_ptr()),
-            Some(PWSTR(cmdline_w.as_mut_ptr())),
-            None,
-            None,
-            true,
-            CREATE_NO_WINDOW,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
-    };
-    if let Err(e) = spawned {
-        return Err(format!("did not spawn: {e} (HRESULT {:#010x})", e.code().0));
-    }
-
-    // SAFETY: `pi.hProcess` is the live handle CreateProcessW just handed us. INFINITE is not a
-    // chosen timeout — the child is `cosca_testbin_image`, which exits on its own.
-    let waited = unsafe { WaitForSingleObject(pi.hProcess, INFINITE) };
-    // Captured before anything else can overwrite the thread's last error.
-    let wait_error = std::io::Error::last_os_error();
-    let mut code = 0u32;
-    let got_code = if waited == WAIT_OBJECT_0 {
-        // SAFETY: the process has exited and `code` is a live out-parameter.
-        unsafe { GetExitCodeProcess(pi.hProcess, &mut code) }.map_err(|e| format!("GetExitCodeProcess failed: {e}"))
-    } else {
-        // Anything else leaves the child possibly running and the capture incomplete.
-        Err(format!(
-            "WaitForSingleObject returned {:#x}, not WAIT_OBJECT_0: {wait_error}",
-            waited.0
-        ))
-    };
-    for (what, handle) in [("thread", pi.hThread), ("process", pi.hProcess)] {
-        // SAFETY: the handle is owned by us and not used again.
-        if let Err(e) = unsafe { CloseHandle(handle) } {
-            println!("  CLEANUP: the child's {what} handle could not be closed: {e}");
-        }
-    }
-    got_code?;
+    let child = spawn_locked_raw_with(program, &[], &[], 0, Console::Hidden, options)
+        .map_err(|e| format!("did not spawn: {e}"))?;
+    // The wait is unbounded: the child is `cosca_testbin_image`, which exits on its own.
+    let code = child.wait().map_err(|e| format!("waiting for the child failed: {e}"))?;
 
     drop(file);
     let captured = std::fs::read_to_string(out_path).map_err(|e| format!("could not read the capture file: {e}"))?;

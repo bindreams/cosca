@@ -100,11 +100,6 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub(crate) fn wide_path(p: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-}
-
 /// `GetTokenInformation`'s two-call protocol, into a `u64`-backed (8-byte-aligned) buffer —
 /// `TOKEN_MANDATORY_LABEL` and `TOKEN_PRIVILEGES` both contain pointer-aligned fields, so a
 /// `Vec<u8>` would be misaligned UB.

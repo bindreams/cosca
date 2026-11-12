@@ -706,61 +706,35 @@ fn fixture_reports_job_breakaway_probe() {
 /// A suspended process this test made itself, holding its main thread. It sits in a
 /// kill-on-close job, so the OS kills it however the test process exits; `Drop` kills it sooner.
 struct SuspendedHelper {
-    process: windows::Win32::Foundation::HANDLE,
+    /// `_child`'s initial thread, which `_child` keeps owning.
     thread: windows::Win32::Foundation::HANDLE,
     tid: u32,
     pid: u32,
+    _child: crate::test_spawn::locked::RawChild,
     _job: super::JobHandle,
 }
 
 impl SuspendedHelper {
     fn new() -> Self {
-        use windows::core::PWSTR;
-        use windows::Win32::System::Threading::{
-            CreateProcessW, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
-        };
-        let mut cmdline: Vec<u16> = "cmd /C more".encode_utf16().chain(std::iter::once(0)).collect();
-        let si = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut pi = PROCESS_INFORMATION::default();
-        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer that outlives the call.
-        unsafe {
-            CreateProcessW(
-                None,
-                Some(PWSTR(cmdline.as_mut_ptr())),
-                None,
-                None,
-                false,
-                CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                None,
-                None,
-                &si,
-                &mut pi,
-            )
-        }
-        .expect("CreateProcessW for the suspended helper");
-        let job = super::assign_to_kill_on_close_job(pi.hProcess.0).expect("assign the helper to a job");
+        use crate::test_spawn::console_flags::Console;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::System::Threading::CREATE_SUSPENDED;
+        let child = crate::test_spawn::locked::spawn_locked_raw(
+            "cmd",
+            &["/C", "more"],
+            &[],
+            CREATE_SUSPENDED.0,
+            Console::Hidden,
+        )
+        .expect("spawn the suspended helper");
+        let job =
+            super::assign_to_kill_on_close_job(child.process().as_raw_handle()).expect("assign the helper to a job");
         Self {
-            process: pi.hProcess,
-            thread: pi.hThread,
-            tid: pi.dwThreadId,
-            pid: pi.dwProcessId,
+            thread: windows::Win32::Foundation::HANDLE(child.thread().as_raw_handle()),
+            tid: child.thread_id(),
+            pid: child.id(),
+            _child: child,
             _job: job,
-        }
-    }
-}
-
-impl Drop for SuspendedHelper {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::TerminateProcess;
-        // SAFETY: both handles are live and owned by this helper.
-        unsafe {
-            _ = TerminateProcess(self.process, 1);
-            _ = CloseHandle(self.thread);
-            _ = CloseHandle(self.process);
         }
     }
 }

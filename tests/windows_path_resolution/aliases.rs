@@ -12,7 +12,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation,
@@ -23,10 +23,7 @@ use windows::Win32::Storage::FileSystem::{
     FindClose, FindFirstFileW, GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
     WIN32_FIND_DATAW,
 };
-use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, SetThreadToken, WaitForSingleObject,
-    CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
 use crate::common::windows_reparse::{app_exec_link_data, set_reparse, IO_REPARSE_TAG_APPEXECLINK};
 use crate::measure::canonical;
@@ -277,45 +274,29 @@ fn reparse_tag(path: &Path) -> String {
 /// `err=<code>`. The wait is unbounded: the only programs launched (`winget --version` and this
 /// test's own image) exit on their own.
 fn launch(path: &Path, args: &str) -> String {
-    let app = wide_of(path.as_os_str());
-    let mut line = wide_of(OsStr::new(&format!("\"{}\" {args}", path.display())));
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESTDHANDLES,
-        ..Default::default()
+    use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, RawStdio};
+
+    let Some(image) = path.to_str() else {
+        return "err=path is not UTF-8".to_owned();
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `app` and `line` are NUL-terminated and outlive the call; `line` is writable; `si`
-    // and `pi` are live.
-    let created = unsafe {
-        CreateProcessW(
-            PCWSTR(app.as_ptr()),
-            Some(PWSTR(line.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
+    let options = RawOptions {
+        image: Some(image),
+        stdio: RawStdio::Null,
     };
-    if let Err(e) = created {
-        return format!("err={}", e.code().0 & 0xFFFF);
-    }
-    let mut code = 0u32;
-    // SAFETY: `pi`'s handles are live and owned here, each closed once.
-    unsafe {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let got = GetExitCodeProcess(pi.hProcess, &mut code);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        if let Err(e) = got {
-            return format!("ok,exit=unknown({e})");
+    let args: Vec<&str> = args.split_whitespace().collect();
+    let child = match spawn_locked_raw_with(image, &args, &[], 0, Console::Hidden, options) {
+        Ok(child) => child,
+        Err(e) => {
+            return format!(
+                "err={}",
+                e.raw_os_error().map_or_else(|| e.to_string(), |c| c.to_string())
+            )
         }
+    };
+    match child.wait() {
+        Ok(code) => format!("ok,exit={code}"),
+        Err(e) => format!("ok,exit=unknown({e})"),
     }
-    format!("ok,exit={code}")
 }
 
 /// A junction (mount point) at `link`, a new directory, to `target`, set by `FSCTL_SET_REPARSE_POINT`

@@ -22,6 +22,19 @@ use std::os::windows::process::CommandExt as _;
 #[path = "../tests/common/console_flags.rs"]
 pub(crate) mod console_flags;
 
+// The integration tests' raw `CreateProcessW` spawn (`locked::spawn_locked_raw_with`), compiled from
+// its real source with the one other file it names.
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "the lib's tests use the raw spawn only; the file's other wrappers are for tests/"
+)]
+#[path = "../tests/common/locked.rs"]
+pub(crate) mod locked;
+#[cfg(windows)]
+#[path = "../tests/common/windows_env.rs"]
+mod windows_env;
+
 thread_local! {
     static BETWEEN_SPAWN_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
 }
