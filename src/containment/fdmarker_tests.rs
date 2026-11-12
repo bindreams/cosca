@@ -1047,6 +1047,124 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     );
 }
 
+/// A later pass that re-fires the group signal after an earlier pass's group signal failed folds both
+/// failures together: neither erases the other. A live holder in the group (P, which carries the
+/// marker) is what opens the gate for the re-fire.
+#[skuld::test]
+fn a_refired_group_signal_that_fails_again_keeps_both_failures() {
+    let _serialize = test_spawn_lock();
+    let mut p_cmd = member_command(0); // pgid == P's own pid.
+    let prepared = install_on(&mut p_cmd, &[]).expect("install marker on P");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut p_child = p_cmd.spawn().expect("spawn P");
+    drop(p_cmd);
+    await_member_ready(&mut p_child);
+    let pgid = p_child.id() as i32;
+
+    let marker = super::Marker::new(prepared, inert_root(), Some(pgid));
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    state.group_result = Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+    let sends = crate::containment::unix::fault::record_kill_group();
+    sends.fail_with_unassessable();
+
+    marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut state,
+        false,
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
+    );
+
+    assert_eq!(
+        sends.killed(),
+        [pgid],
+        "the later pass must re-fire the group signal, or the row proves nothing"
+    );
+    let said = crate::error::Report(state.group_result.as_ref().expect_err("both passes failed")).to_string();
+    assert!(
+        said.contains("os error 1") && said.contains("forced by a test"),
+        "the group result must keep both failures: {said}"
+    );
+
+    _ = p_child.kill(); // P holds the marker, so the pass signalled it.
+    _ = p_child.wait();
+}
+
+/// `finish_sweep` names what went wrong and no more: the still-forking text appears only for a sweep
+/// that stopped on a count that did not fall, and the incomplete text only for an incomplete one.
+#[skuld::test]
+fn finish_sweep_names_only_the_causes_that_apply() {
+    const INCOMPLETE: &str = "could not be assessed or signalled";
+    const FORKING: &str = "still forking";
+    let finish = |incomplete, still_forking| super::Marker::finish_sweep(0x1, Ok(()), incomplete, still_forking);
+    let message = |result: Result<(), crate::error::Error>| match result {
+        Err(crate::error::Error::Unassessable { detail, .. }) => detail,
+        other => panic!("expected an Unassessable error; got {other:?}"),
+    };
+
+    let incomplete_only = message(finish(true, false));
+    assert!(incomplete_only.contains(INCOMPLETE) && !incomplete_only.contains(FORKING));
+
+    let forking_only = message(finish(false, true));
+    assert!(forking_only.contains(FORKING) && !forking_only.contains(INCOMPLETE));
+
+    let both = message(finish(true, true));
+    assert!(both.contains(INCOMPLETE) && both.contains(FORKING));
+
+    assert!(finish(false, false).is_ok(), "a sweep with neither cause is Ok");
+}
+
+/// A pass counts the identities no earlier pass had seen. Two processes hold the marker (`sh`, and
+/// the `cat` it forked), `sh` is already in `seen`, so the pass counts and signals `cat` alone.
+///
+/// Mutant: the count includes an identity already in `seen`.
+#[skuld::test]
+fn a_pass_counts_only_the_identities_no_earlier_pass_had_seen() {
+    let _serialize = test_spawn_lock();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    // `cat` inherits the marker across sh's fork; `echo $!` publishes it, and `wait` keeps `sh` alive.
+    cmd.arg("-c")
+        .arg("exec 3<&0; cat <&3 3<&- & echo $!; wait")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let prepared = install_on(&mut cmd, &[]).expect("install");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut sh = cmd.spawn().expect("spawn sh");
+    drop(cmd);
+    let mut out = std::io::BufReader::new(sh.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read cat's pid");
+    let cat = crate::identity::ProcessId::of(line.trim().parse().expect("cat's pid"))
+        .found()
+        .expect("cat resolves");
+    let sh_id = crate::identity::ProcessId::of(sh.id()).found().expect("sh resolves");
+
+    let marker = super::Marker::new(prepared, inert_root(), None);
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    state.seen.insert(sh_id);
+    let found = marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut state,
+        false,
+        super::Scope::HoldersOnly { except: None },
+    );
+
+    assert_eq!(found, 1, "cat is the only identity no earlier pass had seen");
+    assert!(state.seen.contains(&cat));
+    drop(state);
+    assert_eq!(reached, [cat], "the pass signals cat alone");
+
+    _ = sh.kill();
+    _ = sh.wait();
+}
+
 /// `Marker::sweep`'s top-level `incomplete`/`Err` return, end to end through the REAL public
 /// `hard_kill()` — not a synthetic check of the `incomplete` bool in isolation. Forces a
 /// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
@@ -1061,8 +1179,8 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = install_on(&mut cmd, &[]).expect("install");
-    // The write end closes with the command: the root's pass below makes progress, so a second,
-    // seeing pass follows, and it must not find this process holding its own marker.
+    // The write end closes with the command: pass 1 finds the root, so a second, seeing pass
+    // follows, and it must not find this process holding its own marker.
     drop(cmd);
     let marker = super::Marker::new(prepared, inert_root(), None);
 
@@ -1100,7 +1218,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     state.seen.insert(root);
     let walks = crate::containment::treewalk::fault::record_walks();
     let mark = crate::log_capture::mark();
-    let progressed = marker.sweep_pass(
+    let found = marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
         &mut state,
         true,
@@ -1108,7 +1226,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     );
 
     assert!(state.incomplete, "an unreadable root is not a complete walk");
-    assert!(!progressed, "nothing was signalled");
+    assert_eq!(found, 0, "nothing was found or signalled");
     assert_eq!(
         walks.walked(),
         Vec::<u32>::new(),
@@ -1167,7 +1285,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
     state.seen.insert(root);
-    let progressed = marker.sweep_pass(
+    let found = marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
         &mut state,
         true,
@@ -1178,7 +1296,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
         state.incomplete,
         "a child the walk could not read is not a complete walk"
     );
-    assert!(!progressed, "nothing was signalled");
+    assert_eq!(found, 0, "nothing was found or signalled");
     drop(root_child.stdin.take());
     let mut printed = String::new();
     root_child

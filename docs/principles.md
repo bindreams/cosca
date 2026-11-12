@@ -110,13 +110,25 @@ cgroup drain. On Linux 6.9+ the signals include the signal-0 send through the ro
 decides whether a reaped root's process group is killed (principle 4). A leaf it leaves undrained
 stays behind, logged as principle 7 says.
 A leaf whose `cgroup.kill` fails, and on which no earlier kill landed, is given up the same way,
-though the drop still reaps a root its kill reached. A teardown writes `cgroup.kill` once, and a
-failed write is final for it. The one place that writes again within a call is `finish_elevated`,
-when its first tree kill did not settle the tree (it failed or was skipped): it makes the drop's
-tree kill itself, early, because it hands the root back and disarms the handle, so the drop that
-would have made that kill never runs. Everywhere else a second write is a different teardown's (a
-`kill_tree()` or `send_kill_tree()`, then the drop). A root a drop gives up is still the handle's unreaped child: a
-zombie once it exits, since cosca starts no reaper (principle 1).
+though the drop still reaps a root its kill reached.
+Bounded work is work that terminates, not work of a fixed size (owner, 2026-10-05, on the walk of a
+cgroup leaf's sub-cgroups, #595). `members()` is one pass over the host's process table on Linux and
+one `KERN_PROC_PGRP` listing of the group on macOS; a tree walk reads one snapshot; the fd marker's
+sweep ends at a pass that found nothing, or at a count of new identities that stops falling
+([`after_pass`](../src/containment/sweep_passes.rs)). A count that must fall cannot do so forever,
+so all three are bounded, and the same reading holds for principle 2's "sweep of unbounded length".
+The sweep's one stated limit: it cannot tell a long finite fork chain from an endless one, so some
+finite trees stop early. The processes forked during the last pass may then be left running, and the
+error says so. A wait on an external event (an exit, a drain, a human) is not bounded work and stays
+forbidden where principle 2 forbids it.
+
+A teardown writes `cgroup.kill` once, and a failed write is final for it. The one place that writes
+again within a call is `finish_elevated`, when its first tree kill did not settle the tree (it
+failed or was skipped): it makes the drop's tree kill itself, early, because it hands the root back
+and disarms the handle, so the drop that would have made that kill never runs. Everywhere else a
+second write is a different teardown's (a `kill_tree()` or `send_kill_tree()`, then the drop). A
+root a drop gives up is still the handle's unreaped child: a zombie once it exits, since cosca
+starts no reaper (principle 1).
 
 On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
 included), the drop neither signals nor waits for the root by its number, and logs what it skipped

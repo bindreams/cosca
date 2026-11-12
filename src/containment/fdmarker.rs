@@ -293,8 +293,8 @@ pub(crate) fn holds_marker(pid: RawPid, handle: u64) -> bool {
 /// documented `close(fd)` escape — safe to leave running, `debug!` only) is a different fact
 /// from a KNOWN holder (`holders()` found this pid moments earlier, this pass) that became
 /// unqueryable before the kill — almost always the credential-changing `exec` the module docs
-/// name, a real teardown gap, not an escape, and worth a `warn!` plus counting toward
-/// `incomplete`. Collapsing the two (as a bare `bool` must) would silently reclassify "still a
+/// name, a real teardown gap, not an escape, and worth a `warn!` plus marking the sweep
+/// incomplete. Collapsing the two (as a bare `bool` must) would silently reclassify "still a
 /// member, now unreachable" as "no longer a member".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarkerQuery {
@@ -836,6 +836,7 @@ use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
+use crate::containment::sweep_passes::run_passes;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -853,10 +854,12 @@ enum Scope<'r> {
 
 /// What a sweep carries from one pass to the next ([`Marker::sweep_pass`]).
 struct SweepState<'k> {
-    /// The identities this sweep has signalled, so no later pass signals one again.
+    /// The identities passes have found and resolved (an `except` holder and an unresolvable one are
+    /// looked at again each pass), so no later pass counts or signals one again:
+    /// the count that ends the sweep ([`run_passes`]) depends on it.
     seen: std::collections::HashSet<ProcessId>,
-    /// The group signals' results folded together across passes: a later pass's success does not
-    /// erase an earlier failure, and vice versa.
+    /// The group signals' result across passes: a later pass's success does not erase an earlier
+    /// failure, and two failures fold together (`combine_group_errors`).
     group_result: Result<(), Error>,
     /// Whether any pass was blind, any holder could not be resolved, or any signal was refused: checked
     /// once, by `finish_sweep`, whichever pass it happened on.
@@ -1003,20 +1006,16 @@ pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
     matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
 }
 
-/// Fold two `Error`s from different `sweep` passes (or a pass's group-signal result against
-/// the `incomplete` summary) into one, choosing the merged VARIANT by severity rather than by
-/// which side happened to be checked first. `is_teardown_mechanism_failure`
-/// (above) is the single source of truth for "is this a genuine mechanism failure,
-/// or an ordinary refusal" — reused here rather than re-derived, so this function and the
-/// classifier can never quietly drift apart on what counts as which.
+/// Fold two `Error`s (the `incomplete` summary and a group signal's failure) into one, choosing
+/// the merged VARIANT by severity rather than by which side happened to be checked first.
+/// `is_teardown_mechanism_failure` (above) is the single source of truth for "is this a genuine
+/// mechanism failure, or an ordinary refusal" — reused here rather than re-derived, so this
+/// function and the classifier can never quietly drift apart on what counts as which.
 ///
-/// If EITHER side is a genuine mechanism failure, the merged result must be too: a later
-/// pass's merely-ordinary refusal must never mask an earlier pass's real plumbing break (or
-/// vice versa — an earlier ordinary refusal must never mask a LATER genuine failure). Only
-/// when NEITHER side is a mechanism failure does the merged result stay in the ordinary
-/// (`Containment`) bucket. Either way, both sides' messages are preserved in the combined
-/// `detail`/`io::Error` text — only the final Rust VARIANT is decided by severity, not by
-/// which `Error` happened to already exist when the second one arrived.
+/// If EITHER side is a genuine mechanism failure, the merged result must be too: an ordinary
+/// refusal must never mask a real plumbing break on the other side. Only when NEITHER side is a
+/// mechanism failure does the merged result stay in the ordinary (`Containment`) bucket. Either
+/// way, both sides' messages are preserved in the combined `detail`/`io::Error` text.
 fn combine_group_errors(first: Error, latest: Error) -> Error {
     let detail = format!("{first}; {latest}");
     if is_teardown_mechanism_failure(&first) || is_teardown_mechanism_failure(&latest) {
@@ -1223,22 +1222,15 @@ impl Marker {
 
     fn hard_kill_impl(&self, scope: Scope<'_>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
-        // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
-        // failure must not be erased by a later pass's success or vice versa.
+        // Carries across every pass: an earlier pass's group failure is kept, and `incomplete`
+        // stays set whichever pass set it.
         let mut state = SweepState::new(killed);
-        let mut first_pass = true;
-        // Re-snapshots and re-computes after every signalled pass, repeating while a fresh pass
-        // BOTH finds identities this sweep has not already signalled AND actually resolves at
-        // least one of them (`sweep_pass`'s return value) — no numeric cap (forbidden by this
-        // crate's no-arbitrary-loop-limit rule); see `sweep_pass`'s doc for termination.
-        loop {
-            let progressed = self.sweep_pass(nix::sys::signal::Signal::SIGKILL, &mut state, first_pass, scope);
-            first_pass = false;
-            if !progressed {
-                break;
-            }
-        }
-        Self::finish_sweep(self.handle, state.group_result, state.incomplete)
+        // Re-snapshots and re-computes after every pass, repeating while `run_passes` says another
+        // pass is needed — no numeric cap (forbidden by this crate's no-arbitrary-loop-limit
+        // rule).
+        let still_forking =
+            run_passes(|pass| self.sweep_pass(nix::sys::signal::Signal::SIGKILL, &mut state, pass == 1, scope));
+        Self::finish_sweep(self.handle, state.group_result, state.incomplete, still_forking)
     }
 
     /// See [`hard_kill`](Self::hard_kill)'s doc for what `Err` does and does not mean here, and
@@ -1293,7 +1285,7 @@ impl Marker {
         let mut reached = Vec::new();
         let mut state = SweepState::new(&mut reached);
         self.sweep_pass(nix::sys::signal::Signal::SIGTERM, &mut state, true, scope);
-        Self::finish_sweep(self.handle, state.group_result, state.incomplete)
+        Self::finish_sweep(self.handle, state.group_result, state.incomplete, false)
     }
 
     /// CONTRACT, re-checked on every `hard_kill`/`terminate` call, not just at `Marker::new`
@@ -1359,16 +1351,14 @@ impl Marker {
     /// discovery, not deferred to `kill_holder` — `kill_holder` still re-verifies at signal time
     /// (the window between discovery and signal, not between passes).
     ///
-    /// Returns whether this pass made progress: resolved at least one newly-discovered identity
-    /// to something other than "OS refused" (killed, already gone, or confirmed not a member all
-    /// count; `KillOutcome::NotAttempted`/`MarkerQuery::Denied` do not). `hard_kill` loops on
-    /// this — not on "found something new" alone — because this design deliberately leaves some
-    /// discovered identities unsignalled (an EPERM-unkillable member, say); if such a member
-    /// keeps forking, each child is a genuinely new, never-before-seen identity, so "found
-    /// something new" would stay true forever even though nothing is actually being resolved, an
-    /// unbounded spin with no numeric cap to stop it (forbidden by this crate's
-    /// no-arbitrary-loop-limit rule). A pass where every new discovery is stuck makes no
-    /// progress, and `hard_kill` stops, not spins.
+    /// Returns how many identities this pass found that no earlier pass of the sweep had seen
+    /// (`new_walk` and `new_holders`; on pass 1 that includes the root and the members still
+    /// visible). `hard_kill` loops on it through
+    /// [`run_passes`](crate::containment::sweep_passes::run_passes), which is pure.
+    ///
+    /// **Termination.** The sweep stops on a count that does not fall; the rule and why are in
+    /// [`after_pass`](crate::containment::sweep_passes::after_pass). Processes forked during the
+    /// last pass may be left running, and `finish_sweep` says so.
     ///
     /// **A single snapshot-compute-signal pass has a check-then-act gap a real tree can hit.**
     /// Between the snapshot and the signal, any live member can `fork` a child that inherits the
@@ -1463,7 +1453,7 @@ impl Marker {
         state: &mut SweepState<'_>,
         first_pass: bool,
         scope: Scope<'_>,
-    ) -> bool {
+    ) -> usize {
         let SweepState {
             seen,
             group_result,
@@ -1641,7 +1631,7 @@ impl Marker {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
-                // `io::Error` (see this fn's doc, and `combine_group_errors` below).
+                // `io::Error` (see this fn's doc, and `combine_group_errors`).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
                     (Some(pgid), nix::sys::signal::Signal::SIGKILL) => {
                         crate::containment::unix::kill_group(pgid, group_root, killed)
@@ -1672,10 +1662,10 @@ impl Marker {
             }
         }
 
-        if new_walk.is_empty() && new_holders.is_empty() {
-            return false; // converged this pass — nothing left to signal, no progress made.
+        let found = new_walk.len() + new_holders.len();
+        if found == 0 {
+            return 0;
         }
-        let mut progressed = false;
         for id in new_walk {
             // Test-only fault seam: skip the root's identity kill (take semantics — see
             // `fault`), mirroring `treewalk::hard_kill`'s own seam so a test can force the
@@ -1687,14 +1677,11 @@ impl Marker {
             }
             // `KillOutcome::NotAttempted` means the OS refused to query or signal an identity
             // that WAS resolved — a known member left running, not a gap in discovery. Not
-            // retried (see this fn's doc); folded into `incomplete`. Anything else
-            // (`Terminated`, `AlreadyGone`) is a real resolution: progress.
+            // retried (see this fn's doc); folded into `incomplete`.
             let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
             crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
             if matches!(outcome, crate::containment::treewalk::KillOutcome::NotAttempted(_)) {
                 *incomplete = true;
-            } else {
-                progressed = true;
             }
             // The root's owner waits for the root.
             if matches!(outcome, crate::containment::treewalk::KillOutcome::Terminated)
@@ -1707,23 +1694,38 @@ impl Marker {
         for id in new_holders {
             if self.kill_holder(id, signal, killed) {
                 *incomplete = true; // NotAttempted or Denied
-            } else {
-                progressed = true; // NotHeld (resolved) or a signal actually attempted
             }
         }
-        progressed
+        found
     }
 
-    /// Fold `incomplete` into the final `Result` — see `sweep_pass`'s doc for why a blind pass
-    /// or an unresolved member is a real gap, never silently `Ok(())` — merged against
-    /// `group_result` with the same severity-aware rule `combine_group_errors` uses between
-    /// passes.
-    fn finish_sweep(handle: u64, group_result: Result<(), Error>, incomplete: bool) -> Result<(), Error> {
-        if incomplete {
+    /// Fold `incomplete` and `still_forking` (the sweep ended on a count that did not fall) into
+    /// the final `Result` — see `sweep_pass`'s doc for why a blind pass or an unresolved member is
+    /// a real gap, never silently `Ok(())` — merged against `group_result` with the same
+    /// severity-aware rule `combine_group_errors` states.
+    fn finish_sweep(
+        handle: u64,
+        group_result: Result<(), Error>,
+        incomplete: bool,
+        still_forking: bool,
+    ) -> Result<(), Error> {
+        if incomplete || still_forking {
+            let mut causes = Vec::new();
+            if incomplete {
+                causes.push(
+                    "the host process table was unreadable on at least one pass, or at least one \
+                     known/suspected member could not be assessed or signalled",
+                );
+            }
+            if still_forking {
+                causes.push(
+                    "the tree was still forking when the sweep stopped, so a process it forked \
+                     during the last pass may be left running, unnamed",
+                );
+            }
             let msg = format!(
-                "fd marker {handle:#x}: teardown may be incomplete — the host process table \
-                 was unreadable on at least one pass, or at least one known/suspected member \
-                 could not be assessed or signalled"
+                "fd marker {handle:#x}: teardown may be incomplete — {}",
+                causes.join("; ")
             );
             // `incomplete` alone (no io::Error anywhere in its own tracking — it is a summary
             // bool, not a captured syscall failure) is the SAME kind of ordinary, expected
