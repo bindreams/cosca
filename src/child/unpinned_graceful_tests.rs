@@ -302,6 +302,7 @@ fn graceful_shutdown_tree_decides_its_signal_on_one_look_at_the_root() {
 fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
+    let pid = child.pid();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
     let fake = child.proc.script_over(|f| f);
@@ -320,7 +321,8 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
         matches!(&err, Error::Unassessable { detail, .. } if detail.contains("though the SIGTERM was sent before it")),
         "{err:?}"
     );
-    assert_eq!(sends.entries(), vec![]);
+    // The terminate sent the root its SIGTERM through the handle; the refused sweep sent it nothing.
+    assert_eq!(sends.entries(), vec![(pid, Sig::Term, Via::Identity)]);
     assert!(
         !sends.by_identity().iter().any(|(_, signo)| *signo == libc::SIGKILL),
         "{:?}",
