@@ -16,101 +16,54 @@ use std::io::{BufRead, BufReader};
 #[cfg(windows)]
 use std::net::TcpListener;
 #[cfg(windows)]
-use std::os::windows::io::{BorrowedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
 
 #[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
 #[cfg(windows)]
-use windows::core::PWSTR;
+use windows::Win32::Foundation::HANDLE;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-#[cfg(windows)]
-use windows::Win32::System::Threading::{
-    CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
-};
+use windows::Win32::System::Threading::{ResumeThread, CREATE_SUSPENDED};
 
 #[cfg(windows)]
 /// A process created `CREATE_SUSPENDED` via a raw `CreateProcessW` call — never through
 /// `cosca::Command` — so the test genuinely exercises the caller sequence `cosca::Job`'s docs
 /// describe: create suspended, assign, only then resume.
 struct Suspended {
-    process: HANDLE,
-    thread: HANDLE,
-    pid: u32,
+    child: common::RawChild,
 }
 
 #[cfg(windows)]
 impl Suspended {
-    /// Spawn `exe` with `args` (argv[1..]), suspended. The command line is built with
-    /// `cosca::quote::windows::join_wide` rather than hand-rolled quoting.
+    /// Spawn `exe` with `args` (argv[1..]), suspended.
     fn spawn(exe: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Suspended {
-        let wide_args: Vec<Vec<u16>> = std::iter::once(exe)
-            .chain(args.iter().copied())
-            .map(|a| a.encode_utf16().collect())
+        let env: Vec<(&str, &str)> = [(common::ACK_ENV, "1")]
+            .into_iter()
+            .chain(extra_env.iter().copied())
             .collect();
-        let refs: Vec<&[u16]> = wide_args.iter().map(Vec::as_slice).collect();
-        let mut cmdline = cosca::quote::windows::join_wide(&refs);
-        cmdline.push(0); // CreateProcessW requires a NUL-terminated, writable buffer.
-
-        let si = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut pi = PROCESS_INFORMATION::default();
-        // Our environment plus the accept-handshake opt-in and `extra_env`, as a UTF-16 block.
-        let overrides = [(common::ACK_ENV, "1")].into_iter().chain(extra_env.iter().copied());
-        let env =
-            common::windows_env::env_block(std::env::vars_os().chain(overrides.map(|(k, v)| (k.into(), v.into()))));
-        // Serialized against the crate's own inheritable-handle window, exactly like
-        // `tests/windows_console_identity.rs`'s `probe_raw` — a raw spawn that bypasses
-        // `cosca::Command` entirely still needs to be ordered against it.
-        let created = {
-            let _guard = cosca::test_spawn_lock();
-            // SAFETY: `cmdline` is a NUL-terminated, writable UTF-16 buffer; `si`/`pi` are
-            // valid, correctly-sized in/out params; no handles are inherited.
-            unsafe {
-                CreateProcessW(
-                    None,
-                    Some(PWSTR(cmdline.as_mut_ptr())),
-                    None,
-                    None,
-                    false,
-                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                    Some(env.as_ptr().cast()),
-                    None,
-                    &si,
-                    &mut pi,
-                )
-            }
-        };
-        created.expect("CreateProcessW(CREATE_SUSPENDED)");
-        Suspended {
-            process: pi.hProcess,
-            thread: pi.hThread,
-            pid: pi.dwProcessId,
-        }
+        let child = common::spawn_locked_raw(exe, args, &env, CREATE_SUSPENDED.0, common::Console::Hidden)
+            .expect("CreateProcessW(CREATE_SUSPENDED)");
+        Suspended { child }
     }
 
     /// Borrow the process handle for [`cosca::Job::assign`]. The borrow does not outlive this
     /// call; `Suspended` keeps owning (and eventually closing) the real handle.
     fn borrow_process(&self) -> BorrowedHandle<'_> {
-        let raw: RawHandle = self.process.0;
-        // SAFETY: `self.process` is a live handle owned by `self`, which outlives this borrow.
-        unsafe { BorrowedHandle::borrow_raw(raw) }
+        self.child.process()
     }
 
     /// Resume the (single) initial thread. Must only be called after the process has been
     /// assigned to a job — see `cosca::Job`'s mandatory sequence.
     fn resume(&mut self) {
-        // SAFETY: `self.thread` is the live, still-suspended main thread from `CreateProcessW`.
-        let prev = unsafe { ResumeThread(self.thread) };
+        // SAFETY: the thread handle is the live, still-suspended main thread from `CreateProcessW`.
+        let prev = unsafe { ResumeThread(HANDLE(self.child.thread().as_raw_handle())) };
         assert_eq!(
-            prev, 1,
+            prev,
+            1,
             "pid {}: a CREATE_SUSPENDED process's main thread must resume from exactly one suspend",
-            self.pid
+            self.child.id()
         );
     }
 }
@@ -118,27 +71,11 @@ impl Suspended {
 #[cfg(windows)]
 impl common::Target for Suspended {
     fn pid(&self) -> u32 {
-        self.pid
+        self.child.id()
     }
 
     fn has_exited(&mut self) -> bool {
-        // SAFETY: `self.process` is a live handle owned by `self`, which keeps the pid stable.
-        unsafe { WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Suspended {
-    fn drop(&mut self) {
-        // Best-effort cleanup: whether the tree is contained, disarmed, or already dead by the
-        // time a test ends, nothing should be left running past it. `TerminateProcess` on an
-        // already-exited process is a harmless failure.
-        // SAFETY: `self.process`/`self.thread` are live, owned handles.
-        unsafe {
-            let _ = TerminateProcess(self.process, 1);
-            let _ = CloseHandle(self.thread);
-            let _ = CloseHandle(self.process);
-        }
+        common::Target::has_exited(&mut self.child)
     }
 }
 
@@ -259,7 +196,7 @@ fn disarm_leaves_every_descendant_running() {
     root_member.assert_alive("the root, after disarm + drop(Job)");
     grand_member.assert_alive("the grandchild, after disarm + drop(Job)");
 
-    // Cleanup: `Suspended::drop` only reaches the root; the grandchild survives it, because a
+    // Cleanup: dropping `Suspended` only reaches the root; the grandchild survives it, because a
     // disarmed job is by design no longer this test's tool for reaching it. Dropping a
     // `common::Member` terminates it through its own pinned handle.
     root_member.sock.shutdown(std::net::Shutdown::Both).ok();

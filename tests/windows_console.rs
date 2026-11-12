@@ -12,9 +12,6 @@ use std::io::Read;
 #[cfg(windows)]
 use std::net::TcpListener;
 #[cfg(windows)]
-use std::process::Command;
-
-#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
@@ -25,8 +22,7 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 #[cfg(windows)]
 /// The three creation flags that keep a child out of the spawner's console, and the group flag
-/// whose presence is what makes a child individually addressable at all. Raw constants because
-/// `CommandExt::creation_flags` takes a plain `u32` (winbase.h).
+/// whose presence is what makes a child individually addressable at all. Raw winbase.h values.
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -39,14 +35,20 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `CreateProcess` returning, so a membership probe taken before it reads "absent" for every
 /// flag word, including one with no detaching flag at all — and a matrix asserted at that
 /// instant could never fail.
-fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::process::Child, std::net::TcpStream) {
+fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (common::RawChild, std::net::TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
-    let mut cmd = Command::new(exe);
-    cmd.args(args).arg(&addr).env(common::ACK_ENV, "1");
-    // `Asked`: the flag word is the subject, so no `CREATE_NO_WINDOW` joins it.
-    let mut child = common::spawn_locked_with(&mut cmd, flags, common::console_flags::Console::Asked)
-        .expect("spawn flag-matrix child");
+    let args: Vec<&str> = args.iter().copied().chain([addr.as_str()]).collect();
+    // `Asked`: the flag word is the subject, so no `CREATE_NO_WINDOW` joins it; a new console it
+    // asks for opens no window, as `spawn_locked_raw` hides it.
+    let mut child = common::spawn_locked_raw(
+        exe,
+        &args,
+        &[(common::ACK_ENV, "1")],
+        flags,
+        common::console_flags::Console::Asked,
+    )
+    .expect("spawn flag-matrix child");
     let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
@@ -56,7 +58,7 @@ fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::proces
 #[cfg(windows)]
 /// Kill and reap a flag-matrix child, dropping its socket first so a child blocked on the read
 /// can also exit on EOF.
-fn end(mut child: std::process::Child, sock: std::net::TcpStream) {
+fn end(child: common::RawChild, sock: std::net::TcpStream) {
     drop(sock);
     let _ = child.kill();
     child.wait().expect("reap flag-matrix child");

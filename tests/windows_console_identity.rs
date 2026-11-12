@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 mod common;
 
 #[cfg(windows)]
-/// Raw winbase.h values: `CommandExt::creation_flags` takes a plain `u32`.
+/// Raw winbase.h values.
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -30,7 +30,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// A running `report-console-identity` child plus the report line it wrote. The child blocks on
 /// the same socket until [`Probe::end`] closes it, so every field describes a LIVE process.
 struct Probe {
-    child: std::process::Child,
+    child: common::RawChild,
     sock: TcpStream,
     report: String,
 }
@@ -45,7 +45,7 @@ impl Probe {
         self.child.id()
     }
 
-    fn end(mut self) {
+    fn end(self) {
         drop(self.sock);
         let _ = self.child.kill();
         self.child.wait().expect("reap identity probe child");
@@ -57,19 +57,27 @@ use common::{escape_report_field as escape_field, read_report_line, report_field
 
 #[cfg(windows)]
 /// Bind a report listener, spawn `exe` in `report-console-identity` mode with exactly `flags`
-/// through a RAW `std::process::Command` (cosca cannot express these flags in Task 1), and read
-/// the one report line the child writes before it blocks.
+/// through a RAW `CreateProcessW`, and read the one
+/// report line the child writes before it blocks.
 fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let me = std::process::id().to_string();
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(argv_head)
-        .args(["report-console-identity", addr.as_str(), me.as_str()])
-        .env(common::ACK_ENV, "1");
-    // `Asked`: the flag word is the subject, so no `CREATE_NO_WINDOW` joins it.
-    let mut child = common::spawn_locked_with(&mut cmd, flags, common::console_flags::Console::Asked)
-        .expect("spawn identity probe child");
+    let args: Vec<&str> = argv_head
+        .iter()
+        .copied()
+        .chain(["report-console-identity", addr.as_str(), me.as_str()])
+        .collect();
+    // `Asked`: the flag word is the subject, so no `CREATE_NO_WINDOW` joins it; a new console it
+    // asks for opens no window, as `spawn_locked_raw` hides it.
+    let mut child = common::spawn_locked_raw(
+        exe,
+        &args,
+        &[(common::ACK_ENV, "1")],
+        flags,
+        common::console_flags::Console::Asked,
+    )
+    .expect("spawn identity probe child");
     let sock = common::accept_or_die(&listener, &mut child);
     let report = read_report_line(&sock);
     Probe { child, sock, report }
@@ -163,9 +171,10 @@ fn caller_has_a_console_to_be_measured_against() {
 }
 
 #[cfg(windows)]
-/// `CREATE_NEW_CONSOLE` gives the child its own console too. It deliberately does NOT assert the
-/// `hwnd`/`visible` columns: those need an interactive session, which is one of the two reasons
-/// this bit stays reserved rather than getting a named intent.
+/// `CREATE_NEW_CONSOLE` gives the child its own console too, and a window it has starts hidden:
+/// `spawn_locked_raw` passes `SW_HIDE`, so a test run opens no window. A session with no
+/// interactive desktop gives the console no window (`hwnd=0`), so `visible` is checked only where
+/// there is one.
 #[skuld::test]
 fn new_console_child_gets_its_own_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin"), &[], CREATE_NEW_CONSOLE);
@@ -176,6 +185,14 @@ fn new_console_child_gets_its_own_console() {
         p.report
     );
     assert_eq!(p.field("sees_caller"), "0", "the new console is not ours: {}", p.report);
+    if p.field("hwnd") == "1" {
+        assert_eq!(
+            p.field("visible"),
+            "0",
+            "the new console's window starts hidden: {}",
+            p.report
+        );
+    }
     p.end();
 }
 
@@ -221,7 +238,7 @@ fn ctrl_break_reports_success_for_a_child_outside_our_console() {
         "the child must be provably outside our console: {}",
         p.report
     );
-    // SAFETY: standard Win32 call; the live `std::process::Child` pins the pid.
+    // SAFETY: standard Win32 call; the live `RawChild` pins the pid.
     let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, p.pid()) };
     assert!(
         sent.is_ok(),
