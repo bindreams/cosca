@@ -647,7 +647,13 @@ fn kill_tree_skips_its_backstop_for_a_root_orphaned_during_the_sweep() {
         .expect("the sweep killed the tree; the backstop has nothing to do");
 
     fake.assert_peeks_exhausted();
-    assert_eq!(sends.entries(), vec![], "the backstop must send nothing");
+    // The walk kills the root through the handle, as the backstop would: one kill through it is the
+    // walk's, and a second would be the backstop's.
+    assert_eq!(
+        sends.entries(),
+        vec![(pid, Sig::Kill, Via::Identity)],
+        "the backstop must send nothing after the walk's own kill of the root"
+    );
     assert!(
         sends.by_identity().contains(&(pid, libc::SIGKILL)),
         "the sweep ran first"
@@ -673,7 +679,12 @@ fn kill_tree_keeps_its_backstop_for_an_unknown_root() {
     child.kill_tree().expect("the backstop kills through the handle");
 
     fake.assert_peeks_exhausted();
-    assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Identity)]);
+    // The walk's own kill of the root and the backstop's go through the same handle: the second kill
+    // through it is the backstop's.
+    assert_eq!(
+        sends.entries(),
+        vec![(pid, Sig::Kill, Via::Identity), (pid, Sig::Kill, Via::Identity)]
+    );
     drop(writer);
 }
 
