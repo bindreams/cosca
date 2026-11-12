@@ -4,12 +4,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::containment::dispatch::TreeKillOutcome;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::mechanism::Contains;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
-use crate::containment::{Containment, Root, TerminateOutcome};
+use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
+use crate::containment::treewalk::Left;
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::identity::ProcessId;
 
 /// The sends a [`FakeContains`] was asked for, in order: `"kill"`, `"terminate"`, `"disarm"` and
 /// `"release"`.
@@ -22,6 +24,10 @@ pub(crate) struct FakeContains {
     /// Whether a kill through it reaches the child asked about ([`Contains::would_reach`]).
     #[cfg_attr(windows, allow(dead_code, reason = "only Unix asks whether a kill reaches"))]
     reaches: bool,
+    /// The members its kill states it reached, for the wait over them.
+    killed: Vec<ProcessId>,
+    /// The members its settlement states it killed again, for the wait over them.
+    killed_again: Vec<ProcessId>,
     sends: Sends,
 }
 
@@ -33,9 +39,25 @@ impl FakeContains {
         let fake = FakeContains {
             kind,
             reaches,
+            killed: Vec::new(),
+            killed_again: Vec::new(),
             sends: sends.clone(),
         };
         (fake, sends)
+    }
+
+    /// A mechanism whose settlement states that it killed `members` again, as a tree walk does for
+    /// the members an earlier kill left.
+    pub(crate) fn killing_again(mut self, members: impl IntoIterator<Item = ProcessId>) -> FakeContains {
+        self.killed_again = members.into_iter().collect();
+        self
+    }
+
+    /// A mechanism whose kill states that it reached `members`: it kills none of them, so a wait over
+    /// them ends when the test ends them.
+    pub(crate) fn reaching(mut self, members: impl IntoIterator<Item = ProcessId>) -> FakeContains {
+        self.killed = members.into_iter().collect();
+        self
     }
 
     fn record(&self, send: &'static str) {
@@ -47,10 +69,17 @@ impl FakeContains {
 }
 
 impl Contains for FakeContains {
-    /// A kill that leaves nothing running.
-    fn send_kill(&self, _root: Option<&dyn Root>) -> TreeKillOutcome {
+    /// A kill that leaves nothing running, and states the members it reached.
+    fn kill(&self, _root: Option<&dyn Root>) -> TreeKill<'_> {
         self.record("kill");
-        TreeKillOutcome::Ran(Ok(()))
+        TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied())
+    }
+
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> KillLeftOutcome {
+        KillLeftOutcome {
+            killed: self.killed_again.clone(),
+            ..nothing_held(result)
+        }
     }
 
     fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {

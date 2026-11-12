@@ -95,10 +95,11 @@ whose zombie a foreign tracer holds; either holds the dropping thread, which may
 never blocks: the drop then finds nothing to wait for.
 
 The wait is bounded by a kill that landed, not by who sent it. A disarmed drop (`detach()`,
-`kill_on_drop(false)`) kills nothing, but if a `kill_tree()` on the handle returned `Ok`, its
-`cgroup.kill` landed, and the drop waits for that leaf's drain, warning past 1 s, before it removes
-the leaf ([#194]). On the async `Child` that drop blocks the dropping thread: await `wait_tree()`
-first.
+`kill_on_drop(false)`) kills nothing, but if a `kill_tree()` or `send_kill_tree()` on the handle
+returned `Ok`, its `cgroup.kill` landed, and the drop waits for that leaf's drain, warning past 1 s,
+before it removes the leaf ([#194]). The sync `kill_tree()` waits for the drain itself, so its drop
+finds the leaf drained; `send_kill_tree()`, and the async `Child`'s `kill_tree()`, leave the wait to
+the drop, which blocks the dropping thread: await `wait_tree()` first.
 
 A drop with no landed kill does bounded work only: disarmed and never killed, or armed with a root
 kill that failed or could not be sent, so the root may still run. It may send a bounded number of
@@ -112,7 +113,7 @@ failed write is final for it. The one place that writes again within a call is `
 when its first tree kill did not settle the tree (it failed or was skipped): it makes the drop's
 tree kill itself, early, because it hands the root back and disarms the handle, so the drop that
 would have made that kill never runs. Everywhere else a second write is a different teardown's (a
-`kill_tree()`, then the drop). A root a drop gives up is still the handle's unreaped child: a
+`kill_tree()` or `send_kill_tree()`, then the drop). A root a drop gives up is still the handle's unreaped child: a
 zombie once it exits, since cosca starts no reaper (principle 1).
 
 On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
@@ -127,7 +128,7 @@ waiting, and warns naming its pid (a refused kill warns regardless). A child it 
 given up, unreaped. An `Unreaped` from a sync call waits, as the `Drop` does.
 
 **Why:** a kill that landed makes the wait as bounded as the kernel makes it, whether the drop or an
-earlier `kill_tree()` sent it, and a drop that returns early leaks the zombie and the cgroup leaf.
+earlier `kill_tree()` or `send_kill_tree()` sent it, and a drop that returns early leaks the zombie and the cgroup leaf.
 A kill that failed bounds nothing, so that drop stays bounded.
 Global reapers (`waitpid(-1)`, a subreaper) belong to programs that own the whole process, such as
 tini and the containerd shim. Embeddable libraries decline the role: sd-event avoids

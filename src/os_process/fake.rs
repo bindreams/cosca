@@ -139,6 +139,14 @@ impl FakeProcess {
         self
     }
 
+    /// Answer `exits` to successive [`OsProcess::exited`] looks; a look past them goes to the real
+    /// child of a fake made [`over`](Self::over) one.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn exits(self, exits: impl IntoIterator<Item = Answer>) -> Self {
+        self.script().exits = exits.into_iter().collect();
+        self
+    }
+
     /// Answer `peeks` to successive [`OsChild::peek`] calls.
     pub(crate) fn peeks(self, peeks: impl IntoIterator<Item = PeekAnswer>) -> Self {
         self.script().peeks = peeks.into_iter().collect();

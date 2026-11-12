@@ -245,6 +245,12 @@ impl LeafDir {
     pub(crate) fn remove_children(&self) -> io::Result<usize> {
         remove_children(self.dir.as_fd(), &self.swept)
     }
+
+    /// The `cgroup.procs` lines of every cgroup under the leaf, not the leaf's own, and the failure
+    /// that ended the listing early, if one did (see [`procs_under`]).
+    pub(crate) fn nested_procs(&self) -> (Vec<String>, Option<io::Error>) {
+        procs_under(self.dir.as_fd())
+    }
 }
 
 /// The ids of the cgroups a leaf's sweep removed, shared by the leaf and its subtrees. Holds one id
@@ -322,6 +328,41 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
         // `traverse` said where, at debug.
         Traversed::Listed { behind_a_mount: true } => Err(io::Error::from_raw_os_error(libc::EXDEV)),
     }
+}
+
+/// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, and the failure that
+/// ended the listing early. A [`traverse`] of the tree, with the same bounds as [`find_descendant`]:
+/// two descriptors at most, one visit per cgroup. A cgroup removed during the walk has no member
+/// left to list and is skipped, as is `dir` itself gone. A cgroup that could not be read or listed,
+/// or one behind a mount (`EXDEV`), ends the listing with its error; the lines read before it are
+/// returned.
+pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, Option<io::Error>) {
+    use std::io::Read as _;
+
+    let mut lines = Vec::new();
+    let traversed = traverse(&mut Tree::new(), dir, false, |tree, node, cgroup| {
+        let read = rustix::fs::openat(cgroup, "cgroup.procs", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .map_err(io::Error::from)
+            .and_then(|procs| {
+                let mut content = String::new();
+                std::fs::File::from(procs).read_to_string(&mut content).map(|_| content)
+            });
+        match read {
+            Ok(content) => {
+                lines.extend(content.lines().map(str::to_owned));
+                Ok(Visit::Continue)
+            }
+            Err(e) if gone_io(&e) => Ok(Visit::Skip),
+            Err(e) => Err(at_cgroup(e, tree, node)),
+        }
+    });
+    let failure = match traversed {
+        Ok(Traversed::Listed { behind_a_mount: false }) | Err(Failure::RootGone(_)) => None,
+        Ok(Traversed::Listed { behind_a_mount: true }) => Some(io::Error::from_raw_os_error(libc::EXDEV)),
+        Ok(Traversed::Stopped) => unreachable!("the visitor of a listing never stops the walk"),
+        Err(failure) => Some(failure.into_error()),
+    };
+    (lines, failure)
 }
 
 /// What a visitor of [`traverse`] decides of the cgroup it was shown.

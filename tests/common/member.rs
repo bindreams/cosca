@@ -35,6 +35,20 @@ pub fn assert_dead(sock: &mut TcpStream, who: &str) {
     }
 }
 
+/// A smoke check that a `kill_tree` left its member dead: the member `id` has exited when the call
+/// returns, read by identity right after it. It cannot catch a send-only kill that the kernel finished
+/// before the read; the unit rows that block the wait on a running member are the proof that the call
+/// waits (`tree_kill_tests`, `job_tests`, `leaf_tests`).
+pub fn assert_exited(id: cosca::identity::ProcessId, who: &str) {
+    use cosca::identity::Liveness;
+    assert_eq!(
+        id.is_alive(),
+        Liveness::Dead,
+        "{who} (pid {}) must have exited when kill_tree returns: it waits for the members it killed",
+        id.pid()
+    );
+}
+
 /// A tree member's pid and control socket, plus on Windows a handle on its process. Build it while
 /// the member is alive and blocked on `sock`, before the kill: a live member cannot exit, so its pid
 /// cannot be reissued before the handle is open. The open handle then pins the pid, so on Windows

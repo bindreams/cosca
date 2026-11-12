@@ -153,9 +153,10 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let kill_tree = || {
         // The handle owns the child outright here, so no reap can land.
         let held = child.proc.hold(child.pid());
+        // The cleanup sends only: its waits are the root's and the leaf's own.
         let kill = {
             let seen = crate::containment::Seen::new(&held, view.look());
-            child.tree.kill(Some(&seen))
+            child.tree.send_kill(Some(&seen))
         };
         drop(held);
         kill.log_skip(&view);
@@ -257,7 +258,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let hands_back = Disposition::HandBack.hands_back(&torn);
     let fate = torn.fate;
     // After the root's kill, which settles a walk that left only the root.
-    let tree = tree.map(|kill| child.tree.settle(kill, fate.not_running()));
+    let tree = tree.map(|kill| child.tree.settle(kill, fate.not_running()).answer);
     // The tree is settled when no kill of it is left to try, or it was deliberately left alone because
     // the root is reaped or unpinned.
     let tree_settled = !tree_needs_another_kill(&tree) || (skipped.is_some() && view.leaves_root_alone());
@@ -280,7 +281,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         let early = kill_tree();
         // What the early tree kill adds to the first attempt's report, and the outcome that report is
         // built from.
-        let more = match child.tree.settle(early, fate.not_running()) {
+        let more = match child.tree.settle(early, fate.not_running()).answer {
             // A skip kills nothing: the notes of the first attempt stand.
             Ok(SettleOutcome::Skipped) => None,
             Ok(SettleOutcome::Killed) => {
@@ -1206,7 +1207,8 @@ impl LateTree {
         // The mechanism looks at the root, which reports this sweep ([`Root::state`]): a root this
         // process's unreaped child is shown by a verified peek right before each send by its pid; one
         // not shown ours any more is skipped, its marker's holders alone swept, and never the root.
-        match tree.kill(Some(&*self)) {
+        // A late child's tree is swept alone: it waits for nothing the sweep killed.
+        match tree.send_kill(Some(&*self)) {
             TreeKillOutcome::Skipped(skip) if matches!(sweep, Sweep::RootKilled { zombie: false }) => {
                 if let Some(Err(e)) = &skip.holders {
                     self.notes.push(format!(

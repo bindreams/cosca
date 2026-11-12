@@ -337,19 +337,25 @@ impl Child {
         }
     }
 
-    /// Block until every member of the contained tree has EXITED — not reaped; a status is
-    /// never collected by this call, only the root's own `wait`/`wait_timeout` does that.
-    /// Requires a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2,
-    /// a Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/
-    /// `TreeWalk` and an uncontained or nested-`Delegated` child do not). Event-driven: no
-    /// interval is chosen internally anywhere in this call's path.
+    /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
+    /// Windows job whose process list is empty, a macOS marker with no holder left. A status is
+    /// never collected by this call, only the root's own `wait`/`wait_timeout` does that. This call
+    /// observes the list or the leaf, not each member: on Windows the job's list can empty before
+    /// every member's process object is signalled. A caller that needs the members gone uses
+    /// [`kill_tree`](Child::kill_tree), which waits for each. Requires a mechanism with a real
+    /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
+    /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
+    /// nested-`Delegated` child do not). Event-driven: no interval is chosen internally anywhere in
+    /// this call's path.
     pub fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.tree.wait_drained(None)
     }
 
     /// Like [`wait_tree`](Child::wait_tree) but bounded by `timeout`. `TreeDrain::MembersRemain`
     /// at expiry is not an error. A `timeout` so large it would overflow `Instant` is treated as
-    /// unbounded, matching [`wait_timeout`](Child::wait_timeout).
+    /// unbounded, matching [`wait_timeout`](Child::wait_timeout). `MembersRemain` means the tree was
+    /// not seen drained by the deadline; on Windows the wait answers from the job's list as of its
+    /// last look, in which a member that has just exited can still appear.
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<crate::containment::TreeDrain, Error> {
         self.tree.wait_drained(crate::wait::deadline_from(timeout))
     }

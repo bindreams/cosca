@@ -40,7 +40,7 @@ thread_local! {
     static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
-    static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
+    static PIDFD_INFO_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
     static PROBE_FD_DIR_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -237,7 +237,12 @@ pub(crate) fn proc_hidden_as() -> Option<i32> {
 /// While the guard lives, `PIDFD_GET_INFO` fails on this thread with `EIO`, as a kernel that has
 /// it refusing it.
 pub(crate) fn fail_pidfd_info() -> FailPidfdInfo {
-    PIDFD_INFO_FAILS.with(|f| f.set(true));
+    fail_pidfd_info_with(libc::EIO)
+}
+
+/// [`fail_pidfd_info`] with `errno` in place of `EIO`.
+pub(crate) fn fail_pidfd_info_with(errno: i32) -> FailPidfdInfo {
+    PIDFD_INFO_FAILS.with(|f| f.set(Some(errno)));
     FailPidfdInfo(())
 }
 
@@ -246,11 +251,12 @@ pub(crate) struct FailPidfdInfo(());
 
 impl Drop for FailPidfdInfo {
     fn drop(&mut self) {
-        PIDFD_INFO_FAILS.with(|f| f.set(false));
+        PIDFD_INFO_FAILS.with(|f| f.set(None));
     }
 }
 
-pub(crate) fn pidfd_info_fails() -> bool {
+/// The errno `PIDFD_GET_INFO` is made to fail with, if it is.
+pub(crate) fn pidfd_info_fails() -> Option<i32> {
     PIDFD_INFO_FAILS.with(Cell::get)
 }
 

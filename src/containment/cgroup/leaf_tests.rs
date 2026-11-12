@@ -436,6 +436,410 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     );
 }
 
+/// A real leaf of the lane.
+#[cfg(target_os = "linux")]
+fn lane_leaf() -> crate::containment::cgroup::CgroupLeaf {
+    crate::containment::cgroup::try_create_leaf(None).unwrap_or_else(|e| {
+        panic!(
+            "the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created ({e}) — is this \
+             process running inside a writable, delegated cgroup v2 slice with cgroup.kill support (kernel >= 5.14)?"
+        )
+    })
+}
+
+/// A `cat` blocked on its piped stdin, in the test's own cgroup until the test moves it.
+#[cfg(target_os = "linux")]
+fn cat_member() -> (
+    crate::containment::cgroup::test_support::Member,
+    crate::identity::ProcessId,
+) {
+    cat_member_as(None)
+}
+
+/// [`cat_member`], run as `uid` where there is one (the cgroup group's root may switch to any).
+#[cfg(target_os = "linux")]
+fn cat_member_as(
+    uid: Option<u32>,
+) -> (
+    crate::containment::cgroup::test_support::Member,
+    crate::identity::ProcessId,
+) {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+
+    let mut cat = Command::new("cat");
+    cat.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    if let Some(uid) = uid {
+        cat.uid(uid);
+    }
+    let mut child = crate::test_spawn::spawn(&mut cat).expect("spawn a member");
+    let stdin = child.stdin.take().expect("cat's stdin is piped");
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    (crate::containment::cgroup::test_support::Member(child, stdin), id)
+}
+
+/// Move `member` into the cgroup `dir`.
+#[cfg(target_os = "linux")]
+fn place(member: &crate::containment::cgroup::test_support::Member, dir: &std::path::Path) {
+    std::fs::write(dir.join("cgroup.procs"), member.0.id().to_string())
+        .unwrap_or_else(|e| panic!("move {} into {}: {e}", member.0.id(), dir.display()));
+}
+
+/// The listing a cgroup kill makes names the members of every cgroup under the leaf, `cgroup.kill`
+/// reaching them all: one in the leaf, one in a cgroup under it, and one under that.
+///
+/// Mutant: the listing reads the leaf's own `cgroup.procs` alone.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_cgroup_listing_names_the_members_of_the_cgroups_under_the_leaf(#[fixture(cgroup)] _group: &Group) {
+    let leaf = lane_leaf();
+    let (in_leaf, in_leaf_id) = cat_member();
+    let (under, under_id) = cat_member();
+    let (deeper, deeper_id) = cat_member();
+    let nested = leaf.leaf_path.join("nested");
+    let deepest = nested.join("deeper");
+    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
+    std::fs::create_dir(&deepest).expect("make a cgroup under that");
+    place(&in_leaf, &leaf.leaf_path);
+    place(&under, &nested);
+    place(&deeper, &deepest);
+
+    let (members, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "every member can be named: {unobserved:?}");
+    for (id, who) in [
+        (in_leaf_id, "the member in the leaf"),
+        (under_id, "the member in a cgroup under the leaf"),
+        (deeper_id, "the member two cgroups down"),
+    ] {
+        assert!(members.iter().any(|m| m.id == id), "{who} is named: {members:?}");
+    }
+}
+
+/// A member the walk of the leaf's descendants cannot place is placed through `/proc`, and its listing
+/// keeps no cgroup id: only an id that itself placed it is kept. The member's pidfd is made to read
+/// an id that is no cgroup, and the walk to fail at a cgroup under the leaf.
+///
+/// Mutant: the id the pidfd read is kept whichever route placed the member.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_placed_through_proc_is_listed_with_no_cgroup_id(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::WalkStep;
+
+    let leaf = lane_leaf();
+    let (member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    std::fs::create_dir(leaf.leaf_path.join("nested")).expect("make a cgroup under the leaf");
+    let _read = fault::force_pidfd_cgroup_id(u64::MAX);
+    let _walk = fault::fail_walk_step("./nested", WalkStep::Id, libc::EIO);
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, None)],
+        "placed through /proc, so no cgroup id placed it"
+    );
+}
+
+/// The members are listed before `cgroup.kill`, not after it: a member that has gone from the leaf by
+/// the time the kill is written is still named. The member is ended and reaped right before the write,
+/// so the leaf's `cgroup.procs` is empty when the kill runs.
+///
+/// Mutant: the listing is read after the kill.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_cgroup_lists_its_members_before_it_kills_them(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+    use crate::containment::Contains as _;
+
+    let leaf = lane_leaf();
+    let (member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let member = std::rc::Rc::new(std::cell::RefCell::new(member));
+    let _ending = fault::set_before_kill_write({
+        let member = member.clone();
+        move || {
+            let mut member = member.borrow_mut();
+            member.0.kill().expect("end the member");
+            member.0.wait().expect("reap the member");
+        }
+    });
+
+    let (sent, wait) = leaf.kill(None).split();
+
+    sent.into_result().expect("the leaf's kill");
+    assert_eq!(
+        wait.members_for_test(),
+        [id],
+        "the member was named before the kill ended it"
+    );
+}
+
+/// A kill the kernel refused names no member to wait for: its `Err` is returned, where a wait over
+/// members it did not kill would hang. The wait is made to end the member where it blocks, so a mutant
+/// fails by assertion.
+///
+/// Mutant: the members are named whether or not the kill landed.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_cgroup_kill_the_kernel_refused_waits_for_no_member(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault;
+    use crate::containment::Contains as _;
+
+    let leaf = lane_leaf();
+    let (member, _) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let pid = member.0.id();
+    let _refused = fault::fail_next_kill_write();
+
+    let (sent, wait) = leaf.kill(None).split();
+    assert!(sent.into_result().is_err(), "the kill was refused");
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .expect("end the member");
+        }
+    });
+    wait.wait().expect("a kill that failed waits for nothing");
+
+    assert!(!blocked.get(), "the wait blocked on a member the kill did not reach");
+    drop(member);
+}
+
+/// A member that left the leaf between the listing and `cgroup.kill` is not reached by the kill: it is
+/// no part of the tree, so it is neither killed nor waited for. If the wait blocks on it, the probe
+/// ends it, so the row fails by assertion.
+///
+/// Mutant: every listed member is waited for, whether or not the kill reached it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_that_left_the_leaf_before_the_kill_is_neither_killed_nor_waited_for(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault;
+    use crate::containment::Contains as _;
+
+    let leaf = lane_leaf();
+    let (member, _) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let pid = member.0.id();
+    let outside = leaf
+        .leaf_path
+        .parent()
+        .expect("the leaf has a parent cgroup")
+        .to_owned();
+    let member = Rc::new(std::cell::RefCell::new(member));
+    let _leaving = fault::set_before_kill_write({
+        let member = member.clone();
+        move || place(&member.borrow(), &outside)
+    });
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    });
+
+    let (sent, wait) = leaf.kill(None).split();
+    sent.into_result().expect("the leaf's kill");
+    wait.wait().expect("the leaf drained");
+
+    assert!(!blocked.get(), "the wait blocked on a member that left the leaf");
+    let mut member = member.borrow_mut();
+    assert_eq!(
+        member.0.try_wait().expect("look at the member"),
+        None,
+        "the member outside the leaf was not killed"
+    );
+    member.0.kill().expect("end the member");
+    _ = member.0.wait();
+}
+
+/// After a kill that landed, a listed member still in the leaf was reached (whatever its credentials: the
+/// kernel's kill does not ask), one that left the leaf was not, and one that is gone has exited and
+/// is kept, its wait ending at once. The check sends nothing: the members it leaves running still run.
+///
+/// Mutant: every listed member is kept.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_still_in_the_leaf_is_reached_by_the_kill_and_one_that_left_is_not(#[fixture(cgroup)] _group: &Group) {
+    use crate::identity::HostKernel;
+
+    let leaf = lane_leaf();
+    let (mut inside, inside_id) = cat_member();
+    let (mut outside, outside_id) = cat_member();
+    let (mut gone, gone_id) = cat_member();
+    place(&inside, &leaf.leaf_path);
+    place(&outside, leaf.leaf_path.parent().expect("the leaf has a parent cgroup"));
+    gone.0.kill().expect("end the member");
+    gone.0.wait().expect("reap the member");
+    leaf.kill.record(Ok(()));
+
+    let (reached, unobserved) = leaf.reached_by_kill(
+        &HostKernel,
+        [inside_id, outside_id, gone_id].map(listed_before).to_vec(),
+    );
+
+    assert_eq!(reached, [inside_id, gone_id]);
+    assert!(unobserved.is_empty(), "every member could be placed: {unobserved:?}");
+    for (member, who) in [
+        (&mut inside, "the member in the leaf"),
+        (&mut outside, "the member outside"),
+    ] {
+        assert_eq!(
+            member.0.try_wait().expect("look at the member"),
+            None,
+            "{who} was not signalled by the check"
+        );
+        member.0.kill().expect("end the member");
+        _ = member.0.wait();
+    }
+}
+
+/// `id` as a listing before the kill would have named it, with no cgroup id seen.
+#[cfg(target_os = "linux")]
+fn listed_before(id: crate::identity::ProcessId) -> super::Listed {
+    super::Listed { id, seen: None }
+}
+
+/// A member of another uid still in the leaf is reached by the kill and waited for, as one of the
+/// tree's own uid: the kernel's `cgroup.kill` asks nobody's credentials, and the check sends nothing,
+/// so no refused send takes it out. The lane's root runs the member as the `nobody` uid.
+///
+/// Mutant: a member the check cannot signal is left out.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_of_another_uid_still_in_the_leaf_is_reached_by_the_kill(#[fixture(cgroup)] _group: &Group) {
+    use crate::identity::HostKernel;
+
+    let leaf = lane_leaf();
+    let (mut other, other_id) = cat_member_as(Some(65534));
+    place(&other, &leaf.leaf_path);
+    let (listed, unobserved) = leaf.list_members(None);
+    assert_eq!(
+        listed.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [other_id],
+        "the member is listed"
+    );
+    leaf.kill.record(Ok(()));
+
+    let (reached, unplaced) = leaf.reached_by_kill(&HostKernel, listed);
+
+    assert_eq!(reached, [other_id]);
+    assert!(
+        unobserved.is_empty() && unplaced.is_empty(),
+        "{unobserved:?} {unplaced:?}"
+    );
+    assert_eq!(
+        other.0.try_wait().expect("look at the member"),
+        None,
+        "the check signalled nothing"
+    );
+    other.0.kill().expect("end the member");
+    _ = other.0.wait();
+}
+
+/// A listed member that cannot be opened to be placed is not dropped: it is an error saying its exit
+/// cannot be observed, and it names the member.
+///
+/// Mutant: a member whose check fails is left out without a word.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_whose_place_cannot_be_checked_after_the_kill_is_an_unobserved_error(#[fixture(cgroup)] _group: &Group) {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let leaf = lane_leaf();
+    let (mut unplaced, unplaced_id) = cat_member();
+    place(&unplaced, &leaf.leaf_path);
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(unplaced_id.pid(), Err(rustix::io::Errno::MFILE));
+    leaf.kill.record(Ok(()));
+
+    let (reached, unobserved) = leaf.reached_by_kill(&kernel, vec![listed_before(unplaced_id)]);
+
+    assert!(
+        reached.is_empty(),
+        "a member that cannot be placed is not claimed reached"
+    );
+    assert_eq!(unobserved.len(), 1, "it is reported: {unobserved:?}");
+    let report = crate::error::Report(&unobserved[0]).to_string();
+    assert!(
+        report.contains(&unplaced_id.pid().to_string()) && report.contains("exit cannot be observed"),
+        "the error names the member and what is left undone: {report}"
+    );
+    unplaced.0.kill().expect("end the member");
+    _ = unplaced.0.wait();
+}
+
+/// The wait over a leaf's listed members blocks on a member that is running, and ends once it has exited
+/// and the leaf has drained. The kill is stated, not made: a real kill ends the member before the wait
+/// looks at it, so only a member the kill left running shows that the wait blocks.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_wait_over_a_leafs_listed_members_blocks_on_a_running_member(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::TreeKill;
+
+    let leaf = lane_leaf();
+    let (mut member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let pid = member.0.id();
+    let (members, unobserved) = leaf.list_members(None);
+    assert_eq!(
+        members.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [id],
+        "the member is listed"
+    );
+    let members = members.into_iter().map(|m| m.id).collect();
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .expect("end the member");
+        }
+    });
+
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        members,
+        unobserved,
+        DrainEdge::Cgroup(&leaf),
+    )
+    .split();
+    wait.wait().expect("the member exited and the leaf drained");
+
+    assert!(blocked.get(), "the wait did not block on a member that was running");
+    _ = member.0.wait();
+}
+
 /// The parent's `cgroup.procs` fd stays close-on-exec for as long as the parent holds it. The
 /// child's `pre_exec` write needs it only between `fork` and `exec`, where a CLOEXEC fd is still
 /// open; any other program this process starts meanwhile must not inherit a writable
@@ -622,7 +1026,7 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
 
     let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
-        tree.kill(None).into_result().is_err(),
+        tree.kill(None).outcome().into_result().is_err(),
         "a cgroup tree must propagate like every sibling mechanism; swallowing it makes \
          kill_tree() report a completed teardown over a live tree"
     );
@@ -672,7 +1076,7 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
         ),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
-    assert!(tree.kill(None).into_result().is_ok());
+    assert!(tree.kill(None).outcome().into_result().is_ok());
 }
 
 // Drop's leaf-removal reporting -----
@@ -2876,7 +3280,8 @@ fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group
 
 /// A member that exits and is reaped after `terminate` pinned it, before it is placed, is gone, not
 /// a failure: its place can no longer be read, and its pidfd says it exited. Nothing is sent, and
-/// nothing warns. Mutant: "a placement error after the pin is a failure".
+/// nothing warns; the debug record of it carries the placement error. Mutants: "a placement error
+/// after the pin is a failure", "the record leaves the placement error out".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgroup)] _group: &Group) {
@@ -2902,9 +3307,18 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgrou
     let mark = crate::log_capture::mark();
     let result = leaf.terminate();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
+    let gone = crate::log_capture::records_since_on_current_thread(mark, "exited before it was placed");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
     result.expect("a member reaped after its pin is gone");
     assert_eq!(warns, Vec::<String>::new(), "nothing warns of a member that is gone");
+    let [(level, text)] = gone.as_slice() else {
+        panic!("the member's debug record is the one that says it exited before it was placed: {gone:?}");
+    };
+    assert_eq!(*level, log::Level::Debug, "{text}");
+    assert!(
+        text.contains("os error"),
+        "the record carries the placement error it was told by: {text}"
+    );
     drop(leaf);
 }
 
@@ -3139,9 +3553,100 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
         other => panic!("expected Unassessable, got {other:?}"),
     };
     assert!(
-        detail.contains("could not be placed") && detail.contains("nor its exit read"),
+        detail.contains("could not be placed") && detail.contains("its placement could not be read"),
         "{detail}"
     );
+}
+
+/// A placement that fails while the exit cannot be read either fails with the placement's own
+/// `io::Error` as the error's source, so its OS code is reachable by walking `source()`; the exit
+/// read's failure is in the detail, and the error's own text does not repeat the placement's.
+/// Unprivileged: the placement is refused by a fault, with an errno other than the exit read's.
+///
+/// Mutants: the two failures are folded into one new `io::Error` with no OS code; the detail repeats
+/// the placement's error.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_placement_whose_exit_read_fails_too_keeps_its_os_code_as_the_source() {
+    use crate::containment::cgroup::fault::{fail_pidfd_info, fail_terminate, TerminateStep};
+    use crate::containment::cgroup::test_support::kill_record;
+
+    let subtree = crate::containment::cgroup::Subtree::new(
+        Some(7),
+        None,
+        None,
+        crate::containment::cgroup::Swept::default(),
+        crate::containment::cgroup::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let pidfd = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
+        .expect("pidfd_open");
+    let _placement = fail_pidfd_info();
+    let _exit = fail_terminate(TerminateStep::Exited, libc::EBADF);
+
+    let result = super::placed_or_exited(pidfd.as_fd(), subtree.holds(std::process::id(), Some(pidfd.as_fd())));
+
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("neither the place nor the exit could be read"),
+    };
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    let own = err.to_string();
+    assert!(own.contains("its placement could not be read"), "{own}");
+    assert!(!own.contains("process containment failed"), "{own}");
+    assert!(
+        !own.contains("(os error 5)"),
+        "the placement's error is the source, not in the error's own text: {own}"
+    );
+    let rendered = crate::error::Report(&err).to_string();
+    let (exit, placement) = (
+        rendered.find("its exit could not be read (").expect(&rendered),
+        rendered.find(", and its placement could not be read").expect(&rendered),
+    );
+    assert!(exit < placement, "the report reads in cause order: {rendered}");
+    assert!(
+        rendered.contains("(os error 9)") && rendered[..placement].contains("(os error 9)"),
+        "the exit read's failure is named in the first clause: {rendered}"
+    );
+    assert!(
+        rendered[placement..].contains("(os error 5)"),
+        "the placement's own error ends the report: {rendered}"
+    );
+}
+
+/// A member whose placement fails while it is alive got no `SIGTERM`, and the message names the OS's
+/// error once.
+///
+/// Mutant: the message renders the error through the report, which prints an `io::Error`'s text twice.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_whose_placement_fails_is_named_with_the_os_text_once() {
+    use crate::containment::cgroup::fault::fail_pidfd_info;
+    use crate::containment::cgroup::test_support::kill_record;
+
+    let subtree = crate::containment::cgroup::Subtree::new(
+        Some(7),
+        None,
+        None,
+        crate::containment::cgroup::Swept::default(),
+        crate::containment::cgroup::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let _placement = fail_pidfd_info();
+    // A live child of this test, blocked on its stdin: the member the row names, reaped below.
+    let mut child =
+        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
+            .expect("spawn a member");
+
+    let result = crate::containment::cgroup::CgroupLeaf::placeholder_for_test().terminate_member(child.id(), &subtree);
+
+    drop(child.stdin.take());
+    let status = child.wait().expect("reap the member");
+    assert!(status.success(), "the member was signalled: {status:?}");
+    let Err(super::Unsignalled::Unproven(message)) = result else {
+        panic!("a placement that failed on a live member is unproven");
+    };
+    assert_eq!(message.matches("(os error 5)").count(), 1, "{message}");
 }
 
 /// A listed member that has exited and is not yet reaped is not signalled, and is no failure: it

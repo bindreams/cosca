@@ -54,7 +54,7 @@ use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
-use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, Why};
+use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::Error;
 
 /// A process group or a session, named by the root's pid (`pgid == sid == pid` for a session's
@@ -79,7 +79,7 @@ impl Group {
 }
 
 impl Contains for Group {
-    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+    fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         kill_group_tree(self.pgid, root)
     }
 
@@ -156,12 +156,19 @@ pub(crate) fn set_session(steps: &mut crate::child::spawn::in_child::InChild) {
 /// only an adversarial fork-bomb) is never seen, never signalled, and does not affect the
 /// verdict. A cgroup (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
-pub(crate) fn kill_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
+///
+/// The members it listed and sent a `SIGKILL` through their own handle are added to `killed`, which a
+/// wait over the kill goes on to wait for.
+pub(crate) fn kill_group(
+    pgid: i32,
+    root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
+) -> Result<(), Error> {
     #[cfg(test)]
     if let Some(outcome) = fault::intercept_kill_group(pgid) {
         return outcome;
     }
-    signal_group(pgid, Signal::SIGKILL, root)
+    signal_group(pgid, Signal::SIGKILL, root, killed)
 }
 
 /// Test seam for [`kill_group`]. Thread-local, with an RAII reset.
@@ -368,7 +375,8 @@ pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error
     if fault::intercept_term_group(pgid) {
         return Ok(());
     }
-    signal_group(pgid, Signal::SIGTERM, root)
+    // A `SIGTERM` is only probed, never resent: no member is reached by a handle of its own.
+    signal_group(pgid, Signal::SIGTERM, root, &mut Vec::new())
 }
 
 /// What a process group's kill or terminate sends by the root's number, from one look at `root`
@@ -417,20 +425,24 @@ fn log_empty_group(pgid: i32, look: &NumberLook) {
 /// by the number, when the number may name another process ([`TreeKillOutcome::Skipped`]: on Linux the
 /// caller kills the root alone through its handle when [`Skip::root_alone`]). A group kill is given
 /// its `root`, as [`check_number`] needs it.
-pub(crate) fn kill_group_tree(pgid: i32, root: Option<&dyn Root>) -> TreeKillOutcome {
+pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKill<'a> {
+    let mut killed = Vec::new();
     let ran = |sent: Result<(), Error>| TreeKillOutcome::Ran(sent.map_err(Unkilled::from));
-    let Some(root) = root else {
-        debug_assert!(false, "a group kill was given no root to look at");
-        return ran(kill_group(pgid, None));
-    };
-    match group_look(root) {
-        NumberLook::Trusted => ran(kill_group(pgid, Some(root))),
-        look @ (NumberLook::Empty | NumberLook::GroupGone) => {
-            log_empty_group(pgid, &look);
-            TreeKillOutcome::Answered(Ok(()))
+    let outcome = match root {
+        None => {
+            debug_assert!(false, "a group kill was given no root to look at");
+            ran(kill_group(pgid, None, &mut killed))
         }
-        look => TreeKillOutcome::Skipped(skipped_group(pgid, "kill", look)),
-    }
+        Some(root) => match group_look(root) {
+            NumberLook::Trusted => ran(kill_group(pgid, Some(root), &mut killed)),
+            look @ (NumberLook::Empty | NumberLook::GroupGone) => {
+                log_empty_group(pgid, &look);
+                TreeKillOutcome::Answered(Ok(()))
+            }
+            look => TreeKillOutcome::Skipped(skipped_group(pgid, "kill", look)),
+        },
+    };
+    TreeKill::of(outcome).reaching(killed)
 }
 
 /// [`term_group`] as a tree call decides it, on one look at `root` ([`kill_group_tree`]). A skip ends
@@ -476,7 +488,12 @@ pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOu
 /// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
 /// the broadcast/double-negation hazard this file's Background measures. A check placed after
 /// the dangerous syscall it claims to guard is not a guard.
-fn signal_group(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Error> {
+fn signal_group(
+    pgid: i32,
+    signal: Signal,
+    root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
+) -> Result<(), Error> {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
@@ -504,7 +521,7 @@ fn signal_group(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<()
         }
         Err(e) => return Err(Error::Io(io::Error::from(e))),
     }
-    verify(pgid, signal, root)
+    verify(pgid, signal, root, killed)
 }
 
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's
@@ -712,8 +729,13 @@ fn pidfd_send_syscall(
 /// Turn the group's actual membership into a contract answer — the single source of truth
 /// regardless of what `killpg` reported. See `group`'s module docs for the listing and
 /// signal-delivery design (one pass; `SIGKILL` resends for real, `SIGTERM` only probes).
-fn verify(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> Result<(), Error> {
-    match group::state(pgid, signal, root) {
+fn verify(
+    pgid: i32,
+    signal: Signal,
+    root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
+) -> Result<(), Error> {
+    match group::state(pgid, signal, root, killed) {
         group::GroupState::Cleared => Ok(()),
         group::GroupState::Refused { refused, unassessable } => {
             let list = |pids: &[u32]| pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");

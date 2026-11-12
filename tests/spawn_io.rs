@@ -1018,7 +1018,11 @@ fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = common::contain_without_cgroup(cmd));
     assert_eq!(child.containment(), common::contain_without_cgroup_gives());
 
+    let grand = common::last_reported_grandchild_id().expect("the grandchild's identity");
+
     child.kill_tree().expect("kill_tree");
+    // `kill_tree` waits for the members it killed: the grandchild has exited when it returns.
+    common::assert_exited(grand, "the grandchild");
     let _ = child.wait(); // reap the root
 
     // Deterministic proof the grandchild died: its control socket gives EOF (the OS closed it on
@@ -1068,9 +1072,13 @@ fn windows_kill_tree_reaps_the_grandchild() {
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
 
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
+
     child.kill_tree().expect("kill_tree");
-    // `TerminateJobObject` only starts the termination: the proof is the grandchild's exit event
-    // and its kill exit code, with its socket released so a missing kill ends the wait too.
+    // `TerminateJobObject` only starts the termination, and `kill_tree` waits for it: the grandchild
+    // has exited when the call returns. Its exit event and kill exit code prove the kill, with its
+    // socket released so a missing kill ends the wait too.
+    common::assert_exited(grand_id, "the grandchild");
     common::assert_members_killed(vec![(grand, "the grandchild")]);
     let _ = child.wait(); // reap the root
 }
@@ -1247,9 +1255,12 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
         common::last_reported_grandchild().expect("the grandchild's pid"),
     );
     let root = common::Member::new(root_stream, child.pid());
+    let grand_id = common::last_reported_grandchild_id().expect("the grandchild's identity");
     assert_eq!(child.containment(), common::tree_walk_gives());
 
     child.kill_tree().expect("kill_tree");
+    // `kill_tree` waits for the members it killed: the grandchild has exited when it returns.
+    common::assert_exited(grand_id, "the grandchild");
     // The root still holds its socket, so a kill that did not come would leave it alive: prove
     // both members dead before the wait that only their death ends.
     common::assert_members_killed(vec![(root, "the root"), (grand, "the grandchild")]);
@@ -1349,8 +1360,12 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Gr
          is a delegated cgroup v2 slice available?",
         child.containment()
     );
+    let grand = common::last_reported_grandchild_id().expect("the grandchild's identity");
 
     child.kill_tree().expect("kill_tree");
+    // `kill_tree` waits for the members `cgroup.procs` listed before the kill, and then the leaf's
+    // drain: the grandchild has exited when it returns.
+    common::assert_exited(grand, "the grandchild");
     let _ = child.wait(); // reap the root
 
     // Deterministic proof: the grandchild's control socket EOFs on its death.
@@ -1443,7 +1458,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
     drop((root, grand));
 }
 
-/// After `kill_on_drop(false)`, an explicit `kill_tree()` must still make `Drop` wait for
+/// After `kill_on_drop(false)`, an explicit `send_kill_tree()` must still make `Drop` wait for
 /// the leaf to drain before its `rmdir` — exactly as the `kill_on_drop` (armed) path already
 /// does. `cgroup.kill` is asynchronous: writing it returns before the kernel has finished
 /// reaping the tree and clearing `populated`, so a `Drop` that tries its `rmdir` once, without
@@ -1451,8 +1466,10 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
 ///
 /// Unlike `linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree`, this test does
 /// NOT call `wait_tree()` before dropping: an explicit wait would force the drain itself and mask
-/// exactly the race under test. Between `kill_tree()` and `drop(child)` it only probes that both
-/// members are dead; the probes return a little before the kernel finishes the drain.
+/// exactly the race under test. Between `send_kill_tree()` and `drop(child)` it only probes that both
+/// members are dead; the probes return a little before the kernel finishes the drain. It is
+/// `send_kill_tree` that is called, not `kill_tree`, which waits for the drain itself and leaves the
+/// `Drop` nothing to wait for.
 ///
 /// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
 /// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the
@@ -1463,7 +1480,9 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
 /// polling from the test.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain(#[fixture(cgroup)] _group: &Group) {
+fn linux_cgroup_v2_kill_on_drop_false_send_kill_tree_still_waits_for_the_leaf_to_drain(
+    #[fixture(cgroup)] _group: &Group,
+) {
     common::install_log_capture();
     let EchoTree {
         child,
@@ -1476,15 +1495,15 @@ fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drai
     let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     let mark = common::log_mark();
-    child.kill_tree().expect("kill_tree");
-    common::assert_dead(&mut root, "the root after kill_tree");
-    common::assert_dead(&mut grand, "the grandchild after kill_tree");
+    child.send_kill_tree().expect("send_kill_tree");
+    common::assert_dead(&mut root, "the root after send_kill_tree");
+    common::assert_dead(&mut grand, "the grandchild after send_kill_tree");
     let _ = child.wait(); // reap the root
     drop(child); // no wait_tree(): Drop alone must wait for the drain before its rmdir
 
     assert!(
         !leaf.exists(),
-        "an explicit kill_tree(), even through a handle that opted out of kill_on_drop, must \
+        "an explicit send_kill_tree(), even through a handle that opted out of kill_on_drop, must \
          wait for the leaf to drain before Drop's rmdir: {}",
         leaf.display()
     );

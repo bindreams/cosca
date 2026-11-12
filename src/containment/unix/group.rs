@@ -342,7 +342,11 @@ pub(crate) enum GroupState {
 /// re-narrow the `Liveness::Unknown` handling `classify_member` otherwise protects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reached {
+    /// Not a survivor, by any evidence: already gone, or not in the group any more.
     Yes,
+    /// The `SIGKILL` resend was delivered to it: it is not a survivor, and the kill's wait goes on to
+    /// wait for its exit.
+    Killed,
     No,
     Unknown,
 }
@@ -375,7 +379,7 @@ fn classify_member(
     match liveness {
         crate::identity::Liveness::Dead => MemberOutcome::NotASurvivor,
         crate::identity::Liveness::Alive | crate::identity::Liveness::Unknown => match reached() {
-            Reached::Yes => MemberOutcome::NotASurvivor,
+            Reached::Yes | Reached::Killed => MemberOutcome::NotASurvivor,
             Reached::No => MemberOutcome::Survivor(pid),
             Reached::Unknown => MemberOutcome::Unassessable(pid),
         },
@@ -520,8 +524,9 @@ fn resend_sigkill(
             Err(reached) => reached,
             Ok(()) => {
                 match KillOutcome::of(os.signal(Sig::Kill)) {
-                    // Exited between the open and the send, or delivered.
-                    KillOutcome::Terminated | KillOutcome::AlreadyGone => Reached::Yes,
+                    KillOutcome::Terminated => Reached::Killed,
+                    // Exited between the open and the send.
+                    KillOutcome::AlreadyGone => Reached::Yes,
                     KillOutcome::NotAttempted(crate::error::Error::Io(refused))
                         if refused.raw_os_error() == Some(libc::EPERM) =>
                     {
@@ -632,11 +637,15 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// 6.9+, once the group has no member left, it is in another group that took the number, and is not
 /// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
 /// documents.
+///
+/// A `SIGKILL` resend that was delivered adds its member to `killed`: the kill's wait goes on to wait
+/// for it by identity. The root is not added: its owner waits for it.
 pub(crate) fn converge(
     kernel: &dyn crate::identity::Kernel,
     pgid: i32,
     signal: Signal,
     root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
 ) -> std::io::Result<GroupState> {
     #[cfg(test)]
     let listing_pgid = fault::listed(pgid);
@@ -649,6 +658,7 @@ pub(crate) fn converge(
     let mut unassessable = Vec::new();
     for m in &listed {
         let id = m.id;
+        let mut delivered = false;
         let outcome = classify_member(id.pid(), id.is_alive_with(kernel), || {
             if signal == Signal::SIGKILL && excluded_from_sigkill_resend(id.pid(), m.system) {
                 log::warn!(
@@ -661,12 +671,18 @@ pub(crate) fn converge(
                 return Reached::Unknown;
             }
             if signal == Signal::SIGKILL {
-                resend_sigkill(kernel, id, root)
+                let reached = resend_sigkill(kernel, id, root);
+                delivered = reached == Reached::Killed;
+                reached
             } else {
                 // `SIGTERM` is never resent: it is only probed (see this fn's doc).
                 probe_member(kernel, id.pid(), id, root)
             }
         });
+        // The root is waited for through its owner, which holds its handle.
+        if delivered && Some(id.pid()) != root.map(Root::pid) {
+            killed.push(id);
+        }
         match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {
             MemberOutcome::NotASurvivor => {}
             MemberOutcome::Survivor(pid) => refused.push(pid),
@@ -726,13 +742,18 @@ fn decide(pgid: i32, signal: Signal, refused: Vec<RawPid>, unassessable: Vec<Raw
 /// contract (never called with an unaddressable group id) rather than pretending to be a
 /// safety net for a dangerous syscall — the REAL guard, which runs before `killpg` is ever
 /// called, is in `unix.rs`'s `signal_group` (this module's only production caller).
-pub(crate) fn state(pgid: i32, signal: Signal, root: Option<&dyn Root>) -> GroupState {
+pub(crate) fn state(
+    pgid: i32,
+    signal: Signal,
+    root: Option<&dyn Root>,
+    killed: &mut Vec<crate::identity::ProcessId>,
+) -> GroupState {
     debug_assert!(
         pgid > 0,
         "group::state called with a non-positive pgid ({pgid}); the real guard belongs in the \
          caller, before any signal is sent — see unix.rs::signal_group"
     );
-    match converge(&crate::identity::HostKernel, pgid, signal, root) {
+    match converge(&crate::identity::HostKernel, pgid, signal, root, killed) {
         Ok(gs) => gs,
         Err(e) => GroupState::Unlistable {
             detail: format!("process group {pgid} could not be listed after {signal}"),

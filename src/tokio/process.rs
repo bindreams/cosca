@@ -91,8 +91,11 @@ impl Process {
     /// Best-effort hard identity-walk sweep of the tree (all platforms; the `TreeWalk`
     /// contract — see [`Process::kill_tree`](crate::Process::kill_tree), which says what a member it
     /// leaves running is).
+    ///
+    /// It sends the kills and returns, as [`Process::send_kill_tree`](crate::Process::send_kill_tree)
+    /// does, so that no runtime thread is blocked on the members' exit.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.inner.kill_tree()
+        self.inner.send_kill_tree()
     }
 
     /// Best-effort graceful (`SIGTERM`) identity-walk sweep. Unix only; Windows returns

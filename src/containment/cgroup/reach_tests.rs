@@ -105,10 +105,10 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
         .holds(pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(!subtree(HIGH, false)
-        .reached_by(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()), None)
         .expect("a forced id"));
     assert!(subtree(HIGH, true)
-        .reached_by(pid, Some(pidfd.as_fd()))
+        .reached_by(pid, Some(pidfd.as_fd()), None)
         .expect("a forced id"));
 }
 
@@ -309,6 +309,135 @@ fn a_task_the_walk_cannot_place_is_placed_through_proc() {
         let err = holds_hidden(&leaf, HIGH + 1).expect_err("placed through the hidden /proc");
         assert!(err.to_string().contains("maybe one under it"), "{stat:?} {sub}: {err}");
     }
+}
+
+/// A task whose cgroup id is the one it had when it was found in the subtree is still where it was:
+/// it is placed with no walk and no `/proc`. One whose id differs is placed as any other.
+///
+/// Mutant: the id seen at the listing is ignored, so every task under the leaf is walked for.
+#[skuld::test]
+fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_a_walk() {
+    let (leaf, _dir) = stand_in_subtree(None);
+    let _id = fault::force_pidfd_cgroup_id(HIGH + 1);
+    let _hidden = fault::hide_proc();
+    let pidfd = own_pidfd();
+    let pid = std::process::id();
+
+    let (inside, by) = leaf
+        .holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .expect("no walk and no /proc read");
+    assert!(inside);
+    assert_eq!(
+        by,
+        Some(HIGH + 1),
+        "the cgroup id that placed it is named, for a listing to keep"
+    );
+    assert!(leaf
+        .reached_by(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .expect("no walk and no /proc read"));
+    leaf.holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 2))
+        .expect_err("a task that moved is placed by the walk, which cannot tell here");
+    leaf.holds_seen(pid, Some(pidfd.as_fd()), None)
+        .expect_err("a task not seen before is placed by the walk");
+}
+
+/// A task seen in a cgroup is placed by that id alone, so a leaf whose own id cannot be read (a
+/// subtree with none) still places it without a walk or `/proc`; one that moved is placed through
+/// `/proc`, hidden here, and so not at all.
+///
+/// Mutant: the shortcut is taken only when the leaf's id is known.
+#[skuld::test]
+fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_the_leafs_id() {
+    let leaf = Subtree::new(
+        None,
+        None,
+        Some("/stand-in-leaf".to_owned()),
+        crate::containment::cgroup::Swept::default(),
+        super::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let _id = fault::force_pidfd_cgroup_id(HIGH + 1);
+    let _hidden = fault::hide_proc();
+    let pidfd = own_pidfd();
+    let pid = std::process::id();
+
+    let (inside, by) = leaf
+        .holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .expect("no walk and no /proc read");
+    assert!(inside);
+    assert_eq!(by, Some(HIGH + 1), "the id that placed it is named");
+    assert!(leaf
+        .reached_by(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .expect("no walk and no /proc read"));
+    leaf.holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 2))
+        .expect_err("a task that moved is placed through the hidden /proc");
+}
+
+/// A subtree with no leaf id, asked about a task seen in a cgroup, falls through to `/proc` when its
+/// pidfd's cgroup id cannot be read, as it did with no `seen`: the refusal is not the placement's
+/// failure. `/proc` is hidden, so the error that comes back is `/proc`'s, not the id's.
+///
+/// Mutant: an unreadable pidfd id fails the placement of a task seen in a cgroup.
+#[skuld::test]
+fn an_unreadable_pidfd_id_places_a_seen_task_through_proc_without_the_leafs_id() {
+    let leaf = Subtree::new(
+        None,
+        None,
+        Some("/stand-in-leaf".to_owned()),
+        crate::containment::cgroup::Swept::default(),
+        super::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let _failing = fault::fail_pidfd_info();
+    let _hidden = fault::hide_proc();
+    let pidfd = own_pidfd();
+
+    let e = leaf
+        .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
+        .expect_err("the hidden /proc places nothing");
+    assert_eq!(
+        e.raw_os_error(),
+        Some(libc::ENOENT),
+        "/proc's error, not the id's EIO: {e}"
+    );
+}
+
+/// A subtree with no leaf id, asked about a task seen in a cgroup, takes `ESRCH` from the pidfd's
+/// cgroup id as the task's exit, not a refusal: it propagates, so a caller reads the exit, and
+/// `/proc` is not asked.
+///
+/// Mutant: `ESRCH` from the pidfd's id falls through to `/proc`.
+#[skuld::test]
+fn an_exited_task_has_no_pidfd_id_and_is_not_placed_through_proc_without_the_leafs_id() {
+    let leaf = Subtree::new(
+        None,
+        None,
+        Some("/stand-in-leaf".to_owned()),
+        crate::containment::cgroup::Swept::default(),
+        super::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let _failing = fault::fail_pidfd_info_with(libc::ESRCH);
+    let _hidden = fault::hide_proc();
+    let pidfd = own_pidfd();
+
+    let e = leaf
+        .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
+        .expect_err("the task's exit is the answer");
+    assert_eq!(e.raw_os_error(), Some(libc::ESRCH), "the id's ESRCH, not /proc's: {e}");
+}
+
+/// The id a placement names is the one that placed the task: here the leaf's own.
+#[skuld::test]
+fn a_placement_by_the_leafs_own_id_names_it() {
+    let _id = fault::force_pidfd_cgroup_id(HIGH);
+    let pidfd = own_pidfd();
+
+    let (inside, by) = subtree(HIGH, true)
+        .holds_seen(std::process::id(), Some(pidfd.as_fd()), None)
+        .expect("the leaf's own id");
+    assert!(inside);
+    assert_eq!(by, Some(HIGH), "the leaf's own id placed it");
 }
 
 /// `/proc`'s ` (deleted)` after the leaf's own path is the removed leaf or a live namesake beside

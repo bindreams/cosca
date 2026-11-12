@@ -190,6 +190,7 @@ fn drop_closes_the_childs_untaken_stdout() {
 #[skuld::test]
 fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
     use crate::signal::{Sent, Sig};
+    use crate::test_child::STATUS_DLL_INIT_FAILED;
 
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
     let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
@@ -197,9 +198,11 @@ fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
-    let fake = child
-        .proc
-        .script_over(|f| f.signals([Ok(Sent::Delivered), Ok(Sent::Delivered)]));
+    // The kill is delivered, so the call waits for the root through the same handle: it states its exit.
+    let fake = child.proc.script_over(|f| {
+        f.signals([Ok(Sent::Delivered), Ok(Sent::Delivered)])
+            .exits([crate::os_process::fake::Answer::Exited])
+    });
 
     child.kill_tree().expect("the handle took both kills");
 
@@ -208,9 +211,13 @@ fn a_tree_walk_kill_tree_sends_the_roots_kill_through_the_childs_handle() {
         vec![Sig::Kill, Sig::Kill],
         "the walk's, then the backstop's"
     );
+    // On Windows the walk also kills the console host the root owns, and the call waits for it, which
+    // ends the root of its own accord (`STATUS_DLL_INIT_FAILED`): a kill of the root by its identity
+    // would end it with `TerminateProcess`'s code 1.
+    let status = child.try_wait().expect("look at the live process");
     assert!(
-        child.try_wait().expect("look at the live process").is_none(),
-        "the real process was killed by its identity, not through the child's handle"
+        status.is_none_or(|status| cfg!(windows) && status.code() == Some(STATUS_DLL_INIT_FAILED)),
+        "the real process was killed by its identity, not through the child's handle: {status:?}"
     );
 }
 

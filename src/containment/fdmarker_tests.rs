@@ -702,10 +702,25 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     assert_eq!(ppid, Some(1), "precondition: the orphan must be reparented to launchd");
 
     // The root is inert: sh is reaped, so ONLY the marker channel can reach the orphan.
+    let orphan_id = crate::identity::ProcessId::of(orphan)
+        .found()
+        .expect("the orphan's identity");
     let marker = super::Marker::new(prepared, inert_root(), None);
+    let mut killed = Vec::new();
     marker
-        .hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()))
+        .hard_kill(
+            Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+            &mut killed,
+        )
         .expect("hard_kill");
+    assert!(
+        killed.contains(&orphan_id),
+        "the orphan is among the members the sweep reached, for the wait: {killed:?}"
+    );
+    assert!(
+        !killed.contains(&inert_root()),
+        "the root is not: its owner waits for it: {killed:?}"
+    );
 
     // If `hard_kill()` missed the orphan, the live `cat` echoes this byte and then exits on the
     // EOF, so `rest` below is non-empty. If the kill landed, this writes to a dead pipe.
@@ -766,9 +781,17 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     );
 
     let marker = super::Marker::new(prepared, inert_root(), None);
+    let mut killed = Vec::new();
     marker
-        .hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()))
+        .hard_kill(
+            Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+            &mut killed,
+        )
         .expect("hard_kill");
+    assert!(
+        killed.iter().all(|id| id.pid() != kid),
+        "a holder that closed the marker is not among the members the sweep reached: {killed:?}"
+    );
 
     // Alive, proven positively: a line in, the same line back — the sweep must not have
     // touched a pid that was never in its holder set to begin with.
@@ -891,17 +914,14 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     let pgid = p_child.id() as i32;
 
     let pass1_marker = super::Marker::new(scratch, inert_root(), Some(pgid));
-    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::new();
-    let mut group_result: Result<(), crate::error::Error> = Ok(());
-    let mut incomplete = false;
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
 
     // Pass 1: fires unconditionally (first_pass=true), killing P via killpg(pgid). Neither T
     // nor Q exists yet, so pass 1 cannot reach either regardless.
     pass1_marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
-        &mut seen,
-        &mut group_result,
-        &mut incomplete,
+        &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
@@ -954,9 +974,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // the gate must open and the group signal must re-fire, reaching Q via killpg.
     marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
-        &mut seen,
-        &mut group_result,
-        &mut incomplete,
+        &mut state,
         false,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
@@ -1023,7 +1041,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     };
 
     assert!(
-        marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL),
+        marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL, &mut Vec::new()),
         "a Denied re-check on a supposedly-known holder must report incomplete (true), not \
          silently succeed"
     );
@@ -1049,7 +1067,10 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let marker = super::Marker::new(prepared, inert_root(), None);
 
     crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
-    let result = marker.hard_kill(Some(&crate::test_support::stated_root::StatedRoot::unreaped()));
+    let result = marker.hard_kill(
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut Vec::new(),
+    );
 
     assert!(
         result.is_err(),
@@ -1074,21 +1095,19 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     let marker = super::Marker::new(prepared, root, None);
     let (_kernel, _unreadable) = crate::identity::unreadable(root.pid());
 
-    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
-    let mut group_result: Result<(), crate::error::Error> = Ok(());
-    let mut incomplete = false;
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    state.seen.insert(root);
     let walks = crate::containment::treewalk::fault::record_walks();
     let mark = crate::log_capture::mark();
     let progressed = marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
-        &mut seen,
-        &mut group_result,
-        &mut incomplete,
+        &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
-    assert!(incomplete, "an unreadable root is not a complete walk");
+    assert!(state.incomplete, "an unreadable root is not a complete walk");
     assert!(!progressed, "nothing was signalled");
     assert_eq!(
         walks.walked(),
@@ -1145,19 +1164,20 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     let marker = super::Marker::new(prepared, root, None);
     let (_kernel, _unreadable) = crate::identity::unreadable(child.pid());
 
-    let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::from([root]);
-    let mut group_result: Result<(), crate::error::Error> = Ok(());
-    let mut incomplete = false;
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    state.seen.insert(root);
     let progressed = marker.sweep_pass(
         nix::sys::signal::Signal::SIGKILL,
-        &mut seen,
-        &mut group_result,
-        &mut incomplete,
+        &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
-    assert!(incomplete, "a child the walk could not read is not a complete walk");
+    assert!(
+        state.incomplete,
+        "a child the walk could not read is not a complete walk"
+    );
     assert!(!progressed, "nothing was signalled");
     drop(root_child.stdin.take());
     let mut printed = String::new();
@@ -1228,8 +1248,9 @@ fn a_skipped_kill_names_the_walk_and_the_group_only_when_there_is_one() {
         own: false,
     });
     let skipped = |marker| {
-        let kill =
-            crate::containment::Tree::contained(crate::containment::Mechanism::Marker(marker)).kill(Some(&reaped));
+        let kill = crate::containment::Tree::contained(crate::containment::Mechanism::Marker(marker))
+            .kill(Some(&reaped))
+            .outcome();
         let skipped = kill
             .skipped()
             .expect("the reaped root's kill by its number is skipped")

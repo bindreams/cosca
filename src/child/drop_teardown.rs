@@ -134,7 +134,8 @@ impl Child {
         }
         #[cfg(not(unix))]
         {
-            let tree = self.tree.kill(Some(&self.proc.hold(self.pid())));
+            // The drop sends only: what it killed is waited for by the root's reap and the tree's drain.
+            let tree = self.tree.send_kill(Some(&self.proc.hold(self.pid())));
             let parts = DropParts {
                 caller,
                 tree: Some(tree),
@@ -198,9 +199,10 @@ impl Child {
         // can land; it is dropped before anything below locks the child.
         let held = self.proc.hold(self.pid());
         // The kill decides on the view's look, the one its report is worded from.
+        // The drop sends alone: the wait for what it killed is the root's reap and the leaf's drain.
         let kill = {
             let seen = crate::containment::Seen::new(&held, view.look());
-            self.tree.kill(Some(&seen))
+            self.tree.send_kill(Some(&seen))
         };
         drop(held);
         kill.log_skip(&view);

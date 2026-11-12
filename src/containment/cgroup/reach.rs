@@ -40,8 +40,8 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
         return Ok(None);
     }
     #[cfg(test)]
-    if super::fault::pidfd_info_fails() {
-        return Err(io::Error::from_raw_os_error(libc::EIO));
+    if let Some(errno) = super::fault::pidfd_info_fails() {
+        return Err(io::Error::from_raw_os_error(errno));
     }
     #[cfg(test)]
     if let Some(id) = super::fault::forced_pidfd_cgroup_id() {
@@ -206,34 +206,67 @@ impl Subtree {
     /// before 6.13 or when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
     /// unified-hierarchy path (a test leaf) holds nothing that read would place.
     pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        self.holds_seen(pid, pidfd, None).map(|(inside, _)| inside)
+    }
+
+    /// [`holds`](Self::holds), also giving the cgroup id that placed the task (the leaf's, a swept
+    /// one, one the walk found under the leaf, or `seen`; `None` where `/proc` placed it or it is
+    /// outside), and told `seen`, the id the task had when an id placed it in this subtree: a task
+    /// still in that cgroup is where it was, so no walk of the leaf's descendants is made for it, and
+    /// the leaf's own id is not needed. The pidfd route also answers when the leaf's id is
+    /// unknown, from `seen`; an `ESRCH` from it is the task's exit and is returned.
+    pub(crate) fn holds_seen(
+        &self,
+        pid: u32,
+        pidfd: Option<BorrowedFd<'_>>,
+        seen: Option<u64>,
+    ) -> io::Result<(bool, Option<u64>)> {
         let mut elsewhere = false;
-        if let (Some(pidfd), Some(leaf_id)) = (pidfd, self.leaf_id) {
-            if let Some(id) = pidfd_cgroup_id(pidfd)? {
-                if id == leaf_id || self.swept.holds(id) {
-                    return Ok(true);
+        let id = match pidfd {
+            Some(pidfd) if self.leaf_id.is_some() || seen.is_some() => match pidfd_cgroup_id(pidfd) {
+                Ok(id) => id,
+                // With no leaf id the pidfd's only shortcuts to `seen`: a refusal places by `/proc`,
+                // as a task with no `seen` is. `ESRCH` is the task's exit, which the caller reads.
+                Err(e) if self.leaf_id.is_none() && e.raw_os_error() != Some(libc::ESRCH) => {
+                    log::debug!(
+                        "the cgroup id of pid {pid} could not be read ({report}), so it is placed through /proc",
+                        report = crate::error::Report(&e)
+                    );
+                    None
                 }
+                Err(e) => return Err(e),
+            },
+            _ => None,
+        };
+        if let Some(id) = id {
+            if self.leaf_id == Some(id) || self.swept.holds(id) || seen == Some(id) {
+                return Ok((true, Some(id)));
+            }
+            if self.leaf_id.is_some() {
                 if let Some(under) = self.walk_places(id) {
-                    return Ok(under);
+                    return Ok((under, under.then_some(id)));
                 }
                 elsewhere = true;
             }
         }
         let Some(path) = &self.path else {
-            return Ok(false);
+            return Ok((false, None));
         };
-        proc_names(path, pid, || self.placed.of(pid), elsewhere).map_err(|e| {
-            if elsewhere {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
-                         cannot be read ({e})"
-                    ),
-                )
-            } else {
-                e
-            }
-        })
+        proc_names(path, pid, || self.placed.of(pid), elsewhere)
+            .map(|inside| (inside, None))
+            .map_err(|e| {
+                if elsewhere {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
+                             cannot be read ({e})"
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })
     }
 
     /// Whether the cgroup `id`, not the leaf's own, is under the leaf, by a walk of the leaf's
@@ -294,12 +327,14 @@ impl Subtree {
     }
 
     /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
-    /// only then does the task's exit follow, so only then may it be waited for.
-    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+    /// only then does the task's exit follow, so only then may it be waited for. `seen` is as in
+    /// [`holds_seen`](Self::holds_seen): the pidfd route answers from it when the leaf's id is
+    /// unknown. This is the one check that a kill reached a task.
+    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>, seen: Option<u64>) -> io::Result<bool> {
         if !self.killed.landed() {
             return Ok(false);
         }
-        self.holds(pid, pidfd)
+        self.holds_seen(pid, pidfd, seen).map(|(inside, _)| inside)
     }
 }
 
@@ -308,7 +343,7 @@ impl Reach for Subtree {
     /// has no number to ask `/proc` with, so whether the kill reached it is not known.
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
         match child.pid() {
-            Some(pid) => self.reached_by(pid, child.pidfd()),
+            Some(pid) => self.reached_by(pid, child.pidfd(), None),
             None => Err(io::Error::other("the child's pid is not known, so it cannot be placed")),
         }
     }

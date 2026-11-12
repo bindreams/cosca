@@ -366,7 +366,8 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
                 &root_changed_hands(),
                 root(),
                 &super::ByIdentity::new(&root_changed_hands(), root())
-            ),
+            )
+            .outcome(),
             crate::containment::dispatch::TreeKillOutcome::NoRoot
         ),
         "a gone root has no tree to walk"
@@ -399,6 +400,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
             root(),
             &super::ByIdentity::new(&root_proof_fails(), root()),
         )
+        .outcome()
         .into_result()
         .map_err(crate::containment::dispatch::Unkilled::into_error),
         super::terminate(

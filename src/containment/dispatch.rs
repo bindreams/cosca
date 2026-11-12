@@ -603,7 +603,7 @@ impl UnvouchedKind {
     }
 }
 
-/// What a tree kill did ([`Contains::send_kill`](crate::containment::Contains::send_kill)): the one value [`Tree::settle`] turns into what
+/// What a tree kill did ([`Contains::kill`](crate::containment::Contains::kill)): the one value [`Tree::settle`] turns into what
 /// is left and into the handle's state ([`TreeKilled`]).
 #[derive(Debug)]
 pub(crate) enum TreeKillOutcome {
@@ -768,6 +768,32 @@ impl TreeKillOutcome {
     }
 }
 
+/// What a settlement `answer`ed, and the members it killed again, which a call that waits for what its
+/// kill reached adds to its wait ([`KillWait::reaching`](crate::containment::KillWait::reaching)).
+pub(crate) struct Settled<A = Result<SettleOutcome, Unsettled>> {
+    pub(crate) answer: A,
+    pub(crate) killed_again: Vec<crate::identity::ProcessId>,
+}
+
+impl<A> Settled<A> {
+    /// An answer that killed nothing again.
+    #[cfg(unix)]
+    pub(crate) fn of(answer: A) -> Settled<A> {
+        Settled {
+            answer,
+            killed_again: Vec::new(),
+        }
+    }
+
+    /// The same members, with the answer `f` makes of this one.
+    pub(crate) fn map<B>(self, f: impl FnOnce(A) -> B) -> Settled<B> {
+        Settled {
+            answer: f(self.answer),
+            killed_again: self.killed_again,
+        }
+    }
+}
+
 /// A `kill_tree` sweep that failed, and whether the root is dead all the same: its handle backstop
 /// ended it. A caller that waits for the root before it returns the error reads that.
 pub(crate) struct SweepFailure {
@@ -782,6 +808,41 @@ impl From<Error> for SweepFailure {
             error,
             root_ended: false,
         }
+    }
+}
+
+/// A `kill_tree` sweep's answer, with the wait for what it killed: a caller that returns once the
+/// members have exited [`wait`](Self::wait)s, and one that sends alone takes the [`answer`](Self::answer).
+pub(crate) struct Swept<'a> {
+    answer: Result<(), SweepFailure>,
+    wait: crate::containment::KillWait<'a>,
+}
+
+impl<'a> Swept<'a> {
+    pub(crate) fn new(answer: Result<(), SweepFailure>, wait: crate::containment::KillWait<'a>) -> Swept<'a> {
+        Swept { answer, wait }
+    }
+
+    /// The answer of a call that killed nothing, so it waits for nothing.
+    pub(crate) fn unwaited(answer: Result<(), SweepFailure>) -> Swept<'a> {
+        Swept::new(answer, crate::containment::KillWait::none())
+    }
+
+    /// The sweep's answer, for a caller that sends and does not wait.
+    pub(crate) fn answer(self) -> Result<(), SweepFailure> {
+        self.answer
+    }
+
+    /// The sweep's answer once every member it killed has exited. A kill that failed is the answer
+    /// over a wait that failed: the wait's error is logged. A wait that failed is a failure that
+    /// keeps the record of the root's kill, as a kill that failed does.
+    pub(crate) fn wait(self) -> Result<(), SweepFailure> {
+        let root_ended = self.wait.waits_for_root();
+        let waited = self.wait.wait();
+        crate::containment::tree_kill::answer_after_wait(self.answer, waited, |error| SweepFailure {
+            error,
+            root_ended,
+        })
     }
 }
 
@@ -810,17 +871,18 @@ impl SweepFailure {
         walk: TreeKillOutcome,
         backstop: Result<(), Error>,
         root_ended: bool,
-    ) -> Result<(), SweepFailure> {
-        let walk = tree.settle_for_kill_tree(op, walk, root_ended);
-        if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
-            // The backstop's error is dropped: the walk's names the member left.
-            log::debug!(
-                "{op} handle backstop also failed ({backstop_report}); surfacing the walk's error: {walk_report}",
-                backstop_report = crate::error::Report(backstop),
-                walk_report = crate::error::Report(walk)
-            );
-        }
-        walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
+    ) -> Settled<Result<(), SweepFailure>> {
+        tree.settle_for_kill_tree(op, walk, root_ended).map(|walk| {
+            if let (Err(walk), Err(backstop)) = (&walk, &backstop) {
+                // The backstop's error is dropped: the walk's names the member left.
+                log::debug!(
+                    "{op} handle backstop also failed ({backstop_report}); surfacing the walk's error: {walk_report}",
+                    backstop_report = crate::error::Report(backstop),
+                    walk_report = crate::error::Report(walk)
+                );
+            }
+            walk.and(backstop).map_err(|error| SweepFailure { error, root_ended })
+        })
     }
 }
 
@@ -842,12 +904,15 @@ impl TreeKilled {
     ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
+    ///
+    /// The [`Settled`] also has the members the mechanism killed again in the settlement, for a
+    /// caller that goes on to wait for what its kill reached.
     pub(crate) fn settle(
         &self,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Result<SettleOutcome, Unsettled> {
+    ) -> Settled {
         let outcome = outcome.into();
         let mut state = self.lock();
         let was_killed = matches!(*state, TreeState::Killed);
@@ -863,7 +928,11 @@ impl TreeKilled {
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && !matches!(*state, TreeState::Never);
         let result = if covered { Ok(()) } else { outcome.into_result() };
-        let (mut result, left_now) = match mechanism {
+        let crate::containment::mechanism::KillLeftOutcome {
+            mut result,
+            left: left_now,
+            killed: killed_again,
+        } = match mechanism {
             Some(mechanism) => mechanism.kill_left(result, held),
             None => crate::containment::mechanism::nothing_held(result),
         };
@@ -902,7 +971,7 @@ impl TreeKilled {
             _ => SettleOutcome::Skipped,
         });
         *state = after;
-        answer
+        Settled { answer, killed_again }
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call, which reports: the error names the first member
@@ -913,10 +982,9 @@ impl TreeKilled {
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Result<(), Error> {
+    ) -> Settled<Result<(), Error>> {
         self.settle(mechanism, outcome, root_ended)
-            .map(drop)
-            .map_err(|left| left.report(caller))
+            .map(|answer| answer.map(drop).map_err(|left| left.report(caller)))
     }
 
     /// `outcome` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not
@@ -927,15 +995,16 @@ impl TreeKilled {
         caller: &str,
         mechanism: Option<&Mechanism>,
         outcome: TreeKillOutcome,
-    ) -> Result<TreeKillOutcome, SweepFailure> {
+    ) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
         if !matches!(outcome, TreeKillOutcome::Unwalked(_)) {
             return Ok(outcome);
         }
-        match self.settle_for_kill_tree(caller, mechanism, outcome, false) {
-            Err(error) => Err(SweepFailure::from(error)),
+        let settled = self.settle_for_kill_tree(caller, mechanism, outcome, false);
+        Err(settled.map(|answer| match answer {
+            Err(error) => SweepFailure::from(error),
             // The walk's error is a member left, and the root is not ended.
             Ok(()) => unreachable!("a walk not made leaves its error"),
-        }
+        }))
     }
 
     /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
@@ -955,7 +1024,7 @@ impl TreeKilled {
             | TreeKillOutcome::NoRoot
             | TreeKillOutcome::Skipped(_) => "",
         };
-        let left = match self.settle(mechanism, outcome, root_ended) {
+        let left = match self.settle(mechanism, outcome, root_ended).answer {
             Err(left) => left.log_text(),
             Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,

@@ -519,7 +519,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixt
 }
 
 #[cfg(feature = "tokio")]
-/// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
+/// Async twin of `linux_cgroup_v2_kill_on_drop_false_send_kill_tree_still_waits_for_the_leaf_to_drain`
 /// in `spawn_io.rs`, with the wait made explicit: the async `Drop` of an opted-out handle that
 /// killed its tree waits for the drain on the dropping thread, so this pins the path that never
 /// blocks, where the caller awaited the drain first and the drop has nothing left to wait for.

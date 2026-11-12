@@ -7,30 +7,52 @@ use std::fmt;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::treewalk::Left;
-use crate::containment::{Containment, Root, TerminateOutcome};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::identity::ProcessId;
 
-/// [`Contains::kill_left`] of every mechanism but a tree walk: `result` as it is, with nothing held.
-/// Only a tree walk leaves the root alone (the root's own death then settles it).
-pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> (Result<(), Unkilled>, Vec<Left>) {
+/// What [`Contains::kill_left`] comes to.
+pub(crate) struct KillLeftOutcome {
+    /// What the kill's result comes to once the members an earlier kill left are answered.
+    pub(crate) result: Result<(), Unkilled>,
+    /// The members it leaves now.
+    pub(crate) left: Vec<Left>,
+    /// The members it killed again, which the kill's wait goes on to wait for.
+    pub(crate) killed: Vec<ProcessId>,
+}
+
+/// [`Contains::kill_left`] of every mechanism but a tree walk: `result` as it is, with nothing held
+/// and nothing killed again. Only a tree walk leaves the root alone (the root's own death then
+/// settles it).
+pub(crate) fn nothing_held(result: Result<(), Unkilled>) -> KillLeftOutcome {
     debug_assert!(
         !matches!(&result, Err(left) if left.root.is_some()),
         "only a tree walk leaves the root alone"
     );
-    (result, Vec::new())
+    KillLeftOutcome {
+        result,
+        left: Vec::new(),
+        killed: Vec::new(),
+    }
 }
 
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
 /// as a [`Mechanism`] and asks it nothing about which it is.
 pub(crate) trait Contains: fmt::Debug {
-    /// Kill every member it names. Never waits. `root` is read right before each send by a mechanism
+    /// Kill every member it names, and name them for a caller that waits: the [`TreeKill`] returned
+    /// has the members it reached, and the edge of its own that says when they have all exited. A
+    /// cgroup leaf and a Job Object read their members before the kill, so this costs a pass over
+    /// the tree there: a caller that waits for none calls [`send_kill`](Self::send_kill). `root` is read right before each send by a mechanism
     /// that names its tree by the root's pid, which decides from it what to send; the outcome says
     /// what was skipped and why ([`Skip`](crate::containment::Skip)). Others ignore it.
     ///
     /// What `Ok` says depends on how the mechanism names the tree:
     ///
     /// - A cgroup leaf and a Job Object name it in the kernel: `Ok` says the kernel killed every
-    ///   member, however it was spawned.
+    ///   member, however it was spawned. The members the kernel listed before the kill are waited for
+    ///   by identity, and then the tree's edge. A member forked after the listing is not
+    ///   seen by the first, and the edge waits for it only until it leaves the kernel's list. A kill
+    ///   that fails names nothing: a member it did not kill is not waited for.
     /// - A process group or session, and an fd marker, name it by a number or a pipe: `Ok` says every
     ///   member they list or find holding it was reached. A member outside it (one that left the
     ///   group, or on Linux one `hidepid` hides) is not.
@@ -38,15 +60,24 @@ pub(crate) trait Contains: fmt::Debug {
     ///   snapshot was killed. A process already reparented away from the root (an orphan), or one the
     ///   snapshot did not list, is not a descendant to it and is not killed. A descendant it left
     ///   running is an [`Error::MemberNotKilled`](crate::error::Error::MemberNotKilled).
-    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome;
+    fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_>;
+
+    /// [`kill`](Self::kill) for a caller that waits for nothing: the kill is sent and its outcome
+    /// returned, and no member is read first. Never waits. Only a cgroup leaf and a Job Object, whose
+    /// `kill` reads the tree before the kill, override it, with the bare kill their `kill` then
+    /// sends.
+    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+        self.kill(root).outcome()
+    }
 
     /// What a kill's `result` comes to once the members an earlier kill left (`left`, which only a
-    /// tree walk holds) are answered, and the members it leaves now: the tree's settlement calls it
-    /// for every kill, under its one lock ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
+    /// tree walk holds) are answered, the members it leaves now, and the members it killed again: the
+    /// tree's settlement calls it for every kill, under its one lock
+    /// ([`TreeKilled::settle`](crate::containment::TreeKilled::settle)).
     /// A tree walk's root death reparents a member out of every later walk, so it kills again the
     /// members whose identity it read ([`with_earlier`](crate::containment::treewalk::with_earlier)).
     /// Default: [`nothing_held`].
-    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+    fn kill_left(&self, result: Result<(), Unkilled>, _left: Vec<Left>) -> KillLeftOutcome {
         nothing_held(result)
     }
 
@@ -151,6 +182,22 @@ pub(crate) enum Mechanism {
 }
 
 impl Contains for Mechanism {
+    fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.kill(root),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.kill(root),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.kill(root),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.kill(root),
+            Mechanism::Walk(m) => m.kill(root),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.kill(root),
+        }
+    }
+
     fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
         match self {
             #[cfg(target_os = "linux")]
@@ -167,7 +214,7 @@ impl Contains for Mechanism {
         }
     }
 
-    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> KillLeftOutcome {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.kill_left(result, left),

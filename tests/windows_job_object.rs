@@ -208,13 +208,38 @@ fn kill_tree_reaps_every_descendant() {
     root_member.assert_alive("the root, before teardown");
     grand_member.assert_alive("the grandchild, before teardown");
 
+    let identity = |pid| {
+        cosca::identity::ProcessId::of(pid)
+            .found()
+            .expect("a live member's identity")
+    };
+    let (root_id, grand_id) = (identity(root_member.pid), identity(grand_member.pid));
+
     job.kill_tree().expect("kill_tree");
 
+    // `kill_tree` waits for the members it terminated: both have exited when it returns.
+    common::assert_exited(root_id, "the root");
+    common::assert_exited(grand_id, "the grandchild");
     // `TerminateJobObject` only starts termination, so the proof is each member's exit event and
     // kill exit code, with its socket released so a missing kill ends the wait too.
     common::assert_members_killed(vec![
         (root_member, "the root, after kill_tree"),
         (grand_member, "the grandchild, after kill_tree"),
+    ]);
+}
+
+#[cfg(windows)]
+/// `send_kill_tree()` terminates every descendant too, and returns once the kill is sent: the
+/// members' exit is proved by their exit events, as `kill_tree` could not, having waited for it.
+#[skuld::test]
+fn send_kill_tree_terminates_every_descendant() {
+    let (_root, job, root_member, grand_member) = spawn_contained_tree();
+
+    job.send_kill_tree().expect("send_kill_tree");
+
+    common::assert_members_killed(vec![
+        (root_member, "the root, after send_kill_tree"),
+        (grand_member, "the grandchild, after send_kill_tree"),
     ]);
 }
 

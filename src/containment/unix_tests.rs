@@ -51,8 +51,8 @@ fn await_zombie(pid: u32) {
 #[skuld::test]
 fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _stray: &Group) {
     for pgid in [0, -1, i32::MIN] {
-        let kill_err =
-            kill_group(pgid, Some(&StatedRoot::unreaped())).expect_err("kill_group(non-positive) must be Err");
+        let kill_err = kill_group(pgid, Some(&StatedRoot::unreaped()), &mut Vec::new())
+            .expect_err("kill_group(non-positive) must be Err");
         assert!(
             matches!(kill_err, crate::error::Error::Unassessable { .. }),
             "got {kill_err:?}"
@@ -83,7 +83,7 @@ fn kill_group_on_owned_group_succeeds() {
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(
-        kill_group(pgid, Some(&StatedRoot::unreaped())).is_ok(),
+        kill_group(pgid, Some(&StatedRoot::unreaped()), &mut Vec::new()).is_ok(),
         "kill_group on owned group must succeed"
     );
     drop(stdin);
@@ -135,7 +135,7 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
         stdout.read_line(&mut line).expect("read to a line or EOF");
         *record.borrow_mut() = Some(line);
     });
-    kill_group(pgid, Some(&StatedRoot::unreaped())).expect("kill_group on an owned group");
+    kill_group(pgid, Some(&StatedRoot::unreaped()), &mut Vec::new()).expect("kill_group on an owned group");
 
     let status = child.wait().expect("reap the leader");
     let line = seen.borrow_mut().take().expect("the hook ran in converge");
@@ -207,7 +207,7 @@ fn kill_group_on_an_all_zombie_group_is_ok() {
     );
 
     assert!(
-        kill_group(pid as i32, Some(&StatedRoot::unreaped())).is_ok(),
+        kill_group(pid as i32, Some(&StatedRoot::unreaped()), &mut Vec::new()).is_ok(),
         "a group holding only a zombie is already down"
     );
     let mut child = child;
@@ -337,7 +337,7 @@ mod group_kill_and_terminate {
         ] {
             let _read = read(root);
             let recorder = fault::record_kill_group();
-            let outcome = kill_group_tree(PGID, Some(&stated(root)));
+            let outcome = kill_group_tree(PGID, Some(&stated(root))).outcome();
             let sent = recorder.killed();
             match (root, outcome) {
                 (Root::Unreaped, TreeKillOutcome::Ran(Ok(()))) => assert_eq!(sent, [PGID], "{root:?}"),

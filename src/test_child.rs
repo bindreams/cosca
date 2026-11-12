@@ -15,6 +15,10 @@ pub(crate) mod pid_reuse;
 #[cfg(windows)]
 pub(crate) mod ctrl_break;
 
+/// The exit code of a Windows process that died at start-up, as a root does when a tree walk ends
+/// its console host too.
+pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+
 /// The handle a spawn's parent end holds, for a test that inspects it.
 #[cfg(windows)]
 pub(crate) fn parent_handle(end: &crate::pipe::ParentEnd) -> std::os::windows::io::BorrowedHandle<'_> {

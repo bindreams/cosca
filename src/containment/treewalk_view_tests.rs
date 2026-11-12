@@ -81,6 +81,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
     [
         ("hard_kill", |k, id| {
             super::hard_kill(k, id, &super::ByIdentity::new(k, id))
+                .outcome()
                 .into_result()
                 .map_err(Unkilled::into_error)
         }),
@@ -248,6 +249,7 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
         assert_eq!(pids, [descendant.pid()], "{recursive:?}");
     }
     super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
         .into_result()
         .expect("the walk ran");
     // Both were killed: the root by its signal, the descendant before it could print.
@@ -547,6 +549,7 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let cause = format!("pid {} identity could not be read", descendant.pid());
     let left = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
         .into_result()
         .expect_err("a descendant was left");
     assert!(!left.members.is_empty(), "a descendant was left, not only the root");
@@ -577,6 +580,7 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let mark = crate::log_capture::mark();
     super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
         .into_result()
         .expect_err("a descendant was left");
     assert_eq!(
@@ -623,6 +627,7 @@ fn every_member_left_behind_is_returned_and_none_is_warned_of() {
     let mark = crate::log_capture::mark();
     fault::force_incomplete_once(LeftBehind::Descendant);
     let left = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root))
+        .outcome()
         .into_result()
         .expect_err("two members were left");
     let warned = crate::log_capture::warns_since(mark, "treewalk:");
@@ -654,6 +659,7 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
     let (child, _, descendant, kernel) = root_with_an_unreadable_descendant();
 
     let again = with_earlier(&kernel, vec![Left::Resolved(descendant)], Ok(()))
+        .0
         .expect_err("the kernel still cannot reach the descendant");
     assert_eq!(again.members.len(), 1, "{again:?}");
     assert_not_killed(
@@ -667,7 +673,9 @@ fn members_an_earlier_kill_left_are_killed_again_by_identity_or_reported_again()
         pid: descendant.pid(),
         said: "its identity could not be read".into(),
     };
-    let again = with_earlier(&kernel, vec![unread], Ok(())).expect_err("never read, so never shown killed");
+    let again = with_earlier(&kernel, vec![unread], Ok(()))
+        .0
+        .expect_err("never read, so never shown killed");
     assert_not_killed(
         Err(again.into_error()),
         descendant.pid(),

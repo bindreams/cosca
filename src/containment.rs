@@ -152,7 +152,7 @@ pub enum TreeDrain {
     /// The macOS fd marker's last held copy of the marker descriptor closed. Advisory, not
     /// authoritative — see this type's own doc.
     AllMarkersClosed,
-    /// At least one member was still running at the deadline.
+    /// The tree was not seen drained by the deadline.
     MembersRemain,
 }
 
@@ -297,6 +297,9 @@ pub(crate) mod fake;
 #[path = "containment/tree.rs"]
 mod tree;
 
+#[path = "containment/tree_kill.rs"]
+pub(crate) mod tree_kill;
+
 #[path = "containment/root.rs"]
 mod root;
 
@@ -327,6 +330,11 @@ pub(crate) use skip::{Skip, TerminateOutcome};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};
 pub(crate) use tree::Tree;
+#[allow(
+    unused_imports,
+    reason = "a wait is named outside containment/ only by the callers that wait; the rest send alone"
+)]
+pub(crate) use tree_kill::{KillWait, TreeKill};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

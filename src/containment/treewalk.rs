@@ -85,12 +85,12 @@
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::mechanism::Contains;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
+use crate::containment::mechanism::{Contains, KillLeftOutcome};
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
-use crate::containment::{Containment, Root, Skip, TerminateOutcome};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill};
 use crate::error::Error;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::os_process::OsProcess;
@@ -119,19 +119,23 @@ impl Walker {
 }
 
 impl Contains for Walker {
-    fn send_kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKillOutcome {
+    fn kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKill<'_> {
         kill_tree(self.root, root)
     }
 
     /// Kills again the members an earlier kill left ([`with_earlier`]), and holds the ones this one
     /// leaves.
-    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> (Result<(), Unkilled>, Vec<Left>) {
-        let merged = with_earlier(&crate::identity::HostKernel, left, result);
+    fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> KillLeftOutcome {
+        let (merged, killed) = with_earlier(&crate::identity::HostKernel, left, result);
         let left_now = match &merged {
             Ok(()) => Vec::new(),
             Err(left) => Left::of(left),
         };
-        (merged, left_now)
+        KillLeftOutcome {
+            result: merged,
+            left: left_now,
+            killed,
+        }
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
@@ -601,10 +605,11 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 ///
 /// The root's kill goes through [`Root::signal`] of `held`, which must name `root`
 /// ([`ByIdentity`] where the caller holds no handle on it). Each descendant is killed through a
-/// handle opened by its identity.
+/// handle opened by its identity. The [`TreeKill`] names every descendant whose kill was sent
+/// (each re-opened by identity, through `kernel`, when a caller waits), and whether the root's landed.
 ///
 /// [`Tree::settle`]: crate::containment::Tree::settle
-pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> TreeKillOutcome {
+pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn Root) -> TreeKill<'a> {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     // Test-only fault seam: skip the root's kill (take semantics — see `fault`).
     #[cfg(test)]
@@ -618,8 +623,8 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
     {
         Ok(Some(walk)) => walk,
-        Ok(None) => return TreeKillOutcome::NoRoot,
-        Err(error) => return TreeKillOutcome::Unwalked(error),
+        Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot).through(kernel),
+        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
@@ -646,13 +651,21 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         }
     }
     let mut resolved = Vec::new();
+    let mut killed = Vec::new();
+    let mut root_killed = false;
     #[cfg(any(unix, windows))]
     {
         if !skip_root {
-            root_left = left_behind(root, KillOutcome::of(held.signal(Sig::Kill))).or(root_left);
+            let outcome = KillOutcome::of(held.signal(Sig::Kill));
+            root_killed = !matches!(outcome, KillOutcome::NotAttempted(_));
+            root_left = left_behind(root, outcome).or(root_left);
         }
         for id in descendants {
-            if let Some(error) = left_behind(id, kill_one(kernel, id)) {
+            let outcome = kill_one(kernel, id);
+            if matches!(outcome, KillOutcome::Terminated) {
+                killed.push(id);
+            }
+            if let Some(error) = left_behind(id, outcome) {
                 left.push(error);
                 resolved.push(id);
             }
@@ -660,14 +673,19 @@ pub(crate) fn hard_kill(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (kernel, root, descendants, skip_root, held);
-    if left.is_empty() && root_left.is_none() {
-        return TreeKillOutcome::Ran(Ok(()));
-    }
-    TreeKillOutcome::Ran(Err(Unkilled {
-        members: left,
-        root: root_left,
-        resolved,
-    }))
+    let outcome = if left.is_empty() && root_left.is_none() {
+        TreeKillOutcome::Ran(Ok(()))
+    } else {
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: left,
+            root: root_left,
+            resolved,
+        }))
+    };
+    TreeKill::of(outcome)
+        .through(kernel)
+        .reaching(killed)
+        .root_killed(root_killed)
 }
 
 /// `id`'s SIGKILL by identity (`TerminateProcess` on Windows).
@@ -740,12 +758,12 @@ impl Left {
 /// them: each one read is killed again by its identity, so one that is gone stops failing the call
 /// and one that still refuses is `MemberNotKilled` again; one never read is `MemberNotKilled` again
 /// as it was. A member the walk names itself is not repeated. The earlier members come first, as the
-/// first failure stands.
+/// first failure stands. Also the members killed again, which the kill's wait goes on to wait for.
 pub(crate) fn with_earlier(
     kernel: &dyn Kernel,
     earlier: Vec<Left>,
     walked: Result<(), Unkilled>,
-) -> Result<(), Unkilled> {
+) -> (Result<(), Unkilled>, Vec<ProcessId>) {
     let mut walked = match walked {
         Ok(()) => Unkilled {
             members: Vec::new(),
@@ -763,13 +781,20 @@ pub(crate) fn with_earlier(
         })
         .collect();
     let mut members = Vec::new();
+    let mut killed = Vec::new();
     for left in earlier.into_iter().filter(|left| !named.contains(&left.pid())) {
         match left {
             Left::Resolved(id) => {
                 #[cfg(any(unix, windows))]
-                if let Some(error) = left_behind(id, kill_one(kernel, id)) {
-                    members.push(error);
-                    walked.resolved.push(id);
+                {
+                    let outcome = kill_one(kernel, id);
+                    if matches!(outcome, KillOutcome::Terminated) {
+                        killed.push(id);
+                    }
+                    if let Some(error) = left_behind(id, outcome) {
+                        members.push(error);
+                        walked.resolved.push(id);
+                    }
                 }
                 #[cfg(not(any(unix, windows)))]
                 let _ = (kernel, id);
@@ -784,11 +809,11 @@ pub(crate) fn with_earlier(
         }
     }
     if members.is_empty() && walked.members.is_empty() && walked.root.is_none() {
-        return Ok(());
+        return (Ok(()), killed);
     }
     members.append(&mut walked.members);
     walked.members = members;
-    Err(walked)
+    (Err(walked), killed)
 }
 
 /// The error for the member `pid` a walk left behind, `source` why.
@@ -1073,9 +1098,9 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
 /// [`hard_kill`] from the host's process table, the root killed through `owner`'s handle if there is
 /// one, else by its identity: skipped where the root's number cannot be trusted ([`skipped_walk`]),
 /// else walked.
-pub(crate) fn kill_tree(root: ProcessId, owner: Option<&dyn Root>) -> TreeKillOutcome {
+pub(crate) fn kill_tree<'a>(root: ProcessId, owner: Option<&dyn Root>) -> TreeKill<'a> {
     match skipped_walk(owner) {
-        Some(skip) => TreeKillOutcome::Skipped(skip),
+        Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip)),
         None => {
             let kernel = &crate::identity::HostKernel;
             hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)))

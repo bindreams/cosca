@@ -196,7 +196,6 @@ impl OwnedChild {
     }
 
     /// The child as the process the OS names, to watch for its exit without reaping it.
-    #[cfg(feature = "tokio")]
     pub(crate) fn os_process(&self) -> &dyn crate::os_process::OsProcess {
         &*self.os
     }

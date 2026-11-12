@@ -268,9 +268,9 @@ mod linux {
         let unsure = crate::test_support::stated_root::StatedRoot::with_state(child.pid(), || {
             crate::signal::RootState::Unknown(std::io::Error::other("forced peek failure"))
         });
-        let kill = child.tree.kill(Some(&unsure));
+        let kill = child.tree.kill(Some(&unsure)).outcome();
         assert!(kill.skipped().is_some(), "the number-named kill must be skipped");
-        child.tree.settle(kill, true).expect("a skip is not an error");
+        child.tree.settle(kill, true).answer.expect("a skip is not an error");
 
         assert!(!child.tree.is_killed(), "a skipped kill must not mark the tree killed");
         assert_eq!(recorder.killed(), Vec::<i32>::new());
@@ -294,6 +294,7 @@ mod linux {
 
         let failure = child
             .kill_tree_after("kill_tree", None)
+            .wait()
             .expect_err("the number may name another process");
 
         fake.assert_peeks_exhausted();
