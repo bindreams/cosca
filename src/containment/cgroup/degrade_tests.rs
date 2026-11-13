@@ -58,6 +58,22 @@ fn leaf_error_names_step_and_path_and_keeps_the_reason_as_its_source() {
             Some(13),
         ),
         (
+            LeafError::CheckAccess {
+                path: PathBuf::from("/sys/fs/cgroup/slice/cgroup.procs"),
+                source: std::io::Error::from_raw_os_error(libc::EIO),
+            },
+            &["/sys/fs/cgroup/slice/cgroup.procs"],
+            Some(libc::EIO),
+        ),
+        (
+            LeafError::CheckAccessUnavailable {
+                path: PathBuf::from("/sys/fs/cgroup/slice"),
+                source: std::io::Error::from_raw_os_error(libc::ENOSYS),
+            },
+            &["/sys/fs/cgroup/slice", "faccessat2", "5.8", "effective ids"],
+            Some(libc::ENOSYS),
+        ),
+        (
             LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
             &["report"],
             Some(libc::EMFILE),

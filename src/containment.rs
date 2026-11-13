@@ -211,19 +211,19 @@ pub enum ContainMode {
     ///   spawn; none is remembered.
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
-    ///   installs the marker too, and still degrades when it fails, as it always has.
+    ///   installs the marker too, and degrades when it fails.
     /// - **Windows:** a Job Object, falling back to [`ContainMode::TreeWalk`] when the child
     ///   cannot be assigned to it, as `BestEffort` does. This is unchanged for now: Windows will
     ///   fail instead, as the other platforms do.
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
     Strongest,
-    /// The strongest kernel container that sets up, else the next one down, rather than an error:
-    /// what [`ContainMode::Strongest`] did before it began to fail. A cgroup v2 leaf on Linux, a
-    /// Job Object on Windows and the inherited-fd marker on macOS, each falling back (to a process
-    /// group on Linux and macOS, to [`ContainMode::TreeWalk`] on Windows) rather than to no
-    /// containment. A fallback is logged at `warn` (on Windows it is not, yet), and
-    /// [`Child::containment`](crate::Child::containment) reports what the spawn got.
+    /// The strongest kernel container that sets up, else the next one down, rather than an error.
+    /// A cgroup v2 leaf on Linux, a Job Object on Windows and the inherited-fd marker on macOS,
+    /// each falling back (to a process group on Linux and macOS, to [`ContainMode::TreeWalk`] on
+    /// Windows) rather than to no containment. A fallback is logged at `warn` (on Windows it is
+    /// not, yet), and [`Child::containment`](crate::Child::containment) reports what the spawn
+    /// got.
     BestEffort,
     /// Identity-aware process-tree walk at teardown — selectable directly (e.g.
     /// for a child known to `setsid` out of a process group). The spawn fails if the OS refuses to

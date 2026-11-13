@@ -8,14 +8,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{accessat, Access, AtFlags, CWD};
+use rustix::io::Errno;
+
 use super::*;
 
+/// The supervisor's cgroup in the unified hierarchy, as the kernel prints it for this process.
+const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
+
 /// Where the cgroup v2 filesystem is mounted.
-#[cfg(target_os = "linux")]
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// The supervisor's own cgroup: the directory a leaf is made under.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct OwnCgroup {
     /// Its path in the unified hierarchy, as `/proc/self/cgroup` prints it.
@@ -24,7 +28,6 @@ pub(crate) struct OwnCgroup {
     dir: PathBuf,
 }
 
-#[cfg(target_os = "linux")]
 impl OwnCgroup {
     pub(super) fn rel_path(&self) -> &str {
         &self.rel_path
@@ -34,17 +37,20 @@ impl OwnCgroup {
         &self.dir
     }
 
-    /// Whether this process, by its effective ids, may write the directory: the delegation a leaf's
-    /// `mkdir` needs.
-    fn writable(&self) -> io::Result<()> {
-        use rustix::fs::{accessat, Access, AtFlags, CWD};
-        Ok(accessat(CWD, self.dir.as_path(), Access::WRITE_OK, AtFlags::EACCESS)?)
+    /// What a leaf needs of this cgroup, by this process's effective ids: write and search on the
+    /// directory, for the leaf's `mkdir`, and write on its `cgroup.procs`, which moving the child
+    /// into the leaf writes too (this cgroup is the common ancestor of the child's cgroup and the
+    /// leaf).
+    fn needs(&self) -> [(PathBuf, Access); 2] {
+        [
+            (self.dir.clone(), Access::WRITE_OK | Access::EXEC_OK),
+            (self.dir.join("cgroup.procs"), Access::WRITE_OK),
+        ]
     }
 }
 
 /// The supervisor's own cgroup, from the contents of `/proc/self/cgroup` (`file`, or why it could
 /// not be read) and the cgroup filesystem mounted at `root`.
-#[cfg(target_os = "linux")]
 fn find_in(file: io::Result<String>, root: &Path) -> Result<OwnCgroup, LeafError> {
     let file = file.map_err(LeafError::ReadProcSelfCgroup)?;
     let rel_path = parse_v2_relative_path(&file).ok_or_else(|| {
@@ -60,29 +66,26 @@ fn find_in(file: io::Result<String>, root: &Path) -> Result<OwnCgroup, LeafError
     })
 }
 
-/// The supervisor's own cgroup, found for a leaf. Errs where `/proc/self/cgroup` cannot be read or
-/// has no `0::` line; whether the cgroup can be written is not asked.
-#[cfg(target_os = "linux")]
+/// The supervisor's own cgroup, found for a leaf: the one read of `/proc/self/cgroup`. Errs where
+/// it cannot be read or has no `0::` line; whether the cgroup can be written is not asked.
 pub(super) fn find_own_cgroup() -> Result<OwnCgroup, LeafError> {
-    find_in(fs::read_to_string("/proc/self/cgroup"), Path::new(CGROUP_ROOT))
+    find_in(fs::read_to_string(PROC_SELF_CGROUP), Path::new(CGROUP_ROOT))
 }
 
-/// Whether the host offers a cgroup for a leaf: the supervisor's own cgroup, writable by this
-/// process. `Ok(None)` is a host that does not: no `/proc/self/cgroup`, no `0::` line in it, or an
-/// own cgroup this process may not write (an undelegated slice, a read-only cgroup filesystem, a
-/// path the filesystem does not show). Any other failure to read `/proc/self/cgroup` is an error.
+/// Whether the host offers a cgroup for a leaf: the supervisor's own cgroup, with what a leaf needs
+/// of it granted to this process (see [`OwnCgroup::needs`]). `Ok(None)` is a host that does not:
+/// no `/proc/self/cgroup`, no `0::` line in it, or an own cgroup this process may not use (an
+/// undelegated slice, a read-only cgroup filesystem, a path the filesystem does not show). Any
+/// other failure, to read `/proc/self/cgroup` or to check the access, is an error.
 ///
-/// It reads two files' worth of state per call and keeps none: a delegation can change between
-/// spawns.
-#[cfg(target_os = "linux")]
+/// It reads state per call and keeps none: a delegation can change between spawns.
 pub(crate) fn offered_cgroup() -> Result<Option<OwnCgroup>, LeafError> {
-    offered_in(fs::read_to_string("/proc/self/cgroup"), Path::new(CGROUP_ROOT))
+    offered_from(find_own_cgroup())
 }
 
-/// [`offered_cgroup`] over an explicit `/proc/self/cgroup` read and cgroup filesystem mount.
-#[cfg(target_os = "linux")]
-fn offered_in(file: io::Result<String>, root: &Path) -> Result<Option<OwnCgroup>, LeafError> {
-    let own = match find_in(file, root) {
+/// [`offered_cgroup`] over the own cgroup as [`find_in`] answered it.
+fn offered_from(found: Result<OwnCgroup, LeafError>) -> Result<Option<OwnCgroup>, LeafError> {
+    let own = match found {
         Ok(own) => own,
         Err(LeafError::ReadProcSelfCgroup(e)) if e.kind() == io::ErrorKind::NotFound => {
             log::debug!("cgroup v2: no /proc/self/cgroup, so no cgroup is offered");
@@ -97,16 +100,36 @@ fn offered_in(file: io::Result<String>, root: &Path) -> Result<Option<OwnCgroup>
         }
         Err(e) => return Err(e),
     };
-    match own.writable() {
-        Ok(()) => Ok(Some(own)),
-        Err(e) => {
-            log::debug!(
-                "cgroup v2: no cgroup is offered: {} is not writable ({})",
-                own.dir.display(),
-                crate::error::Report(&e)
-            );
-            Ok(None)
+    for (path, access) in own.needs() {
+        let answer = accessat(CWD, path.as_path(), access, AtFlags::EACCESS);
+        if !grants(answer, &path)? {
+            log::debug!("cgroup v2: no cgroup is offered: {} is not {access:?}", path.display());
+            return Ok(None);
         }
+    }
+    Ok(Some(own))
+}
+
+/// What the answer of `faccessat(AT_EACCESS)` for `path` says of whether the access is granted:
+/// `Ok(false)` for a refusal (`EACCES`, `EPERM`, `EROFS`) or a path that is not there (`ENOENT`),
+/// and an error for any other answer, which says nothing of what is granted.
+///
+/// `ENOSYS` is the kernel having no `faccessat2` (before Linux 5.8). `rustix` then checks with the
+/// plain `faccessat`, which is exact for a process whose effective ids are its real ones, so the
+/// answer reaches this function only for one whose ids differ.
+fn grants(answer: Result<(), Errno>, path: &Path) -> Result<bool, LeafError> {
+    let path = || path.to_path_buf();
+    match answer {
+        Ok(()) => Ok(true),
+        Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::NOENT) => Ok(false),
+        Err(source @ Errno::NOSYS) => Err(LeafError::CheckAccessUnavailable {
+            path: path(),
+            source: source.into(),
+        }),
+        Err(source) => Err(LeafError::CheckAccess {
+            path: path(),
+            source: source.into(),
+        }),
     }
 }
 
@@ -117,7 +140,6 @@ fn offered_in(file: io::Result<String>, root: &Path) -> Result<Option<OwnCgroup>
 /// can kill a tree, so the host offers none: a process group, with the leaf removed. It is read on
 /// the new leaf and not on the own directory, because the hierarchy's root never shows
 /// `cgroup.kill`. Every other failure to set up a cgroup the host offers is an error.
-#[cfg(target_os = "linux")]
 pub(crate) fn leaf_if_offered(
     offered: Result<Option<OwnCgroup>, LeafError>,
     teardown_warn_after: Option<std::time::Duration>,
@@ -138,6 +160,6 @@ pub(crate) fn leaf_if_offered(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 #[path = "own_tests.rs"]
 mod own_tests;

@@ -2872,6 +2872,39 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     );
 }
 
+/// A child whose refusing placement failed exits from inside its hook with `REFUSED_EXIT`, after
+/// its report, rather than return an error to `std` (which would write its error record to the fd
+/// number its error channel had: a stdio slot once `std` returned early). A regression exits 0
+/// here (the forked body's own `_exit`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_whose_refusing_placement_failed_exits_from_its_hook() {
+    use std::os::fd::IntoRawFd;
+
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let slot = channel.slot().refusing();
+    // A descriptor open for reading only: the placement write fails with EBADF.
+    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
+    let guard = fork_running(&[procs_fd, slot.fd, slot.parent_fd], move || {
+        // SAFETY: this child's inherited copies of the channel's ends and the descriptor.
+        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
+    });
+    // SAFETY: the parent's own copy, closed once; the child keeps its own.
+    unsafe { libc::close(procs_fd) };
+
+    let pid = guard.defuse();
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    assert!(libc::WIFEXITED(status), "status {status:#x}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        crate::containment::cgroup::REFUSED_EXIT,
+        "a refused child must exit from its hook, not return an error to std"
+    );
+    assert_eq!(channel.shut().placement(), PlacementReport::WriteFailed(libc::EBADF));
+}
+
 /// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
 /// parent would misread as never placed.
 #[cfg(target_os = "linux")]

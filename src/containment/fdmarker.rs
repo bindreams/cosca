@@ -557,7 +557,7 @@ pub(crate) fn install(
 
     // A supervisor whose soft RLIMIT_NOFILE sits below `want` (HIGH_FLOOR=64 in the common
     // case, or higher with a large reserved set) makes F_DUPFD_CLOEXEC fail EINVAL here on
-    // EVERY contained spawn, not just an occasional one — diagnosable from this log line alone
+    // EVERY contained spawn, not just an occasional one — diagnosable from the error alone,
     // since `nix::errno::Errno`'s `Display` names the symbolic errno (e.g. "EINVAL: Invalid
     // argument"), not just a bare OS error number.
     let want = safe_marker_fd(write.as_fd().as_raw_fd(), reserved);

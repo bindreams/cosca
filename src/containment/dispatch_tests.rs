@@ -2522,8 +2522,9 @@ fn a_failed_write_degrades_a_best_effort_spawn_and_removes_the_leaf() {
     assert!(!leaf_path.exists(), "the degrade must remove the leaf it created");
 }
 
-/// The same child under `Strongest`: the attach fails, naming the cgroup, and the empty leaf is
-/// removed. The failed attach's teardown ends the child.
+/// The same child under `Strongest`: the attach fails as a spawn that did not start (the program
+/// never ran: the child's report proves it), the error names the leaf and keeps the placement's
+/// cause as its source, and the empty leaf is removed. The failed attach's teardown ends the child.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
@@ -2535,10 +2536,33 @@ fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
         let failure = decide_for(crate::containment::ContainMode::Strongest, &leaf_path, report)
             .expect_err("a Strongest root the leaf did not take fails its attach");
 
-        assert!(
-            matches!(failure.cause, crate::error::Error::Containment { ref detail, .. } if detail.contains("cgroup")),
-            "{failure:?}"
+        assert!(failure.not_started, "the program never ran: {failure:?}");
+        let crate::error::Error::Containment { detail, source } = &failure.cause else {
+            panic!("{failure:?}");
+        };
+        assert_eq!(
+            detail,
+            &format!(
+                "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run",
+                leaf_path.display()
+            ),
+            "the detail says only this layer"
         );
+        let source = source.as_deref().expect("the placement's cause is the source");
+        // `cgroup.procs` is absent from this leaf, so the diagnosis read failed too: its OS error
+        // is further down the source chain, not folded into the detail.
+        let causes = std::iter::successors(Some(source as &(dyn std::error::Error + 'static)), |e| e.source())
+            .filter_map(|e| e.downcast_ref::<std::io::Error>())
+            .filter_map(std::io::Error::raw_os_error)
+            .collect::<Vec<_>>();
+        assert!(
+            causes.contains(&libc::ENOENT),
+            "the unreadable cgroup.procs: {causes:?}"
+        );
+        if matches!(report, ChildReport::WriteFailed) {
+            let said = crate::error::Report(source).to_string();
+            assert!(said.contains("errno 9"), "the write's errno: {said}");
+        }
         assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
     }
 }

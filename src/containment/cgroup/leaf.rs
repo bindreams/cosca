@@ -1338,36 +1338,19 @@ impl CgroupLeaf {
     /// after it.
     #[must_use = "a child that named itself and was given no handle is a breach for a caller to act on"]
     pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) -> WithoutChild {
-        let Some(received) = self.abandon(warn) else {
+        let Some(received) = self.shut_exchange() else {
             debug_assert!(false, "the leaf answers for a child once");
             return WithoutChild::AlreadyAbandoned;
         };
+        // What the abandonment finds wrong on the way, warned once when it ends.
+        let mut why = crate::child::spawn::Diagnosis::default();
+        self.kill_entered(&mut why);
+        self.remove_abandoned(warn);
         if received.pid.is_some() {
             WithoutChild::Named
         } else {
             WithoutChild::Unnamed
         }
-    }
-
-    /// [`abandon_without_child`](Self::abandon_without_child) for a spawn that failed, answering the
-    /// errno the child's placement write failed with, if it reported one before the spawn failed.
-    /// A child that stopped for it is a [`refusing`](ReportSlot::refusing) slot's.
-    pub(crate) fn abandon_failed_spawn(&mut self, warn: &mut dyn TeardownWarn) -> Option<i32> {
-        match self.abandon(warn)?.placement() {
-            PlacementReport::WriteFailed(errno) => Some(errno),
-            PlacementReport::Placed | PlacementReport::NotReported => None,
-        }
-    }
-
-    /// Ends the exchange, kills through the leaf if the child entered it, and removes the leaf.
-    /// What the child sent before, or `None` once an abandonment has done it.
-    fn abandon(&mut self, warn: &mut dyn TeardownWarn) -> Option<Received> {
-        let received = self.shut_exchange()?;
-        // What the abandonment finds wrong on the way, warned once when it ends.
-        let mut why = crate::child::spawn::Diagnosis::default();
-        self.kill_entered(&mut why);
-        self.remove_abandoned(warn);
-        Some(received)
     }
 
     /// Takes and shuts the report channel, and records whether the child entered the leaf: what an
@@ -1809,13 +1792,21 @@ pub(crate) fn create_leaf_under(
 #[cfg(target_os = "linux")]
 pub(crate) const ABANDONED_EXIT: i32 = 125;
 
+/// The status a child exits with from inside its hook when its [`refusing`](ReportSlot::refusing)
+/// placement failed. Distinct from [`ABANDONED_EXIT`] so a status in a log tells them apart; the
+/// parent decides from the leaf's report, never from this.
+#[cfg(target_os = "linux")]
+pub(crate) const REFUSED_EXIT: i32 = 124;
+
 /// The placement hook a contained spawn registers: close the forked child's inherited copy of the
 /// parent's end, then place the child (see [`place_self_in_cgroup_pre_exec`]).
 ///
 /// A spawn the parent abandoned makes the child `_exit` here, with [`ABANDONED_EXIT`], instead of
-/// returning an error to `std`. A child that never execs needs no error channel, and `std` would
-/// write its error record to the number its channel had — which, once `std`'s spawn returned
-/// early because two of fds 0–2 were closed, is one of the child's own stdio slots.
+/// returning an error to `std`; so does a [`refusing`](ReportSlot::refusing) slot's child whose
+/// placement failed, with [`REFUSED_EXIT`]. A child that never execs needs no error channel, and
+/// `std` would write its error record to the number its channel had — which, once `std`'s spawn
+/// returned early because two of fds 0–2 were closed, is one of the child's own stdio slots. The
+/// parent reads a refusal's cause from the leaf's report, never from `std`.
 ///
 /// # Safety
 /// As [`place_self_in_cgroup_pre_exec`], in a forked child only.
@@ -1827,6 +1818,8 @@ pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Re
     match unsafe { place_self_in_cgroup_pre_exec(procs_fd, slot) } {
         // Safety: `_exit` is async-signal-safe, and runs nothing of this process's.
         Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => unsafe { libc::_exit(ABANDONED_EXIT) },
+        // Safety: as above.
+        Err(_) if slot.refusing => unsafe { libc::_exit(REFUSED_EXIT) },
         other => other,
     }
 }
@@ -1901,7 +1894,7 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     match unsafe { slot.send_report(report) }? {
         Delivery::Abandoned => Err(abandoned()),
         // A refusing slot's child stops here: the report is sent, and the parent reads the cause
-        // from it, not from the errno `std` carries back.
+        // from it. `placement_hook` turns this `Err` into an exit.
         Delivery::Queued | Delivery::Decided if slot.refusing && report != REPORT_PLACED => {
             Err(io::Error::from_raw_os_error(report))
         }

@@ -585,9 +585,9 @@ impl Command {
     ///
     /// This is [`ContainMode::Strongest`]: where the mechanism the host offers cannot be set up,
     /// the spawn fails with [`Error::Containment`] before the program runs, and never falls back to
-    /// a weaker one. `contain_with(ContainMode::BestEffort)` is the request that does, and what
-    /// `contain()` did before. On Windows `contain()` still falls back, until that platform fails
-    /// instead too.
+    /// a weaker one. `contain_with(ContainMode::BestEffort)` is the request that does. On Windows
+    /// `contain()` falls back to [`ContainMode::TreeWalk`] when the child cannot be assigned to its
+    /// Job Object.
     ///
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the

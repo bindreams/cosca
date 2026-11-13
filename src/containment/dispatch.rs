@@ -90,27 +90,6 @@ impl Prepared {
         }
     }
 
-    /// A `Strongest` spawn that failed before its attach: the leaf it made is abandoned and removed,
-    /// and if the child stopped before `exec` because its placement write failed, the answer is that
-    /// refusal as [`Error::Containment`], which replaces `std`'s errno (that cannot tell a placement
-    /// from a `chdir`). `None` for any other spawn or cause.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn refused_placement(&mut self) -> Option<Error> {
-        if !self.mode.is_some_and(ContainMode::is_strict) {
-            return None;
-        }
-        let leaf = self.cgroup_leaf.as_mut()?;
-        let mut warn = leaf.warn();
-        let errno = leaf.abandon_failed_spawn(&mut warn)?;
-        Some(Error::Containment {
-            detail: format!(
-                "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run",
-                leaf.path().display()
-            ),
-            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
-        })
-    }
-
     /// Whether the root's process group is its containment: the root is a Session or process-group
     /// root, and no cgroup leaf took it, as `attach` would decide. On Linux the leaf's verdict is
     /// taken first ([`settle_verdict`](Self::settle_verdict)).
@@ -1429,11 +1408,21 @@ pub(crate) fn prepare(
 pub(crate) struct AttachFailure {
     pub(crate) cause: Error,
     pub(crate) cleanup: Option<Failures>,
+    /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
+    /// before `exec` because its placement in its leaf was refused. Every other failure may have
+    /// started the program. Only Linux places a child after its spawn.
+    #[cfg(target_os = "linux")]
+    pub(crate) not_started: bool,
 }
 
 impl From<Error> for AttachFailure {
     fn from(cause: Error) -> AttachFailure {
-        AttachFailure { cause, cleanup: None }
+        AttachFailure {
+            cause,
+            cleanup: None,
+            #[cfg(target_os = "linux")]
+            not_started: false,
+        }
     }
 }
 
@@ -1520,14 +1509,24 @@ fn attach_tree(
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
                         Err(reason) => {
-                            // `Strongest` fails the spawn: the failed attach's teardown ends the child.
+                            // `Strongest` fails the spawn: the failed attach's teardown ends the
+                            // child. A `Strongest` child stops before `exec` when it is not placed,
+                            // so the program never ran, on every path: the spawn says so.
                             if prepared.mode.is_some_and(ContainMode::is_strict) {
+                                let detail = format!(
+                                    "cgroup v2: the child could not be placed in its leaf cgroup {}, so the \
+                                     program did not run",
+                                    leaf.path().display()
+                                );
                                 leaf.remove_unentered();
-                                return Err(Error::Containment {
-                                    detail: format!("cgroup v2: {}", crate::error::Report(&reason)),
-                                    source: None,
-                                }
-                                .into());
+                                return Err(AttachFailure {
+                                    cause: Error::Containment {
+                                        detail,
+                                        source: Some(Arc::new(Error::Io(std::io::Error::other(reason)))),
+                                    },
+                                    cleanup: None,
+                                    not_started: true,
+                                });
                             }
                             crate::containment::cgroup::log_degrade(&reason);
                             leaf.remove_unentered();
