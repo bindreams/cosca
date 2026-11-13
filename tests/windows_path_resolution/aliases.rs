@@ -12,7 +12,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation,
@@ -23,10 +23,7 @@ use windows::Win32::Storage::FileSystem::{
     FindClose, FindFirstFileW, GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
     WIN32_FIND_DATAW,
 };
-use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, SetThreadToken, WaitForSingleObject,
-    CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
 use crate::common::windows_reparse::{app_exec_link_data, set_reparse, IO_REPARSE_TAG_APPEXECLINK};
 use crate::measure::canonical;
@@ -84,7 +81,8 @@ fn m19_app_execution_aliases(#[fixture(path_probes)] _group: &Group) {
         return;
     };
     let alias = apps.join(name);
-    let launch = name.eq_ignore_ascii_case("winget.exe").then_some("--version");
+    let version = [OsStr::new("--version")];
+    let launch = name.eq_ignore_ascii_case("winget.exe").then_some(&version[..]);
     println!("M19 alias={name}");
     println!("M19 alias {}", facts(&alias, launch));
     link_rows(&t, &apps, name, &alias, launch);
@@ -105,12 +103,12 @@ fn self_made_alias(t: &Path) {
         println!("M19 own_alias_privileged_create={}", outcome(&created));
     }
     if created.is_ok() {
-        println!("M19 own_alias {}", facts(&alias, Some("")));
+        println!("M19 own_alias {}", facts(&alias, Some(&[])));
     }
 }
 
 /// The link rows, each `M19 <row> create=<outcome> <facts>`.
-fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&str>) {
+fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&[&OsStr]>) {
     let row = |label: &str, created: Result<(), String>, path: &Path| {
         let facts = if created.is_ok() {
             facts(path, launch)
@@ -202,9 +200,9 @@ fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&st
     if created.is_ok() {
         let stem = name.strip_suffix(".exe").unwrap_or(name);
         let found = match launch {
-            Some(arg) => {
+            Some(args) => {
                 let mut cmd = std::process::Command::new(stem);
-                cmd.arg(arg).env("PATH", &entry);
+                cmd.args(args).env("PATH", &entry);
                 match crate::common::output_locked(&mut cmd) {
                     Ok(out) => format!("ok,exit={:?}", out.status.code()),
                     Err(e) => io_outcome(&e),
@@ -217,7 +215,7 @@ fn link_rows(t: &Path, apps: &Path, name: &str, alias: &Path, launch: Option<&st
 }
 
 /// What std and Win32 say about `path`, and the launch by full path when `args` is given.
-fn facts(path: &Path, args: Option<&str>) -> String {
+fn facts(path: &Path, args: Option<&[&OsStr]>) -> String {
     use std::os::windows::fs::FileTypeExt;
     let metadata = match std::fs::metadata(path) {
         Ok(m) => format!("ok,is_file={}", m.is_file()),
@@ -276,46 +274,26 @@ fn reparse_tag(path: &Path) -> String {
 /// `CreateProcessW` with `path` as `lpApplicationName` and null std handles: `ok,exit=<code>` or
 /// `err=<code>`. The wait is unbounded: the only programs launched (`winget --version` and this
 /// test's own image) exit on their own.
-fn launch(path: &Path, args: &str) -> String {
-    let app = wide_of(path.as_os_str());
-    let mut line = wide_of(OsStr::new(&format!("\"{}\" {args}", path.display())));
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESTDHANDLES,
+fn launch(path: &Path, args: &[&OsStr]) -> String {
+    use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, RawStdio};
+
+    let options = RawOptions {
+        exact_image: true,
+        quote_exe: true,
+        stdio: RawStdio::Null,
         ..Default::default()
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `app` and `line` are NUL-terminated and outlive the call; `line` is writable; `si`
-    // and `pi` are live.
-    let created = unsafe {
-        CreateProcessW(
-            PCWSTR(app.as_ptr()),
-            Some(PWSTR(line.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
-    };
-    if let Err(e) = created {
-        return format!("err={}", e.code().0 & 0xFFFF);
-    }
-    let mut code = 0u32;
-    // SAFETY: `pi`'s handles are live and owned here, each closed once.
-    unsafe {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let got = GetExitCodeProcess(pi.hProcess, &mut code);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        if let Err(e) = got {
-            return format!("ok,exit=unknown({e})");
+    let child = match spawn_locked_raw_with(path, args, &[], 0, Console::Hidden, options) {
+        Ok(child) => child,
+        Err(e) => {
+            let code = e.raw_os_error().expect("a failed spawn carries its Win32 code");
+            return format!("err={code}");
         }
+    };
+    match child.wait() {
+        Ok(code) => format!("ok,exit={code}"),
+        Err(e) => format!("ok,exit=unknown({e})"),
     }
-    format!("ok,exit={code}")
 }
 
 /// A junction (mount point) at `link`, a new directory, to `target`, set by `FSCTL_SET_REPARSE_POINT`
