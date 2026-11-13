@@ -18,7 +18,7 @@ fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
     };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     assert_eq!(

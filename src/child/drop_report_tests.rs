@@ -39,7 +39,11 @@ fn bare_blocker() -> (crate::Child, crate::PipeWriter) {
 }
 
 fn failed_write() -> Result<(), crate::error::Error> {
-    Err(crate::error::Error::Io(std::io::Error::other("w")))
+    Err(crate::error::Error::Elevation {
+        kind: crate::error::ElevationErrorKind::AuthFailed,
+        detail: "w".into(),
+        source: None,
+    })
 }
 
 /// An unknown root whose kill the OS refuses: the unknown state and the refusal are one event, so
@@ -160,7 +164,19 @@ fn finish_elevated_reports_a_walk_that_left_only_the_root_as_unvouched_once() {
         let drop_looks = crate::graceful_hooks::watch_for_a_second_look();
 
         let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-        let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+        let error = crate::error::Error::from(failure);
+        // A walk that left a descendant failed: its members are the cleanup. One that left only the
+        // root is no failure, and has none.
+        let cleanup = matches!(&error, crate::error::Error::MayHaveStarted { cleanup: Some(_), .. });
+        assert_eq!(cleanup, failed, "{left:?}: {error:?}");
+        if failed {
+            let cleanup = crate::test_child::cleanup_of(&error);
+            assert!(
+                matches!(&**cleanup.first(), crate::error::Error::MembersLeft { .. }),
+                "{left:?}: {cleanup:?}"
+            );
+        }
+        let (cause, fate, _) = crate::test_child::expect_may_have_started_parts(error, writer);
 
         assert!(fate.not_running(), "{left:?}: {fate:?}");
         // A failed kill leaves the handle armed to try again: the look at the tree when it drops is the
@@ -271,7 +287,9 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+    let error = crate::error::Error::from(failure);
+    let cleanup = crate::test_child::cleanup_of(&error);
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(error, writer);
 
     let cause = cause.to_string();
     assert!(
@@ -280,8 +298,16 @@ fn finish_elevated_names_the_root_the_first_walk_saw_running_when_the_early_tree
     );
     let found = "the root an earlier walk found running is gone";
     assert!(
-        cause.contains("the drop's tree kill, made early, failed too") && cause.contains(found),
-        "the early tree kill's answer: {cause}"
+        cause.contains("the drop's tree kill, made early, failed too"),
+        "the early tree kill failed: {cause}"
+    );
+    // The early tree kill's answer is the cleanup's, not the cause's.
+    assert!(!cause.contains(found), "{cause}");
+    assert!(
+        cleanup
+            .iter()
+            .any(|failure| crate::error::Report(&**failure).to_string().contains(found)),
+        "the early tree kill's answer: {cleanup:?}"
     );
     assert!(!cause.contains("left something running"), "{cause}");
     assert_eq!(teardowns.count(), 0, "the handle is disarmed: its drop does not retry");
@@ -465,7 +491,9 @@ fn finish_elevated_names_the_failure_of_the_look_after_a_refused_kill() {
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+    let error = crate::error::Error::from(failure);
+    let cleanup = crate::test_child::cleanup_of(&error);
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(error, writer);
 
     let failed_look = std::io::Error::from(std::io::ErrorKind::Other).to_string();
     let warns = warns_since(mark, "");
@@ -474,9 +502,18 @@ fn finish_elevated_names_the_failure_of_the_look_after_a_refused_kill() {
         warns[0].contains(&format!("the wait failed: {failed_look}")),
         "{warns:?}"
     );
+    // The error says the wait failed, and the failure itself is the cleanup's, after the refusal.
+    let said = cause.to_string();
+    assert!(said.contains("the wait failed"), "{said}");
+    assert!(!said.contains(&failed_look) && !said.contains(&refusal()), "{said}");
+    let codes: Vec<_> = cleanup
+        .iter()
+        .map(|failure| crate::error::first_os_code(&**failure))
+        .collect();
+    assert_eq!(codes, [Some(libc::EPERM), None], "{cleanup:?}");
     assert!(
-        cause.to_string().contains(&format!("the wait failed: {failed_look}")),
-        "{cause}"
+        matches!(&**cleanup.iter().nth(1).expect("the failed look"), crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::Other),
+        "{cleanup:?}"
     );
     handed_back.wait();
 }
@@ -551,18 +588,23 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_the_root_reaped_elsewhe
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+    let error = crate::error::Error::from(failure);
+    let cleanup = crate::test_child::cleanup_of(&error);
+    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, writer);
 
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(handed_back.is_none());
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
+    // The refusal is the cleanup's, with its code; the error says what was done.
     let cause = cause.to_string();
     assert!(
-        cause.contains(&format!(
-            "could not be terminated ({}): reaped by someone else",
-            refusal()
-        )),
+        cause.contains("could not be terminated: reaped by someone else"),
         "{cause}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(libc::EPERM),
+        "{cleanup:?}"
     );
     let debug = crate::log_capture::records_since_on_current_thread(mark, "reaped by someone else");
     assert!(
@@ -588,12 +630,19 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_roo
     });
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(failure.into(), writer);
+    let error = crate::error::Error::from(failure);
+    let cleanup = crate::test_child::cleanup_of(&error);
+    let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, writer);
 
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(handed_back.is_none());
-    // The warn goes through `Report`; the cause is returned, so it keeps Display.
-    let clause = format!("could not be terminated ({}): not ours to reap (launchd", refusal());
+    // The warn goes through `Report`; the cause says what was done, and the refusal is the cleanup's.
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(libc::EPERM),
+        "{cleanup:?}"
+    );
+    let clause = "could not be terminated: not ours to reap (launchd";
     let reported = format!(
         "could not be terminated ({0}: {0}): not ours to reap (launchd",
         refusal()
@@ -602,7 +651,7 @@ fn finish_elevated_keeps_the_refusal_when_the_look_finds_launchd_holding_the_roo
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&reported), "{warns:?}");
     let cause = cause.to_string();
-    assert!(cause.contains(&clause), "{cause}");
+    assert!(cause.contains(clause), "{cause}");
 }
 
 /// A root a delivered kill reached whose zombie launchd held when the wait came (macOS): the one
@@ -865,7 +914,9 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
     let mark = crate::log_capture::mark();
 
     let failure = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
-    let (cause, _, handed_back) = crate::test_child::expect_handed_back(failure.into(), writer);
+    let error = crate::error::Error::from(failure);
+    let cleanup = crate::test_child::cleanup_of(&error);
+    let (cause, _, handed_back) = crate::test_child::expect_handed_back(error, writer);
 
     let first = std::io::Error::from_raw_os_error(libc::EIO).to_string();
     let early = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
@@ -874,7 +925,8 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
         .iter()
         .find(|warn| warn.contains(&leaf_path.display().to_string()))
         .unwrap_or_else(|| panic!("no warn names the tree: {warns:?}"));
-    // The warn and the returned text both say the early kill through `Report`.
+    // The warn says the early kill through `Report`; the returned text says that it failed too, and
+    // both failures are the cleanup's, around the root's refusal, in the order they happened.
     let cause = cause.to_string();
     // A failed `cgroup.kill` is a `Containment` over the OS error, which `Report` prints whole.
     let report = format!(
@@ -882,8 +934,23 @@ fn a_tree_kill_that_failed_when_made_early_too_names_both_failures() {
          write of {}/cgroup.kill: {early}: {early})",
         leaf_path.display()
     );
-    assert!(cause.contains(&first), "the first failure: {cause}");
-    assert!(cause.contains(&report), "the early kill's Report: {cause}");
+    assert!(
+        cause.contains("the drop's tree kill, made early, failed too"),
+        "{cause}"
+    );
+    assert!(
+        !cause.contains(&first) && !cause.contains(&early),
+        "a failure is in the text: {cause}"
+    );
+    let codes: Vec<_> = cleanup
+        .iter()
+        .map(|failure| crate::error::first_os_code(&**failure))
+        .collect();
+    assert_eq!(
+        codes,
+        [Some(libc::EIO), Some(libc::EPERM), Some(libc::EISDIR)],
+        "the first tree kill's failure, the root's refusal, the early one's: {cleanup:?}"
+    );
     assert!(warn.contains(&first), "the first failure: {warn}");
     assert!(warn.contains(&report), "the early kill's Report: {warn}");
     handed_back.wait();

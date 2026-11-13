@@ -127,13 +127,14 @@ pub enum RecordErrorKind {
 }
 
 /// A non-empty, ordered list of the errors that one operation's failure is made of, built only by
-/// cosca. [`Error::Several`] holds one as the `source` of the variant the failing site returns, and
-/// [`Error::MembersLeft`] holds the members a tree kill left. [`iter`](Failures::iter) gives the
-/// count (`iter().len()`).
-#[derive(Debug)]
+/// cosca. [`Error::Several`] holds one as the `source` of the variant the failing site returns,
+/// [`Error::MembersLeft`] holds the members a tree kill left, and [`Error::MayHaveStarted`] the
+/// failures of its teardown. [`iter`](Failures::iter) gives the count (`iter().len()`).
+#[derive(Debug, Clone)]
 pub struct Failures {
-    // Never empty: `first` reads `members[0]`.
-    members: Vec<Arc<Error>>,
+    // Never empty. A boxed slice, not a `Vec`: an error that holds a list
+    // in each of its variants stays small enough for a `Result` of it.
+    members: Box<[Arc<Error>]>,
 }
 
 impl Failures {
@@ -161,17 +162,27 @@ impl Failures {
         self.members.iter()
     }
 
+    /// `first` and then `second`, whichever of them there are.
+    pub(crate) fn merged(first: Option<Failures>, second: Option<Failures>) -> Option<Failures> {
+        match (first, second) {
+            (Some(first), Some(second)) => Some(first.extended(second.members.into_vec())),
+            (first, None) => first,
+            (None, second) => second,
+        }
+    }
+
     /// This list, then `more`.
-    fn extended(mut self, more: impl IntoIterator<Item = Arc<Error>>) -> Failures {
-        self.members.extend(more);
-        self
+    fn extended(self, more: impl IntoIterator<Item = Arc<Error>>) -> Failures {
+        Failures {
+            members: self.members.into_vec().into_iter().chain(more).collect(),
+        }
     }
 
     /// The `source` of the error a site returns for this list: its one member, or a
     /// [`Error::Several`] of them when there are two or more.
-    pub(crate) fn into_cause(mut self) -> Arc<Error> {
+    pub(crate) fn into_cause(self) -> Arc<Error> {
         if self.members.len() == 1 {
-            return self.members.remove(0);
+            return self.members.into_vec().remove(0);
         }
         Arc::new(Error::Several(self))
     }
@@ -187,7 +198,8 @@ impl Failures {
 /// The OS code of a failure may sit on an `io::Error` down the `source()` chain of any variant,
 /// below context cosca added: walk `source()` and take the first `io::Error` whose
 /// `raw_os_error()` is `Some`. A [`Error::Several`] and an [`Error::MembersLeft`] give their first
-/// member as the `source`, so the walk finds the first member's code.
+/// member as the `source`, so the walk finds the first member's code. The `cleanup` of an
+/// [`Error::MayHaveStarted`] is not on the walk: the code it finds is the cause's.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -403,6 +415,12 @@ pub enum Error {
         /// A `Running` fate carries the child's own identity, except where the identity read failed
         /// (`id: None`). Dropped while its thread is panicking, it is given up, not waited for.
         unreaped: Option<Box<crate::Unreaped>>,
+        /// The failures of the teardown the failed spawn ran on its child, when something in it
+        /// failed: a refused kill, a failed wait, the members a tree kill left. In the order they
+        /// happened. Not in `source` (the cause alone); they come beside it, as an exception's
+        /// context does beside its cause. `Display` says that the teardown failed too and how many
+        /// failures are here; `Report` prints them in full.
+        cleanup: Option<Failures>,
     },
 }
 
@@ -438,12 +456,21 @@ impl std::fmt::Display for Error {
                 fate,
                 wrapper_elevated,
                 source,
+                cleanup,
                 ..
-            } => write!(
-                f,
-                "the program may have started, and {fate}{}: {source}",
-                elevated_note(fate, *wrapper_elevated)
-            ),
+            } => {
+                write!(
+                    f,
+                    "the program may have started, and {fate}{}",
+                    elevated_note(fate, *wrapper_elevated)
+                )?;
+                match cleanup.as_ref().map(|failures| failures.iter().len()) {
+                    None => {}
+                    Some(1) => f.write_str("; its teardown failed too (1 failure, in `cleanup`)")?,
+                    Some(n) => write!(f, "; its teardown failed too ({n} failures, in `cleanup`)")?,
+                }
+                write!(f, ": {source}")
+            }
         }
     }
 }
@@ -483,10 +510,11 @@ impl From<std::io::Error> for Error {
 
 impl Error {
     /// The list of failures this error holds, for a layer of [`Report`]: an [`Error::Several`] and an
-    /// [`Error::MembersLeft`] have one.
+    /// [`Error::MembersLeft`] have one, and an [`Error::MayHaveStarted`] its `cleanup`, if it has any.
     pub(crate) fn failures(&self) -> Option<&Failures> {
         match self {
             Error::Several(failures) | Error::MembersLeft { members: failures, .. } => Some(failures),
+            Error::MayHaveStarted { cleanup, .. } => cleanup.as_ref(),
             _ => None,
         }
     }
@@ -659,6 +687,12 @@ pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option
 /// members, as `; others: <chain>`. A list in a member's chain reads in brackets, so
 /// the `;` between its members is not taken for the outer list's: `(1) a: 2 failures: [(1) b; (2) c]; (2) d`
 /// is a list of two whose first member holds a list of two.
+///
+/// An [`Error::MayHaveStarted`] with `cleanup` failures prints its cause's whole chain, then
+/// `; cleanup: [(1) <chain>; (2) <chain>]`, and the walk of its own `source` ends there. A list in
+/// the cause reads in brackets, as it does in a member. As a member of an outer list, the cause and
+/// the cleanup together read in brackets (`(1) <words>: [<cause>; cleanup: [...]]; (2) ...`), so the
+/// outer `;` stays the outer list's.
 pub(crate) struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl Report<'_> {
@@ -672,17 +706,23 @@ impl Report<'_> {
                 f.write_str(": ")?;
             }
             write!(f, "{layer}")?;
+            if let Some(Error::MayHaveStarted {
+                source,
+                cleanup: Some(cleanup),
+                ..
+            }) = layer.downcast_ref::<Error>()
+            {
+                f.write_str(if nested { ": [" } else { ": " })?;
+                Report::write(&**source, true, f)?;
+                f.write_str("; cleanup: [")?;
+                Report::write_members(cleanup, f)?;
+                return f.write_str(if nested { "]]" } else { "]" });
+            }
             let Some(failures) = layer.downcast_ref::<Error>().and_then(Error::failures) else {
                 continue;
             };
             f.write_str(if nested { ": [" } else { ": " })?;
-            for (n, member) in failures.iter().enumerate() {
-                if n > 0 {
-                    f.write_str("; ")?;
-                }
-                write!(f, "({}) ", n + 1)?;
-                Report::write(&**member, true, f)?;
-            }
+            Report::write_members(failures, f)?;
             if let Some(Error::MembersLeft {
                 others: Some(others), ..
             }) = layer.downcast_ref::<Error>()
@@ -691,6 +731,18 @@ impl Report<'_> {
                 Report::write(&**others, true, f)?;
             }
             return f.write_str(if nested { "]" } else { "" });
+        }
+        Ok(())
+    }
+
+    /// `(1) <chain>; (2) <chain>`: each member's whole chain, numbered.
+    fn write_members(failures: &Failures, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (n, member) in failures.iter().enumerate() {
+            if n > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "({}) ", n + 1)?;
+            Report::write(&**member, true, f)?;
         }
         Ok(())
     }
@@ -767,6 +819,15 @@ impl Error {
     /// `e` as the `source` of an error it caused.
     pub(crate) fn io_cause(e: std::io::Error) -> Arc<Error> {
         Arc::new(Error::Io(e))
+    }
+
+    /// This error as the failure of `step`, which an [`Error::Io`] names first; any other error
+    /// says its own step.
+    pub(crate) fn in_step(self, step: &str) -> Error {
+        match self {
+            Error::Io(e) => Error::Io(io_context(step, e)),
+            other => other,
+        }
     }
 
     /// What a failed spawn did with its child, for an error that says the program may have started
@@ -891,11 +952,13 @@ impl Error {
                 wrapper_elevated,
                 source,
                 unreaped,
+                cleanup,
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
                 source: joined(Some(source), peers),
                 unreaped,
+                cleanup,
             },
             Error::Several(list) => Error::Several(list.extended(peers)),
             Error::MembersLeft { members, others } => {
@@ -1042,9 +1105,11 @@ impl Error {
                 wrapper_elevated,
                 source,
                 unreaped,
+                cleanup,
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
+                cleanup,
                 // A freshly built cause has one owner and takes the note; a shared one cannot be
                 // rewritten, so in release it stays as it is.
                 source: match Arc::try_unwrap(source) {

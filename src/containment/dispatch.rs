@@ -1033,14 +1033,15 @@ impl TreeKilled {
         }))
     }
 
-    /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
-    /// here and only when it will be logged.
+    /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, the text of the
+    /// drop's warn (worded here and only when it will be logged) and the error, if the settlement's
+    /// was one.
     pub(crate) fn settle_for_drop(
         &self,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Option<String> {
+    ) -> Option<TreeLeft> {
         let outcome = outcome.into();
         let after = match &outcome {
             // A drop cannot retry a walk that was not made.
@@ -1050,13 +1051,26 @@ impl TreeKilled {
             | TreeKillOutcome::NoRoot
             | TreeKillOutcome::Skipped(_) => "",
         };
-        let left = match self.settle(mechanism, outcome, root_ended).answer {
-            Err(left) => crate::error::Report(&left).to_string(),
-            Ok(SettleOutcome::Unvouched { kind }) => kind.drop_text(),
+        let (left, failure) = match self.settle(mechanism, outcome, root_ended).answer {
+            Err(left) => (crate::error::Report(&left).to_string(), Some(left)),
+            Ok(SettleOutcome::Unvouched { kind }) => (kind.drop_text(), None),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
         };
-        Some(format!("contained-tree teardown did not fully succeed: {left}{after}"))
+        Some(TreeLeft {
+            text: format!("contained-tree teardown did not fully succeed: {left}{after}"),
+            failure,
+        })
     }
+}
+
+/// What a drop or a failed run's teardown found left of its contained tree
+/// ([`TreeKilled::settle_for_drop`]).
+pub(crate) struct TreeLeft {
+    /// The text of the teardown's warn.
+    pub(crate) text: String,
+    /// The tree kill's failure, as an error: absent when the tree is only not vouched for, which is a
+    /// state, not a failure.
+    pub(crate) failure: Option<Error>,
 }
 
 /// Returns `true` when the current process is the outermost contained root
@@ -1372,6 +1386,21 @@ pub(crate) fn prepare(
     })
 }
 
+/// Why a child could not be contained, and what failed in the cleanup the attach made of it (on
+/// Windows, the kill of the job after a failed resume): the failed spawn returns the cause, with the
+/// cleanup beside it (`cleanup` of [`Error::MayHaveStarted`]).
+#[derive(Debug)]
+pub(crate) struct AttachFailure {
+    pub(crate) cause: Error,
+    pub(crate) cleanup: Option<Failures>,
+}
+
+impl From<Error> for AttachFailure {
+    fn from(cause: Error) -> AttachFailure {
+        AttachFailure { cause, cleanup: None }
+    }
+}
+
 /// Phase 2 (after spawn, before the `OwnedChild` adopts): attach the mechanism and bundle it with the
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
 /// cleanly to the cgroup mechanism without requiring interior mutability — hence the
@@ -1387,7 +1416,7 @@ pub(crate) fn attach(
     #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<Attachment, Error> {
+) -> Result<Attachment, AttachFailure> {
     let graceful = prepared.graceful_mechanism();
     let tree = attach_tree(
         #[cfg(unix)]
@@ -1409,7 +1438,7 @@ fn attach_tree(
     #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<Tree, Error> {
+) -> Result<Tree, AttachFailure> {
     use crate::containment::treewalk::Walker;
     #[cfg(unix)]
     use crate::containment::unix::Group;
@@ -1552,7 +1581,8 @@ fn attach_tree(
                     Err(e) => Err(Error::Containment {
                         detail: "the frozen child could not be assigned to its job".to_owned(),
                         source: Some(Error::io_cause(e)),
-                    }),
+                    }
+                    .into()),
                 };
             }
             match crate::containment::windows::attach_job(proc_handle) {
@@ -1564,12 +1594,7 @@ fn attach_tree(
                     // so `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
-                Err(e) => {
-                    return Err(Error::Containment {
-                        detail: "the child's initial threads could not be resumed".to_owned(),
-                        source: Some(Error::io_cause(e)),
-                    })
-                }
+                Err(failure) => return Err(failure),
             }
         } else if prepared.mode.is_some() {
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no

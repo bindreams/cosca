@@ -198,6 +198,41 @@ fn only_a_childs_refusal_changes_a_failed_spawns_error() {
     ));
 }
 
+/// A failed read of the report, or wait for it, beside a failed spawn: std's `Io` answers, and the
+/// failure, which it has no slot for, is warned of once.
+///
+/// Mutant: the failure is only logged at debug, or the answer is replaced.
+#[skuld::test]
+fn a_failed_report_read_or_wait_beside_a_failed_spawn_is_warned_of_and_stds_error_answers() {
+    crate::log_capture::install();
+    for (report, step) in [
+        (
+            Report::ReadFailed(std::io::Error::other("report failure 4a2d")),
+            "the read of",
+        ),
+        (
+            Report::WaitFailed(std::io::Error::other("report failure 4a2d")),
+            "the wait for",
+        ),
+    ] {
+        let mark = crate::log_capture::mark();
+        let kept = failed_spawn_error(Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT)), &report);
+        assert!(
+            matches!(&kept, Error::Io(e) if e.raw_os_error() == Some(libc::ENOENT)),
+            "{report:?}: {kept:?}"
+        );
+        let warns = crate::log_capture::warns_since(mark, "report failure 4a2d");
+        assert_eq!(
+            warns,
+            [format!(
+                "the spawn failed ({}), and so did {step} the child's unique-id report: report failure 4a2d",
+                crate::error::Report(&kept)
+            )],
+            "{report:?}"
+        );
+    }
+}
+
 /// Runs `cmd` through a channel, as a spawn does.
 fn run_through_channel(cmd: &mut std::process::Command) -> (std::io::Result<std::process::Child>, Report) {
     let pending = register(cmd);

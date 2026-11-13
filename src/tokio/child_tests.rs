@@ -213,10 +213,10 @@ mod leaf_drain {
         let first = poll_once(&mut teardown).await;
         assert!(first.is_pending(), "the leaf has not drained, so the teardown waits");
         leaf.drain();
-        let (fate, unreaped) = teardown.await;
+        let torn = teardown.await;
 
-        assert_eq!(fate, crate::error::ChildFate::Reaped);
-        assert!(unreaped.is_none());
+        assert_eq!(torn.fate, crate::error::ChildFate::Reaped);
+        assert!(torn.unreaped.is_none());
         assert!(!leaf.fake.leaf.exists(), "the drained leaf is removed");
     }
 
@@ -238,10 +238,10 @@ mod leaf_drain {
         std::fs::write(&leaf.fake.events, "garbled\n").expect("garble cgroup.events");
         let mark = crate::log_capture::mark();
 
-        let (fate, unreaped) = child.tear_down_awaiting().await;
+        let torn = child.tear_down_awaiting().await;
 
-        assert_eq!(fate, crate::error::ChildFate::Reaped);
-        assert!(unreaped.is_none());
+        assert_eq!(torn.fate, crate::error::ChildFate::Reaped);
+        assert!(torn.unreaped.is_none());
         let said = crate::log_capture::records_since(mark, "its leaf's drain cannot be watched");
         assert_eq!(said.len(), 1, "{said:?}");
         let warned = crate::log_capture::records_since(mark, "its drain could not be watched");
@@ -264,12 +264,16 @@ mod leaf_drain {
         let first = poll_once(&mut teardown).await;
         assert!(first.is_pending(), "the leaf has not drained, so the teardown waits");
         leaf.drain();
-        let (fate, unreaped) = teardown.await;
+        let torn = teardown.await;
 
         assert!(!leaf.fake.leaf.exists(), "the drained leaf is removed");
         // The fake leaf's kill reaches nothing, so the front still runs and is handed back.
-        assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "got {fate:?}");
-        assert!(unreaped.is_some(), "a front left running is the caller's");
+        assert!(
+            matches!(torn.fate, crate::error::ChildFate::Running { .. }),
+            "got {:?}",
+            torn.fate
+        );
+        assert!(torn.unreaped.is_some(), "a front left running is the caller's");
     }
 
     /// A front behind a closed gate whose leaf is empty: the awaited teardown removes the leaf at
@@ -283,7 +287,7 @@ mod leaf_drain {
         leaf.drain();
         let (child, _stdin) = leaf.spawn_front().await;
 
-        let (_fate, _unreaped) = child.tear_down_awaiting().await;
+        let _torn = child.tear_down_awaiting().await;
 
         assert!(!leaf.fake.leaf.exists(), "the empty leaf is removed");
         assert!(leaf.fake.kill_written().is_empty(), "an empty leaf is written no kill");
@@ -303,7 +307,7 @@ mod leaf_drain {
         let (child, _stdin) = leaf.spawn_front().await;
         leaf_fault::record_leaf_steps();
 
-        let (_fate, _unreaped) = child.tear_down_awaiting().await;
+        let _torn = child.tear_down_awaiting().await;
 
         let rmdirs = leaf_fault::take_leaf_steps()
             .iter()

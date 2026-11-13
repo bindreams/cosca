@@ -7,7 +7,10 @@
 //! on a plain error does not compile in a function that returns one. Every failure point in a
 //! spawn names its answer: [`Classify::not_started`] or [`SpawnFailure::started`].
 
-use crate::error::{ChildFate, Error};
+use std::sync::Arc;
+
+use crate::child::drop_teardown::Torn;
+use crate::error::{ChildFate, Error, Failures};
 use crate::Unreaped;
 
 /// A failed spawn's error, and whether the program could have started.
@@ -35,6 +38,8 @@ pub(crate) enum SpawnFailure {
         wrapper_elevated: bool,
         /// The child, when the spawn hands it to the caller (see [`Error::MayHaveStarted`]).
         unreaped: Option<Box<Unreaped>>,
+        /// What failed in the teardown the spawn ran on the child (see [`Error::MayHaveStarted`]).
+        cleanup: Option<Failures>,
     },
 }
 
@@ -48,6 +53,35 @@ impl SpawnFailure {
             fate,
             wrapper_elevated: false,
             unreaped: unreaped.map(Box::new),
+            cleanup: None,
+        }
+    }
+
+    /// This failure with `cleanup`, what failed in the teardown it ran on its child, after any it
+    /// has, beside its cause. A failure that says the program did not start has no teardown to
+    /// report.
+    pub(crate) fn with_cleanup(self, cleanup: Option<Failures>) -> SpawnFailure {
+        let Some(cleanup) = cleanup else {
+            return self;
+        };
+        match self {
+            SpawnFailure::MayHaveStarted {
+                cause,
+                fate,
+                wrapper_elevated,
+                unreaped,
+                cleanup: earlier,
+            } => SpawnFailure::MayHaveStarted {
+                cause,
+                fate,
+                wrapper_elevated,
+                unreaped,
+                cleanup: Failures::merged(earlier, Some(cleanup)),
+            },
+            other => {
+                debug_assert!(false, "a spawn that did not start has no cleanup: {other:?}");
+                other
+            }
         }
     }
 
@@ -65,11 +99,13 @@ impl SpawnFailure {
                 fate,
                 wrapper_elevated,
                 unreaped,
+                cleanup,
             } => SpawnFailure::MayHaveStarted {
                 cause: f(cause),
                 fate,
                 wrapper_elevated,
                 unreaped,
+                cleanup,
             },
         }
     }
@@ -79,12 +115,17 @@ impl SpawnFailure {
     pub(crate) fn behind_front(self) -> SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted {
-                cause, fate, unreaped, ..
+                cause,
+                fate,
+                unreaped,
+                cleanup,
+                ..
             } => SpawnFailure::MayHaveStarted {
                 cause,
                 fate,
                 wrapper_elevated: true,
                 unreaped,
+                cleanup,
             },
             not_started => not_started,
         }
@@ -92,21 +133,21 @@ impl SpawnFailure {
 }
 
 /// The error of a run-to-completion helper (`output`, `status`, `read`) that failed after its spawn
-/// succeeded: the program may have started, and `fate` says what became of its child.
-/// `unreaped` is the child its teardown could not end, handed back. `behind_front` is whether the
-/// child is an elevation front.
-pub(crate) fn after_the_spawn(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>, behind_front: bool) -> Error {
-    Error::from(failed_after_the_spawn(cause, fate, unreaped, behind_front))
+/// succeeded: the program may have started, and `torn` says what its teardown left of the child: its
+/// fate, the child itself if the teardown could not end it (handed back), and what failed in the
+/// teardown, which goes beside the cause. `behind_front` is whether the child is an elevation front.
+pub(crate) fn after_the_spawn(cause: Error, torn: Torn, behind_front: bool) -> Error {
+    Error::from(failed_after_the_spawn(cause, torn, behind_front))
 }
 
 /// [`after_the_spawn`], as the [`SpawnFailure`] a spawn returns.
-pub(crate) fn failed_after_the_spawn(
-    cause: Error,
-    fate: ChildFate,
-    unreaped: Option<Unreaped>,
-    behind_front: bool,
-) -> SpawnFailure {
-    let failure = SpawnFailure::started(cause, fate, unreaped);
+pub(crate) fn failed_after_the_spawn(cause: Error, torn: Torn, behind_front: bool) -> SpawnFailure {
+    let Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = torn;
+    let failure = SpawnFailure::started(cause, fate, unreaped).with_cleanup(cleanup);
     if behind_front {
         failure.behind_front()
     } else {
@@ -115,19 +156,17 @@ pub(crate) fn failed_after_the_spawn(
 }
 
 /// [`failed_after_the_spawn`] for a `cause` that called for a teardown of the child, whose result is
-/// `torn_down`. `Err(note)` is a teardown that did not run, because the task that was to run it was
-/// cancelled and dropped the child instead: the `cause` stays, `note` goes beside it, and nothing
-/// reports what the drop did, so the fate is [`ChildFate::Unknown`]. (`Running { id: None }` would
-/// say cosca left the child alone before its identity was read.)
-pub(crate) fn failed_after_teardown(
-    cause: Error,
-    behind_front: bool,
-    torn_down: Result<(ChildFate, Option<Unreaped>), String>,
-) -> SpawnFailure {
-    match torn_down {
-        Ok((fate, unreaped)) => failed_after_the_spawn(cause, fate, unreaped, behind_front),
-        Err(note) => failed_after_the_spawn(cause.with_note(&note), ChildFate::Unknown, None, behind_front),
-    }
+/// `torn_down`. `Err(cancelled)` is a teardown that did not run, because the task that was to run it
+/// was cancelled and dropped the child instead: the `cause` stays, `cancelled` goes beside it as the
+/// teardown's failure, and nothing reports what the drop did, so the fate is [`ChildFate::Unknown`].
+/// (`Running { id: None }` would say cosca left the child alone before its identity was read.)
+pub(crate) fn failed_after_teardown(cause: Error, behind_front: bool, torn_down: Result<Torn, Error>) -> SpawnFailure {
+    let torn = torn_down.unwrap_or_else(|cancelled| Torn {
+        fate: ChildFate::Unknown,
+        unreaped: None,
+        cleanup: Failures::collect([Arc::new(cancelled)]),
+    });
+    failed_after_the_spawn(cause, torn, behind_front)
 }
 
 // Only the Unix tests take a `SpawnFailure` apart; the rest read the public `Error`.
@@ -275,6 +314,7 @@ impl From<SpawnFailure> for Error {
                 fate,
                 wrapper_elevated,
                 unreaped,
+                cleanup,
             } => {
                 debug_assert!(
                     !matches!(cause, Error::MayHaveStarted { .. }),
@@ -294,6 +334,7 @@ impl From<SpawnFailure> for Error {
                     wrapper_elevated,
                     source: std::sync::Arc::new(cause),
                     unreaped,
+                    cleanup,
                 }
             }
         }

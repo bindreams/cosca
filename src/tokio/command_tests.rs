@@ -228,12 +228,20 @@ async fn handed_back_after_refused_kills() -> (
     let crate::error::Error::MayHaveStarted {
         fate,
         unreaped: Some(unreaped),
+        cleanup,
         ..
     } = error
     else {
         panic!("expected a handed-back child, got {error:?}");
     };
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
+    // The refused kill is the teardown's failure, beside the pump's, in the cleanup.
+    let cleanup = cleanup.expect("the refused kill is in the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        matches!(&**cleanup.first(), crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{cleanup:?}"
+    );
     (*unreaped, id, writer, mark)
 }
 

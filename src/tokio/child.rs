@@ -83,8 +83,8 @@ impl Child {
     }
 
     /// The failed run's teardown, awaited: what became of the child, and the child itself if its
-    /// teardown could not end it (a refused kill, a running elevation front).
-    pub(super) async fn tear_down_awaiting(self) -> (crate::error::ChildFate, Option<crate::Unreaped>) {
+    /// teardown could not end it (a refused kill, a running elevation front), and what failed in it.
+    pub(super) async fn tear_down_awaiting(self) -> crate::child::drop_teardown::Torn {
         self.inner
             .tear_down_or_hand_back_awaiting(crate::child::owned::teardown::Disposition::HandBack)
             .await

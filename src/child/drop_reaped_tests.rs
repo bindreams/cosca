@@ -549,7 +549,11 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
     let mark = crate::log_capture::mark();
     let (err, fate) = super::spawn::finish_elevated(
         child,
-        Err(crate::error::Error::Io(std::io::Error::other("no password"))),
+        Err(crate::error::Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "no password".into(),
+            source: None,
+        }),
     )
     .expect_err("the password write failed")
     .expect_may_have_started_with();

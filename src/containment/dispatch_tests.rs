@@ -1559,7 +1559,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let held_gone = tree_left_with(id.pid(), vec![id]);
     let warn = held_gone
         .settle_for_drop(Some(&walker()), skipped(), true)
-        .expect("an unvouched tree is warned of");
+        .expect("an unvouched tree is warned of")
+        .text;
     drop(stdin);
     crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
     assert!(warn.contains("could not be vouched for"), "{warn}");
@@ -1591,7 +1592,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .expect_err("a member is running");
     let warn = earlier
         .settle_for_drop(Some(&walker()), skipped(), true)
-        .expect("an unvouched tree is warned of");
+        .expect("an unvouched tree is warned of")
+        .text;
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("skipped the kill"), "{warn}");
     assert!(warn.contains("left something running that it could not name"), "{warn}");
@@ -1607,7 +1609,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .expect_err("the root is running");
     let warn = root_running
         .settle_for_drop(Some(&walker()), skipped(), true)
-        .expect("an unvouched tree is warned of");
+        .expect("an unvouched tree is warned of")
+        .text;
     assert!(warn.contains("found the root running"), "{warn}");
     assert!(!warn.contains("had ended"), "{warn}");
     assert!(!warn.contains("members"), "{warn}");
@@ -1622,7 +1625,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     for _ in 0..2 {
         let warn = root_only
             .settle_for_drop(Some(&walker()), skipped(), true)
-            .expect("an unvouched tree is warned of");
+            .expect("an unvouched tree is warned of")
+            .text;
         assert!(warn.contains("could not be vouched for"), "{warn}");
         assert!(warn.contains("found the root running"), "{warn}");
         assert!(warn.contains("never looked for"), "{warn}");
@@ -1644,7 +1648,8 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
             })),
             true,
         )
-        .expect("a walk that left the root is warned of");
+        .expect("a walk that left the root is warned of")
+        .text;
     assert!(warn.contains("could not be vouched for"), "{warn}");
     assert!(warn.contains("found the root running"), "{warn}");
     assert!(warn.contains("never looked for"), "{warn}");
@@ -1657,11 +1662,10 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
         .settle(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true)
         .answer
         .expect("a complete kill");
-    assert_eq!(killed.settle_for_drop(Some(&walker()), skipped(), true), None);
-    assert_eq!(
-        TreeKilled::default().settle_for_drop(Some(&walker()), skipped(), true),
-        None
-    );
+    assert!(killed.settle_for_drop(Some(&walker()), skipped(), true).is_none());
+    assert!(TreeKilled::default()
+        .settle_for_drop(Some(&walker()), skipped(), true)
+        .is_none());
 }
 
 /// A walk that saw the root running and left it un-vouches the tree, from any state and whatever
@@ -2588,7 +2592,7 @@ mod frozen_attach {
         let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
             panic!("the suspended child must be readable");
         };
-        attach(Ok(id), raw(child), prepared)
+        attach(Ok(id), raw(child), prepared).map_err(|failure| failure.cause)
     }
 
     /// The identity read the OS refused, as the spawn hands it to the attach.
@@ -2627,7 +2631,8 @@ mod frozen_attach {
             prepared(Some(ContainMode::TreeWalk), true, false),
         )
         .err()
-        .expect("a tree walk without an identity must fail the attach");
+        .expect("a tree walk without an identity must fail the attach")
+        .cause;
 
         assert!(matches!(err, Error::Unassessable { source: None, .. }), "got {err:?}");
         dispose(child);

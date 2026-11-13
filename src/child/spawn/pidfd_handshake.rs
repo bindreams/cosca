@@ -75,7 +75,7 @@ use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, So
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::held_teardown::tear_down_pidfd;
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{Past, Remains};
+use crate::child::owned::teardown::{HandleTeardown, Past, Remains};
 use crate::error::{ChildFate, Error};
 
 const GO: u8 = 1;
@@ -267,9 +267,11 @@ impl Handshake {
 
     /// Runs `spawn` (the fork) with the helper thread alive beside it, then answers the pidfd.
     ///
-    /// - A failed `pidfd_open` in the child is the error, whatever `spawn` answered: the child
-    ///   aborted, and std collected it by pid (see residuals b and c in
-    ///   [`child_exited_before_the_helper_finished`]).
+    /// - A failed `pidfd_open` in the child, or any other failure of the helper, fails the spawn
+    ///   whatever `spawn` answered: the child aborted, and std collected it by pid (see residuals b
+    ///   and c in [`child_exited_before_the_helper_finished`]). A refusal is [`Error::Unsupported`]
+    ///   with `spawn`'s error as its cause; any other failure answers the helper's own [`Error::Io`],
+    ///   and `spawn`'s, which only echoes it, is logged at warn.
     /// - If the helper thread cannot be started, `spawn` is never called: no child exists.
     /// - A child killed before it reported leaves `spawn` answering `Ok` (std reads the closed
     ///   status pipe as success) and the helper at EOF. It is dead but unreaped, and its number
@@ -829,14 +831,17 @@ fn conclude(
             let fate = end_unexecuted(None, pidfd, warn_after);
             with_child(Error::Io(e), fate)
         }
-        // The helper's error explains the abort std reports.
-        (Err(_), Outcome::Failed(e, pidfd)) => match pidfd {
-            Some(pidfd) => {
-                let fate = end_unexecuted(None, pidfd, warn_after);
-                with_child(e, fate)
+        // The helper failed too, and its error explains the abort std reports.
+        (Err(spawn), Outcome::Failed(helper, pidfd)) => {
+            let error = answer_of_failed_spawn_and_helper(spawn, helper);
+            match pidfd {
+                Some(pidfd) => {
+                    let fate = end_unexecuted(None, pidfd, warn_after);
+                    with_child(error, fate)
+                }
+                None => not_started(error),
             }
-            None => not_started(e),
-        },
+        }
         // The child reads EOF in place of its verdict, whenever it reaches its hook.
         (Ok(child), Outcome::Unwatched(what, cause)) => {
             let named = super::named(Some(child.id()));
@@ -849,14 +854,50 @@ fn conclude(
                 ChildFate::Killed,
             )
         }
-        (Err(e), Outcome::NoReport | Outcome::Unwatched(..)) => not_started(Error::Io(e)),
+        (Err(e), Outcome::Unwatched(what, cause)) => {
+            warn_beside_the_answer(
+                &format!("the spawn failed, and so did the watch on its child's exit ({what})"),
+                &cause,
+            );
+            not_started(Error::Io(e))
+        }
+        (Err(e), Outcome::NoReport) => not_started(Error::Io(e)),
     }
+}
+
+/// The answer of a spawn that failed while its helper did too. The helper's failure is the cause: the
+/// child aborted for it, and std's error only echoes what the child's hook returned. The helper's
+/// error is an [`Error::Unsupported`] (the child found `pidfd_open` refused) or an [`Error::Io`].
+/// `Unsupported` has a slot for the spawn's error, which goes below it. No variant says "the spawn
+/// failed and so did its helper", so `Io` has none: the helper's `Io` is the answer, and the spawn's
+/// error is logged. An `Io` answers at every count and its peers are logged at warn; an `Io` goes
+/// below a slot variant only where that variant's meaning covers what failed. It is not
+/// [`Error::with_peers_or_unassessable`]'s, which turns the answer into an `Unassessable` that says
+/// the state could not be determined.
+fn answer_of_failed_spawn_and_helper(spawn: io::Error, helper: Error) -> Error {
+    match helper {
+        Error::Io(_) => {
+            warn_beside_the_answer("the spawn failed, and so did its helper; the spawn's error", &spawn);
+            helper
+        }
+        slot => slot.with_peers([Error::io_cause(spawn)]),
+    }
+}
+
+/// Logs at warn a failure that the answer of a failed spawn has no slot for; `what` says which.
+fn warn_beside_the_answer(what: &str, failure: &(dyn std::error::Error + 'static)) {
+    log::warn!(
+        "pidfd handshake: {what}: {report}",
+        report = crate::error::Report(failure)
+    );
 }
 
 /// [`tear_down_pidfd`] for the child `pidfd` names, whose pid is `pid` if known: a child it could
 /// not end is left running and warned of, the warn led by `why`; the fate says so. `past`: see
 /// [`Past`]. With `warn_after`, the wait for the killed child warns once it passes that long.
-/// Answers what is left of the teardown, whose clause is said.
+/// Answers what is left of the teardown, whose clause is said. A spawn this module concludes did not
+/// start, and its answer has no `cleanup`, so each failure of the teardown that its warn did not
+/// hold is logged at warn ([`say_teardown_of_failed_spawn`]).
 fn end_through_pidfd(
     pid: Option<u32>,
     pidfd: OwnedFd,
@@ -864,7 +905,30 @@ fn end_through_pidfd(
     warn_after: Option<std::time::Duration>,
     why: &mut super::Diagnosis,
 ) -> Remains {
-    tear_down_pidfd(pid, pidfd, None, past, warn_after).say_as_failed_spawn(why)
+    say_teardown_of_failed_spawn(tear_down_pidfd(pid, pidfd, None, past, warn_after), why)
+}
+
+/// Says `torn` as the failed spawn's one warn, and logs at warn ([`warn_of_teardown_failures`]) each
+/// failure that warn does not hold.
+fn say_teardown_of_failed_spawn(torn: HandleTeardown, why: &mut super::Diagnosis) -> Remains {
+    let held = torn.outcome.said_in_the_one_warn(why);
+    let remains = torn.say_as_failed_spawn(why);
+    warn_of_teardown_failures(&remains, held);
+    remains
+}
+
+/// Logs at warn each failure of a failed spawn's teardown that the event's one warn
+/// ([`say_as_failed_spawn`](HandleTeardown::say_as_failed_spawn)) does not hold. That warn holds them
+/// all when it was said (`held`: its clause is at warn, or the spawn's diagnosis was owed and folded
+/// into it); a clause below warn (a refused kill whose look found the child gone) is said at its
+/// level only.
+fn warn_of_teardown_failures(remains: &Remains, held: bool) {
+    if held {
+        return;
+    }
+    for failure in remains.failures.iter().flat_map(|failures| failures.iter()) {
+        warn_beside_the_answer("the failed spawn's teardown of its child failed", failure.as_ref());
+    }
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program

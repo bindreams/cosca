@@ -1426,6 +1426,111 @@ fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running()
     crate::test_frozen::assert_not_released("the child", child.wait().expect("reap the child"));
 }
 
+/// A frozen child whose initial thread cannot be resumed fails the attach with that failure as the
+/// cause. The job's kill after it, which fails too, is the attach's cleanup: the cause is not
+/// changed by it, and it is not in the cause's text.
+///
+/// Mutants: the kill's failure is only logged; it replaces the resume's as the cause; it is among
+/// the cause's `source`s; it is not logged at warn, naming the job and that the tree may still run.
+#[skuld::test]
+fn attach_job_whose_resume_and_job_kill_both_fail_returns_the_kill_as_cleanup() {
+    use super::fault::{force_next, set_before_job_kill, Step};
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_HANDLE: u32 = 6;
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+
+    let child = crate::test_frozen::spawn_suspended_blocker();
+    // One failure is forced at a time: the kill's is armed once the resume's is spent.
+    let kill_failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _resume = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+    let _arms_the_kill = set_before_job_kill({
+        let kill_failure = std::rc::Rc::clone(&kill_failure);
+        move || *kill_failure.borrow_mut() = Some(force_next(Step::JobKill, ERROR_INVALID_HANDLE))
+    });
+
+    let failure = super::attach_job(crate::test_frozen::raw(&child)).expect_err("the resume failed");
+
+    assert!(
+        matches!(failure.cause, crate::error::Error::Containment { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&failure.cause),
+        Some(ERROR_ACCESS_DENIED as i32),
+        "the resume's failure is the cause: {failure:?}"
+    );
+    let cleanup = failure.cleanup.expect("the job kill's failure is the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(ERROR_INVALID_HANDLE as i32),
+        "{cleanup:?}"
+    );
+    let warns = crate::log_capture::warns_since(mark, "job kill after a failed resume also failed");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("the tree may still be running") && warns[0].contains("terminating the job"),
+        "{warns:?}"
+    );
+    assert!(
+        cleanup.first().to_string().contains("terminating the job"),
+        "the cleanup member names its step: {cleanup:?}"
+    );
+    drop(kill_failure);
+    dispose(child);
+}
+
+/// A spawn whose attach fails in its resume, and whose job kill after it fails too, returns the
+/// resume as the cause and the kill in the `cleanup` of the error that says the program may have
+/// started, beside the child's fate.
+///
+/// Mutant: the spawn drops the attach's cleanup when it tears the child down.
+#[skuld::test]
+fn a_spawn_whose_attach_fails_returns_the_job_kill_in_its_cleanup() {
+    use super::fault::{force_next, set_before_job_kill, Step};
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_HANDLE: u32 = 6;
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.contain();
+    let kill_failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _resume = force_next(Step::Resume, ERROR_ACCESS_DENIED);
+    let _arms_the_kill = set_before_job_kill({
+        let kill_failure = std::rc::Rc::clone(&kill_failure);
+        move || *kill_failure.borrow_mut() = Some(force_next(Step::JobKill, ERROR_INVALID_HANDLE))
+    });
+
+    let error = cmd.spawn().expect_err("the resume failed");
+
+    let crate::error::Error::MayHaveStarted {
+        source, cleanup, fate, ..
+    } = &error
+    else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    assert_eq!(*fate, crate::error::ChildFate::Reaped, "{error:?}");
+    assert!(
+        matches!(**source, crate::error::Error::Containment { .. }),
+        "{source:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&**source),
+        Some(ERROR_ACCESS_DENIED as i32),
+        "{source:?}"
+    );
+    let cleanup = cleanup.as_ref().expect("the job kill's failure is the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(ERROR_INVALID_HANDLE as i32),
+        "{cleanup:?}"
+    );
+    drop(kill_failure);
+}
+
 /// `assign_held` assigns the job and does not resume: the thread stays frozen.
 #[skuld::test]
 fn death_watch_assign_held_assigns_the_job_without_resuming() {

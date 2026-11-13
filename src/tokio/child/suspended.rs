@@ -108,8 +108,8 @@ impl SuspendedChild {
     /// and warned, with `unreaped` `None` after a failed release, and handed back after the disarm's
     /// refusal, as for the sync [`SuspendedChild::resume`](crate::SuspendedChild::resume). The same
     /// error, with `fate` [`ChildFate::Unknown`], when a drop stood in for the teardown (see Runtime):
-    /// its cause is still the release's (or the disarm's) failure, and a note beside it says what
-    /// happened.
+    /// its cause is still the release's (or the disarm's) failure, and the `cleanup` says that the
+    /// teardown did not run.
     ///
     /// [`ChildFate::Unknown`]: crate::error::ChildFate::Unknown
     pub async fn resume(self) -> Result<Child, Error> {
@@ -150,12 +150,16 @@ impl SuspendedChild {
     }
 }
 
-/// What a teardown's error says when its hop gave no result: for a task that did not run, that its
-/// child was dropped in the teardown's place, as its handle's drop does.
-fn dropped_instead(unjoined: Unjoined) -> String {
+/// The failure of a teardown whose hop gave no result, which goes beside the error as its cleanup:
+/// for a task that did not run, it says that the child was dropped in the teardown's place, as its
+/// handle's drop does.
+fn dropped_instead(unjoined: Unjoined) -> Error {
     match unjoined {
-        Unjoined::NotRun(e) => format!("{e}; the child was dropped as its handle's drop does"),
-        Unjoined::Unknown(e) => e.to_string(),
+        Unjoined::NotRun(e) => Error::Io(crate::error::io_context(
+            "the teardown did not run, and the child was dropped as its handle's drop does",
+            e.into_io(),
+        )),
+        Unjoined::Unknown(e) => e,
     }
 }
 

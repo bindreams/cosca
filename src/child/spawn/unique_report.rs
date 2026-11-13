@@ -552,10 +552,13 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
 }
 
 /// The error for a failed spawn: only the child's own refusal changes it, because only then did the
-/// hook fail the spawn. Any other report state keeps std's error, and is logged.
+/// hook fail the spawn. Any other report state keeps std's error, and is logged: a failed read of the
+/// report, or wait for it, at warn, since std's `Io` has no slot for it; the rest at debug.
 pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {
     match report {
         Report::ChildRefused(errno) => refused_error(*errno),
+        Report::ReadFailed(failure) => warn_beside_the_spawn(error, "the read of", failure),
+        Report::WaitFailed(failure) => warn_beside_the_spawn(error, "the wait for", failure),
         other => {
             debug_assert!(
                 !matches!(other, Report::BadTag(_)),
@@ -568,6 +571,18 @@ pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {
             error
         }
     }
+}
+
+/// Logs at warn that the spawn failed with `spawn` and that `step`, with the child's unique-id
+/// report as its object ("the read of", "the wait for"), failed with `failure` too, and answers
+/// `spawn`: std's `Io` has no slot for `failure`.
+fn warn_beside_the_spawn(spawn: Error, step: &str, failure: &io::Error) -> Error {
+    log::warn!(
+        "the spawn failed ({report}), and so did {step} the child's unique-id report: {failure}",
+        report = crate::error::Report(&spawn),
+        failure = crate::error::Report(failure)
+    );
+    spawn
 }
 
 /// The error for a child that could not read its own unique id (`errno`). It is a refusal, not a

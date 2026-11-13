@@ -303,7 +303,8 @@ fn tear_down_leaving(
         disposition: Disposition::Leave,
         policy: SpawnPolicy::SYNC,
     };
-    tear_down_held(owned, how, why, failed())
+    let (error, torn) = tear_down_held(owned, how, why, failed());
+    (error, torn.fate, torn.unreaped)
 }
 
 /// A child whose kill is refused, under a caller that leaves it, is left running and warned of, and
@@ -516,7 +517,7 @@ fn after_a_pidfd_kill_refused_with(errno: i32, past: Past) -> ChildFate {
         SpawnPolicy::SYNC,
         &mut Diagnosis::default(),
     )
-    .0
+    .fate
 }
 
 /// A kill of a pidfd refused with `EPERM` is within the contract, a setuid child's.
@@ -577,7 +578,8 @@ fn tear_down_front_under(
         disposition: Disposition::HandBack,
         policy,
     };
-    tear_down_held(owned, how, &mut Diagnosis::default(), failed())
+    let (error, torn) = tear_down_held(owned, how, &mut Diagnosis::default(), failed());
+    (error, torn.fate, torn.unreaped)
 }
 
 /// The wait for a front its leaf's kill reached warns past the threshold the spawn's policy gave

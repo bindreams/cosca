@@ -372,9 +372,13 @@ impl Tree {
         self.killed.unless_unwalked(self.named_by(), outcome)
     }
 
-    /// [`settle`](Self::settle) for a drop: the text of its warn when the tree is not settled, worded
-    /// here and only when it will be logged.
-    pub(crate) fn settle_for_drop(&self, outcome: impl Into<TreeKillOutcome>, root_ended: bool) -> Option<String> {
+    /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, worded here and
+    /// only when it will be logged ([`TreeKilled::settle_for_drop`]).
+    pub(crate) fn settle_for_drop(
+        &self,
+        outcome: impl Into<TreeKillOutcome>,
+        root_ended: bool,
+    ) -> Option<crate::containment::dispatch::TreeLeft> {
         self.killed.settle_for_drop(self.named_by(), outcome, root_ended)
     }
 }

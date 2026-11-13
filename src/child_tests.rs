@@ -43,14 +43,12 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_path() 
     drop(child);
 }
 
-/// A failed `cgroup.kill` write during `Child::drop`'s own teardown is a real OS outcome: Drop
-/// must warn, not panic. Forced via the EISDIR technique of
-/// `hard_kill_propagates_a_kill_the_kernel_refused` (`containment/cgroup/leaf_tests.rs`):
-/// `open(O_WRONLY)` on a directory always fails.
+/// A blocker whose contained tree is a cgroup leaf whose `cgroup.kill` write always fails, forced via
+/// the EISDIR technique of `hard_kill_propagates_a_kill_the_kernel_refused`
+/// (`containment/cgroup/leaf_tests.rs`): `open(O_WRONLY)` on a directory always fails. `kill_on_drop`
+/// is its default, true. The directory holds the leaf: keep it until the child is gone.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
-    crate::log_capture::install();
+fn child_whose_tree_kill_fails() -> (crate::Child, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-drop-kill-fail-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -60,11 +58,47 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    // `kill_on_drop` defaults to true.
     let mut child = cmd.spawn().expect("spawn");
     child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
-        crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone()),
+        crate::containment::cgroup::test_support::entered_leaf_at(leaf_path),
     ));
+    (child, dir)
+}
+
+/// The teardown a helper runs after its failed run (`output`, `status`) is a run's, not a drop's: a
+/// tree kill that fails in it is an error among its failures, which the helper's error carries as
+/// its `cleanup`, and the call returns normally.
+///
+/// Mutant: the tree kill's failure is only logged.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_runs_teardown_returns_its_tree_kills_failure() {
+    crate::log_capture::install();
+    let (mut child, _leaf) = child_whose_tree_kill_fails();
+    let stdin = child.stdin().expect("piped stdin");
+    let blocker = crate::child::spawn::fault::release_between_kill_and_wait(stdin);
+
+    let torn = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
+
+    blocker.assert_killed();
+    assert_eq!(torn.fate, crate::error::ChildFate::Reaped);
+    assert!(torn.unreaped.is_none());
+    let cleanup = torn.cleanup.expect("the tree kill's failure is the teardown's");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        matches!(&**cleanup.first(), crate::error::Error::Containment { .. })
+            && crate::error::first_os_code(&**cleanup.first()) == Some(libc::EISDIR),
+        "{cleanup:?}"
+    );
+}
+
+/// A failed `cgroup.kill` write during `Child::drop`'s own teardown is a real OS outcome: Drop
+/// must warn, not panic.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
+    crate::log_capture::install();
+    let (mut child, _leaf) = child_whose_tree_kill_fails();
     // Released once the drop's root kill has returned: the drop blocks until the root is reaped.
     let stdin = child.stdin().expect("piped stdin");
     let blocker = crate::child::spawn::fault::release_at_drop_kill(stdin);
