@@ -17,7 +17,7 @@
 //! cgroup self-placement, which `_exit`s from the hook and reports through its own channel (see
 //! `containment::cgroup::placement_hook`). std's channel is made before the fork at the lowest free
 //! descriptors, so with two of fds 0 to 2 closed its error record can land in the child's stdio and
-//! the spawn returns `Ok`: #383 (cosca's own fork and error channel) fixes it.
+//! the spawn returns `Ok`. A cosca-owned fork and error channel would fix it.
 //!
 //! A command with no step gets no hook, so std is free to take its `posix_spawn` route.
 

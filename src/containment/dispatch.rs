@@ -78,16 +78,32 @@ impl Prepared {
     /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
     /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
     /// tree either way.
-    pub(crate) fn settle_verdict(&mut self, #[cfg(target_os = "linux")] child: ChildHandle<'_>) {
+    ///
+    /// The verdict that says the program never ran comes back as the attach's own not-started
+    /// failure ([`not_started_failure`]), so a failed spawn that finds the child's identity gone
+    /// answers as the attach would have.
+    pub(crate) fn settle_verdict(
+        &mut self,
+        #[cfg(target_os = "linux")] child: ChildHandle<'_>,
+    ) -> Option<AttachFailure> {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            if let Err(e) = leaf.take_placement(child) {
-                log::debug!(
-                    "cgroup v2: a failed spawn's child is not placed in its leaf: {report}",
-                    report = crate::error::Report(&e)
-                );
+            if let Err(reason) = leaf.take_placement(child) {
+                let path = leaf.path().display().to_string();
+                let strict = self.mode.is_some_and(ContainMode::is_strict);
+                return match not_started_failure(reason, &path, strict) {
+                    Ok(failure) => Some(failure),
+                    Err(reason) => {
+                        log::debug!(
+                            "cgroup v2: a failed spawn's child is not placed in its leaf: {report}",
+                            report = crate::error::Report(&reason)
+                        );
+                        None
+                    }
+                };
             }
         }
+        None
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group
@@ -1160,12 +1176,10 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
 /// Windows can honour.
 ///
-/// Fallible on Windows, where the composed creation-flag word may name a reserved bit, and for a
-/// `Strongest` spawn on Linux (the cgroup the host offers cannot be used) and macOS (the fd marker
-/// cannot be installed): [`Error::Containment`], with nothing forked. The Windows
-/// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
+/// Fallible on Windows (a reserved creation-flag bit; composed first, so nothing is left to
 /// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
-/// flags too.
+/// flags too) and for a `Strongest` spawn on Linux and macOS ([`Error::Containment`], nothing
+/// forked).
 #[allow(
     clippy::too_many_arguments,
     reason = "each Unix platform reads its own subset of the arguments"
@@ -1299,8 +1313,8 @@ pub(crate) fn prepare(
 
             let strict = mode.is_some_and(ContainMode::is_strict);
             let leaf = if strict {
-                // `Strongest` decides on what the host offers, and a failure of any step after
-                // that fails the spawn. A host that offers no cgroup is the process group set above.
+                // `Strongest` decides by the setup calls (see `leaf_if_offered`). A host that
+                // offers no cgroup is the process group set above.
                 crate::containment::cgroup::leaf_if_offered(
                     crate::containment::cgroup::offered_cgroup(),
                     teardown_warn_after,
@@ -1320,9 +1334,8 @@ pub(crate) fn prepare(
                 // The child's self-placement step. Under `Strongest` a failed placement stops the
                 // child before `exec` (see `ReportSlot::refusing`). Otherwise it returns Ok (e.g.
                 // EBUSY — "no internal processes" rule), so the spawn proceeds and `attach` falls
-                // back to the already-configured process group. Only a report the child cannot send
-                // fails the spawn either way. Both the sync and the tokio spawn add this one step
-                // through `prepare`.
+                // back to the already-configured process group. Both the sync and the tokio spawn
+                // add this one step through `prepare`.
                 let slot = l.placement_slot();
                 // SAFETY: the leaf, which owns both the fd and the report channel, stays in
                 // `Prepared` until after the spawn.
@@ -1411,13 +1424,52 @@ pub(crate) struct AttachFailure {
     /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
     /// before `exec` because its placement in its leaf was refused, or a child (in any mode) sent
     /// no report, which its hook only leaves unsent by ending the child before `exec`. Every other
-    /// failure may have started the program. Only Linux places a child after its spawn, so only it sets and reads
-    /// this.
+    /// failure may have started the program.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "read only by the Linux arm of the spawn")
     )]
     pub(crate) not_started: bool,
+}
+
+/// The not-started failure of a child that is not in its leaf (`reason`, in the leaf at `path`), or
+/// `reason` back when the child may have run its program.
+///
+/// The program never ran when the child sent no report (its hook ends it before `exec` after every
+/// report it can send), or, under `strict`, its placement write failed (it stops before `exec`). A
+/// failed write otherwise is a child that went on in the process group. The error names the leaf;
+/// the write's errno is its source, and a failed read of `cgroup.procs` for the diagnosis a second
+/// cause beside it. The diagnosis itself is said at `debug`.
+#[cfg(target_os = "linux")]
+pub(crate) fn not_started_failure(
+    reason: crate::containment::cgroup::NotPlaced,
+    path: &str,
+    strict: bool,
+) -> Result<AttachFailure, crate::containment::cgroup::NotPlaced> {
+    use crate::containment::cgroup::NotEntered;
+    let (detail, source) = match reason.report() {
+        NotEntered::NotReported => (
+            format!(
+                "cgroup v2: the child did not report its placement in leaf cgroup {path}, so the program did not run"
+            ),
+            None,
+        ),
+        NotEntered::WriteFailed(errno) if strict => (
+            format!("cgroup v2: the child could not be placed in its leaf cgroup {path}, so the program did not run"),
+            Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+        ),
+        NotEntered::WriteFailed(_) => return Err(reason),
+    };
+    log::debug!(
+        "cgroup v2: the program did not run: {report}",
+        report = crate::error::Report(&reason)
+    );
+    let cause = Error::Containment { detail, source }.with_peers(reason.into_read_failure().map(Error::io_cause));
+    Ok(AttachFailure {
+        cause,
+        cleanup: None,
+        not_started: true,
+    })
 }
 
 impl From<Error> for AttachFailure {
@@ -1513,58 +1565,18 @@ fn attach_tree(
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
                         Err(reason) => {
-                            use crate::containment::cgroup::NotEntered;
                             let path = leaf.path().display().to_string();
                             leaf.remove_unentered();
-                            let report = reason.report();
-                            // The program never ran, so the spawn fails as one that did not start
-                            // (the failed attach's teardown ends the child), when:
-                            // - the child sent no report: its hook ends the child before `exec`
-                            //   after every report it can send, so one that sent none never ran
-                            //   the program, in every mode;
-                            // - its placement write failed under `Strongest`, whose child stops
-                            //   before `exec` when it is not placed.
-                            // A failed write under `BestEffort` is a child that went on to run
-                            // in the process group set before the spawn: a degrade.
-                            let detail = match report {
-                                NotEntered::NotReported => Some(format!(
-                                    "cgroup v2: the child did not report its placement in leaf cgroup \
-                                     {path}, so the program did not run"
-                                )),
-                                NotEntered::WriteFailed(_) if prepared.mode.is_some_and(ContainMode::is_strict) => {
-                                    Some(format!(
-                                        "cgroup v2: the child could not be placed in its leaf cgroup \
-                                         {path}, so the program did not run"
-                                    ))
+                            let strict = prepared.mode.is_some_and(ContainMode::is_strict);
+                            return match not_started_failure(reason, &path, strict) {
+                                Ok(failure) => Err(failure),
+                                // A failed write under `BestEffort` is a child that went on to run
+                                // in the process group set before the spawn: a degrade.
+                                Err(reason) => {
+                                    crate::containment::cgroup::log_degrade(&reason);
+                                    Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))))
                                 }
-                                NotEntered::WriteFailed(_) => None,
                             };
-                            let Some(detail) = detail else {
-                                crate::containment::cgroup::log_degrade(&reason);
-                                return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
-                            };
-                            // What was found of the child and its leaf (`cgroup.procs`, its state)
-                            // is what a reader debugging a refused placement needs: said at `debug`.
-                            log::debug!(
-                                "cgroup v2: the program did not run: {report}",
-                                report = crate::error::Report(&reason)
-                            );
-                            let cause = match report {
-                                // The child's own report is the proof; there is no cause beneath it.
-                                NotEntered::NotReported => Error::Containment { detail, source: None },
-                                // The write's errno is the cause, and the failed diagnosis read, if
-                                // there was one, a second cause beside it.
-                                NotEntered::WriteFailed(errno) => Error::Containment {
-                                    detail,
-                                    source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
-                                }
-                                .with_peers(reason.into_read_failure().map(Error::io_cause)),
-                            };
-                            return Err(AttachFailure {
-                                cause,
-                                cleanup: None,
-                                not_started: true,
-                            });
                         }
                     }
                 }

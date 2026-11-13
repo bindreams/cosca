@@ -1854,7 +1854,9 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
     cmd.set_elevation_report(sudo_report());
-    crate::containment::cgroup::fault::set_force_placement_write_result(0);
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
     (cmd, writer.into())
 }
 
@@ -1925,8 +1927,15 @@ fn cgroup_a_front_whose_placement_is_refused_answers_not_started(#[fixture(cgrou
     let mut cmd = in_cgroup(cat());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.set_elevation_report(sudo_report());
-    crate::containment::cgroup::fault::set_force_placement_write_result(0);
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
 
+    let pid = std::rc::Rc::new(std::cell::Cell::new(None));
+    let _seen = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, {
+        let pid = std::rc::Rc::clone(&pid);
+        move || pid.set(Some(crate::child::spawn::fault::spawn_pid()))
+    });
     let spawned = crate::child::spawn::spawn(&mut cmd);
     // The forked child took its own copy; this thread's stays armed for the next test.
     crate::containment::cgroup::fault::take_force_placement_write_result();
@@ -1936,9 +1945,20 @@ fn cgroup_a_front_whose_placement_is_refused_answers_not_started(#[fixture(cgrou
     };
     let (error, fate) = failure.expect_not_started_with_child();
     assert!(matches!(error, crate::error::Error::Containment { .. }), "{error:?}");
-    assert!(
-        !matches!(fate, crate::error::ChildFate::Running { .. }),
-        "the front was killed and reaped: {fate:?}"
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "the front was killed and reaped");
+    // No front detail: the front never ran `sudo`, so the error does not say the elevated program
+    // may be running.
+    let said = crate::error::Report(&error).to_string();
+    assert!(!said.contains("what sudo left"), "{said}");
+    // Reaped by the spawn: this process has no such child left to wait for.
+    let pid = pid.get().expect("the spawn forked a front");
+    let mut status = 0;
+    // SAFETY: `status` is a valid out-parameter; WNOHANG never blocks.
+    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    assert_eq!(
+        (waited, std::io::Error::last_os_error().raw_os_error()),
+        (-1, Some(libc::ECHILD)),
+        "the front's pid is gone"
     );
 }
 

@@ -201,17 +201,15 @@ pub enum ContainMode {
     /// weaker one; [`ContainMode::BestEffort`] does.
     ///
     /// - **Linux:** a cgroup v2 leaf, when the host offers one: `/proc/self/cgroup` names this
-    ///   process's cgroup in the unified hierarchy, and this process may write that directory. A
-    ///   host that offers none (no `/proc/self/cgroup`, a cgroup v1 host, a cgroup that is not
-    ///   writable) gets a process group, with no error; so does a host whose new leaf has no
-    ///   `cgroup.kill` (a kernel before Linux 5.14), and the leaf is removed. Once a cgroup is
-    ///   offered, every other step after that fails the spawn: making the leaf, opening its
-    ///   `cgroup.procs`, its report channel, its inotify watch, and the child's own placement
-    ///   write, whose failure stops the child before `exec`. The offer is read again at every
-    ///   spawn; none is remembered. The inspection asks the kernel with `faccessat2`; a container
-    ///   whose seccomp profile refuses it with `EPERM` (older container runtimes) cannot answer, so
-    ///   a `Strongest` spawn there fails with [`Error::Containment`] and
-    ///   [`BestEffort`](ContainMode::BestEffort) serves it.
+    ///   process's cgroup in the unified hierarchy, and the kernel lets this process use it. The
+    ///   setup calls decide that, not a permission check beforehand. A host that offers none (no
+    ///   `/proc/self/cgroup`, a cgroup v1 host, or a refusal from the kernel (`EACCES`, `EPERM` or
+    ///   `EROFS`) when the own cgroup is opened, the leaf is made, or the leaf's `cgroup.procs` is
+    ///   opened, or an own cgroup its mount does not show) gets a process group, with no error; so
+    ///   does a host whose new leaf has no `cgroup.kill` (a kernel before Linux 5.14), and the
+    ///   leaf is removed. Every other failure fails the spawn: a limit such as `cgroup.max.depth`,
+    ///   the report channel, the inotify watch, and the child's own placement write, whose failure
+    ///   stops the child before `exec`.
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and degrades when it fails.
@@ -230,15 +228,11 @@ pub enum ContainMode {
     ///
     /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
     ///   leaf's directory, `cgroup.procs`, report channel or inotify watch), or a child whose
-    ///   placement write failed, degrades to the process group the spawn set up. `BestEffort` does
-    ///   not inspect the own cgroup first, so a seccomp profile that refuses `faccessat2` does not
-    ///   stop it. A child that sends no report of its placement never ran its program (its hook ends
-    ///   it before `exec`), so that spawn fails with [`Error::Containment`], as under `Strongest`,
-    ///   instead of handing back a child that never ran.
+    ///   placement write failed, degrades to the process group the spawn set up. A child that sends
+    ///   no report of its placement never ran its program (its hook ends it before `exec`), so
+    ///   that spawn fails with [`Error::Containment`], as under `Strongest`, instead of handing
+    ///   back a child that never ran.
     /// - **macOS:** a failed install of the fd marker degrades to the process group.
-    ///
-    /// A host whose new leaf has no `cgroup.kill` (a kernel before Linux 5.14) gets a process
-    /// group under `Strongest` too.
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
     BestEffort,

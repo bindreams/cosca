@@ -41,7 +41,7 @@ impl Step {
     fn force(self) -> Forced {
         match self {
             Step::Leaf => fault::set_force_leaf_open_failure(true),
-            Step::Placement => fault::set_force_placement_write_result(0),
+            Step::Placement => fault::set_force_placement_write_result(fault::ForcedWrite::Returns0),
         }
         Forced
     }
@@ -82,29 +82,39 @@ fn assert_best_effort_degrades(step: Step) {
     assert!(marker.exists(), "{step:?}: the program ran");
 }
 
-/// `Strongest` follows what the host offers, whichever host this is: a leaf where the inspection
-/// finds a delegated cgroup, and a process group, not an error, where it finds none.
-///
-/// Where the host offers a cgroup this makes a leaf in its real tree, so the `cgroup` group is
-/// declared: it asks for consent and fails the test if the leaf is left behind.
+/// The `cgroup` group's host has a delegated cgroup v2 with `cgroup.kill`, so a `Strongest` spawn
+/// gets a leaf in it. This makes a leaf in the host's real tree, so the group is declared: it asks
+/// for consent and fails the test if the leaf is left behind.
 #[skuld::test]
-fn a_strongest_spawn_gets_what_the_inspection_offers(#[fixture(cgroup)] _group: &Group) {
-    let offered = crate::containment::cgroup::offered_cgroup()
-        .expect("this host's /proc/self/cgroup can be read")
-        .is_some();
+fn a_strongest_spawn_on_a_host_with_a_delegated_cgroup_gets_a_leaf(#[fixture(cgroup)] _group: &Group) {
     let dir = tempfile::tempdir().expect("tempdir");
     let marker = dir.path().join("ran");
 
     let child = writes_marker(&marker, ContainMode::Strongest)
         .spawn()
-        .unwrap_or_else(|e| panic!("cgroup offered: {offered}, and the spawn failed: {e}"));
+        .unwrap_or_else(|e| panic!("the spawn failed on a host with a delegated cgroup: {e}"));
 
-    let want = if offered {
-        Containment::CgroupV2
-    } else {
-        Containment::ProcessGroup
-    };
-    assert_eq!(child.containment(), want);
+    assert_eq!(child.containment(), Containment::CgroupV2);
+    child.wait().expect("wait");
+    assert!(marker.exists(), "the program ran");
+}
+
+/// A host that offers no cgroup this process can use is a process group for a `Strongest` spawn,
+/// not an error, and the program runs. The own cgroup is one the mount does not show (the setup
+/// call answers `ENOENT`, whoever runs it), in a directory standing for the cgroup filesystem, so
+/// no real cgroup is touched.
+#[skuld::test(labels = [])]
+fn a_strongest_spawn_on_a_host_offering_no_usable_cgroup_gets_a_process_group() {
+    let root = tempfile::tempdir().expect("tempdir");
+    fault::set_force_own_cgroup("0::/not/here\n", root.path());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("ran");
+
+    let child = writes_marker(&marker, ContainMode::Strongest)
+        .spawn()
+        .unwrap_or_else(|e| panic!("a host offering no cgroup is a process group, not an error: {e}"));
+
+    assert_eq!(child.containment(), Containment::ProcessGroup);
     child.wait().expect("wait");
     assert!(marker.exists(), "the program ran");
 }
@@ -157,6 +167,44 @@ fn strongest_refuses_an_unplaced_child_as_not_started_with_fds_0_and_2_closed(#[
         b"",
         "the child wrote into its stderr"
     );
+}
+
+/// A refused placement is the same not-started `Error::Containment` when another party reaps the
+/// refused child before the spawn reads its identity (here `SIGCHLD` is ignored, so the kernel
+/// reaps it): the identity is gone, but the leaf's verdict says the program never ran, and the
+/// error names the cgroup. Runs in a process of its own, since the disposition is process-wide.
+///
+/// Mutant: the vanished identity answers `MayHaveStarted` with an identity error.
+#[skuld::test]
+fn strongest_refuses_an_unplaced_child_as_not_started_when_another_party_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+
+    let Some(_done) = own_process(
+        test_path!(strongest_refuses_an_unplaced_child_as_not_started_when_another_party_reaps_it),
+        spawn,
+    ) else {
+        return;
+    };
+    // SAFETY: setting a disposition is async-signal-safe; this process runs this test alone.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("ran");
+    let _forced = Step::Placement.force();
+
+    let spawned = writes_marker(&marker, ContainMode::Strongest).spawn();
+
+    let Err(error) = spawned else {
+        panic!("a refused placement must fail a Strongest spawn");
+    };
+    assert!(matches!(error, Error::Containment { .. }), "not started: {error:?}");
+    assert!(error.fate().is_none(), "the program did not start: {error:?}");
+    let said = crate::error::Report(&error).to_string();
+    assert!(
+        said.contains("could not be placed"),
+        "the error names the placement: {said}"
+    );
+    assert!(!marker.exists(), "the program ran");
 }
 
 #[skuld::test]

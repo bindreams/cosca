@@ -1641,13 +1641,26 @@ pub(crate) fn create_leaf_under(
     current: &Path,
     teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<CgroupLeaf, LeafError> {
+    // The own cgroup is held and its `cgroup.procs` opened for writing before anything is made: a
+    // refusal here leaves nothing to remove. Moving the child into the leaf writes that file too
+    // (the own cgroup is the common ancestor of the child's cgroup and the leaf's).
+    let own_refused = |path: PathBuf, source: io::Error| LeafError::OpenOwnCgroup { path, source };
+    let parent = LeafDir::open_parent(current).map_err(|source| own_refused(current.to_path_buf(), source))?;
+    rustix::fs::openat(
+        &parent,
+        "cgroup.procs",
+        rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|source| own_refused(current.join("cgroup.procs"), source.into()))?;
+
     let leaf_name = leaf_name().map_err(|source| LeafError::CreateLeafDir {
         path: current.join("cosca-*"),
         source,
     })?;
     let leaf_path = current.join(&leaf_name);
 
-    let dir = LeafDir::create(current, &leaf_name).map_err(|source| LeafError::CreateLeafDir {
+    let dir = LeafDir::create(parent, &leaf_name).map_err(|source| LeafError::CreateLeafDir {
         path: leaf_path.clone(),
         source,
     })?;
@@ -1793,8 +1806,10 @@ pub(crate) fn create_leaf_under(
 pub(crate) const ABANDONED_EXIT: i32 = 125;
 
 /// The status a child exits with from inside its hook when its [`refusing`](ReportSlot::refusing)
-/// placement failed. Distinct from [`ABANDONED_EXIT`] so a status in a log tells them apart; the
-/// parent decides from the leaf's report, never from this.
+/// placement failed, or it could not send its report. Distinct from [`ABANDONED_EXIT`] so a status
+/// in a log tells them apart; the parent decides from the leaf's report, never from this: the
+/// cause is in it when it was sent, and a child that sent none never ran the program
+/// ([`PlacementReport::NotReported`]).
 #[cfg(target_os = "linux")]
 pub(crate) const REFUSED_EXIT: i32 = 124;
 
@@ -1810,10 +1825,10 @@ pub(crate) const UNSENT_EXIT: i32 = 123;
 /// It never returns an error to `std`. A child that never execs needs no error channel, and `std`
 /// would write its error record to the number its channel had — which, once `std`'s spawn returned
 /// early because two of fds 0–2 were closed, is one of the child's own stdio slots. So every
-/// failure `_exit`s here: a spawn the parent abandoned with [`ABANDONED_EXIT`], a
-/// [`refusing`](ReportSlot::refusing) slot's with [`REFUSED_EXIT`] (the parent reads the cause from
-/// the leaf's report), and a report that cannot be sent with [`UNSENT_EXIT`]. `Ok` is a child that
-/// goes on to `exec`.
+/// failure `_exit`s here: a spawn the parent abandoned with [`ABANDONED_EXIT`], any other failure of
+/// a [`refusing`](ReportSlot::refusing) slot with [`REFUSED_EXIT`] (its refused write, or a report
+/// that cannot be sent), and a report that cannot be sent from any other slot with [`UNSENT_EXIT`].
+/// `Ok` is a child that goes on to `exec`.
 ///
 /// # Safety
 /// As [`place_self_in_cgroup_pre_exec`], in a forked child only.
@@ -1878,13 +1893,13 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     let write = || unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
     #[cfg(test)]
     let ret = match forced {
-        // A forced `-errno`: the failed write the kernel would have answered with it.
-        Some(failed) if failed < -1 => {
+        // The failed write the kernel would have answered with this errno.
+        Some(fault::ForcedWrite::FailsWith(errno)) => {
             // Safety: errno is this thread's own.
-            unsafe { *libc::__errno_location() = -failed as i32 };
+            unsafe { *libc::__errno_location() = errno };
             -1
         }
-        Some(ret) => ret,
+        Some(fault::ForcedWrite::Returns0) => 0,
         None => write(),
     };
     #[cfg(not(test))]

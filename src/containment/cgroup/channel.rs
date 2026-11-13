@@ -286,9 +286,7 @@ pub(crate) struct ReportSlot {
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
-    /// This slot, for a spawn that must not run its program outside the leaf: a child whose
-    /// placement write fails reports it, and then stops (`placement_hook` exits it), so `exec`
-    /// never runs.
+    /// This slot, for a spawn that must not run its program outside the leaf.
     pub(crate) fn refusing(self) -> ReportSlot {
         ReportSlot { refusing: true, ..self }
     }

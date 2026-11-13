@@ -2437,7 +2437,9 @@ fn decide_for(
             _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
         }
         ChildReport::WriteFailedWith(errno) => {
-            crate::containment::cgroup::fault::set_force_placement_write_result(-(errno as isize));
+            crate::containment::cgroup::fault::set_force_placement_write_result(
+                crate::containment::cgroup::fault::ForcedWrite::FailsWith(errno),
+            );
             // SAFETY: fd -1 is never writable, and the forced result stands for its write; closing -1
             // is a no-op. The slot's pipe lives as long as `leaf`.
             _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
@@ -2543,7 +2545,7 @@ fn a_failed_write_degrades_a_best_effort_spawn_and_removes_the_leaf() {
 #[skuld::test]
 fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
     crate::log_capture::install();
-    for errno in [libc::EBADF, libc::EBUSY] {
+    for errno in [libc::EBADF, libc::EBUSY, libc::EPERM] {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-decision-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -2593,9 +2595,11 @@ fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
 
 /// A child that sent no report never ran the program, whatever the mode: the attach fails as one
 /// that did not start, saying that no report came (not that the child "could not be placed"), with
-/// no cause beneath it, and the leaf is removed.
+/// no write errno beneath it, and the leaf is removed. The leaf here has no `cgroup.procs`, so the
+/// diagnosis read failed: its error is the one cause, as for a failed write.
 ///
-/// Mutants: `BestEffort` degrades it, the text says the placement failed, or it has a source.
+/// Mutants: `BestEffort` degrades it, the text says the placement failed, it has a write errno as a
+/// source, or the failed diagnosis read is dropped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_unreported_child_fails_the_attach_in_every_mode() {
@@ -2622,7 +2626,10 @@ fn an_unreported_child_fails_the_attach_in_every_mode() {
             ),
             "{mode:?}"
         );
-        assert!(source.is_none(), "{mode:?}: {source:?}");
+        assert!(
+            matches!(source.as_deref(), Some(crate::error::Error::Io(e)) if e.raw_os_error() == Some(libc::ENOENT)),
+            "{mode:?}: {source:?}"
+        );
         assert!(!leaf_path.exists(), "{mode:?}: the failed attach must remove the leaf");
     }
 }

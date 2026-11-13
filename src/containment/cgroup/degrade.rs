@@ -31,30 +31,16 @@ pub(crate) enum LeafError {
          do not tell these cases apart)"
     )]
     NoUnifiedLine { line_count: usize, controllers: String },
-    /// Whether this process may use its own cgroup could not be determined: the check failed with
-    /// something other than a refusal or a path that is not there.
-    #[error("could not check whether {} may be used for a leaf", path.display())]
-    CheckAccess {
+    /// The own cgroup's directory or its `cgroup.procs` could not be opened for a leaf.
+    #[error("could not open {} for a leaf", path.display())]
+    OpenOwnCgroup {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    /// As [`LeafError::CheckAccess`], on a kernel before Linux 5.8 for a process whose effective
-    /// ids differ from its real ones: the kernel has no `faccessat2`, and the older `faccessat`
-    /// checks the real ids.
-    #[error(
-        "could not check whether {} may be used for a leaf: the kernel has no faccessat2 (before \
-         Linux 5.8), and the older faccessat checks real ids, which differ from this process's \
-         effective ids",
-        path.display()
-    )]
-    CheckAccessUnavailable {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
-    /// write to (`EACCES`/`EPERM`), or a read-only cgroupfs (`EROFS`).
+    /// `mkdir` of the leaf failed. A refusal (`EACCES`, `EPERM`, `EROFS`) is the host not offering
+    /// the cgroup: an undelegated slice, a read-only cgroupfs, or a policy such as Landlock or
+    /// AppArmor.
     #[error("could not create the leaf cgroup {}", path.display())]
     CreateLeafDir {
         path: PathBuf,
@@ -113,8 +99,7 @@ impl LeafError {
         let source = match self {
             LeafError::ReadProcSelfCgroup(source)
             | LeafError::OpenReportChannel(source)
-            | LeafError::CheckAccess { source, .. }
-            | LeafError::CheckAccessUnavailable { source, .. }
+            | LeafError::OpenOwnCgroup { source, .. }
             | LeafError::CreateLeafDir { source, .. }
             | LeafError::CheckKill { source, .. }
             | LeafError::OpenProcs { source, .. }

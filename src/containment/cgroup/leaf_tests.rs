@@ -876,19 +876,36 @@ fn cgroup_leaf_procs_fd_is_not_inherited_across_exec(#[fixture(cgroup)] _group: 
 // Linux failure-path tests -----
 // Real filesystem, no cgroup v2 required: `create_leaf_under` is parameterised by the
 // directory it creates the leaf in, so every precondition it checks can be failed for real
-// against a temp directory on any Linux host.
+// against a temp directory on any Linux host. The temp directory stands for the own cgroup, so it
+// holds the `cgroup.procs` a cgroup always shows.
 
-/// A `mkdir` the kernel refuses reports the `mkdir` step, its path and its errno — not a
-/// bare "cgroups unavailable".
+/// A temp directory that stands for the own cgroup: it holds a `cgroup.procs`.
+#[cfg(target_os = "linux")]
+fn own_cgroup_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("create cgroup.procs");
+    dir
+}
+
+/// What a failed leaf creation left in the own cgroup's directory besides its `cgroup.procs`.
+#[cfg(target_os = "linux")]
+fn strays_in(own: &std::path::Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(own)
+        .expect("read the own cgroup")
+        .map(|e| e.expect("entry").file_name())
+        .filter(|name| name != "cgroup.procs")
+        .collect()
+}
+
+/// An own cgroup the kernel cannot show reports the open step, its path and its errno, and makes
+/// nothing: not a bare "cgroups unavailable".
 ///
-/// The refusal is a parent directory that does not exist (`ENOENT`), not one whose mode
-/// forbids writing: CI's cgroup lane runs as root, and root ignores directory permissions, so
-/// a mode-based refusal would be a no-op there and this test would assert nothing. `ENOENT`
-/// is uid-independent, and the step maps every errno the same way — it carries the kernel's
-/// reason rather than classifying it.
+/// The refusal is a directory that does not exist (`ENOENT`), not one whose mode forbids
+/// writing: CI's cgroup lane runs as root, and root ignores directory permissions. The mode rows
+/// are in `own_tests`, under the `unprivileged` group.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn create_leaf_under_reports_a_refused_mkdir() {
+fn create_leaf_under_reports_an_own_cgroup_it_cannot_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parent = dir.path().join("no-such-slice");
 
@@ -897,12 +914,31 @@ fn create_leaf_under_reports_a_refused_mkdir() {
         Ok(_) => panic!("creating a leaf under a nonexistent directory must fail"),
     };
     assert!(
-        matches!(err, LeafError::CreateLeafDir { .. }),
-        "expected CreateLeafDir, got {err:?}"
+        matches!(err, LeafError::OpenOwnCgroup { .. }),
+        "expected OpenOwnCgroup, got {err:?}"
     );
     let rendered = err.to_string();
     assert!(rendered.contains("no-such-slice"), "path missing from {rendered:?}");
     assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
+}
+
+/// An own cgroup whose `cgroup.procs` cannot be opened is the same step, naming that file.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn create_leaf_under_reports_an_own_cgroup_procs_it_cannot_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
+        Err(e) => e,
+        Ok(_) => panic!("an own cgroup with no cgroup.procs must fail"),
+    };
+    assert!(matches!(err, LeafError::OpenOwnCgroup { .. }), "got {err:?}");
+    assert!(err.to_string().contains("cgroup.procs"), "got {err}");
+    assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
+    assert!(
+        strays_in(dir.path()).is_empty(),
+        "nothing is made before the own cgroup opens"
+    );
 }
 
 /// The OS code on `err`'s `source()`.
@@ -918,7 +954,7 @@ fn first_source_code(err: &LeafError) -> Option<i32> {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn create_leaf_under_reports_a_missing_cgroup_kill() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = own_cgroup_dir();
     let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
         Ok(_) => panic!("a plain directory has no cgroup.kill; leaf creation must fail"),
@@ -928,10 +964,7 @@ fn create_leaf_under_reports_a_missing_cgroup_kill() {
         "expected KillUnsupported, got {err:?}"
     );
     assert!(err.to_string().contains("cgroup.kill"), "got {err}");
-    let strays: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("read tempdir")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
+    let strays = strays_in(dir.path());
     assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
 }
 
@@ -941,7 +974,7 @@ fn create_leaf_under_reports_a_missing_cgroup_kill() {
 #[skuld::test]
 fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
     crate::log_capture::install();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = own_cgroup_dir();
     let marker = dir.path().to_string_lossy().into_owned();
     crate::containment::cgroup::fault::set_force_occupy_before_unwind(true);
 
@@ -976,7 +1009,7 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = own_cgroup_dir();
     let parent = dir.path().to_path_buf();
     crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
@@ -993,10 +1026,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
         Some(libc::EACCES),
         "the errno is the diagnosis: {err:?}"
     );
-    let strays: Vec<_> = std::fs::read_dir(&parent)
-        .expect("read the parent")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
+    let strays = strays_in(&parent);
     assert!(strays.is_empty(), "a failed leaf creation left {strays:?} behind");
 }
 
@@ -2465,7 +2495,7 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = own_cgroup_dir();
     crate::containment::cgroup::fault::set_force_kill_supported(true);
     let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
         Err(e) => e,
@@ -2480,11 +2510,9 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
         "expected OpenProcs, got {err:?}"
     );
     assert!(err.to_string().contains("cgroup.procs"), "got {err}");
+    assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
 
-    let strays: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("read tempdir")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
+    let strays = strays_in(dir.path());
     assert!(
         strays.is_empty(),
         "the degrade left {strays:?} behind — a cosca-* cgroup this host then keeps forever"
@@ -2497,7 +2525,7 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = own_cgroup_dir();
     crate::containment::cgroup::fault::set_force_kill_supported(true);
     crate::containment::cgroup::fault::set_force_report_channel_failure(true);
     let err = match crate::containment::cgroup::create_leaf_under(dir.path(), None) {
@@ -2514,10 +2542,7 @@ fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf()
     );
     assert_eq!(first_source_code(&err), Some(libc::EMFILE), "got {err:?}");
 
-    let strays: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("read tempdir")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
+    let strays = strays_in(dir.path());
     assert!(strays.is_empty(), "a failed channel left {strays:?} behind");
 }
 
@@ -2905,6 +2930,39 @@ fn a_child_whose_refusing_placement_failed_exits_from_its_hook() {
     assert_eq!(channel.shut().placement(), PlacementReport::WriteFailed(libc::EBADF));
 }
 
+/// A child whose refusing placement cannot report it exits from its hook with `REFUSED_EXIT` too,
+/// having sent nothing: the parent reads no cause from the channel, and takes the child as one that
+/// sent no report.
+///
+/// Mutant: a refusing slot's unsent report exits `UNSENT_EXIT`, or returns to `exec`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_whose_refusing_placement_cannot_report_it_exits_refused_with_nothing_sent() {
+    use std::os::fd::IntoRawFd;
+
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let slot = crate::containment::cgroup::test_support::unsendable(channel.slot().refusing());
+    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
+    let guard = fork_running(&[procs_fd], move || {
+        // SAFETY: this child's inherited copy of the descriptor; the report end is deliberately not open.
+        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
+    });
+    // SAFETY: the parent's own copy, closed once; the child keeps its own.
+    unsafe { libc::close(procs_fd) };
+
+    let pid = guard.defuse();
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    assert!(libc::WIFEXITED(status), "status {status:#x}");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        crate::containment::cgroup::REFUSED_EXIT,
+        "a refusing child that cannot report exits from its hook"
+    );
+    assert_eq!(channel.shut().placement(), PlacementReport::NotReported);
+}
+
 /// A lenient child whose report cannot be sent exits from its hook with `UNSENT_EXIT` instead of
 /// returning an error to `std`: with fds 0 and 2 closed, `std`'s status pipe takes the child's
 /// stderr number and `std` returns before the hook runs, so an error record would be written into
@@ -3223,7 +3281,9 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
         .open("/dev/null")
         .expect("open /dev/null");
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    crate::containment::cgroup::fault::set_force_placement_write_result(0);
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
     // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
     let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, channel.slot()) };
     assert!(

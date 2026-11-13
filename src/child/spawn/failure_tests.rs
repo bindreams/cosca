@@ -338,31 +338,6 @@ fn a_not_started_attach_with_a_clean_teardown_stays_not_started() {
     );
 }
 
-/// A failed attach that says the program never ran is a not-started failure whatever its teardown
-/// left: the child never ran, so there is nothing to hand back, and the teardown's own failures went
-/// into the failed spawn's warn.
-///
-/// Mutant: `failed_attach` answers `MayHaveStarted` when the teardown has a failure or leaves the
-/// child running.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_not_started_attach_is_not_started_whatever_the_teardown_left() {
-    let id = crate::identity::ProcessId::current();
-    let running = ChildFate::Running { id: Some(id) };
-    let torn = Torn {
-        fate: running,
-        unreaped: None,
-        cleanup: crate::error::Failures::collect([std::sync::Arc::new(io("teardown"))]),
-    };
-
-    let failure = super::failed_attach(true, io("refused"), None, None, torn);
-
-    assert!(
-        matches!(failure, SpawnFailure::NotStartedWithChild { fate, .. } if fate == running),
-        "{failure:?}"
-    );
-}
-
 /// A failed attach that did not say the program never ran is `MayHaveStarted`, a clean teardown or
 /// not.
 ///

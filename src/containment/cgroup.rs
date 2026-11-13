@@ -3,10 +3,8 @@
 //! When cgroup v2 is mounted, delegated, and writable with `cgroup.kill`
 //! support, the spawned child is placed in a freshly created leaf sub-cgroup.
 //! Teardown writes `"1"` to `cgroup.kill` — the kernel atomically kills every
-//! process in the leaf (fork-proof). `ContainMode::Strongest` decides on whether the host offers
-//! its own cgroup for a leaf (see `offered_cgroup`) and fails the spawn when any step after that
-//! fails; a host that offers none gets the process-group mechanism. `ContainMode::BestEffort`
-//! falls back to the process-group mechanism when any precondition fails (see `try_create_leaf`).
+//! process in the leaf (fork-proof). Which mode fails and which degrades is in `ContainMode`'s
+//! docs; see `leaf_if_offered` and `try_create_leaf`.
 //!
 //! # Delegation prerequisite
 //! cgroup v2 requires "no internal processes": a non-root cgroup may not

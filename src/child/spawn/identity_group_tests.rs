@@ -85,7 +85,9 @@ impl Container {
         match self {
             Container::Session => (crate::ContainMode::Session, PlacementForced),
             Container::LeafNotTaken => {
-                crate::containment::cgroup::fault::set_force_placement_write_result(0);
+                crate::containment::cgroup::fault::set_force_placement_write_result(
+                    crate::containment::cgroup::fault::ForcedWrite::Returns0,
+                );
                 (crate::ContainMode::BestEffort, PlacementForced)
             }
             Container::Leafless => {
