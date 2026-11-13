@@ -28,10 +28,10 @@ fn graceful_call() -> SkipCall<'static> {
 fn skip() -> Skip {
     Skip {
         action: format!("signal its process group (pgid {PGID})"),
-        why: Why::MayNameAnother(Refusal::Unsure(
-            PGID as u32,
-            std::sync::Arc::new(std::io::Error::other("forced")),
-        )),
+        why: Why::MayNameAnother(
+            Refusal::Unsure(PGID as u32, std::sync::Arc::new(std::io::Error::other("forced"))),
+            None,
+        ),
         root_alone: true,
         holders: None,
     }

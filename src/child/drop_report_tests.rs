@@ -1085,6 +1085,38 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     );
 }
 
+/// A drop that can read neither the handle nor the root's number says why the number could not be
+/// read, when the read knows: the `debug` line carries the failed call's error.
+///
+/// Mutant: `DropView::read` keeps the read's `Unknown` and drops its cause.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unreadable_number_is_logged_with_why() {
+    crate::log_capture::install();
+    let (mut child, _writer) = contained_blocker(ContainMode::Session);
+    let mark = crate::log_capture::mark();
+    let _number = crate::child::fault::force_root_reads_failing(crate::identity::FailedCall::pidfd_open(
+        rustix::io::Errno::MFILE,
+    ));
+    let fake = child
+        .proc
+        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 8c3"))]));
+
+    let _view = crate::containment::DropView::read(
+        crate::containment::dispatch::TeardownCaller::Drop,
+        child.pid(),
+        child.id,
+        || child.proc.state(),
+        &child.tree,
+    );
+
+    fake.assert_peeks_exhausted();
+    let records = crate::log_capture::records_since_on_current_thread(mark, "could not be read either");
+    assert_eq!(records.len(), 1, "{records:?}");
+    let emfile = std::io::Error::from_raw_os_error(libc::EMFILE).to_string();
+    assert!(records[0].1.contains(&emfile), "{records:?} lacks {emfile}");
+}
+
 /// The kill decides on the look the report is worded from: a handle that could not say, whose
 /// number shows the reap, is `Reaped` to the mechanism too, not the handle's raw `Unknown`.
 ///
