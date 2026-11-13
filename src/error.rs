@@ -246,10 +246,9 @@ pub enum Error {
     ///   `kill_tree` and `hard_kill`;
     /// - a spawn, where the identity is read through the view.
     ///
-    /// A refusal met after the view opened, while a listing or walk reads a pid's `stat` (a seccomp
-    /// filter installed mid-scan), is the same: the refusing errno is the `source`, and when the
-    /// directory refused `self/stat` after the pid's `stat` answered `EPERM`, the pid's own failure
-    /// is a second cause.
+    /// A refusal met after the view opened (a seccomp filter installed mid-scan) is the same: the
+    /// refusing errno is the `source`, and the failure of the pid it was met beside, if any, a
+    /// second cause.
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this

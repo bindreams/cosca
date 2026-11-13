@@ -3,9 +3,8 @@
 //!
 //! A scan that skips a pid it could not read reports a table with a live process missing, and a
 //! tree walk over it misses that process and its subtree. So only the errnos that mean "this pid is
-//! not there for us" skip; every other one fails the scan. A refused `openat2` (a seccomp filter
-//! installed mid-scan) is [`PidStat::Refused`], for the scan to fail as `Unsupported`, as a refused
-//! view-open does.
+//! not there for us" skip; every other one fails the scan, as `Unsupported` when it is a
+//! [`Refusal`].
 
 use std::io;
 use std::sync::Arc;
@@ -23,9 +22,7 @@ pub(crate) enum PidStat {
     /// The pid exited mid-scan (`ENOENT`/`ESRCH`), or `hidepid` hides it (`EACCES`, or `EPERM`
     /// while the checked directory still answers). The error is why.
     Skipped(io::Error),
-    /// The `openat2` of the read was refused: the `stat` answered `ENOSYS`/`ENODEV`, or `EPERM` while
-    /// the checked directory refuses `self/stat` too, with a refusal errno. The refusing errno is
-    /// its cause, and the pid's own `EPERM` the second one when the directory refused.
+    /// The read was refused.
     Refused(Refusal),
 }
 
@@ -72,12 +69,10 @@ enum Kind {
     /// `EXDEV`/`ELOOP`: the checked directory refused to cross a mount, so the record is not the
     /// kernel's.
     BeyondMount,
-    /// `EPERM`, and the checked directory refused `self/stat` too: the pid's failure, which comes
-    /// beside the refusal ([`Refusal::beside`]) and is the source of this layer.
+    /// The pid's failure beside a refusal ([`Refusal::beside`]); the source of this layer.
     BesideRefusal,
-    /// `EPERM`, and the `self/stat` re-check failed without refusing (`EMFILE`, `ENOMEM`, ...):
-    /// whether the pid is hidden is unknown. The re-check's error is the source, and the pid's own
-    /// `EPERM` is the peer.
+    /// `EPERM`, and the `self/stat` re-check failed without refusing: whether the pid is hidden is
+    /// unknown. The re-check's error is the source, and the pid's own `EPERM` is the peer.
     RecheckFailed,
     /// `EMFILE`, `ENOMEM`, `EIO`, ...: nothing is known about the pid.
     Other,
@@ -101,9 +96,7 @@ impl std::error::Error for Unreadable {
     }
 }
 
-/// `pid`'s `stat` through `dir`: [`PidStat::Skipped`] for the errnos that mean the pid is not
-/// there for us, [`PidStat::Refused`] for a refused `openat2`, [`Unreadable`] for every other.
-/// Never asks `kill(pid, 0)`.
+/// `pid`'s `stat` through `dir`, as [`failed_read`] decides a failure. Never asks `kill(pid, 0)`.
 pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
     match read_stat_file(kernel, dir, pid) {
         Ok(stat) => Ok(PidStat::Read(stat)),
@@ -113,8 +106,7 @@ pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Resu
 
 /// What `source`, the error of the failed `stat` read of `pid` through `dir`, means:
 /// [`PidStat::Skipped`] for the errnos that mean the pid is not there for us, [`PidStat::Refused`]
-/// for a refused `openat2`, [`Unreadable`] for every other. The policy of [`read_in_scan`], for a
-/// by-pid read that has a failed read in hand.
+/// for a [`Refusal`], [`Unreadable`] for every other. The one policy of every by-pid `stat` read.
 pub(crate) fn failed_read(
     kernel: &dyn Kernel,
     dir: &ProcDir,
@@ -151,15 +143,14 @@ pub(crate) fn failed_read(
     Err(Unreadable { pid, kind, cause, peer })
 }
 
-/// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`],
-/// `identity::linux::stat_by_pid`, the cgroup leaf's state read).
+/// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`], the by-pid
+/// read `identity::linux::read_in`, the cgroup leaf's state read).
 pub(crate) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io::Result<Vec<u8>> {
     kernel.read(dir, &format!("{pid}/stat"))
 }
 
-/// The refused `openat2` that `error` is, when its errno is one [`FailedCall::requirement`] counts
-/// as a refusal.
-fn refusal(error: &io::Error) -> Option<Refusal> {
+/// The [`Refusal`] that `error`, the failure of an `openat2` read, is, by its errno.
+pub(crate) fn refusal(error: &io::Error) -> Option<Refusal> {
     FailedCall::openat2(Errno::from_io_error(error)?).refusal()
 }
 

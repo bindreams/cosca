@@ -76,12 +76,9 @@ impl FailedCall {
         self.errno
     }
 
-    /// What cosca requires of the kernel, when this call is a refusal: the one sentence an
+    /// What cosca requires of the kernel, when this call is a [`Refusal`]: the one sentence an
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a refused call carries as its
-    /// `detail`.
-    ///
-    /// Refusal sets per call: see [`Error::Unsupported`](crate::error::Error::Unsupported). No other
-    /// call is refused; its failure, with any errno, is its own.
+    /// `detail`. The table is the one place that says which errno of which call is a refusal.
     pub(crate) fn requirement(&self) -> Option<String> {
         let (floor, errno) = match (self.call, self.errno) {
             (Call::PidfdOpen, Errno::NOSYS) => ("5.3", "ENOSYS"),
@@ -117,6 +114,13 @@ impl FailedCall {
 
 /// A [`FailedCall`] that is a refusal, with the [`requirement`](FailedCall::requirement) it names,
 /// built once: a holder never asks again whether the call was refused.
+///
+/// The rule, stated here once for every place an `openat2` or `pidfd_open` is met: a call is refused
+/// when its errno is in [`requirement`](FailedCall::requirement)'s table. A read in `/proc` is an
+/// `openat2` here, so the same holds for the view-open, the reads that establish the view, the
+/// `/proc` listing and each pid's `stat`. That `stat` answering `EPERM` is `hidepid`'s answer, and a
+/// refusal only if the checked directory refuses `self/stat` too: the re-check's errno is then the
+/// refusal, and the pid's failure is kept beside it. Every other errno is the call's own failure.
 #[derive(Debug)]
 pub(crate) struct Refusal {
     call: FailedCall,
@@ -127,7 +131,7 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    /// This refusal, with `failure`, the other failure of the same read, kept as a second cause.
+    /// This refusal, with `failure`, the other failure it was met beside, kept as a second cause.
     pub(crate) fn beside(mut self, failure: Arc<Error>) -> Refusal {
         self.beside = Some(failure);
         self
@@ -157,6 +161,13 @@ impl Refusal {
             source: Some(Arc::new(self.cause())),
         }
     }
+}
+
+/// `error`, what a [`Refusal`] ended the scan `caller` with, logged at `warn` and handed back. The
+/// one place such a refusal is warned about, where it is met: its caller does not log it again.
+pub(crate) fn warn_refused<E: std::error::Error + 'static>(caller: &str, error: E) -> E {
+    log::warn!("{caller}: {report}", report = crate::error::Report(&error));
+    error
 }
 
 /// What opening `pid` found about the process a `Pidfs` id names.

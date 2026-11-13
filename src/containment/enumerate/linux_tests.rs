@@ -219,23 +219,48 @@ fn a_refused_openat2_mid_scan_is_unsupported_naming_the_refusing_errno() {
                         );
                         let second = crate::error::Report(*second).to_string();
                         assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {second}");
-                        assert_eq!(
-                            crate::error::first_os_code(&error),
-                            Some(refusing),
-                            "{stat}/{recheck:?}: the refusal is the source"
-                        );
                     }
                     (_, causes) => panic!("{stat}/{recheck:?}: unexpected causes {causes:?}"),
                 }
             }
             other => panic!("{stat}/{recheck:?}: expected Unsupported, got {other:?}"),
         }
-        assert!(
-            records
-                .iter()
-                .any(|(level, line)| *level == log::Level::Warn && line.contains("requires openat2")),
-            "{stat}/{recheck:?}: {records:?}"
-        );
+        assert_warned_once_about_openat2(&records, &format!("{stat}/{recheck:?}"));
+    }
+}
+
+/// The snapshot logged exactly one warning, and it names the `openat2` requirement.
+fn assert_warned_once_about_openat2(records: &Records, row: &str) {
+    let warns: Vec<_> = records.iter().filter(|(level, _)| *level == log::Level::Warn).collect();
+    assert!(
+        matches!(warns.as_slice(), [(_, line)] if line.contains("requires openat2")),
+        "{row}: {records:?}"
+    );
+}
+
+/// An `openat2` refused before any pid is read is the same `Unsupported`: the `/proc` listing, and the
+/// read of `self/status` that establishes the view. Each is warned about once. Any other listing
+/// failure stays `Unassessable`. Mutant: "an `openat2` refused before any pid is read is
+/// `Unassessable`".
+#[skuld::test]
+fn a_refused_openat2_in_the_listing_or_the_view_read_is_unsupported() {
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
+        let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
+        for (what, kernel) in [("listing", listing), ("self/status", status)] {
+            let (got, records) = snapshot_with(&kernel);
+            match got {
+                Err(error @ crate::error::Error::Unsupported { .. }) => {
+                    assert_eq!(
+                        crate::error::first_os_code(&error),
+                        Some(errno),
+                        "{what} {errno}: {error:?}"
+                    );
+                }
+                other => panic!("{what} {errno}: expected Unsupported, got {other:?}"),
+            }
+            assert_warned_once_about_openat2(&records, &format!("{what} {errno}"));
+        }
     }
 }
 

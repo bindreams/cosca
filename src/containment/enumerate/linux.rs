@@ -6,21 +6,24 @@ use crate::identity::pid_stat::{self, PidStat};
 use crate::identity::stat_parse::parse_ppid;
 use crate::identity::Kernel;
 use crate::identity::RawPid;
+use crate::identity::{warn_refused, Refusal};
 
 /// An outer pid namespace's `/proc` lists pids that mean nothing to the caller, and the tree walk
 /// signals by pid, so it is an error, not a snapshot. So is every `stat` read that is not an
-/// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]).
+/// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]). A
+/// [`Refusal`], wherever in the snapshot it is met, is [`Error::Unsupported`], warned about once.
 pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
     let dir = crate::identity::proc_view_with(kernel)
         .into_dir()
-        .map_err(|why| match why.unsupported(OP_NAME) {
-            Some(unsupported) => warned(unsupported),
+        .map_err(|why| match why.refusal() {
+            Some(refusal) => refused(&refusal),
             None => unassessable(&why.reason, why.source),
         })?;
-    let pids = kernel
-        .pids(&dir)
-        .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
+    let pids = kernel.pids(&dir).map_err(|e| match pid_stat::refusal(&e) {
+        Some(refusal) => refused(&refusal),
+        None => unassessable("/proc could not be listed", Some(e)),
+    })?;
     for pid in pids {
         let stat = match pid_stat::read_in_scan(kernel, &dir, pid) {
             Ok(PidStat::Read(stat)) => stat,
@@ -32,7 +35,7 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
                 );
                 continue;
             }
-            Ok(PidStat::Refused(refusal)) => return Err(warned(refusal.unsupported(OP_NAME))),
+            Ok(PidStat::Refused(refusal)) => return Err(refused(&refusal)),
             Err(unreadable) => return Err(stat_unreadable(unreadable)),
         };
         match ppid_of_stat(pid, &stat) {
@@ -59,13 +62,9 @@ fn ppid_of_stat(pid: RawPid, stat: &[u8]) -> Result<RawPid, Error> {
 /// What the snapshot's [`Error::Unsupported`] names as its `op`.
 const OP_NAME: &str = "listing the process table";
 
-/// `unsupported`, a refused `openat2` that ended the snapshot, logged at `warn`.
-fn warned(unsupported: Error) -> Error {
-    log::warn!(
-        "enumerate::process_parents: {report}",
-        report = crate::error::Report(&unsupported)
-    );
-    unsupported
+/// The snapshot that a refusal ended, warned about here.
+fn refused(refusal: &Refusal) -> Error {
+    warn_refused("enumerate::process_parents", refusal.unsupported(OP_NAME))
 }
 
 fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {

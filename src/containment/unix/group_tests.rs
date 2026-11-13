@@ -828,9 +828,11 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
 fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
     use rustix::process::Pid;
 
+    crate::log_capture::install();
     for (stat, recheck, refusing) in [
         (libc::EPERM, Some(libc::EPERM), libc::EPERM),
         (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+        (libc::EPERM, Some(libc::ENODEV), libc::ENODEV),
         (libc::ENOSYS, None, libc::ENOSYS),
         (libc::ENODEV, None, libc::ENODEV),
     ] {
@@ -841,6 +843,7 @@ fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
         if let Some(recheck) = recheck {
             kernel = kernel.on_read("self/stat", Err(recheck));
         }
+        let mark = crate::log_capture::mark();
         let err = members(&kernel, 1234).expect_err("a refused own read lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert_eq!(
@@ -854,23 +857,73 @@ fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
             Some(refusing),
             "{stat}/{recheck:?}: {text}"
         );
+        match (recheck, text.split_once("(2) ")) {
+            (Some(_), Some((_, second))) => {
+                assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {text}");
+                assert!(
+                    second.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+                    "{stat}/{recheck:?}: the pid's EPERM is below the second cause: {text}"
+                );
+            }
+            (Some(_), None) => panic!("{stat}/{recheck:?}: the pid's own failure is kept: {text}"),
+            (None, second) => assert!(second.is_none(), "{stat}/{recheck:?}: a lone refusal: {text}"),
+        }
         assert_eq!(
-            text.contains("(2) "),
-            recheck.is_some(),
-            "{stat}/{recheck:?}: the pid's own failure is the second cause of a directory's refusal: {text}"
+            crate::log_capture::warns_since(mark, "").len(),
+            1,
+            "{stat}/{recheck:?}: warned once"
         );
     }
 }
 
-/// A read of the member's own `stat` that fails without refusing stays an exclusion with no cause:
-/// `EIO`, or `EPERM` while the checked directory still answers (`hidepid`). Mutant: "any failed own
-/// read fails the listing".
+/// A read of the member's own `stat` that fails without refusing and is no absence fails the listing,
+/// naming the pid and carrying the errno, because excluding a live member could clear a live group:
+/// `EIO`, `EMFILE`, a mount crossing, or `EPERM` beside a `self/stat` that fails too. Mutant: "a failed
+/// own read excludes the member".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn members_excludes_a_pid_whose_own_stat_read_fails_without_refusing() {
+fn members_fails_when_the_members_own_stat_read_is_unreadable() {
     use rustix::process::Pid;
 
-    for (stat, recheck) in [(libc::EIO, None), (libc::EPERM, Some(Ok(&b""[..])))] {
+    for (stat, recheck, below) in [
+        (libc::EIO, None, libc::EIO),
+        (libc::EMFILE, None, libc::EMFILE),
+        (libc::EXDEV, None, libc::EXDEV),
+        (libc::ELOOP, None, libc::ELOOP),
+        (libc::EPERM, Some(libc::EMFILE), libc::EMFILE),
+    ] {
+        let (kernel, _writer) = scan_shows_group_1234();
+        let mut kernel = kernel
+            .on_signal_probe(Pid::from_raw(PID as i32).expect("a pid"), Ok(()))
+            .on_read_after(&format!("{PID}/stat"), 1, Err(stat));
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", Err(recheck));
+        }
+        let err = members(&kernel, 1234).expect_err("an unreadable own read lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{stat}/{recheck:?}: {text}");
+        assert!(text.contains(&format!("pid {PID}")), "{stat}/{recheck:?}: {text}");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(below),
+            "{stat}/{recheck:?}: {text}"
+        );
+    }
+}
+
+/// A read of the member's own `stat` that is no more than an absence stays an exclusion with no cause:
+/// `ENOENT` or `EACCES` of a pid `kill(pid, 0)` does not say is gone, or `EPERM` while the checked
+/// directory still answers (`hidepid`). Mutant: "any failed own read fails the listing".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_excludes_a_pid_whose_own_stat_read_is_an_absence() {
+    use rustix::process::Pid;
+
+    for (stat, recheck) in [
+        (libc::ENOENT, None),
+        (libc::EACCES, None),
+        (libc::EPERM, Some(Ok(&b""[..]))),
+    ] {
         let (kernel, _writer) = scan_shows_group_1234();
         let mut kernel = kernel
             .on_signal_probe(Pid::from_raw(PID as i32).expect("a pid"), Ok(()))
@@ -885,6 +938,37 @@ fn members_excludes_a_pid_whose_own_stat_read_fails_without_refusing() {
             "{stat}"
         );
     }
+}
+
+/// An `openat2` refused where the listing begins is the same `Unsupported`: the `/proc` listing
+/// (`ENOSYS`, `EPERM`, `ENODEV` of the open), and the read of `self/status` that establishes the view.
+/// Each is warned about once. Any other listing failure stays an error with its own errno. Mutant:
+/// "an `openat2` refused before any pid is read is `Other`".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
+    crate::log_capture::install();
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
+        let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
+        for (what, kernel) in [("listing", listing), ("self/status", status)] {
+            let mark = crate::log_capture::mark();
+            let err = members(&kernel, i32::MAX).expect_err("a refused openat2 lists nothing");
+            let text = crate::error::Report(&err).to_string();
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{what} {errno}: {text}");
+            assert!(text.contains("requires openat2"), "{what} {errno}: {text}");
+            assert_eq!(crate::error::first_os_code(&err), Some(errno), "{what} {errno}: {text}");
+            assert_eq!(
+                crate::log_capture::warns_since(mark, "").len(),
+                1,
+                "{what} {errno}: warned once"
+            );
+        }
+    }
+    let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
+    let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
+    assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
 }
 
 /// `PID` is in group 1234 by the scan's `stat`; the identity read that follows makes its own.

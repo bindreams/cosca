@@ -69,9 +69,8 @@ pub(crate) struct ViewUnreadable {
     pub(crate) reason: String,
     /// The OS error behind `reason`, when there was one.
     pub(crate) source: Option<io::Error>,
-    /// The `openat2` of `/proc` that failed, when that is why the view could not be established.
-    /// If [`FailedCall::requirement`] is `Some`, the call was refused and no `/proc` view can ever
-    /// be established here.
+    /// The `openat2` that failed, when that is why the view could not be established: of `/proc`
+    /// itself or of a file read to check it.
     openat2: Option<FailedCall>,
 }
 
@@ -90,6 +89,15 @@ impl ViewUnreadable {
         ViewUnreadable {
             openat2: Some(call),
             ..ViewUnreadable::new("/proc could not be opened", Some(call.errno().into()))
+        }
+    }
+
+    /// The view that the failed read `source` of a file under `/proc` leaves: its errno, if it has
+    /// one, is the `openat2`'s, and [`refusal`](Self::refusal) decides whether that is a refusal.
+    fn of_read(reason: impl Into<String>, source: io::Error) -> Self {
+        ViewUnreadable {
+            openat2: rustix::io::Errno::from_io_error(&source).map(FailedCall::openat2),
+            ..ViewUnreadable::new(reason, Some(source))
         }
     }
 
@@ -238,7 +246,7 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
-            return ProcView::Unassessable(ViewUnreadable::new(UNREADABLE_STATUS_REASON, Some(e)));
+            return ProcView::Unassessable(ViewUnreadable::of_read(UNREADABLE_STATUS_REASON, e));
         }
     };
     let verdict = match classify_status(&status, || ns_pid_exists(&dir)) {
@@ -275,9 +283,9 @@ fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> io::Result<bool
         return match ns_pid_exists() {
             Ok(false) => Verdict::Same,
             Ok(true) => Verdict::NoNspid,
-            Err(e) => Verdict::Unassessable(ViewUnreadable::new(
+            Err(e) => Verdict::Unassessable(ViewUnreadable::of_read(
                 "self/status has no NSpid line and self/ns/pid could not be checked",
-                Some(e),
+                e,
             )),
         };
     };
@@ -330,9 +338,9 @@ fn pid_ns_link(link: io::Result<Vec<u8>>, path: &str) -> Result<Vec<u8>, ViewUnr
             ),
             None,
         )),
-        Err(e) => Err(ViewUnreadable::new(
+        Err(e) => Err(ViewUnreadable::of_read(
             format!("self/status has no NSpid line and {path} could not be read"),
-            Some(e),
+            e,
         )),
     }
 }

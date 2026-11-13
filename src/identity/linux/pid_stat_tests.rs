@@ -99,8 +99,17 @@ fn the_other_failure_of_a_refused_pid_is_kept_beside_the_refusal() {
         };
         let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
         assert_eq!(codes, [Some(recheck), Some(libc::EPERM)], "{recheck}");
-        let second = crate::error::Report(&**causes.iter().nth(1).expect("a second cause")).to_string();
-        assert!(second.contains("4242/stat"), "{recheck}: {second}");
+        let second = &**causes.iter().nth(1).expect("a second cause");
+        let words = crate::error::Report(second).to_string();
+        assert!(
+            words.contains("4242/stat was refused, and the checked /proc refused self/stat too"),
+            "{recheck}: {words}"
+        );
+        assert_eq!(
+            crate::error::first_os_code(second),
+            Some(libc::EPERM),
+            "{recheck}: {words}"
+        );
     }
     let kernel = FakeKernel::new().on_read("4242/stat", Err(libc::ENOSYS));
     let Ok(PidStat::Refused(refusal)) = read_in_scan(&kernel, &dir, 4242) else {
