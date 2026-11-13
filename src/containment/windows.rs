@@ -27,8 +27,8 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
-    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::error::{io_context, win32_io_error};
@@ -213,30 +213,45 @@ impl JobHandle {
         };
         let (mut members, mut unobserved) = (Vec::new(), Vec::new());
         for pid in pids.into_iter().filter(|pid| Some(*pid) != root) {
-            // SAFETY: a standard Win32 call; `member_to_watch` closes the handle unless it returns it.
-            let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
-            match member_to_watch(opened, self.raw) {
-                Ok(Some(handle)) => {
-                    let id = crate::identity::windows_identity_from_handle_result(handle, pid);
-                    // SAFETY: opened above, and kept nowhere else.
-                    _ = unsafe { CloseHandle(handle) };
-                    match id {
-                        Ok(id) => members.push(id),
-                        Err(e) => unobserved.push(exit_unobserved(
-                            pid,
-                            Error::Unassessable {
-                                detail: "its start time could not be read".to_owned(),
-                                source: Some(Error::io_cause(win32_io_error(e))),
-                            },
-                        )),
-                    }
-                }
+            match member_identity(self.raw, pid, open_for_membership(pid)) {
+                Ok(Some(id)) => members.push(id),
                 Ok(None) => {}
-                Err(e) => unobserved.push(exit_unobserved(pid, Error::Io(e))),
+                Err(cause) => unobserved.push(exit_unobserved(pid, cause)),
             }
         }
         (members, unobserved)
     }
+}
+
+/// `OpenProcess` for what proving membership and waiting need: `PROCESS_QUERY_LIMITED_INFORMATION` is
+/// what `IsProcessInJob` needs and `PROCESS_SYNCHRONIZE` does not imply it; the least rights that
+/// work, grantable across integrity levels. The handle is the caller's to close, or to pass to
+/// [`member_to_watch`] or [`member_identity`], which close it unless they return it.
+fn open_for_membership(pid: u32) -> windows::core::Result<HANDLE> {
+    // SAFETY: a standard Win32 call with no borrowed arguments.
+    unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+}
+
+/// The identity of the process `OpenProcess` returned as `opened`, if it is a member of `job`; `None`
+/// if it is not one (its pid is gone or was reused). The handle is closed on every path. The error is
+/// the cause that kept membership or the identity from being established.
+fn member_identity(
+    job: HANDLE,
+    pid: u32,
+    opened: windows::core::Result<HANDLE>,
+) -> Result<Option<ProcessId>, crate::error::Error> {
+    use crate::error::Error;
+
+    let Some(handle) = member_to_watch(opened, job).map_err(Error::Io)? else {
+        return Ok(None);
+    };
+    let id = crate::identity::windows_identity_from_handle_result(handle, pid);
+    // SAFETY: opened by the caller and kept nowhere else.
+    _ = unsafe { CloseHandle(handle) };
+    id.map(Some).map_err(|e| Error::Unassessable {
+        detail: "its start time could not be read".to_owned(),
+        source: Some(Error::io_cause(win32_io_error(e))),
+    })
 }
 
 impl crate::containment::Contains for JobHandle {
@@ -998,14 +1013,13 @@ impl JobHandle {
     /// signaled on exit is an unconditional, always-honored OS guarantee — unlike a job message
     /// — so as long as this round's tree is non-empty, at least one tracked handle WILL
     /// eventually signal, forcing a fresh re-enumeration next round. A member leaves the job's list
-    /// slightly before its process object is signalled, so an empty re-count is the drain only once
-    /// every handle this wait still holds on a member it listed is signalled too: the wait blocks on
-    /// them, one at a time, before it answers. Never reports `AllMembersExited` falsely (only an
-    /// empty re-count, with those handles signalled, does); with more than `MAXIMUM_WAIT_OBJECTS -
-    /// 1` live members it may notice the drain late, and a member that exits between two listings
-    /// without this wait having opened it is not waited for. A wait whose first listing is already
-    /// empty holds no handle to wait on. The handle stays open after
-    /// [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree.
+    /// before its process object is signalled, and after a kill the list can be empty while members
+    /// have not been signalled, so an empty re-count (the first one too) is the drain only once the
+    /// members a system process snapshot still names that are in this job have exited: the wait
+    /// opens each, one at a time, waits for it and closes it ([`confirm_drained`]). Never reports
+    /// `AllMembersExited` falsely (only an empty re-count with no such member left does); with more
+    /// than `MAXIMUM_WAIT_OBJECTS - 1` live members it may notice the drain late. The handle stays
+    /// open after [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1022,19 +1036,25 @@ impl JobHandle {
 
     /// One round of the drain wait: list the live members, open each (up to the wait-set cap) with
     /// `SYNCHRONIZE`, and say what the round decided. `last_round` is whether the caller's deadline
-    /// has already passed, on the caller's clock. `watch` is the handles the wait holds from its
-    /// earlier rounds, which one wait passes to every round. What a round answers is stated at
+    /// has already passed, on the caller's clock. What a round answers is stated at
     /// [`wait_drained_raw`].
     #[cfg(feature = "tokio")]
-    pub(crate) fn drain_round(&self, last_round: bool, watch: &mut Watch) -> Result<Round, crate::error::Error> {
-        drain_round(HANDLE(self.handle().as_raw_handle()), last_round, watch)
+    pub(crate) fn drain_round(&self, last_round: bool) -> Result<Round, crate::error::Error> {
+        drain_round(HANDLE(self.handle().as_raw_handle()), last_round)
     }
 
-    /// What follows a round's wait that ended on a member's handle: the answer or the wait for the
-    /// members that left the list if the round was the last, the next round if not.
+    /// What follows a round's wait that ended on a member's handle: the answer or the confirmation of
+    /// an empty listing if the round was the last, the next round if not.
     #[cfg(feature = "tokio")]
-    pub(crate) fn after_signalled(&self, watch: &mut Watch) -> Result<Round, crate::error::Error> {
+    pub(crate) fn after_signalled(&self, watch: &Watch) -> Result<Round, crate::error::Error> {
         after_signalled(HANDLE(self.handle().as_raw_handle()), watch)
+    }
+
+    /// The members an empty listing leaves to be waited for ([`Round::Confirm`]): see
+    /// [`confirm_drained`].
+    #[cfg(feature = "tokio")]
+    pub(crate) fn unsignalled_members(&self) -> Result<Vec<ProcessId>, crate::error::Error> {
+        unsignalled_members(HANDLE(self.handle().as_raw_handle()))
     }
 }
 
@@ -1121,17 +1141,17 @@ fn thread_entries_closing(
 /// The blocking driver of the drain wait's rounds ([`drain_round`]), taking a borrowed handle rather
 /// than `&JobHandle`.
 ///
-/// A bounded wait answers from the job's list as of its last look, so `MembersRemain` means the tree
-/// was not seen drained by the deadline. A round that starts past the deadline (an already-elapsed or
-/// `Duration::ZERO` one, or one reached after a wait ended on a member's exit) is the last. It lists:
-/// an empty listing is `AllMembersExited` however late the caller arrived. Live members that a
-/// zero-ms poll finds none signalled are `MembersRemain`. Otherwise the listing may be stale (a
-/// deleted pid shows for one listing after a member's exit, or a polled handle was signalled), and
-/// exactly one more listing is final: empty is `AllMembersExited`, anything else `MembersRemain`.
+/// `MembersRemain` means the tree was not seen drained by the deadline. A round that starts past the
+/// deadline (an already-elapsed or `Duration::ZERO` one, or one reached after a wait ended on a
+/// member's exit) is the last. It lists: an empty listing is confirmed however late the caller
+/// arrived. Live members that a zero-ms poll finds none signalled are `MembersRemain`. Otherwise the
+/// listing may be stale (a deleted pid shows for one listing after a member's exit, or a polled
+/// handle was signalled), and exactly one more listing is final: empty is confirmed, anything else
+/// `MembersRemain`.
 ///
-/// An empty listing is the drain only once the members this wait opened and the listing no longer
-/// names are signalled too (see [`Round::Settle`]); until the deadline, that waits for them, and at
-/// it, `MembersRemain` answers if one is not.
+/// An empty listing, the first one too, is no answer by itself: [`confirm_drained`] waits for the
+/// members a system snapshot still names, until the deadline, and `AllMembersExited` answers only
+/// once none is left; one still running at the deadline is `MembersRemain`.
 pub(crate) fn wait_drained_raw(
     job: BorrowedHandle<'_>,
     deadline: Option<std::time::Instant>,
@@ -1139,26 +1159,24 @@ pub(crate) fn wait_drained_raw(
     use crate::containment::TreeDrain;
 
     let job = HANDLE(job.as_raw_handle());
-    let mut watch = Watch::default();
     loop {
         // A round that starts past the deadline is the last: it lists and answers, with at most one
         // more listing (`final_listing`).
         let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
-        let round = match drain_round(job, last_round, &mut watch)? {
-            Round::Wait => match watch.wait(deadline)? {
+        let round = match drain_round(job, last_round)? {
+            Round::Watch(watch) => match watch.wait(deadline)? {
                 // `wait_until` returns a timeout only once the real deadline has passed.
                 Ended::Deadline => return Ok(TreeDrain::MembersRemain),
-                Ended::Signalled => after_signalled(job, &mut watch)?,
+                Ended::Signalled => after_signalled(job, &watch)?,
             },
             round => round,
         };
         match round {
             Round::Answer(drain) => return Ok(drain),
-            // `wait_until` polls once at a deadline that has passed.
-            Round::Settle => return watch.settle(deadline),
+            Round::Confirm => return confirm_drained(job, deadline),
             // A tracked member exited, or the listing named no live member: the next round
             // re-enumerates the authoritative live set.
-            Round::List | Round::Wait => {}
+            Round::List | Round::Watch(_) => {}
         }
     }
 }
@@ -1170,38 +1188,24 @@ pub(crate) enum Round {
     /// No listed pid is a live member, which says nothing of one that joined after the listing: list
     /// again.
     List,
-    /// Wait for any of [`Watch::handles`], then run the next round.
-    Wait,
-    /// The listing is empty, but a member this wait opened and the listing no longer names has not
-    /// been seen signalled: the job's list drops a member slightly before its process object is
-    /// signalled. Wait for each of [`Watch::settling`]; once all are signalled the job is drained.
-    Settle,
+    /// Wait for one of these handles, then run the next round.
+    Watch(Watch),
+    /// The listing is empty, which is not yet the drain: the job's list drops a member before its
+    /// process object is signalled, and is empty on its first read after a kill. Wait for the
+    /// members [`unsignalled_members`] names; once none is left the job is drained.
+    Confirm,
 }
 
-/// A member the drain wait holds a handle on: kept open until the member is seen signalled, so its
-/// number cannot be reused meanwhile.
-struct Held {
-    pid: u32,
-    handle: std::os::windows::io::OwnedHandle,
-}
-
-/// The handles a drain wait holds across its rounds, which one wait passes to each of them.
-#[derive(Default)]
+/// The handles one round waits on: each is open on a listed member, and closed with this.
 pub(crate) struct Watch {
-    /// The members the last listing named come first, then the members an earlier listing named that
-    /// this one does not, which have left the job's list and are not yet seen signalled.
-    held: Vec<Held>,
-    /// How many of `held` the last listing named: the round waits for any of those.
-    listed: usize,
-    /// The first `listed` handles as the array `WaitForMultipleObjects` takes, built once with the
-    /// round.
+    handles: Vec<std::os::windows::io::OwnedHandle>,
+    /// The same handles as the array `WaitForMultipleObjects` takes, built once with the round.
     set: HandleSet,
     /// The round started past the deadline: its wait is a poll and its answer final.
     last_round: bool,
 }
 
 /// The raw handles of a [`Watch`], which `HANDLE`'s raw pointer would make `!Send` and `!Sync`.
-#[derive(Default)]
 struct HandleSet(Vec<HANDLE>);
 
 // SAFETY: a handle names a kernel object and has no thread affinity. The set is only read, by
@@ -1223,36 +1227,7 @@ impl Watch {
     #[cfg(feature = "tokio")]
     pub(crate) fn handles(&self) -> impl Iterator<Item = BorrowedHandle<'_>> + Clone {
         use std::os::windows::io::AsHandle as _;
-        self.held[..self.listed].iter().map(|held| held.handle.as_handle())
-    }
-
-    /// The handles [`Round::Settle`] waits on, each in turn: every one is to be signalled.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn settling(&self) -> impl Iterator<Item = BorrowedHandle<'_>> + Clone {
-        use std::os::windows::io::AsHandle as _;
-        self.held[self.listed..].iter().map(|held| held.handle.as_handle())
-    }
-
-    /// Block until every handle of [`settling`](Watch::settling) is signalled, or the real `deadline`
-    /// passes: the drain, or `MembersRemain`. Each wait is armed from the deadline, as in
-    /// [`wait`](Watch::wait), and an elapsed one polls once.
-    fn settle(
-        &self,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        use crate::containment::TreeDrain;
-
-        for held in &self.held[self.listed..] {
-            let handle = HANDLE(held.handle.as_raw_handle());
-            let waited = crate::wait::wait_until(deadline, |ms| {
-                // SAFETY: `handle` is open for the call, owned by `self`.
-                unsafe { WaitForSingleObject(handle, ms) }
-            });
-            if !signalled(waited).map_err(crate::error::Error::Io)? {
-                return Ok(TreeDrain::MembersRemain);
-            }
-        }
-        Ok(TreeDrain::AllMembersExited)
+        self.handles.iter().map(|h| h.as_handle())
     }
 
     /// Block until a handle is signalled or the real `deadline` passes. A `WAIT_TIMEOUT` is never
@@ -1283,102 +1258,103 @@ impl Watch {
         }
         let idx = waited.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
         debug_assert!(
-            idx < self.listed,
+            idx < self.handles.len(),
             "unexpected WaitForMultipleObjects verdict: {waited:?}"
         );
-        if idx >= self.listed {
+        if idx >= self.handles.len() {
             // Same anomaly the debug_assert above catches in debug builds — surfaced here too
             // so a release build does not silently fall through to "treat as a member exit and
             // re-enumerate" without any trace of the OS having returned an unexpected verdict.
             log::warn!(
                 "wait_tree: unexpected WaitForMultipleObjects verdict {waited:?} (index {idx} \
                  outside the {} handles waited on) - re-enumerating regardless",
-                self.listed
+                self.handles.len()
             );
         }
         Ok(Ended::Signalled)
     }
 }
 
-/// Whether the one-handle wait `WaitForSingleObject` answered `waited` for found the process
-/// signalled (`false`: its timeout passed first). Must follow the wait directly, for the Win32 error
-/// of a failed one.
-fn signalled(waited: windows::Win32::Foundation::WAIT_EVENT) -> io::Result<bool> {
-    match waited {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        // A process handle is never abandoned, so the rest is a failure.
-        _ => Err(io::Error::last_os_error()),
-    }
-}
-
-/// Whether the process behind `handle` has exited, by one look that does not wait.
-pub(crate) fn exited(handle: BorrowedHandle<'_>) -> io::Result<bool> {
-    // SAFETY: `handle` is open for the call.
-    signalled(unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) })
-}
-
 /// What follows a round's wait that ended on a member's handle: for the last round, whose own
-/// listing may have named an exited member, the answer from one more listing (or the wait for the
-/// members that left the list), and for any other the next round.
-fn after_signalled(job: HANDLE, watch: &mut Watch) -> Result<Round, crate::error::Error> {
+/// listing may have named an exited member, the answer from one more listing (or the confirmation of
+/// an empty one), and for any other the next round.
+fn after_signalled(job: HANDLE, watch: &Watch) -> Result<Round, crate::error::Error> {
     if watch.last_round {
-        return final_listing(job, watch);
+        return final_listing(job);
     }
     Ok(Round::List)
 }
 
-/// The members of `held` still running, by one look at each.
-fn unsignalled(held: Vec<Held>) -> Result<Vec<Held>, crate::error::Error> {
-    use std::os::windows::io::AsHandle as _;
+/// An empty listing is the drain once the job's members that a system process snapshot still names
+/// have exited: a member leaves the job's list before its process object is signalled, and the list
+/// is empty on its first read after a kill whether or not the members have exited. Each is opened by
+/// the snapshot's pid, kept only if the OS says it is in this job, and waited for one at a time
+/// through [`wait_for_member`] (open, wait, close), until `deadline` (`None`: for ever), which
+/// answers `MembersRemain` if one is still running at it. No handle outlives its own wait, and no
+/// wait set bounds the members.
+///
+/// A member in the gap is in the snapshot taken after the listing: it is not yet signalled, and a
+/// signalled process is not in a snapshot.
+fn confirm_drained(
+    job: HANDLE,
+    deadline: Option<std::time::Instant>,
+) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+    use crate::containment::tree_kill::wait_for_member;
+    use crate::containment::TreeDrain;
+    use crate::identity::HostKernel;
 
-    let mut running = Vec::with_capacity(held.len());
-    for member in held {
-        if !exited(member.handle.as_handle()).map_err(crate::error::Error::Io)? {
-            running.push(member);
+    for id in unsignalled_members(job)? {
+        if !wait_for_member(&HostKernel, id, deadline).map_err(|cause| member_unobserved(id.pid(), cause))? {
+            return Ok(TreeDrain::MembersRemain);
         }
     }
-    Ok(running)
+    Ok(TreeDrain::AllMembersExited)
 }
 
-/// A listing came back empty: the job's list has dropped every member this wait holds a handle on,
-/// and the drain is answered once those are signalled too. The ones that are not yet are the
-/// members of [`Round::Settle`].
-fn empty_listing(watch: &mut Watch) -> Result<Round, crate::error::Error> {
-    watch.listed = 0;
-    watch.held = unsignalled(std::mem::take(&mut watch.held))?;
-    Ok(if watch.held.is_empty() {
-        Round::Answer(crate::containment::TreeDrain::AllMembersExited)
-    } else {
-        Round::Settle
-    })
+/// The identity of every process a system snapshot names that is a member of `job`. A pid that cannot
+/// be opened is no member of it, and one that a new process reused answers not-in-job. A failed
+/// snapshot, or a failed membership check on a process that opened, is an error: neither is an empty
+/// job.
+fn unsignalled_members(job: HANDLE) -> Result<Vec<ProcessId>, crate::error::Error> {
+    use crate::identity::HostKernel;
+
+    let mut members = Vec::new();
+    for (pid, _parent) in crate::containment::enumerate::process_parents(&HostKernel)? {
+        let Ok(handle) = open_for_membership(pid) else {
+            continue;
+        };
+        if let Some(id) = member_identity(job, pid, Ok(handle)).map_err(|cause| member_unobserved(pid, cause))? {
+            members.push(id);
+        }
+    }
+    Ok(members)
+}
+
+/// The failure of a drain that cannot establish whether the job's member `pid` has exited.
+pub(crate) fn member_unobserved(pid: u32, cause: crate::error::Error) -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: format!("a member of the job, pid {pid}, could not be waited for"),
+        source: Some(std::sync::Arc::new(cause)),
+    }
 }
 
 /// One round of the drain wait, shared by the blocking driver ([`wait_drained_raw`]) and the async
 /// one: list the live members, open them, and say what to do next. `last_round` is whether the
-/// caller's deadline has passed, on the caller's clock. `watch` holds the earlier rounds' handles:
-/// a member the listing names again keeps its handle, and one it no longer names is kept until it
-/// is seen signalled, for [`Round::Settle`].
-fn drain_round(job: HANDLE, last_round: bool, watch: &mut Watch) -> Result<Round, crate::error::Error> {
+/// caller's deadline has passed, on the caller's clock.
+fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Error> {
     use crate::error::Error;
 
     let budget = MAXIMUM_WAIT_OBJECTS - 1;
-    watch.last_round = last_round;
     // List BEFORE consulting the deadline for a return, so an elapsed deadline (a `Duration::ZERO`
-    // probe) still observes the tree's actual state and an empty listing answers
-    // `AllMembersExited`, as an unbounded wait would. This mirrors `Kqueue::wait` on the macOS
-    // side, which takes one look at an elapsed deadline.
+    // probe) still observes the tree's actual state and an empty listing is confirmed, as an
+    // unbounded wait's is. This mirrors `Kqueue::wait` on the macOS side, which takes one look at an
+    // elapsed deadline.
     let pids = match list_members_or_drained(job)? {
-        ControlFlow::Break(_) => return empty_listing(watch),
+        ControlFlow::Break(()) => return Ok(Round::Confirm),
         ControlFlow::Continue(pids) => pids,
     };
 
-    // A member this wait holds a handle on cannot have had its number reused, so a pid the listing
-    // names again is the same member: its handle stays. One it does not name has left the list.
-    let (mut handles, left): (Vec<Held>, Vec<Held>) = std::mem::take(&mut watch.held)
-        .into_iter()
-        .partition(|held| pids.contains(&held.pid));
-    let left = unsignalled(left)?;
+    let mut handles: Vec<std::os::windows::io::OwnedHandle> = Vec::new();
     let mut denied: Option<io::Error> = None;
     // Every listed pid is looked at unless the wait set is already full: a pid that is gone
     // does not use up the budget a live member needs.
@@ -1386,29 +1362,15 @@ fn drain_round(job: HANDLE, last_round: bool, watch: &mut Watch) -> Result<Round
         if handles.len() == budget {
             break;
         }
-        if handles.iter().any(|held| held.pid == *pid) {
-            continue;
-        }
-        // SAFETY: standard Win32 call; the handle is closed by `member_to_watch` unless it is
-        // returned. `PROCESS_QUERY_LIMITED_INFORMATION` is what `IsProcessInJob` needs and
-        // `PROCESS_SYNCHRONIZE` does not imply it; the least right that works, grantable across
-        // integrity levels.
-        let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) };
-        match member_to_watch(opened, job) {
-            Ok(Some(h)) => handles.push(Held {
-                pid: *pid,
-                // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
-                handle: unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) },
-            }),
+        match member_to_watch(open_for_membership(*pid), job) {
+            // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
+            Ok(Some(h)) => handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) }),
             Ok(None) => {}
             Err(e) => denied = Some(e),
         }
     }
 
-    watch.listed = handles.len();
-    handles.extend(left);
-    watch.held = handles;
-    if watch.listed == 0 {
+    if handles.is_empty() {
         if let Some(e) = denied {
             // A persistent, actionable open failure (not a benign exit-race): looping
             // back here without ever holding a real handle to block on would busy-spin.
@@ -1428,7 +1390,7 @@ fn drain_round(job: HANDLE, last_round: bool, watch: &mut Watch) -> Result<Round
         // listing, so a drain is only a fresh listing that is empty: list again. Past the
         // deadline this was the last round, so that listing is the final one.
         if last_round {
-            return final_listing(job, watch);
+            return final_listing(job);
         }
         return Ok(Round::List);
     }
@@ -1442,34 +1404,30 @@ fn drain_round(job: HANDLE, last_round: bool, watch: &mut Watch) -> Result<Round
         );
     }
 
-    watch.set = HandleSet(
-        watch.held[..watch.listed]
-            .iter()
-            .map(|held| HANDLE(held.handle.as_raw_handle()))
-            .collect(),
-    );
-    Ok(Round::Wait)
+    let set = HandleSet(handles.iter().map(|h| HANDLE(h.as_raw_handle())).collect());
+    Ok(Round::Watch(Watch {
+        handles,
+        set,
+        last_round,
+    }))
 }
 
-/// The one more listing a last round takes when its own is no proof: an empty listing is the drain
-/// (once the members this wait holds are signalled, which a last round polls rather than waits
-/// for), anything else is `MembersRemain`. Nothing follows it.
-fn final_listing(job: HANDLE, watch: &mut Watch) -> Result<Round, crate::error::Error> {
+/// The one more listing a last round takes when its own is no proof: an empty listing is to be
+/// confirmed ([`Round::Confirm`]), anything else is `MembersRemain`. Nothing follows it.
+fn final_listing(job: HANDLE) -> Result<Round, crate::error::Error> {
     use crate::containment::TreeDrain;
 
-    match list_members_or_drained(job)? {
-        ControlFlow::Break(_) => empty_listing(watch),
-        ControlFlow::Continue(_) => Ok(Round::Answer(TreeDrain::MembersRemain)),
-    }
+    Ok(match list_members_or_drained(job)? {
+        ControlFlow::Break(()) => Round::Confirm,
+        ControlFlow::Continue(_) => Round::Answer(TreeDrain::MembersRemain),
+    })
 }
 
-/// One listing of the job: an empty one is the drain (`Break`), any other is the listed pids.
-fn list_members_or_drained(
-    job: HANDLE,
-) -> Result<ControlFlow<crate::containment::TreeDrain, Vec<u32>>, crate::error::Error> {
+/// One listing of the job: an empty one is `Break`, any other is the listed pids.
+fn list_members_or_drained(job: HANDLE) -> Result<ControlFlow<(), Vec<u32>>, crate::error::Error> {
     let pids = query_job_pid_list(job).map_err(crate::error::Error::Io)?;
     Ok(if pids.is_empty() {
-        ControlFlow::Break(crate::containment::TreeDrain::AllMembersExited)
+        ControlFlow::Break(())
     } else {
         ControlFlow::Continue(pids)
     })

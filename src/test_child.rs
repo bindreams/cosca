@@ -329,21 +329,36 @@ pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::wi
     (child, job)
 }
 
-/// A live job with two running members, each a [`spawn_more_blocker`]: [`spawn_job_member`]'s, and a
-/// second one assigned to the same job. A test that ends the first holds the second alive through
-/// its stdin.
+/// A live job with `count` (at least one) running members, each a [`spawn_more_blocker`]:
+/// [`spawn_job_member`]'s, and the rest assigned to the same job. A test that ends some holds the
+/// others alive through their stdin.
+#[cfg(windows)]
+pub(crate) fn spawn_job_with_members(
+    count: usize,
+) -> (Vec<std::process::Child>, crate::containment::windows::JobHandle) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let (first, job) = spawn_job_member();
+    let mut members = vec![first];
+    for _ in 1..count {
+        let member = spawn_more_blocker();
+        job.assign_for_test(member.as_raw_handle())
+            .expect("assign a member to the job");
+        members.push(member);
+    }
+    (members, job)
+}
+
+/// [`spawn_job_with_members`] for two.
 #[cfg(windows)]
 pub(crate) fn spawn_job_with_two_members() -> (
     std::process::Child,
     std::process::Child,
     crate::containment::windows::JobHandle,
 ) {
-    use std::os::windows::io::AsRawHandle as _;
-
-    let (first, job) = spawn_job_member();
-    let second = spawn_more_blocker();
-    job.assign_for_test(second.as_raw_handle())
-        .expect("assign the second member to the job");
+    let (mut members, job) = spawn_job_with_members(2);
+    let second = members.pop().expect("two members");
+    let first = members.pop().expect("two members");
     (first, second, job)
 }
 

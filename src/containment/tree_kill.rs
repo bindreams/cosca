@@ -7,6 +7,7 @@
 //! The Linux `Ticks` limit of the by-identity open applies (see [`Child::kill_tree`](crate::Child::kill_tree)).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::drain_edge::DrainEdge;
@@ -185,7 +186,7 @@ impl<'a> KillWait<'a> {
             kernel,
         } = self;
         for id in once_each(members) {
-            if let Err(why) = wait_for_member(kernel, id) {
+            if let Err(why) = wait_for_killed_member(kernel, id) {
                 unobserved.push(why);
             }
         }
@@ -215,7 +216,7 @@ impl<'a> KillWait<'a> {
             kernel,
         } = self;
         for id in once_each(members) {
-            if let Err(why) = wait_for_member_async(kernel, id).await {
+            if let Err(why) = wait_for_killed_member_async(kernel, id).await {
                 unobserved.push(why);
             }
         }
@@ -273,30 +274,50 @@ fn drained(verdict: TreeDrain) -> Result<(), Error> {
     }
 }
 
-/// Wait for the member `id` to exit: re-open it by its identity, wait on it, close it. One that cannot
-/// be opened because it is gone has exited.
-fn wait_for_member(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    match open_member(kernel, id)? {
-        Some(os) => wait_for_exit(&*os).map_err(|why| exit_unobserved(id.pid(), why)),
-        None => Ok(()),
-    }
+/// [`wait_for_member`] for a wait with no deadline, as a kill's wait is: the failure names `id`'s pid as
+/// a member whose exit cannot be observed.
+fn wait_for_killed_member(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
+    let exited = wait_for_member(kernel, id, None).map_err(|why| exit_unobserved(id.pid(), why))?;
+    debug_assert!(exited, "a wait with no deadline ends only on an exit");
+    Ok(())
 }
 
-/// [`wait_for_member`], awaited.
+/// [`wait_for_killed_member`], awaited.
 #[cfg(feature = "tokio")]
-async fn wait_for_member_async(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
+async fn wait_for_killed_member_async(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
+    let exited = wait_for_member_async(kernel, id, None)
+        .await
+        .map_err(|why| exit_unobserved(id.pid(), why))?;
+    debug_assert!(exited, "a wait with no deadline ends only on an exit");
+    Ok(())
+}
+
+/// Wait for the member `id` to exit until `deadline` (`None`: for ever): re-open it by its identity,
+/// wait on it, close it. `Ok(true)` is an exit, and so is a member that cannot be opened because it is
+/// gone; `Ok(false)` is a member still running at the deadline's final look. One that cannot be opened
+/// for another reason has not exited as far as anyone can tell: the error is that cause.
+pub(crate) fn wait_for_member(kernel: &dyn Kernel, id: ProcessId, deadline: Option<Instant>) -> Result<bool, Error> {
     match open_member(kernel, id)? {
-        Some(os) => wait_for_exit_async(&*os)
-            .await
-            .map_err(|why| exit_unobserved(id.pid(), why)),
-        None => Ok(()),
+        Some(os) => crate::os_process::drive::exited_until(&*os, deadline),
+        None => Ok(true),
     }
 }
 
-/// The member `id` re-opened by its identity; `None` if it is gone. One that cannot be opened has
-/// not exited as far as anyone can tell: its exit cannot be observed.
+/// [`wait_for_member`], awaited. A Windows `deadline` is on the real clock.
+#[cfg(feature = "tokio")]
+pub(crate) async fn wait_for_member_async(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+    deadline: Option<Instant>,
+) -> Result<bool, Error> {
+    match open_member(kernel, id)? {
+        Some(os) => crate::tokio::drive::exited_until(&*os, deadline).await,
+        None => Ok(true),
+    }
+}
+
 fn open_member(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    crate::os_process::open_with(kernel, id).map_err(|failure| exit_unobserved(id.pid(), failure.into_open_error()))
+    crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())
 }
 
 fn wait_for_exit(os: &dyn OsProcess) -> Result<(), Error> {

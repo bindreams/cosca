@@ -311,14 +311,89 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listin
     drop(forced);
 }
 
-/// An empty listing is the drain only once the members the round before held are signalled: the
-/// list drops a member before its process object signals. The second member is alive, in the job,
-/// when the second listing (forced) comes back empty; the wait must block on its handle, and the
-/// hook ends it when the wait arms, so the drain is answered only after its exit.
+/// An empty FIRST listing is no answer: the list is empty on its first read after a kill whether or
+/// not the members have exited, so the drain looks for the job's members in a system snapshot. The
+/// member is alive, in the job, when the listing (forced) comes back empty; at an elapsed deadline
+/// the drain polls it and answers `MembersRemain`.
 ///
-/// Mutant: an empty listing answers `AllMembersExited` without looking at the handles held.
+/// Mutant: an empty first listing answers `AllMembersExited` off the list alone.
 #[skuld::test]
-fn wait_drained_raw_waits_for_the_held_members_when_the_listing_empties() {
+fn wait_drained_raw_does_not_answer_an_empty_first_listing_while_a_member_runs() {
+    let (child, job) = spawn_job_member();
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero);
+
+    drop(forced);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+    assert_eq!(
+        verdict.expect("wait_drained_raw"),
+        crate::containment::TreeDrain::MembersRemain,
+        "the drain was answered off an empty listing while a member's process object was unsignalled"
+    );
+}
+
+/// A member the wait never opened is waited for too: with more live members than one wait set holds
+/// (`MAXIMUM_WAIT_OBJECTS - 1`), the last is left unopened, and the listing after the rest exit is
+/// empty (forced) while it runs.
+///
+/// Mutant: the drain confirms only the members it opened.
+#[skuld::test]
+fn wait_drained_raw_waits_for_a_member_it_never_opened_past_the_wait_set() {
+    use crate::test_child::spawn_job_with_members;
+
+    let (mut members, job) = spawn_job_with_members(super::MAXIMUM_WAIT_OBJECTS);
+    let unopened = members.pop().expect("a last member");
+    let mut listed: Vec<u32> = members.iter().map(std::process::Child::id).collect();
+    listed.push(unopened.id());
+    // Reaped, but each handle stays open, so each pid still opens as a signalled member.
+    for member in &mut members {
+        drop(member.stdin.take());
+        member.wait().expect("wait for a member to exit");
+    }
+    let forced = super::fault::force_job_pid_lists([listed, Vec::new()]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero);
+
+    drop(forced);
+    job.hard_kill().expect("end the member");
+    let_member_exit(unopened);
+    assert_eq!(
+        verdict.expect("wait_drained_raw"),
+        crate::containment::TreeDrain::MembersRemain,
+        "the drain was answered while a member it never opened was unsignalled"
+    );
+}
+
+/// A system snapshot that cannot be taken is the drain's failure, with its cause: an empty listing
+/// is never answered `AllMembersExited` without it.
+#[skuld::test]
+fn wait_drained_raw_fails_when_the_snapshot_for_an_empty_listing_cannot_be_taken() {
+    let job = super::JobHandle::create_empty_for_test();
+    let _snapshot = crate::containment::enumerate::backend_fault::force_snapshot_failure();
+    let forced = super::fault::force_job_pid_list(Vec::new());
+
+    let verdict = super::wait_drained_raw(job.handle(), None);
+
+    drop(forced);
+    let error = verdict.expect_err("an empty listing with no snapshot is not a drain");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { source: Some(_), .. }),
+        "{error:?}"
+    );
+}
+
+/// An empty listing is the drain only once the members the snapshot names are signalled: the list
+/// drops a member before its process object signals. The second member is alive, in the job, when
+/// the second listing (forced) comes back empty; the wait must block on it, and the hook ends it
+/// when the wait arms, so the drain is answered only after its exit.
+///
+/// Mutant: an empty listing answers `AllMembersExited` without waiting for the snapshot's members.
+#[skuld::test]
+fn wait_drained_raw_waits_for_the_members_the_snapshot_names_when_the_listing_empties() {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -344,7 +419,7 @@ fn wait_drained_raw_waits_for_the_held_members_when_the_listing_empties() {
     crate::wait::wait_ms_probe::take();
     drop(forced);
     let ended = released.get();
-    // The held member ends either way: on a failure the hook never ran.
+    // The member ends either way: on a failure the hook never ran.
     let_member_exit(second);
     assert!(
         ended,
@@ -361,7 +436,7 @@ fn wait_drained_raw_waits_for_the_held_members_when_the_listing_empties() {
 /// unsignalled), then none. The second member stays alive, so the bounded wait ends in
 /// `MembersRemain` at its deadline rather than answering the drain off the empty listing.
 ///
-/// Mutant: only the handles of the last round are confirmed at an empty listing.
+/// Mutant: an empty listing is answered off the earlier rounds' handles, not the snapshot.
 #[skuld::test]
 fn wait_drained_raw_keeps_waiting_for_a_member_that_left_the_listing_in_an_earlier_round() {
     use std::time::Duration;
@@ -383,10 +458,10 @@ fn wait_drained_raw_keeps_waiting_for_a_member_that_left_the_listing_in_an_earli
     );
 }
 
-/// A round past the deadline whose final listing is empty polls the members it held, and answers
-/// `MembersRemain` for one that is still running.
+/// A round past the deadline whose final listing is empty polls the members the snapshot names, and
+/// answers `MembersRemain` for one that is still running.
 ///
-/// Mutant: the final empty listing answers `AllMembersExited` without looking at the handles held.
+/// Mutant: the final empty listing answers `AllMembersExited` without looking at the snapshot.
 #[skuld::test]
 fn wait_drained_raw_with_an_elapsed_deadline_polls_the_members_its_empty_final_listing_leaves() {
     let (mut first, second, job) = spawn_job_with_two_members();

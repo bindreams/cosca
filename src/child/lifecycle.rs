@@ -359,11 +359,13 @@ impl Child {
     }
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
-    /// Windows job whose process list is empty, a macOS marker with no holder left. A status is
-    /// never collected by this call, only the root's own `wait`/`wait_timeout` does that. This call
-    /// observes the list or the leaf, not each member: on Windows the job's list can empty before
-    /// every member's process object is signalled. A caller that needs the members gone uses
-    /// [`kill_tree`](Child::kill_tree), which waits for each. Requires a mechanism with a real
+    /// Windows job with no member left, a macOS marker with no holder left. A status is never
+    /// collected by this call, only the root's own `wait`/`wait_timeout` does that. On Windows an
+    /// empty process list is not taken as the drain, the first one included (it is empty on its first
+    /// read after a kill): the job's list can empty before a member's process object is signalled,
+    /// so the call waits for each job member a system process snapshot still names. A caller that
+    /// needs a member whose exit cannot be observed named uses [`kill_tree`](Child::kill_tree).
+    /// Requires a mechanism with a real
     /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
     /// nested-`Delegated` child do not).

@@ -610,14 +610,38 @@ mod windows {
         let_member_exit(member);
     }
 
-    /// An empty listing is the drain only once the members the round before held are signalled, as
-    /// in the sync wait. The second member is alive when the second listing (forced) comes back
-    /// empty; the wait is polled until that listing has been read, and must then be waiting on the
-    /// second member's handle, not have answered.
+    /// An empty FIRST listing is no answer, as in the sync wait: the member is alive, in the job,
+    /// when the listing (forced) comes back empty, so the drain waits for it, and answers only once
+    /// it has exited.
     ///
-    /// Mutant: an empty listing answers `AllMembersExited` without looking at the handles held.
+    /// Mutant: an empty first listing answers `AllMembersExited` off the list alone.
     #[skuld::test]
-    async fn a_drain_whose_listing_empties_waits_for_the_members_it_held() {
+    async fn a_drain_does_not_answer_an_empty_first_listing_while_a_member_runs() {
+        use crate::containment::windows::fault::force_job_pid_list;
+
+        let (mut member, job) = spawn_job_member();
+        let _forced = force_job_pid_list(Vec::new());
+        let mut wait = pin!(drain(&job, None));
+        let answered = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        drop(member.stdin.take());
+        if answered.is_pending() {
+            assert_eq!(wait.await, TreeDrain::AllMembersExited);
+        }
+        member.wait().expect("reap the member");
+        assert!(
+            answered.is_pending(),
+            "the drain answered {answered:?} off the empty listing while a member's process object was unsignalled"
+        );
+    }
+
+    /// An empty listing is the drain only once the members the snapshot names are signalled, as in
+    /// the sync wait. The second member is alive when the second listing (forced) comes back empty;
+    /// the wait is polled until that listing has been read, and must then be waiting on the second
+    /// member, not have answered.
+    ///
+    /// Mutant: an empty listing answers `AllMembersExited` without waiting for the snapshot's members.
+    #[skuld::test]
+    async fn a_drain_whose_listing_empties_waits_for_the_members_the_snapshot_names() {
         use crate::containment::windows::fault::{force_job_pid_lists, job_pid_list_queries};
 
         let (mut first, mut second, job) = spawn_job_with_two_members();
@@ -652,7 +676,7 @@ mod windows {
     /// A member that left the listing in an earlier round is still waited for when a later listing
     /// is empty. The second member stays alive, so the bounded drain ends in `MembersRemain`.
     ///
-    /// Mutant: only the handles of the last round are confirmed at an empty listing.
+    /// Mutant: an empty listing is answered off the earlier rounds' handles, not the snapshot.
     #[skuld::test]
     async fn a_drain_keeps_waiting_for_a_member_that_left_the_listing_in_an_earlier_round() {
         use crate::containment::windows::fault::force_job_pid_lists;

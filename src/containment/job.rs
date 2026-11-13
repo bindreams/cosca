@@ -121,10 +121,11 @@ impl Job {
         self.0.disarm().map_err(Error::Io)
     }
 
-    /// Block until the job's process list is empty, or forever if it never is. This call observes
-    /// the list, not each member: the list can empty before every member's process object is
-    /// signalled. A caller that needs the members gone uses [`kill_tree`](Job::kill_tree), which
-    /// waits for each.
+    /// Block until the job has no member left, or forever if it never does. An empty process list
+    /// is not taken as the drain, the first one included (it is empty on its first read after a kill):
+    /// the list can empty before a member's process object is signalled, so the call waits for each
+    /// job member a system process snapshot still names. A caller that needs a member whose exit
+    /// cannot be observed named uses [`kill_tree`](Job::kill_tree).
     pub fn wait_tree(&self) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(None)
     }

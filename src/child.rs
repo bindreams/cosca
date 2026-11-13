@@ -667,8 +667,9 @@ impl Child {
     /// [`kill_tree`](Self::kill_tree) that sends and does not wait: the tree is killed, and the call
     /// returns once the kill is sent, with the same errors for a kill that could not be sent. `Ok`
     /// says every member was reached, not that any has exited. A caller that needs the members gone
-    /// uses [`kill_tree`](Self::kill_tree): [`wait_tree`](Child::wait_tree) after a send-only kill
-    /// observes the drain, not each member.
+    /// uses [`kill_tree`](Self::kill_tree), or [`wait_tree`](Child::wait_tree) after a send-only
+    /// kill, which waits for the tree's drain (on Windows, for each job member a system process
+    /// snapshot still names).
     pub fn send_kill_tree(&self) -> Result<(), Error> {
         self.send_kill_tree_after("send_kill_tree", None)
             .map_err(|failure| failure.error)
