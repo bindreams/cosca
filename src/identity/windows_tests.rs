@@ -135,7 +135,7 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let err = crate::os_process::open(id).expect_err("a process we may not open must not read as gone");
@@ -161,7 +161,7 @@ fn waiting_on_an_access_denied_live_process_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let err = exited_now(id).expect_err("an unopenable live process must not be reported as exited");
@@ -188,7 +188,7 @@ fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
         return;
     };
     let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     child.terminate();
     assert!(!child.is_running(), "precondition: the subject must have exited");
@@ -206,7 +206,7 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
     };
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     // Precondition: the terminate right must actually be refused, or this exercises the
     // Opened::Found path and never reaches the arm under test.
@@ -346,7 +346,7 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
         return;
     };
     let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
-    let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let real = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
     assert!(child.is_running(), "precondition: the pid's occupant is live");
@@ -364,7 +364,7 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let real = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
     assert!(

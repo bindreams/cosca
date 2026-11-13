@@ -14,6 +14,25 @@ use crate::containment::dispatch::{TeardownCaller, TreeKillOutcome};
 #[cfg(unix)]
 use crate::containment::mechanism::{FrontReach, Release};
 
+/// What a failed spawn's or run's teardown left of its child: its fate, the child itself if it could
+/// not be ended, and the teardown's failures (the error's `cleanup`).
+pub(crate) struct Torn {
+    pub(crate) fate: crate::error::ChildFate,
+    pub(crate) unreaped: Option<Unreaped>,
+    pub(crate) cleanup: Option<crate::error::Failures>,
+}
+
+impl Torn {
+    /// A child the teardown left alone (it was disarmed): nothing ran, so nothing failed.
+    pub(crate) fn left(fate: crate::error::ChildFate) -> Torn {
+        Torn {
+            fate,
+            unreaped: None,
+            cleanup: None,
+        }
+    }
+}
+
 impl Child {
     /// What [`Drop`] does, now, for a caller that owns the child and fails after its spawn: it says
     /// what became of the child. With [`Disposition::HandBack`], a child whose teardown could not
@@ -23,33 +42,37 @@ impl Child {
     /// Only a `kill_on_drop(false)` child is left whatever `disposition` says. The containment is
     /// torn down as `self` drops, before this returns. On Windows a refused root kill gets the
     /// single look.
-    pub(crate) fn tear_down_or_hand_back(
-        mut self,
-        disposition: Disposition,
-    ) -> (crate::error::ChildFate, Option<Unreaped>) {
+    pub(crate) fn tear_down_or_hand_back(mut self, disposition: Disposition) -> Torn {
         if !self.kill_on_drop {
-            return (self.fate_of_a_disarmed_child(), None);
+            return Torn::left(self.fate_of_a_disarmed_child());
         }
         self.kill_on_drop = false;
         let torn = self.tear_down(TeardownCaller::FailedRun, disposition);
-        (torn.fate, disposition.hands_back(&torn).then(|| self.into_unreaped()))
+        let unreaped = disposition.hands_back(&torn).then(|| self.into_unreaped());
+        Torn {
+            fate: torn.fate,
+            unreaped,
+            cleanup: torn.failures,
+        }
     }
 
     /// [`tear_down_or_hand_back`](Self::tear_down_or_hand_back) for an `async fn`: the root's wait
     /// and the leaf's drain are awaited, with no warn (the warn is about a blocked thread).
     /// Dropped mid-teardown, the future settles as the drop does.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn tear_down_or_hand_back_awaiting(
-        mut self,
-        disposition: Disposition,
-    ) -> (crate::error::ChildFate, Option<Unreaped>) {
+    pub(crate) async fn tear_down_or_hand_back_awaiting(mut self, disposition: Disposition) -> Torn {
         if !self.kill_on_drop {
-            return (self.fate_of_a_disarmed_child(), None);
+            return Torn::left(self.fate_of_a_disarmed_child());
         }
         // Before the waits, so the handle's own drop does nothing more if this future is dropped.
         self.kill_on_drop = false;
         let torn = self.tear_down_awaiting(TeardownCaller::FailedRun, disposition).await;
-        (torn.fate, disposition.hands_back(&torn).then(|| self.into_unreaped()))
+        let unreaped = disposition.hands_back(&torn).then(|| self.into_unreaped());
+        Torn {
+            fate: torn.fate,
+            unreaped,
+            cleanup: torn.failures,
+        }
     }
 
     /// What became of a child whose teardown a `kill_on_drop(false)` leaves.
@@ -190,7 +213,7 @@ impl Child {
                     tree: None,
                     disposition,
                 };
-                return self.begin_leaf_and_front(crate::error::Report(&unkillable).to_string(), parts);
+                return self.begin_leaf_and_front(NotKilled::by(unkillable), parts);
             }
             crate::elevation::front::Gate::CgroupOnly(front) => Some(front),
             _ => None,
@@ -230,12 +253,10 @@ impl Child {
             return BeginOutcome::Done(parts.finish(self, torn));
         }
         if let Some(front) = cgroup_only {
+            // The tree kill's failure is the tree's, settled in `DropParts::finish`.
             let not_reached = match kill.incomplete_for_log() {
-                None => self
-                    .cgroup_kill_reached(front)
-                    .err()
-                    .map(|e| crate::error::Report(&e).to_string()),
-                failure => failure,
+                None => self.cgroup_kill_reached(front).err().map(NotKilled::by),
+                Some(failure) => Some(NotKilled::in_words(failure)),
             };
             let parts = DropParts {
                 view,
@@ -289,7 +310,7 @@ impl Child {
     /// and then the front is looked at. The leaf's drain is the first of the teardown's waits, so
     /// the first half only names it ([`RootWait::Leaf`]) and blocks on nothing. `why` is why the
     /// front is not killed.
-    fn begin_leaf_and_front(&mut self, why: String, parts: DropParts) -> BeginOutcome<Remains, DropWait> {
+    fn begin_leaf_and_front(&mut self, why: NotKilled, parts: DropParts) -> BeginOutcome<Remains, DropWait> {
         BeginOutcome::Wait(DropWait {
             parts,
             wait: RootWait::Leaf { why },
@@ -312,13 +333,13 @@ impl Child {
     fn look_at_front_after_releasing(
         &mut self,
         (release, reach): (Release, FrontReach),
-        why: &dyn std::fmt::Display,
+        why: &NotKilled,
         disposition: Disposition,
     ) -> TeardownOutcome {
         release.wait();
         match self.look_at_front_after_leaf(reach) {
-            BeginOutcome::Done(look) => word_front(self.proc.pid(), why, disposition, look),
-            BeginOutcome::Wait(wait) => word_front(self.proc.pid(), why, disposition, wait.settle(&self.proc)),
+            BeginOutcome::Done(look) => why.word_front(self.proc.pid(), disposition, look),
+            BeginOutcome::Wait(wait) => why.word_front(self.proc.pid(), disposition, wait.settle(&self.proc)),
         }
     }
 
@@ -382,9 +403,12 @@ impl DropParts {
         } = self;
         let mut report = crate::child::drop_report::DropReport::new(&view);
         report.skipped = skipped;
-        let remains = report.fold_clause(torn);
+        let mut remains = report.fold_clause(torn);
         if let Some(kill) = tree {
-            report.tree = child.tree.settle_for_drop(kill, remains.fate.not_running());
+            if let Some(left) = child.tree.settle_for_drop(kill, remains.fate.not_running()) {
+                report.tree = Some(left.text);
+                remains = remains.after_tree_kill(left.failure);
+            }
         }
         report.emit(&child.reported);
         remains
@@ -393,10 +417,13 @@ impl DropParts {
     /// The teardown's one report, once the root's `torn` is known: what became of the child.
     #[cfg(not(unix))]
     fn finish(self, child: &mut Child, torn: TeardownOutcome) -> Remains {
-        let (warn, remains) = torn.take_warn(self.caller.label());
+        let (warn, mut remains) = torn.take_warn(self.caller.label());
         let mut left = Vec::new();
         if let Some(tree) = self.tree {
-            left.extend(child.tree.settle_for_drop(tree, remains.fate.not_running()));
+            if let Some(tree_left) = child.tree.settle_for_drop(tree, remains.fate.not_running()) {
+                left.push(tree_left.text);
+                remains = remains.after_tree_kill(tree_left.failure);
+            }
         }
         left.extend(warn);
         if !left.is_empty() {
@@ -420,7 +447,7 @@ enum RootWait {
     /// the front was not killed.
     #[cfg(unix)]
     Leaf {
-        why: String,
+        why: NotKilled,
     },
     /// The tree's resource is being released, as an awaited teardown does it: held here until its wait
     /// completes, so a future dropped mid-await leaves it to the blocking settle, with the reach it
@@ -428,15 +455,45 @@ enum RootWait {
     #[cfg(all(unix, feature = "tokio"))]
     Releasing {
         released: Option<(Release, FrontReach)>,
-        why: String,
+        why: NotKilled,
     },
     /// The look at the front is under way, as an awaited teardown leaves it; `why` is why the front
     /// was not killed.
     #[cfg(all(unix, feature = "tokio"))]
     Front {
         wait: FrontWait,
-        why: String,
+        why: NotKilled,
     },
+}
+
+/// Why an elevation front was not killed: the words of the teardown's warn and, when an error says
+/// it, that error (the refusal of its kill), which is a failure of the teardown ahead of the look's.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct NotKilled {
+    text: String,
+    failure: Option<std::sync::Arc<crate::error::Error>>,
+}
+
+#[cfg(unix)]
+impl NotKilled {
+    /// Not killed as `refusal` says.
+    fn by(refusal: crate::error::Error) -> NotKilled {
+        NotKilled {
+            text: crate::error::Report(&refusal).to_string(),
+            failure: Some(std::sync::Arc::new(refusal)),
+        }
+    }
+
+    /// Not killed for a reason that is words alone.
+    fn in_words(text: String) -> NotKilled {
+        NotKilled { text, failure: None }
+    }
+
+    /// [`word_front`], with the refusal, if there is one, ahead of the look's failures.
+    fn word_front(&self, pid: Option<u32>, disposition: Disposition, look: FrontLook) -> TeardownOutcome {
+        word_front(pid, &self.text, disposition, look).failing_first(self.failure.clone())
+    }
 }
 
 impl DropWait {
@@ -458,7 +515,7 @@ impl DropWait {
             }
             #[cfg(all(unix, feature = "tokio"))]
             RootWait::Front { wait, why } => {
-                word_front(child.proc.pid(), &why, parts.disposition, wait.settle(&child.proc))
+                why.word_front(child.proc.pid(), parts.disposition, wait.settle(&child.proc))
             }
         };
         parts.finish(child, torn)
@@ -489,7 +546,7 @@ impl DropWait {
             let (release, reach) = released.take().expect("held until its wait completes");
             release.wait();
             match child.look_at_front_after_leaf(reach) {
-                BeginOutcome::Done(look) => return word_front(child.proc.pid(), &why, self.parts.disposition, look),
+                BeginOutcome::Done(look) => return why.word_front(child.proc.pid(), self.parts.disposition, look),
                 BeginOutcome::Wait(wait) => self.wait = RootWait::Front { wait, why },
             }
         }
@@ -500,7 +557,7 @@ impl DropWait {
             #[cfg(unix)]
             RootWait::Front { wait, why } => {
                 let look = wait.settle_async(&mut child.proc).await;
-                word_front(child.proc.pid(), why, self.parts.disposition, look)
+                why.word_front(child.proc.pid(), self.parts.disposition, look)
             }
         }
     }
@@ -544,6 +601,7 @@ pub(super) fn word_front(
     look: FrontLook,
 ) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
+    use crate::error::Error;
 
     let front = crate::elevation::front::front_named(pid.into());
     let FrontLook { fate, look } = look;
@@ -563,6 +621,7 @@ pub(super) fn word_front(
     match look {
         LookOutcome::Ended(settlement) => {
             TeardownOutcome::new(fate, settlement.wording(&front, None, Some(disposition)))
+                .failing(settlement.failure())
         }
         LookOutcome::LeftRunning => left(match disposition {
             Disposition::Leave => format!(
@@ -578,10 +637,18 @@ pub(super) fn word_front(
         LookOutcome::PlaceUnreadable(e) => left(unreadable(format!(
             "where it is cannot be read ({})",
             crate::error::Report(&e)
-        ))),
+        )))
+        .failing([Error::io_cause(crate::error::io_context(
+            format!("where {front} is cannot be read"),
+            e,
+        ))]),
         LookOutcome::SubtreeUnreadable(e) => left(unreadable(format!(
             "its leaf's subtree cannot be read ({})",
             crate::error::Report(&e)
-        ))),
+        )))
+        .failing([Error::io_cause(crate::error::io_context(
+            format!("the subtree of {front}'s leaf cannot be read"),
+            e,
+        ))]),
     }
 }

@@ -550,6 +550,23 @@ mod on_windows {
         writer
     }
 
+    /// The text of the one failure in the `cleanup` of the error of a resume whose teardown did not
+    /// run: the cancellation, and that the child was dropped in the teardown's place. The cause
+    /// (the release's or the disarm's failure) does not say it.
+    #[track_caller]
+    fn cancelled_teardown(err: &Error) -> String {
+        let Error::MayHaveStarted { source, cleanup, .. } = err else {
+            panic!("expected MayHaveStarted, got {err:?}");
+        };
+        let cleanup = cleanup.as_ref().expect("the cancelled teardown is in the cleanup");
+        assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+        let cause = crate::error::Report(&**source).to_string();
+        assert!(!cause.contains("dropped as its handle's drop does"), "{cause}");
+        let said = crate::error::Report(&**cleanup.first()).to_string();
+        assert!(said.contains("dropped as its handle's drop does"), "{said}");
+        said
+    }
+
     /// Release a frozen child's stdin and let its initial thread run, once the code under test has
     /// torn it down. A frozen child runs nothing, so the release alone cannot end it; with the thread
     /// resumed, a kill that sent nothing lets the blocker exit 0 and fail the exit-code assertion
@@ -678,9 +695,8 @@ mod on_windows {
             Some(ERROR_ACCESS_DENIED as i32),
             "{err:?}"
         );
-        let said = err.to_string();
+        let said = cancelled_teardown(&err);
         assert!(said.contains("Tokio runtime"), "{said}");
-        assert!(said.contains("dropped as its handle's drop does"), "{said}");
         assert!(dropped_there, "the child was not dropped on the calling thread");
         release_and_expect_it_killed(&thread, writer, &remote, "a resume outside a runtime");
     }
@@ -737,10 +753,8 @@ mod on_windows {
             Some(ERROR_ACCESS_DENIED as i32),
             "{err:?}"
         );
-        let said = err.to_string();
+        let said = cancelled_teardown(&err);
         assert!(said.contains("cancelled"), "{said}");
-        assert!(said.contains("dropped as its handle's drop does"), "{said}");
-        assert!(!said.contains("did not run"), "{said}");
         assert!(
             dropped_here.get(),
             "the cancelled task's child was not dropped on this thread"
@@ -767,7 +781,7 @@ mod on_windows {
 
         let err = super::answered_at_once(frozen.resume()).expect_err("the disarm was refused");
 
-        let said = err.to_string();
+        let said = cancelled_teardown(&err);
         let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
         assert!(matches!(cause, Error::Io(_)), "{cause:?}");
         assert_eq!(
@@ -776,7 +790,6 @@ mod on_windows {
             "{cause:?}"
         );
         assert!(said.contains("cancelled"), "{said}");
-        assert!(said.contains("dropped as its handle's drop does"), "{said}");
         assert_eq!(fate, ChildFate::Unknown);
         assert!(handed_back.is_none());
         // The drop killed the child (a kill exits with 1), though it would end with its stdin (0).

@@ -452,11 +452,6 @@ pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCa
 /// Build a `ProcessId` from an already-open Windows process handle and its pid, reusing the
 /// creation-token read. Avoids a second `OpenProcess` (which can fail and would otherwise
 /// force dropping a live elevated child).
-pub(crate) fn windows_identity_from_handle(handle: HANDLE, pid: RawPid) -> Option<crate::identity::ProcessId> {
-    windows_identity_from_handle_result(handle, pid).ok()
-}
-
-/// [`windows_identity_from_handle`], with the failure of the read of the creation time.
 pub(crate) fn windows_identity_from_handle_result(
     handle: HANDLE,
     pid: RawPid,

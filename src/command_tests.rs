@@ -504,6 +504,17 @@ fn a_failure_after_the_spawn_hands_back_a_child_whose_kill_is_refused(
 
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
 
+    // The refused kill is the teardown's failure, beside the pump's: its code is the OS's refusal.
+    let crate::error::Error::MayHaveStarted { cleanup, .. } = &error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    let cleanup = cleanup.as_ref().expect("the refused kill is in the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(libc::EPERM),
+        "{cleanup:?}"
+    );
     let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, stdin);
 
     assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
@@ -527,11 +538,13 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
         wrapper_elevated,
         source,
         unreaped,
+        cleanup,
     } = &error
     else {
         panic!("expected MayHaveStarted, got {error:?}");
     };
     assert!(unreaped.is_none(), "a reaped child is not handed back: {error:?}");
+    assert!(cleanup.is_none(), "nothing in the teardown failed: {error:?}");
     assert_eq!(*got, fate, "{error}");
     assert_eq!(*wrapper_elevated, wrapper, "{error}");
     assert!(

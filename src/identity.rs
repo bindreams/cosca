@@ -1024,15 +1024,6 @@ pub(crate) fn windows_handle_identity(handle: windows::Win32::Foundation::HANDLE
 /// the runas launch can derive identity from the owned handle of a possibly-elevated
 /// child without re-opening it by pid.
 #[cfg(windows)]
-pub(crate) fn windows_identity_from_handle(
-    handle: windows::Win32::Foundation::HANDLE,
-    pid: RawPid,
-) -> Option<ProcessId> {
-    backend::windows_identity_from_handle(handle, pid)
-}
-
-/// [`windows_identity_from_handle`], with the failure of the read.
-#[cfg(windows)]
 pub(crate) fn windows_identity_from_handle_result(
     handle: windows::Win32::Foundation::HANDLE,
     pid: RawPid,

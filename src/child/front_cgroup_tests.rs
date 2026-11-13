@@ -888,28 +888,48 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         .expect_err("a failed write fails the spawn")
     };
     let release = stdin.take().expect("the teardown must not release the front");
-    let (err, fate, handed_back) = err.expect_may_have_started_parts(release);
+    let err = crate::error::Error::from(err);
+    let cleanup = crate::test_child::cleanup_of(&err);
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, release);
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
         "a front its cgroup kill did not end may be running"
     );
-    assert_front_refused_by_its_cgroup_kill(&err, pid);
+    assert_front_refused_by_its_cgroup_kill(&err, &cleanup, pid);
     handed_back.unreaped();
     let status = handed_back.wait();
     assert!(status.success(), "the front was signalled: {status:?}");
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
-/// `err`, a failed password write's, says its front `pid` was refused as `kill` refuses a front
+/// `err`, a failed password write's, says its front `pid` could not be terminated, and its `cleanup`
+/// holds, in the order they happened, the failed cgroup kill, then the refusal of `kill` of a front
 /// whose cgroup kill failed.
 #[track_caller]
-pub(crate) fn assert_front_refused_by_its_cgroup_kill(err: &crate::error::Error, pid: u32) {
+pub(crate) fn assert_front_refused_by_its_cgroup_kill(
+    err: &crate::error::Error,
+    cleanup: &crate::error::Failures,
+    pid: u32,
+) {
     let text = err.to_string();
     assert!(text.contains("the elevated child could not be terminated"), "{text}");
-    assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-    assert!(text.contains("no kill was sent"), "{text}");
-    assert!(text.contains("(its cgroup kill failed: "), "{text}");
+    assert!(
+        !text.contains("is what sudo left"),
+        "the refusal is in the detail: {text}"
+    );
+    assert!(
+        matches!(&**cleanup.first(), crate::error::Error::Containment { .. }),
+        "the failed cgroup kill came first: {cleanup:?}"
+    );
+    let refusal = cleanup
+        .iter()
+        .nth(1)
+        .unwrap_or_else(|| panic!("the refusal follows the failed cgroup kill: {cleanup:?}"))
+        .to_string();
+    assert!(refusal.contains(&format!("pid {pid} is what sudo left")), "{refusal}");
+    assert!(refusal.contains("no kill was sent"), "{refusal}");
+    assert!(refusal.contains("(its cgroup kill failed: "), "{refusal}");
 }
 
 /// A front that has left its leaf is out of the cgroup kill's reach: sent nothing, and refused.

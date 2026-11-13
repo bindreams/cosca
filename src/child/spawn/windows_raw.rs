@@ -78,6 +78,7 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
+use crate::child::drop_teardown::Torn;
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
@@ -216,7 +217,11 @@ pub(crate) fn spawn_raw(
         crate::identity::Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
         other => {
             // A child the teardown could not end comes back in the failure.
-            let (fate, unreaped) = tear_down_failed_spawn(
+            let Torn {
+                fate,
+                unreaped,
+                cleanup,
+            } = tear_down_failed_spawn(
                 owned,
                 None,
                 Past::Clean,
@@ -224,18 +229,24 @@ pub(crate) fn spawn_raw(
                 policy,
                 &mut Diagnosis::default(),
             );
-            return Err(SpawnFailure::started(
-                crate::child::spawn::spawn_identity_error(other, cause),
-                fate,
-                unreaped,
-            ));
+            return Err(
+                SpawnFailure::started(crate::child::spawn::spawn_identity_error(other, cause), fate, unreaped)
+                    .with_cleanup(cleanup),
+            );
         }
     };
     let id_read = id.as_ref().ok().copied();
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
-        Err(e) => {
-            let (fate, unreaped) = tear_down_failed_spawn(
+        Err(crate::containment::dispatch::AttachFailure {
+            cause: e,
+            cleanup: attach_cleanup,
+        }) => {
+            let Torn {
+                fate,
+                unreaped,
+                cleanup,
+            } = tear_down_failed_spawn(
                 owned,
                 id_read,
                 Past::Clean,
@@ -243,7 +254,10 @@ pub(crate) fn spawn_raw(
                 policy,
                 &mut Diagnosis::default(),
             );
-            return Err(SpawnFailure::started(e, fate, unreaped));
+            // What failed in the attach's own cleanup comes first: it happened before the teardown.
+            return Err(SpawnFailure::started(e, fate, unreaped)
+                .with_cleanup(attach_cleanup)
+                .with_cleanup(cleanup));
         }
     };
 

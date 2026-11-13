@@ -337,6 +337,33 @@ fn a_running_elevation_front_is_handed_back() {
     assert_front_handed_back(id, mark, fate, handed_back);
 }
 
+/// A front outside a cgroup is sent no kill, and the refusal that says so is a failure of the
+/// teardown: the failed run's error carries it in its `cleanup`.
+///
+/// Mutant: the refusal reaches the warn's text alone.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_front_sent_no_kill_has_the_refusal_among_its_failures() {
+    let (child, stdin) = a_running_front();
+
+    let (_, failures, handed_back) = crate::test_child::tear_down_holding_failures(child, stdin, Disposition::HandBack);
+
+    let failures = failures.expect("the refusal is the teardown's failure");
+    assert_eq!(failures.iter().len(), 1, "{failures:?}");
+    assert!(
+        matches!(
+            &**failures.first(),
+            crate::error::Error::Elevation {
+                kind: crate::error::ElevationErrorKind::Unkillable,
+                ..
+            }
+        ),
+        "{failures:?}"
+    );
+    handed_back.unreaped();
+    handed_back.wait();
+}
+
 /// A caller that leaves a front gets it left, warned, and no `Unreaped`.
 ///
 /// Mutant: a front is handed back whatever the caller says.
@@ -513,6 +540,36 @@ mod in_a_cgroup {
 
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
         assert_front_handed_back(id, mark, fate, handed_back);
+    }
+
+    /// A front the leaf's kill did not reach is refused its kill, and the refusal is a failure of the
+    /// teardown: the failed run's error carries it in its `cleanup`.
+    ///
+    /// Mutant: the refusal reaches the warn's text alone.
+    #[skuld::test]
+    fn a_front_the_leafs_kill_missed_has_the_refusal_among_its_failures(#[fixture(cgroup)] _group: &Group) {
+        let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let pid = child.pid();
+        let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
+
+        let (_, failures, handed_back) =
+            crate::test_child::tear_down_holding_failures(child, stdin, Disposition::HandBack);
+
+        let failures = failures.expect("the refusal is the teardown's failure");
+        assert_eq!(failures.iter().len(), 1, "{failures:?}");
+        let refusal = failures.first().to_string();
+        assert!(
+            matches!(
+                &**failures.first(),
+                crate::error::Error::Elevation {
+                    kind: crate::error::ElevationErrorKind::Unkillable,
+                    ..
+                }
+            ) && refusal.contains("left the cgroup before its kill"),
+            "{failures:?}"
+        );
+        handed_back.unreaped();
+        handed_back.wait();
     }
 
     /// A front whose place cannot be read is not known to have been reached by the leaf's kill: the

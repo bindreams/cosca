@@ -32,7 +32,7 @@ pub(super) fn exit() -> ExitRecord {
 /// A child whose reap consumed the zombie and read no exit record, so every wait on it answers
 /// `Exited(Unreadable)`. A debug build asserts that contract breach after it caches the record; a
 /// release build returns.
-pub(super) fn child_with_an_unreadable_exit() -> OwnedChild {
+pub(crate) fn child_with_an_unreadable_exit() -> OwnedChild {
     let child = OwnedChild::new(Box::new(
         fake().reaps([ReapAnswer::Reaped(ExitRecord::Unreadable { si_code: 7 })]),
     ));
@@ -523,6 +523,14 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
         "{torn:?}"
     );
     assert!(!left.contains("leaving it running"), "{torn:?}");
+    // The refused kill and the failed look are the teardown's failures, each naming its step.
+    let failures = torn.remains().failures.expect("the teardown's failures");
+    let steps: Vec<_> = failures.iter().map(|failure| failure.to_string()).collect();
+    assert!(
+        matches!(steps.as_slice(), [kill, wait] if kill.starts_with("killing the child: ")
+            && wait.starts_with("waiting for the child: ")),
+        "{steps:?}"
+    );
 }
 
 /// A kill that failed on a child someone else already reaped: the look finds `ECHILD`, the child is

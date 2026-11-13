@@ -613,10 +613,11 @@ mod settlement {
 
     /// A failed wait is a warn that says where the uncollected child goes: nothing for a caller that
     /// says so itself, "left unreaped" for one that leaves it, handed back for one that hands it back.
-    /// The no-disposition caller returns the text (Display); the others log it (chain).
+    /// The no-disposition caller returns the text, with the failure in its error (`failure`), so it
+    /// does not repeat it; the others log it (chain).
     #[track_caller]
     fn assert_failed_wait_worded(settlement: &Settlement) {
-        let returned = "S: the wait failed: cosca-wait-e5a1";
+        let returned = "S: the wait failed";
         let logged = "S: the wait failed: cosca-wait-e5a1: cosca-wait-e5a1";
         for (disposition, said, goes) in [
             (None, returned, ""),
@@ -693,6 +694,34 @@ mod settlement {
             assert_eq!(settlement.ended(), ended, "{settlement:?}");
             assert_eq!(settlement.status(), status, "{settlement:?}");
         }
+    }
+
+    /// The failure of a wait is the settlement's failure, shared with the outcome built from it, whose
+    /// remains carry it as the teardown's failure; every other answer has none.
+    ///
+    /// Mutants: the failure is only in the clause; the outcome drops it; an answer with no failure
+    /// has one.
+    #[skuld::test]
+    fn a_failed_wait_is_the_failure_of_its_settlement_and_of_the_teardown_built_from_it() {
+        let outcome = |answer| {
+            TeardownOutcome::of_settlement(&Settlement::new(answer, false), None, "S", None, Disposition::Leave)
+        };
+        let failure = Settlement::new(failed(), false).failure().expect("the failed wait");
+        assert!(
+            failure.to_string().starts_with("waiting for the child: ")
+                && failure.to_string().contains("cosca-wait-e5a1"),
+            "{failure}"
+        );
+
+        let remains = outcome(failed()).remains();
+        let failures = remains.failures.expect("the teardown's failure");
+        assert_eq!(failures.iter().len(), 1, "{failures:?}");
+        assert!(failures.first().to_string().contains("cosca-wait-e5a1"), "{failures:?}");
+
+        for answer in [passed(), foreign(Foreign::Gone), unreadable()] {
+            assert!(Settlement::new(answer, false).failure().is_none());
+        }
+        assert!(outcome(passed()).remains().failures.is_none());
     }
 
     /// A clause at warn is the outcome's warn text for the caller's one warn, and is logged by

@@ -18,6 +18,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::proc::create_process;
+use crate::child::drop_teardown::Torn;
 use crate::child::lifecycle::Wording;
 use crate::child::owned::owned_tests::teardown_lines::{HANDED_BACK, LEFT};
 use crate::child::owned::teardown::{Disposition, Kill, Past};
@@ -157,7 +158,7 @@ fn after_a_failed_spawn(
     disposition: Disposition,
     warn_after: Option<Duration>,
 ) -> (ChildFate, Option<crate::Unreaped>) {
-    tear_down_failed_spawn(
+    let torn = tear_down_failed_spawn(
         child,
         id,
         past,
@@ -167,7 +168,8 @@ fn after_a_failed_spawn(
             ..SpawnPolicy::SYNC
         },
         &mut Diagnosis::default(),
-    )
+    );
+    (torn.fate, torn.unreaped)
 }
 
 /// A failed spawn's teardown with warnings on, whose child has already exited by the time it looks,
@@ -505,6 +507,98 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_hands_the_child_back() {
     owner.end_with_code_zero()();
     let status = unreaped.wait().expect("wait for the handed-back child");
     assert_eq!(status.code(), Some(0), "nothing was sent to the child: {status:?}");
+}
+
+/// What failed in a failed spawn's teardown of `child` (a refused kill, a failed wait), as the
+/// `cleanup` of the error the spawn returns, with the child's fate and the child it handed back.
+fn failed_spawn_cleanup(child: OwnedChild, id: Option<ProcessId>, past: Past) -> crate::child::drop_teardown::Torn {
+    tear_down_failed_spawn(
+        child,
+        id,
+        past,
+        Disposition::HandBack,
+        SpawnPolicy::SYNC,
+        &mut Diagnosis::default(),
+    )
+}
+
+/// A kill the OS refuses is a failure of the spawn's teardown: it is in the error's `cleanup`, with
+/// the refusal's code, beside the fate and the child handed back.
+///
+/// Mutant: the teardown reports the refusal to the log alone.
+#[skuld::test]
+fn a_failed_spawn_teardown_with_a_denied_terminate_reports_the_refusal_as_its_cleanup() {
+    let owner = Suspended::spawn();
+    let id = owner.id();
+    let child = OwnedChild::new(Box::new(uac_process(owner.without_terminate_right(), owner.pid)));
+
+    let Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = failed_spawn_cleanup(child, Some(id), Past::Clean);
+
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    let cleanup = cleanup.expect("the refused kill is the teardown's failure");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{cleanup:?}"
+    );
+    assert!(
+        cleanup.first().to_string().starts_with("killing the child: "),
+        "{cleanup:?}"
+    );
+    owner.end_with_code_zero()();
+    unreaped
+        .expect("handed back")
+        .wait()
+        .expect("wait for the handed-back child");
+}
+
+/// A wait that fails after a delivered kill is a failure of the teardown: it is the `cleanup`.
+///
+/// Mutant: the failed wait is in the clause's text alone.
+#[skuld::test]
+fn a_failed_spawn_teardown_with_a_failed_wait_reports_the_wait_as_its_cleanup() {
+    let owner = Suspended::spawn();
+    let (child, _fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
+
+    let Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = failed_spawn_cleanup(child, None, Past::WaitMayFail);
+
+    assert_eq!(fate, ChildFate::Killed);
+    let cleanup = cleanup.expect("the failed wait is the teardown's failure");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        matches!(&**cleanup.first(), crate::error::Error::Io(e) if e.kind() == KIND)
+            && cleanup.first().to_string().starts_with("waiting for the child: "),
+        "{cleanup:?}"
+    );
+    drop(unreaped);
+}
+
+/// A teardown that ended the child with no failure has no `cleanup`.
+///
+/// Mutant: an empty list is reported where there is nothing.
+#[skuld::test]
+fn a_failed_spawn_teardown_that_failed_in_nothing_has_no_cleanup() {
+    let owner = Suspended::spawn();
+    let (child, _fake) = owned(real(owner.duplicate(), owner.pid));
+
+    let Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = failed_spawn_cleanup(child, None, Past::Clean);
+
+    assert_eq!(fate, ChildFate::Reaped);
+    assert!(unreaped.is_none());
+    assert!(cleanup.is_none(), "{cleanup:?}");
 }
 
 // The drop's teardown =====

@@ -1,4 +1,5 @@
 use super::{Classify, SpawnFailure};
+use crate::child::drop_teardown::Torn;
 use crate::error::{ChildFate, Error};
 use crate::test_child::over_fake::exited_unreaped;
 
@@ -109,12 +110,13 @@ fn behind_front_sets_the_flag_alone() {
 #[skuld::test]
 fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
     for wrapper in [false, true] {
-        let error = super::after_the_spawn(io("wait"), ChildFate::Reaped, None, wrapper);
+        let error = super::after_the_spawn(io("wait"), Torn::left(ChildFate::Reaped), wrapper);
         let Error::MayHaveStarted {
             fate,
             wrapper_elevated,
             source,
             unreaped: None,
+            cleanup: None,
         } = &error
         else {
             panic!("expected MayHaveStarted around no child, got {error:?}");
@@ -137,7 +139,12 @@ fn after_the_spawn_with_a_child_carries_it_with_a_running_fate() {
     let id = crate::identity::ProcessId::current();
     let running = ChildFate::Running { id: Some(id) };
     for wrapper in [false, true] {
-        let error = super::after_the_spawn(io("wait"), running, Some(*exited_unreaped(id)), wrapper);
+        let torn = Torn {
+            fate: running,
+            unreaped: Some(*exited_unreaped(id)),
+            cleanup: None,
+        };
+        let error = super::after_the_spawn(io("wait"), torn, wrapper);
         assert_eq!(error.fate(), Some(running), "{error}");
         let Error::MayHaveStarted {
             unreaped: Some(child),
@@ -191,6 +198,7 @@ fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
         fate: ChildFate::Reaped,
         wrapper_elevated: false,
         unreaped: Some(exited_unreaped(id)),
+        cleanup: None,
     }));
 }
 
@@ -206,6 +214,7 @@ fn an_unreaped_child_whose_fate_names_no_identity_asserts_in_debug() {
         fate: ChildFate::Running { id: None },
         wrapper_elevated: false,
         unreaped: Some(exited_unreaped(id)),
+        cleanup: None,
     }));
 }
 
@@ -222,6 +231,7 @@ fn an_unreaped_child_whose_fate_names_another_process_asserts_in_debug() {
         fate: ChildFate::Running { id: Some(other) },
         wrapper_elevated: false,
         unreaped: Some(exited_unreaped(id)),
+        cleanup: None,
     }));
 }
 

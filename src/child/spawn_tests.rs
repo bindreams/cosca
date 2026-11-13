@@ -878,23 +878,33 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let pid = child.pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
-    let (err, fate, handed_back) = super::finish_elevated(child, failed_write())
-        .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_parts(());
+    let error = Error::from(super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn"));
+    // The failed wait is the teardown's failure, so it is in the cleanup, not in the detail.
+    let cleanup = crate::test_child::cleanup_of(&error);
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        cleanup.first().to_string().contains("cosca-finish-elevated-reap-4c1e"),
+        "{cleanup:?}"
+    );
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
     assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
     // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
     // reaped elsewhere and returns at once.
     handed_back.unreaped();
     drop(handed_back);
 
+    // The password write's failure is the cause: its code is the error's.
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPIPE), "{err:?}");
     let Error::Elevation { detail, .. } = &err else {
         panic!("got {err:?}");
     };
     assert!(
-        detail.contains(&format!(
-            "the elevated child pid {pid}: the wait failed: cosca-finish-elevated-reap-4c1e"
-        )),
+        detail.contains(&format!("the elevated child pid {pid}: the wait failed")),
         "the note must say the wait failed, got {detail:?}"
+    );
+    assert!(
+        !detail.contains("cosca-finish-elevated-reap-4c1e"),
+        "the failure is in the detail: {detail:?}"
     );
     assert!(
         !detail.contains("was terminated"),
@@ -1037,7 +1047,11 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
     crate::log_capture::install();
-    let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
+    let failed = || {
+        Some(Err(std::sync::Arc::new(Error::Io(std::io::Error::from_raw_os_error(
+            libc::EISDIR,
+        )))))
+    };
     for (name, tree, reported) in [
         ("cosca-report-failed", failed(), true),
         (
@@ -1065,6 +1079,17 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
             reported,
             "{name}: the note names the subject, got {note:?}"
         );
+        // The failure is the error's cleanup: the warn carries its text, the note does not.
+        let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+        assert!(
+            !note.contains(&errno_text),
+            "{name}: the failure is in the note: {note:?}"
+        );
+        assert_eq!(
+            warn.as_deref().is_some_and(|text| text.contains(&errno_text)),
+            reported,
+            "{name}: the warn carries the failure, got {warn:?}"
+        );
         assert_eq!(
             crate::log_capture::levels_since(mark, name),
             Vec::<log::Level>::new(),
@@ -1082,13 +1107,13 @@ fn reaped(pid: u32) -> bool {
     r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
-/// The error a failed password write returns.
+/// The error a failed password write returns: `AuthFailed`, caused by the pipe's `EPIPE`.
 #[cfg(unix)]
 fn failed_write() -> Result<(), Error> {
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "forced password-write failure".into(),
-        source: None,
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPIPE))),
     })
 }
 
@@ -1133,9 +1158,17 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     put_in_leaf(&mut child, &leaf_path);
     let pid = child.pid();
 
-    let (err, fate) = super::finish_elevated(child, failed_write())
-        .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_with();
+    let error = Error::from(super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn"));
+    // The tree's failure is the teardown's, so it is the cleanup's, with the OS's code; the detail
+    // says what was done.
+    let cleanup = crate::test_child::cleanup_of(&error);
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(
+        crate::error::first_os_code(&**cleanup.first()),
+        Some(libc::EISDIR),
+        "{cleanup:?}"
+    );
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
     assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
@@ -1146,6 +1179,53 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         detail.contains("its contained tree could not be killed"),
         "the tree's failure is reported, got {detail}"
     );
+    let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    assert!(!detail.contains(&errno_text), "the failure is in the detail: {detail}");
+    // The password write's failure is the cause.
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPIPE), "{err:?}");
+}
+
+/// The cleanup's failures come in the order they happened: the tree's first kill, then the root's
+/// failed wait, then the tree's kill made early over a root handed back.
+///
+/// Mutants: the root's failure comes before the first tree kill's (the order `Remains::after_tree_kill`
+/// has); the early kill's failure comes before the root's.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_password_writes_cleanup_lists_its_failures_in_the_order_they_happened() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unkillable-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would, each time.
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.kill_on_drop(false);
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    put_in_leaf(&mut child, &leaf_path);
+    fault::set_force_reap_failure("cosca-finish-elevated-order-9b3d");
+
+    let error = Error::from(super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn"));
+    let cleanup = crate::test_child::cleanup_of(&error);
+    assert_eq!(cleanup.iter().len(), 3, "{cleanup:?}");
+    let members: Vec<_> = cleanup.iter().collect();
+    assert_eq!(
+        crate::error::first_os_code(&**members[0]),
+        Some(libc::EISDIR),
+        "the first tree kill: {cleanup:?}"
+    );
+    assert!(
+        members[1].to_string().contains("cosca-finish-elevated-order-9b3d"),
+        "the root's wait: {cleanup:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&**members[2]),
+        Some(libc::EISDIR),
+        "the tree kill made early: {cleanup:?}"
+    );
+    let (_err, _fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
+    handed_back.unreaped();
+    drop(handed_back);
+    drop(teardown);
 }
 
 /// A tree kill that fails and a root whose handle cannot say whether it was reaped (`Unknown`) are
@@ -1410,9 +1490,11 @@ fn foreign_reap(child: &crate::Child, writer: crate::PipeWriter) {
 #[skuld::test]
 fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the_tree() {
     use crate::containment::dispatch::{SettleOutcome, UnvouchedKind};
-    let unsettled = || Error::Containment {
-        detail: "refused".into(),
-        source: None,
+    let unsettled = || {
+        std::sync::Arc::new(Error::Containment {
+            detail: "refused".into(),
+            source: None,
+        })
     };
     let table = [
         ("none made", None, false),

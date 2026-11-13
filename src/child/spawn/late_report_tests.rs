@@ -466,8 +466,8 @@ fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
 
 /// A late [`TREE_ARGV`] child under `TreeWalk` without a marker, whose first tree sweep is spoiled by
 /// `spoil`, armed once the grandchild runs. Answers the root's pid, its fate, whether the grandchild
-/// survived the teardown, and the log mark taken before the spawn.
-fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usize) {
+/// survived the teardown, the log mark taken before the spawn, and the `cleanup` of the spawn's error.
+fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usize, Option<crate::error::Failures>) {
     use crate::containment::ContainMode;
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
@@ -490,22 +490,28 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
         let _late = unique_report::seams::find_the_report_unwritten();
         cmd.spawn().expect_err("a late child is not adopted")
     };
+    let cleanup = match &err {
+        crate::error::Error::MayHaveStarted { cleanup, .. } => cleanup.clone(),
+        other => panic!("expected MayHaveStarted, got {other:?}"),
+    };
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
     };
     let survived = tree.borrow_mut().take().expect("the tree").grandchild_survived();
-    (id.pid(), fate, survived, mark)
+    (id.pid(), fate, survived, mark, cleanup)
 }
 
 /// A walk that cannot take its snapshot kills nothing; the root's kill then reparents the grandchild
 /// to launchd, so the walk from the zombie finds nothing and succeeds. That success does not erase
 /// the first failure: the warn says the tree may not be fully killed.
 ///
-/// Mutant: each sweep's result overwrites the last one's.
+/// The failed sweep is also the spawn's `cleanup`, as an error: the walk's own failure, not its text.
+///
+/// Mutants: each sweep's result overwrites the last one's; the failure is only in the warn's text.
 #[skuld::test]
 fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_left() {
-    let (pid, fate, survived, mark) =
+    let (pid, fate, survived, mark, cleanup) =
         late_tree_walk(|| crate::containment::enumerate::force_blind_snapshot_for_next_call(true));
     assert!(survived, "a walk that could not take its snapshot kills nothing");
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
@@ -515,6 +521,14 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
         &[SAID_REAPED, "its tree may not be fully killed", "test fault injected"],
         &[],
     );
+    let cleanup = cleanup.expect("the failed sweep is the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        crate::error::Report(&**cleanup.first())
+            .to_string()
+            .contains("test fault injected"),
+        "{cleanup:?}"
+    );
 }
 
 /// A walk that left a member it could not kill is an error naming it: the warn says so, even when a
@@ -523,11 +537,18 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
 /// Mutant: a later walk's `Ok` overwrites the error of the first.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
-    let (pid, fate, _, mark) = late_tree_walk(|| {
+    let (pid, fate, _, mark, cleanup) = late_tree_walk(|| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Descendant,
         );
     });
+    assert!(
+        matches!(
+            cleanup.as_ref().map(|failures| &**failures.first()),
+            Some(crate::error::Error::MembersLeft { .. })
+        ),
+        "the members the walk left are the cleanup: {cleanup:?}"
+    );
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
         pid,
@@ -543,11 +564,12 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
 /// Mutant: the walk's result is judged before the root's kill.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() {
-    let (pid, fate, _, mark) = late_tree_walk(|| {
+    let (pid, fate, _, mark, cleanup) = late_tree_walk(|| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Root,
         );
     });
+    assert!(cleanup.is_none(), "the root's kill settled the walk: {cleanup:?}");
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
         pid,
@@ -582,11 +604,21 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
             resolved: Vec::new(),
         })],
         notes: Vec::new(),
+        failures: Vec::new(),
     };
 
-    assert_eq!(root_left().failure_note(true), None, "the root's kill ended it");
-    let named = root_left().failure_note(false).expect("the root is still running");
+    let mut ended = root_left();
+    assert_eq!(ended.failure_note(true), None, "the root's kill ended it");
+    assert!(ended.failures.is_empty(), "{:?}", ended.failures);
+    let mut running = root_left();
+    let named = running.failure_note(false).expect("the root is still running");
     assert!(named.contains("pid 4242 was not killed"), "{named}");
+    assert_eq!(running.failures.len(), 1, "{:?}", running.failures);
+    assert!(
+        running.failures[0].to_string().contains("pid 4242 was not killed"),
+        "the failure is held as an error: {:?}",
+        running.failures
+    );
 }
 
 /// A late child's root with `id`, for [`Root::signal`](crate::containment::Root::signal).
@@ -599,6 +631,7 @@ fn late_root(pid: u32, id: Option<crate::identity::ProcessId>) -> LateTree {
         id,
         sweeps: Vec::new(),
         notes: Vec::new(),
+        failures: Vec::new(),
     }
 }
 
@@ -912,9 +945,39 @@ fn tear_down_warning_after(
     let _armed = arm(pid);
     let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, warn_after);
     let tail = done.zombie_tail();
-    let fate = done.warn(pid, tail);
+    let (fate, _failures) = done.warn(pid, tail);
     drop(child);
     (fate, warns_of(pid, mark), sent.entries())
+}
+
+/// A refused kill of a late child is returned for the spawn's `cleanup` as the error the OS gave, beside
+/// the warn that says it.
+///
+/// Mutant: the failure is only in the warn's text.
+#[skuld::test]
+fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let uncontained = crate::containment::Prepared {
+        mode: None,
+        is_root: true,
+        marker: None,
+    };
+    let _refused = refuse_the_kill();
+
+    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, uncontained, None);
+    let (fate, failures) = done.warn(pid, None);
+
+    assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
+    let failures = failures.expect("the kill was refused");
+    assert_eq!(failures.iter().len(), 1, "{failures:?}");
+    assert!(
+        matches!(&**failures.first(), crate::error::Error::Io(_)),
+        "{failures:?}"
+    );
+    drop(child);
+    end_unsignalled_and_reap(pid);
 }
 
 fn only(warns: &[String]) -> &str {

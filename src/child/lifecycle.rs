@@ -72,8 +72,16 @@ pub(super) fn status_of_outcome(
 /// exit is lost, so it is `Reaped` whether or not a kill reached it.
 #[derive(Debug)]
 pub(crate) struct Settlement {
-    answer: Result<ChildWaitOutcome, Error>,
+    answer: Result<ChildWaitOutcome, FailedWait>,
     killed: bool,
+}
+
+/// A wait that failed: the failure as the teardown reports it, naming its step, and as the wait's own
+/// error said it, for the clause.
+#[derive(Debug)]
+struct FailedWait {
+    failure: std::sync::Arc<Error>,
+    said: String,
 }
 
 impl Settlement {
@@ -82,7 +90,19 @@ impl Settlement {
             !(killed && matches!(answer, Ok(ChildWaitOutcome::DeadlinePassed))),
             "a kill is followed by a wait with no deadline"
         );
-        Settlement { answer, killed }
+        Settlement {
+            answer: answer.map_err(|e| FailedWait {
+                said: crate::error::Report(&e).to_string(),
+                failure: std::sync::Arc::new(e.in_step("waiting for the child")),
+            }),
+            killed,
+        }
+    }
+
+    /// The failure of the wait, if it failed: the error a failed spawn's teardown reports beside
+    /// its cause.
+    pub(crate) fn failure(&self) -> Option<std::sync::Arc<Error>> {
+        self.answer.as_ref().err().map(|failed| failed.failure.clone())
     }
 
     /// What became of the child, whose identity the caller read as `id`, if it did.
@@ -135,7 +155,9 @@ impl Settlement {
     /// What to say of the child, and at what level: a clause for every answer, which the caller logs
     /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
     /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.
-    /// `disposition` adds where an uncollected child goes; `None` for a caller that says so itself.
+    /// `disposition` adds where an uncollected child goes; `None` for a caller that says so itself and
+    /// returns the text in an error, which holds a failed wait itself ([`failure`](Self::failure)): the
+    /// text then says only that it failed.
     pub(crate) fn wording(&self, subject: &str, running: Option<&str>, disposition: Option<Disposition>) -> Wording {
         let after = if self.killed { " after the kill" } else { "" };
         match &self.answer {
@@ -152,14 +174,13 @@ impl Settlement {
             Ok(ChildWaitOutcome::Foreign(_)) => {
                 Wording::Collected(log::Level::Debug, format!("{subject}: reaped by someone else"))
             }
-            // A logged text gets the whole chain; `None` returns it in an error, so Display.
-            Err(e) => Wording::Uncollected(match disposition {
+            Err(failed) => Wording::Uncollected(match disposition {
                 Some(disposition) => format!(
                     "{subject}: the wait failed: {}{}",
-                    crate::error::Report(e),
+                    failed.said,
                     disposition.suffix(true)
                 ),
-                None => format!("{subject}: the wait failed: {e}"),
+                None => format!("{subject}: the wait failed"),
             }),
             Ok(ChildWaitOutcome::DeadlinePassed) => Wording::Uncollected(
                 running.map_or_else(|| format!("{subject}: its wait ended with no exit"), str::to_owned),

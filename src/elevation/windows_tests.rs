@@ -1107,8 +1107,9 @@ fn an_hresult_cause_keeps_its_hex_unless_it_is_a_win32_code() {
 /// could not be read; that arm needs a UAC prompt to reach, so the mapping is tested here.
 ///
 /// Mutants: `Terminated` reported as `Running`; `Exited` reported as `Running`; `Failed` reported
-/// as `Killed`; the failure's code or the pid left out of the detail; an unreadable pid shown as a
-/// pid or worded as an identity failure.
+/// as `Killed`; the pid left out of the detail; an unreadable pid shown as a pid or worded as an
+/// identity failure; a failure's text in the detail; the refused termination or a failed read
+/// missing from where it goes (the refusal is the `cleanup`, the read the `source`).
 #[skuld::test]
 fn an_untracked_child_fate_follows_how_its_termination_ended() {
     use super::untracked_outcome;
@@ -1116,20 +1117,28 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     use crate::identity::Termination;
     use windows::core::{Error as WinError, HRESULT};
 
-    let (detail, source, fate) = untracked_outcome(Ok(4242), Termination::Terminated);
-    assert_eq!(fate, ChildFate::Killed);
-    assert!(source.is_none(), "{source:?}");
-    assert!(detail.ends_with("it was terminated"), "{detail}");
+    let win = |code| WinError::from_hresult(HRESULT::from_win32(code));
+    // The pid was read and its identity was not: the identity read's failure is the cause.
+    let unresolved = || Ok((4242, win(1)));
 
-    let (detail, _, fate) = untracked_outcome(Ok(4242), Termination::Exited);
+    let (detail, source, cleanup, fate) = untracked_outcome(unresolved(), Termination::Terminated);
     assert_eq!(fate, ChildFate::Killed);
+    assert!(cleanup.is_none(), "{cleanup:?}");
+    assert!(detail.ends_with("it was terminated"), "{detail}");
+    assert_eq!(
+        crate::error::first_os_code(&*source.expect("the identity read's failure is the cause")),
+        Some(1)
+    );
+
+    let (detail, _, cleanup, fate) = untracked_outcome(unresolved(), Termination::Exited);
+    assert_eq!(fate, ChildFate::Killed);
+    assert!(cleanup.is_none(), "{cleanup:?}");
     assert!(
         detail.ends_with("it exited or is exiting, and its exit was not waited for"),
         "{detail}"
     );
 
-    let refusal = WinError::from_hresult(HRESULT::from_win32(5));
-    let (detail, source, fate) = untracked_outcome(Ok(4242), Termination::Failed(refusal));
+    let (detail, source, cleanup, fate) = untracked_outcome(unresolved(), Termination::Failed(win(5)));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(detail.contains("pid 4242"), "{detail}");
     assert!(detail.contains("identity could not be resolved"), "{detail}");
@@ -1138,27 +1147,43 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
         "{detail}"
     );
     assert_eq!(
-        crate::error::first_os_code(&*source.expect("the refusal is the cause")),
-        Some(5)
+        crate::error::first_os_code(&*source.expect("the identity read's failure is the cause")),
+        Some(1)
+    );
+    let cleanup = cleanup.expect("the refused termination is the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert_eq!(crate::error::first_os_code(&**cleanup.first()), Some(5), "{cleanup:?}");
+    assert!(
+        cleanup.first().to_string().contains("terminating the elevated child"),
+        "the refusal names its step: {cleanup:?}"
     );
 
-    // A failed `GetProcessId` has no pid to show, and is not an identity failure.
-    let no_pid = || Err(WinError::from_hresult(HRESULT::from_win32(6)));
-    let refusal = WinError::from_hresult(HRESULT::from_win32(5));
-    let (detail, _, fate) = untracked_outcome(no_pid(), Termination::Failed(refusal));
+    // A failed `GetProcessId` has no pid to show, and is not an identity failure. Its failure, and
+    // the refusal, are told apart by where they are: the read is the source, the refusal the cleanup.
+    let no_pid = || Err(win(6));
+    let (detail, source, cleanup, fate) = untracked_outcome(no_pid(), Termination::Failed(win(5)));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(!detail.contains("pid 0"), "{detail}");
-    assert!(
-        detail.contains("pid could not be read (") && detail.contains("GetProcessId"),
-        "{detail}"
-    );
+    assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(!detail.contains("identity could not be resolved"), "{detail}");
     assert!(
-        detail.contains("could not be terminated (") && detail.contains("it may still be running"),
+        detail.ends_with("and could not be terminated; it may still be running"),
         "{detail}"
     );
-    let (detail, source, fate) = untracked_outcome(no_pid(), Termination::Terminated);
+    assert!(
+        !detail.contains(&win(6).message()) && !detail.contains(&win(5).message()),
+        "a failure's text is in the detail: {detail}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&*source.expect("the failed read is the cause")),
+        Some(6)
+    );
+    let cleanup = cleanup.expect("the refused termination is the cleanup");
+    assert_eq!(crate::error::first_os_code(&**cleanup.first()), Some(5), "{cleanup:?}");
+
+    let (detail, source, cleanup, fate) = untracked_outcome(no_pid(), Termination::Terminated);
     assert_eq!(fate, ChildFate::Killed);
+    assert!(cleanup.is_none(), "{cleanup:?}");
     assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(detail.ends_with("it was terminated"), "{detail}");
     assert_eq!(

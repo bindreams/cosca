@@ -26,7 +26,7 @@
 
 use std::io;
 
-use crate::error::{ElevationErrorKind, Error};
+use crate::error::{ElevationErrorKind, Error, Failures};
 
 /// How a message names the elevation front `pid` (`None`: not known).
 pub(crate) fn front_named(pid: Option<u32>) -> String {
@@ -137,26 +137,15 @@ impl Reason {
     }
 }
 
-/// A single failed read becomes the refusal's cause; several go into its words, since a refusal
-/// has one `source`.
-fn unread_reason(mut unread: Unread) -> Option<Reason> {
-    match unread.len() {
-        0 => None,
-        1 => {
-            let (what, e) = unread.remove(0);
-            Some(Reason {
-                words: what.to_owned(),
-                cause: Some(Error::io_cause(e)),
-            })
-        }
-        _ => Some(Reason::words(
-            unread
-                .iter()
-                .map(|(what, e)| format!("{what}: {e}"))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )),
-    }
+/// What the failed reads were of, as the refusal's words, and the reads' errors as its cause: the
+/// one failure, or a [`Error::Several`] of them in the order they failed.
+fn unread_reason(unread: Unread) -> Option<Reason> {
+    let words = unread.iter().map(|(what, _)| *what).collect::<Vec<_>>().join("; ");
+    let cause = Failures::collect(unread.into_iter().map(|(_, e)| Error::io_cause(e)))?.into_cause();
+    Some(Reason {
+        words,
+        cause: Some(cause),
+    })
 }
 
 /// Whether a cgroup kill, just written, reached the tracked process `pid`, the `front` its spawn

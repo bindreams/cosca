@@ -59,7 +59,7 @@ mod failed_spawn {
         let mut fate = None;
 
         let warns = slow_warns_during(|| {
-            let (reaped, handed_back) = tear_down_failed_spawn(
+            let torn = tear_down_failed_spawn(
                 owned,
                 None,
                 Past::Clean,
@@ -67,8 +67,8 @@ mod failed_spawn {
                 SpawnPolicy::WARNS_AT_ONCE,
                 &mut Diagnosis::default(),
             );
-            assert!(handed_back.is_none(), "a reaped child is not handed back");
-            fate = Some(reaped);
+            assert!(torn.unreaped.is_none(), "a reaped child is not handed back");
+            fate = Some(torn.fate);
         });
 
         assert_eq!(fate, Some(ChildFate::Reaped));
@@ -90,7 +90,7 @@ mod failed_spawn {
         });
         let fake = fake.expect("the script ran");
 
-        let (_, handed_back) = tear_down_failed_spawn(
+        let torn = tear_down_failed_spawn(
             owned,
             None,
             Past::WaitMayFail,
@@ -98,7 +98,7 @@ mod failed_spawn {
             SpawnPolicy::LET_GO,
             &mut Diagnosis::default(),
         );
-        let handed_back = handed_back.expect("a child whose wait failed is handed back");
+        let handed_back = torn.unreaped.expect("a child whose wait failed is handed back");
         assert_eq!(fake.signal_calls(), [Sig::Kill], "the teardown's own kill");
         // So that a drop that waits ends with the child, not never.
         drop(stdin);

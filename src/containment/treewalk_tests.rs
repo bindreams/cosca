@@ -728,7 +728,7 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let outcome = super::kill_by_identity(id);
@@ -750,7 +750,7 @@ fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
     };
     // Readable by pid, but not terminable: the walk anchors on it, and its kill is refused.
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let kernel = crate::identity::HostKernel;
@@ -967,7 +967,7 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
     // SYNCHRONIZE and TERMINATE that the process refuses.
     let (child, stdin) =
         crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
-    let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let real = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
 
@@ -1014,7 +1014,7 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
     let (child, _stdin) =
         crate::identity::windows_fixture::spawn_restricted_releasable(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
     let child = std::rc::Rc::new(child);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     let exiter = std::rc::Rc::clone(&child);
     super::fault::set_before_terminate(move || exiter.terminate());
@@ -1044,7 +1044,7 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
             .stderr(std::process::Stdio::null()),
     )
     .expect("spawn cmd /C more");
-    let id = crate::identity::windows_identity_from_handle(
+    let id = crate::identity::windows_identity_from_handle_result(
         windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
         child.id(),
     )

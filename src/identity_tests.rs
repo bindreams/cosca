@@ -109,7 +109,7 @@ fn an_access_denied_live_process_is_unknown_everywhere() {
     };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
-    let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
+    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     // We cannot name it by pid at all...

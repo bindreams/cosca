@@ -418,8 +418,22 @@ pub(crate) fn tear_down_holding<R>(
     release: R,
     disposition: crate::child::owned::teardown::Disposition,
 ) -> (crate::error::ChildFate, HandedBack<R>) {
-    let (fate, unreaped) = child.tear_down_or_hand_back(disposition);
-    (fate, HandedBack::new(release, unreaped))
+    let (fate, _, handed_back) = tear_down_holding_failures(child, release, disposition);
+    (fate, handed_back)
+}
+
+/// [`tear_down_holding`], and the failures of the teardown too (the `cleanup` of a failed run's error).
+pub(crate) fn tear_down_holding_failures<R>(
+    child: crate::Child,
+    release: R,
+    disposition: crate::child::owned::teardown::Disposition,
+) -> (crate::error::ChildFate, Option<crate::error::Failures>, HandedBack<R>) {
+    let crate::child::drop_teardown::Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = child.tear_down_or_hand_back(disposition);
+    (fate, cleanup, HandedBack::new(release, unreaped))
 }
 
 /// The cause, fate and [`HandedBack`] child (none if the spawn handed none back) inside an error a
@@ -432,6 +446,17 @@ pub(crate) fn expect_may_have_started_parts<R>(
 ) -> (crate::error::Error, crate::error::ChildFate, HandedBack<R>) {
     let (cause, fate, unreaped) = crate::child::spawn::failure::error_parts(error);
     (cause, fate, HandedBack::new(release, unreaped))
+}
+
+#[cfg(unix)]
+#[track_caller]
+pub(crate) fn cleanup_of(error: &crate::error::Error) -> crate::error::Failures {
+    let crate::error::Error::MayHaveStarted { cleanup, .. } = error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    cleanup
+        .clone()
+        .unwrap_or_else(|| panic!("the teardown's failures are in the cleanup: {error:?}"))
 }
 
 /// [`expect_may_have_started_parts`] for an error that must hand the child back.
@@ -468,8 +493,8 @@ pub(crate) fn tear_down_held_holding<R>(
         disposition: crate::child::owned::teardown::Disposition::HandBack,
         policy: crate::child::spawn::policy::SpawnPolicy::SYNC,
     };
-    let (error, fate, unreaped) = crate::child::spawn::held_teardown::tear_down_held(child, how, why, error);
-    (error, fate, HandedBack::new(release, unreaped))
+    let (error, torn) = crate::child::spawn::held_teardown::tear_down_held(child, how, why, error);
+    (error, torn.fate, HandedBack::new(release, torn.unreaped))
 }
 
 #[cfg(unix)]

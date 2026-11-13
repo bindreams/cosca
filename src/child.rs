@@ -24,7 +24,7 @@ pub(crate) mod spawn;
 #[path = "child/drop_report.rs"]
 pub(crate) mod drop_report;
 #[path = "child/drop_teardown.rs"]
-mod drop_teardown;
+pub(crate) mod drop_teardown;
 #[cfg(all(unix, any(test, target_os = "linux")))]
 use drop_teardown::word_front;
 #[path = "child/owned.rs"]
@@ -160,7 +160,7 @@ pub struct Child {
 pub(crate) fn refused_commit(
     refusal: std::io::Error,
     behind_front: bool,
-    torn_down: Result<(crate::error::ChildFate, Option<crate::Unreaped>), String>,
+    torn_down: Result<drop_teardown::Torn, Error>,
 ) -> crate::child::spawn::SpawnFailure {
     crate::child::spawn::failed_after_teardown(Error::Io(refusal), behind_front, torn_down)
 }
@@ -230,7 +230,7 @@ impl Child {
     /// The teardown half of [`commit_kill_on_drop`](Self::commit_kill_on_drop): the still-armed child
     /// whose disarm was refused is torn down as a failed run's is (handed back if its kill is
     /// refused). This waits for the child to be reaped.
-    pub(crate) fn tear_down_refused_commit(mut self) -> (crate::error::ChildFate, Option<crate::Unreaped>) {
+    pub(crate) fn tear_down_refused_commit(mut self) -> drop_teardown::Torn {
         // Armed, whatever the caller asked for: the teardown leaves a `kill_on_drop(false)` child.
         self.kill_on_drop = true;
         self.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack)

@@ -79,7 +79,10 @@ impl JobHandle {
     /// other containment mechanisms already report this.
     pub(crate) fn hard_kill(&self) -> io::Result<()> {
         #[cfg(test)]
-        fault::run_before_job_kill();
+        {
+            fault::run_before_job_kill();
+            forced(fault::Step::JobKill, None).map_err(win32_io_error)?;
+        }
         // SAFETY: `self.raw` is a valid handle we own for as long as `self` lives.
         unsafe { TerminateJobObject(self.raw, 1) }.map_err(win32_io_error)
     }
@@ -683,6 +686,7 @@ pub(crate) mod fault {
         CreationTime,
         /// The assignment of a Strongest root's job.
         Assign,
+        JobKill,
     }
 
     /// The forced pid lists of this thread.
@@ -1827,24 +1831,39 @@ pub(crate) fn resume_initial_threads(
 /// Returns `Ok(None)` when job assignment fails — the caller falls back to the
 /// universal `Containment::TreeWalk` mechanism (identity teardown).
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
-/// child+job are killed and the error propagates to fail the spawn.
-pub(crate) fn attach_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<Option<JobHandle>> {
+/// child+job are killed and the failure propagates to fail the spawn. The resume failure is its
+/// cause; a failure of the job's kill after it is its cleanup (a teardown failure of the failed
+/// spawn), which cannot change the outcome.
+pub(crate) fn attach_job(
+    proc_handle: std::os::windows::io::RawHandle,
+) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
     let job_result = assign_held(proc_handle);
 
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
     if let Err(resume_err) = resume_initial_threads(proc_handle, SuspendCount::Any) {
-        if let Ok(job) = job_result {
-            // Kill via the job first (catches any threads the walk may have missed). The
-            // resume failure is what gets reported; a kill failure on top of it cannot change
-            // that outcome, so it is logged here rather than swallowed.
-            if let Err(e) = job.hard_kill() {
-                log::warn!(
-                    "job kill after a failed resume also failed ({report}); the tree may still be running",
-                    report = crate::error::Report(&e)
-                );
-            }
+        let cleanup = match job_result {
+            // Kill via the job first (catches any threads the walk may have missed).
+            Ok(job) => job
+                .hard_kill()
+                .err()
+                .map(|e| crate::error::Error::io_cause(crate::error::io_context("terminating the job", e))),
+            Err(_) => None,
+        };
+        // Both the warn and the `cleanup` are deliberate: a failed kill logs at warn naming the
+        // resource (principle 7), and the error carries it too.
+        if let Some(failure) = &cleanup {
+            log::warn!(
+                "job kill after a failed resume also failed ({report}); the tree may still be running",
+                report = crate::error::Report(&**failure)
+            );
         }
-        return Err(resume_err);
+        return Err(crate::containment::dispatch::AttachFailure {
+            cause: crate::error::Error::Containment {
+                detail: "the child's initial threads could not be resumed".to_owned(),
+                source: Some(crate::error::Error::io_cause(resume_err)),
+            },
+            cleanup: crate::error::Failures::collect(cleanup),
+        });
     }
 
     match job_result {

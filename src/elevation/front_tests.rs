@@ -296,15 +296,68 @@ fn a_front_outside_its_leaf_after_the_kill_was_not_reached() {
     assert!(detail.contains("left the cgroup before its kill"), "{detail}");
 }
 
-/// A front whose place cannot be read is not shown reached: refused, with every reason.
+/// The two failed reads of a refusal, as its cause: both are the `source` (a `Several`, the first
+/// read first), and neither is in the detail, which says only what was done.
+#[track_caller]
+fn assert_refused_by_two_reads(error: &Error, words: &[&str], reads: [&str; 2]) {
+    let Error::Elevation {
+        kind: ElevationErrorKind::Unkillable,
+        detail,
+        source: Some(source),
+    } = error
+    else {
+        panic!("expected Unkillable with a source, got {error:?}");
+    };
+    for word in words {
+        assert!(detail.contains(word), "{detail}");
+    }
+    for read in reads {
+        assert!(!detail.contains(read), "a cause is in the detail: {detail}");
+    }
+    let Error::Several(failures) = &**source else {
+        panic!("expected the two reads as a Several, got {source:?}");
+    };
+    let texts: Vec<_> = failures.iter().map(|failure| failure.to_string()).collect();
+    assert_eq!(texts, reads, "{error:?}");
+}
+
+/// A front whose place cannot be read is not shown reached: refused, with every read that failed
+/// as its cause.
+///
+/// Mutants: only the first read is the cause; the reads are in the detail's text.
 #[skuld::test]
 fn a_front_whose_place_after_the_kill_cannot_be_read_is_refused() {
     let (r, _) = reached_asking(Err(io::Error::other("peek refused")), Err(io::Error::other("hidepid")));
-    let detail = refusal_detail(Gate::Closed(r.expect_err("not shown reached")));
-    assert!(detail.contains("nothing shows the cgroup kill reached it"), "{detail}");
-    assert!(
-        detail.contains("peek refused") && detail.contains("hidepid"),
-        "{detail}"
+    let error = r.expect_err("not shown reached");
+    assert_refused_by_two_reads(
+        &error,
+        &[
+            "nothing shows the cgroup kill reached it",
+            "whether it had exited could not be read",
+            "its cgroup could not be read",
+        ],
+        ["peek refused", "hidepid"],
+    );
+}
+
+/// The gate before a kill, when both of its reads fail: closed, with both as the cause.
+///
+/// Mutant: the second failed read replaces the first, or is only in the detail.
+#[skuld::test]
+fn a_front_whose_two_gate_reads_fail_is_closed_with_both_as_its_cause() {
+    let g = kill_gate(
+        Some(Front::Sudo),
+        PID,
+        || Err(io::Error::other("peek refused")),
+        || Err(io::Error::other("hidepid")),
+    );
+    assert_refused_by_two_reads(
+        &refusal(g),
+        &[
+            "whether it had exited could not be read",
+            "whether its cgroup kill reaches it could not be read",
+        ],
+        ["peek refused", "hidepid"],
     );
 }
 

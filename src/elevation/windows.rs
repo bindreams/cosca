@@ -500,56 +500,60 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     })))
 }
 
-/// The detail and fate of a launched child that could not be tracked, after its termination came
-/// back as `outcome`. `pid` is what `GetProcessId` returned: its error when the pid could not be
-/// read, else the pid whose identity could not be resolved. Never waits.
+/// The detail, cause, cleanup and fate of a launched child that could not be tracked, after its
+/// termination came back as `outcome`. `unread` is what could not be read: the error of
+/// `GetProcessId` when the pid could not be, else the pid whose identity could not be resolved, with
+/// the identity read's error. Never waits.
 ///
-/// The second value is the failed read when it is the only failure (its cause); with a refused
-/// termination too, both are in the detail.
+/// The detail says what was done. The failed read is the cause (the `source`), and a refused
+/// termination, which is a failure of the cleanup, not of what the call was doing, is the cleanup.
 fn untracked_outcome(
-    pid: Result<u32, windows::core::Error>,
+    unread: Result<(u32, windows::core::Error), windows::core::Error>,
     outcome: Termination,
-) -> (String, Option<std::sync::Arc<Error>>, ChildFate) {
-    let (who, why) = match &pid {
-        Ok(pid) => (
+) -> (
+    String,
+    Option<std::sync::Arc<Error>>,
+    Option<crate::error::Failures>,
+    ChildFate,
+) {
+    let (who, why, read_failure) = match unread {
+        Ok((pid, e)) => (
             format!("the elevated child (pid {pid})"),
             "its identity could not be resolved".to_string(),
+            e,
         ),
-        Err(_) => (
+        Err(e) => (
             "the elevated child".to_string(),
             "its pid could not be read (GetProcessId)".to_string(),
+            e,
         ),
     };
-    let read_failure = pid.err();
     let cause = |e| Error::io_cause(crate::error::win32_io_error(e));
+    let source = Some(cause(read_failure));
     match outcome {
         Termination::Terminated => (
             format!("the elevated child launched but {why}; it was terminated"),
-            read_failure.map(cause),
+            source,
+            None,
             ChildFate::Killed,
         ),
         Termination::Exited => (
             format!("the elevated child launched but {why}; it exited or is exiting, and its exit was not waited for"),
-            read_failure.map(cause),
+            source,
+            None,
             // `Killed` is "dead or dying, exit not collected": it claims no completion. Waiting here
             // would block, and this launch runs inside the async spawn too.
             ChildFate::Killed,
         ),
-        Termination::Failed(e) => match read_failure {
-            Some(read) => (
-                format!(
-                    "{who} launched but its pid could not be read (GetProcessId: {read}) and {}; it may still be running",
-                    crate::child::owned::teardown::kill_refused(&e)
-                ),
-                None,
-                ChildFate::Running { id: None },
-            ),
-            None => (
-                format!("{who} launched but {why} and could not be terminated; it may still be running"),
-                Some(cause(e)),
-                ChildFate::Running { id: None },
-            ),
-        },
+        Termination::Failed(e) => (
+            format!("{who} launched but {why} and could not be terminated; it may still be running"),
+            source,
+            crate::error::Failures::collect([Error::io_cause(crate::error::io_context(
+                "terminating the elevated child",
+                crate::error::win32_io_error(e),
+            ))]),
+            ChildFate::Running { id: None },
+        ),
     }
 }
 
@@ -614,23 +618,30 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         0 => Err(windows::core::Error::from_thread()),
         pid => Ok(pid),
     };
-    let tracked = pid
-        .as_ref()
-        .ok()
-        .and_then(|&pid| crate::identity::windows_identity_from_handle(handle, pid).map(|id| (pid, id)));
-    let Some((pid, id)) = tracked else {
-        // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
-        // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
-        let (detail, source, fate) = untracked_outcome(pid, windows_terminate_held(handle, granted));
-        return Err(SpawnFailure::started(
-            Error::Elevation {
-                kind: ElevationErrorKind::Untracked,
-                detail,
-                source,
-            },
-            fate,
-            None,
-        ));
+    // What could not be read: the pid's error, or the pid with the identity read's.
+    let tracked = match pid {
+        Ok(pid) => crate::identity::windows_identity_from_handle_result(handle, pid)
+            .map(|id| (pid, id))
+            .map_err(|e| Ok((pid, e))),
+        Err(e) => Err(Err(e)),
+    };
+    let (pid, id) = match tracked {
+        Ok(tracked) => tracked,
+        Err(unread) => {
+            // Auth SUCCEEDED but we cannot track the child. Terminate it, and report the
+            // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
+            let (detail, source, cleanup, fate) = untracked_outcome(unread, windows_terminate_held(handle, granted));
+            return Err(SpawnFailure::started(
+                Error::Elevation {
+                    kind: ElevationErrorKind::Untracked,
+                    detail,
+                    source,
+                },
+                fate,
+                None,
+            )
+            .with_cleanup(cleanup));
+        }
     };
 
     let report = ElevationReport {

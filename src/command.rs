@@ -998,8 +998,7 @@ impl Command {
         String::from_utf8(out.stdout).map_err(|e| {
             crate::child::spawn::after_the_spawn(
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                crate::error::ChildFate::Reaped,
-                None,
+                crate::child::drop_teardown::Torn::left(crate::error::ChildFate::Reaped),
                 child.front().is_some(),
             )
         })
@@ -1011,8 +1010,8 @@ impl Command {
 /// carries it when its teardown could not end it.
 fn after_the_spawn(error: Error, child: crate::Child) -> Error {
     let behind_front = child.front().is_some();
-    let (fate, unreaped) = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
-    crate::child::spawn::after_the_spawn(error, fate, unreaped, behind_front)
+    let torn = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
+    crate::child::spawn::after_the_spawn(error, torn, behind_front)
 }
 
 #[cfg(test)]

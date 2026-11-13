@@ -499,6 +499,7 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
             wrapper_elevated,
             source: Arc::new(Error::Io(std::io::Error::other("cause"))),
             unreaped: None,
+            cleanup: None,
         }
         .to_string()
     };
@@ -523,6 +524,7 @@ fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
         wrapper_elevated: false,
         source: Arc::new(Error::Io(std::io::Error::other("cause"))),
         unreaped,
+        cleanup: None,
     };
     let with_child = error(Some(exited_unreaped(id)));
     assert_eq!(with_child.fate(), Some(fate));
@@ -543,12 +545,20 @@ fn with_note_keeps_the_unreaped_child() {
             source: None,
         }),
         unreaped: Some(exited_unreaped(id)),
+        cleanup: Some(failures_of([coded(CODES[0])])),
     }
     .with_note("front left");
-    let Error::MayHaveStarted { source, unreaped, .. } = &error else {
+    let Error::MayHaveStarted {
+        source,
+        unreaped,
+        cleanup,
+        ..
+    } = &error
+    else {
         panic!("expected MayHaveStarted, got {error:?}");
     };
     assert_eq!(unreaped.as_ref().map(|child| child.pid()), Some(Some(id.pid())));
+    assert_eq!(cleanup.as_ref().map(codes_of), Some(vec![Some(CODES[0])]));
     assert!(
         matches!(**source, Error::Containment { ref detail, .. } if detail == "x; front left"),
         "{source:?}"
@@ -879,6 +889,103 @@ fn report_of_a_several_under_a_variant_prints_the_variant_then_every_member() {
         Report(&e).to_string(),
         format!("could not determine the target process's state: d: 2 failures: (1) {a}: {a}; (2) {b}: {b}")
     );
+}
+
+fn may_have_started(cause: Arc<Error>, cleanup: Option<Failures>) -> Error {
+    Error::MayHaveStarted {
+        fate: ChildFate::Reaped,
+        wrapper_elevated: false,
+        source: cause,
+        unreaped: None,
+        cleanup,
+    }
+}
+
+/// Without cleanup the layer prints as it always did: its words, then the cause's chain.
+///
+/// Mutant: `Report` prints a `cleanup` marker with nothing in it.
+#[skuld::test]
+fn report_of_a_may_have_started_without_cleanup_is_its_words_and_its_cause() {
+    let a = os_text(CODES[0]);
+    let e = may_have_started(coded(CODES[0]), None);
+    assert_eq!(Report(&e).to_string(), format!("{e}: {a}: {a}"));
+}
+
+/// The cause's chain comes first, and the teardown failures after it, each with its whole chain.
+///
+/// Mutants: `Report` leaves the cleanup out; prints it before the cause; numbers the cause among it.
+#[skuld::test]
+fn report_of_a_may_have_started_prints_the_cause_then_every_cleanup_failure() {
+    let [a, b, c] = CODES.map(os_text);
+    let e = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1]), coded(CODES[2])])));
+    assert_eq!(
+        Report(&e).to_string(),
+        format!("{e}: {a}: {a}; cleanup: [(1) {b}: {b}; (2) {c}: {c}]")
+    );
+}
+
+/// `Display` and `source()` do not reach `cleanup`, so the layer's own words say that the teardown
+/// failed too and how many failures are in it.
+///
+/// Mutants: the words are dropped, or say nothing of the count, or are said for no cleanup.
+#[skuld::test]
+fn a_may_have_started_says_in_its_display_that_its_teardown_failed_too() {
+    let a = os_text(CODES[0]);
+    assert_eq!(
+        may_have_started(coded(CODES[0]), None).to_string(),
+        format!("the program may have started, and its child was reaped: {a}")
+    );
+    let one = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])])));
+    assert_eq!(
+        one.to_string(),
+        format!("the program may have started, and its child was reaped; its teardown failed too (1 failure, in `cleanup`): {a}")
+    );
+    let two = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1]), coded(CODES[2])])));
+    assert_eq!(
+        two.to_string(),
+        format!("the program may have started, and its child was reaped; its teardown failed too (2 failures, in `cleanup`): {a}")
+    );
+}
+
+/// A `MayHaveStarted` with cleanup that is a member of an outer list wraps its cause and cleanup in
+/// brackets, so the outer `;` stays the outer list's.
+///
+/// Mutant: the brackets are left off in a member.
+#[skuld::test]
+fn report_of_a_may_have_started_in_a_member_brackets_its_cause_and_cleanup() {
+    let [a, b, c] = CODES.map(os_text);
+    let member = Arc::new(may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])]))));
+    let outer = Error::Several(failures_of([member.clone(), coded(CODES[2])]));
+    assert_eq!(
+        Report(&outer).to_string(),
+        format!("2 failures: (1) {member}: [{a}: {a}; cleanup: [(1) {b}: {b}]]; (2) {c}: {c}")
+    );
+}
+
+/// A list in the cause reads in brackets, so the cleanup that follows is not taken for its member.
+#[skuld::test]
+fn report_of_a_may_have_started_brackets_a_list_in_its_cause() {
+    let [a, b, c] = CODES.map(os_text);
+    let e = may_have_started(
+        Arc::new(several(&[CODES[0], CODES[1]])),
+        Some(failures_of([coded(CODES[2])])),
+    );
+    assert_eq!(
+        Report(&e).to_string(),
+        format!("{e}: 2 failures: [(1) {a}: {a}; (2) {b}: {b}]; cleanup: [(1) {c}: {c}]")
+    );
+}
+
+/// The OS code of a failed spawn is its cause's, not the teardown's.
+///
+/// Mutant: the cleanup's first failure is the layer's `source`.
+#[skuld::test]
+fn a_may_have_started_with_cleanup_has_the_causes_os_code_first() {
+    let e = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])])));
+    assert_eq!(first_os_code(&e), Some(CODES[0]));
+    let cleanup = e.failures().expect("the cleanup");
+    assert_eq!(codes_of(cleanup), [Some(CODES[1])]);
+    assert!(may_have_started(coded(CODES[0]), None).failures().is_none());
 }
 
 fn codes_of(list: &Failures) -> Vec<Option<i32>> {

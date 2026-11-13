@@ -37,11 +37,12 @@
 //! front back ([`Disposition`]), and words the look into one.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::OwnedChild;
 use crate::child::lifecycle::{wait_to_exit, Settlement, Wording};
-use crate::error::{ChildFate, Error};
+use crate::error::{ChildFate, Error, Failures};
 use crate::identity::ProcessId;
 use crate::os_process::child::KillRefusal;
 use crate::os_process::child_named;
@@ -184,18 +185,30 @@ pub(crate) struct TeardownOutcome {
     refused_look: Option<Box<Settlement>>,
     /// The kind of the error the kill was refused with, if it was.
     refused: Option<io::ErrorKind>,
+    /// What failed in the teardown, in the order it did: a refused kill, a failed wait, a look at an
+    /// elevation front that could not read where the front is.
+    failures: Vec<Arc<Error>>,
 }
 
 /// What is left of a [`TeardownOutcome`] once its clause is said: the fate, whether the child is
-/// uncollected, and the kind of the error its kill was refused with, if it was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// uncollected, the kind of the error its kill was refused with, if it was, and the failures the
+/// teardown had.
+#[derive(Debug, Clone)]
 pub(crate) struct Remains {
     pub(crate) fate: ChildFate,
     pub(crate) uncollected: bool,
     pub(crate) refused: Option<io::ErrorKind>,
+    /// Every failure of the teardown, for the `cleanup` of the error of a failed spawn or run.
+    pub(crate) failures: Option<Failures>,
 }
 
 impl Remains {
+    /// With `failure`, the earlier tree kill's failure, ahead of the root's own.
+    pub(crate) fn after_tree_kill(mut self, failure: Option<Error>) -> Remains {
+        self.failures = Failures::merged(Failures::collect(failure.map(Arc::new)), self.failures);
+        self
+    }
+
     /// The remains of a child that was collected: `fate` is not [`Running`](ChildFate::Running).
     #[cfg(unix)]
     pub(crate) fn collected(fate: ChildFate) -> Remains {
@@ -207,6 +220,7 @@ impl Remains {
             fate,
             uncollected: false,
             refused: None,
+            failures: None,
         }
     }
 }
@@ -225,6 +239,7 @@ impl TeardownOutcome {
             said: None,
             refused_look: None,
             refused: None,
+            failures: Vec::new(),
         }
     }
 
@@ -241,11 +256,25 @@ impl TeardownOutcome {
             said: Some(said),
             refused_look: None,
             refused: None,
+            failures: Vec::new(),
         }
     }
 
-    /// The outcome `settlement` states: its fate and its clause. `subject`, `running` and
-    /// `disposition` word it as [`Settlement::wording`] says.
+    /// This outcome, with `failures` among what failed in the teardown.
+    pub(crate) fn failing(mut self, failures: impl IntoIterator<Item = Arc<Error>>) -> TeardownOutcome {
+        self.failures.extend(failures);
+        self
+    }
+
+    /// This outcome, with `failure`, one that happened before the teardown's own, ahead of them.
+    #[cfg(unix)]
+    pub(crate) fn failing_first(mut self, failure: Option<Arc<Error>>) -> TeardownOutcome {
+        self.failures.splice(0..0, failure);
+        self
+    }
+
+    /// The outcome `settlement` states: its fate, its clause, and its failed wait among the
+    /// failures. `subject`, `running` and `disposition` word it as [`Settlement::wording`] says.
     pub(crate) fn of_settlement(
         settlement: &Settlement,
         id: Option<ProcessId>,
@@ -257,6 +286,7 @@ impl TeardownOutcome {
             settlement.fate(id),
             settlement.wording(subject, running, Some(disposition)),
         )
+        .failing(settlement.failure())
     }
 
     /// Whether the teardown left the child uncollected.
@@ -270,6 +300,7 @@ impl TeardownOutcome {
             fate: self.fate,
             uncollected: self.uncollected(),
             refused: self.refused,
+            failures: Failures::collect(self.failures.iter().cloned()),
         }
     }
 
@@ -307,17 +338,26 @@ impl TeardownOutcome {
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn failed_spawn_line(self, why: &mut crate::child::spawn::Diagnosis) -> (Option<String>, Remains) {
         let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
+        let one_warn = self.said_in_the_one_warn(why);
         let remains = self.remains();
         let Some(said) = self.said else {
             return (None, remains);
         };
-        let level = said.level();
         let text = said.text();
-        if level == log::Level::Warn || why.is_owed() {
+        if one_warn {
             return (Some(format!("{label}: {}", why.fold(text))), remains);
         }
-        log::log!(level, "{label}: {text}");
+        log::log!(said.level(), "{label}: {text}");
         (None, remains)
+    }
+
+    /// Whether [`failed_spawn_line`](Self::failed_spawn_line) returns this outcome's clause as the
+    /// event's one warn: it has a clause, and it is at warn or `why` is owed.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn said_in_the_one_warn(&self, why: &crate::child::spawn::Diagnosis) -> bool {
+        self.said
+            .as_ref()
+            .is_some_and(|said| said.level() == log::Level::Warn || why.is_owed())
     }
 }
 
@@ -425,6 +465,7 @@ fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
         fate,
         uncollected,
         refused,
+        failures: _,
     } = *remains;
     let Expect { refusal, past } = expect;
     if let Some(line) = line {
@@ -584,6 +625,8 @@ impl OwnedChild {
         let mut torn = TeardownOutcome::of_settlement(&settlement, id, &subject, Some(&running), disposition);
         torn.refused_look = settlement.ended().then(|| Box::new(settlement));
         torn.refused = Some(refused_kind);
+        // The refusal first: it is what the failed wait (if any, in `of_settlement`) followed.
+        torn.failures.insert(0, Arc::new(refused.in_step("killing the child")));
         torn
     }
 

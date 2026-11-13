@@ -183,7 +183,7 @@ fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
         let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
         let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let pid = id.pid();
-        let (detail, fate, handed_back) = failed_password_write_detail(child, stdin);
+        let (detail, cleanup, fate, handed_back) = failed_password_write_detail(child, stdin);
         assert_eq!(
             fate,
             crate::error::ChildFate::Running { id: Some(id) },
@@ -191,33 +191,56 @@ fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
         );
         assert_eq!(handed_back.unreaped().pid(), Some(pid));
         assert!(detail.contains("could not be terminated"), "{detail}");
-        assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
+        // The refusal is the cleanup's, an `Unkillable` that names the front; the detail says only
+        // what was done.
+        assert!(!detail.contains("is what sudo left"), "{detail}");
+        let cleanup = cleanup.expect("the refused kill is the cleanup");
+        assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+        assert!(
+            matches!(
+                &**cleanup.first(),
+                Error::Elevation { kind: ElevationErrorKind::Unkillable, detail, .. }
+                    if detail.contains(&format!("pid {pid} is what sudo left"))
+            ),
+            "{cleanup:?}"
+        );
         let status = handed_back.wait();
         assert!(status.success(), "the front was signalled: {status:?}");
     }
 }
 
 /// The `detail` of the error the sync `finish_elevated` returns for `child` after a failed
-/// password write, its fate, and the child it handed back, if it did, with `release` (what lets the
-/// front exit; `()`: nothing).
+/// password write, the `cleanup` of the error (the failures of the teardown, if any), its fate, and
+/// the child it handed back, if it did, with `release` (what lets the front exit; `()`: nothing).
 pub(crate) fn failed_password_write_detail<R>(
     child: crate::Child,
     release: R,
-) -> (String, crate::error::ChildFate, crate::test_child::HandedBack<R>) {
-    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
-        child,
-        Err(Error::Elevation {
-            kind: ElevationErrorKind::AuthFailed,
-            detail: "forced password-write failure".into(),
-            source: None,
-        }),
-    )
-    .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_parts(release);
+) -> (
+    String,
+    Option<crate::error::Failures>,
+    crate::error::ChildFate,
+    crate::test_child::HandedBack<R>,
+) {
+    let error = Error::from(
+        crate::child::spawn::finish_elevated(
+            child,
+            Err(Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+                source: None,
+            }),
+        )
+        .expect_err("a failed write fails the spawn"),
+    );
+    let Error::MayHaveStarted { cleanup, .. } = &error else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    let cleanup = cleanup.clone();
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, release);
     let Error::Elevation { detail, .. } = err else {
         panic!("expected an Elevation error, got {err:?}");
     };
-    (detail, fate, handed_back)
+    (detail, cleanup, fate, handed_back)
 }
 
 /// A front that exits on its `SIGTERM` within the grace is not escalated against: its status is
@@ -287,7 +310,7 @@ fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exited() {
     drop(stdin);
     crate::test_child::wait_until_zombie(pid);
     assert!(reap(pid).is_some(), "the test reaps the front itself");
-    let (detail, fate, handed_back) = failed_password_write_detail(child, ());
+    let (detail, _cleanup, fate, handed_back) = failed_password_write_detail(child, ());
     assert!(handed_back.is_none(), "a front someone else reaped is not handed back");
     assert_eq!(fate, crate::error::ChildFate::Gone);
     assert!(
@@ -424,16 +447,7 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let pid = id.pid();
-    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
-        child,
-        Err(Error::Elevation {
-            kind: ElevationErrorKind::AuthFailed,
-            detail: "forced password-write failure".into(),
-            source: None,
-        }),
-    )
-    .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_parts(stdin);
+    let (detail, cleanup, fate, handed_back) = failed_password_write_detail(child, stdin);
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
@@ -443,17 +457,23 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     assert_eq!(
         groups.killed(),
         Vec::<i32>::new(),
-        "no group kill of a live front: {err}"
+        "no group kill of a live front: {detail}"
     );
-    let Error::Elevation { detail, .. } = &err else {
-        panic!("expected an Elevation error, got {err:?}");
-    };
     assert!(detail.contains("could not be terminated"), "{detail}");
     assert!(
         detail.contains(crate::child::owned::owned_tests::teardown_lines::HANDED_BACK),
         "{detail}"
     );
-    assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
+    // The refusal that says why is the cleanup's, not the detail's.
+    assert!(!detail.contains("is what sudo left"), "{detail}");
+    let cleanup = cleanup.expect("the refused kill is the cleanup");
+    assert!(
+        cleanup
+            .first()
+            .to_string()
+            .contains(&format!("pid {pid} is what sudo left")),
+        "{cleanup:?}"
+    );
     // Released: the front exits by itself, unsignalled.
     let status = handed_back.wait();
     assert!(status.success(), "the front was signalled: {status:?}");
@@ -594,16 +614,25 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
-    let (err, fate, handed_back) = crate::child::spawn::finish_elevated(
-        child,
-        Err(Error::Elevation {
-            kind: ElevationErrorKind::AuthFailed,
-            detail: "forced password-write failure".into(),
-            source: None,
-        }),
-    )
-    .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_parts(());
+    let error = Error::from(
+        crate::child::spawn::finish_elevated(
+            child,
+            Err(Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+                source: None,
+            }),
+        )
+        .expect_err("a failed write fails the spawn"),
+    );
+    // The failed wait is the teardown's failure, so it is the cleanup's; the detail says it failed.
+    let cleanup = crate::test_child::cleanup_of(&error);
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        cleanup.first().to_string().contains("forced reap failure"),
+        "{cleanup:?}"
+    );
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
     assert_eq!(fate, crate::error::ChildFate::Killed, "the exit was not collected");
     // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
     // reaped elsewhere and returns at once.
@@ -613,9 +642,10 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     let Error::Elevation { detail, .. } = &err else {
         panic!("expected an Elevation error, got {err:?}");
     };
+    assert!(detail.contains("(it had already exited): the wait failed"), "{detail}");
     assert!(
-        detail.contains("(it had already exited): the wait failed: forced reap failure"),
-        "{detail}"
+        !detail.contains("forced reap failure"),
+        "the failure is in the detail: {detail}"
     );
     assert!(!detail.contains("killed"), "{detail}");
 }

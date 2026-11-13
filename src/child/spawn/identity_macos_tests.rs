@@ -549,6 +549,14 @@ fn macos_fdmarker_attach_reads_nothing_by_pid() {
 /// [`teardown_after_attach_failure`](super::teardown_after_attach_failure) of `child`, as a spawn
 /// that read the current process's identity (a stand-in: the test cannot read a reaped child's).
 fn teardown(child: std::process::Child, unique: u64) -> crate::error::ChildFate {
+    teardown_with_failures(child, unique).0
+}
+
+/// [`teardown`], with what failed in it as well.
+fn teardown_with_failures(
+    child: std::process::Child,
+    unique: u64,
+) -> (crate::error::ChildFate, Option<crate::error::Failures>) {
     super::teardown_after_attach_failure(child, unique, Some(crate::identity::ProcessId::current()), None)
 }
 
@@ -716,6 +724,35 @@ fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown
     end_unsignalled_and_reap(pid);
 }
 
+/// What failed in the teardown, a refused kill and then a refused id read, is returned in order for
+/// the spawn's `cleanup`, each as an error with its own cause, beside the one warn that says them.
+///
+/// Mutant: the failures are only in the warn's text.
+#[skuld::test]
+fn macos_attach_failure_teardown_returns_its_failures_for_the_cleanup() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let _refused = refuse_the_kill();
+    let _denied = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    let (fate, failures) = teardown_with_failures(child, unique);
+    assert_eq!(fate, crate::error::ChildFate::Unknown);
+    let failures = failures.expect("a refused kill and a refused read failed");
+    assert_eq!(failures.iter().len(), 2, "{failures:?}");
+    assert!(
+        failures
+            .iter()
+            .all(|failure| matches!(&**failure, crate::error::Error::Io(_))),
+        "{failures:?}"
+    );
+    let texts: Vec<String> = failures.iter().map(|failure| failure.to_string()).collect();
+    assert!(
+        texts[0].contains("killing the child") && texts[1].contains("looking at the child's exit"),
+        "each failure names its step: {texts:?}"
+    );
+    end_unsignalled_and_reap(pid);
+}
+
 /// A child the teardown leaves running is left as its caller says: the warn ends with the caller's
 /// words, not the sync spawn's.
 ///
@@ -728,7 +765,7 @@ fn macos_kill_and_reap_verified_says_the_callers_words_of_a_child_left_running()
     let pid = child.id();
     let mark = crate::log_capture::mark();
     let _refused = refuse_the_kill();
-    let fate = super::kill_and_reap_verified(pid, unique, None, TAIL, None);
+    let (fate, _failures) = super::kill_and_reap_verified(pid, unique, None, TAIL, None);
     assert!(matches!(fate, crate::error::ChildFate::Running { .. }), "{fate:?}");
     let records = teardown_records(mark);
     assert_eq!(records.len(), 1, "one warn for the one event: {records:?}");

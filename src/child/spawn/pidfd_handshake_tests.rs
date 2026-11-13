@@ -1512,6 +1512,182 @@ fn conclude_answers_every_remaining_pair() {
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
 }
 
+/// The warns a `conclude` call logged on this thread since `mark`, led by the handshake's name.
+fn handshake_warns_since(mark: usize) -> Vec<String> {
+    crate::log_capture::records_since_on_current_thread(mark, "pidfd handshake: ")
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// A spawn that failed while its helper failed too answers the helper's `Io`, the cause (std's error
+/// only echoes what the child's hook returned). An `Io` has no slot for a peer, so the spawn's error
+/// is logged at warn through `Report`, once.
+///
+/// Mutant: the spawn's error is the answer and the helper's is dropped; or the spawn's is dropped.
+#[skuld::test]
+fn a_failed_spawn_whose_helper_failed_too_answers_the_helpers_io_and_warns_of_the_spawn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let error = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("spawn 6e1a")),
+        Outcome::Failed(Error::Io(std::io::Error::other("helper 6e1a")), None),
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started();
+    assert!(
+        matches!(&error, Error::Io(e) if e.to_string() == "helper 6e1a"),
+        "{error:?}"
+    );
+    let warns = handshake_warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("spawn 6e1a") && !warns[0].contains("helper 6e1a"),
+        "{warns:?}"
+    );
+}
+
+/// A helper whose child found `pidfd_open` refused answers `Unsupported`, which has a slot: the
+/// spawn's error is its peer, below it, and nothing is logged for it.
+///
+/// Mutant: the spawn's error is dropped, or answers in the helper's place.
+#[skuld::test]
+fn a_refused_pidfd_open_beside_a_failed_spawn_answers_unsupported_with_the_spawns_error_below_it() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let refused = crate::os_process::linux::open::spawn_open_error(Errno::PERM);
+    let error = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("spawn 2b7c")),
+        Outcome::Failed(refused, None),
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started();
+    assert!(matches!(&error, Error::Unsupported { .. }), "{error:?}");
+    let source = std::error::Error::source(&error).expect("the refusal and the spawn's error are its causes");
+    let Some(Error::Several(causes)) = source.downcast_ref::<Error>() else {
+        panic!("two causes are a Several: {source:?}")
+    };
+    assert_eq!(causes.iter().len(), 2, "{causes:?}");
+    assert!(
+        causes.iter().any(|cause| cause.to_string().contains("spawn 2b7c")),
+        "{causes:?}"
+    );
+    assert_eq!(handshake_warns_since(mark), Vec::<String>::new());
+}
+
+/// A spawn that failed with a child whose exit could not be watched answers the spawn's `Io` and
+/// logs the watch's failure, naming what failed.
+///
+/// Mutant: the watch's failure is dropped.
+#[skuld::test]
+fn a_failed_spawn_whose_watch_failed_too_answers_the_spawns_io_and_warns_of_the_watch() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let error = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("spawn 9d40")),
+        Outcome::Unwatched("a watch 9d40", std::io::Error::other("cause 9d40")),
+        None,
+    )
+    .err()
+    .expect("the spawn fails")
+    .expect_not_started();
+    assert!(
+        matches!(&error, Error::Io(e) if e.to_string() == "spawn 9d40"),
+        "{error:?}"
+    );
+    let warns = handshake_warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("a watch 9d40") && warns[0].contains("cause 9d40"),
+        "{warns:?}"
+    );
+}
+
+/// The remains of a failed spawn's teardown with two failures. (No real pidfd teardown fails on
+/// demand: a kill is refused only for another user's process, and a wait on a pidfd that is no
+/// child's finds it gone, so the remains are stated.)
+fn remains_with_two_failures() -> crate::child::owned::teardown::Remains {
+    crate::child::owned::teardown::Remains {
+        fate: ChildFate::Killed,
+        uncollected: false,
+        refused: None,
+        failures: crate::error::Failures::collect([
+            Error::io_cause(std::io::Error::other("refused kill 51f3")),
+            Error::io_cause(std::io::Error::other("failed wait 51f3")),
+        ]),
+    }
+}
+
+/// What failed in a failed spawn's teardown of the child it held has no `cleanup` to go to in a
+/// `not started` answer, so each failure the teardown's own warn did not say is logged at warn
+/// through `Report`.
+///
+/// Mutant: the teardown's failures are dropped.
+#[skuld::test]
+fn a_failed_spawns_teardown_failures_its_own_warn_did_not_say_are_each_warned_of() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    super::warn_of_teardown_failures(&remains_with_two_failures(), false);
+    let warns = handshake_warns_since(mark);
+    assert_eq!(warns.len(), 2, "{warns:?}");
+    assert!(warns[0].contains("refused kill 51f3"), "{warns:?}");
+    assert!(warns[1].contains("failed wait 51f3"), "{warns:?}");
+}
+
+/// The teardown's own warn (a clause at warn, or the spawn's diagnosis folded into it) holds its
+/// failures, and the failed spawn's event has that one warn: nothing is logged a second time.
+///
+/// Mutant: the failures are logged again beside the teardown's warn.
+#[skuld::test]
+fn a_failed_spawns_teardown_failures_its_own_warn_said_are_not_warned_of_again() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    super::warn_of_teardown_failures(&remains_with_two_failures(), true);
+    assert_eq!(handshake_warns_since(mark), Vec::<String>::new());
+}
+
+/// A refused kill whose look found the child's exit record unreadable is said by a clause at warn
+/// (the child was reaped, so it is not `uncollected`): that clause, the event's one warn, holds the
+/// refusal, and nothing is logged beside it.
+///
+/// Mutant: the failures are logged for a clause that is not `uncollected`.
+#[skuld::test]
+fn a_failed_spawns_refused_kill_whose_look_found_an_unreadable_record_is_warned_once() {
+    use crate::child::owned::owned_tests::teardown::child_with_an_unreadable_exit;
+    use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown};
+    use crate::os_process::child::KillRefusal;
+
+    crate::log_capture::install();
+    let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let outcome = child_with_an_unreadable_exit().look_after_refused_kill(None, refused, Disposition::HandBack);
+    let torn = HandleTeardown::new(
+        outcome,
+        Expect {
+            refusal: KillRefusal::Permission,
+            past: super::Past::WaitMayFail,
+        },
+    );
+    let mark = crate::log_capture::mark();
+
+    let remains = super::say_teardown_of_failed_spawn(torn, &mut crate::child::spawn::Diagnosis::default());
+
+    assert_eq!(remains.fate, ChildFate::Reaped);
+    assert!(!remains.uncollected, "the look reaped it");
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed spawn: ")
+            && warns[0].contains("could not be terminated")
+            && warns[0].contains("unreadable"),
+        "{warns:?}"
+    );
+}
+
 /// A child the failed spawn's teardown ends through its pidfd is said reaped under the spawn
 /// teardown's name, at `debug`: every line of a teardown names its caller.
 ///

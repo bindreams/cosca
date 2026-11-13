@@ -63,6 +63,8 @@ pub(crate) struct Failed {
     pub(crate) member: Member,
     /// The levels of the records that say members of the root's group may be left running.
     pub(crate) left_running: Vec<log::Level>,
+    /// The `cleanup` of the spawn's error: what failed in its teardown.
+    pub(crate) cleanup: Option<crate::error::Failures>,
 }
 
 /// The root's containment, whose process group the root leads.
@@ -129,16 +131,19 @@ fn failed_spawn(container: Container) -> Failed {
     let steps = capture.group_steps();
     let pid = armed.pid();
     drop((armed, placement, release));
-    let (_err, fate) = match spawned {
+    let error = match spawned {
         Ok(child) => panic!("the spawn must fail at its identity read: {:?}", child.id()),
-        Err(e) => expect_may_have_started_with(e),
+        Err(e) => e,
     };
+    let cleanup = error.failures().cloned();
+    let (_err, fate) = expect_may_have_started_with(error);
     let left_running = crate::log_capture::levels_since(mark, &left_running_note(pid));
     Failed {
         fate,
         steps,
         member,
         left_running,
+        cleanup,
     }
 }
 
@@ -154,6 +159,7 @@ fn kills_the_group(container: Container) {
         failed.left_running
     );
     assert_eq!(failed.fate, ChildFate::Gone, "the root was reaped before any kill");
+    assert!(failed.cleanup.is_none(), "nothing failed: {:?}", failed.cleanup);
 }
 
 /// Below 6.9 the old behaviour holds: the kernel refuses the group's send through the pidfd,
@@ -180,6 +186,16 @@ fn below_6_9_sends_nothing_to_the_group(container: Container) {
         failed.left_running,
         [log::Level::Warn],
         "one warn says members of the root's group may be left running"
+    );
+    // The refused kill of the group is a failure of the teardown: the error's `cleanup` holds it.
+    let cleanup = failed
+        .cleanup
+        .expect("the refused group kill is the teardown's failure");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
+    assert!(
+        cleanup.first().to_string().contains("killing the process group of pid")
+            && crate::error::first_os_code(&**cleanup.first()) == Some(libc::EINVAL),
+        "{cleanup:?}"
     );
 }
 
