@@ -801,22 +801,21 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
     );
 }
 
-/// A child whose exit watch has fired while it runs and whose confirming read is refused is `Alive`
-/// when the peek reads it running with its unique id verified: the evidence is in hand, so
-/// `liveness` does not fail. The registration refusal stands in for the early edge.
+/// A child whose exit watch has fired while it runs and whose confirming read is refused is the
+/// refusal, not `Alive`, when the peek reads it running: a running peek proves nothing (a tracer can
+/// hold the zombie). The registration refusal stands in for the early edge.
 ///
-/// Mutant: `OwnedChild::liveness` answers the refusal for a child the peek reads running.
+/// Mutant: `OwnedChild::liveness` answers `Alive` for a child the peek reads running.
 #[skuld::test]
-fn a_refused_confirmation_is_alive_when_the_peek_reads_the_child_running() {
+fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
     let forced_watch = test_hooks::force_proc_registration_esrch_once(test_hooks::Registration::ExitWatch);
     let b = Blocker::spawn();
     drop(forced_watch);
     let reads = uniq_fault::record();
     let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
-    assert!(
-        matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Alive)),
-        "the peek reads the child running"
-    );
+    let err = b.owned.liveness().expect_err("a running peek does not answer");
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
     assert!(
         reads.purposes().contains(&ReadPurpose::Exit),
         "the watch fired and the forced refusal was consumed: {:?}",

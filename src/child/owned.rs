@@ -240,9 +240,10 @@ impl OwnedChild {
     /// elsewhere, and (macOS) the zombie the edge withholds.
     ///
     /// An edge that fired and could not be confirmed (`exited` failed) is answered by the peek where
-    /// the peek can: an exit record or a reap elsewhere is `Dead`, a child it reads running (its
-    /// unique id verified) is `Alive`; a failed peek leaves the failure. An edge that fired and
-    /// confirmed `Recheck` has read the child running, so `exited_unannounced` is not asked.
+    /// the peek can: an exit record or a reap elsewhere is `Dead`; otherwise the failure stands,
+    /// also when the peek reads the child running, which proves nothing (a tracer can hold the
+    /// zombie, which the real parent's `waitid` does not see). An edge that fired and confirmed
+    /// `Recheck` has read the child running, so `exited_unannounced` is not asked.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
@@ -252,8 +253,7 @@ impl OwnedChild {
             Err(refused) => {
                 return match self.peek() {
                     Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => Ok(Liveness::Dead),
-                    Ok(PeekOutcome::Running) => Ok(Liveness::Alive),
-                    Err(_) => Err(refused),
+                    Ok(PeekOutcome::Running) | Err(_) => Err(refused),
                 };
             }
         };
