@@ -1424,13 +1424,14 @@ pub(crate) fn prepare(
 pub(crate) struct AttachFailure {
     pub(crate) cause: Error,
     pub(crate) cleanup: Option<Failures>,
-    /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
-    /// before `exec` because its placement in its leaf was refused, or a child (in any mode) sent
-    /// no report, which its hook only leaves unsent by ending the child before `exec`. Every other
-    /// failure may have started the program.
+    /// The program never ran, and the attach proves it: on Linux the child's own report (a
+    /// `Strongest` child stopped before `exec` because its placement in its leaf was refused, or a
+    /// child in any mode sent no report, which its hook only leaves unsent by ending the child
+    /// before `exec`); on Windows a strict root, still suspended, that could not be put in its Job
+    /// Object. Every other failure may have started the program.
     #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "read only by the Linux arm of the spawn")
+        not(any(target_os = "linux", windows)),
+        allow(dead_code, reason = "read only by the Linux and Windows arms of the spawn")
     )]
     pub(crate) not_started: bool,
 }
@@ -1659,7 +1660,7 @@ fn attach_tree(
         }
     }
 
-    // Windows: Job Object (strongest available on this OS), or TreeWalk.
+    // Windows: a Job Object, or for a request that accepts less, TreeWalk.
     #[cfg(windows)]
     {
         if prepared.mode.is_some() && prepared.is_root {
@@ -1680,13 +1681,14 @@ fn attach_tree(
                     .into()),
                 };
             }
-            match crate::containment::windows::attach_job(proc_handle) {
+            let strict = prepared.mode.is_some_and(ContainMode::is_strict);
+            match crate::containment::windows::attach_job(proc_handle, strict) {
                 Ok(Some(job)) => return Ok(Tree::contained(Mechanism::Job(job))),
                 Ok(None) => {
-                    // Job assignment failed: fall back to the universal TreeWalk
-                    // mechanism rather than silently yielding no containment. The
-                    // root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags),
-                    // so `terminate`'s CTRL_BREAK still reaches the group.
+                    // Job assignment failed under a request that accepts less: fall back to the
+                    // universal TreeWalk mechanism rather than silently yielding no containment.
+                    // The root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags), so
+                    // `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
                 Err(failure) => return Err(failure),

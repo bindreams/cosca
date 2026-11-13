@@ -885,8 +885,8 @@ fn spawn_reported(
     ) {
         Ok(v) => v,
         Err(failure) => {
-            // Only Linux's attach says the program never ran.
-            #[cfg(target_os = "linux")]
+            // Only Linux's and Windows' attach say the program never ran.
+            #[cfg(any(target_os = "linux", windows))]
             let not_started = failure.not_started;
             let crate::containment::dispatch::AttachFailure {
                 cause: error,
@@ -943,21 +943,21 @@ fn spawn_reported(
             return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
             #[cfg(windows)]
             {
-                let Torn {
-                    fate: child_fate,
-                    unreaped,
-                    cleanup,
-                } = held_teardown::tear_down_failed_spawn(
-                    owned,
-                    id_read,
-                    crate::child::owned::teardown::Past::Clean,
-                    crate::child::owned::teardown::Disposition::HandBack,
-                    policy,
-                    &mut why,
-                );
-                return Err(SpawnFailure::started(error, child_fate, unreaped)
-                    .with_cleanup(attach_cleanup)
-                    .with_cleanup(cleanup));
+                // A suspended root that never ran is ended as one that did not start; any other
+                // child is killed and handed back if it cannot be.
+                let torn = if not_started {
+                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why)
+                } else {
+                    held_teardown::tear_down_failed_spawn(
+                        owned,
+                        id_read,
+                        crate::child::owned::teardown::Past::Clean,
+                        crate::child::owned::teardown::Disposition::HandBack,
+                        policy,
+                        &mut why,
+                    )
+                };
+                return Err(failure::failed_attach(not_started, error, None, attach_cleanup, torn));
             }
             #[cfg(target_os = "macos")]
             return Err(SpawnFailure::started(error, child_fate, None)
@@ -3015,8 +3015,11 @@ pub(crate) mod fault {
 
     /// Run `hook` once at the next `point` on this thread; the guard clears it on drop.
     #[cfg_attr(
-        not(all(feature = "tokio", target_os = "linux")),
-        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+        not(any(all(feature = "tokio", target_os = "linux"), windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux async spawn's and the Windows spawn's tests arm a spawn point"
+        )
     )]
     pub(crate) fn set_at(point: SpawnPoint, hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
         crate::oneshot_hook::arm(hook_at(point), hook)
@@ -3066,8 +3069,11 @@ pub(crate) mod fault {
 
     /// The pid of the child the spawn that fired the running hook has just forked.
     #[cfg_attr(
-        not(all(feature = "tokio", target_os = "linux")),
-        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+        not(any(all(feature = "tokio", target_os = "linux"), windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux async spawn's and the Windows spawn's tests arm a spawn point"
+        )
     )]
     pub(crate) fn spawn_pid() -> u32 {
         SPAWN_PID.with(Cell::get).expect("spawn_pid is read from a spawn hook")

@@ -13,7 +13,7 @@ use super::Diagnosis;
 #[cfg(target_os = "linux")]
 use super::FrontFate;
 use crate::child::drop_teardown::Torn;
-use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past};
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, Remains};
 #[cfg(target_os = "linux")]
 use crate::child::owned::teardown::{Reach, TeardownOutcome};
 use crate::child::owned::unreaped::DropKind;
@@ -79,24 +79,24 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
     (detail, torn)
 }
 
-/// Tears `child` down after a failed attach that proved it never ran the program (its hook ended it
-/// before `exec`, as the handshake ends a child it never told to go): killed and reaped, whether or
-/// not it is an elevation front, which never ran its `sudo`. It has this process's credentials, so
-/// nothing but its being gone refuses its kill ([`Past::Unexecuted`]). Its failures are said in the
-/// failed spawn's one warn, led by `why`; a not-started error has no place for them, and the child
-/// is never handed back.
+/// Tears `child` down after a failed attach that proved it never ran the program (on Linux its hook
+/// ended it before `exec`, as the handshake ends a child it never told to go; on Windows it is still
+/// suspended): killed and reaped, whether or not it is an elevation front, which never ran its
+/// `sudo`. It has this process's credentials, so nothing but its being gone refuses its kill
+/// ([`Past::Unexecuted`]). Its failures are said in the failed spawn's one warn, led by `why`; a
+/// not-started error has no place for them, and the child is never handed back.
 ///
-/// `id`: the identity the spawn read, `None` when that read failed. A look on the pidfd that failed
-/// may have left the wait on it failing too ([`Past::WaitMayFail`]), so a child it cannot collect is
-/// left, as `abandon_unreported` leaves one, and the warn says so.
-#[cfg(target_os = "linux")]
+/// `id`: the identity the spawn read, `None` when that read failed. On Linux a look on the pidfd that
+/// failed may have left the wait on it failing too ([`Past::WaitMayFail`]), so a child it cannot
+/// collect is left, as `abandon_unreported` leaves one, and the warn says so. A Windows handle's
+/// wait does not depend on the identity read.
 pub(crate) fn tear_down_unexecuted(
     child: OwnedChild,
     id: Option<ProcessId>,
     policy: SpawnPolicy,
     why: &mut Diagnosis,
 ) -> Torn {
-    let past = if id.is_some() {
+    let past = if id.is_some() || cfg!(windows) {
         Past::Unexecuted
     } else {
         Past::WaitMayFail
@@ -106,11 +106,37 @@ pub(crate) fn tear_down_unexecuted(
         tree: None,
     };
     let torn = tear_down_expecting(&child, id, kill, past, policy.teardown_warn_after);
-    let remains = super::pidfd_handshake::say_teardown_of_failed_spawn(torn, why);
+    let remains = say_teardown_of_failed_spawn(torn, why);
     Torn {
         fate: remains.fate,
         unreaped: None,
         cleanup: None,
+    }
+}
+
+/// Says `torn` as the failed spawn's one warn, and logs at warn ([`warn_of_teardown_failures`]) each
+/// failure that warn does not hold.
+pub(super) fn say_teardown_of_failed_spawn(torn: HandleTeardown, why: &mut super::Diagnosis) -> Remains {
+    let held = torn.outcome.said_in_the_one_warn(why);
+    let remains = torn.say_as_failed_spawn(why);
+    warn_of_teardown_failures(&remains, held);
+    remains
+}
+
+/// Logs at warn each failure of a failed spawn's teardown that the event's one warn
+/// ([`say_as_failed_spawn`](HandleTeardown::say_as_failed_spawn)) does not hold. That warn holds them
+/// all when it was said (`held`: its clause is at warn, or the spawn's diagnosis was owed and folded
+/// into it); a clause below warn (a refused kill whose look found the child gone) is said at its
+/// level only.
+pub(super) fn warn_of_teardown_failures(remains: &Remains, held: bool) {
+    if held {
+        return;
+    }
+    for failure in remains.failures.iter().flat_map(|failures| failures.iter()) {
+        log::warn!(
+            "the failed spawn's teardown of its child failed: {report}",
+            report = crate::error::Report(failure.as_ref())
+        );
     }
 }
 

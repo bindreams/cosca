@@ -2159,23 +2159,39 @@ pub(crate) fn resume_initial_threads(
 }
 
 /// Assign the process at `proc_handle` to a `KILL_ON_JOB_CLOSE` job and resume its
-/// initial threads.
+/// initial threads. `strict`: the request accepts no weaker mechanism than the job.
 ///
 /// `proc_handle` must remain open for the whole call (it pins the pid against reuse during the
 /// Toolhelp thread walk in `resume_initial_threads`). Every caller holds the process it spawned
 /// across the call, so it does.
 ///
 /// Returns `Ok(Some(JobHandle))` on full success (job assigned AND resumed).
-/// Returns `Ok(None)` when job assignment fails — the caller falls back to the
-/// universal `Containment::TreeWalk` mechanism (identity teardown).
+/// Returns `Ok(None)` when job assignment fails and the request is not `strict`: the child is
+/// resumed, the failure is logged at `warn`, and the caller falls back to the universal
+/// `Containment::TreeWalk` mechanism (identity teardown).
+/// Returns `Err` when job assignment fails and the request is `strict`: the child is left
+/// suspended, for the caller to terminate, and the failure says the program never ran.
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
 /// child+job are killed and the failure propagates to fail the spawn. The resume failure is its
 /// cause; a failure of the job's kill after it is its cleanup (a teardown failure of the failed
 /// spawn), which cannot change the outcome.
 pub(crate) fn attach_job(
     proc_handle: std::os::windows::io::RawHandle,
+    strict: bool,
 ) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
-    let job_result = assign_held(proc_handle);
+    let job_result = match assign_held(proc_handle) {
+        Err(e) if strict => {
+            return Err(crate::containment::dispatch::AttachFailure {
+                cause: crate::error::Error::Containment {
+                    detail: "the child could not be put in its Job Object, so the program did not run".to_owned(),
+                    source: Some(crate::error::Error::io_cause(e)),
+                },
+                cleanup: None,
+                not_started: true,
+            });
+        }
+        other => other,
+    };
 
     // Resume REGARDLESS of job assignment result. A frozen child cannot be left running.
     if let Err(resume_err) = resume_initial_threads(proc_handle, SuspendCount::Any) {
@@ -2207,10 +2223,12 @@ pub(crate) fn attach_job(
 
     match job_result {
         Ok(job) => Ok(Some(job)),
-        Err(_e) => {
-            // Job assignment failed. Surfaced to the caller as Ok(None); dispatch
-            // falls back to the TreeWalk mechanism. A library must not write to
-            // the parent's stderr unconditionally.
+        Err(e) => {
+            // Job assignment failed, and the request accepts a weaker mechanism: dispatch
+            // falls back to the TreeWalk mechanism.
+            log::warn!(
+                "Job Object containment: the child could not be put in its Job Object ({e}); falling back to a process-tree walk"
+            );
             Ok(None)
         }
     }

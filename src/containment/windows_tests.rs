@@ -2149,7 +2149,7 @@ fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running()
     let thread = crate::test_frozen::InitialThread::of(child.id());
     assert_eq!(thread.release_one(), 1);
 
-    let job = super::attach_job(crate::test_frozen::raw(&child))
+    let job = super::attach_job(crate::test_frozen::raw(&child), true)
         .expect("an ordinary attach must not fail on a running thread")
         .expect("the job was assigned");
 
@@ -2183,7 +2183,7 @@ fn attach_job_whose_resume_and_job_kill_both_fail_returns_the_kill_as_cleanup() 
         move || *kill_failure.borrow_mut() = Some(force_next(Step::JobKill, ERROR_INVALID_HANDLE))
     });
 
-    let failure = super::attach_job(crate::test_frozen::raw(&child)).expect_err("the resume failed");
+    let failure = super::attach_job(crate::test_frozen::raw(&child), true).expect_err("the resume failed");
 
     assert!(
         matches!(failure.cause, crate::error::Error::Containment { .. }),

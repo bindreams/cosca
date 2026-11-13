@@ -81,7 +81,8 @@ use windows::Win32::System::Threading::{
 use crate::child::drop_teardown::Torn;
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
-use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::failure::failed_attach;
+use crate::child::spawn::held_teardown::{tear_down_failed_spawn, tear_down_unexecuted};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
@@ -241,24 +242,17 @@ pub(crate) fn spawn_raw(
         Err(crate::containment::dispatch::AttachFailure {
             cause: e,
             cleanup: attach_cleanup,
-            ..
+            not_started,
         }) => {
-            let Torn {
-                fate,
-                unreaped,
-                cleanup,
-            } = tear_down_failed_spawn(
-                owned,
-                id_read,
-                Past::Clean,
-                Disposition::HandBack,
-                policy,
-                &mut Diagnosis::default(),
-            );
-            // What failed in the attach's own cleanup comes first: it happened before the teardown.
-            return Err(SpawnFailure::started(e, fate, unreaped)
-                .with_cleanup(attach_cleanup)
-                .with_cleanup(cleanup));
+            // A suspended root that never ran is ended as one that did not start; any other child
+            // is killed and handed back if it cannot be.
+            let mut why = Diagnosis::default();
+            let torn = if not_started {
+                tear_down_unexecuted(owned, id_read, policy, &mut why)
+            } else {
+                tear_down_failed_spawn(owned, id_read, Past::Clean, Disposition::HandBack, policy, &mut why)
+            };
+            return Err(failed_attach(not_started, e, None, attach_cleanup, torn));
         }
     };
 

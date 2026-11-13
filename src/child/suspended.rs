@@ -63,8 +63,8 @@ impl Command {
     ///
     /// As [`spawn`](Self::spawn), and one more that `spawn` would not give: a [`Strongest`] or
     /// [`BestEffort`] root whose job assignment fails is an [`Error::Containment`] (`spawn` falls
-    /// back to [`TreeWalk`] there, as Windows does for `Strongest` until that mode fails there as
-    /// it does on Linux and macOS; a frozen root without a job is not worth having). A frozen spawn
+    /// back to [`TreeWalk`] there under `BestEffort`; a frozen root without a job is not worth
+    /// having). Unlike `spawn`'s, it answers [`Error::MayHaveStarted`], with the child's fate. A frozen spawn
     /// that fails after the process exists reports [`Error::MayHaveStarted`].
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.

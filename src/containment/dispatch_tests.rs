@@ -2927,18 +2927,77 @@ mod frozen_attach {
         dispose(child);
     }
 
-    /// The ordinary attach is unchanged: it resumes, and a failed assignment still degrades to
-    /// `TreeWalk`.
+    /// The attach of `child`, whose failure is returned whole.
+    fn attach_failure_of(
+        child: &std::process::Child,
+        prepared: Prepared,
+    ) -> crate::containment::dispatch::AttachFailure {
+        let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+            panic!("the suspended child must be readable");
+        };
+        attach(Ok(id), raw(child), prepared)
+            .err()
+            .expect("the attach was forced to fail")
+    }
+
+    /// `Strongest` (and `Session`, which Windows treats as `Strongest`) is a Job Object or an error:
+    /// a failed assignment fails the attach as one that proves the program never ran, with the OS
+    /// error as the source, and the child is not resumed.
+    ///
+    /// Mutants: the attach resumes the child before it fails; it falls back to `TreeWalk`; the
+    /// failure is not marked not started; the OS error is dropped or goes into the text.
     #[skuld::test]
-    fn attach_without_hold_still_resumes_and_still_falls_back_to_treewalk() {
+    fn attach_fails_a_strict_root_whose_job_assignment_fails_without_resuming_it() {
+        for mode in [ContainMode::Strongest, ContainMode::Session] {
+            let child = spawn_suspended_blocker();
+            let thread = InitialThread::of(child.id());
+            let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+            let failure = attach_failure_of(&child, prepared(Some(mode), true, false));
+
+            assert!(failure.not_started, "{mode:?}: the program never ran: {failure:?}");
+            assert!(failure.cleanup.is_none(), "{mode:?}: {failure:?}");
+            let Error::Containment { detail, .. } = &failure.cause else {
+                panic!("{mode:?}: got {:?}", failure.cause);
+            };
+            assert!(
+                detail.contains("Job Object"),
+                "{mode:?}: the error names the Job: {detail}"
+            );
+            assert_eq!(
+                crate::error::first_os_code(&failure.cause),
+                Some(ERROR_ACCESS_DENIED as i32),
+                "{mode:?}: {:?}",
+                failure.cause
+            );
+            let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
+            assert!(!detail.contains(&os_text), "{mode:?}: {detail}");
+            assert_eq!(thread.suspend_count(), 1, "{mode:?}: the child must not be resumed");
+            dispose(child);
+        }
+    }
+
+    /// `BestEffort` is the ordinary attach: it resumes, a failed assignment degrades to `TreeWalk`,
+    /// and the degrade is said at `warn`, naming the Job Object and the OS error.
+    ///
+    /// Mutants: the degrade is silent; the warn leaves the OS error out.
+    #[skuld::test]
+    fn attach_under_best_effort_resumes_falls_back_to_treewalk_and_warns() {
+        crate::log_capture::install();
         let child = spawn_suspended_blocker();
         let thread = InitialThread::of(child.id());
         let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+        let mark = crate::log_capture::mark();
 
-        let attachment = attach_suspended(&child, prepared(Some(ContainMode::Strongest), true, false)).expect("attach");
+        let attachment =
+            attach_suspended(&child, prepared(Some(ContainMode::BestEffort), true, false)).expect("attach");
 
         assert_eq!(attachment.tree.containment(), Containment::TreeWalk);
         assert_eq!(thread.suspend_count(), 0, "the ordinary attach resumes the child");
+        let warns = crate::log_capture::warns_since(mark, "Job Object");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
+        assert!(warns[0].contains(&os_text), "the warn names the OS error: {warns:?}");
         dispose(child);
     }
 

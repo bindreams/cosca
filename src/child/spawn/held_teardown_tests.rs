@@ -4,18 +4,18 @@
 
 use std::io;
 
-use super::held_teardown::{tear_down_held, HeldTeardown};
+use super::held_teardown::{say_teardown_of_failed_spawn, tear_down_held, warn_of_teardown_failures, HeldTeardown};
 use super::policy::SpawnPolicy;
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown::{
-    fire_on_block, held_owned_blocker as held_blocker, slow_warns_during,
+    child_with_an_unreadable_exit, fire_on_block, held_owned_blocker as held_blocker, slow_warns_during,
 };
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
-use crate::error::ChildFate;
+use crate::error::{ChildFate, Error};
 use crate::log_capture::warns_since;
 use crate::os_process::child::{ExitRecord, Foreign, KillRefusal};
 use crate::os_process::fake::{failed_signal, ReapAnswer};
@@ -597,6 +597,82 @@ fn the_unreaped_a_failed_spawn_hands_back_for_a_front_does_what_its_policy_says_
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
         warns[0].contains("dropped without wait or leak") && !warns[0].contains("waited for it"),
+        "{warns:?}"
+    );
+}
+
+/// The remains of a failed spawn's teardown with two failures. (No real pidfd teardown fails on
+/// demand: a kill is refused only for another user's process, and a wait on a pidfd that is no
+/// child's finds it gone, so the remains are stated.)
+fn remains_with_two_failures() -> crate::child::owned::teardown::Remains {
+    crate::child::owned::teardown::Remains {
+        fate: ChildFate::Killed,
+        uncollected: false,
+        refused: None,
+        failures: crate::error::Failures::collect([
+            Error::io_cause(std::io::Error::other("refused kill 51f3")),
+            Error::io_cause(std::io::Error::other("failed wait 51f3")),
+        ]),
+    }
+}
+
+/// What failed in a failed spawn's teardown of the child it held has no `cleanup` to go to in a
+/// `not started` answer, so each failure the teardown's own warn did not say is logged at warn
+/// through `Report`.
+///
+/// Mutant: the teardown's failures are dropped.
+#[skuld::test]
+fn a_failed_spawns_teardown_failures_its_own_warn_did_not_say_are_each_warned_of() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    warn_of_teardown_failures(&remains_with_two_failures(), false);
+    let warns = warns_since(mark, "teardown of its child failed");
+    assert_eq!(warns.len(), 2, "{warns:?}");
+    assert!(warns[0].contains("refused kill 51f3"), "{warns:?}");
+    assert!(warns[1].contains("failed wait 51f3"), "{warns:?}");
+}
+
+/// The teardown's own warn (a clause at warn, or the spawn's diagnosis folded into it) holds its
+/// failures, and the failed spawn's event has that one warn: nothing is logged a second time.
+///
+/// Mutant: the failures are logged again beside the teardown's warn.
+#[skuld::test]
+fn a_failed_spawns_teardown_failures_its_own_warn_said_are_not_warned_of_again() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    warn_of_teardown_failures(&remains_with_two_failures(), true);
+    assert_eq!(warns_since(mark, "teardown of its child failed"), Vec::<String>::new());
+}
+
+/// A refused kill whose look found the child's exit record unreadable is said by a clause at warn
+/// (the child was reaped, so it is not `uncollected`): that clause, the event's one warn, holds the
+/// refusal, and nothing is logged beside it.
+///
+/// Mutant: the failures are logged for a clause that is not `uncollected`.
+#[skuld::test]
+fn a_failed_spawns_refused_kill_whose_look_found_an_unreadable_record_is_warned_once() {
+    crate::log_capture::install();
+    let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let outcome = child_with_an_unreadable_exit().look_after_refused_kill(None, refused, Disposition::HandBack);
+    let torn = HandleTeardown::new(
+        outcome,
+        Expect {
+            refusal: KillRefusal::Permission,
+            past: Past::WaitMayFail,
+        },
+    );
+    let mark = crate::log_capture::mark();
+
+    let remains = say_teardown_of_failed_spawn(torn, &mut crate::child::spawn::Diagnosis::default());
+
+    assert_eq!(remains.fate, ChildFate::Reaped);
+    assert!(!remains.uncollected, "the look reaped it");
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("teardown after a failed spawn: ")
+            && warns[0].contains("could not be terminated")
+            && warns[0].contains("unreadable"),
         "{warns:?}"
     );
 }

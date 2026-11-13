@@ -1,7 +1,7 @@
 //! Identity-aware process-tree teardown — the cross-platform mechanism, used
 //! both when requested directly (`ContainMode::TreeWalk`) and as the terminal
 //! fallback on Windows, where a job-assign failure falls back to it for `ContainMode::BestEffort`
-//! and, until `Strongest` fails there too, for `ContainMode::Strongest`.
+//! only; `ContainMode::Strongest` fails the spawn.
 //!
 //! Unlike a kernel container, this mechanism has no enforced membership: at
 //! teardown it takes a `(pid, ppid)` snapshot of the host, walks the ppid chain
