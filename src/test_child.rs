@@ -238,7 +238,8 @@ pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, crate::PipeWriter) {
 }
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
-/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
+/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`. `more` echoes,
+/// so a Windows caller nulls the stdout.
 pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
     let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
     cmd.args(&BLOCKER_ARGV[1..])
@@ -1572,8 +1573,8 @@ pub(crate) fn system32(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// `more.com` by its `System32` path, the Windows [`BLOCKER_ARGV`]. A test that needs `more.com`
-/// itself (its image name or its path in a command line) takes this; any other takes the blocker.
+/// `more.com` by its `System32` path, the Windows [`BLOCKER_ARGV`]. For tests that need `more.com`
+/// itself (image name or command-line path).
 #[cfg(windows)]
 pub(crate) fn windows_more() -> std::path::PathBuf {
     system32("more.com")

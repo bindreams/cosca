@@ -281,7 +281,6 @@ fn std_child_consecutive_frozen_waits_never_return_early() {
 fn drop_kills_and_reaps_the_child() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    // `more` echoes, so its stdout is nulled.
     #[cfg(windows)]
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     let (stdin, writer) = crate::test_child::held_writer_stdin();

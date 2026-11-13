@@ -186,6 +186,8 @@ async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace()
     #[cfg(windows)]
     {
         cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        // `executable` routes the spawn to the raw `CreateProcessW` backend, whose untaken piped stdin this covers.
+        cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
         cmd.stdout(crate::Stdio::null()).expect("null stdout");
     }
     cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");

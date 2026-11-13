@@ -3236,7 +3236,6 @@ pub(crate) mod fault {
     /// The argv and stdio of a [`teardown_blocker_stdin`] child, for the sync and async `Command`.
     pub(crate) fn teardown_blocker_parts() -> TeardownBlockerParts {
         let (stdin, guard) = teardown_blocker_stdin();
-        // `more` echoes, so its stdout is nulled.
         #[cfg(unix)]
         let stdout = None;
         #[cfg(windows)]

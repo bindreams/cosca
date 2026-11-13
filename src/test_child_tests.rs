@@ -25,7 +25,7 @@ mod restore_mode_tests {
 
 /// The Windows [`BLOCKER_ARGV`](super::BLOCKER_ARGV) child exits 0 when its stdin closes. Every
 /// Windows test that takes a non-zero exit as proof of a kill relies on this: were it non-zero, a
-/// natural end would read as a kill (#972).
+/// natural end would read as a kill.
 #[cfg(windows)]
 #[skuld::test]
 fn the_windows_blocker_exits_zero_when_its_stdin_closes() {
