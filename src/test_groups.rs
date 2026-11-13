@@ -209,7 +209,7 @@ test_group!(CLONE3 => clone3, env = "COSCA_TEST_CLONE3");
 test_group!(STRAY_SIGNAL => stray_signal, env = "COSCA_TEST_STRAY_SIGNAL", consent = "may signal an unrelated process (a number no live process of the test pins, or a walk from a reaped root's pid)");
 test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
 
-/// A pidfd of this process, closed when dropped: what the kernel preconditions ask their questions of.
+/// A pidfd of this process, for the kernel preconditions to query.
 #[cfg(target_os = "linux")]
 fn own_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(rustix::process::pidfd_open(
@@ -232,8 +232,7 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd as _;
-        // Only `EINVAL` is the kernel's own answer to a flag it does not know; any other failure (a seccomp or LSM
-        // refusal, `ENOSYS`) is the probe's own.
+        // Other failures (seccomp/LSM refusal, `ENOSYS`) are the probe's own.
         let probe_failed = |what: String| {
             format!(
                 "the PIDFD_GROUP_SIGNAL group could not ask the kernel whether it takes PIDFD_SIGNAL_PROCESS_GROUP \
@@ -266,18 +265,16 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     Err(lacks("this host is not Linux".to_owned()))
 }
 
-/// `PIDFD_GET_INFO` for the first version of `struct pidfd_info` (`PIDFD_INFO_SIZE_VER0` bytes): `_IOWR(PIDFS_IOCTL_MAGIC
-/// = 0xFF, 11, ...)` of `linux/pidfd.h`. libc's own `PIDFD_GET_INFO` encodes `size_of::<libc::pidfd_info>()`, which a
-/// libc that adds the struct's later fields would change. The same request as the library's
-/// (`containment::cgroup::reach`), which integration roots cannot name.
+/// The library's `PIDFD_GET_INFO_VER0` request (`containment::cgroup::reach`), repeated because integration roots
+/// cannot name it.
 #[cfg(target_os = "linux")]
 const PIDFD_GET_INFO_VER0: libc::Ioctl = libc::_IOWR::<[u8; libc::PIDFD_INFO_SIZE_VER0 as usize]>(0xFF, 11);
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<libc::pidfd_info>() >= libc::PIDFD_INFO_SIZE_VER0 as usize);
 
 /// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
-/// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13, a supported host that reads a
-/// task's cgroup through `/proc` instead, refuses it with `ENOTTY` or `EINVAL`. It does not call the library's
+/// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13 refuses it with `ENOTTY` or
+/// `EINVAL`. It does not call the library's
 /// `pidfd_cgroup_id`, so a defect there cannot read as a missing kernel feature.
 #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
 fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
@@ -290,8 +287,7 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd as _;
-        // Only `ENOTTY` and `EINVAL` say the kernel is too old; any other failure (a seccomp or LSM refusal,
-        // `ENOSYS`) is the probe's own, as the library reads it (`pidfd_cgroup_id`).
+        // Any other failure (a seccomp or LSM refusal, `ENOSYS`) is the probe's own, not the kernel's.
         let probe_failed = |what: String| {
             format!(
                 "the PIDFD_GET_INFO group could not ask the kernel whether it answers PIDFD_GET_INFO ({what}); \
@@ -299,8 +295,7 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
             )
         };
         let pidfd = own_pidfd().map_err(|e| probe_failed(format!("pidfd_open failed: {e}")))?;
-        // SAFETY: all-zero is a valid `pidfd_info` (plain integers); it is `#[non_exhaustive]`, so it cannot be built
-        // by a literal.
+        // SAFETY: all-zero is a valid `pidfd_info` (plain integers).
         let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
         info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
         // SAFETY: `pidfd` is open, and `info` is a valid, writable `struct pidfd_info`, at least as large as the first
@@ -319,7 +314,6 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
                 _ => Err(probe_failed(format!("the ioctl failed: {errno}"))),
             };
         }
-        // A kernel that took the ioctl but does not fill the cgroup id lacks the feature too.
         if info.mask & u64::from(libc::PIDFD_INFO_CGROUPID) == 0 {
             return Err(lacks("this kernel's answer carries no cgroup id".to_owned()));
         }

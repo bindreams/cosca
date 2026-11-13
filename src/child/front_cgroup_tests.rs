@@ -1544,9 +1544,8 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(
     );
 }
 
-/// A front moved into a cgroup nested under its leaf is in the leaf's subtree, whatever the kernel: with a
-/// readable `/proc` it is placed, and without `PIDFD_GET_INFO` a hidden `/proc` places nothing, since its path is
-/// all that is left (such a host refuses the spawn, see `front_placement`).
+/// With `PIDFD_GET_INFO` missing, a front nested under its leaf is placed by its path, and a hidden `/proc` places
+/// nothing (such a host refuses the spawn, see `front_placement`).
 #[skuld::test]
 fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hides_it(
     #[fixture(cgroup)] _group: &Group,

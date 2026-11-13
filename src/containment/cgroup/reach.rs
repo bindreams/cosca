@@ -43,8 +43,7 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
     if let Some(id) = super::fault::forced_pidfd_cgroup_id() {
         return Ok(Some(id));
     }
-    // SAFETY: all-zero is a valid `pidfd_info` (plain integers); it is `#[non_exhaustive]`, so it cannot be built
-    // by a literal.
+    // SAFETY: all-zero is a valid `pidfd_info` (plain integers).
     let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
     info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
     // SAFETY: `info` is a valid, writable `struct pidfd_info`, at least as large as the first version the request
