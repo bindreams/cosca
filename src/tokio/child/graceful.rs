@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::Child;
 #[cfg(test)]
 use crate::child::graceful::fault;
-use crate::child::graceful::waits::Waits;
+use crate::child::graceful::tree::Waits;
 #[cfg(unix)]
 use crate::child::graceful::HoldersShutdown;
 use crate::containment::dispatch::{SweepFailure, Swept};
@@ -251,7 +251,7 @@ impl Child {
     /// holds** are answered as for the sync
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), with the grace awaited.
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        crate::child::graceful::waits::shutdown_tree(self, grace).await
+        crate::child::graceful::tree::shutdown_tree(self, grace).await
     }
 }
 
@@ -263,6 +263,14 @@ impl Waits for Child {
 
     async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error> {
         edge.wait_async(crate::tokio::wait::deadline_from(grace)).await
+    }
+
+    #[cfg(unix)]
+    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
+        self.inner
+            .tree
+            .wait_drained_async(crate::tokio::wait::deadline_from(grace))
+            .await
     }
 
     async fn root_exited(&self, within: Duration) -> Result<bool, Error> {

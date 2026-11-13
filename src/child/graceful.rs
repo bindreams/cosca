@@ -24,6 +24,18 @@ pub(crate) fn take_forced_watch_error() -> Option<Error> {
     None
 }
 
+/// The failure a test forced on the sweep of `graceful_shutdown_tree` (see
+/// [`fault::set_force_kill_tree_error`]), taken once; the sweep is not sent when it is `Some`. Outside test
+/// builds it is a constant `None`.
+#[cfg(test)]
+pub(crate) fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
+    fault::take_force_kill_tree_error().then(|| fault::forced_kill_tree_error().into())
+}
+#[cfg(not(test))]
+pub(crate) fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
+    None
+}
+
 /// What [`Child::signal_tree_cooperatively`] decided: the cooperative signal of
 /// `graceful_shutdown_tree`, which the caller then follows with the grace and the sweep.
 pub(crate) enum SignalTreeCooperativelyOutcome {
@@ -284,7 +296,7 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
     /// is not this process's to reap.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        waits::run_ready(waits::shutdown_tree(&mut waits::BlockingDriver(self), grace))
+        tree::run_ready(tree::shutdown_tree(&mut tree::BlockingDriver(self), grace))
     }
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
@@ -346,7 +358,7 @@ impl Child {
         }
     }
 
-    /// The end of a holders-only shutdown ([`waits::shutdown_tree`]'s `holders_only`): the mechanism's kill
+    /// The end of a holders-only shutdown ([`tree::holders_only`]): the mechanism's kill
     /// with the same root, taken under a hold of its own, which is not held across the grace. The pending
     /// shutdown is finished by its caller, sync or async, which waits for what that kill reached.
     #[cfg(unix)]
@@ -663,8 +675,8 @@ pub(crate) mod fault {
     }
 }
 
-#[path = "graceful/waits.rs"]
-pub(crate) mod waits;
+#[path = "graceful/tree.rs"]
+pub(crate) mod tree;
 
 #[cfg(test)]
 #[path = "graceful_tests.rs"]

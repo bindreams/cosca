@@ -123,7 +123,7 @@ impl Tree {
     }
 
     /// What a call that needs the tree's drain edge answers when it has none.
-    pub(crate) fn no_drain_edge(&self) -> Error {
+    fn no_drain_edge(&self) -> Error {
         Error::Unsupported {
             op: "wait for the contained tree to drain (wait_tree / wait_tree_timeout)".into(),
             platform: std::env::consts::OS,

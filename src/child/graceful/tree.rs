@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use super::fault;
-use super::{take_forced_watch_error, Child, SignalTreeCooperativelyOutcome};
+use super::{take_forced_sweep, take_forced_watch_error, Child, SignalTreeCooperativelyOutcome};
 use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::TreeDrain;
@@ -25,6 +25,11 @@ pub(crate) trait Waits {
 
     /// Until every member of the tree has exited (not reaped), through `edge`, or `grace` is over.
     async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error>;
+
+    /// [`Tree::wait_drained`](crate::containment::Tree::wait_drained) for `grace`: the drain edge, or
+    /// `Unsupported` where the mechanism has none.
+    #[cfg(unix)]
+    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error>;
 
     /// Whether the root has exited within `within`, looked at through its handle. Non-reaping, so its
     /// pid stays pinned.
@@ -51,6 +56,11 @@ impl Waits for BlockingDriver<'_> {
 
     async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error> {
         edge.wait(crate::wait::deadline_from(grace))
+    }
+
+    #[cfg(unix)]
+    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
+        self.0.tree.wait_drained(crate::wait::deadline_from(grace))
     }
 
     async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
@@ -157,21 +167,16 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     // before the reap on a LIVE root (waiting unswept would hang), but once the root is dead (its
     // exit was observed, or the sweep's backstop killed it), the reap runs first.
     if !drained {
-        // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
-        // not merely that it would have no-op'd: forcing this call to fail and then
-        // observing `Ok` from the whole function is only possible if this branch was
-        // never entered at all.
-        #[cfg(test)]
-        let sweep_result = if fault::take_force_kill_tree_error() {
-            Err(fault::forced_kill_tree_error().into())
-        } else {
-            w.sweep(w.child().kill_tree_after("graceful_shutdown_tree", earlier))
-                .await
+        // The seam lets a test PROVE the sweep is skipped when `drained`, not merely that it
+        // would have no-op'd: forcing this call to fail and then observing `Ok` from the whole
+        // function is only possible if this branch was never entered at all.
+        let sweep_result = match take_forced_sweep() {
+            Some(failure) => Err(failure),
+            None => {
+                w.sweep(w.child().kill_tree_after("graceful_shutdown_tree", earlier))
+                    .await
+            }
         };
-        #[cfg(not(test))]
-        let sweep_result = w
-            .sweep(w.child().kill_tree_after("graceful_shutdown_tree", earlier))
-            .await;
         if let Err(sweep) = sweep_result {
             // A zombie launchd holds is not ours to reap: waiting on it only warns.
             if (root_exited || sweep.root_ended) && !w.child().root_is_unpinned() {
@@ -268,11 +273,7 @@ pub(crate) async fn holders_only<W: Waits>(w: &W, skip: crate::containment::Skip
         None,
     );
     // A failed grace wait means the holders are killed now.
-    let watch = match child.tree.drain_edge() {
-        Some(edge) => w.drain(&edge, grace).await,
-        None => Err(child.tree.no_drain_edge()),
-    }
-    .err();
+    let watch = w.tree_drained(grace).await.err();
     let label = format!("graceful_shutdown_tree({})", child.pid());
     crate::graceful::joined(
         &label,
@@ -282,5 +283,5 @@ pub(crate) async fn holders_only<W: Waits>(w: &W, skip: crate::containment::Skip
 }
 
 #[cfg(test)]
-#[path = "waits_tests.rs"]
-mod waits_tests;
+#[path = "tree_tests.rs"]
+mod tree_tests;

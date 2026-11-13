@@ -85,14 +85,16 @@ async fn keeps_an_untaken_stdin_open_through_the_grace(tree: bool) {
     {
         cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
         cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+        // A process group on Linux: no cgroup is asked for, so the row needs no delegated one.
+        crate::test_child::contain_without_cgroup_async(&mut cmd);
     }
     #[cfg(windows)]
     {
         cmd.executable(crate::test_child::windows_more()).args(["more"]);
         cmd.stdout(crate::Stdio::null()).expect("null stdout");
+        cmd.contain();
     }
     cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
-    cmd.contain();
     let mut child = cmd.spawn().await.expect("spawn");
     #[cfg(unix)]
     {
@@ -494,7 +496,7 @@ async fn async_graceful_tree_drained_skips_sweep_in_a_cgroup(#[fixture(cgroup)] 
 
 // Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's
 // rationale (`exited_through_handle`, like the sync wait, does not reap) and for `mode` and `swept`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 async fn members_remain_still_reaps_an_already_exited_root(
     mode: crate::ContainMode,
     swept: impl FnOnce(&mut crate::tokio::Child),
@@ -572,6 +574,25 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
     members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Strongest, |child| {
         assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
         child.send_kill_tree().expect("the leaf is swept by its own handle");
+    })
+    .await;
+}
+
+/// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
+/// number its own while the call runs. On macOS the tree is the fd marker: the drain verdict is
+/// `AllMarkersClosed` or members remain, never proof to skip the sweep, and the root probe follows.
+#[cfg(unix)]
+#[skuld::test]
+async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
+    members_remain_still_reaps_an_already_exited_root(crate::ContainMode::Session, |child| {
+        assert_eq!(child.containment(), crate::test_child::session_gives());
+        // Below Linux 6.9 a group is signalled by its number alone.
+        #[cfg(target_os = "linux")]
+        let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+        let err = child
+            .send_kill_tree()
+            .expect_err("a reaped root's group is not signalled by its number");
+        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
     })
     .await;
 }
@@ -742,7 +763,7 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
 
     let (error, ()) = ::tokio::join!(
         async {
-            let error = crate::child::graceful::waits::holders_only(&child, skip, Duration::ZERO).await;
+            let error = crate::child::graceful::tree::holders_only(&child, skip, Duration::ZERO).await;
             done.set(true);
             error
         },
