@@ -32,17 +32,14 @@ use std::sync::OnceLock;
 
 use cosca::{Gate, Inject, ShimTestHooks};
 
-pub struct EnvHooks {
-    log: OnceLock<Option<RawFd>>,
-}
-
 /// Set in a process's environment to make [`init`] start the shim as a host ships it.
 pub const SHIM_SHIPPED_ENV: &str = "COSCA_TESTCFG_SHIM_SHIPPED";
 /// Set in a process's environment to make [`init`] print whether `cosca::installed()` held before and
 /// after `cosca::init()`, and exit.
 pub const INIT_PROBE_ENV: &str = "COSCA_TESTCFG_INIT_PROBE";
 
-/// The seam variables, as the module doc describes them.
+// The seam variables, as the module doc describes them -----
+
 pub const LOG_ENV: &str = "COSCA_SEAM_LOG";
 pub const INJECT_ENV: &str = "COSCA_SEAM_INJECT";
 pub const CHILD_GATE_ENV: &str = "COSCA_SEAM_CHILD_GATE";
@@ -53,6 +50,10 @@ pub const EXHAUST_FDS_ENV: &str = "COSCA_SEAM_EXHAUST_FDS";
 /// The variable that holds `gate`'s FIFO.
 pub fn gate_env(gate: Gate) -> String {
     format!("COSCA_SEAM_GATE_{}", gate.name().to_uppercase().replace('-', "_"))
+}
+
+pub struct EnvHooks {
+    log: OnceLock<Option<RawFd>>,
 }
 
 pub static HOOKS: EnvHooks = EnvHooks { log: OnceLock::new() };

@@ -925,6 +925,7 @@ fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
 }
 
 const KQUEUE_MARKER: &str = "COSCA_TESTCFG_MACCHILD_KQUEUE";
+// `run_fixture_case` requires a case variable; this fixture does not read it.
 const KQUEUE_CASE_ENV: &str = "COSCA_TESTCFG_MACCHILD_KQUEUE_CASE";
 
 /// A refused kqueue fails the adoption with the refusal, instead of an adopted child that can

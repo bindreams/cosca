@@ -39,7 +39,7 @@ use cosca::identity::ProcessId;
 
 #[path = "../../testbin/ack.rs"]
 pub mod ack;
-pub use ack::{ACK_ENV, GC_PID_ADDR_ENV};
+pub use ack::ACK_ENV;
 
 #[path = "accept/shared.rs"]
 mod shared;

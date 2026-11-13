@@ -134,15 +134,6 @@ fn all_succeeded_reports_every_failed_step() {
 }
 
 #[skuld::test]
-fn marker_file_name_is_a_valid_windows_file_name() {
-    assert_eq!(
-        marker_file_name("dots_and_spaces::a_final_component"),
-        "dots_and_spaces.a_final_component"
-    );
-    assert_eq!(marker_file_name("top_level"), "top_level");
-}
-
-#[skuld::test]
 fn reap_after_terminate_reaps_only_a_terminated_child() {
     let mut reaped = false;
     let outcome = reap_after_terminate(

@@ -62,14 +62,23 @@ use windows::Win32::System::Threading::{
 /// doc for why no phase attribution is claimed here.
 pub(crate) const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
-/// The names of the `COSCA_PROBE_*` variables this suite uses to talk to its children and to gate itself.
+// The `COSCA_PROBE_*` variables this suite uses to talk to its children and to gate itself -----
+
+/// What every name below starts with; a child's env block carries the variables with this prefix.
 pub(crate) const PROBE_PREFIX: &str = "COSCA_PROBE_";
+/// The file a spawned child answers through.
 pub(crate) const PROBE_REPORT_TO_ENV: &str = "COSCA_PROBE_REPORT_TO";
+/// Set in a spawned child so it runs the measurement alone, not the full chain.
 pub(crate) const PROBE_CHILD_ENV: &str = "COSCA_PROBE_CHILD";
+/// `1` when the child was wrapped in a `contain()` job before it ran.
 pub(crate) const PROBE_ANCESTOR_CONTAINED_ENV: &str = "COSCA_PROBE_ANCESTOR_CONTAINED";
+/// A value the caller plants to see it arrive in the child's environment block.
 pub(crate) const PROBE_ENV_CANARY_ENV: &str = "COSCA_PROBE_ENV_CANARY";
+/// The pid whose token the inspection probe reads.
 pub(crate) const PROBE_INSPECT_PID_ENV: &str = "COSCA_PROBE_INSPECT_PID";
+/// `1` marks the host disposable for the probes that register a scheduled task.
 pub(crate) const PROBE_ALLOW_STATE_ENV: &str = "COSCA_PROBE_ALLOW_STATE";
+/// `1` marks the host disposable for the probes that create local accounts.
 pub(crate) const PROBE_ALLOW_ACCOUNTS_ENV: &str = "COSCA_PROBE_ALLOW_ACCOUNTS";
 
 /// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under

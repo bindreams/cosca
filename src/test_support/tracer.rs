@@ -59,12 +59,14 @@ use std::io::Write as _;
 
 use crate::test_child::Console;
 
-/// The variables the helper and the tracee fixture take their inputs from (see the module doc).
+// The variables the helper and the tracee fixture take their inputs from (see the module doc) -----
+
 const ROLE_ENV: &str = "COSCA_UH_ROLE";
 const MODE_ENV: &str = "COSCA_UH_MODE";
 const FORCE_ENV: &str = "COSCA_UH_FORCE";
 const TRACE_ENV: &str = "COSCA_UH_TRACE";
 const MARKER_ENV: &str = "COSCA_UH_MARKER";
+/// The tracee fixture's kind, as the `Debug` name of its `Tracee`.
 const KIND_ENV: &str = "COSCA_UH_KIND";
 
 mod attach;

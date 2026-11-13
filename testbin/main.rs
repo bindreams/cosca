@@ -2,7 +2,7 @@
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
 //! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
 //! spawn through each Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement
-//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by [`env_names::TESTBIN_MODE_ENV`]
+//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by [`TESTBIN_MODE_ENV`]
 //! when set, else by argv[1]; the variable keeps the mode when a test shifts argv (`dump-argv`).
 
 #[cfg(target_os = "macos")]
@@ -22,6 +22,13 @@ mod quiet_io;
 mod ack;
 #[cfg(windows)]
 use accept::ack;
+
+/// The env vars this binary reads that tests set, shared with `tests/common`.
+#[path = "env_names.rs"]
+mod env_names;
+#[cfg(unix)]
+use env_names::DROP_TO_ENV;
+use env_names::{GC_PID_ADDR_ENV, TESTBIN_MODE_ENV};
 
 /// The `report-console-identity` mode, shared verbatim with the GUI-subsystem fixture.
 #[cfg(windows)]
@@ -134,12 +141,6 @@ fn fake_pkexec(args: &[String]) {
         .expect("open the log");
     writeln!(f, "{line}").expect("append to the log");
 }
-
-#[path = "env_names.rs"]
-mod env_names;
-#[cfg(unix)]
-use env_names::DROP_TO_ENV;
-use env_names::TESTBIN_MODE_ENV;
 
 /// If root, become the `uid:gid` the test names in [`DROP_TO_ENV`]: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
@@ -317,7 +318,7 @@ fn hold(sock: &mut std::net::TcpStream) {
     }
 }
 
-/// Spawn `exe args` as a grandchild and, when the harness asked for it via [`ack::GC_PID_ADDR_ENV`],
+/// Spawn `exe args` as a grandchild and, when the harness asked for it via [`GC_PID_ADDR_ENV`],
 /// report its pid there as one `<pid>\n` line on a throwaway connection, then wait for the
 /// harness's release (the second ack) before returning. The harness resolves the grandchild's
 /// identity while this root is held here, alive and still its parent, so the pid names the
@@ -336,7 +337,7 @@ fn hold(sock: &mut std::net::TcpStream) {
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     // `connect_control` waits for the first ack: the harness has accepted this connection.
     let report =
-        std::env::var_os(ack::GC_PID_ADDR_ENV).map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
+        std::env::var_os(GC_PID_ADDR_ENV).map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
     #[allow(
         clippy::disallowed_methods,
         reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
@@ -761,7 +762,7 @@ fn main() {
         }
         "spawn-grandchild-report-eof" => {
             // Connects to the pid report address, then exits without reporting anything.
-            let addr = std::env::var(ack::GC_PID_ADDR_ENV).expect(ack::GC_PID_ADDR_ENV);
+            let addr = std::env::var(GC_PID_ADDR_ENV).expect(GC_PID_ADDR_ENV);
             let _sock = crate::ack::connect_control(addr).unwrap();
         }
         "hold-until-stdin-eof" => {
