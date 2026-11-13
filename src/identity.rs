@@ -693,7 +693,7 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 pub(crate) use backend::call_error;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::prove::{prove, FailedCall, Proof};
+pub(crate) use backend::prove::{prove, warn_refused, FailedCall, Proof, Refusal};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
@@ -735,6 +735,12 @@ pub(crate) struct UnknownCause {
     /// The failed `pidfd_open`, `pidfs_ino` or `poll` that left the read `Unknown`.
     #[cfg(target_os = "linux")]
     call: Option<FailedCall>,
+    /// The refused `openat2` of the `stat` read that left the read `Unknown`.
+    #[cfg(target_os = "linux")]
+    refusal: Option<Box<Refusal>>,
+    /// The `stat` read that failed, beyond absence and refusal, and left the read `Unknown`.
+    #[cfg(target_os = "linux")]
+    unreadable: Option<Box<backend::pid_stat::Unreadable>>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -801,9 +807,7 @@ impl UnknownCause {
     pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
         UnknownCause {
             view,
-            call: None,
-            parent: None,
-            candidate: None,
+            ..UnknownCause::default()
         }
     }
 
@@ -811,15 +815,44 @@ impl UnknownCause {
     #[cfg(target_os = "linux")]
     pub(crate) fn of_call(call: FailedCall) -> UnknownCause {
         UnknownCause {
-            view: None,
             call: Some(call),
-            parent: None,
-            candidate: None,
+            ..UnknownCause::default()
         }
     }
 
-    /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
-    /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
+    /// The cause of a read whose `stat` was refused (`openat2`) and left it `Unknown`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_refusal(refusal: Refusal) -> UnknownCause {
+        UnknownCause {
+            refusal: Some(Box::new(refusal)),
+            ..UnknownCause::default()
+        }
+    }
+
+    /// The cause of a read whose `stat` failed as `unreadable` says and left it `Unknown`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_unreadable(unreadable: backend::pid_stat::Unreadable) -> UnknownCause {
+        UnknownCause {
+            unreadable: Some(Box::new(unreadable)),
+            ..UnknownCause::default()
+        }
+    }
+
+    /// This cause as the [`Refusal`] it is: of the `openat2` that left the view unusable, of a
+    /// `pidfd_open`, or of the `stat` read. Any other cause comes back as it was, for
+    /// [`into_error`](Self::into_error).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_refusal(mut self) -> Result<Refusal, UnknownCause> {
+        let refusal = match (&self.view, &self.call) {
+            (Some(view), _) => view.refusal(),
+            (None, Some(call)) => call.refusal(),
+            (None, None) => self.refusal.take().map(|refusal| *refusal),
+        };
+        refusal.ok_or(self)
+    }
+
+    /// The error for `subject`'s `Unknown` read when the read knows why: [`Error::Unsupported`] for
+    /// a refusal ([`into_refusal`](Self::into_refusal)), else [`Error::Unassessable`] with the view's
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
     /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
     /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
@@ -828,10 +861,15 @@ impl UnknownCause {
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
-            match (self.view, self.call) {
-                (Some(why), _) => Some(backend::view_error(subject, why)),
-                (None, Some(call)) => Some(backend::call_error(subject, call)),
-                (None, None) => None,
+            let cause = match self.into_refusal() {
+                Ok(refusal) => return Some(refusal.unsupported(format!("identifying {subject}"))),
+                Err(cause) => cause,
+            };
+            match (cause.view, cause.call, cause.unreadable) {
+                (Some(why), _, _) => Some(backend::view_error(subject, why)),
+                (None, Some(call), _) => Some(backend::call_error(subject, call)),
+                (None, None, Some(unreadable)) => Some(backend::unreadable_error(subject, *unreadable)),
+                (None, None, None) => None,
             }
         }
         #[cfg(windows)]

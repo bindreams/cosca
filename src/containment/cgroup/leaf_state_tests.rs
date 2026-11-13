@@ -61,6 +61,57 @@ fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
 }
 
+/// A `stat` read that is a refusal (see `identity::Refusal`) is an unknown state whose cause and
+/// debug line say what cosca requires, with the refusing errno below. `EPERM` is one when the
+/// checked directory refuses `self/stat` too.
+#[skuld::test]
+fn a_refused_stat_read_is_an_unknown_state_that_names_openat2() {
+    crate::log_capture::install();
+    let me = std::process::id();
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_read(&format!("{me}/stat"), Err(errno))
+            .on_read("self/stat", Err(libc::ENODEV));
+        let Err(StateUnknown::Unreadable(e)) = read_proc_state(&kernel, me) else {
+            panic!("{errno}: expected Unreadable");
+        };
+        let said = crate::error::Report(&e).to_string();
+        assert!(said.contains("requires openat2"), "{errno}: {said}");
+        assert!(
+            crate::error::first_os_code(&e).is_some_and(|code| code == errno || code == libc::ENODEV),
+            "{errno}: {said}"
+        );
+
+        let mark = crate::log_capture::mark();
+        assert_eq!(proc_state(&kernel, handle_of(me, &pidfd_of(me))), None);
+        let records =
+            crate::log_capture::records_since_on_current_thread(mark, &format!("pid {me}'s state is unknown"));
+        assert!(
+            records.iter().any(|(_, line)| line.contains("requires openat2")),
+            "{errno}: {records:?}"
+        );
+    }
+}
+
+/// A `stat` read that is no refusal stays the read's own error, with its code and no requirement:
+/// `EIO`, and `EPERM` while the checked directory still answers (`hidepid`).
+#[skuld::test]
+fn a_stat_read_that_is_no_refusal_is_the_reads_own_error() {
+    let me = std::process::id();
+    for errno in [libc::EIO, libc::EPERM] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_read(&format!("{me}/stat"), Err(errno));
+        let Err(StateUnknown::Unreadable(e)) = read_proc_state(&kernel, me) else {
+            panic!("{errno}: expected Unreadable");
+        };
+        assert_eq!(e.raw_os_error(), Some(errno), "{e}");
+        let said = crate::error::Report(&e).to_string();
+        assert!(!said.contains("requires"), "{errno}: {said}");
+    }
+}
+
 /// An unreadable stat's `io::Error`, and an unusable view, are `StateUnknown`'s `source()`.
 #[skuld::test]
 fn an_unknown_state_has_what_it_wraps_as_its_source() {

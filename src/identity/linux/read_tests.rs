@@ -205,6 +205,76 @@ fn the_error_for_a_failed_pidfd_call_keeps_the_errno_as_its_source() {
     );
 }
 
+/// The `Unknown` reads of live `PID`'s `stat` under a fine view that `stat` and `recheck` (the answer
+/// of `self/stat`, where the read asks) cause, through the two by-pid reads that carry a cause.
+fn unknown_reads_of_a_stat(stat: i32, recheck: Option<i32>) -> [Option<Error>; 2] {
+    const PID: u32 = 4242;
+    let mut kernel = ticks_host(PID)
+        .same_view()
+        .on_read(&format!("{PID}/stat"), Err(stat))
+        .on_signal_probe(Pid::from_raw(PID as i32).unwrap(), Ok(()));
+    if let Some(recheck) = recheck {
+        kernel = kernel.on_read("self/stat", Err(recheck));
+    }
+    let (got, cause) = ProcessId::of_with(&kernel, PID);
+    assert!(matches!(got, Resolved::Unknown), "{stat}/{recheck:?}: got {got:?}");
+    let of = cause.into_error("pid 4242");
+    let (existence, cause) = ProcessId::from_parts_for_test(PID, Key::for_test(1)).exists_with(&kernel);
+    assert_eq!(existence, Existence::Unknown, "{stat}/{recheck:?}");
+    [of, cause.into_error("pid 4242")]
+}
+
+/// A `stat` read refused (`openat2`) after the view opened leaves the by-pid reads `Unknown` with the
+/// `Unsupported` of a refused view-open, the refusing errno as its source: the pid's `stat` answering
+/// `ENOSYS`/`ENODEV`, or `EPERM` beside a `self/stat` that refuses too. Mutant: "a refused read has no
+/// cause".
+#[skuld::test]
+fn a_refused_stat_read_of_a_live_pid_is_unknown_and_unsupported() {
+    for (stat, recheck, refusing) in [
+        (libc::ENOSYS, None, libc::ENOSYS),
+        (libc::ENODEV, None, libc::ENODEV),
+        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
+        (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+    ] {
+        for error in unknown_reads_of_a_stat(stat, recheck) {
+            let Some(err @ Error::Unsupported { .. }) = error else {
+                panic!("{stat}/{recheck:?}: expected Unsupported, got {error:?}");
+            };
+            assert_eq!(crate::error::first_os_code(&err), Some(refusing), "{stat}/{recheck:?}");
+        }
+    }
+}
+
+/// A `stat` read that fails without a refusal (`EIO`, `EMFILE`, a mount crossing, a failed re-check)
+/// leaves the by-pid reads `Unknown` with an `Unassessable` naming the pid and carrying the errno: a
+/// live process is never read as absent for it. Mutant: "an unreadable `stat` has no cause".
+#[skuld::test]
+fn an_unreadable_stat_of_a_live_pid_is_unknown_and_unassessable_naming_pid_and_errno() {
+    for (stat, recheck, below) in [
+        (libc::EIO, None, libc::EIO),
+        (libc::EMFILE, None, libc::EMFILE),
+        (libc::EXDEV, None, libc::EXDEV),
+        (libc::ELOOP, None, libc::ELOOP),
+        (libc::EPERM, Some(libc::EMFILE), libc::EMFILE),
+    ] {
+        for error in unknown_reads_of_a_stat(stat, recheck) {
+            let Some(err @ Error::Unassessable { .. }) = error else {
+                panic!("{stat}/{recheck:?}: expected Unassessable, got {error:?}");
+            };
+            let text = crate::error::Report(&err).to_string();
+            assert!(
+                text.contains("pid 4242") && text.contains("4242/stat"),
+                "{stat}: {text}"
+            );
+            assert_eq!(
+                crate::error::first_os_code(&err),
+                Some(below),
+                "{stat}/{recheck:?}: {text}"
+            );
+        }
+    }
+}
+
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
 #[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {

@@ -148,6 +148,49 @@ fn proc_view_with_is_unassessable_for_a_status_that_is_not_utf8() {
     }
 }
 
+/// Every read made to establish the view is an `openat2`, and a refusal of one is the view's
+/// `openat2` refusal, as a refused `/proc` open is: `self/status`, `self/ns/pid`,
+/// `thread-self/ns/pid` and the procfs's `1/ns/pid`. Any other errno is no refusal. Mutant: "a read
+/// that establishes the view and is refused is only an unreadable view".
+#[skuld::test]
+fn a_refused_read_that_establishes_the_view_is_a_refused_openat2() {
+    let refusal_of = |why: &ViewUnreadable| {
+        why.refusal()
+            .map(|refusal| crate::error::first_os_code(&refusal.cause()))
+    };
+    for (errno, refused) in [
+        (libc::ENOSYS, true),
+        (libc::EPERM, true),
+        (libc::ENODEV, true),
+        (libc::EACCES, false),
+        (libc::EIO, false),
+    ] {
+        let denied = || io::Error::from_raw_os_error(errno);
+        let expected = refused.then_some(Some(errno));
+
+        let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
+        let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+            panic!("{errno}: a status that cannot be read is Unassessable");
+        };
+        assert_eq!(refusal_of(&why), expected, "{errno}: self/status");
+
+        let Verdict::Unassessable(why) = classify_status("Name:\tcosca\n", ns_pid(Err(denied()))) else {
+            panic!("{errno}: expected Unassessable");
+        };
+        assert_eq!(refusal_of(&why), expected, "{errno}: self/ns/pid");
+
+        let Verdict::Unassessable(why) = classify_ns_links(Err(denied()), || panic!("own link failed first")) else {
+            panic!("{errno}: expected Unassessable");
+        };
+        assert_eq!(refusal_of(&why), expected, "{errno}: thread-self/ns/pid");
+
+        let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied())) else {
+            panic!("{errno}: expected Unassessable");
+        };
+        assert_eq!(refusal_of(&why), expected, "{errno}: 1/ns/pid");
+    }
+}
+
 // Checked /proc dirfd =====
 
 #[skuld::test]
@@ -294,6 +337,33 @@ fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
     child.wait().expect("reap the child");
     assert!(matches!(got, Ok(PidfdTarget::Pid(p)) if p == stated_pid), "got {got:?}");
     assert!(err.reason.contains("no parseable Pid line"), "{err}");
+}
+
+/// The fdinfo read is an `openat2` through the view, so a refusal of it is the view's `openat2`
+/// refusal, with the errno as its source; any other errno is no refusal. Mutant: "a failed fdinfo
+/// read is only an unreadable view".
+#[skuld::test]
+fn a_refused_fdinfo_read_is_a_refused_openat2() {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut child, pidfd) = spawn_exited_child_with_pidfd();
+    let dir = ProcDir::open().expect("/proc opens");
+    let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
+    for (errno, refused) in [
+        (libc::ENOSYS, true),
+        (libc::EPERM, true),
+        (libc::ENODEV, true),
+        (libc::EACCES, false),
+        (libc::EIO, false),
+    ] {
+        let kernel = FakeKernel::over(&HostKernel).on_read(&path, Err(errno));
+        let why = pidfd_pid_in(&kernel, &dir, pidfd.as_fd()).expect_err("an unreadable fdinfo");
+        let got = why
+            .refusal()
+            .map(|refusal| crate::error::first_os_code(&refusal.cause()));
+        assert_eq!(got, refused.then_some(Some(errno)), "{errno}");
+    }
+    child.wait().expect("reap the child");
 }
 
 fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd) {
