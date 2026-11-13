@@ -6,8 +6,9 @@ use std::io;
 use std::path::PathBuf;
 
 /// Why a cgroup v2 leaf could not be created. Each variant names its step, and its path where it
-/// has one; a variant for a failed call keeps that call's OS error as its `source`. The caller
-/// degrades to a process group either way, stating which precondition was missing.
+/// has one; a variant for a failed call keeps that call's OS error as its `source`. A
+/// `BestEffort` caller degrades to a process group, stating which precondition was missing; a
+/// `Strongest` one fails the spawn with it ([`LeafError::into_containment`]).
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -30,8 +31,16 @@ pub(crate) enum LeafError {
          do not tell these cases apart)"
     )]
     NoUnifiedLine { line_count: usize, controllers: String },
-    /// `mkdir` of the leaf failed — most often an undelegated slice the supervisor may not
-    /// write to (`EACCES`/`EPERM`), or a read-only cgroupfs (`EROFS`).
+    /// The own cgroup's directory or its `cgroup.procs` could not be opened for a leaf.
+    #[error("could not open {} for a leaf", path.display())]
+    OpenOwnCgroup {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// `mkdir` of the leaf failed. A refusal (`EACCES`, `EPERM`, `EROFS`) is the host not offering
+    /// the cgroup: an undelegated slice, a read-only cgroupfs, or a policy such as Landlock or
+    /// AppArmor.
     #[error("could not create the leaf cgroup {}", path.display())]
     CreateLeafDir {
         path: PathBuf,
@@ -74,6 +83,31 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
+}
+
+impl LeafError {
+    /// The failure of a spawn that asked for a cgroup and could not have it: [`Error::Containment`]
+    /// naming the failed step and its path, with the OS error that failed it as its source.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "called only by the linux-gated spawn")
+    )]
+    pub(crate) fn into_containment(self) -> crate::error::Error {
+        let detail = format!("cgroup v2: {self}");
+        let source = match self {
+            LeafError::ReadProcSelfCgroup(source)
+            | LeafError::OpenReportChannel(source)
+            | LeafError::OpenOwnCgroup { source, .. }
+            | LeafError::CreateLeafDir { source, .. }
+            | LeafError::CheckKill { source, .. }
+            | LeafError::OpenProcs { source, .. }
+            | LeafError::WatchDrain { source, .. } => Some(crate::error::Error::io_cause(source)),
+            LeafError::NoUnifiedLine { .. } | LeafError::KillUnsupported { .. } => None,
+        };
+        crate::error::Error::Containment { detail, source }
+    }
 }
 
 /// What the child's own `pre_exec` self-placement write reported back to the parent.
@@ -183,6 +217,34 @@ pub(crate) enum NotPlaced {
         /// As in [`NotPlaced::Absent`]: the leaf's report, not `pid`'s in general.
         report: NotEntered,
     },
+}
+
+impl NotPlaced {
+    /// What the child reported, which is why it is not in the leaf.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the linux-gated attach")
+    )]
+    pub(crate) fn report(&self) -> NotEntered {
+        match self {
+            NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. } => *report,
+        }
+    }
+}
+
+impl NotPlaced {
+    /// The error of the `cgroup.procs` read that failed, if it did: the diagnosis's own failure,
+    /// which is not why the child is not in the leaf.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the linux-gated attach")
+    )]
+    pub(crate) fn into_read_failure(self) -> Option<io::Error> {
+        match self {
+            NotPlaced::Absent { .. } => None,
+            NotPlaced::Unreadable { source, .. } => Some(source),
+        }
+    }
 }
 
 impl fmt::Display for NotPlaced {

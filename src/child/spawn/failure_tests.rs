@@ -314,3 +314,38 @@ fn each_fate_has_its_own_message() {
     };
     assert!(running.to_string().contains(&format!("pid {}", std::process::id())));
 }
+
+/// A failed attach that says the program never ran stays a not-started failure when its teardown
+/// has nothing to report.
+///
+/// Mutant: `failed_attach` answers `MayHaveStarted` whatever the teardown says.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_not_started_attach_with_a_clean_teardown_stays_not_started() {
+    let torn = Torn::left(ChildFate::Reaped);
+
+    let failure = super::failed_attach(true, io("refused"), None, None, torn);
+
+    assert!(
+        matches!(
+            failure,
+            SpawnFailure::NotStartedWithChild {
+                fate: ChildFate::Reaped,
+                ..
+            }
+        ),
+        "{failure:?}"
+    );
+}
+
+/// A failed attach that did not say the program never ran is `MayHaveStarted`, a clean teardown or
+/// not.
+///
+/// Mutant: `failed_attach` reads a clean teardown as proof the program did not run.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_attach_that_does_not_say_not_started_may_have_started() {
+    let failure = super::failed_attach(false, io("attach"), None, None, Torn::left(ChildFate::Reaped));
+
+    assert!(matches!(failure, SpawnFailure::MayHaveStarted { .. }), "{failure:?}");
+}

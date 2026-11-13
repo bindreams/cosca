@@ -13,7 +13,11 @@
 //! 5. the fd map's `dup2`s, last, so they cannot replace a descriptor an earlier step still needs.
 //!
 //! std's stdio `dup2`s, and the [`fd_channel`](super::fd_channel) hook registered before this one,
-//! run before it. The first step that fails fails the spawn through std's error channel.
+//! run before it. The first step that fails fails the spawn through std's error channel, except
+//! cgroup self-placement, which `_exit`s from the hook and reports through its own channel (see
+//! `containment::cgroup::placement_hook`). std's channel is made before the fork at the lowest free
+//! descriptors, so with two of fds 0 to 2 closed its error record can land in the child's stdio and
+//! the spawn returns `Ok`. A cosca-owned fork and error channel would fix it.
 //!
 //! A command with no step gets no hook, so std is free to take its `posix_spawn` route.
 

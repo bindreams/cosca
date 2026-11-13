@@ -317,8 +317,16 @@ pub(crate) fn childs_copy(
     let slot = crate::containment::cgroup::ReportSlot {
         fd: end.as_raw_fd(),
         parent_fd: -1,
+        refusing: false,
     };
     (end, slot)
+}
+
+/// `slot` with a child's end that is not open, so the child's every send fails with `EBADF`: a
+/// report that cannot be sent.
+#[cfg(target_os = "linux")]
+pub(crate) fn unsendable(slot: crate::containment::cgroup::ReportSlot) -> crate::containment::cgroup::ReportSlot {
+    crate::containment::cgroup::ReportSlot { fd: -1, ..slot }
 }
 
 /// Run the test `name` (its full path) alone, in a copy of this test binary, and assert it passed.
