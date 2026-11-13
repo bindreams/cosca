@@ -18,9 +18,9 @@
 //!
 //! [`init`] is what the test binaries call first in `main`. Two variables change what it does:
 //!
-//! - `COSCA_TESTCFG_SHIM_SHIPPED`: the process runs the shim as a host ships it, through `cosca::init()`
+//! - [`SHIM_SHIPPED_ENV`] (`COSCA_TESTCFG_SHIM_SHIPPED`): the process runs the shim as a host ships it, through `cosca::init()`
 //!   with no hooks, whatever else the environment says.
-//! - `COSCA_TESTCFG_INIT_PROBE`: the process prints whether `cosca::installed()` held before and after
+//! - [`INIT_PROBE_ENV`] (`COSCA_TESTCFG_INIT_PROBE`): the process prints whether `cosca::installed()` held before and after
 //!   `cosca::init()`, and exits.
 
 use std::ffi::OsString;
@@ -36,6 +36,12 @@ use cosca::{Gate, Inject, ShimTestHooks};
 pub struct EnvHooks {
     log: OnceLock<Option<RawFd>>,
 }
+
+/// Set in a process's environment to make [`init`] start the shim as a host ships it.
+pub const SHIM_SHIPPED_ENV: &str = "COSCA_TESTCFG_SHIM_SHIPPED";
+/// Set in a process's environment to make [`init`] print whether `cosca::installed()` held before and
+/// after `cosca::init()`, and exit.
+pub const INIT_PROBE_ENV: &str = "COSCA_TESTCFG_INIT_PROBE";
 
 pub static HOOKS: EnvHooks = EnvHooks { log: OnceLock::new() };
 
@@ -54,7 +60,7 @@ fn flag(name: &str) -> bool {
 
 /// Starts the shim if this process was started as one, and otherwise returns.
 pub fn init() {
-    if var("COSCA_TESTCFG_INIT_PROBE").is_some() {
+    if var(INIT_PROBE_ENV).is_some() {
         let before = cosca::installed();
         cosca::init();
         // Not `quiet_io`: the lib's unit-test binary includes this file too. A closed stdout is a
@@ -63,11 +69,11 @@ pub fn init() {
         match writeln!(out, "installed before={before} after={}", cosca::installed()).and_then(|()| out.flush()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => panic!("COSCA_TESTCFG_INIT_PROBE: write stdout: {e}"),
+            Err(e) => panic!("{INIT_PROBE_ENV}: write stdout: {e}"),
         }
         std::process::exit(0);
     }
-    if var("COSCA_TESTCFG_SHIM_SHIPPED").is_some() {
+    if var(SHIM_SHIPPED_ENV).is_some() {
         cosca::init();
     } else {
         cosca::init_with_test_hooks(&HOOKS);

@@ -135,7 +135,13 @@ fn fake_pkexec(args: &[String]) {
     writeln!(f, "{line}").expect("append to the log");
 }
 
-/// If root, become the `uid:gid` the test names in `COSCA_TESTCFG_DROP_TO`: one the test checked this
+#[cfg(unix)]
+#[path = "drop_to.rs"]
+mod drop_to;
+#[cfg(unix)]
+use drop_to::DROP_TO_ENV;
+
+/// If root, become the `uid:gid` the test names in [`DROP_TO_ENV`]: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
 /// (`/proc/self/setgroups` reads `deny`), leaving the supplementary groups root had. Runs
 /// single-threaded, before anything else in the mode.
@@ -145,8 +151,10 @@ fn drop_root() {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
-    let target = std::env::var("COSCA_TESTCFG_DROP_TO").expect("a root testbin needs COSCA_TESTCFG_DROP_TO=uid:gid");
-    let (uid, gid) = target.split_once(':').expect("COSCA_TESTCFG_DROP_TO is uid:gid");
+    let target = std::env::var(DROP_TO_ENV).unwrap_or_else(|_| panic!("a root testbin needs {DROP_TO_ENV}=uid:gid"));
+    let (uid, gid) = target
+        .split_once(':')
+        .unwrap_or_else(|| panic!("{DROP_TO_ENV} is uid:gid"));
     let uid: libc::uid_t = uid.parse().expect("uid");
     let gid: libc::gid_t = gid.parse().expect("gid");
     let setgroups_denied = std::fs::read_to_string("/proc/self/setgroups").is_ok_and(|s| s.trim() == "deny");
@@ -309,7 +317,7 @@ fn hold(sock: &mut std::net::TcpStream) {
     }
 }
 
-/// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TESTCFG_GC_PID_ADDR`,
+/// Spawn `exe args` as a grandchild and, when the harness asked for it via [`ack::GC_PID_ADDR_ENV`],
 /// report its pid there as one `<pid>\n` line on a throwaway connection, then wait for the
 /// harness's release (the second ack) before returning. The harness resolves the grandchild's
 /// identity while this root is held here, alive and still its parent, so the pid names the
@@ -327,8 +335,8 @@ fn hold(sock: &mut std::net::TcpStream) {
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     // `connect_control` waits for the first ack: the harness has accepted this connection.
-    let report = std::env::var_os("COSCA_TESTCFG_GC_PID_ADDR")
-        .map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
+    let report =
+        std::env::var_os(ack::GC_PID_ADDR_ENV).map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
     #[allow(
         clippy::disallowed_methods,
         reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
@@ -753,7 +761,7 @@ fn main() {
         }
         "spawn-grandchild-report-eof" => {
             // Connects to the pid report address, then exits without reporting anything.
-            let addr = std::env::var("COSCA_TESTCFG_GC_PID_ADDR").expect("COSCA_TESTCFG_GC_PID_ADDR");
+            let addr = std::env::var(ack::GC_PID_ADDR_ENV).expect(ack::GC_PID_ADDR_ENV);
             let _sock = crate::ack::connect_control(addr).unwrap();
         }
         "hold-until-stdin-eof" => {

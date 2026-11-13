@@ -206,8 +206,9 @@ fn classify(line: &str, stream: TcpStream) -> Handshake {
     if let Some(reason) = line.strip_prefix("F ") {
         panic!(
             "setuid helper provisioning failed: {reason}\n\
-             (check that COSCA_TESTCFG_SETUID_HELPER points at a copy of cosca_testbin that is \
-             owned by root, mode u+s, on a filesystem NOT mounted nosuid)"
+             (check that {helper} points at a copy of cosca_testbin that is \
+             owned by root, mode u+s, on a filesystem NOT mounted nosuid)",
+            helper = common::setuid::HELPER
         );
     }
     if line == "R" {

@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-const HELPER: &str = "COSCA_TESTCFG_SETUID_HELPER";
+pub const HELPER: &str = "COSCA_TESTCFG_SETUID_HELPER";
 
 /// The helper's path. Call it only from a test that joined the `SETUID` group.
 ///

@@ -21,6 +21,11 @@ use std::net::{TcpStream, ToSocketAddrs};
 /// Set (to any value) in a target's environment to make its connections wait for the ack.
 pub const ACK_ENV: &str = "COSCA_TESTCFG_ACCEPT_ACK";
 
+/// Set (to the address of a listener) in a `spawn-grandchild*` testbin root's environment to make it
+/// report its grandchild's pid there (see `tests/common/report.rs`). Unset, the root reports nothing,
+/// so other consumers of these modes see no extra connection.
+pub const GC_PID_ADDR_ENV: &str = "COSCA_TESTCFG_GC_PID_ADDR";
+
 /// The single byte the harness writes to a connection right after accepting it.
 pub const ACK_BYTE: u8 = 0xA5;
 
