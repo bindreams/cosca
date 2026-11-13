@@ -74,18 +74,17 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 ///
 /// Reads through [`HostKernel`](crate::identity::HostKernel) and the containment `fault` hooks,
-/// not a `Kernel` the caller passes: this is containment's own read.
+/// not a `Kernel` the caller passes: this is containment's own read. A read that is a
+/// [`Refusal`](crate::identity::Refusal) fails with an `Unsupported` error that says so, carried as
+/// the `io::Error` this returns; any other failure is the read's own error.
 pub(crate) fn proc_names(
     leaf_path: &str,
     pid: u32,
     recorded: impl FnOnce() -> Option<bool>,
     other_id: bool,
 ) -> io::Result<bool> {
-    #[cfg(test)]
-    if let Some(errno) = super::fault::proc_hidden_as() {
-        return Err(io::Error::from_raw_os_error(errno));
-    }
-    let proc_dir = match crate::identity::proc_view_with(&crate::identity::HostKernel) {
+    let kernel = &crate::identity::HostKernel;
+    let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(io::Error::other(format!(
@@ -95,7 +94,16 @@ pub(crate) fn proc_names(
         }
         crate::identity::ProcView::Unassessable(why) => return Err(view_unreadable(pid, why)),
     };
-    let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
+    let file = format!("{pid}/cgroup");
+    #[cfg(test)]
+    let read = match super::fault::proc_hidden_as() {
+        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+        None => proc_dir.read_to_string(&file),
+    };
+    #[cfg(not(test))]
+    let read = proc_dir.read_to_string(&file);
+    let text =
+        read.map_err(|e| crate::identity::pid_stat::explained_read_failure(kernel, &proc_dir, pid, "cgroup", e))?;
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
     names_leaf(path, leaf_path, other_id, recorded)
@@ -366,9 +374,11 @@ fn dying_in(text: &str) -> Option<u64> {
 /// spawned. Placement is by a pidfd's cgroup id on Linux 6.13 and later, else by `/proc/<pid>/cgroup`
 /// of a non-dumpable child, since `hidepid` hides such a process as it hides a root `sudo` front.
 /// The leaf's id must be readable: `ENOSYS`, `EOPNOTSUPP` or `EPERM` is `Unsupported` naming the
-/// errno, and any other error is `Io`. Where `PIDFD_GET_INFO` is missing, the probe's fork also
-/// needs a free descriptor number for the child's pidfd, beyond the `/proc` handle and the socket's
-/// two ends: with none, the spawn is refused with `Io` (`EMFILE`), before anything runs.
+/// errno, and any other error is `Io`. Where `PIDFD_GET_INFO` is missing, an `openat2` of the probe
+/// that is a [`Refusal`](crate::identity::Refusal) (the child's open of its `/proc/self/fd`, or its
+/// cgroup read) is `Unsupported` naming it, with the refusing errno as its source. The probe's fork
+/// also needs a free descriptor number for the child's pidfd, beyond the `/proc` handle and the
+/// socket's two ends: with none, the spawn is refused with `Io` (`EMFILE`), before anything runs.
 ///
 /// `Err` is the spawn's refusal.
 pub(crate) fn front_placement(
@@ -423,6 +433,13 @@ fn refusal(why: Unreadable) -> crate::error::Error {
             format!("this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and {why}"),
             cause,
         ),
+        Unreadable::Refused(refusal) => unplaceable_by(
+            format!(
+                "this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and {}",
+                refusal.requirement()
+            ),
+            Some(Arc::new(refusal.cause())),
+        ),
         Unreadable::Probe(e) => crate::error::Error::Io(crate::error::io_context(
             "probing whether /proc shows the cgroup of a process this one may not trace",
             e,
@@ -432,6 +449,11 @@ fn refusal(why: Unreadable) -> crate::error::Error {
 
 /// The spawn's refusal for `why`, caused by the failed call `cause`, if there was one.
 fn unplaceable(why: String, cause: Option<io::Error>) -> crate::error::Error {
+    unplaceable_by(why, cause.map(crate::error::Error::io_cause))
+}
+
+/// [`unplaceable`], for a `cause` that is already an error: a [`Refusal`](crate::identity::Refusal)'s.
+fn unplaceable_by(why: String, cause: Option<Arc<crate::error::Error>>) -> crate::error::Error {
     crate::error::Error::Unsupported {
         op: "contain() on an elevated command".into(),
         platform: "linux",
@@ -439,7 +461,7 @@ fn unplaceable(why: String, cause: Option<io::Error>) -> crate::error::Error {
             "{why}. cosca could not tell whether a cgroup kill reached the elevated front, so the spawn is \
              refused before anything is spawned"
         ),
-        source: cause.map(crate::error::Error::io_cause),
+        source: cause,
     }
 }
 
@@ -448,6 +470,10 @@ fn unplaceable(why: String, cause: Option<io::Error>) -> crate::error::Error {
 enum Unreadable {
     /// `/proc` hid it.
     Hidden(io::Error),
+    /// A read or an open of the probe was refused ([`Refusal`](crate::identity::Refusal)): the
+    /// probe's child could not open its `/proc/self/fd`, or the read of its cgroup was refused
+    /// (`EPERM` with `self/stat` refused too).
+    Refused(crate::identity::Refusal),
     /// This process's `/proc` view is not its own pid namespace's, or could not be told: what it
     /// says, and the error behind it, if there is one.
     View(String, Option<io::Error>),
@@ -460,6 +486,12 @@ const RELEASED: i32 = 0;
 /// The probe child's exit status when it was not released: its socket closed or failed with no
 /// byte, its descriptors could not be set up, or its parent was gone.
 const ABANDONED: i32 = 1;
+/// The first byte of the report of a probe child that could not open its `/proc/self/fd`, instead of
+/// the ready report (whose first byte, `PR_GET_DUMPABLE`'s, is at most 2): four bytes follow, the
+/// errno of the failed open as a native-endian `i32`. The child then exits [`ABANDONED`].
+const SETUP_FAILED: u8 = 0xFF;
+/// The length of that report, which is also the longest the probe reads.
+const SETUP_FAILED_LEN: usize = 5;
 
 /// A forked probe child (see [`fork_probe`]). Dropped without [`end`](Self::end), as by an unwind,
 /// it is ended all the same: no probe process outlives it.
@@ -597,7 +629,8 @@ unsafe fn probe_child(proc: &crate::identity::ProcDir, parent: libc::pid_t, dump
 /// first, which leaves the walk's directory a free number. That directory is opened before any
 /// range is closed, which may close the `/proc` handle it opens through, and no range closes it: a
 /// range that fails after another succeeded leaves the walk its directory. `false` if the directory
-/// cannot be opened, or the walk fails.
+/// cannot be opened, whose errno is first reported on `ends.child` ([`SETUP_FAILED`]), or the walk
+/// fails.
 ///
 /// # Safety
 ///
@@ -609,15 +642,19 @@ unsafe fn keep_only_own(proc: &crate::identity::ProcDir, ends: Ends) -> bool {
     unsafe {
         libc::close(ends.parent);
         #[cfg(test)]
-        let opened = if super::fault::probe_fd_dir_fails() {
-            None
-        } else {
-            proc.open_own_fd_dir().ok()
+        let opened = match super::fault::probe_fd_dir_fails() {
+            Some(errno) => Err(rustix::io::Errno::from_raw_os_error(errno)),
+            None => proc.open_own_fd_dir(),
         };
         #[cfg(not(test))]
-        let opened = proc.open_own_fd_dir().ok();
-        let Some(dir) = opened.map(IntoRawFd::into_raw_fd) else {
-            return false;
+        let opened = proc.open_own_fd_dir();
+        let dir = match opened {
+            Ok(dir) => dir.into_raw_fd(),
+            // The parent classifies the errno; this child only says it.
+            Err(errno) => {
+                report_setup_failed(ends.child, errno.raw_os_error());
+                return false;
+            }
         };
         let close_range = |first: libc::c_uint, last: libc::c_uint| {
             #[cfg(test)]
@@ -632,6 +669,23 @@ unsafe fn keep_only_own(proc: &crate::identity::ProcDir, ends: Ends) -> bool {
             return true;
         }
         close_by_walk(dir, ends.child)
+    }
+}
+
+/// Writes the [`SETUP_FAILED`] report with `errno` to the child's end `fd`: one raw `write`, with no
+/// allocation or formatting. A write that fails is lost: the parent then sees the child exit
+/// [`ABANDONED`] without a report, as it does for the failures that report no errno.
+///
+/// # Safety
+///
+/// As [`probe_child`]'s.
+unsafe fn report_setup_failed(fd: libc::c_int, errno: i32) {
+    let mut report = [0u8; SETUP_FAILED_LEN];
+    report[0] = SETUP_FAILED;
+    report[1..].copy_from_slice(&errno.to_ne_bytes());
+    // SAFETY: an async-signal-safe `write` of a local buffer, in the forked child.
+    unsafe {
+        libc::write(fd, report.as_ptr().cast(), report.len());
     }
 }
 
@@ -803,36 +857,50 @@ fn reaped_elsewhere(pid: libc::pid_t) {
     );
 }
 
-/// What the probe's child's `end` says of it, in words.
-fn describe_end(end: ProbeEnd) -> String {
-    match end {
-        ProbeEnd::Signal(signo) => format!("killed by signal {signo}"),
+/// What the probe's child's `end` says of it, in words, as `read` set the scene: a child that
+/// reported [`SETUP_FAILED`] states the step it reported failing (the errno is the error's source)
+/// and that it was ended, then how; a child that was `Gone` says why first; every end is a full
+/// clause. The end is as the reap returned it.
+fn describe_end(read: &ProbeRead, end: ProbeEnd) -> String {
+    let ended = match end {
+        ProbeEnd::Signal(signo) => format!("it was killed by signal {signo}"),
+        ProbeEnd::Exit(ABANDONED) if matches!(read, ProbeRead::SetupFailed(_)) => {
+            format!("it exited ABANDONED ({ABANDONED})")
+        }
         ProbeEnd::Exit(ABANDONED) => format!(
-            "exited ABANDONED ({ABANDONED}): it could not set up its descriptors, its socket closed with no release byte, or its parent was gone"
+            "it exited ABANDONED ({ABANDONED}): it could not set up its descriptors, its socket closed with no release byte, or its parent was gone"
         ),
-        ProbeEnd::Exit(status) => format!("exited with status {status}"),
+        ProbeEnd::Exit(status) => format!("it exited with status {status}"),
         ProbeEnd::Elsewhere => {
-            "reaped by another reaper or, with SIGCHLD ignored, by the kernel as it exited, so its status is lost"
+            "it was reaped by another reaper or, with SIGCHLD ignored, by the kernel as it exited, so its status is lost"
                 .to_owned()
         }
+    };
+    match read {
+        ProbeRead::SetupFailed(_) => format!(
+            "the probe's child could not open its /proc/self/fd (it reported the failure); it was ended: {ended}"
+        ),
+        ProbeRead::Gone(why) => format!("{why}: {ended}"),
+        ProbeRead::Answer(_) => ended,
     }
 }
 
 /// Logs how the probe's child `pid` ended: `debug` for the ends the probe makes (the kill, the
-/// release), `warn` for any other, which is the child's own doing.
-fn log_probe_end(pid: libc::pid_t, end: ProbeEnd) {
-    match end {
-        ProbeEnd::Signal(libc::SIGKILL) | ProbeEnd::Exit(RELEASED) => {
+/// release) and for any end of a child that reported [`SETUP_FAILED`], whose cause is the returned
+/// error; `warn` for any other, which is the child's own doing.
+fn log_probe_end(pid: libc::pid_t, read: &ProbeRead, end: ProbeEnd) {
+    match (read, end) {
+        (ProbeRead::SetupFailed(_), _) | (_, ProbeEnd::Signal(libc::SIGKILL) | ProbeEnd::Exit(RELEASED)) => {
             log::debug!(
                 "containment::cgroup: the placement probe's child {pid} ended: {}",
-                describe_end(end)
+                describe_end(read, end)
             );
         }
         // `reaped_elsewhere` logged it.
-        ProbeEnd::Elsewhere => {}
-        other => log::warn!(
+        (_, ProbeEnd::Elsewhere) => {}
+        (_, other) => log::warn!(
             "containment::cgroup: the placement probe's child {pid} ended on its own: {}",
-            describe_end(other)
+            describe_end(read, other)
         ),
     }
 }
@@ -844,6 +912,9 @@ enum ProbeRead {
     /// The child ended before it reported, or before the read was confirmed to have named it: these
     /// words, then its status once it is reaped, say why.
     Gone(&'static str),
+    /// The child could not open its `/proc/self/fd` and reported the errno ([`SETUP_FAILED`]); its
+    /// status once it is reaped is part of the answer.
+    SetupFailed(i32),
 }
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
@@ -873,7 +944,7 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
     let probe =
         fork_probe(&proc_dir, rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
     let pid = probe.pid;
-    let mut ready = [0u8; 2];
+    let mut ready = [0u8; SETUP_FAILED_LEN];
     let readied = loop {
         match std::io::Read::read(&mut probe.channel(), &mut ready) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -887,6 +958,9 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
     #[cfg(not(test))]
     let hidden: Option<i32> = None;
     let read = match readied {
+        Ok(SETUP_FAILED_LEN) if ready[0] == SETUP_FAILED => {
+            ProbeRead::SetupFailed(i32::from_ne_bytes([ready[1], ready[2], ready[3], ready[4]]))
+        }
         Ok(2) if ready[0] != 0 => ProbeRead::Answer(Err(Unreadable::Probe(io::Error::other(
             "the probe's child could not make itself non-dumpable",
         )))),
@@ -905,9 +979,16 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
                     .and_then(crate::identity::utf8)
                     .map(drop),
             }
-            .map_err(|e| match e.raw_os_error() {
-                Some(libc::ENOENT | libc::EPERM | libc::EACCES) => Unreadable::Hidden(e),
-                _ => Unreadable::Probe(e),
+            .map_err(|e| {
+                // `EPERM` is `hidepid`'s answer too: a refusal only as in a scan.
+                let child = u32::try_from(pid).expect("a forked child's pid is positive");
+                match crate::identity::pid_stat::refusal_of_read(kernel, &proc_dir, child, "cgroup", &e) {
+                    Some(refusal) => Unreadable::Refused(refusal),
+                    None => match e.raw_os_error() {
+                        Some(libc::ENOENT | libc::EPERM | libc::EACCES) => Unreadable::Hidden(e),
+                        _ => Unreadable::Probe(e),
+                    },
+                }
             });
             match peek(&Target::PidFd(probe.pidfd.as_fd())) {
                 Ok(PeekOutcome::Running) => ProbeRead::Answer(read),
@@ -921,13 +1002,20 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Err(e) => ProbeRead::Answer(Err(Unreadable::Probe(e))),
     };
     let end = probe.end().map_err(Unreadable::Probe)?;
-    log_probe_end(pid, end);
+    log_probe_end(pid, &read, end);
     match read {
         ProbeRead::Answer(answer) => answer,
-        ProbeRead::Gone(why) => Err(Unreadable::Probe(io::Error::other(format!(
-            "{why}: it {}",
-            describe_end(end)
-        )))),
+        ProbeRead::Gone(_) => Err(Unreadable::Probe(io::Error::other(describe_end(&read, end)))),
+        ProbeRead::SetupFailed(errno) => {
+            let call = crate::identity::FailedCall::openat2(rustix::io::Errno::from_raw_os_error(errno));
+            Err(match call.refusal() {
+                Some(refusal) => Unreadable::Refused(refusal),
+                None => Unreadable::Probe(crate::error::io_context(
+                    describe_end(&read, end),
+                    io::Error::from_raw_os_error(errno),
+                )),
+            })
+        }
     }
 }
 

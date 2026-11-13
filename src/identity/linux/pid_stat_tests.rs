@@ -41,66 +41,109 @@ fn an_unreadable_pid_says_what_failed_and_not_the_os_error() {
     assert!(!unreadable.to_string().contains(&os_error), "{unreadable}");
 }
 
-/// A `stat` refused while the checked directory refuses `self/stat` too (`EPERM`, `ENOSYS`,
-/// `ENODEV`: the refusal set of an `openat2`): the text says both refusals, and the `source()` is
-/// the pid's own `stat` error, with its code.
+/// An `openat2` refusal (`EPERM`, `ENOSYS`, `ENODEV`) is [`PidStat::Refused`] carrying the refusing
+/// errno as its first cause: the checked directory refusing `self/stat` beside a pid's `EPERM` (the
+/// refusal is the directory's, not the pid's `EPERM`), or the pid's own `stat` answering
+/// `ENOSYS`/`ENODEV`.
 ///
-/// Mutant: the `source()` is the directory's error, or the directory's error is put in the text.
+/// Mutant: the pid's `EPERM` is the refusal's errno; a refusal is an `Unreadable`.
 #[skuld::test]
-fn a_pid_refused_beside_a_refusing_directory_keeps_its_own_stat_error_as_its_source() {
+fn a_refused_openat2_is_a_refusal_carrying_the_refusing_errno() {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    for (stat, recheck, refusing) in [
+        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
+        (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+        (libc::EPERM, Some(libc::ENODEV), libc::ENODEV),
+        (libc::ENOSYS, None, libc::ENOSYS),
+        (libc::ENODEV, None, libc::ENODEV),
+    ] {
+        let mut kernel = FakeKernel::new().on_read("4242/stat", Err(stat));
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", Err(recheck));
+        }
+        match read_in_scan(&kernel, &dir, 4242) {
+            Ok(PidStat::Refused(refusal)) => {
+                assert_eq!(
+                    crate::error::first_os_code(&refusal.cause()),
+                    Some(refusing),
+                    "{stat}/{recheck:?}"
+                );
+                assert!(refusal.requirement().contains("requires openat2"), "{stat}/{recheck:?}");
+            }
+            other => panic!("{stat}/{recheck:?}: expected Refused, got {other:?}"),
+        }
+    }
+}
+
+/// The pid's own failure is kept beside a refusal the checked directory made: the refusal's second
+/// cause, naming the pid, with the pid's `EPERM` below it. A lone refusal has no second cause.
+///
+/// Mutant: the second failure is named in the words only, or dropped.
+#[skuld::test]
+fn the_other_failure_of_a_refused_pid_is_kept_beside_the_refusal() {
+    use crate::error::Error;
+
     let dir = HostKernel.open_proc().expect("/proc opens");
     for recheck in [libc::EPERM, libc::ENOSYS, libc::ENODEV] {
         let kernel = FakeKernel::new()
             .on_read("4242/stat", Err(libc::EPERM))
             .on_read("self/stat", Err(recheck));
-        let Err(unreadable) = read_in_scan(&kernel, &dir, 4242) else {
-            panic!("{recheck}: a refusing directory is no skip");
+        let Ok(PidStat::Refused(refusal)) = read_in_scan(&kernel, &dir, 4242) else {
+            panic!("{recheck}: a refusing directory is a refusal");
         };
 
-        let text = unreadable.to_string();
+        let cause = refusal.cause();
 
-        assert!(text.starts_with("4242/stat was refused"), "{recheck}: {text}");
-        assert!(text.contains("refused self/stat too"), "{recheck}: {text}");
+        let Error::Several(causes) = &cause else {
+            panic!("{recheck}: expected Several, got {cause:?}");
+        };
+        let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
+        assert_eq!(codes, [Some(recheck), Some(libc::EPERM)], "{recheck}");
+        let second = &**causes.iter().nth(1).expect("a second cause");
+        let words = crate::error::Report(second).to_string();
         assert!(
-            !text.contains(&std::io::Error::from_raw_os_error(recheck).to_string()),
-            "{recheck}: {text}"
+            words.contains("4242/stat was refused, and the checked /proc refused self/stat too"),
+            "{recheck}: {words}"
         );
         assert_eq!(
-            crate::error::first_os_code(&unreadable),
+            crate::error::first_os_code(second),
             Some(libc::EPERM),
-            "{recheck}: {text}"
+            "{recheck}: {words}"
         );
     }
+    let kernel = FakeKernel::new().on_read("4242/stat", Err(libc::ENOSYS));
+    let Ok(PidStat::Refused(refusal)) = read_in_scan(&kernel, &dir, 4242) else {
+        panic!("ENOSYS is a refusal");
+    };
+    assert!(
+        matches!(refusal.cause(), Error::Io(_)),
+        "a lone refusal has no second cause"
+    );
 }
 
-/// The `self/stat` failure that came with a pid's refused `stat` is kept beside it, whichever of the
-/// two is the source: it is the peer the scan's error holds as a second cause.
+/// The pid's `EPERM` is kept beside a re-check that failed without refusing: it is the peer the
+/// scan's error holds as a second cause, and the re-check's error is the source.
 ///
 /// Mutant: the second failure is named in the words only, or dropped.
 #[skuld::test]
-fn the_other_failure_of_a_refused_pid_is_kept_as_its_peer() {
+fn the_pids_eperm_is_kept_as_the_peer_of_a_failed_recheck() {
     let dir = HostKernel.open_proc().expect("/proc opens");
-    for (recheck, source, peer) in [
-        (libc::ENOSYS, libc::EPERM, libc::ENOSYS),
-        (libc::EMFILE, libc::EMFILE, libc::EPERM),
-    ] {
-        let kernel = FakeKernel::new()
-            .on_read("4242/stat", Err(libc::EPERM))
-            .on_read("self/stat", Err(recheck));
-        let Err(mut unreadable) = read_in_scan(&kernel, &dir, 4242) else {
-            panic!("{recheck}: a failed directory is no skip");
-        };
+    let kernel = FakeKernel::new()
+        .on_read("4242/stat", Err(libc::EPERM))
+        .on_read("self/stat", Err(libc::EMFILE));
+    let Err(mut unreadable) = read_in_scan(&kernel, &dir, 4242) else {
+        panic!("a failed directory is no skip");
+    };
 
-        let kept = unreadable.take_peer().and_then(|e| e.raw_os_error());
+    let kept = unreadable.take_peer().and_then(|e| e.raw_os_error());
 
-        assert_eq!(kept, Some(peer), "{recheck}");
-        assert_eq!(crate::error::first_os_code(&unreadable), Some(source), "{recheck}");
-        assert_eq!(
-            unreadable.take_peer().and_then(|e| e.raw_os_error()),
-            None,
-            "taken once"
-        );
-    }
+    assert_eq!(kept, Some(libc::EPERM));
+    assert_eq!(crate::error::first_os_code(&unreadable), Some(libc::EMFILE));
+    assert_eq!(
+        unreadable.take_peer().and_then(|e| e.raw_os_error()),
+        None,
+        "taken once"
+    );
     let beyond = FakeKernel::new().on_read("4242/stat", Err(libc::EIO));
     let Err(mut unreadable) = read_in_scan(&beyond, &dir, 4242) else {
         panic!("EIO is no skip");
@@ -112,7 +155,7 @@ fn the_other_failure_of_a_refused_pid_is_kept_as_its_peer() {
 /// the text says the pid's `stat` was refused and the re-check failed, and the `source()` is the
 /// re-check's own error, the operative cause.
 ///
-/// Mutant: any re-check failure is "refused self/stat too", with the pid's `EPERM` as the source.
+/// Mutant: a failed re-check is a `Refused`, so the result is not an `Err(Unreadable)`.
 #[skuld::test]
 fn a_recheck_that_fails_without_refusing_is_its_own_error_and_the_source() {
     let dir = HostKernel.open_proc().expect("/proc opens");
@@ -120,15 +163,15 @@ fn a_recheck_that_fails_without_refusing_is_its_own_error_and_the_source() {
         let kernel = FakeKernel::new()
             .on_read("4242/stat", Err(libc::EPERM))
             .on_read("self/stat", Err(recheck));
-        let Err(unreadable) = read_in_scan(&kernel, &dir, 4242) else {
-            panic!("{recheck}: a failed re-check is no skip");
+        let unreadable = match read_in_scan(&kernel, &dir, 4242) {
+            Err(unreadable) => unreadable,
+            other => panic!("{recheck}: a failed re-check is neither a skip nor a refusal: {other:?}"),
         };
 
         let text = unreadable.to_string();
 
         assert!(text.starts_with("4242/stat was refused"), "{recheck}: {text}");
         assert!(text.contains("re-check of self/stat failed"), "{recheck}: {text}");
-        assert!(!text.contains("refused self/stat too"), "{recheck}: {text}");
         let os_text = std::io::Error::from_raw_os_error(recheck).to_string();
         assert!(
             !text.contains(&os_text),
