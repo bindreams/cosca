@@ -39,8 +39,9 @@ pub(crate) fn take_events() -> Vec<(i16, u32)> {
     AWAIT_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
 }
 
-/// The next `await_reapable` on this thread sees its `EVFILT_PROC` registration answered `ESRCH`
-/// without calling `kevent`.
+/// The next `EVFILT_PROC` registration on this thread, an `await_reapable`'s or an exit watch's
+/// (`ExitWatch::proc_exit`), is answered `ESRCH` without calling `kevent`: for a watch, the process
+/// reads as exited, as one past `P_REF_DEAD` does before it is a zombie.
 pub(crate) fn force_proc_registration_esrch_once() -> ForcedOnce {
     FORCE_ESRCH_REGISTRATION.with(|f| f.set(true));
     ForcedOnce(|| FORCE_ESRCH_REGISTRATION.with(|f| f.set(false)))

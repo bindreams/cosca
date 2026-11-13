@@ -84,12 +84,11 @@ impl OsProcess for MacChild {
         via_audit_token(self.pid, Some(self.unique), sig).map_err(Error::Io)
     }
 
+    /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it:
+    /// see [`ExitWatch::look`]. The reap ([`try_reap`](OsChild::try_reap)) does not come through
+    /// here: it reads the watch raw and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        if self.exit.exited()? {
-            Ok(Exit::Exited)
-        } else {
-            Ok(Exit::Running(WaitFor::Readable(self.exit.as_fd())))
-        }
+        self.exit.look(self.pid, self.unique)
     }
 }
 
