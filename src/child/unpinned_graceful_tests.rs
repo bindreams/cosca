@@ -26,6 +26,13 @@ fn orphan_next_peek(fake: &FakeProcess) -> impl FnOnce() + 'static {
     move || drop(fake.peeks([Untrusted::Unpinned.result()]))
 }
 
+/// The hook that makes the next reap of `fake`'s root answer that launchd holds its zombie: the
+/// reap is where a root orphaned late is found out.
+fn orphan_next_reap(fake: &FakeProcess) -> impl FnOnce() + 'static {
+    let fake = fake.clone();
+    move || drop(fake.reaps([ReapAnswer::Foreign(Foreign::Orphaned)]))
+}
+
 // graceful_shutdown =====
 
 /// A root that is orphaned when the shutdown begins is refused by its `terminate`, with no grace
@@ -102,48 +109,39 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     drop(writer);
 }
 
-/// A root that exited and is held by launchd when the grace watch looks is neither killed nor waited
-/// on, and nothing warns that the zombie is not ours to reap: the call is refused, saying the exit
-/// status cannot be collected. The zombie is left as it was.
+/// A root that exited and is held by launchd is neither killed nor looked at before the reap, and
+/// nothing warns that the zombie is not ours to reap: the grace watch ends at once on the exit, with
+/// the grace unspent, and the reap's own answer, that launchd holds it, is the refusal, saying the
+/// exit status cannot be collected. The reap's answer is stated by the fake root; its exit watch
+/// reading past `NOTE_EXIT` for a parent that is launchd is pinned beside `MacChild::exited`.
 ///
-/// Mutants: the grace watch or the reap warns that the zombie is not ours to reap; the reap waits on
-/// an `Unpinned` root; the escalation kills an exited root.
+/// Mutants: the grace watch or the reap warns that the zombie is not ours to reap; the call looks
+/// at the root before the reap instead of asking the reap; the escalation kills an exited root; the
+/// grace is spent on a root that has exited.
 #[skuld::test]
-fn graceful_shutdown_of_an_exited_orphaned_root_is_refused_without_a_warn() {
+fn graceful_shutdown_of_an_exited_root_launchd_holds_is_refused_without_a_warn() {
+    use crate::os_process::fake::Answer;
+    use crate::test_child::over_fake::{child_over, root_looking};
+
     crate::log_capture::install();
-    let (mut child, writer) = walked_blocker();
-    let pid = child.pid();
-    // SAFETY: `pid` is this test's own child.
-    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
-    crate::test_child::wait_until_zombie(pid);
-    let sends = Capture::start();
     let mark = crate::log_capture::mark();
-    // The terminate's read, and the read before the reap.
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
+    let root = root_looking([Answer::Exited]).reaps([ReapAnswer::Foreign(Foreign::Orphaned)]);
+    let child = child_over(&root);
 
     let err = child
-        .graceful_shutdown(Duration::ZERO)
+        .graceful_shutdown(Duration::from_secs(3600))
         .expect_err("the status of a zombie launchd holds cannot be collected");
 
-    fake.assert_peeks_exhausted();
     assert!(
         matches!(&err, Error::Unassessable { detail, source: None }
-            if detail.contains("exit status cannot be collected") && detail.contains("launchd")),
+            if detail.contains("graceful_shutdown sent its signals")
+                && detail.contains("exit status cannot be collected")
+                && detail.contains("launchd")),
         "{err:?}"
     );
-    assert!(
-        !sends.by_identity().iter().any(|(_, signo)| *signo == libc::SIGKILL),
-        "{:?}",
-        sends.by_identity()
-    );
-    assert!(
-        crate::test_child::is_unreaped_child(pid),
-        "the zombie launchd holds was waited on"
-    );
+    assert_eq!(root.signal_calls(), vec![Sig::Term], "only the SIGTERM was sent");
+    assert_eq!(root.looks(), 2, "one look at the exit, and the reap's");
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
-    drop(writer);
 }
 
 /// Control for the quiet wait: the public `wait_timeout` still reports a zombie launchd holds.
@@ -344,11 +342,12 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
     drop(writer);
 }
 
-/// The best-effort reap after a failed sweep skips a root launchd holds: it is an exited zombie, so
-/// the root reads as exited, but waiting on it only warns. The root is a real zombie; the sweep and
-/// the reap's own look both read it `Orphaned`.
+/// The best-effort reap after a failed sweep finds a root launchd holds out by asking the reap: it
+/// is an exited zombie, so the root reads as exited, the reap answers `Orphaned`, and nothing warns
+/// or waits. The root is a real zombie; the sweep's look reads it `Orphaned`, and the reap's answer
+/// is stated.
 ///
-/// Mutant: the best-effort reap waits on an `Unpinned` root.
+/// Mutant: the best-effort reap waits on, or warns of, an `Unpinned` root.
 #[skuld::test]
 fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_sweep() {
     crate::log_capture::install();
@@ -359,13 +358,10 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
     crate::test_child::wait_until_zombie(pid);
     graceful_fault::set_force_terminate(graceful_fault::Forced::Containment);
     let mark = crate::log_capture::mark();
-    // The entry's read, the sweep's, the reap's.
+    // The entry's read and the sweep's; the reap's answer.
     let fake = child.proc.script_over(|f| {
-        f.peeks([
-            Ok(PeekOutcome::Running),
-            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        ])
+        f.peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Orphaned))])
+            .reaps([ReapAnswer::Foreign(Foreign::Orphaned)])
     });
 
     let err = child
@@ -383,8 +379,9 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
     drop(writer);
 }
 
-/// A root orphaned after the sweep is not waited on: its status cannot be collected, and the error
-/// says so instead of the wait warning. The zombie is left as it was.
+/// A root orphaned after the sweep is not waited on: the reap answers that launchd holds it, its
+/// status cannot be collected, and the error says so instead of the wait warning. The zombie is left
+/// as it was.
 ///
 /// Mutant: the reap waits on an `Unpinned` root.
 #[skuld::test]
@@ -394,7 +391,7 @@ fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_reap() {
     let pid = child.pid();
     let mark = crate::log_capture::mark();
     let fake = child.proc.script_over(|f| f);
-    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, orphan_next_peek(&fake));
+    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::BeforeReap, orphan_next_reap(&fake));
 
     let err = child
         .graceful_shutdown_tree(Duration::ZERO)

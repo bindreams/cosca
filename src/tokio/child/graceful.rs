@@ -1,5 +1,5 @@
-//! Async `Child` graceful shutdown — the soft-then-hard escalation trio, mirroring the
-//! sync `Child` counterparts.
+//! Async `Child` graceful shutdown: `graceful_shutdown` and `graceful_shutdown_tree` are the sync
+//! `Child`'s cores (`child::graceful::shutdown`), run over this `Child`'s awaited [`Waits`].
 
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -236,7 +236,8 @@ impl Child {
     }
 }
 
-/// The async `Child`'s waits for `graceful_shutdown_tree`: each is awaited, on tokio's clock.
+/// The async `Child`'s waits for `graceful_shutdown` and `graceful_shutdown_tree`: each is awaited, on
+/// tokio's clock.
 impl Waits for Child {
     fn child(&self) -> &crate::Child {
         &self.inner
@@ -254,8 +255,8 @@ impl Waits for Child {
         swept.wait_async().await
     }
 
-    async fn reap(&mut self) -> Result<ExitStatus, Error> {
-        self.wait().await
+    async fn reap(&mut self) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
+        self.reap_outcome().await
     }
 
     #[cfg(unix)]

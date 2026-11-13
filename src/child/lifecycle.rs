@@ -250,16 +250,9 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
 }
 
 /// [`wait_to_exit`] with no threshold, as the status the public blocking waits answer:
-/// `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`.
+/// `Unreaped::wait` and `Child::wait_root` with `None`.
 pub(super) fn wait_for_status(proc: &OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
     unbounded_status(proc.pid(), wait_to_exit(proc, None)?, orphaned)
-}
-
-/// [`wait_for_status`] awaited, through [`OwnedChild::wait_async`], as the async `Child::wait` answers.
-#[cfg(feature = "tokio")]
-pub(super) async fn wait_for_status_async(proc: &mut OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
-    let outcome = proc.wait_async().await?;
-    unbounded_status(proc.pid(), outcome, orphaned)
 }
 
 /// The status an unbounded wait's `outcome` on the child `pid` answers: a deadline that passed is
@@ -290,7 +283,7 @@ pub(super) fn orphaned_note(pid: Option<u32>) -> String {
 }
 
 /// The `ECHILD` every wait answers when the child was reaped by someone else.
-fn echild() -> io::Error {
+pub(crate) fn echild() -> io::Error {
     #[cfg(unix)]
     {
         io::Error::from_raw_os_error(libc::ECHILD)
@@ -329,7 +322,14 @@ impl Child {
     /// runtime and blocks no thread.
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&mut self) -> Result<ExitStatus, Error> {
-        wait_for_status_async(&mut self.proc, Orphaned::Warn).await
+        let outcome = self.proc.wait_async().await?;
+        self.status_of_reap(outcome)
+    }
+
+    /// The status [`wait`](Child::wait) answers for the root's `outcome` ([`reap_outcome`](Child::reap_outcome)): a
+    /// zombie launchd holds is warned of, a root reaped elsewhere is `ECHILD`.
+    pub(crate) fn status_of_reap(&self, outcome: ChildWaitOutcome) -> Result<ExitStatus, Error> {
+        unbounded_status(self.proc.pid(), outcome, Orphaned::Warn)
     }
 
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is

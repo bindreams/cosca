@@ -10,9 +10,12 @@ use std::time::Duration;
 #[cfg(test)]
 use super::fault;
 use super::{take_forced_sweep, take_forced_watch_error, Child, SignalTreeCooperativelyOutcome};
+use crate::child::owned::ChildWaitOutcome;
 use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::TreeDrain;
 use crate::error::Error;
+#[cfg(target_os = "macos")]
+use crate::os_process::child::Foreign;
 
 /// The waits [`shutdown_lone`] and [`shutdown_tree`] make. A deadline is a `Duration` from the wait's start, which each
 /// driver turns into an instant on its own clock.
@@ -31,8 +34,10 @@ pub(crate) trait Waits {
     /// The sweep's answer once every member its kill reached has exited.
     async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure>;
 
-    /// The root's reap. The async driver closes an untaken stdin first, as its `wait` does.
-    async fn reap(&mut self) -> Result<ExitStatus, Error>;
+    /// The root's reap, as the wait ended: the exit record or the foreign verdict, unfolded and with no
+    /// warn ([`status_of_reap`] answers for it). The async driver closes an untaken stdin first, as its
+    /// `wait` does.
+    async fn reap(&mut self) -> Result<ChildWaitOutcome, Error>;
 
     /// The error of a holders-only shutdown, once the holders its kill reached have exited.
     #[cfg(unix)]
@@ -59,8 +64,8 @@ impl Waits for BlockingDriver<'_> {
         swept.wait()
     }
 
-    async fn reap(&mut self) -> Result<ExitStatus, Error> {
-        self.0.wait()
+    async fn reap(&mut self) -> Result<ChildWaitOutcome, Error> {
+        self.0.reap_outcome()
     }
 
     #[cfg(unix)]
@@ -82,6 +87,34 @@ pub(crate) fn run_ready<F: Future>(f: F) -> F::Output {
     }
 }
 
+/// What `op` answers for the root's reap, `outcome`, once its signals went out: the status, or the
+/// reap's failure, or, for a root this process cannot collect, [`Error::Unassessable`] saying so. A
+/// zombie launchd holds is the macOS refusal ([`unpinned_status`](crate::signal::unpinned_status));
+/// a root reaped elsewhere (or whose pid names another process now) is the same, with the `ECHILD`
+/// every wait answers for it as its `source()`. Neither warns: the caller's answer is the report.
+fn status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome, Error>) -> Result<ExitStatus, Error> {
+    use crate::child::lifecycle::{echild, unbounded_status, Orphaned};
+
+    match outcome? {
+        ChildWaitOutcome::Foreign(foreign) => {
+            #[cfg(target_os = "macos")]
+            if foreign == Foreign::Orphaned {
+                return Err(crate::signal::unpinned_status(pid, op));
+            }
+            let _ = foreign;
+            log::debug!("{op}({pid}): the root was reaped elsewhere");
+            Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid}: {op} sent its signals, but its exit status cannot be collected: the root was \
+                     reaped elsewhere"
+                ),
+                source: Some(std::sync::Arc::new(Error::Io(echild()))),
+            })
+        }
+        reaped => unbounded_status(Some(pid), reaped, Orphaned::Quiet),
+    }
+}
+
 /// [`Child::graceful_shutdown`](crate::Child::graceful_shutdown), for any [`Waits`]: the signal, the
 /// grace, the kill unless the root exited, and the reap.
 pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Result<ExitStatus, Error> {
@@ -90,35 +123,23 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     fault::run_hook(fault::HookPoint::AfterTerminate);
 
     let pid = w.child().pid();
-    let call = format!("graceful_shutdown({pid})");
+    let call = || format!("graceful_shutdown({pid})");
     // A watch failure must not strand the child between the soft signal and the escalation: the
     // kill and the reap still run, then the failure surfaces.
     let watch = match take_forced_watch_error() {
         Some(e) => Err(e),
         None => w.root_exited(grace).await,
     };
-    let exited = matches!(watch, Ok(true));
-    let mut watch = watch.err();
-    if !exited {
+    // The escalation is `kill`, with the `SIGTERM` named as already sent.
+    let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
-        // The escalation is `kill`, with the `SIGTERM` named as already sent.
-        w.child()
-            .kill_after(Some("the SIGTERM"))
-            .map_err(|e| crate::graceful::joined(&call, e, watch.take()))?;
-    }
+        w.child().kill_after(Some("the SIGTERM"))
+    })?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);
-    // A zombie launchd holds is not ours to reap: waiting on it only warns.
-    #[cfg(target_os = "macos")]
-    if w.child().root_is_unpinned() {
-        return Err(crate::graceful::joined(
-            &call,
-            crate::signal::unpinned_status(pid, "graceful_shutdown"),
-            watch,
-        ));
-    }
-    crate::graceful::after_reap(&call, w.reap().await, None, watch)
+    let waited = status_of_reap(pid, "graceful_shutdown", w.reap().await);
+    crate::graceful::after_reap(call, waited, None, watch)
 }
 
 /// [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), for any [`Waits`]: the signal,
@@ -150,7 +171,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     fault::run_hook(fault::HookPoint::AfterTerminate);
 
     let pid = w.child().pid();
-    let call = format!("graceful_shutdown_tree({pid})");
+    let call = || format!("graceful_shutdown_tree({pid})");
     // Watch-Err ordering: sweep + reap first, then surface (see `Child::graceful_shutdown`).
     //
     // `drained`: the tree's drain edge proved every member exited (`permits_skipping_sweep`), so the
@@ -189,8 +210,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
             }
         };
         if let Err(sweep) = sweep_result {
-            // A zombie launchd holds is not ours to reap: waiting on it only warns.
-            if (root_exited || sweep.root_ended) && !w.child().root_is_unpinned() {
+            if root_exited || sweep.root_ended {
                 // Best-effort: a dead root must not stay a zombie; `sweep` is the reported error.
                 if let Err(e) = w.reap().await {
                     log::warn!(
@@ -200,7 +220,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
                 }
             }
             return Err(crate::graceful::joined(
-                &call,
+                &call(),
                 sweep.error,
                 term.err().into_iter().chain(watch_err),
             ));
@@ -208,18 +228,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     }
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);
-    #[cfg(target_os = "macos")]
-    if w.child().root_is_unpinned() {
-        return Err(crate::graceful::joined(
-            &call,
-            crate::signal::unpinned_status(pid, "graceful_shutdown_tree"),
-            term.err().into_iter().chain(watch_err),
-        ));
-    }
-    #[cfg(unix)]
-    let waited = super::status_unless_reaped_elsewhere(w.reap().await, pid);
-    #[cfg(not(unix))]
-    let waited = w.reap().await;
+    let waited = status_of_reap(pid, "graceful_shutdown_tree", w.reap().await);
     // The tree is confirmed clear (drained, or the sweep returned Ok), which disproves a `term`
     // refusal: a successful reap discards it; a failed reap keeps it as a peer.
     if let (Ok(_), Err(e)) = (&waited, &term) {
@@ -228,7 +237,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
             report = crate::error::Report(e)
         );
     }
-    crate::graceful::after_reap(&call, waited, term.err(), watch_err)
+    crate::graceful::after_reap(call, waited, term.err(), watch_err)
 }
 
 /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd),

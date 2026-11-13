@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
+use crate::identity::{has_exited, held_by, Held, ReadPurpose};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::{Exit, OsProcess, WaitFor};
 use crate::signal::{via_audit_token, Sent, Sig};
@@ -84,11 +85,48 @@ impl OsProcess for MacChild {
         via_audit_token(self.pid, Some(self.unique), sig).map_err(Error::Io)
     }
 
-    /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it:
-    /// see [`ExitWatch::look`]. The reap ([`try_reap`](OsChild::try_reap)) does not come through
-    /// here: it reads the watch raw and peeks `waitid` itself, so this adds nothing to it.
+    /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it
+    /// ([`ExitWatch::look`]), and also when the watch cannot say: XNU withholds `NOTE_EXIT` from a
+    /// parent that does not hold the child (`p_oppid` set, `kern_event.c` `filt_procevent`), so a
+    /// child whose parent is another process, a tracer or launchd, may be a zombie with its watch
+    /// unfired. Then the zombie read decides: `Exited` for a zombie or gone, `Recheck` for a child
+    /// still running, since no event will come while another process is the parent. A child whose
+    /// parent is this process and whose watch has not fired is `Running` on the watch, with no
+    /// zombie read. A refused read is [`Error::Unassessable`] with its errno as the source.
+    ///
+    /// The reap ([`try_reap`](OsChild::try_reap)) does not come through here: it reads the watch raw
+    /// and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        self.exit.look(self.pid, self.unique)
+        match self.exit.look(self.pid, self.unique)? {
+            Exit::Running(wait_for) => self.exited_past_the_watch(wait_for),
+            look => Ok(look),
+        }
+    }
+}
+
+impl MacChild {
+    /// [`exited`](OsProcess::exited) for a watch that has not fired: `Running` on `wait_for` only
+    /// while this process is the child's parent.
+    fn exited_past_the_watch<'a>(&self, wait_for: WaitFor<'a>) -> Result<Exit<'a>, Error> {
+        let refused = |errno| {
+            crate::os_process::macos::exit_read_refused(
+                self.pid,
+                errno,
+                "its exit watch has not fired, and whether it has exited could not be read",
+            )
+        };
+        let exited = match held_by(self.pid, self.unique, ReadPurpose::Running) {
+            Held::Parent(parent) if parent == std::process::id() => return Ok(Exit::Running(wait_for)),
+            Held::Parent(_) => has_exited(self.pid, self.unique, ReadPurpose::Running).map_err(refused)?,
+            // Another process now, or reaped: exited.
+            Held::Other | Held::Gone => true,
+            Held::Refused(errno) => return Err(refused(errno)),
+        };
+        if !exited {
+            return Ok(Exit::Recheck);
+        }
+        self.exit.confirm();
+        Ok(Exit::Exited)
     }
 }
 
@@ -101,18 +139,6 @@ impl OsChild for MacChild {
     /// read is an error. Touches no kqueue.
     fn peek(&self) -> Result<PeekOutcome, Error> {
         exit_only::peek_verified(&self.target()).map_err(Error::Io)
-    }
-
-    /// XNU withholds `NOTE_EXIT` from a parent that does not trace the child while `p_oppid` is
-    /// set, so a zombie its tracer holds is seen as one (`SZOMB`) on the verified unique id.
-    fn exited_unannounced(&self) -> Result<bool, Error> {
-        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running).map_err(|errno| {
-            crate::os_process::macos::exit_read_refused(
-                self.pid,
-                errno,
-                "its exit watch has not fired, and whether it has exited could not be read",
-            )
-        })
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the

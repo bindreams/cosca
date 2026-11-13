@@ -693,7 +693,7 @@ pub(crate) fn chain<'a>(
 /// The OS code of a failure, for a look whose failure is told apart by it: the first `io::Error`
 /// down `error`'s [`chain`] that has one. `None` when the chain holds none. The one getter of the
 /// code, for any error: an `io_context` error has none of its own, and its cause below it does.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
     chain(error)
         .filter_map(|layer| layer.downcast_ref::<std::io::Error>())

@@ -39,7 +39,9 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it. On macOS
     /// [`Exit::Exited`] means the process is a zombie or gone, not merely that its `NOTE_EXIT` has
-    /// fired; [`ProcessId::is_alive`] never reads `Alive` afterwards.
+    /// fired; [`ProcessId::is_alive`] never reads `Alive` afterwards. A child another process holds
+    /// (its tracer, or launchd) gets no `NOTE_EXIT` until it is handed back, so its look reads the zombie
+    /// itself.
     fn exited(&self) -> Result<Exit<'_>, Error>;
 
     /// The OS object that names the process, lent to platform-only consumers (Job Objects, resume,
@@ -54,8 +56,9 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
 pub(crate) enum Exit<'a> {
     Exited,
     Running(WaitFor<'a>),
-    /// macOS: the exit edge has fired, but the process is not yet a zombie (or gone), and nothing
-    /// will signal the change: look again after a backoff. A look that only asks whether it runs
+    /// macOS: the exit edge has fired but the process is not yet a zombie (or gone), or no edge will
+    /// come (another process holds the child), and nothing will signal the change: look again after a
+    /// backoff. A look that only asks whether it runs
     /// reads this as running.
     #[cfg_attr(
         not(target_os = "macos"),

@@ -155,17 +155,19 @@ impl Child {
     /// only through a cgroup that holds it. Outside one it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     ///
-    /// The grace watch reaps nothing: a root that exited within it, even one whose zombie a tracer
-    /// holds or whose reap another process took, is not escalated against, and the reap that
-    /// follows answers for it, with the status or its own failure (a root reaped elsewhere is an
-    /// [`Error::Io`](crate::error::Error::Io) with `ECHILD`).
+    /// The grace watch reaps nothing: a root that exited within it, even one whose zombie a tracer or
+    /// launchd holds or whose reap another process took, is not escalated against, and the reap that
+    /// follows answers for it. A zombie a tracer holds is waited on until the tracer hands it back,
+    /// and then the reap returns its status. A root reaped elsewhere has no exit status to collect:
+    /// the call returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying so, with
+    /// the `ECHILD` as its `source()` and no warn, as
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) does.
     ///
     /// **macOS, a root launchd holds** is refused by the cooperative half, as for
     /// [`kill`](Child::kill). A root launchd comes to hold during the call is not killed or waited
-    /// on, and nothing warns. If its exit was seen, the call returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying its exit status cannot be
-    /// collected. If it was orphaned after the grace ran out, the escalation returns `Unassessable`
-    /// saying the kill sent nothing though the `SIGTERM` was sent.
+    /// on, and nothing warns. If its exit was seen, the call returns `Unassessable` saying its exit
+    /// status cannot be collected. If it was orphaned after the grace ran out, the escalation returns
+    /// `Unassessable` saying the kill sent nothing though the `SIGTERM` was sent.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         shutdown::run_ready(shutdown::shutdown_lone(&mut shutdown::BlockingDriver(self), grace))
     }
@@ -501,31 +503,6 @@ impl PidfdShutdown {
             (_, Some(Err(kill))) => kill.with_peers_or_unassessable(|| detail, cause, watch),
             _ => Error::Unassessable { detail, source: cause }.with_peers(watch),
         }
-    }
-}
-
-/// `graceful_shutdown_tree`'s answer (sync and async) from the root's reap, `waited`, once the tree is
-/// down. A root reaped elsewhere (`ECHILD`) leaves no exit status for this handle: that is
-/// `Unassessable`, saying the tree is down, as for a root launchd holds. Only an [`Error::Io`] says it, bare
-/// or under a context or a note: an `ECHILD` deep in the chain of any other variant is that variant's
-/// own cause. Any other answer stands.
-#[cfg(unix)]
-pub(crate) fn status_unless_reaped_elsewhere(
-    waited: Result<ExitStatus, Error>,
-    pid: crate::identity::RawPid,
-) -> Result<ExitStatus, Error> {
-    match waited {
-        Err(e @ Error::Io(_)) if crate::error::first_os_code(&e) == Some(libc::ECHILD) => {
-            log::debug!("graceful_shutdown_tree({pid}): the tree is down, and the root was reaped elsewhere");
-            Err(Error::Unassessable {
-                detail: format!(
-                    "pid {pid}: graceful_shutdown_tree brought the tree down, but its exit status cannot be \
-                     collected: the root was reaped elsewhere"
-                ),
-                source: Some(std::sync::Arc::new(e)),
-            })
-        }
-        other => other,
     }
 }
 

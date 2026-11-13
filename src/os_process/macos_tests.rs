@@ -285,11 +285,13 @@ fn a_fired_watch_on_a_child_is_exited_only_once_it_is_a_zombie() {
     child.wait().unwrap();
 }
 
-/// A look at a watch that has not fired reads nothing about the process, for either type. The
-/// confirming read is forced refused: a look that reads before it asks the watch is an error for a
-/// process that runs.
+/// A look at a watch that has not fired reads no state of the process: a process's reads nothing, and a
+/// child's, whose parent is this process, reads only that parent, never whether it is a zombie. The
+/// confirming read is forced refused: a look that makes it before it asks the watch is an error for
+/// a process that runs.
 ///
-/// Mutant: `ExitWatch::look` reads the process's state before it asks the watch.
+/// Mutant: `ExitWatch::look` reads the process's state before it asks the watch; `MacChild::exited`
+/// reads whether the child is a zombie while this process is its parent.
 #[skuld::test]
 fn a_look_at_an_unfired_watch_reads_nothing() {
     use crate::identity::uniq_fault::force_uniq_read_once;
@@ -302,13 +304,20 @@ fn a_look_at_an_unfired_watch_reads_nothing() {
     let p = MacProcess::open(id).unwrap().expect("a live process opens");
     let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
     let _refused = force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
+    let reads = crate::identity::uniq_fault::record();
     assert!(
         matches!(p.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running process is Running"
     );
+    assert_eq!(reads.purposes(), vec![], "a process's unfired watch reads nothing");
     assert!(
         matches!(mac.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running child is Running"
+    );
+    assert_eq!(
+        reads.purposes(),
+        vec![ReadPurpose::Running, ReadPurpose::Running],
+        "a child's unfired watch reads its parent (two unique-id reads) and nothing else"
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -487,8 +496,8 @@ fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
 }
 
 /// A refused `has_exited` read is `Unassessable` with the errno as its source, and the message
-/// does not word it as an "errno". Both readers of it (`ExitWatch::look` and
-/// `MacChild::exited_unannounced`) build it with this function, each with its own situation text.
+/// does not word it as an "errno". Both readers of it (`ExitWatch::look` and `MacChild::exited` past
+/// an unfired watch) build it with this function, each with its own situation text.
 #[skuld::test]
 fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_words_none() {
     for (situation, said) in [
@@ -511,36 +520,112 @@ fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_wo
     }
 }
 
-/// A refused read of `exited_unannounced`, on a plain `MacChild::new`, is `Unassessable` with the
-/// errno as its source and says its watch has not fired.
+/// A refused read of a child's look whose watch has not fired, of its parent or of whether it is a
+/// zombie, is `Unassessable` with the errno as its source, and says its watch has not fired. The
+/// child's parent reads launchd, so the second read is reached.
 ///
-/// Mutant: `MacChild::exited_unannounced` wraps the errno as `Error::Io`, or words another situation.
+/// Mutant: `MacChild::exited` wraps the errno as `Error::Io`, words another situation, or answers
+/// `Running` for a read it could not make.
 #[skuld::test]
-fn a_refused_unannounced_read_is_unassessable_with_the_errno() {
+fn a_refused_read_past_an_unfired_watch_is_unassessable_with_the_errno() {
     use crate::identity::uniq_fault::force_uniq_read_once;
-    use crate::os_process::child::OsChild;
+    use crate::identity::{ppid_fault, LAUNCHD};
     use crate::os_process::macos::child::MacChild;
 
-    let (mut child, id) = blocker();
-    let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
-        panic!("the blocker's unique id must be readable");
-    };
-    let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
-    let _refused = force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
-    let err = mac.exited_unannounced().expect_err("a refused read is an error");
-    let Error::Unassessable { detail, .. } = &err else {
-        panic!("{err:?}");
-    };
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
-    assert_eq!(
-        detail,
-        &format!(
-            "pid {}: its exit watch has not fired, and whether it has exited could not be read",
-            id.pid()
-        )
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    for zombie_read in [false, true] {
+        let (mut child, id) = blocker();
+        let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
+            panic!("the blocker's unique id must be readable");
+        };
+        let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
+        let _parent = ppid_fault::force_ppid_with(|| Ok(LAUNCHD));
+        // The parent read is two unique-id reads and the zombie read two more: the third is the
+        // zombie read's first.
+        let mut forced = Vec::new();
+        if zombie_read {
+            forced.push(force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(read)));
+            forced.push(force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(read)));
+        }
+        forced.push(force_uniq_read_once(
+            ReadPurpose::Running,
+            UniqRead::Refused(libc::EPERM),
+        ));
+        let err = mac.exited().expect_err("a refused read is an error");
+        let Error::Unassessable { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+        assert_eq!(
+            detail,
+            &format!(
+                "pid {}: its exit watch has not fired, and whether it has exited could not be read",
+                id.pid()
+            ),
+            "zombie read: {zombie_read}"
+        );
+        drop(forced);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// A child whose parent is another process (its tracer, or launchd) gets no `NOTE_EXIT` from XNU, so
+/// its unfired watch cannot say it is running: while the process is no zombie, the look is
+/// `Recheck`, which the driver paces. This process's own pid stands in for the child, and its parent
+/// read is forced.
+///
+/// Mutant: an unfired watch on a child another process holds is `Running`, so a wait on it blocks
+/// for an event that never comes.
+#[skuld::test]
+fn an_unfired_watch_on_a_running_child_another_process_holds_is_a_recheck() {
+    use crate::identity::{ppid_fault, LAUNCHD};
+    use crate::os_process::macos::child::MacChild;
+    use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, held_by_a_tracer_pid};
+
+    let (pid, unique) = echild_yet_resolvable();
+    let mac = MacChild::new(pid, unique).expect("watch the stand-in");
+    for parent in [LAUNCHD, held_by_a_tracer_pid()] {
+        let _parent = ppid_fault::force_ppid_with(move || Ok(parent));
+        assert!(
+            matches!(mac.exited(), Ok(Exit::Recheck)),
+            "held by pid {parent}, the child is no zombie and its watch cannot fire"
+        );
+    }
+}
+
+/// A child whose pid names another process now, or none, has been reaped: exited, with its watch
+/// unfired. The look remembers it, so later looks read nothing. The read of the pid is forced, once
+/// each way.
+///
+/// Mutant: a reaped child is `Recheck` or `Running`; or the confirmation is not remembered.
+#[skuld::test]
+fn a_child_that_was_reaped_is_exited_with_its_watch_unfired_and_remembered() {
+    use crate::identity::uniq_fault::{force_uniq_read_once, record};
+    use crate::identity::UniqInfo;
+    use crate::os_process::macos::child::MacChild;
+
+    for reaped in ["gone", "another process"] {
+        let (mut child, id) = blocker();
+        let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
+            panic!("the blocker's unique id must be readable");
+        };
+        let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
+        let answer = match reaped {
+            "gone" => UniqRead::Gone,
+            _ => UniqRead::Found(UniqInfo {
+                unique_id: read.unique_id ^ 1,
+                ..read
+            }),
+        };
+        let forced = force_uniq_read_once(ReadPurpose::Running, answer);
+        assert!(matches!(mac.exited(), Ok(Exit::Exited)), "{reaped}");
+        drop(forced);
+        let reads = record();
+        assert!(matches!(mac.exited(), Ok(Exit::Exited)), "{reaped}");
+        assert_eq!(reads.purposes(), vec![], "a confirmed exit is not read again: {reaped}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 /// Once a look has confirmed the exit, later looks make no `Exit` read. The watch is armed on a live

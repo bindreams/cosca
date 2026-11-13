@@ -131,6 +131,69 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
     });
 }
 
+/// A tracee whose tracer holds its zombie has exited for the grace watch, though XNU sends its
+/// `NOTE_EXIT` to the tracer alone: the look reads the zombie itself, so the watch ends with the
+/// tracer still holding it. While the tracee runs, the held look is a `Recheck`, so it reads as
+/// running at an expired deadline.
+///
+/// Mutant: `exited_by` waits on the exit watch alone, which fires only at the hand-back: the
+/// unbounded watch below never returns.
+#[skuld::test]
+fn a_zombie_a_tracer_holds_has_exited_for_the_grace_watch_before_the_hand_back(
+    #[fixture(tracer_group)] _group: &Group,
+) {
+    let (tracee, stdin) = held();
+    let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+    assert_eq!(helper.recv(), Report::Attached);
+    assert!(
+        !tracee.proc.exited_by(Some(Instant::now())).expect("a held live root"),
+        "a held root that runs has not exited"
+    );
+    drop(stdin);
+    assert_eq!(helper.recv(), Report::Exited);
+    assert!(
+        tracee.proc.exited_by(None).expect("a held zombie"),
+        "the held zombie has exited"
+    );
+    assert_eq!(
+        tracee.try_wait().expect("try_wait"),
+        None,
+        "a held zombie is not ours yet"
+    );
+    helper.signal();
+    assert_eq!(helper.recv(), Report::Reaped);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A zombie that launchd holds has exited for the grace watch, with a long grace unspent. The tracer's
+/// hold is the real state, and its parent read is forced to launchd, as when the tracer died while the
+/// tracee was exiting.
+///
+/// Mutant: the look reads past the exit watch only for a parent that is a tracer, not for launchd.
+#[skuld::test]
+fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(tracer_group)] _group: &Group) {
+    use crate::identity::{ppid_fault, LAUNCHD};
+
+    let (tracee, stdin) = held();
+    let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+    assert_eq!(helper.recv(), Report::Attached);
+    drop(stdin);
+    assert_eq!(helper.recv(), Report::Exited);
+    {
+        let _launchd = ppid_fault::force_ppid_with(|| Ok(LAUNCHD));
+        let long = Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(
+            tracee.proc.exited_by(Some(long)).expect("a zombie launchd holds"),
+            "the zombie has exited: no grace is spent on it"
+        );
+    }
+    helper.signal();
+    assert_eq!(helper.recv(), Report::Reaped);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
 /// The live blocker [`tracer::spawn_tracee`] makes, its stdin (closing it ends the tracee), and its
 /// unique id.
 fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
