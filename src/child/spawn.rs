@@ -3136,8 +3136,7 @@ pub(crate) mod fault {
     /// A stdin for a child only a kill ends, its writer released as [`release_between_kill_and_wait`]
     /// does. Keep the guard alive through the assertion: dropping it clears the hook and recorder.
     ///
-    /// The child must exit 0 on stdin EOF: `cat` on Unix, `more.com` on Windows (whose `findstr x`
-    /// exits 1, which is what a kill reports) with a null stdout, because `more` echoes. Use
+    /// The child is a `BLOCKER_ARGV` one, with a null stdout on Windows, because `more` echoes. Use
     /// [`teardown_blocker_parts`] to get the whole child.
     pub(crate) fn teardown_blocker_stdin() -> (crate::stdio::Stdio, TeardownBlocker) {
         let (reader, writer) = std::io::pipe().expect("pipe");
@@ -3237,15 +3236,13 @@ pub(crate) mod fault {
     /// The argv and stdio of a [`teardown_blocker_stdin`] child, for the sync and async `Command`.
     pub(crate) fn teardown_blocker_parts() -> TeardownBlockerParts {
         let (stdin, guard) = teardown_blocker_stdin();
+        // `more` echoes, so its stdout is nulled.
         #[cfg(unix)]
-        let (argv, stdout) = (crate::test_child::BLOCKER_ARGV.iter().map(Into::into).collect(), None);
+        let stdout = None;
         #[cfg(windows)]
-        let (argv, stdout) = (
-            vec![crate::test_child::windows_more().into_os_string()],
-            Some(crate::stdio::Stdio::null()),
-        );
+        let stdout = Some(crate::stdio::Stdio::null());
         TeardownBlockerParts {
-            argv,
+            argv: crate::test_child::BLOCKER_ARGV.iter().map(Into::into).collect(),
             stdin,
             stdout,
             guard,

@@ -280,14 +280,10 @@ fn std_child_consecutive_frozen_waits_never_return_early() {
 #[skuld::test]
 fn drop_kills_and_reaps_the_child() {
     let mut cmd = crate::test_child::command(Console::Hidden);
-    #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     // `more` echoes, so its stdout is nulled.
     #[cfg(windows)]
-    {
-        cmd.args([crate::test_child::windows_more()]);
-        cmd.stdout(crate::Stdio::null()).expect("set stdout null");
-    }
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     cmd.stdin(stdin).expect("set stdin");
     let teardown = crate::child::spawn::fault::release_at_drop_kill(writer);

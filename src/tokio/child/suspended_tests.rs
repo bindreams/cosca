@@ -79,11 +79,10 @@ mod on_windows {
     /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
     /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> Command {
-        let more = crate::test_child::windows_more();
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        cmd.args([&more]);
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
-            cmd.executable(&more);
+            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");

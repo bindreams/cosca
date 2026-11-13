@@ -172,8 +172,8 @@ fn a_refused_inode_read_is_io_not_unsupported() {
 /// A live child opens on its inode; once reaped the id opens to nothing.
 #[skuld::test]
 fn a_real_child_opens_by_its_inode_and_is_none_once_reaped(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let mut child =
-        crate::test_spawn::spawn(&mut crate::test_child::held_std_killable_blocker()).expect("spawn the child");
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the child");
     let pid = child.id();
     let pidfd = HostKernel
         .pidfd_open(

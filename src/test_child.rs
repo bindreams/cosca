@@ -96,11 +96,11 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
-/// `more.com` on Windows, which exits 0 on EOF where a kill gives 1: `findstr x` exits 1 on EOF
-/// with no match, so a released one would read as a kill to [`assert_killed`]. Every fixture that
-/// needs a child "still alive at some later check" uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the child on
-/// its own and let a mutant that skips the kill under test pass for the wrong reason. Stdin is
-/// what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
+/// `more.com` by its `System32` path on Windows. It exits 0 on EOF, and a kill never gives it 0, so
+/// [`assert_killed`] tells the two apart. Every fixture that needs a child "still alive at some
+/// later check" uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the
+/// child on its own and let a mutant that skips the kill under test pass for the wrong reason.
+/// Stdin is what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
 ///
 /// - [`leaked_writer_stdin`]: the write end is never closed, so only a kill by the code under
 ///   test ends the child (teardown tests that own no handle on it).
@@ -116,7 +116,21 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 /// Neither `cat` nor `more.com` is proof of life by itself: `Existence::Present` is
 /// zombie-inclusive, and `SIGKILL`/`TerminateProcess` land asynchronously. A liveness claim needs
 /// an echo round trip through a piped stdout, or (Windows) a clean exit after a closed stdin.
-pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["more.com"] } else { &["cat"] };
+pub(crate) static BLOCKER_ARGV: std::sync::LazyLock<&'static [&'static str]> = std::sync::LazyLock::new(|| {
+    #[cfg(windows)]
+    {
+        let more: &'static str = Box::leak(
+            windows_more()
+                .into_os_string()
+                .into_string()
+                .expect("a UTF-8 System32 path")
+                .into_boxed_str(),
+        );
+        Box::leak(Box::new([more]))
+    }
+    #[cfg(not(windows))]
+    &["cat"]
+});
 
 /// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
 /// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
@@ -231,12 +245,6 @@ pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Com
         .stdin(std::process::Stdio::piped())
         .stdout(stdout);
     cmd
-}
-
-/// [`held_std_blocker`] with a null stdout, for a test that tells a kill from the child's own exit
-/// by its status (see [`assert_killed`]).
-pub(crate) fn held_std_killable_blocker() -> std::process::Command {
-    held_std_blocker(std::process::Stdio::null())
 }
 
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
@@ -514,7 +522,7 @@ fn held_blocker(
 }
 
 /// Async twin of [`held_contained_blocker`].
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub(crate) async fn held_contained_blocker_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
@@ -1564,35 +1572,11 @@ pub(crate) fn system32(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// `more.com` by its `System32` path: blocks reading stdin and exits 0 on EOF, as
-/// [`BLOCKER_ARGV`] does, for a test that needs the path and not the name.
+/// `more.com` by its `System32` path, the Windows [`BLOCKER_ARGV`]. A test that needs `more.com`
+/// itself (its image name or its path in a command line) takes this; any other takes the blocker.
 #[cfg(windows)]
 pub(crate) fn windows_more() -> std::path::PathBuf {
     system32("more.com")
-}
-
-/// [`held_contained_blocker_on_console`] with a null stdout (`more` echoes), for a test of the
-/// graceful signals.
-#[cfg(windows)]
-pub(crate) fn windows_blocker_on_console() -> (crate::Child, crate::PipeWriter) {
-    held_contained_blocker_on_console(crate::Stdio::null())
-}
-
-/// [`held_blocker_async`] with a null stdout (`more` echoes); `configure` selects the containment
-/// under test.
-#[cfg(all(windows, feature = "tokio"))]
-pub(crate) async fn windows_blocker_async(
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(crate::Stdio::null(), Console::Hidden, configure).await
-}
-
-/// [`windows_blocker_async`] on this process's console, for a test of the graceful signals.
-#[cfg(all(windows, feature = "tokio"))]
-pub(crate) async fn windows_blocker_on_console_async(
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(crate::Stdio::null(), Console::Asked, configure).await
 }
 
 /// The argv of a child that ignores `SIGTERM` (an ignored disposition survives the `exec`), tells
@@ -1681,8 +1665,7 @@ pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate
 
 /// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, the
 /// kill's exit code `1` on Windows, so a crash on the release fails too. A Windows child that
-/// itself exits `1` on EOF (`findstr x`) cannot be told from a kill, so it is no blocker for this:
-/// [`BLOCKER_ARGV`] is `more.com`, which exits 0.
+/// itself exits `1` on EOF cannot be told from a kill, so it is no blocker for this.
 /// Separate compilation units cannot share it: `tests/common` keeps its own copy.
 pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]

@@ -61,7 +61,7 @@ async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate:
         assert!(status.success(), "the blocker must exit 0 on EOF, got {status:?}");
         assert!(
             output.windows(1).any(|w| w == b"x"),
-            "the blocker's stdout must contain the echoed match, got {output:?}"
+            "the blocker's stdout must contain the echoed line, got {output:?}"
         );
     }
 }
@@ -185,7 +185,7 @@ async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace()
     }
     #[cfg(windows)]
     {
-        cmd.executable(crate::test_child::windows_more()).args(["more"]);
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         cmd.stdout(crate::Stdio::null()).expect("null stdout");
     }
     cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
@@ -1168,7 +1168,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_waited() {
     const GRACE: Duration = Duration::from_secs(30);
-    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|cmd| {
+    let (mut child, stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Asked, |cmd| {
         cmd.contain_with(crate::ContainMode::TreeWalk);
     })
     .await;
@@ -1202,7 +1202,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
 #[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
-    let (mut child, stdin) = crate::test_child::windows_blocker_on_console_async(|_| {}).await;
+    let (mut child, stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Asked, |_| {}).await;
     assert_eq!(
         child.graceful_mechanism(),
         crate::graceful::GracefulMechanism::None,
