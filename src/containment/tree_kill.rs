@@ -44,12 +44,10 @@ pub(crate) struct KillWait<'a> {
 
 /// A member a kill's send reached but whose identity could not be had (or a listing that failed
 /// whole), so its exit cannot be observed. `why` says so; `pid` names the member where the listing
-/// had one, so a later wait that meets the same member does not report it again ([`Settled`]). Only
-/// a Job's edge reads the pid, so it is kept on Windows, and on Linux in tests.
+/// had one, so a later wait that meets the same member does not report it again ([`Settled`]).
 #[derive(Debug)]
 pub(crate) struct Unnamed {
-    #[cfg(any(windows, all(test, target_os = "linux")))]
-    pid: Option<u32>,
+    pub(crate) pid: Option<u32>,
     why: Error,
 }
 
@@ -58,7 +56,6 @@ impl Unnamed {
     #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn member(pid: u32, cause: Error) -> Unnamed {
         Unnamed {
-            #[cfg(any(windows, all(test, target_os = "linux")))]
             pid: Some(pid),
             why: exit_unobserved(pid, cause),
         }
@@ -67,17 +64,7 @@ impl Unnamed {
     /// A member, or a listing, with no pid to name: `why` is the whole error.
     #[cfg(any(target_os = "linux", windows, test))]
     pub(crate) fn nameless(why: Error) -> Unnamed {
-        Unnamed {
-            #[cfg(any(windows, all(test, target_os = "linux")))]
-            pid: None,
-            why,
-        }
-    }
-
-    /// The pid of the member, for a row that states which one the listing named.
-    #[cfg(all(test, any(windows, target_os = "linux")))]
-    pub(crate) fn pid(&self) -> Option<u32> {
-        self.pid
+        Unnamed { pid: None, why }
     }
 
     /// The error saying the member's exit cannot be observed, for a row that states its words.
@@ -88,22 +75,27 @@ impl Unnamed {
 }
 
 /// What a kill's wait has settled when it waits on the tree's edge, which neither waits for nor reports
-/// it again. Only a Job's edge reads it, so it is kept on Windows alone.
+/// it again. Only a Job's edge reads it.
 ///
 /// A snapshot entry with a readable identity is settled iff that identity is one of the `members`,
 /// each of which the wait saw exit or reported (the root too, when its handle reads an identity). An
 /// entry whose identity cannot be read is settled iff its pid is one of the `reported`: the pid of a
-/// member or the root whose wait failed, or of one the listing could not name. The pid of a member whose exit was seen is never matched: an exited process is not
-/// in a snapshot, so that pid names another process.
+/// member or the root whose wait failed, or of one the listing could not name. The pid of a member whose
+/// exit was seen is never matched: it names another process now.
 #[derive(Default)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Job's edge reads what a wait settled")
+)]
 pub(crate) struct Settled {
-    #[cfg(windows)]
     members: Vec<ProcessId>,
-    #[cfg(windows)]
     reported: Vec<u32>,
 }
 
-#[cfg(windows)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Job's edge reads what a wait settled")
+)]
 impl Settled {
     pub(crate) fn new(members: Vec<ProcessId>, reported: Vec<u32>) -> Settled {
         Settled { members, reported }
@@ -263,24 +255,17 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        #[cfg_attr(
-            not(windows),
-            allow(unused_mut, reason = "only a Job's edge reads the root's settlement")
-        )]
         let mut members: Vec<ProcessId> = once_each(members).collect();
-        #[cfg(windows)]
         let mut reported = reported_pids(&unnamed);
         let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
         for &id in &members {
             if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
-                #[cfg(windows)]
                 reported.push(id.pid());
                 unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
         if let RootEnd::Waited(root) = root {
             let waited = wait_for_exit(root);
-            #[cfg(windows)]
             settle_root(root, waited.is_err(), &mut members, &mut reported);
             if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
@@ -288,10 +273,7 @@ impl<'a> KillWait<'a> {
         }
         if let Some(edge) = edge {
             // Every member reached is settled: it exited or was reported above, once.
-            #[cfg(windows)]
             let settled = Settled::new(members, reported);
-            #[cfg(not(windows))]
-            let settled = Settled::default();
             if let Err(why) = edge.wait_past(None, &settled).and_then(drained) {
                 unobserved.push(why);
             }
@@ -311,34 +293,24 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        #[cfg_attr(
-            not(windows),
-            allow(unused_mut, reason = "only a Job's edge reads the root's settlement")
-        )]
         let mut members: Vec<ProcessId> = once_each(members).collect();
-        #[cfg(windows)]
         let mut reported = reported_pids(&unnamed);
         let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
         for &id in &members {
             if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
-                #[cfg(windows)]
                 reported.push(id.pid());
                 unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
         if let RootEnd::Waited(root) = root {
             let waited = wait_for_exit_async(root).await;
-            #[cfg(windows)]
             settle_root(root, waited.is_err(), &mut members, &mut reported);
             if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
         }
         if let Some(edge) = edge {
-            #[cfg(windows)]
             let settled = Settled::new(members, reported);
-            #[cfg(not(windows))]
-            let settled = Settled::default();
             if let Err(why) = edge.wait_async_past(None, &settled).await.and_then(drained) {
                 unobserved.push(why);
             }
@@ -347,9 +319,7 @@ impl<'a> KillWait<'a> {
     }
 }
 
-/// The pids of the members a listing could not name: the first of a wait's `reported`
-/// ([`Settled`]), on Windows alone, where an edge reads them.
-#[cfg(windows)]
+/// The pids of the members a listing could not name: the first of a wait's `reported` ([`Settled`]).
 fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
     unnamed.iter().filter_map(|unnamed| unnamed.pid).collect()
 }
@@ -357,22 +327,43 @@ fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
 /// Settle the root, once its wait ended: its identity, if its handle can read one, is a settled member
 /// (it is matched by identity alone, never by its pid), and its pid is `reported` when the wait `failed`,
 /// so a snapshot entry for the root whose identity cannot be read is not named again. A handle that
-/// names no process (a fake's) settles nothing.
+/// names no process (a fake's) settles nothing, quietly. A real root whose pid or identity cannot be
+/// read is logged at `warn`: what it would have settled is lost, so a snapshot entry for it can be
+/// walked and named a second time. Only a Job's edge reads the settlement.
 #[cfg(windows)]
 fn settle_root(root: &dyn OsProcess, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
     use std::os::windows::io::AsRawHandle as _;
 
+    use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
+
     let raw = windows::Win32::Foundation::HANDLE(root.os_handle().as_raw_handle());
-    let Ok(pid) = crate::containment::windows::process_pid_of(raw) else {
-        return;
+    let pid = match crate::containment::windows::process_pid_of(raw) {
+        Ok(pid) => pid,
+        Err(e) if crate::error::first_os_code(&e) == Some(ERROR_INVALID_HANDLE.0 as i32) => return,
+        Err(e) => {
+            log::warn!(
+                "the root's pid cannot be read, so the drain's snapshot may name the root again: {report}",
+                report = crate::error::Report(&e)
+            );
+            return;
+        }
     };
     if failed {
         reported.push(pid);
     }
-    if let Ok(id) = crate::identity::windows_identity_from_handle_result(raw, pid) {
-        members.push(id);
+    match crate::identity::windows_identity_from_handle_result(raw, pid) {
+        Ok(id) => members.push(id),
+        Err(e) => log::warn!(
+            "the identity of the root, pid {pid}, cannot be read, so the drain's snapshot may name it again: \
+             {report}",
+            report = crate::error::Report(&e)
+        ),
     }
 }
+
+/// Only a Job's edge reads the root's settlement ([`Settled`]).
+#[cfg(not(windows))]
+fn settle_root(_root: &dyn OsProcess, _failed: bool, _members: &mut Vec<ProcessId>, _reported: &mut Vec<u32>) {}
 
 /// `members`, each one once, in the order they were reached.
 fn once_each(members: Vec<ProcessId>) -> impl Iterator<Item = ProcessId> {

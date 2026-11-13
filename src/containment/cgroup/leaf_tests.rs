@@ -787,7 +787,7 @@ fn a_member_whose_place_cannot_be_checked_after_the_kill_is_an_unobserved_error(
         "the error names the member and what is left undone: {report}"
     );
     assert_eq!(
-        unobserved[0].pid(),
+        unobserved[0].pid,
         Some(unplaced_id.pid()),
         "the member's pid is carried with the error: {unobserved:?}"
     );

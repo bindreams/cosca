@@ -34,9 +34,11 @@ impl DrainEdge<'_> {
     /// exited or failed in a way it reported. Only a Job's edge, which confirms an empty listing from a
     /// system snapshot of its members, has anything to skip: it neither waits for them nor reports them
     /// again.
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "only a Job's edge reads what a wait settled")
+    )]
     pub(crate) fn wait_past(&self, deadline: Option<Instant>, settled: &Settled) -> Result<TreeDrain, Error> {
-        #[cfg(not(windows))]
-        let _ = settled;
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => leaf.wait_drained(deadline),
@@ -59,13 +61,15 @@ impl DrainEdge<'_> {
 
     /// [`wait_past`](Self::wait_past), awaited.
     #[cfg(feature = "tokio")]
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "only a Job's edge reads what a wait settled")
+    )]
     pub(crate) async fn wait_async_past(
         &self,
         deadline: Option<Instant>,
         settled: &Settled,
     ) -> Result<TreeDrain, Error> {
-        #[cfg(not(windows))]
-        let _ = settled;
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => cgroup_wait_tree_drained(leaf, deadline).await,
@@ -312,9 +316,20 @@ async fn snapshot_members_on_pool(
     })
     .await
     .map_err(|unjoined| {
-        let (crate::tokio::wait::Unjoined::NotRun(cause) | crate::tokio::wait::Unjoined::Unknown(cause)) = unjoined;
+        use crate::tokio::wait::Unjoined;
+
+        let (detail, cause) = match unjoined {
+            Unjoined::NotRun(cause) => (
+                "the snapshot of the job's members did not run, so their exit cannot be observed",
+                cause,
+            ),
+            Unjoined::Unknown(cause) => (
+                "nothing can be said of what the snapshot of the job's members did, so their exit cannot be observed",
+                cause,
+            ),
+        };
         Error::Unassessable {
-            detail: "the snapshot of the job's members did not run, so their exit cannot be observed".to_owned(),
+            detail: detail.to_owned(),
             source: Some(std::sync::Arc::new(cause)),
         }
     })?
@@ -330,14 +345,11 @@ async fn snapshot_members_on_pool(
 ///
 /// An empty listing is confirmed from a system snapshot, as the sync wait's `confirm_drained` does:
 /// each job member it names, except those `settled`, is awaited in turn through the by-identity wait
-/// a kill's wait uses. It is the sync wait's own [`ConfirmWalk`]; the two differ only in how a member
-/// is waited for.
+/// a kill's wait uses.
 ///
 /// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
 /// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
-/// runs on the blocking pool ([`snapshot_members_on_pool`]). Every round reaches an
-/// await, so a future that is dropped between rounds is not starved by rounds that find every
-/// member gone.
+/// runs on the blocking pool ([`snapshot_members_on_pool`]).
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
@@ -361,9 +373,7 @@ async fn job_wait_tree_drained(
                 } else {
                     match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
                         Woke::Signalled => Ended::Signalled,
-                        // The deadline passed first. One look at the handles, as the sync wait's
-                        // zero-ms wait is: a member that exited as it passed is seen, and the last
-                        // round lists.
+                        // The deadline passed first: one look at the handles, as the sync wait takes.
                         Woke::TimedOut => watch.poll()?,
                     }
                 };
@@ -376,8 +386,6 @@ async fn job_wait_tree_drained(
         };
         match round {
             Round::Answer(drain) => return Ok(drain),
-            // The sync wait's `confirm_drained`: the same walk, each member awaited through the same
-            // by-identity wait a kill's wait uses.
             Round::Confirm => {
                 let Some(count) = job.count_to_confirm()? else {
                     return Ok(TreeDrain::AllMembersExited);

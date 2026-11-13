@@ -24,8 +24,7 @@ fn wait_drained_after_hard_kill_reports_the_drain() {
 }
 
 /// Against the real OS, with no forced listing: once `wait_drained` answers `AllMembersExited` after
-/// the job's kill, every member the job held (each opened before the kill) is signalled. The job's
-/// list empties before the members are signalled, so a drain answering off the list alone is early.
+/// the job's kill, every member the job held (each opened before the kill) is signalled.
 ///
 /// Mutant: an empty listing answers `AllMembersExited` without the snapshot's members.
 #[skuld::test]
@@ -354,8 +353,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listin
     drop(forced);
 }
 
-/// An empty FIRST listing is no answer: the list is empty on its first read after a kill whether or
-/// not the members have exited, so the drain looks for the job's members in a system snapshot. The
+/// An empty first listing is no answer: the drain looks for the job's members in a system snapshot. The
 /// member is alive, in the job, when the listing (forced) comes back empty; at an elapsed deadline
 /// the drain polls it and answers `MembersRemain`.
 ///
@@ -596,7 +594,7 @@ fn a_listed_pid_whose_membership_cannot_be_established_is_unobserved_with_its_pi
     let_member_exit(child);
     assert!(members.iter().all(|id| id.pid() != pid), "{members:?}");
     assert_eq!(
-        unobserved.iter().filter(|unnamed| unnamed.pid() == Some(pid)).count(),
+        unobserved.iter().filter(|unnamed| unnamed.pid == Some(pid)).count(),
         1,
         "{unobserved:?}"
     );
@@ -813,6 +811,42 @@ fn wait_drained_raw_names_a_member_it_may_not_wait_on_when_the_listing_is_empty(
     let verdict = super::wait_drained_raw(&job, None);
 
     drop(forced);
+    let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
+            if detail.contains(&member.pid().to_string())),
+        "{error:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(error.source().expect("the OS error is the cause")),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{error:?}"
+    );
+}
+
+/// [`wait_drained_raw_names_a_member_it_may_not_wait_on_when_the_listing_is_empty`] for a member the
+/// job still LISTS: the round's open for its wait is refused, and the answer names its pid with the OS
+/// error as the cause, as the confirmation's does.
+///
+/// Mutant: the round that is refused the only listed member drops its pid from the error.
+#[skuld::test]
+fn wait_drained_raw_names_a_member_it_may_not_wait_on_while_the_job_lists_it() {
+    use std::error::Error as _;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_drained_raw_names_a_member_it_may_not_wait_on_while_the_job_lists_it),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+
+    let verdict = super::wait_drained_raw(&job, None);
+
     let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
     assert!(
         matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }

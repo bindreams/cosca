@@ -196,8 +196,7 @@ fn a_member_with_a_settled_identity_is_not_waited_for_and_stands_for_no_count() 
     assert_eq!(job.confirmed.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
-/// A pid match against a member whose exit was seen is never used: the snapshot's entry with that pid
-/// and another identity is another process, which is walked.
+/// A pid match against a member whose exit was seen is never used.
 ///
 /// Mutant: a readable identity is settled by its pid.
 #[skuld::test]
@@ -211,8 +210,7 @@ fn a_pid_of_a_settled_member_does_not_settle_another_identity() {
 }
 
 /// An entry whose identity cannot be read is settled by a pid the kill's wait reported, and by no pid of
-/// a member whose exit it saw: that pid names another process, which this walk cannot tell from the
-/// member, and so reports.
+/// a member whose exit it saw.
 ///
 /// Mutant: an unreadable entry is settled by any member's pid.
 #[skuld::test]

@@ -122,11 +122,8 @@ impl Job {
     }
 
     /// Block until the job has no member left, or forever if it never does. An empty process list
-    /// is not taken as the drain, the first one included (it is empty on its first read after a kill):
-    /// the list can empty before a member's process object is signalled, so the call waits for each
-    /// job member a system process snapshot still names. The limit stated at
-    /// [`Child::wait_tree`](crate::Child::wait_tree) holds; a caller that needs a member it hides named
-    /// uses [`kill_tree`](Job::kill_tree).
+    /// is not the drain, and the limit stated at [`Child::wait_tree`](crate::Child::wait_tree) holds; a
+    /// caller that needs a member it hides named uses [`kill_tree`](Job::kill_tree).
     pub fn wait_tree(&self) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(None)
     }

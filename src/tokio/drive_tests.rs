@@ -825,6 +825,52 @@ mod windows {
         );
     }
 
+    /// The async twin of `after_the_job_kill_the_drain_answers_only_once_every_member_is_signalled`,
+    /// against the real OS with no forced listing: after the job's kill, the drain answers
+    /// `AllMembersExited` only once every member the job held (each opened before the kill) is
+    /// signalled.
+    ///
+    /// Mutant: the async drain answers an empty listing without the snapshot's members.
+    #[skuld::test]
+    async fn after_the_job_kill_the_async_drain_answers_only_once_every_member_is_signalled() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+        use crate::containment::Contains as _;
+
+        let (mut members, job) = crate::test_child::spawn_job_with_members(3);
+        let pids = crate::containment::windows::query_job_pid_list(HANDLE(job.handle().as_raw_handle()))
+            .expect("list the job's members");
+        assert!(pids.len() >= members.len(), "the job holds its members: {pids:?}");
+        let held: Vec<(u32, OwnedHandle)> = pids
+            .into_iter()
+            .map(|pid| {
+                // SAFETY: a standard Win32 call; the handle returned is ours and owned from here.
+                let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("open a member of the job");
+                // SAFETY: `OpenProcess` returned an open handle that nothing else owns.
+                (pid, unsafe { OwnedHandle::from_raw_handle(handle.0) })
+            })
+            .collect();
+
+        job.send_kill(None).into_result().expect("terminate the job");
+        let verdict = drain(&job, None).await;
+
+        assert_eq!(verdict, TreeDrain::AllMembersExited);
+        for (pid, handle) in &held {
+            // SAFETY: `handle` is open for the call.
+            let waited = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) };
+            assert_eq!(
+                waited, WAIT_OBJECT_0,
+                "pid {pid} is a member the drain answered before it was signalled"
+            );
+        }
+        for member in &mut members {
+            member.wait().expect("reap a member");
+        }
+    }
+
     /// A drain dropped while it waits unregisters its waits and leaves the job waitable: the next
     /// drain over it sees the member exit.
     #[skuld::test]

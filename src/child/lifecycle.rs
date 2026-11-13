@@ -360,21 +360,18 @@ impl Child {
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
     /// Windows job with no member left, a macOS marker with no holder left. A status is never
-    /// collected by this call, only the root's own `wait`/`wait_timeout` does that. On Windows an
-    /// empty process list is not taken as the drain, the first one included (it is empty on its first
-    /// read after a kill): the job's list can empty before a member's process object is signalled,
-    /// so the call waits for each job member a system process snapshot still names, within the limit
-    /// below. Requires a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2,
+    /// collected by this call, only the root's own `wait`/`wait_timeout` does that. On Windows the
+    /// job's list can empty before a member's process object is signalled, so an empty list is not the
+    /// drain: the call waits for each job member a system process snapshot still names, within the
+    /// limit below. Requires a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2,
     /// a Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and
     /// an uncontained or nested-`Delegated` child do not).
     ///
     /// # Limit (Windows)
     ///
     /// A Job member that refuses the caller query access is not seen once the Job's list is empty.
-    /// The snapshot's processes are opened for `PROCESS_QUERY_LIMITED_INFORMATION` alone, to ask
-    /// whether each is in the Job. One that refuses it (another user's, an elevated one, one whose
-    /// DACL denies the query), or whose `IsProcessInJob` fails, cannot be shown to be a member and is
-    /// skipped. So `wait_tree` after `send_kill_tree` (or after a kill made outside cosca) can answer
+    /// One that refuses it (another user's, an elevated one, one whose DACL denies the query), or
+    /// whose `IsProcessInJob` fails, cannot be shown to be a member and is skipped. So `wait_tree` after `send_kill_tree` (or after a kill made outside cosca) can answer
     /// while such a member is still finishing its exit: a live member is always in the Job's list, so
     /// this holds only during its exit. A later wait on the same Job whose count of processes ever
     /// (`TotalProcesses`) has not changed since a confirmation answers from that count, so a skipped
