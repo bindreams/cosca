@@ -234,7 +234,7 @@ pub enum Error {
     /// The checked `/proc` view needs `openat2` (the kernel needs 5.6), refused with `ENOSYS`,
     /// `EPERM` or `ENODEV`, as above. `EACCES` is not a refusal here: it is also the kernel's own
     /// answer to a `/proc` that may not be opened, so it stays [`Error::Unassessable`] carrying
-    /// `EACCES`, as does any other failure of the call (a tree walk's included). A refused `openat2` fails with this
+    /// `EACCES`, as does any other failure of the call. A refused `openat2` fails with this
     /// variant naming `openat2` from:
     ///
     /// - a by-pid identity read, wait or kill;
@@ -242,7 +242,14 @@ pub enum Error {
     /// - `parent` and `children` of a [`ProcessId`](crate::identity::ProcessId);
     /// - the group listing of a [`ProcessGroup`](crate::Containment::ProcessGroup) or
     ///   [`Session`](crate::Containment::Session) child's `kill_tree`;
+    /// - the process-table walk behind a [`TreeWalk`](crate::Containment::TreeWalk) containment's
+    ///   `kill_tree` and `hard_kill`;
     /// - a spawn, where the identity is read through the view.
+    ///
+    /// A refusal met after the view opened, while a listing or walk reads a pid's `stat` (a seccomp
+    /// filter installed mid-scan), is the same: the refusing errno is the `source`, and when the
+    /// directory refused `self/stat` after the pid's `stat` answered `EPERM`, the pid's own failure
+    /// is a second cause.
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this

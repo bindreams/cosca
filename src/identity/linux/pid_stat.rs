@@ -8,12 +8,13 @@
 //! view-open does.
 
 use std::io;
+use std::sync::Arc;
 
 use rustix::io::Errno;
 
 use super::kernel::Kernel;
 use super::proc_view::ProcDir;
-use super::prove::FailedCall;
+use super::prove::{FailedCall, Refusal};
 
 /// What reading one pid's `stat` yielded.
 #[derive(Debug)]
@@ -23,9 +24,9 @@ pub(crate) enum PidStat {
     /// while the checked directory still answers). The error is why.
     Skipped(io::Error),
     /// The `openat2` of the read was refused: the `stat` answered `ENOSYS`/`ENODEV`, or `EPERM` while
-    /// the checked directory refuses `self/stat` too, with a refusal errno. The call carries the
-    /// refusing errno.
-    Refused(FailedCall),
+    /// the checked directory refuses `self/stat` too, with a refusal errno. The refusing errno is
+    /// its cause, and the pid's own `EPERM` the second one when the directory refused.
+    Refused(Refusal),
 }
 
 /// Why one pid's `stat` could not be read and is not simply absent. Its words say what failed; the
@@ -71,6 +72,9 @@ enum Kind {
     /// `EXDEV`/`ELOOP`: the checked directory refused to cross a mount, so the record is not the
     /// kernel's.
     BeyondMount,
+    /// `EPERM`, and the checked directory refused `self/stat` too: the pid's failure, which comes
+    /// beside the refusal ([`Refusal::beside`]) and is the source of this layer.
+    BesideRefusal,
     /// `EPERM`, and the `self/stat` re-check failed without refusing (`EMFILE`, `ENOMEM`, ...):
     /// whether the pid is hidden is unknown. The re-check's error is the source, and the pid's own
     /// `EPERM` is the peer.
@@ -84,6 +88,7 @@ impl std::fmt::Display for Unreadable {
         let Unreadable { pid, kind, .. } = self;
         match kind {
             Kind::BeyondMount => write!(f, "{pid}/stat lies beyond a mount in /proc and was not read"),
+            Kind::BesideRefusal => write!(f, "{pid}/stat was refused, and the checked /proc refused self/stat too"),
             Kind::RecheckFailed => write!(f, "{pid}/stat was refused, and the re-check of self/stat failed"),
             Kind::Other => write!(f, "{pid}/stat could not be read"),
         }
@@ -100,10 +105,22 @@ impl std::error::Error for Unreadable {
 /// there for us, [`PidStat::Refused`] for a refused `openat2`, [`Unreadable`] for every other.
 /// Never asks `kill(pid, 0)`.
 pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
-    let source = match read_stat_file(kernel, dir, pid) {
-        Ok(stat) => return Ok(PidStat::Read(stat)),
-        Err(e) => e,
-    };
+    match read_stat_file(kernel, dir, pid) {
+        Ok(stat) => Ok(PidStat::Read(stat)),
+        Err(source) => failed_read(kernel, dir, pid, source),
+    }
+}
+
+/// What `source`, the error of the failed `stat` read of `pid` through `dir`, means:
+/// [`PidStat::Skipped`] for the errnos that mean the pid is not there for us, [`PidStat::Refused`]
+/// for a refused `openat2`, [`Unreadable`] for every other. The policy of [`read_in_scan`], for a
+/// by-pid read that has a failed read in hand.
+pub(crate) fn failed_read(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    source: io::Error,
+) -> Result<PidStat, Unreadable> {
     let (kind, cause, peer) = match source.raw_os_error() {
         // Deliberately NOT disambiguated with `kill(pid, 0)`: a scan covers all of `/proc`, and a
         // `hidepid` `/proc` answers a foreign-uid probe `EPERM` too, so the first foreign-uid
@@ -113,13 +130,21 @@ pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Resu
         Some(libc::EPERM) => match check_dir_answers(kernel, dir) {
             Ok(()) => return Ok(PidStat::Skipped(source)),
             Err(recheck) => match refusal(&recheck) {
-                Some(call) => return Ok(PidStat::Refused(call)),
+                Some(refusal) => {
+                    let pid_failure = Unreadable {
+                        pid,
+                        kind: Kind::BesideRefusal,
+                        cause: source,
+                        peer: None,
+                    };
+                    return Ok(PidStat::Refused(refusal.beside(Arc::new(pid_failure.into_cause()))));
+                }
                 None => (Kind::RecheckFailed, recheck, Some(source)),
             },
         },
         Some(libc::EXDEV | libc::ELOOP) => (Kind::BeyondMount, source, None),
         _ => match refusal(&source) {
-            Some(call) => return Ok(PidStat::Refused(call)),
+            Some(refusal) => return Ok(PidStat::Refused(refusal)),
             None => (Kind::Other, source, None),
         },
     };
@@ -134,9 +159,8 @@ pub(crate) fn read_stat_file(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> io
 
 /// The refused `openat2` that `error` is, when its errno is one [`FailedCall::requirement`] counts
 /// as a refusal.
-fn refusal(error: &io::Error) -> Option<FailedCall> {
-    let call = FailedCall::openat2(Errno::from_io_error(error)?);
-    call.requirement().map(|_| call)
+fn refusal(error: &io::Error) -> Option<Refusal> {
+    FailedCall::openat2(Errno::from_io_error(error)?).refusal()
 }
 
 /// Whether the checked directory still reads (`self/stat`).

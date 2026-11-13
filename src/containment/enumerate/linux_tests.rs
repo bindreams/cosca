@@ -181,8 +181,9 @@ fn eperm_is_unassessable_when_the_checked_directory_fails_without_refusing() {
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
 /// condition as a refused view-open: `Unsupported` naming `openat2`, with the refusing errno as the
 /// source, and warned about. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or as
-/// `EPERM` beside a checked directory that refuses `self/stat` too. Mutant: "a refusal mid-scan is
-/// `Unassessable`"; "the pid's `EPERM` is the source of a refusal the directory made".
+/// `EPERM` beside a checked directory that refuses `self/stat` too, and then the pid's own failure,
+/// which names the pid, is the second cause. Mutant: "a refusal mid-scan is `Unassessable`"; "the
+/// pid's `EPERM` is the source of a refusal the directory made"; "the pid's `EPERM` is dropped".
 #[skuld::test]
 fn a_refused_openat2_mid_scan_is_unsupported_naming_the_refusing_errno() {
     // The pid's `stat` answer, the `self/stat` answer where there is one, and the refusing errno.
@@ -207,6 +208,25 @@ fn a_refused_openat2_mid_scan_is_unsupported_naming_the_refusing_errno() {
                     Some(refusing),
                     "{stat}/{recheck:?}: {text}"
                 );
+                let below = error.failures_below();
+                match (recheck, below.as_slice()) {
+                    (None, [_]) => {}
+                    (Some(_), [first, second]) => {
+                        assert_eq!(
+                            crate::error::first_os_code(*first),
+                            Some(refusing),
+                            "{stat}/{recheck:?}"
+                        );
+                        let second = crate::error::Report(*second).to_string();
+                        assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {second}");
+                        assert_eq!(
+                            crate::error::first_os_code(&error),
+                            Some(refusing),
+                            "{stat}/{recheck:?}: the refusal is the source"
+                        );
+                    }
+                    (_, causes) => panic!("{stat}/{recheck:?}: unexpected causes {causes:?}"),
+                }
             }
             other => panic!("{stat}/{recheck:?}: expected Unsupported, got {other:?}"),
         }

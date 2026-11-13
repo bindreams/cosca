@@ -32,10 +32,7 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
                 );
                 continue;
             }
-            Ok(PidStat::Refused(call)) => {
-                let unsupported = call.unsupported(OP_NAME);
-                return Err(warned(unsupported.expect("read_in_scan reports only refusals")));
-            }
+            Ok(PidStat::Refused(refusal)) => return Err(warned(refusal.unsupported(OP_NAME))),
             Err(unreadable) => return Err(stat_unreadable(unreadable)),
         };
         match ppid_of_stat(pid, &stat) {

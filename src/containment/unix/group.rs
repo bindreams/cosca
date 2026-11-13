@@ -163,18 +163,17 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
     use crate::identity::stat_parse::parse_pgrp;
     use crate::identity::Resolved;
 
-    let proc_dir =
-        crate::identity::proc_view_with(kernel)
-            .into_dir()
-            .map_err(|why| match why.openat2_requirement() {
-                Some(requirement) => refused_listing(pgid, &requirement, why.source.map(Into::into)),
-                None => {
-                    let message = format!(
+    let proc_dir = crate::identity::proc_view_with(kernel)
+        .into_dir()
+        .map_err(|why| match why.refusal() {
+            Some(refusal) => refused_listing(pgid, &refusal),
+            None => {
+                let message = format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
                 );
-                    listing_error(std::io::ErrorKind::Other, message, why.source.map(Into::into))
-                }
-            })?;
+                listing_error(std::io::ErrorKind::Other, message, why.source.map(Into::into))
+            }
+        })?;
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     for pid in kernel.pids(&proc_dir)? {
@@ -191,14 +190,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                 continue;
             }
             // A refusal mid-scan is the `Unsupported` a refused view-open is.
-            Ok(crate::identity::pid_stat::PidStat::Refused(call)) => {
-                let requirement = call.requirement().expect("read_in_scan reports only refusals");
-                return Err(refused_listing(
-                    pgid,
-                    &requirement,
-                    Some(Box::new(std::io::Error::from(call.errno()))),
-                ));
-            }
+            Ok(crate::identity::pid_stat::PidStat::Refused(refusal)) => return Err(refused_listing(pgid, &refusal)),
             // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc),
             // and the failure that came with its read is its peer: both are causes of the listing.
             Err(e) => {
@@ -243,9 +235,16 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                     let message =
                         format!("containment::unix::group::members: {why}, so process group {pgid} cannot be listed");
                     return Err(match why {
-                        crate::error::Error::Unsupported { source, .. } => {
-                            listing_error(std::io::ErrorKind::Unsupported, message, source.map(Into::into))
-                        }
+                        // The cause is handed on as the error it is, not behind its `Arc`, so a
+                        // report of the listing still shows every failure a list of causes holds.
+                        crate::error::Error::Unsupported { source, .. } => warned(listing_error(
+                            std::io::ErrorKind::Unsupported,
+                            message,
+                            source.map(|cause| match std::sync::Arc::try_unwrap(cause) {
+                                Ok(cause) => Box::new(cause) as Box<dyn std::error::Error + Send + Sync>,
+                                Err(shared) => Box::new(shared),
+                            }),
+                        )),
                         crate::error::Error::Unassessable { source, .. } => {
                             listing_error(std::io::ErrorKind::Other, message, source.map(Into::into))
                         }
@@ -277,18 +276,28 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
 }
 
 /// The listing failure of an `openat2` that was refused, whether opening the view or reading in it:
-/// `ErrorKind::Unsupported` saying `requirement`, with `cause` as its source.
+/// `ErrorKind::Unsupported` saying the requirement, with the refusal's causes as its source. Its
+/// caller (`unix.rs`'s `signal_group`) does not log it, so it is warned about here, once.
 #[cfg(target_os = "linux")]
-fn refused_listing(
-    pgid: i32,
-    requirement: &str,
-    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
-) -> std::io::Error {
-    listing_error(
+fn refused_listing(pgid: i32, refusal: &crate::identity::Refusal) -> std::io::Error {
+    warned(listing_error(
         std::io::ErrorKind::Unsupported,
-        format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
-        cause,
-    )
+        format!(
+            "containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed",
+            requirement = refusal.requirement()
+        ),
+        Some(Box::new(refusal.cause())),
+    ))
+}
+
+/// `error`, a refused `openat2` that ended a listing, logged at `warn` as the process snapshot's is.
+#[cfg(target_os = "linux")]
+fn warned(error: std::io::Error) -> std::io::Error {
+    log::warn!(
+        "containment::unix::group::members: {report}",
+        report = crate::error::Report(&error)
+    );
+    error
 }
 
 /// A listing failure of `kind` that says `message` and keeps `cause`, the failed call's errno, as

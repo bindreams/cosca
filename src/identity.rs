@@ -692,7 +692,7 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 pub(crate) use backend::call_error;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::prove::{prove, FailedCall, Proof};
+pub(crate) use backend::prove::{prove, FailedCall, Proof, Refusal};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
@@ -734,6 +734,9 @@ pub(crate) struct UnknownCause {
     /// The failed `pidfd_open`, `pidfs_ino` or `poll` that left the read `Unknown`.
     #[cfg(target_os = "linux")]
     call: Option<FailedCall>,
+    /// The refused `openat2` of the `stat` read that left the read `Unknown`.
+    #[cfg(target_os = "linux")]
+    refusal: Option<Box<Refusal>>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -800,9 +803,7 @@ impl UnknownCause {
     pub(crate) fn of_view(view: Option<ViewUnreadable>) -> UnknownCause {
         UnknownCause {
             view,
-            call: None,
-            parent: None,
-            candidate: None,
+            ..UnknownCause::default()
         }
     }
 
@@ -810,15 +811,22 @@ impl UnknownCause {
     #[cfg(target_os = "linux")]
     pub(crate) fn of_call(call: FailedCall) -> UnknownCause {
         UnknownCause {
-            view: None,
             call: Some(call),
-            parent: None,
-            candidate: None,
+            ..UnknownCause::default()
+        }
+    }
+
+    /// The cause of a read whose `stat` was refused (`openat2`) and left it `Unknown`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_refusal(refusal: Refusal) -> UnknownCause {
+        UnknownCause {
+            refusal: Some(Box::new(refusal)),
+            ..UnknownCause::default()
         }
     }
 
     /// The error for `subject`'s `Unknown` read when the read knows why: `Error::Unsupported` naming
-    /// the `openat2` requirement or a refused `pidfd_open`, or `Error::Unassessable` with the view's
+    /// the `openat2` requirement (also of a `stat` read refused mid-read) or a refused `pidfd_open`, or `Error::Unassessable` with the view's
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
     /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
     /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
@@ -827,10 +835,11 @@ impl UnknownCause {
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
-            match (self.view, self.call) {
-                (Some(why), _) => Some(backend::view_error(subject, why)),
-                (None, Some(call)) => Some(backend::call_error(subject, call)),
-                (None, None) => None,
+            match (self.view, self.call, self.refusal) {
+                (Some(why), _, _) => Some(backend::view_error(subject, why)),
+                (None, Some(call), _) => Some(backend::call_error(subject, call)),
+                (None, None, Some(refusal)) => Some(refusal.unsupported(format!("identifying {subject}"))),
+                (None, None, None) => None,
             }
         }
         #[cfg(windows)]

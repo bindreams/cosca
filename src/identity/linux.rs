@@ -64,10 +64,20 @@ fn read_stat(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Vec<u8>> {
     read_stat_explained(kernel, pid).0
 }
 
-/// [`read_stat`], and the unusable view that made it `Unknown`, when one did.
-fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
+/// [`read_stat`], and what made it `Unknown`, when the read knows: the unusable view, or a `stat`
+/// read refused (`openat2`) after the view opened.
+fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, UnknownCause) {
     match proc_view::proc_view_with(kernel).into_dir() {
-        Ok(dir) => (stat_by_pid(kernel, &dir, pid), None),
+        Ok(dir) => match pid_stat::read_stat_file(kernel, &dir, pid) {
+            Ok(bytes) => (Resolved::Found(bytes), UnknownCause::default()),
+            Err(e) => {
+                let why = crate::error::Report(&e).to_string();
+                match resolve_unreadable(kernel, pid, why) {
+                    Resolved::Unknown => (Resolved::Unknown, refusal_of(kernel, &dir, pid, e)),
+                    resolved => (resolved, UnknownCause::default()),
+                }
+            }
+        },
         Err(why) => (
             resolve_unreadable(
                 kernel,
@@ -77,8 +87,17 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
                     report = crate::error::Report(&why)
                 ),
             ),
-            Some(why),
+            UnknownCause::of_view(Some(why)),
         ),
+    }
+}
+
+/// The cause of a by-pid `stat` read that failed with `e` and is `Unknown`: a refused `openat2`
+/// (by the policy of the scans, `pid_stat::failed_read`), else none known.
+fn refusal_of(kernel: &dyn Kernel, dir: &ProcDir, pid: RawPid, e: std::io::Error) -> UnknownCause {
+    match pid_stat::failed_read(kernel, dir, pid, e) {
+        Ok(pid_stat::PidStat::Refused(refusal)) => UnknownCause::of_refusal(refusal),
+        _ => UnknownCause::default(),
     }
 }
 
@@ -262,8 +281,8 @@ fn key_of(kernel: &dyn Kernel, pid: RawPid, look: Look) -> (Resolved<Key>, Unkno
         Look::Gone => (Resolved::Gone, UnknownCause::default()),
         Look::Unknown(cause) => (Resolved::Unknown, cause),
         Look::Ticks => {
-            let (stat, view) = read_stat_explained(kernel, pid);
-            (ticks_from(pid, stat).map(Key::Ticks), UnknownCause::of_view(view))
+            let (stat, cause) = read_stat_explained(kernel, pid);
+            (ticks_from(pid, stat).map(Key::Ticks), cause)
         }
     }
 }
@@ -289,15 +308,12 @@ pub(super) fn of_stat(
         Look::Gone => (Resolved::Gone, UnknownCause::default()),
         Look::Unknown(cause) => (Resolved::Unknown, cause),
         Look::Ticks => {
-            let (stat, view) = read_stat_explained(kernel, pid);
+            let (stat, cause) = read_stat_explained(kernel, pid);
             let bytes = match &stat {
                 Resolved::Found(bytes) => bytes.clone(),
                 _ => Vec::new(),
             };
-            (
-                ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)),
-                UnknownCause::of_view(view),
-            )
+            (ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)), cause)
         }
     }
 }
@@ -334,11 +350,8 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Ke
 pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, UnknownCause) {
     match key {
         Key::Ticks(ticks) => {
-            let (stat, view) = read_stat_explained(kernel, pid);
-            (
-                existence_of_ticks(ticks_from(pid, stat), ticks),
-                UnknownCause::of_view(view),
-            )
+            let (stat, cause) = read_stat_explained(kernel, pid);
+            (existence_of_ticks(ticks_from(pid, stat), ticks), cause)
         }
         Key::Pidfs(ino) => match prove::prove(kernel, pid, ino) {
             Proof::Holds { .. } => (Existence::Present, UnknownCause::default()),
@@ -387,11 +400,11 @@ fn ticks_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<u64> {
 /// `stat` read between is its own; the other order would let a reuser's `stat` through. `Gone` when
 /// the proof finds another process.
 fn bracketed_stat(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> (Resolved<Vec<u8>>, UnknownCause) {
-    let (stat, view) = read_stat_explained(kernel, pid);
+    let (stat, cause) = read_stat_explained(kernel, pid);
     let stat = match stat {
         Resolved::Found(stat) => stat,
-        Resolved::Gone => return (Resolved::Gone, UnknownCause::of_view(view)),
-        Resolved::Unknown => return (Resolved::Unknown, UnknownCause::of_view(view)),
+        Resolved::Gone => return (Resolved::Gone, cause),
+        Resolved::Unknown => return (Resolved::Unknown, cause),
     };
     match prove::prove(kernel, pid, ino) {
         Proof::Holds { .. } => (Resolved::Found(stat), UnknownCause::default()),

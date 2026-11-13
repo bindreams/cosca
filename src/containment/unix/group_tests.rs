@@ -764,12 +764,16 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_fails_without_refusi
 
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
 /// condition as a refused view-open: `ErrorKind::Unsupported` naming `openat2`, with the refusing
-/// errno as the source. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or as
-/// `EPERM` beside a checked directory that refuses `self/stat` too. Mutant: "a refusal mid-scan is
-/// `Other`"; "the pid's `EPERM` is the source of a refusal the directory made".
+/// errno as the source and the pid's own failure, which names the pid, as a second cause when the
+/// refusal is the directory's. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or
+/// as `EPERM` beside a checked directory that refuses `self/stat` too. It is warned about once, as
+/// the process snapshot's is. Mutant: "a refusal mid-scan is `Other`"; "the pid's `EPERM` is the
+/// source of a refusal the directory made"; "the pid's `EPERM` is dropped"; "the refusal is not
+/// warned about".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
+    crate::log_capture::install();
     // The pid's `stat` answer, the `self/stat` answer where there is one, and the refusing errno.
     for (stat, recheck, refusing) in [
         (libc::EPERM, Some(libc::EPERM), libc::EPERM),
@@ -782,6 +786,7 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
         if let Some(recheck) = recheck {
             kernel = kernel.on_read("self/stat", Err(recheck));
         }
+        let mark = crate::log_capture::mark();
         let err = members(&kernel, i32::MAX).expect_err("a refused openat2 lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert_eq!(
@@ -794,6 +799,90 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
             crate::error::first_os_code(&err),
             Some(refusing),
             "{stat}/{recheck:?}: {text}"
+        );
+        match (recheck, text.split_once("(2) ")) {
+            (Some(_), Some((_, second))) => {
+                assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {text}");
+                assert!(
+                    second.contains(&std::io::Error::from_raw_os_error(stat).to_string()),
+                    "{stat}/{recheck:?}: {text}"
+                );
+            }
+            (Some(_), None) => panic!("{stat}/{recheck:?}: the pid's own failure is kept: {text}"),
+            (None, second) => assert!(second.is_none(), "{stat}/{recheck:?}: a lone refusal: {text}"),
+        }
+        let warned = crate::log_capture::records_since_on_current_thread(mark, "containment::unix::group::members");
+        assert_eq!(
+            warned.iter().filter(|(level, _)| *level == log::Level::Warn).count(),
+            1,
+            "{stat}/{recheck:?}: {warned:?}"
+        );
+    }
+}
+
+/// The member's own identity read goes through the `stat` of the pid again, and a refusal there is the
+/// same `Unsupported` as a refusal in the scan, with the pid's own failure beside it when the refusal
+/// is the directory's. Mutant: "a refused read of the member's own `stat` excludes the member".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
+    use rustix::process::Pid;
+
+    for (stat, recheck, refusing) in [
+        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
+        (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+        (libc::ENOSYS, None, libc::ENOSYS),
+        (libc::ENODEV, None, libc::ENODEV),
+    ] {
+        let (kernel, _writer) = scan_shows_group_1234();
+        let mut kernel = kernel
+            .on_signal_probe(Pid::from_raw(PID as i32).expect("a pid"), Ok(()))
+            .on_read_after(&format!("{PID}/stat"), 1, Err(stat));
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", Err(recheck));
+        }
+        let err = members(&kernel, 1234).expect_err("a refused own read lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Unsupported,
+            "{stat}/{recheck:?}: {text}"
+        );
+        assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(refusing),
+            "{stat}/{recheck:?}: {text}"
+        );
+        assert_eq!(
+            text.contains("(2) "),
+            recheck.is_some(),
+            "{stat}/{recheck:?}: the pid's own failure is the second cause of a directory's refusal: {text}"
+        );
+    }
+}
+
+/// A read of the member's own `stat` that fails without refusing stays an exclusion with no cause:
+/// `EIO`, or `EPERM` while the checked directory still answers (`hidepid`). Mutant: "any failed own
+/// read fails the listing".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_excludes_a_pid_whose_own_stat_read_fails_without_refusing() {
+    use rustix::process::Pid;
+
+    for (stat, recheck) in [(libc::EIO, None), (libc::EPERM, Some(Ok(&b""[..])))] {
+        let (kernel, _writer) = scan_shows_group_1234();
+        let mut kernel = kernel
+            .on_signal_probe(Pid::from_raw(PID as i32).expect("a pid"), Ok(()))
+            .on_read_after(&format!("{PID}/stat"), 1, Err(stat));
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", recheck);
+        }
+        assert!(
+            members(&kernel, 1234)
+                .unwrap_or_else(|e| panic!("{stat}: an exclusion, not an error: {e}"))
+                .is_empty(),
+            "{stat}"
         );
     }
 }

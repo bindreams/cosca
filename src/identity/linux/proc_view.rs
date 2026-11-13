@@ -29,7 +29,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
 
 use super::kernel::Kernel;
-use super::prove::FailedCall;
+use super::prove::{FailedCall, Refusal};
 use crate::error::Error;
 
 /// What this process's `/proc` says about its own pid namespace.
@@ -99,10 +99,10 @@ impl ViewUnreadable {
         self.openat2?.unsupported(op)
     }
 
-    /// The `openat2` requirement text, when `openat2` being refused is why the view could not be
-    /// established. For callers whose error type is not [`Error`].
-    pub(crate) fn openat2_requirement(&self) -> Option<String> {
-        self.openat2?.requirement()
+    /// The refused `openat2`, when that is why the view could not be established. For callers whose
+    /// error type is not [`Error`].
+    pub(crate) fn refusal(&self) -> Option<Refusal> {
+        self.openat2?.refusal()
     }
 }
 

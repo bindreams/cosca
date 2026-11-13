@@ -5,12 +5,13 @@
 //! no `/proc`.
 
 use std::os::fd::{AsFd as _, OwnedFd};
+use std::sync::Arc;
 
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::kernel::{Kernel, PIDFD_THREAD};
-use crate::error::Error;
+use crate::error::{Error, Failures};
 use crate::identity::RawPid;
 
 #[derive(Debug, Clone, Copy)]
@@ -98,15 +99,63 @@ impl FailedCall {
         ))
     }
 
+    /// This call as a [`Refusal`], when it is one.
+    pub(crate) fn refusal(self) -> Option<Refusal> {
+        self.requirement().map(|requirement| Refusal {
+            call: self,
+            requirement,
+            beside: None,
+        })
+    }
+
     /// [`Error::Unsupported`] naming `op` and the [`requirement`](Self::requirement), when this
     /// call is a refusal. The errno is its `source`.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
-        self.requirement().map(|detail| Error::Unsupported {
+        self.refusal().map(|refusal| refusal.unsupported(op))
+    }
+}
+
+/// A [`FailedCall`] that is a refusal, with the [`requirement`](FailedCall::requirement) it names,
+/// built once: a holder never asks again whether the call was refused.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    call: FailedCall,
+    requirement: String,
+    /// The failure of the pid the refusal was met beside, when there is one: the pid's own `EPERM`
+    /// beside a checked directory that refuses `self/stat`.
+    beside: Option<Arc<Error>>,
+}
+
+impl Refusal {
+    /// This refusal, with `failure`, the other failure of the same read, kept as a second cause.
+    pub(crate) fn beside(mut self, failure: Arc<Error>) -> Refusal {
+        self.beside = Some(failure);
+        self
+    }
+
+    pub(crate) fn requirement(&self) -> &str {
+        &self.requirement
+    }
+
+    /// The failures behind the refusal: the refusing errno, then the other failure, as an
+    /// [`Error::Several`] when there is one.
+    pub(crate) fn cause(&self) -> Error {
+        let own = std::io::Error::from(self.call.errno());
+        match &self.beside {
+            None => Error::Io(own),
+            Some(beside) => Error::Several(Failures::new(Error::io_cause(own), [Arc::clone(beside)])),
+        }
+    }
+
+    /// [`Error::Unsupported`] naming `op` and the requirement, with [`cause`](Self::cause) as its
+    /// `source`.
+    pub(crate) fn unsupported(&self, op: impl Into<String>) -> Error {
+        Error::Unsupported {
             op: op.into(),
             platform: "linux",
-            detail,
-            source: Some(Error::io_cause(std::io::Error::from(self.errno))),
-        })
+            detail: self.requirement.clone(),
+            source: Some(Arc::new(self.cause())),
+        }
     }
 }
 

@@ -113,7 +113,11 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
         assert_eq!(call.requirement().as_deref(), Some(want.as_str()), "{errno}");
 
         let view = ViewUnreadable::from_open_errno(errno);
-        assert_eq!(view.openat2_requirement().as_deref(), Some(want.as_str()), "{errno}");
+        assert_eq!(
+            view.refusal().as_ref().map(|refusal| refusal.requirement()),
+            Some(want.as_str()),
+            "{errno}"
+        );
         let refused = view
             .unsupported("identifying pid 4242")
             .unwrap_or_else(|| panic!("{errno} refuses openat2"));
