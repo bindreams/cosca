@@ -212,14 +212,10 @@ test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
 /// A pidfd of this process, closed when dropped: what the kernel preconditions ask their questions of.
 #[cfg(target_os = "linux")]
 fn own_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd as _;
-    // SAFETY: a plain syscall.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a descriptor the syscall just opened, which nothing else owns.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) })
+    Ok(rustix::process::pidfd_open(
+        rustix::process::getpid(),
+        rustix::process::PidfdFlags::empty(),
+    )?)
 }
 
 /// The `PIDFD_GROUP_SIGNAL` group's precondition: the kernel takes `PIDFD_SIGNAL_PROCESS_GROUP`
@@ -236,7 +232,15 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd as _;
-        let pidfd = own_pidfd().map_err(|e| lacks(format!("pidfd_open failed ({e})")))?;
+        // Only `EINVAL` is the kernel's own answer to a flag it does not know; any other failure (a seccomp or LSM
+        // refusal, `ENOSYS`) is the probe's own.
+        let probe_failed = |what: String| {
+            format!(
+                "the PIDFD_GROUP_SIGNAL group could not ask the kernel whether it takes PIDFD_SIGNAL_PROCESS_GROUP \
+                 ({what}); set {enabled_var}=0 to turn it off"
+            )
+        };
+        let pidfd = own_pidfd().map_err(|e| probe_failed(format!("pidfd_open failed: {e}")))?;
         // SAFETY: `pidfd` is open, and a null `siginfo_t` asks for the defaults.
         let sent = unsafe {
             libc::syscall(
@@ -247,18 +251,29 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
                 libc::PIDFD_SIGNAL_PROCESS_GROUP,
             )
         };
-        // Any other answer (`ESRCH`: this process leads no group) comes from a kernel that took the flag.
         if sent < 0 {
             let errno = std::io::Error::last_os_error();
-            if errno.raw_os_error() == Some(libc::EINVAL) {
-                return Err(lacks(format!("this kernel refused the flag ({errno})")));
-            }
+            return match errno.raw_os_error() {
+                Some(libc::EINVAL) => Err(lacks(format!("this kernel refused the flag ({errno})"))),
+                // This process leads no group: the answer of a kernel that took the flag.
+                Some(libc::ESRCH) => Ok(()),
+                _ => Err(probe_failed(format!("the send failed: {errno}"))),
+            };
         }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     Err(lacks("this host is not Linux".to_owned()))
 }
+
+/// `PIDFD_GET_INFO` for the first version of `struct pidfd_info` (`PIDFD_INFO_SIZE_VER0` bytes): `_IOWR(PIDFS_IOCTL_MAGIC
+/// = 0xFF, 11, ...)` of `linux/pidfd.h`. libc's own `PIDFD_GET_INFO` encodes `size_of::<libc::pidfd_info>()`, which a
+/// libc that adds the struct's later fields would change. The same request as the library's
+/// (`containment::cgroup::reach`), which integration roots cannot name.
+#[cfg(target_os = "linux")]
+const PIDFD_GET_INFO_VER0: libc::Ioctl = libc::_IOWR::<[u8; libc::PIDFD_INFO_SIZE_VER0 as usize]>(0xFF, 11);
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<libc::pidfd_info>() >= libc::PIDFD_INFO_SIZE_VER0 as usize);
 
 /// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
 /// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13, a supported host that reads a
@@ -288,12 +303,12 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
         // by a literal.
         let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
         info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
-        // SAFETY: `pidfd` is open, and `info` is a valid, writable `struct pidfd_info` of the size the request
-        // encodes.
+        // SAFETY: `pidfd` is open, and `info` is a valid, writable `struct pidfd_info`, at least as large as the first
+        // version the request encodes.
         let rc = unsafe {
             libc::ioctl(
                 pidfd.as_raw_fd(),
-                libc::PIDFD_GET_INFO,
+                PIDFD_GET_INFO_VER0,
                 &mut info as *mut libc::pidfd_info,
             )
         };

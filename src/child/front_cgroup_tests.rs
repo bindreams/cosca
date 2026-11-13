@@ -1551,6 +1551,8 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(
 fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hides_it(
     #[fixture(cgroup)] _group: &Group,
 ) {
+    // Held first, so that on a kernel with `PIDFD_GET_INFO` too the place is read through `/proc`.
+    let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
     move_under_its_leaf(pid);
@@ -1558,7 +1560,6 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hi
     assert!(names().expect("/proc is readable here"));
     {
         let _hidden = crate::containment::cgroup::fault::hide_proc();
-        let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
         names().expect_err("a hidden path places nothing");
     }
     // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
