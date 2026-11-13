@@ -300,11 +300,13 @@ pub enum Error {
         source: Option<Arc<Error>>,
     },
     /// A tree-walk kill killed what it could and left members running, one or more. Each of `members`
-    /// is an [`Error::MemberNotKilled`], in the order the walk found them. `unwalked` is set when the
-    /// walk could not be made, or found no root, after an earlier kill left members: that kill's
-    /// [`Error::Unassessable`] or [`Error::Unsupported`], which names no process. The call returns this
-    /// variant in place of the `Unassessable` that means nothing was killed. Its `source` is the first
-    /// member.
+    /// is an [`Error::MemberNotKilled`], in the order the walk found them. `others` holds the call's
+    /// failures besides the members left, none of which names a process: a walk that could not be made,
+    /// or found no root, after an earlier kill left members (that kill's [`Error::Unassessable`] or
+    /// [`Error::Unsupported`]; the call returns this variant in place of the `Unassessable` that means
+    /// nothing was killed), and, from a graceful tree call, its refused cooperative signal and its
+    /// failed grace wait. It is one error, or an [`Error::Several`] of them in the order they happened.
+    /// Its `source` is the first member.
     ///
     /// Comes from the `TreeWalk` mechanism's `kill_tree` and `graceful_shutdown_tree`, and from
     /// [`Process::kill_tree`](crate::Process::kill_tree) and its `graceful_shutdown_tree`, which walk
@@ -317,7 +319,7 @@ pub enum Error {
     /// `Process::kill_tree`, and a `TreeWalk` handle on Linux and Windows.
     MembersLeft {
         members: Failures,
-        unwalked: Option<Arc<Error>>,
+        others: Option<Arc<Error>>,
     },
     /// A member a tree-walk kill left running, and why it was not killed: its identity could not be
     /// read, at the walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when
@@ -490,15 +492,15 @@ impl Error {
     }
 
     /// An [`Error::MembersLeft`] of `members`, each a [`Error::MemberNotKilled`] (asserted in debug), with
-    /// the `unwalked` error of a walk that could not be made.
-    pub(crate) fn members_left(members: Failures, unwalked: Option<Arc<Error>>) -> Error {
+    /// the `others` of the call's failures that name no member.
+    pub(crate) fn members_left(members: Failures, others: Option<Arc<Error>>) -> Error {
         debug_assert!(
             members
                 .iter()
                 .all(|member| matches!(**member, Error::MemberNotKilled { .. })),
             "every member of a MembersLeft is a MemberNotKilled: {members:?}"
         );
-        Error::MembersLeft { members, unwalked }
+        Error::MembersLeft { members, others }
     }
 }
 
@@ -653,8 +655,8 @@ pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option
 ///
 /// A layer that holds a [`Failures`] ([`Error::Several`], [`Error::MembersLeft`]) is followed by
 /// every member's whole chain, `(1) <chain>; (2) <chain>`, and the walk of the layer's own `source`
-/// ends there: its first member is one of them. An [`Error::MembersLeft`]'s `unwalked` error follows
-/// its members, as `; walk not made: <chain>`. A list in a member's chain reads in brackets, so
+/// ends there: its first member is one of them. An [`Error::MembersLeft`]'s `others` follow its
+/// members, as `; others: <chain>`. A list in a member's chain reads in brackets, so
 /// the `;` between its members is not taken for the outer list's: `(1) a: 2 failures: [(1) b; (2) c]; (2) d`
 /// is a list of two whose first member holds a list of two.
 pub(crate) struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
@@ -682,12 +684,11 @@ impl Report<'_> {
                 Report::write(&**member, true, f)?;
             }
             if let Some(Error::MembersLeft {
-                unwalked: Some(unwalked),
-                ..
+                others: Some(others), ..
             }) = layer.downcast_ref::<Error>()
             {
-                f.write_str("; walk not made: ")?;
-                Report::write(&**unwalked, true, f)?;
+                f.write_str("; others: ")?;
+                Report::write(&**others, true, f)?;
             }
             return f.write_str(if nested { "]" } else { "" });
         }
@@ -801,16 +802,27 @@ impl Error {
     }
 
     /// What a tree kill's error holds, for the tests that read it: the members of an
-    /// [`Error::MembersLeft`] and then its `unwalked` error, or the one error that is no member.
+    /// [`Error::MembersLeft`] and then its `others`, or the one error that is no member.
     #[cfg(test)]
     pub(crate) fn left_members(&self) -> Vec<&Error> {
         match self {
-            Error::MembersLeft { members, unwalked } => members
+            Error::MembersLeft { members, others } => members
                 .iter()
                 .map(|member| &**member)
-                .chain(unwalked.as_deref())
+                .chain(others.as_deref())
                 .collect(),
             other => vec![other],
+        }
+    }
+
+    /// What a slot variant's `source` holds, for the tests that read it: the members of its
+    /// [`Error::Several`], or its one cause; none when it has no cause.
+    #[cfg(test)]
+    pub(crate) fn failures_below(&self) -> Vec<&Error> {
+        match std::error::Error::source(self).and_then(|source| source.downcast_ref::<Error>()) {
+            Some(Error::Several(list)) => list.iter().map(|member| &**member).collect(),
+            Some(cause) => vec![cause],
+            None => Vec::new(),
         }
     }
 
@@ -818,10 +830,13 @@ impl Error {
     /// stay, and its `source` becomes its own cause, if it has one, then the peers, as a
     /// [`Error::Several`] when that is two or more. A [`Error::Several`] takes them as more members.
     ///
+    /// An [`Error::MembersLeft`] takes them as its `others`, never as members, which are processes left
+    /// running: before the `others` it has, as one flat list.
+    ///
     /// An [`Error::Io`], [`Error::Quote`] and [`Error::NoConsole`] are leaves with no cause to hold
-    /// peers, and the members of an [`Error::MembersLeft`] are a walk's: giving any of them peers is a
-    /// contract breach, asserted in debug, and in release they are returned as they are. A site that
-    /// can have peers returns a variant with a slot at every count.
+    /// peers: giving them some is a contract breach, asserted in debug, and in release they are returned
+    /// as they are. [`with_peers_or_warn`](Error::with_peers_or_warn) is the form for a failure that may
+    /// be a leaf.
     pub(crate) fn with_peers(self, peers: impl IntoIterator<Item = Arc<Error>>) -> Error {
         let mut peers = peers.into_iter().peekable();
         if peers.peek().is_none() {
@@ -883,13 +898,19 @@ impl Error {
                 unreaped,
             },
             Error::Several(list) => Error::Several(list.extended(peers)),
-            walk @ Error::MembersLeft { .. } => {
-                debug_assert!(
-                    false,
-                    "the members of a MembersLeft are a walk's members, so peers cannot join it: {}",
-                    Report(&walk)
-                );
-                walk
+            Error::MembersLeft { members, others } => {
+                // The peers happened before the sweep, so they go before its own failures, flat.
+                let own = match others {
+                    None => Vec::new(),
+                    Some(one) => match &*one {
+                        Error::Several(list) => list.iter().cloned().collect(),
+                        _ => vec![one],
+                    },
+                };
+                Error::MembersLeft {
+                    members,
+                    others: Some(Failures::collect(peers.chain(own)).expect("a peer").into_cause()),
+                }
             }
             leaf @ (Error::Io(_) | Error::Quote(_) | Error::NoConsole { .. }) => {
                 debug_assert!(
@@ -921,6 +942,30 @@ impl Error {
             .with_peers(std::iter::once(Arc::new(io)).chain(peers)),
             other => other.with_peers(peers.into_iter().chain(own)),
         }
+    }
+
+    /// Whether this error can hold the other failures of its call: every variant but a leaf
+    /// ([`Error::Io`], [`Error::Quote`], [`Error::NoConsole`]).
+    fn has_slot(&self) -> bool {
+        !matches!(self, Error::Io(_) | Error::Quote(_) | Error::NoConsole { .. })
+    }
+
+    /// This error, the answer of `call`, with `peers`, the call's other failures: below it as its
+    /// [`with_peers`](Error::with_peers) when it has a slot for them. A leaf has none, and no variant's
+    /// meaning covers what it says failed, so it is the answer as it is, with its OS code, and each peer
+    /// is logged at warn through [`Report`], naming `call`.
+    pub(crate) fn with_peers_or_warn(self, call: &str, peers: impl IntoIterator<Item = Error>) -> Error {
+        let peers = peers.into_iter();
+        if self.has_slot() {
+            return self.with_peers(peers.map(Arc::new));
+        }
+        for peer in peers {
+            log::warn!(
+                "{call}: another failure of the call is not in its error, which has no place for it: {report}",
+                report = Report(&peer)
+            );
+        }
+        self
     }
 
     /// This error as an [`std::io::Error`]: an [`Error::Io`] as it is, any other variant wrapped.

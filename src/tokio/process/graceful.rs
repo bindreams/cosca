@@ -12,7 +12,9 @@ impl Process {
     /// even if `SIGTERM` is ignored. Unix only; Windows returns `Unsupported`. `grace` is
     /// relative; `ZERO` polls once, then escalates.
     ///
-    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
+    /// A watch failure surfaces only after the kill runs. A kill error is the call's error, and the
+    /// watch failure joins it as a peer, as for the sync
+    /// [`graceful_shutdown`](crate::Process::graceful_shutdown).
     /// Dropping this future mid-grace cancels the watch and performs no further signalling.
     ///
     /// # Runtime
@@ -23,7 +25,8 @@ impl Process {
         self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        crate::graceful::after_grace(self.wait_timeout(grace).await, || self.kill())
+        let call = format!("graceful_shutdown({})", self.id().pid());
+        crate::graceful::after_grace(&call, self.wait_timeout(grace).await, || self.kill())
     }
 
     /// Cooperative-then-forced shutdown of the foreign process's tree: `SIGTERM`-walk, wait
@@ -32,7 +35,8 @@ impl Process {
     /// `Unsupported`).
     ///
     /// A grace-watch failure does not strand the tree: the hard sweep still runs, and the
-    /// watch error is surfaced afterward; a sweep failure would win over it. Dropping this
+    /// watch error is surfaced afterward; a sweep failure is the call's error, and the watch
+    /// failure joins it as a peer, as for the sync call. Dropping this
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
     /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
@@ -40,8 +44,12 @@ impl Process {
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         let watch = self.wait_timeout(grace).await;
-        crate::graceful::note_watch(&watch);
-        crate::graceful::after_sweep(self.kill_tree().await, watch)
+        let swept = self
+            .inner
+            .kill_tree_with_async("graceful_shutdown_tree", &crate::identity::HostKernel)
+            .await;
+        let call = format!("graceful_shutdown_tree({})", self.id().pid());
+        crate::graceful::after_sweep(&call, swept, watch)
     }
 }
 

@@ -341,16 +341,6 @@ mod call {
             )
         }
 
-        /// A failed grace wait of a macOS fd marker's holders: they are killed now.
-        pub(crate) fn holders_grace_failed(&self, e: &Error) {
-            log::debug!(
-                "{}({}): the marker holders' grace wait failed, so they are killed now: {report}",
-                self.op,
-                self.pid,
-                report = crate::error::Report(e)
-            );
-        }
-
         /// macOS: the end of a call that signalled an fd marker's holders alone ([`Skip::holders`] of
         /// `skip` is their `SIGTERM`), after the grace: `kill` is the kill of any holder left, the
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or

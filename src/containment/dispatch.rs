@@ -463,7 +463,7 @@ impl Unkilled {
 
     /// What is still left once the root's own handle has had its say: `Ok` when nothing is, else the
     /// error that holds every member left, in order ([`Error::MembersLeft`]), with the errors that
-    /// name no member as its `unwalked` (a [`Error::Several`] when there are two or more). With no
+    /// name no member as its `others` (a [`Error::Several`] when there are two or more). With no
     /// member, the first error that names none is the answer, in its own variant, with the others as
     /// its peers ([`Error::with_peers`]) (see
     /// [`Child::kill_tree`](crate::Child::kill_tree) for the contract).
@@ -799,18 +799,24 @@ impl From<Error> for SweepFailure {
 /// A `kill_tree` sweep's answer, with the wait for what it killed: a caller that returns once the
 /// members have exited [`wait`](Self::wait)s, and one that sends alone takes the [`answer`](Self::answer).
 pub(crate) struct Swept<'a> {
+    /// The call the sweep is a step of, which a warn about its wait names.
+    op: &'static str,
     answer: Result<(), SweepFailure>,
     wait: crate::containment::KillWait<'a>,
 }
 
 impl<'a> Swept<'a> {
-    pub(crate) fn new(answer: Result<(), SweepFailure>, wait: crate::containment::KillWait<'a>) -> Swept<'a> {
-        Swept { answer, wait }
+    pub(crate) fn new(
+        op: &'static str,
+        answer: Result<(), SweepFailure>,
+        wait: crate::containment::KillWait<'a>,
+    ) -> Swept<'a> {
+        Swept { op, answer, wait }
     }
 
     /// The answer of a call that killed nothing, so it waits for nothing.
-    pub(crate) fn unwaited(answer: Result<(), SweepFailure>) -> Swept<'a> {
-        Swept::new(answer, crate::containment::KillWait::none())
+    pub(crate) fn unwaited(op: &'static str, answer: Result<(), SweepFailure>) -> Swept<'a> {
+        Swept::new(op, answer, crate::containment::KillWait::none())
     }
 
     /// The sweep's answer, for a caller that sends and does not wait.
@@ -824,7 +830,7 @@ impl<'a> Swept<'a> {
     pub(crate) fn wait(self) -> Result<(), SweepFailure> {
         let root_ended = self.wait.waits_for_root();
         let waited = self.wait.wait();
-        Self::after_wait(self.answer, waited, root_ended)
+        Self::after_wait(self.op, self.answer, waited, root_ended)
     }
 
     /// [`wait`](Self::wait), awaited, with no runtime thread blocked.
@@ -832,15 +838,16 @@ impl<'a> Swept<'a> {
     pub(crate) async fn wait_async(self) -> Result<(), SweepFailure> {
         let root_ended = self.wait.waits_for_root();
         let waited = self.wait.wait_async().await;
-        Self::after_wait(self.answer, waited, root_ended)
+        Self::after_wait(self.op, self.answer, waited, root_ended)
     }
 
     fn after_wait(
+        op: &str,
         answer: Result<(), SweepFailure>,
         waited: Result<(), Error>,
         root_ended: bool,
     ) -> Result<(), SweepFailure> {
-        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| SweepFailure { error, root_ended })
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| SweepFailure { error, root_ended })
     }
 }
 
@@ -885,7 +892,7 @@ impl SweepFailure {
         let backstop = Arc::new(backstop);
         let root_member = |source| Error::MemberNotKilled { pid: root, source };
         match walk {
-            Some(Error::MembersLeft { members, unwalked }) => {
+            Some(Error::MembersLeft { members, others }) => {
                 let mut root_seen = false;
                 let mut members: Vec<Arc<Error>> = members
                     .iter()
@@ -902,7 +909,7 @@ impl SweepFailure {
                 if !root_seen {
                     members.push(Arc::new(root_member(backstop)));
                 }
-                Error::members_left(Failures::collect(members).expect("a member was left"), unwalked)
+                Error::members_left(Failures::collect(members).expect("a member was left"), others)
             }
             Some(other) => other.with_peers([Arc::new(root_member(backstop))]),
             None => tree.root_left(root_member(backstop)),

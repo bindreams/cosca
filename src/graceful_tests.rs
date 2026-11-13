@@ -5,6 +5,9 @@ use std::cell::Cell;
 use super::{after_grace, after_tree_grace, GracefulMechanism};
 use crate::error::Error;
 
+/// The call a pure policy row names, as a caller's `graceful_shutdown_tree(pid)` does.
+const CALL: &str = "graceful_shutdown_tree(7)";
+
 fn io_error(msg: &str) -> Error {
     Error::Io(std::io::Error::other(msg.to_owned()))
 }
@@ -156,51 +159,196 @@ fn signal_refuses_a_child_cosca_did_not_create() {
 
 #[skuld::test]
 fn after_grace_is_done_without_a_kill_when_the_process_exited_in_grace() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(Ok(true), k));
+    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Ok(true), k));
     out.expect("exited in grace is done");
     assert_eq!(kills, 0);
 }
 
 #[skuld::test]
 fn after_grace_kills_when_the_grace_ran_out() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(Ok(false), k));
+    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Ok(false), k));
     out.expect("a successful kill is done");
     assert_eq!(kills, 1);
 }
 
 #[skuld::test]
 fn after_grace_kills_then_reports_the_watch_error() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(Err(io_error("watch")), k));
+    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Err(io_error("watch")), k));
     assert!(message(out).contains("watch"));
     assert_eq!(kills, 1, "an unobservable grace escalates");
 }
 
+/// The texts of the failures below a slot variant's cause.
+fn failures_below(error: &Error) -> Vec<String> {
+    error.failures_below().into_iter().map(ToString::to_string).collect()
+}
+
+/// A failure that has a slot, with nothing below it.
+fn containment(detail: &str) -> Error {
+    Error::Containment {
+        detail: detail.to_owned(),
+        source: None,
+    }
+}
+
+// A kill's `Io` is the answer at every count, with its OS code: nothing's meaning covers a refused
+// kill but the refusal itself. The grace wait's failure is logged at warn, not carried.
 #[skuld::test]
-fn after_grace_kill_error_wins_over_the_watch_error() {
-    let (out, kills) = counted(Err(io_error("kill")), |k| after_grace(Err(io_error("watch")), k));
-    let msg = message(out);
-    assert!(msg.contains("kill") && !msg.contains("watch"), "{msg}");
+fn after_grace_an_io_kill_error_stays_the_answer_and_the_watch_error_is_a_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (out, kills) = counted(Err(io_error("kill")), |k| after_grace(CALL, Err(io_error("watch")), k));
+    assert!(matches!(&out, Err(Error::Io(e)) if e.to_string() == "kill"), "{out:?}");
     assert_eq!(kills, 1);
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "watch");
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.starts_with(CALL)),
+        "the warn names the caller's call: {logged:?}"
+    );
+}
+
+// With no watch failure the kill's error is returned as it is: a raw `Io` keeps its code.
+#[skuld::test]
+fn after_grace_a_lone_kill_error_stays_as_it_is() {
+    let (out, _) = counted(Err(io_error("kill")), |k| after_grace(CALL, Ok(false), k));
+    assert!(matches!(out, Err(Error::Io(_))), "{out:?}");
+}
+
+// A kill error that has a slot keeps its variant, with the watch failure as its cause.
+#[skuld::test]
+fn after_grace_a_kill_error_with_a_slot_keeps_its_variant() {
+    let (out, _) = counted(Err(containment("kill")), |k| {
+        after_grace(CALL, Err(io_error("watch")), k)
+    });
+    assert!(
+        matches!(&out, Err(Error::Containment { detail, source: Some(cause) })
+            if detail == "kill" && cause.to_string() == "watch"),
+        "{out:?}"
+    );
 }
 
 #[skuld::test]
 fn after_tree_grace_sweeps_even_when_the_root_exited() {
-    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(Ok(true), s));
+    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(CALL, Ok(true), s));
     out.expect("a successful sweep is done");
     assert_eq!(sweeps, 1);
 }
 
 #[skuld::test]
-fn after_tree_grace_sweep_error_wins_over_the_watch_error() {
-    let (out, sweeps) = counted(Err(io_error("sweep")), |s| after_tree_grace(Err(io_error("watch")), s));
-    let msg = message(out);
-    assert!(msg.contains("sweep") && !msg.contains("watch"), "{msg}");
+fn after_tree_grace_an_io_sweep_error_stays_the_answer_and_the_watch_error_is_a_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (out, sweeps) = counted(Err(io_error("sweep")), |s| {
+        after_tree_grace(CALL, Err(io_error("watch")), s)
+    });
+    assert!(matches!(&out, Err(Error::Io(e)) if e.to_string() == "sweep"), "{out:?}");
     assert_eq!(sweeps, 1);
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "watch");
+    assert!(matches!(&logged[..], [(log::Level::Warn, _)]), "{logged:?}");
+}
+
+// A sweep that left members has a slot for the call's other failures: they are its `others`, in the
+// order given, and not members.
+#[skuld::test]
+fn a_sweep_that_left_members_carries_the_refusal_and_the_watch_error_in_others() {
+    let left = || {
+        Error::members_left(
+            crate::error::Failures::new(
+                std::sync::Arc::new(Error::MemberNotKilled {
+                    pid: 7,
+                    source: std::sync::Arc::new(io_error("member")),
+                }),
+                [],
+            ),
+            None,
+        )
+    };
+    let out = super::joined(CALL, left(), [containment("refused"), io_error("watch")]);
+    let Error::MembersLeft { members, others } = &out else {
+        panic!("the variant is kept: {out:?}");
+    };
+    assert_eq!(members.iter().len(), 1);
+    let Some(Error::Several(others)) = others.as_deref() else {
+        panic!("expected a Several in others: {out:?}");
+    };
+    let texts: Vec<_> = others.iter().map(|e| e.to_string()).collect();
+    assert!(
+        texts[0].contains("refused") && texts[1] == "watch" && texts.len() == 2,
+        "{texts:?}"
+    );
+
+    let out = after_tree_grace(CALL, Err(io_error("watch")), || Err(left()));
+    assert!(
+        matches!(&out, Err(Error::MembersLeft { others: Some(o), .. }) if o.to_string() == "watch"),
+        "{out:?}"
+    );
+}
+
+#[skuld::test]
+fn after_tree_grace_a_sweep_error_with_a_slot_keeps_its_variant() {
+    let (out, _) = counted(Err(containment("sweep")), |s| {
+        after_tree_grace(CALL, Err(io_error("watch")), s)
+    });
+    assert!(
+        matches!(&out, Err(Error::Containment { detail, source: Some(cause) })
+            if detail == "sweep" && cause.to_string() == "watch"),
+        "{out:?}"
+    );
+}
+
+// The root's reap is the answer when it fails, with the refusal of the cooperative signal and then
+// the watch failure below it; a reap that succeeds leaves the watch failure as the answer (the sweep
+// proved the tree clear, which supersedes the refusal), and with neither failing the status comes
+// back.
+#[skuld::test]
+fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() {
+    let status = std::process::ExitStatus::default();
+    let out = super::after_reap(
+        CALL,
+        Err(containment("reap")),
+        Some(containment("refused")),
+        Some(io_error("watch")),
+    );
+    let out = out.expect_err("all failed");
+    assert!(
+        matches!(&out, Error::Containment { detail, .. } if detail == "reap"),
+        "{out:?}"
+    );
+    let below = failures_below(&out);
+    assert!(
+        below.len() == 2 && below[0].contains("refused") && below[1] == "watch",
+        "{below:?}"
+    );
+    assert_eq!(
+        message_of(super::after_reap(
+            CALL,
+            Ok(status),
+            Some(containment("refused")),
+            Some(io_error("watch"))
+        )),
+        "watch"
+    );
+    assert_eq!(
+        message_of(super::after_reap(CALL, Err(io_error("reap")), None, None)),
+        "reap"
+    );
+    assert_eq!(
+        super::after_reap(CALL, Ok(status), None, None).expect("neither failed"),
+        status
+    );
+    assert_eq!(
+        super::after_reap(CALL, Ok(status), Some(containment("refused")), None).expect("a superseded refusal"),
+        status
+    );
+}
+
+fn message_of(r: Result<std::process::ExitStatus, Error>) -> String {
+    r.expect_err("an error").to_string()
 }
 
 #[skuld::test]
 fn after_tree_grace_reports_the_watch_error_after_the_sweep() {
-    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(Err(io_error("watch")), s));
+    let (out, sweeps) = counted(Ok(()), |s| after_tree_grace(CALL, Err(io_error("watch")), s));
     assert!(message(out).contains("watch"));
     assert_eq!(sweeps, 1);
 }

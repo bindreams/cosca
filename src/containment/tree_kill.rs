@@ -332,9 +332,10 @@ pub(crate) fn refused_unobserved(pid: u32) -> Error {
 }
 
 /// The call's answer once its wait has run: a kill that failed is the answer, over a wait that failed
-/// too (the wait's error is logged); otherwise a wait that failed is the failure, as `as_failure`
-/// makes it.
+/// too (the wait's error is logged, once, naming the call `op`); otherwise a wait that failed is the
+/// failure, as `as_failure` makes it.
 pub(crate) fn answer_after_wait<F>(
+    op: &str,
     answer: Result<(), F>,
     waited: Result<(), Error>,
     as_failure: impl FnOnce(Error) -> F,
@@ -343,16 +344,17 @@ pub(crate) fn answer_after_wait<F>(
         (Ok(()), waited) => waited.map_err(as_failure),
         (Err(failure), Ok(())) => Err(failure),
         (Err(failure), Err(waited)) => {
-            log_failed_wait("a failed kill_tree", &waited);
+            log_failed_wait(&format!("a failed {op}"), &waited);
             Err(failure)
         }
     }
 }
 
 /// Log the failed wait behind a failed answer, which stays the answer: the one place that policy's
-/// log is written. `after` names what failed first.
+/// log is written. `after` names the call that failed first. A wait that failed means a member's exit
+/// was not seen, which the answer does not say, so it is a `warn`.
 pub(crate) fn log_failed_wait(after: &str, waited: &Error) {
-    log::debug!(
+    log::warn!(
         "the wait after {after} also failed: {report}",
         report = crate::error::Report(waited)
     );

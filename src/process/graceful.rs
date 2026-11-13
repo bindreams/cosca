@@ -28,12 +28,14 @@ impl Process {
     /// Unix only; Windows returns `Unsupported`. `grace` is relative; `ZERO` signals, polls
     /// once, then escalates.
     ///
-    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
+    /// A watch failure surfaces only after the kill runs. A kill error is the call's error, and the
+    /// watch failure joins it as a peer (`Error::with_peers_or_warn`).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
         self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        crate::graceful::after_grace(self.wait_timeout(grace), || self.kill())
+        let call = format!("graceful_shutdown({})", self.id.pid());
+        crate::graceful::after_grace(&call, self.wait_timeout(grace), || self.kill())
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies
@@ -59,7 +61,7 @@ impl Process {
     /// start tick, is waited for in its successor's place. A member whose exit cannot be observed is
     /// an [`Error::Unassessable`] naming it, returned once the others have been waited for. [`send_kill_tree`](Process::send_kill_tree) only sends.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.kill_tree_with(&crate::identity::HostKernel)
+        self.kill_tree_with("kill_tree", &crate::identity::HostKernel)
     }
 
     /// [`kill_tree`](Self::kill_tree) that sends and does not wait: `Ok` says every member the walk
@@ -68,19 +70,24 @@ impl Process {
         self.send_kill_tree_with(&crate::identity::HostKernel)
     }
 
-    /// [`kill_tree`](Self::kill_tree), reading through `kernel`.
-    pub(crate) fn kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+    /// [`kill_tree`](Self::kill_tree) for the call `op`, which a warn about its failed wait names,
+    /// reading through `kernel`.
+    pub(crate) fn kill_tree_with(&self, op: &str, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         let (answer, wait) = self.sweep(kernel);
         let waited = wait.wait();
-        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| error)
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
 
     /// [`kill_tree_with`](Self::kill_tree_with), awaited, with no runtime thread blocked.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn kill_tree_with_async(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+    pub(crate) async fn kill_tree_with_async(
+        &self,
+        op: &str,
+        kernel: &dyn crate::identity::Kernel,
+    ) -> Result<(), Error> {
         let (answer, wait) = self.sweep(kernel);
         let waited = wait.wait_async().await;
-        crate::containment::tree_kill::answer_after_wait(answer, waited, |error| error)
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
 
     /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
@@ -148,14 +155,19 @@ impl Process {
     ///
     /// A grace-watch failure does not strand the tree between the soft signal and the sweep:
     /// the hard sweep still runs (an unobservable grace escalates immediately), and the watch
-    /// error is surfaced afterward; a sweep failure would win over it. The sweep's errors are those
-    /// of [`kill_tree`](Process::kill_tree), a member it left running included.
+    /// error is surfaced afterward. A sweep failure is the call's error, and the watch failure joins
+    /// it as a peer, as for [`graceful_shutdown`](Process::graceful_shutdown). The sweep's errors
+    /// are those of [`kill_tree`](Process::kill_tree); one that left members running carries the watch
+    /// failure in its `others`.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
-        crate::graceful::after_tree_grace(self.wait_timeout(grace), || self.kill_tree())
+        let call = format!("graceful_shutdown_tree({})", self.id.pid());
+        crate::graceful::after_tree_grace(&call, self.wait_timeout(grace), || {
+            self.kill_tree_with("graceful_shutdown_tree", &crate::identity::HostKernel)
+        })
     }
 }
 

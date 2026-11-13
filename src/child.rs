@@ -381,10 +381,18 @@ impl Child {
     /// send if the pid now names another process. If the unique id read at spawn cannot be read
     /// again, nothing is sent and `kill` returns the error.
     pub fn kill(&self) -> Result<(), Error> {
+        self.kill_after(None)
+    }
+
+    /// [`kill`](Child::kill) as a step of an operation that already sent `earlier`, so an error never
+    /// claims the whole operation sent nothing: the escalation of a graceful shutdown.
+    pub(crate) fn kill_after(&self, earlier: Option<&str>) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            self.kill_sent().map(drop)
+            self.kill_sent(earlier).map(drop)
         }
+        #[cfg(not(unix))]
+        let _ = earlier;
         // Returns Ok(()) for an already-exited child (std delegates to std::process::Child::kill;
         // the raw path maps an already-dead TerminateProcess to Ok). ACCESS_DENIED on a UAC child
         // becomes the typed `Unkillable`.
@@ -409,14 +417,14 @@ impl Child {
         Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
-    /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
+    /// [`kill_after`](Child::kill_after), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
-    pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
+    pub(crate) fn kill_sent(&self, earlier: Option<&str>) -> Result<crate::signal::Sent, Error> {
         let gate = self.kill_gate();
         // A front's refusal is permanent and says nothing of the pid, so it outranks a root launchd
         // holds, which the caller can do nothing about either way.
         if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
-            self.refuse_unpinned("kill", None)?;
+            self.refuse_unpinned("kill", earlier)?;
         }
         self.kill_sent_gated(gate)
     }
@@ -687,14 +695,14 @@ impl Child {
         #[cfg(not(unix))]
         let _ = earlier;
         if let Err(e) = self.require_contained() {
-            return Swept::unwaited(Err(e.into()));
+            return Swept::unwaited(op, Err(e.into()));
         }
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. It comes before the root's state: a front
         // that may not be signalled is refused whatever the root's number names.
         #[cfg(unix)]
         let front = match self.kill_gate() {
-            crate::elevation::front::Gate::Closed(unkillable) => return Swept::unwaited(Err(unkillable.into())),
+            crate::elevation::front::Gate::Closed(unkillable) => return Swept::unwaited(op, Err(unkillable.into())),
             crate::elevation::front::Gate::Open => None,
             crate::elevation::front::Gate::Exited => Some(None),
             crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
@@ -716,7 +724,7 @@ impl Child {
                 drop(held);
                 let settled = self.tree.settle_for_kill_tree(answered, false);
                 wait.reaching(settled.killed_again);
-                return Swept::new(settled.answer.map_err(SweepFailure::from), wait);
+                return Swept::new(op, settled.answer.map_err(SweepFailure::from), wait);
             }
             TreeKillOutcome::Skipped(skip) => {
                 // The root's handle names the root even when its number is reused; its kill ends the
@@ -733,6 +741,7 @@ impl Child {
                 drop(held);
                 wait.reaching(answered.killed_again);
                 return Swept::new(
+                    op,
                     answered.answer.map_err(|error| SweepFailure { error, root_ended }),
                     wait.with_root(self.proc.os_process(), root_ended),
                 );
@@ -746,7 +755,7 @@ impl Child {
             Ok(group_result) => group_result,
             Err(settled) => {
                 wait.reaching(settled.killed_again);
-                return Swept::new(Err(settled.answer), wait);
+                return Swept::new(op, Err(settled.answer), wait);
             }
         };
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
@@ -762,7 +771,7 @@ impl Child {
             }
             .map_err(SweepFailure::from);
             wait.reaching(settled.killed_again);
-            return Swept::new(answer, wait);
+            return Swept::new(op, answer, wait);
         }
         // Backstop for the TreeWalk mechanism: its hard_kill sends the root's kill through this handle,
         // but kills nothing if the walk finds no root or cannot read the process table — this
@@ -786,6 +795,7 @@ impl Child {
         wait.reaching(settled.killed_again);
         // A root launchd holds is not ours to wait on: nothing of ours killed it.
         Swept::new(
+            op,
             settled.answer,
             wait.with_root(self.proc.os_process(), root_ended && !unpinned),
         )
@@ -993,7 +1003,10 @@ impl Child {
     /// `Output` and exit status.
     ///
     /// A child that stops reading stdin ends the input; it is not an error. Errors from the pipes
-    /// are returned after the child has been waited for.
+    /// are returned after the child has been waited for. When more than one of the wait, the pump
+    /// loop and the streams fails, the first (in that order, then stdout, stderr, stdin) is the error,
+    /// as it is. Each later one names its stream (`pump`, `stdout`, `stderr` or `stdin`) and joins the
+    /// error as a peer (`Error::with_peers_or_warn`).
     ///
     /// `input` of `Some` for a child whose stdin is not piped, or was already taken, is an
     /// [`Error::Io`] of kind `InvalidInput`; no pipe is taken then.

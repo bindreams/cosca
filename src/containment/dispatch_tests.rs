@@ -60,12 +60,12 @@ fn members_of(error: &crate::error::Error) -> Vec<(u32, Option<i32>)> {
         .collect()
 }
 
-/// The walk that was not made, of a `MembersLeft`.
+/// The failures of a `MembersLeft` that name no member.
 fn unwalked_of(error: &crate::error::Error) -> Option<&crate::error::Error> {
-    let crate::error::Error::MembersLeft { unwalked, .. } = error else {
+    let crate::error::Error::MembersLeft { others, .. } = error else {
         panic!("expected MembersLeft, got {error:?}");
     };
-    unwalked.as_deref()
+    others.as_deref()
 }
 
 /// What a tree kill left once the root had its say is one `MembersLeft` of every member, in the order
@@ -112,7 +112,7 @@ fn one_member_is_a_members_left_and_one_error_that_is_no_member_stays_as_it_is()
     assert!(matches!(refused, Error::Containment { .. }), "{refused:?}");
 }
 
-/// The error of a walk that was not made, after an earlier kill left members, is the `unwalked` of
+/// The error of a walk that was not made, after an earlier kill left members, is the `others` of
 /// the `MembersLeft`, no member of it.
 #[skuld::test]
 fn the_error_of_a_walk_not_made_is_unwalked_after_earlier_members() {
@@ -139,7 +139,7 @@ fn the_error_of_a_walk_not_made_is_unwalked_after_earlier_members() {
     );
 }
 
-/// Two errors that name no member are both kept, whether or not members were left: the `unwalked` of
+/// Two errors that name no member are both kept, whether or not members were left: the `others` of
 /// the `MembersLeft` is a `Several` of them, and with no member the answer is that `Several`.
 ///
 /// Mutant: a later error overwrites the earlier one.
@@ -1898,9 +1898,9 @@ fn a_backstop_failure_adds_the_root_to_the_members_the_walk_left() {
     assert_eq!(members_of(&error), [(2, Some(a)), (1, Some(b))]);
 }
 
-/// A walk that left a member and then could not be made again keeps its `unwalked` error; the root the
+/// A walk that left a member and then could not be made again keeps its `others` error; the root the
 /// backstop failed to kill joins the members.
-/// Mutant: the root is dropped, or put in `unwalked`, or `unwalked` is lost.
+/// Mutant: the root is dropped, or put in `others`, or `others` is lost.
 #[skuld::test]
 fn a_backstop_failure_adds_the_root_to_the_members_and_keeps_the_unwalked_error() {
     use super::{TreeKillOutcome, Unkilled};

@@ -370,7 +370,7 @@ fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
             .finish(
                 &term_call("skip_peers_probe_d1"),
                 &skip(unsure(libc::EACCES)),
-                None::<Result<bool, std::io::Error>>,
+                None,
                 || Gate::Open,
                 || Ok(crate::signal::Sent::Delivered),
             )

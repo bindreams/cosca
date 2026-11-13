@@ -131,9 +131,12 @@ impl Child {
     /// child. Anything below it that left that group is the intermediate's business — and if the
     /// intermediate is itself contained by *its* holder, `kill_tree` there is the backstop.
     ///
-    /// A watch failure never skips the kill and reap; it surfaces only after they run, and a
-    /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
-    /// applies).
+    /// A watch failure never skips the kill and reap; it surfaces only after they run. A kill or
+    /// reap error is the call's error (the child then stays owned — `Drop`'s teardown applies), and
+    /// the watch failure joins it as a peer (`Error::with_peers_or_warn`). The escalation is
+    /// [`kill`](Child::kill), so its refusal answers as `kill`'s does: [`Unkillable`](crate::error::ElevationErrorKind::Unkillable)
+    /// for a child that may run as another user (or a front); a refused kill of any other child is
+    /// the OS's [`Error::Io`], with its code.
     ///
     /// An elevated child behind a front (see [`kill`](Child::kill)) that outlives the grace is killed
     /// only through a cgroup that holds it. Outside one it is left running, and this answers
@@ -156,57 +159,18 @@ impl Child {
         if let Ok(Some(status)) = &watch {
             return Ok(*status); // exited within grace (already reaped by wait_timeout)
         }
-        if let Err(e) = &watch {
-            log::debug!(
-                "graceful_shutdown({id}): watch error before escalation (subsumed if it also fails): {report}",
-                id = self.pid(),
-                report = crate::error::Report(e)
-            );
-        }
+        let mut watch = watch.err();
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
-        // A root orphaned during the grace is no longer ours to kill.
-        #[cfg(unix)]
-        self.refuse_unpinned("kill", Some("the SIGTERM"))?;
-        // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
-        // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
-        // refused kill stays the raw `Io`.
-        #[cfg(unix)]
-        match self.kill_gate() {
-            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
-            // An exit is permanent, so a refused signal to an exited front changes nothing.
-            crate::elevation::front::Gate::Exited => match self.kill_root() {
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    log::debug!(
-                        "the kill of exited front pid {} was refused ({report})",
-                        self.pid(),
-                        report = crate::error::Report(&e)
-                    );
-                }
-                other => other.map(drop).map_err(Error::Io)?,
-            },
-            crate::elevation::front::Gate::Open => self.kill_root().map(drop).map_err(Error::Io)?,
-            // A live front in its cgroup: killed through it, and nothing signalled after it.
-            crate::elevation::front::Gate::CgroupOnly(front) => {
-                // A cgroup kill names no group by the root's pid, so no root is given.
-                debug_assert_eq!(
-                    self.containment(),
-                    crate::containment::Containment::CgroupV2,
-                    "CgroupOnly is a front in a cgroup"
-                );
-                self.tree
-                    .kill_settled(None)
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
-                self.cgroup_kill_reached(front)?;
-            }
-        }
-        #[cfg(not(unix))]
-        self.kill_root().map(drop).map_err(Error::Io)?;
+        // A watch failure must not strand the child between the soft signal and the escalation, so
+        // the escalation's failures end the call only after it has been given to them. The escalation is
+        // `kill`, as for any child, with the `SIGTERM` named as already sent.
+        let call = format!("graceful_shutdown({})", self.pid());
+        self.kill_after(Some("the SIGTERM"))
+            .map_err(|e| crate::graceful::joined(&call, e, watch.take()))?;
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
-        let status = self.wait()?;
-        watch?;
-        Ok(status)
+        crate::graceful::after_reap(&call, self.wait(), None, watch)
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: send the group its graceful
@@ -264,9 +228,13 @@ impl Child {
     /// reaping first could let `killpg` hit a recycled group. A skipped or no-op sweep alike
     /// preserve a graceful exit's status (the lone backstop no-ops on an already-dead root).
     ///
-    /// A watch failure never skips the sweep and reap; a sweep error wins over it — and over
-    /// a graceful root exit (survivors may remain; the root is still reaped first when its
-    /// exit was observed, otherwise the child stays owned for `Drop`).
+    /// A watch failure never skips the sweep and reap. A sweep error is the call's error over it
+    /// — and over a graceful root exit (survivors may remain; the root is still reaped first when
+    /// its exit was observed, otherwise the child stays owned for `Drop`) — and so is a reap
+    /// error once the sweep succeeded. A refused graceful signal and then the watch failure join the
+    /// error as peers, in that order (`Error::with_peers_or_warn`); for a [`Error::MembersLeft`]
+    /// they are its `others`. The refusal is dropped only when the tree is proved clear and the root
+    /// reaped.
     ///
     /// **A refused or unconfirmed graceful signal never skips the grace wait and hard sweep
     /// either.** If the signal went out and the check after it fails (a live member refuses it, or
@@ -275,12 +243,12 @@ impl Child {
     /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
     /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
     /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
-    /// call reports `Ok`. It resurfaces only indirectly, as the sweep's own error, if the
-    /// sweep then fails too. A failed group send on an fd marker that still signalled the root, a
-    /// holder or a walked descendant is a signal that went out: the grace is held and the sweep runs. A signal that was not
-    /// sent at all (`NoConsole`, an invalid process group, a root whose number may name another
-    /// process, an fd marker whose group send failed with nothing else signalled) returns at once:
-    /// there is nothing for a grace wait or sweep to act on yet.
+    /// call reports `Ok`. If the sweep fails too, the refusal is a peer of its error. A failed group
+    /// send on an fd marker that still signalled the root, a holder or a walked descendant is a
+    /// signal that went out: the grace is held and the sweep runs. A signal that was not sent at all
+    /// (`NoConsole`, an invalid process group, a root whose number may name another process, an fd
+    /// marker whose group send failed with nothing else signalled) returns at once: there is
+    /// nothing for a grace wait or sweep to act on yet.
     ///
     /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
     ///
@@ -320,7 +288,7 @@ impl Child {
         // internally; the redundancy is intentional so an uncontained child errors up front.
         self.require_contained()?;
 
-        let (term_result, earlier) = match self.signal_tree_cooperatively() {
+        let (term, earlier) = match self.signal_tree_cooperatively() {
             SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
             SignalTreeCooperativelyOutcome::End(e) => return Err(e),
             #[cfg(target_os = "linux")]
@@ -334,21 +302,12 @@ impl Child {
         };
 
         // The signal went out, so every error of the check after it holds, whatever its variant: the
-        // grace is waited and the sweep can still reach what the signal did not.
-        let term = match term_result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                log::debug!(
-                    "graceful_shutdown_tree({id}): terminate_tree refused; the sweep's own outcome decides what surfaces: {report}",
-                    id = self.pid(),
-                    report = crate::error::Report(&e)
-                );
-                Err(e)
-            }
-        };
+        // grace is waited and the sweep can still reach what the signal did not. A refusal is dropped
+        // when the sweep proves the tree clear.
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::AfterTerminate);
 
+        let call = format!("graceful_shutdown_tree({})", self.pid());
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         //
         // `drained`: whether the sweep below is skippable. Only `TreeDrain::AllMembersExited`
@@ -387,16 +346,9 @@ impl Child {
                 Err(e) => (false, false, Some(e)),
             }
         };
-        if let Some(e) = &watch_err {
-            log::debug!(
-                "graceful_shutdown_tree({id}): watch error before escalation (subsumed if it also fails): {report}",
-                id = self.pid(),
-                report = crate::error::Report(e)
-            );
-        }
-        // A sweep Err subsumes any watch or terminate Err; it must propagate before the reap on
-        // a LIVE root (waiting unswept would hang), but once the root is dead (its exit was observed,
-        // or the sweep's backstop killed it), the reap runs first.
+        // A sweep Err is the answer, with the terminate and watch failures below it; it must propagate
+        // before the reap on a LIVE root (waiting unswept would hang), but once the root is dead (its
+        // exit was observed, or the sweep's backstop killed it), the reap runs first.
         if !drained {
             // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
             // not merely that it would have no-op'd: forcing this call to fail and then
@@ -415,45 +367,49 @@ impl Child {
                 if (root_exited || sweep.root_ended) && !self.root_is_unpinned() {
                     // Best-effort reap so a dead root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
-                    // secondary — but every other discarded error in this module is still logged,
-                    // and a silent one here would obscure a second, independent failure mode.
+                    // secondary and is logged, not returned.
                     if let Err(e) = self.wait() {
-                        log::debug!(
-                            "graceful_shutdown_tree({id}): best-effort reap after a swept, exited root also failed: {report}",
+                        log::warn!(
+                            "graceful_shutdown_tree({id}): the best-effort reap after a swept, exited root also failed: {report}",
                             id = self.pid(),
                             report = crate::error::Report(&e)
                         );
                     }
                 }
-                return Err(sweep.error);
+                return Err(crate::graceful::joined(
+                    &call,
+                    sweep.error,
+                    term.err().into_iter().chain(watch_err),
+                ));
             }
         }
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         #[cfg(target_os = "macos")]
         if self.root_is_unpinned() {
-            return Err(crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"));
+            return Err(crate::graceful::joined(
+                &call,
+                crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"),
+                term.err().into_iter().chain(watch_err),
+            ));
         }
         #[cfg(unix)]
-        let status = status_unless_reaped_elsewhere(self.wait(), self.pid())?;
+        let waited = status_unless_reaped_elsewhere(self.wait(), self.pid());
         #[cfg(not(unix))]
-        let status = self.wait()?;
-        if let Some(e) = watch_err {
-            return Err(e);
-        }
+        let waited = self.wait();
         // The tree is confirmed clear here — either the drain watch observed the whole tree
         // directly (`drained`), or the sweep just returned `Ok`: either way, positive,
-        // freshly-measured proof superseding whatever `term` held. Discard it here rather than
-        // returning it — an already-disproved refusal must never outrank the evidence that
-        // disproved it.
-        if let Err(e) = &term {
+        // freshly-measured proof superseding whatever `term` held. A reap that succeeded discards
+        // it, so an already-disproved refusal never outranks the evidence that disproved it; a reap
+        // that failed is the call's own failure, and the refusal is one of its peers.
+        if let (Ok(_), Err(e)) = (&waited, &term) {
             log::debug!(
                 "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {report}",
                 id = self.pid(),
                 report = crate::error::Report(e)
             );
         }
-        Ok(status)
+        crate::graceful::after_reap(&call, waited, term.err(), watch_err)
     }
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
@@ -556,10 +512,10 @@ impl Child {
             crate::containment::dispatch::TreeSignal::Term,
             None,
         );
-        if let Err(e) = self.tree.wait_drained(crate::wait::deadline_from(grace)) {
-            call.holders_grace_failed(&e);
-        }
-        self.holders_shutdown(&call, skip).finish()
+        // A failed grace wait means the holders are killed now.
+        let watch = self.tree.wait_drained(crate::wait::deadline_from(grace)).err();
+        let label = format!("graceful_shutdown_tree({})", self.pid());
+        crate::graceful::joined(&label, self.holders_shutdown(&call, skip).finish(), watch)
     }
 
     /// The end of [`shut_down_holders_only`](Self::shut_down_holders_only): the mechanism's kill with
@@ -649,30 +605,26 @@ impl PidfdShutdown {
     /// The call's error, after `exited`, the grace wait's outcome (`None`: not waited): a root
     /// that did not exit within it, or whose wait failed, is killed by `kill` unless `kill_gate`
     /// refuses it. One `warn` names what was skipped and what was sent. The error is an `Unassessable`
-    /// with the refusal's cause, and below it the failed signal's `Io` (a leaf: it takes no peers) and
-    /// the failed kill; a failed signal that is no `Io` keeps its variant, with the kill and the
-    /// refusal's cause as peers.
+    /// with the refusal's cause, and below it the failed signal's `Io` (a leaf: it takes no peers), the
+    /// failed grace wait and the failed kill; a failed signal that is no `Io` keeps its variant, with the
+    /// wait, the kill and the refusal's cause as peers. The call's own failure comes first, then the
+    /// wait's.
     pub(crate) fn finish(
         self,
         call: &SkipCall<'_>,
         skip: &Skip,
-        exited: Option<Result<bool, impl std::error::Error + 'static>>,
+        exited: Option<Result<bool, Error>>,
         kill_gate: impl FnOnce() -> crate::elevation::front::Gate,
         kill: impl FnOnce() -> Result<crate::signal::Sent, Error>,
     ) -> Error {
         use crate::elevation::front::Gate;
         use crate::signal::Sent;
+        // A grace wait that failed means the root is killed now.
+        let mut watch = None;
         let kill = match exited {
             None | Some(Ok(true)) => None,
             Some(outcome) => {
-                if let Err(e) = outcome {
-                    log::debug!(
-                        "{}({}): the root's grace wait failed, so it is killed now: {report}",
-                        call.op,
-                        call.pid,
-                        report = crate::error::Report(&e)
-                    );
-                }
+                watch = outcome.err().map(std::sync::Arc::new);
                 Some(match kill_gate() {
                     Gate::Closed(unkillable) => Err(unkillable),
                     _ => kill(),
@@ -708,11 +660,15 @@ impl PidfdShutdown {
         let cause = skip.why.cause();
         // An `Io` is a leaf with no slot for peers: it goes below the call's `Unassessable`.
         match (self.term, kill) {
-            (Err(term), kill) => {
-                term.with_peers_or_unassessable(|| detail, cause, kill.and_then(Result::err).map(std::sync::Arc::new))
-            }
-            (_, Some(Err(kill))) => kill.with_peers_or_unassessable(|| detail, cause, []),
-            _ => Error::Unassessable { detail, source: cause },
+            (Err(term), kill) => term.with_peers_or_unassessable(
+                || detail,
+                cause,
+                watch
+                    .into_iter()
+                    .chain(kill.and_then(Result::err).map(std::sync::Arc::new)),
+            ),
+            (_, Some(Err(kill))) => kill.with_peers_or_unassessable(|| detail, cause, watch),
+            _ => Error::Unassessable { detail, source: cause }.with_peers(watch),
         }
     }
 }
