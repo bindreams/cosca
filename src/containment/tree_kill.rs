@@ -7,6 +7,7 @@
 //! The Linux `Ticks` limit of the by-identity open applies (see [`Child::kill_tree`](crate::Child::kill_tree)).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::drain_edge::DrainEdge;
@@ -33,12 +34,82 @@ pub(crate) struct KillWait<'a> {
     /// is waited for once.
     members: Vec<ProcessId>,
     /// Members a send reached but could not name by identity, so their exit cannot be observed.
-    unobserved: Vec<Error>,
+    unobserved: Vec<Unnamed>,
     /// The tree's own edge for "no member runs", chosen by the mechanism: only a kernel tree whose
     /// kill landed has one. It is waited for with no deadline.
     edge: Option<DrainEdge<'a>>,
     root: RootEnd<'a>,
     kernel: &'a dyn Kernel,
+}
+
+/// A member a kill's send reached but whose identity could not be had (or a listing that failed
+/// whole), so its exit cannot be observed. `why` says so; `pid` names the member where the listing
+/// had one, so a later wait that meets the same member does not report it again ([`Settled`]).
+#[derive(Debug)]
+pub(crate) struct Unnamed {
+    pub(crate) pid: Option<u32>,
+    why: Error,
+}
+
+impl Unnamed {
+    /// The member `pid`, whose identity could not be had for `cause`.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn member(pid: u32, cause: Error) -> Unnamed {
+        Unnamed {
+            pid: Some(pid),
+            why: exit_unobserved(pid, cause),
+        }
+    }
+
+    /// A member, or a listing, with no pid to name: `why` is the whole error.
+    #[cfg(any(target_os = "linux", windows, test))]
+    pub(crate) fn nameless(why: Error) -> Unnamed {
+        Unnamed { pid: None, why }
+    }
+
+    /// The error saying the member's exit cannot be observed, for a row that states its words.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn why(&self) -> &Error {
+        &self.why
+    }
+}
+
+/// What a kill's wait has settled when it waits on the tree's edge, which neither waits for nor reports
+/// it again. Only a Job's edge reads it.
+///
+/// A snapshot entry with a readable identity is settled iff that identity is one of the `members`,
+/// each of which the wait saw exit or reported (the root too, when its handle reads an identity). An
+/// entry whose identity cannot be read is settled iff its pid is one of the `reported`: the pid of a
+/// member or the root whose wait failed, or of one the listing could not name. The pid of a member whose
+/// exit was seen is never matched: it names another process now.
+#[derive(Default)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Job's edge reads what a wait settled")
+)]
+pub(crate) struct Settled {
+    members: Vec<ProcessId>,
+    reported: Vec<u32>,
+}
+
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Job's edge reads what a wait settled")
+)]
+impl Settled {
+    pub(crate) fn new(members: Vec<ProcessId>, reported: Vec<u32>) -> Settled {
+        Settled { members, reported }
+    }
+
+    /// Whether the member `id`, whose identity a snapshot read, is settled.
+    pub(crate) fn covers_identity(&self, id: ProcessId) -> bool {
+        self.members.contains(&id)
+    }
+
+    /// Whether the entry `pid`, whose identity a snapshot could not read, is settled.
+    pub(crate) fn covers_unreadable(&self, pid: u32) -> bool {
+        self.reported.contains(&pid)
+    }
 }
 
 /// What a [`KillWait`] does about the root, which its owner holds.
@@ -49,8 +120,9 @@ enum RootEnd<'a> {
     /// The mechanism's own kill ended it (a tree walk), for a caller that holds the root's handle but no
     /// backstop ([`Process::kill_tree`](crate::Process::kill_tree)).
     Killed,
-    /// Its kill landed, and it is waited for through its owner's handle.
-    Waited(&'a dyn OsProcess),
+    /// Its kill landed, and it is waited for through its owner's handle. `pid` is the root's, as its
+    /// owner knows it.
+    Waited { os: &'a dyn OsProcess, pid: u32 },
 }
 
 impl<'a> TreeKill<'a> {
@@ -79,7 +151,7 @@ impl<'a> TreeKill<'a> {
     /// be observed.
     #[cfg(test)]
     pub(crate) fn unobserved(mut self, why: Error) -> TreeKill<'a> {
-        self.wait.unobserved.push(why);
+        self.wait.unobserved.push(Unnamed::nameless(why));
         self
     }
 
@@ -91,14 +163,14 @@ impl<'a> TreeKill<'a> {
     pub(crate) fn listed(
         sent: TreeKillOutcome,
         members: Vec<ProcessId>,
-        unobserved: Vec<Error>,
+        unobserved: Vec<Unnamed>,
         edge: DrainEdge<'a>,
     ) -> TreeKill<'a> {
         if !matches!(sent, TreeKillOutcome::Ran(Ok(()))) {
-            for why in &unobserved {
+            for unnamed in &unobserved {
                 log::debug!(
                     "the kill failed, so a member the listing could not name is not waited for: {report}",
-                    report = crate::error::Report(why)
+                    report = crate::error::Report(&unnamed.why)
                 );
             }
             return TreeKill::of(sent);
@@ -156,14 +228,15 @@ impl<'a> KillWait<'a> {
 
     /// Whether the wait is for the root too: its kill landed, so it is dead whatever the wait finds.
     pub(crate) fn waits_for_root(&self) -> bool {
-        matches!(self.root, RootEnd::Waited(_))
+        matches!(self.root, RootEnd::Waited { .. })
     }
 
-    /// Wait for the root through its owner's handle if `landed`, whether its kill landed. A kill that
-    /// did not land leaves what the mechanism recorded ([`TreeKill::root_killed`]) as it is.
-    pub(crate) fn with_root(mut self, root: &'a dyn OsProcess, landed: bool) -> KillWait<'a> {
+    /// Wait for the root, whose pid its owner knows as `pid`, through its owner's handle if `landed`,
+    /// whether its kill landed. A kill that did not land leaves what the mechanism recorded
+    /// ([`TreeKill::root_killed`]) as it is.
+    pub(crate) fn with_root(mut self, root: &'a dyn OsProcess, pid: u32, landed: bool) -> KillWait<'a> {
         if landed {
-            self.root = RootEnd::Waited(root);
+            self.root = RootEnd::Waited { os: root, pid };
         }
         self
     }
@@ -179,23 +252,31 @@ impl<'a> KillWait<'a> {
     pub(crate) fn wait(self) -> Result<(), Error> {
         let KillWait {
             members,
-            mut unobserved,
+            unobserved: unnamed,
             edge,
             root,
             kernel,
         } = self;
-        for id in once_each(members) {
-            if let Err(why) = wait_for_member(kernel, id) {
-                unobserved.push(why);
+        let mut members: Vec<ProcessId> = once_each(members).collect();
+        let mut reported = reported_pids(&unnamed);
+        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        for &id in &members {
+            if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
+                reported.push(id.pid());
+                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited(root) = root {
-            if let Err(why) = wait_for_exit(root) {
+        if let RootEnd::Waited { os: root, pid } = root {
+            let waited = wait_for_exit(root);
+            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
+            if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge.wait(None).and_then(drained) {
+            // Every member reached is settled: it exited or was reported above, once.
+            let settled = Settled::new(members, reported);
+            if let Err(why) = edge.wait_past(None, &settled).and_then(drained) {
                 unobserved.push(why);
             }
         }
@@ -209,28 +290,75 @@ impl<'a> KillWait<'a> {
     pub(crate) async fn wait_async(self) -> Result<(), Error> {
         let KillWait {
             members,
-            mut unobserved,
+            unobserved: unnamed,
             edge,
             root,
             kernel,
         } = self;
-        for id in once_each(members) {
-            if let Err(why) = wait_for_member_async(kernel, id).await {
-                unobserved.push(why);
+        let mut members: Vec<ProcessId> = once_each(members).collect();
+        let mut reported = reported_pids(&unnamed);
+        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        for &id in &members {
+            if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
+                reported.push(id.pid());
+                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited(root) = root {
-            if let Err(why) = wait_for_exit_async(root).await {
+        if let RootEnd::Waited { os: root, pid } = root {
+            let waited = wait_for_exit_async(root).await;
+            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
+            if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge.wait_async(None).await.and_then(drained) {
+            let settled = Settled::new(members, reported);
+            if let Err(why) = edge.wait_async_past(None, &settled).await.and_then(drained) {
                 unobserved.push(why);
             }
         }
         answer_of(unobserved)
     }
+}
+
+/// The pids of the members a listing could not name: the first of a wait's `reported` ([`Settled`]).
+fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
+    unnamed.iter().filter_map(|unnamed| unnamed.pid).collect()
+}
+
+/// Settle the root, whose pid its owner gave as `pid`, once its wait ended: its identity, if its handle
+/// can read one, is a settled member (it is matched by identity alone, never by its pid), and `pid` is
+/// `reported` when the wait `failed`, so a snapshot entry for the root whose identity cannot be read is
+/// not named again. A root whose identity cannot be read is logged at `warn`: what it would have
+/// settled is lost, so a snapshot entry for it that reads an identity can be named a second time. Only a
+/// Job's edge reads the settlement.
+#[cfg(windows)]
+fn settle_root(root: &dyn OsProcess, pid: u32, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let raw = windows::Win32::Foundation::HANDLE(root.os_handle().as_raw_handle());
+    if failed {
+        reported.push(pid);
+    }
+    match crate::identity::windows_identity_from_handle_result(raw, pid) {
+        Ok(id) => members.push(id),
+        Err(e) => log::warn!(
+            "the identity of the root, pid {pid}, cannot be read, so the drain's snapshot may name it again: \
+             {report}",
+            report = crate::error::Report(&e)
+        ),
+    }
+}
+
+/// Only a Job's edge reads the root's settlement ([`Settled`]).
+#[cfg(not(windows))]
+fn settle_root(
+    _root: &dyn OsProcess,
+    _pid: u32,
+    _failed: bool,
+    _members: &mut Vec<ProcessId>,
+    _reported: &mut Vec<u32>,
+) {
 }
 
 /// `members`, each one once, in the order they were reached.
@@ -273,43 +401,43 @@ fn drained(verdict: TreeDrain) -> Result<(), Error> {
     }
 }
 
-/// Wait for the member `id` to exit: re-open it by its identity, wait on it, close it. One that cannot
-/// be opened because it is gone has exited.
-fn wait_for_member(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    match open_member(kernel, id)? {
-        Some(os) => wait_for_exit(&*os).map_err(|why| exit_unobserved(id.pid(), why)),
-        None => Ok(()),
+/// What a wait with no deadline comes to: it ends only on an exit, so `exited` is `true`.
+fn exit_seen(exited: bool) -> Result<(), Error> {
+    debug_assert!(exited, "a wait with no deadline ends only on an exit");
+    Ok(())
+}
+
+/// Wait for the member `id` to exit until `deadline` (`None`: for ever): re-open it by its identity,
+/// wait on it, close it. `Ok(true)` is an exit, and so is a member that cannot be opened because it is
+/// gone; `Ok(false)` is a member still running at the deadline's final look. One that cannot be opened
+/// for another reason has not exited as far as anyone can tell: the error is that cause.
+pub(crate) fn wait_for_member(kernel: &dyn Kernel, id: ProcessId, deadline: Option<Instant>) -> Result<bool, Error> {
+    match crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())? {
+        Some(os) => crate::os_process::drive::exited_until(&*os, deadline),
+        None => Ok(true),
     }
 }
 
-/// [`wait_for_member`], awaited.
+/// [`wait_for_member`], awaited. A Windows `deadline` is on the real clock.
 #[cfg(feature = "tokio")]
-async fn wait_for_member_async(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    match open_member(kernel, id)? {
-        Some(os) => wait_for_exit_async(&*os)
-            .await
-            .map_err(|why| exit_unobserved(id.pid(), why)),
-        None => Ok(()),
+pub(crate) async fn wait_for_member_async(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+    deadline: Option<Instant>,
+) -> Result<bool, Error> {
+    match crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())? {
+        Some(os) => crate::tokio::drive::exited_until(&*os, deadline).await,
+        None => Ok(true),
     }
-}
-
-/// The member `id` re-opened by its identity; `None` if it is gone. One that cannot be opened has
-/// not exited as far as anyone can tell: its exit cannot be observed.
-fn open_member(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    crate::os_process::open_with(kernel, id).map_err(|failure| exit_unobserved(id.pid(), failure.into_open_error()))
 }
 
 fn wait_for_exit(os: &dyn OsProcess) -> Result<(), Error> {
-    let exited = crate::os_process::drive::exited_until(os, None)?;
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
+    crate::os_process::drive::exited_until(os, None).and_then(exit_seen)
 }
 
 #[cfg(feature = "tokio")]
 async fn wait_for_exit_async(os: &dyn OsProcess) -> Result<(), Error> {
-    let exited = crate::tokio::drive::exited_held(os, None).await?;
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
+    crate::tokio::drive::exited_held(os, None).await.and_then(exit_seen)
 }
 
 pub(crate) fn exit_unobserved(pid: u32, cause: Error) -> Error {

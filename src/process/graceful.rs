@@ -105,7 +105,7 @@ impl Process {
         // No handle backstop: the root is left as any member is, and the error holds every member.
         let answer = outcome.into_result().or_else(|left| left.unsettled(false));
         let landed = wait.root_killed();
-        (answer, wait.with_root(&*self.os, landed))
+        (answer, wait.with_root(&*self.os, self.id.pid(), landed))
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root

@@ -41,9 +41,9 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::child::spawn::windows_raw::AttributeList;
@@ -298,6 +298,18 @@ pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
     spawn_with_ace(alone, PROCESS_QUERY_LIMITED_INFORMATION.0)
 }
 
+/// [`spawn_query_only`] with no console (`DETACHED_PROCESS`, where the others pass
+/// `CREATE_NO_WINDOW`), so the child brings no console host along: for a test that needs the
+/// restricted child to be the only process of the job it is put in.
+pub(crate) fn spawn_query_only_without_console(alone: &Completion) -> RestrictedChild {
+    spawn_with_ace_cmdline(
+        alone,
+        PROCESS_QUERY_LIMITED_INFORMATION.0,
+        &quoted_more(),
+        DETACHED_PROCESS,
+    )
+}
+
 /// Like [`spawn_restricted`], but the restricted process is a shell that spawns an ordinary
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
@@ -307,6 +319,7 @@ pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> Restri
         alone,
         granted | PROCESS_TERMINATE.0,
         &format!("\"{}\" /c {}", cmd.display(), quoted_more()),
+        CREATE_NO_WINDOW,
     )
 }
 
@@ -326,7 +339,7 @@ fn quoted_more() -> String {
 }
 
 fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(alone, granted, &quoted_more())
+    spawn_with_ace_cmdline(alone, granted, &quoted_more(), CREATE_NO_WINDOW)
 }
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
@@ -335,7 +348,12 @@ fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
 /// inheritable only under [`spawn_lock`](crate::child::spawn::spawn_lock) and closed before it is
 /// released. A spawner outside the lock that inherits with no list can still take them. The caller
 /// must not hold `spawn_lock`.
-fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> RestrictedChild {
+fn spawn_with_ace_cmdline(
+    alone: &Completion,
+    granted: u32,
+    cmdline: &str,
+    console: PROCESS_CREATION_FLAGS,
+) -> RestrictedChild {
     use std::os::windows::io::AsRawHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
@@ -435,7 +453,7 @@ fn spawn_with_ace_cmdline(alone: &Completion, granted: u32, cmdline: &str) -> Re
                 Some(&sa),
                 None,
                 true,
-                CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                console | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
                 None,
                 None,
                 &si.StartupInfo,

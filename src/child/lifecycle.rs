@@ -359,14 +359,24 @@ impl Child {
     }
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
-    /// Windows job whose process list is empty, a macOS marker with no holder left. A status is
-    /// never collected by this call, only the root's own `wait`/`wait_timeout` does that. This call
-    /// observes the list or the leaf, not each member: on Windows the job's list can empty before
-    /// every member's process object is signalled. A caller that needs the members gone uses
-    /// [`kill_tree`](Child::kill_tree), which waits for each. Requires a mechanism with a real
-    /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
-    /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
-    /// nested-`Delegated` child do not).
+    /// Windows job with no member left, a macOS marker with no holder left. A status is never
+    /// collected by this call, only the root's own `wait`/`wait_timeout` does that. On Windows the
+    /// job's list can empty before a member's process object is signalled, so an empty list is not the
+    /// drain: the call waits for each job member a system process snapshot still names, within the
+    /// limit below. Requires a mechanism with a real kernel drain edge (`Unsupported` otherwise — cgroup v2,
+    /// a Windows job object, and the macOS fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and
+    /// an uncontained or nested-`Delegated` child do not).
+    ///
+    /// # Limit (Windows)
+    ///
+    /// A Job member that refuses the caller query access is not seen once the Job's list is empty.
+    /// One that refuses it (another user's, an elevated one, one whose DACL denies the query), or
+    /// whose `IsProcessInJob` fails, cannot be shown to be a member and is skipped. So `wait_tree` after `send_kill_tree` (or after a kill made outside cosca) can answer
+    /// while such a member is still finishing its exit: a live member is always in the Job's list, so
+    /// this holds only during its exit. A later wait on the same Job whose count of processes ever
+    /// (`TotalProcesses`) has not changed since a confirmation answers from that count, so a skipped
+    /// member is not looked for again. [`kill_tree`](Child::kill_tree) reports such a member as
+    /// unobserved; a caller that needs one named uses it.
     pub fn wait_tree(&self) -> Result<crate::containment::TreeDrain, Error> {
         self.tree.wait_drained(None)
     }
@@ -375,7 +385,8 @@ impl Child {
     /// at expiry is not an error. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded, matching [`wait_timeout`](Child::wait_timeout). `MembersRemain` means the tree was
     /// not seen drained by the deadline; on Windows the wait answers from the job's list as of its
-    /// last look, in which a member that has just exited can still appear.
+    /// last look, in which a member that has just exited can still appear. The Windows limit stated at
+    /// [`wait_tree`](Child::wait_tree) holds.
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<crate::containment::TreeDrain, Error> {
         self.tree.wait_drained(crate::wait::deadline_from(timeout))
     }
