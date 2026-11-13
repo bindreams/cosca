@@ -621,13 +621,13 @@ impl ProcessId {
     /// [`Liveness::Unknown`] when the OS refuses the query, or answers ambiguously — never
     /// `Dead` on a process we could not assess.
     ///
-    /// **On macOS the exit *edge* precedes that bookkeeping.** A death-watch
-    /// ([`Process::wait`](crate::Process::wait)) returning, and a pipe or socket EOF on the dying
-    /// process's own descriptors, both fire while the kernel is still tearing the process down —
+    /// **On macOS the exit *edge* precedes that bookkeeping.** A pipe or socket EOF on the dying
+    /// process's own descriptors fires while the kernel is still tearing the process down —
     /// before it is marked a zombie, which is the state this reads. So `Alive` is briefly
     /// reachable for a process that has already exited; Linux and Windows signal only after their
-    /// equivalent transition. Confirm a process is finished by reaping it, or by
-    /// `waitid(WEXITED | WNOWAIT)` — never by asking this after an exit event.
+    /// equivalent transition. cosca's own waits ([`Process::wait`](crate::Process::wait),
+    /// `kill_tree`) return only once this reads `Dead`. Confirm a process is finished after any
+    /// other exit event by reaping it, or by `waitid(WEXITED | WNOWAIT)` — never by asking this.
     pub fn is_alive(&self) -> Liveness {
         self.is_alive_with(&HostKernel)
     }

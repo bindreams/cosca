@@ -644,7 +644,9 @@ impl Child {
     /// the root's pid checks each process it signals by its identity.
     ///
     /// **`Ok` means every member the kill reached has exited**, and so has the root once its kill
-    /// landed: the call waits for them, with no deadline. What it waits on is what its mechanism's
+    /// landed: the call waits for them, with no deadline. "Exited" is the state
+    /// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive) reads as `Dead`: on macOS a zombie or gone,
+    /// not merely a fired exit edge. What it waits on is what its mechanism's
     /// kill reached, and a member forked after the kill's listing is not seen. On a cgroup leaf, a
     /// member another process moves across the leaf's boundary while the call runs is a stated
     /// limit, in both directions. A member found outside the leaf after the kill is taken to have

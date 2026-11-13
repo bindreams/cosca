@@ -223,18 +223,46 @@ fn an_open_and_a_send_arm_no_watch_and_the_first_look_arms_it() {
     child.wait().unwrap();
 }
 
+/// An exit edge (`NOTE_EXIT`, here the real one) is an exit only once the zombie read says `Dead`:
+/// `Alive` is a recheck, `Unknown` a failed look, and a running process is not asked.
+///
+/// Mutant: `exited` answers `Exited` on the watch alone, so the first scripted `Alive` is `Exited`.
+#[skuld::test]
+fn an_exit_edge_is_exited_only_once_the_zombie_read_says_dead() {
+    use crate::identity::Liveness;
+
+    let (mut child, id) = blocker();
+    let p = MacProcess::open(id).unwrap().expect("a live process opens");
+    assert!(
+        matches!(
+            p.exited_with(&|| unreachable!("a running process is not read")),
+            Ok(Exit::Running(_))
+        ),
+        "no edge, no read"
+    );
+    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
+    wait_until_zombie(id.pid());
+    assert!(matches!(p.exited_with(&|| Liveness::Alive), Ok(Exit::Recheck)));
+    assert!(matches!(
+        p.exited_with(&|| Liveness::Unknown),
+        Err(Error::Unassessable { .. })
+    ));
+    assert!(matches!(p.exited_with(&|| Liveness::Dead), Ok(Exit::Exited)));
+    child.wait().unwrap();
+}
+
 /// Mutant: the arming ignores its unique-id read, so a pid taken between the open and the first look
 /// is watched as the original.
 #[skuld::test]
 fn a_watch_armed_while_another_process_holds_the_pid_reads_exited() {
     use crate::identity::uniq_fault::force_uniq_read_once;
-    use crate::identity::UniqInfo;
+    use crate::identity::{Liveness, UniqInfo};
 
     let (mut child, id) = blocker();
     let UniqRead::Found(real) = uniq_info(id.pid(), ReadPurpose::Kill) else {
         panic!("the blocker's unique id must be readable");
     };
-    let p = open(id).unwrap().expect("a live process opens");
+    let p = MacProcess::open(id).unwrap().expect("a live process opens");
     let _second = force_uniq_read_once(
         ReadPurpose::Open,
         UniqRead::Found(UniqInfo {
@@ -242,8 +270,9 @@ fn a_watch_armed_while_another_process_holds_the_pid_reads_exited() {
             ..real
         }),
     );
+    // The zombie read is scripted: the blocker itself is alive, only its arming read was forced.
     assert!(
-        matches!(p.exited().unwrap(), Exit::Exited),
+        matches!(p.exited_with(&|| Liveness::Dead), Ok(Exit::Exited)),
         "the process that was opened is not the one holding the pid"
     );
     child.kill().unwrap();

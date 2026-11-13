@@ -95,7 +95,8 @@ impl Process {
     pub fn is_alive(&self) -> Liveness {
         match self.os.exited() {
             Ok(Exit::Exited) => Liveness::Dead,
-            Ok(Exit::Running(_)) => Liveness::Alive,
+            // The exit edge has fired but the process is not yet the zombie `ProcessId::is_alive` reads.
+            Ok(Exit::Running(_) | Exit::Recheck) => Liveness::Alive,
             Err(e) => {
                 log::debug!(
                     "is_alive: reading the exit state of pid {} failed: {report}",
@@ -108,7 +109,8 @@ impl Process {
     }
 
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). Non-reaping. Returns at once for a process that has already exited.
+    /// parent gets one). Non-reaping. Returns at once for a process that has already exited. On macOS
+    /// "exited" is a zombie or gone, the state [`ProcessId::is_alive`] reads as `Dead`.
     /// `Err` only on a wait failure; on Windows, for a handle without `SYNCHRONIZE`, while the
     /// process runs (`ERROR_ACCESS_DENIED`). On macOS the first look at the process (a wait, a
     /// timed wait or [`is_alive`](Self::is_alive)) arms its exit watch, a kqueue, so a wait there

@@ -14,7 +14,7 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{uniq_info, Existence, Liveness, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -77,6 +77,35 @@ impl MacProcess {
             Some(now) if now.unique_id == self.unique => watch,
             Some(_) | None => watch.exited_now(),
         })
+    }
+
+    /// [`exited`](OsProcess::exited) with `liveness` as the read of the process's state, which is
+    /// consulted only once the watch says the process has exited. `Unknown` is a failed look: the
+    /// exit cannot be shown to be complete.
+    fn exited_with(&self, liveness: &dyn Fn() -> Liveness) -> Result<Exit<'_>, Error> {
+        // Two threads that look first may each arm a watch; one is kept and the other closed.
+        let watch = match self.watch.get() {
+            Some(watch) => watch,
+            None => {
+                let armed = self.arm()?;
+                self.watch.get_or_init(|| armed)
+            }
+        };
+        if !watch.exited()? {
+            return Ok(Exit::Running(WaitFor::Readable(watch.as_fd())));
+        }
+        match liveness() {
+            Liveness::Dead => Ok(Exit::Exited),
+            Liveness::Alive => Ok(Exit::Recheck),
+            Liveness::Unknown => Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid} has exited, but its state could not be read to show the exit is complete; \
+                     {EXIT_CONSEQUENCE}",
+                    pid = self.id.pid()
+                ),
+                source: None,
+            }),
+        }
     }
 }
 
@@ -209,20 +238,11 @@ impl OsProcess for MacProcess {
         }
     }
 
+    /// `Exited` once the process is a zombie or gone, as [`ProcessId::is_alive`] reads it. The watch
+    /// fires earlier (`NOTE_EXIT` precedes `p_stat = SZOMB`, and a pid past `P_REF_DEAD` refuses
+    /// registration before either), so an edge that has fired is a `Recheck` until the read agrees.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        // Two threads that look first may each arm a watch; one is kept and the other closed.
-        let watch = match self.watch.get() {
-            Some(watch) => watch,
-            None => {
-                let armed = self.arm()?;
-                self.watch.get_or_init(|| armed)
-            }
-        };
-        if watch.exited()? {
-            Ok(Exit::Exited)
-        } else {
-            Ok(Exit::Running(WaitFor::Readable(watch.as_fd())))
-        }
+        self.exited_with(&|| self.id.is_alive())
     }
 }
 
