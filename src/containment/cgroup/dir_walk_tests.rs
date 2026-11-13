@@ -4,7 +4,7 @@
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use super::{cgroup_id, find_descendant, Walked};
+use super::{cgroup_id, find_descendant, procs_under, Swept, Walked};
 use crate::containment::cgroup::fault::fail_walk_step;
 use crate::containment::cgroup::WalkStep;
 use crate::test_groups::{cgroup, pidfd_get_info, Group};
@@ -246,6 +246,64 @@ fn cgroup_the_walk_skips_a_cgroup_removed_mid_walk(#[fixture(cgroup)] _group: &G
     let walked = find_descendant(root.as_fd(), under);
     assert!(matches!(walked, Walked::Absent), "{walked:?}");
     assert!(removed.get(), "the walk reached `gone`, and skipped it once removed");
+}
+
+/// A listing of the cgroups under a root records the id of every cgroup it visits, however deep, in
+/// the set it is given, and not the root's own. Mutant: only the cgroups whose `cgroup.procs` lists
+/// a member are recorded.
+#[skuld::test]
+fn cgroup_a_listing_records_the_id_of_every_cgroup_it_visits(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("list-ids");
+    let ids: Vec<_> = ["a", "a/b", "c"].map(|rel| id_at(&scratch.make(rel))).into();
+    let known = Swept::default();
+
+    let (lines, failure) = procs_under(scratch.fd().as_fd(), &known);
+
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(lines, Vec::<String>::new(), "no member");
+    assert!(
+        ids.iter().all(|&id| known.holds(id)),
+        "every cgroup visited is recorded"
+    );
+    assert!(!known.holds(id_at(scratch.path())), "the root is not under itself");
+}
+
+/// A cgroup whose id read finds it gone is skipped with what is under it: it is no member's place,
+/// and is not recorded. Mutant: a gone cgroup ends the listing, or its children are visited.
+#[skuld::test]
+fn cgroup_a_cgroup_gone_at_its_id_read_is_skipped_with_what_is_under_it(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("list-gone");
+    let a = id_at(&scratch.make("a"));
+    let under = id_at(&scratch.make("a/b"));
+    let c = id_at(&scratch.make("c"));
+    let known = Swept::default();
+    let _gone = fail_walk_step("./a", WalkStep::Id, libc::ENOENT);
+
+    let (_, failure) = procs_under(scratch.fd().as_fd(), &known);
+
+    assert!(failure.is_none(), "{failure:?}");
+    assert!(
+        !known.holds(a) && !known.holds(under),
+        "the gone cgroup and what is under it"
+    );
+    assert!(known.holds(c), "the listing went on");
+}
+
+/// A cgroup whose id cannot be read is left out of the set and fails nothing: what is under it is
+/// listed and recorded. Mutant: an unreadable id ends the listing.
+#[skuld::test]
+fn cgroup_a_cgroup_whose_id_cannot_be_read_is_left_out_of_the_set_alone(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("list-unreadable");
+    let a = id_at(&scratch.make("a"));
+    let under = id_at(&scratch.make("a/b"));
+    let known = Swept::default();
+    let _refused = fail_walk_step("./a", WalkStep::Id, libc::EIO);
+
+    let (_, failure) = procs_under(scratch.fd().as_fd(), &known);
+
+    assert!(failure.is_none(), "{failure:?}");
+    assert!(!known.holds(a), "an id that could not be read");
+    assert!(known.holds(under), "what is under it is recorded");
 }
 
 /// A root removed before the walk lists anything leaves nothing listed, so nothing is known of the

@@ -67,9 +67,9 @@ pub(crate) struct LeafDir {
     parent: OwnedFd,
     /// Shared with the leaf's [`Subtree`](super::Subtree)s, which read it after the leaf is gone.
     dir: std::sync::Arc<OwnedFd>,
-    /// The ids of the cgroups [`remove_children`](Self::remove_children) removed, shared with the
-    /// leaf's [`Subtree`](super::Subtree)s: a task in one is in the subtree, which no walk can show
-    /// once it is removed.
+    /// The ids of the cgroups [`remove_children`](Self::remove_children) removed and of those a
+    /// member listing visited, shared with the leaf's [`Subtree`](super::Subtree)s: a task in one is
+    /// in the subtree, which no walk can show once it is removed.
     swept: Swept,
     name: OsString,
 }
@@ -151,7 +151,7 @@ impl LeafDir {
         std::sync::Arc::clone(&self.dir)
     }
 
-    /// The record of the cgroups the leaf's sweep removed (see [`Swept`]).
+    /// The record of the cgroups known to be under the leaf (see [`Swept`]).
     pub(crate) fn swept(&self) -> Swept {
         self.swept.clone()
     }
@@ -246,14 +246,14 @@ impl LeafDir {
         remove_children(self.dir.as_fd(), &self.swept)
     }
 
-    /// [`procs_under`] the leaf.
+    /// [`procs_under`] the leaf, recording the cgroups it visits in the leaf's [`Swept`].
     pub(crate) fn nested_procs(&self) -> (Vec<String>, Option<io::Error>) {
-        procs_under(self.dir.as_fd())
+        procs_under(self.dir.as_fd(), &self.swept)
     }
 }
 
-/// The ids of the cgroups a leaf's sweep removed, shared by the leaf and its subtrees. Holds one id
-/// per cgroup the sweep removed.
+/// The ids of the cgroups known to be under a leaf, shared by the leaf and its subtrees: the ones its
+/// sweep removed, which no walk can show, and the ones a member listing visited ([`procs_under`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Swept(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>);
 
@@ -265,12 +265,19 @@ impl Swept {
             .insert(id);
     }
 
-    /// Whether the sweep removed the cgroup `id`.
+    /// Whether the cgroup `id` is known to be under the leaf.
     pub(crate) fn holds(&self, id: u64) -> bool {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 }
 
@@ -310,13 +317,10 @@ pub(crate) fn find_descendant(dir: BorrowedFd<'_>, id: u64) -> Walked {
 /// [`find_descendant`]'s walk: `Some` once found, `None` once every cgroup was listed.
 fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     let traversed = traverse(&mut Tree::new(), dir, true, |tree, node, cgroup| {
-        match step_fault(tree, node, WalkStep::Id)
-            .map_err(io::Error::from)
-            .and_then(|()| cgroup_id(cgroup))
-        {
-            Ok(found) if found == id => Ok(Visit::Stop),
-            Ok(_) => Ok(Visit::Continue),
-            Err(e) if gone_io(&e) => Ok(Visit::Skip),
+        match visited_id(tree, node, cgroup) {
+            Ok(Some(found)) if found == id => Ok(Visit::Stop),
+            Ok(Some(_)) => Ok(Visit::Continue),
+            Ok(None) => Ok(Visit::Skip),
             Err(e) => Err(at_cgroup(e, tree, node)),
         }
     })
@@ -329,13 +333,27 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     }
 }
 
+/// The id of the cgroup `cgroup`, which a walk visits as `node` of `tree` (see [`cgroup_id`]),
+/// read through the walk's [`WalkStep::Id`] gate; `None` if it is gone.
+fn visited_id(tree: &Tree, node: usize, cgroup: BorrowedFd<'_>) -> io::Result<Option<u64>> {
+    match step_fault(tree, node, WalkStep::Id)
+        .map_err(io::Error::from)
+        .and_then(|()| cgroup_id(cgroup))
+    {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if gone_io(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, and the failure that
-/// ended the listing early. A [`traverse`] of the tree, with the same bounds as [`find_descendant`]:
-/// two descriptors at most, one visit per cgroup. A cgroup removed during the walk has no member
-/// left to list and is skipped, as is `dir` itself gone. A cgroup that could not be read or listed,
-/// or one behind a mount (`EXDEV`), ends the listing with its error; the lines read before it are
-/// returned.
-pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, Option<io::Error>) {
+/// ended the listing early. The id of each cgroup it visits is recorded in `known`; one that cannot
+/// be read fails nothing and is not recorded. A [`traverse`] of the tree, with the same bounds as
+/// [`find_descendant`]: two descriptors at most, one visit per cgroup. A cgroup removed during the
+/// walk has no member left to list and is skipped, as is `dir` itself gone. A cgroup that could not
+/// be read or listed, or one behind a mount (`EXDEV`), ends the listing with its error; the lines
+/// and ids read before it are returned.
+pub(crate) fn procs_under(dir: BorrowedFd<'_>, known: &Swept) -> (Vec<String>, Option<io::Error>) {
     use std::io::Read as _;
 
     let mut lines = Vec::new();
@@ -349,6 +367,15 @@ pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, Option<io::Error
         match read {
             Ok(content) => {
                 lines.extend(content.lines().map(str::to_owned));
+                match visited_id(tree, node, cgroup) {
+                    Ok(Some(id)) => known.record(id),
+                    Ok(None) => return Ok(Visit::Skip),
+                    Err(e) => log::debug!(
+                        "cgroup v2: the id of {} cannot be read ({report}), so it is not known to be under the leaf",
+                        tree.path(node).display(),
+                        report = crate::error::Report(&e)
+                    ),
+                }
                 Ok(Visit::Continue)
             }
             Err(e) if gone_io(&e) => Ok(Visit::Skip),

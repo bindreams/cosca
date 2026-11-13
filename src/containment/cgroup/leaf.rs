@@ -832,7 +832,8 @@ impl CgroupLeaf {
     }
 
     /// The one subtree a pass over the listed members places each of them in. Where the leaf's id
-    /// cannot be read, the pidfd route cannot place a member, and `/proc` does.
+    /// cannot be read, the pidfd route places a member only by the id of a cgroup the listing's walk
+    /// visited; `/proc` places any other.
     fn listing_subtree(&self) -> Subtree {
         self.subtree_with(match self.id() {
             Ok(id) => Some(id),
