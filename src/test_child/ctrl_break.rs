@@ -246,21 +246,6 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     (child, sock)
 }
 
-/// [`spawn_consoleless_root`] for the tokio `Child`.
-#[cfg(feature = "tokio")]
-pub(crate) async fn spawn_consoleless_root_async() -> (crate::tokio::Child, TcpStream) {
-    let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut cmd = crate::test_child::tokio_command(Console::Asked);
-    cmd.executable(super::testbin("cosca_testbin_gui"))
-        .args(["cosca_testbin_gui", addr.as_str()]);
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    cmd.env(ack::ACK_ENV, "1");
-    cmd.contain();
-    let child = cmd.spawn().await.expect("spawn the GUI-subsystem root");
-    let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
-    (child, sock)
-}
-
 /// The grandchild a root member started: its control socket, which keeps it running while held,
 /// and a handle on its process.
 pub(crate) struct Grandchild {

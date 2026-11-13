@@ -273,7 +273,11 @@ impl ExitWatch {
             reap: false,
         };
         #[cfg(test)]
-        let forced = kqueue::test_hooks::take_forced_esrch_registration(kqueue::test_hooks::Registration::ExitWatch);
+        if kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::SilentExitWatch) {
+            return Ok(Self::new(kq));
+        }
+        #[cfg(test)]
+        let forced = kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::ExitWatch);
         #[cfg(not(test))]
         let forced = false;
         let subscribed = if forced {
@@ -315,7 +319,7 @@ impl ExitWatch {
         }
         match has_exited(pid, unique, ReadPurpose::Exit) {
             Ok(true) => {
-                self.confirmed.store(true, Ordering::Relaxed);
+                self.confirm();
                 Ok(Exit::Exited)
             }
             Ok(false) => Ok(Exit::Recheck),
@@ -325,6 +329,12 @@ impl ExitWatch {
                 "its exit watch fired, but whether it has exited could not be read",
             )),
         }
+    }
+
+    /// Records that a read found the process a zombie or gone, as [`look`](Self::look) does: later
+    /// looks make no read.
+    pub(crate) fn confirm(&self) {
+        self.confirmed.store(true, Ordering::Relaxed);
     }
 
     /// The kqueue's descriptor: readable once the exit has happened.

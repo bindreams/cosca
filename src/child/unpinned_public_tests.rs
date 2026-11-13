@@ -178,9 +178,6 @@ pub(crate) enum Cause {
     None,
     /// The failed peek `Untrusted::Unknown` scripts.
     Unreadable,
-    /// The grace wait's `ECHILD`, from a zombie launchd holds: a failure of the same call, carried
-    /// below the refusal.
-    Echild,
     /// The failure the test forces on the cooperative signal (`Forced::Containment`), carried below
     /// the sweep's refusal.
     ForcedTerm,
@@ -197,9 +194,6 @@ impl Cause {
             (Cause::Unreadable, Some(cause)) => {
                 let said = crate::error::said(&**cause);
                 assert!(said.contains("unreadable"), "{said}");
-            }
-            (Cause::Echild, Some(cause)) => {
-                assert_eq!(crate::error::first_os_code(&**cause), Some(libc::ECHILD), "{cause:?}");
             }
             (Cause::ForcedTerm, Some(cause)) => assert!(
                 matches!(&**cause, Error::Containment { detail, .. } if detail.contains("forced term_group refusal")),

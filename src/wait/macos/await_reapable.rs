@@ -78,7 +78,7 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
     kq.subscribe(Subscription::Signal(libc::SIGCHLD))
         .map_err(crate::error::Error::into_io)?;
     #[cfg(test)]
-    if test_hooks::take_forced_esrch_registration(test_hooks::Registration::Reap) {
+    if test_hooks::take_forced_registration(test_hooks::Registration::Reap) {
         return Ok(true);
     }
     let child = Subscription::Process {

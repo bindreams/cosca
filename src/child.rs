@@ -314,11 +314,17 @@ impl Child {
     /// root, and is not one of them), so call [`kill_tree`](Child::kill_tree) first to end
     /// descendants (see `Drop`).
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
+        self.status_of_reap(self.reap_outcome()?)
+    }
+
+    /// The root's unbounded reap, as the wait ended: the exit record, or the foreign verdict
+    /// (reaped elsewhere, or a zombie launchd holds), not folded into an error and not warned of.
+    pub(crate) fn reap_outcome(&self) -> Result<owned::ChildWaitOutcome, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        lifecycle::wait_for_status(&self.proc, lifecycle::Orphaned::Warn)
+        lifecycle::wait_to_exit(&self.proc, None)
     }
 
     /// Return the exit status if the child has already exited.

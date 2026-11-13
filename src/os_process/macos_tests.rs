@@ -230,11 +230,11 @@ fn an_open_and_a_send_arm_no_watch_and_the_first_look_arms_it() {
 /// Mutant: `exited` answers `Exited` on the watch alone, so the first look is `Exited`.
 #[skuld::test]
 fn a_fired_watch_on_a_process_is_exited_only_once_it_is_a_zombie() {
-    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
 
     let (mut child, id) = blocker();
     let p = MacProcess::open(id).unwrap().expect("a live process opens");
-    let _fired = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let _fired = force_proc_registration_once(Registration::ExitWatch);
     assert!(
         matches!(p.exited(), Ok(Exit::Recheck)),
         "the watch fired, the process is not a zombie"
@@ -254,7 +254,7 @@ fn a_child_with_a_fired_watch() -> (
     crate::os_process::macos::child::MacChild,
 ) {
     use crate::os_process::macos::child::MacChild;
-    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
@@ -263,7 +263,7 @@ fn a_child_with_a_fired_watch() -> (
     let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
         panic!("the blocker's unique id must be readable");
     };
-    let fired = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let fired = force_proc_registration_once(Registration::ExitWatch);
     let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
     drop(fired);
     (child, stdin, id, mac)
@@ -285,11 +285,13 @@ fn a_fired_watch_on_a_child_is_exited_only_once_it_is_a_zombie() {
     child.wait().unwrap();
 }
 
-/// A look at a watch that has not fired reads nothing about the process, for either type. The
-/// confirming read is forced refused: a look that reads before it asks the watch is an error for a
-/// process that runs.
+/// A look at a watch that has not fired reads no state of the process: a process's reads nothing, and a
+/// child's, whose parent is this process, reads only that parent, never whether it is a zombie. The
+/// confirming read is forced refused: a look that makes it before it asks the watch is an error for
+/// a process that runs.
 ///
-/// Mutant: `ExitWatch::look` reads the process's state before it asks the watch.
+/// Mutant: `ExitWatch::look` reads the process's state before it asks the watch; `MacChild::exited`
+/// reads whether the child is a zombie while this process is its parent.
 #[skuld::test]
 fn a_look_at_an_unfired_watch_reads_nothing() {
     use crate::identity::uniq_fault::force_uniq_read_once;
@@ -302,13 +304,20 @@ fn a_look_at_an_unfired_watch_reads_nothing() {
     let p = MacProcess::open(id).unwrap().expect("a live process opens");
     let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
     let _refused = force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
+    let reads = crate::identity::uniq_fault::record();
     assert!(
         matches!(p.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running process is Running"
     );
+    assert_eq!(reads.purposes(), vec![], "a process's unfired watch reads nothing");
     assert!(
         matches!(mac.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running child is Running"
+    );
+    assert_eq!(
+        reads.purposes(),
+        vec![ReadPurpose::Running, ReadPurpose::Running],
+        "a child's unfired watch reads its parent (two unique-id reads) and nothing else"
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -322,11 +331,11 @@ fn a_look_at_an_unfired_watch_reads_nothing() {
 #[skuld::test]
 fn a_wait_through_a_fired_watch_returns_a_process_that_reads_dead() {
     use crate::identity::Liveness;
-    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
 
     let (mut child, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
-    let _fired = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let _fired = force_proc_registration_once(Registration::ExitWatch);
     assert!(
         !exited_held(&*p, Some(Duration::ZERO)).unwrap(),
         "a fired watch on a process that runs is not an exit"
@@ -348,19 +357,19 @@ fn a_wait_through_a_fired_watch_returns_a_process_that_reads_dead() {
 async fn a_tokio_wait_through_a_fired_watch_returns_a_process_that_reads_dead() {
     use crate::identity::Liveness;
     use crate::os_process::macos::kqueue::test_hooks::{
-        force_proc_registration_esrch_once, take_forced_esrch_registration, Registration,
+        force_proc_registration_once, take_forced_registration, Registration,
     };
     use crate::tokio::drive::exited_held;
 
     let (mut child, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
-    let _fired = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let _fired = force_proc_registration_once(Registration::ExitWatch);
     assert!(
         !exited_held(&*p, Some(Duration::ZERO)).await.unwrap(),
         "a fired watch on a process that runs is not an exit"
     );
     assert!(
-        !take_forced_esrch_registration(Registration::ExitWatch),
+        !take_forced_registration(Registration::ExitWatch),
         "the watch's registration consumed the forcing"
     );
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
@@ -384,11 +393,11 @@ fn assert_a_refused_confirmation_is_unassessable_with_the_errno(p: &dyn OsProces
 /// Mutant: a refused read answers `Exited`, or loses the errno.
 #[skuld::test]
 fn a_refused_confirmation_of_a_process_is_unassessable_with_the_errno() {
-    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
 
     let (mut child, id) = blocker();
     let p = open(id).unwrap().expect("a live process opens");
-    let _fired = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let _fired = force_proc_registration_once(Registration::ExitWatch);
     assert_a_refused_confirmation_is_unassessable_with_the_errno(&*p);
     child.kill().unwrap();
     child.wait().unwrap();
@@ -487,8 +496,8 @@ fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
 }
 
 /// A refused `has_exited` read is `Unassessable` with the errno as its source, and the message
-/// does not word it as an "errno". Both readers of it (`ExitWatch::look` and
-/// `MacChild::exited_unannounced`) build it with this function, each with its own situation text.
+/// does not word it as an "errno". Both readers of it (`ExitWatch::look` and `MacChild::exited` past
+/// an unfired watch) build it with this function, each with its own situation text.
 #[skuld::test]
 fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_words_none() {
     for (situation, said) in [
@@ -511,36 +520,112 @@ fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_wo
     }
 }
 
-/// A refused read of `exited_unannounced`, on a plain `MacChild::new`, is `Unassessable` with the
-/// errno as its source and says its watch has not fired.
+/// A refused read of a child's look whose watch has not fired, of its parent or of whether it is a
+/// zombie, is `Unassessable` with the errno as its source, and says its watch has not fired. The
+/// child's parent reads launchd, so the second read is reached.
 ///
-/// Mutant: `MacChild::exited_unannounced` wraps the errno as `Error::Io`, or words another situation.
+/// Mutant: `MacChild::exited` wraps the errno as `Error::Io`, words another situation, or answers
+/// `Running` for a read it could not make.
 #[skuld::test]
-fn a_refused_unannounced_read_is_unassessable_with_the_errno() {
+fn a_refused_read_past_an_unfired_watch_is_unassessable_with_the_errno() {
     use crate::identity::uniq_fault::force_uniq_read_once;
-    use crate::os_process::child::OsChild;
+    use crate::identity::{ppid_fault, LAUNCHD};
     use crate::os_process::macos::child::MacChild;
 
-    let (mut child, id) = blocker();
-    let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
-        panic!("the blocker's unique id must be readable");
-    };
-    let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
-    let _refused = force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
-    let err = mac.exited_unannounced().expect_err("a refused read is an error");
-    let Error::Unassessable { detail, .. } = &err else {
-        panic!("{err:?}");
-    };
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
-    assert_eq!(
-        detail,
-        &format!(
-            "pid {}: its exit watch has not fired, and whether it has exited could not be read",
-            id.pid()
-        )
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    for zombie_read in [false, true] {
+        let (mut child, id) = blocker();
+        let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
+            panic!("the blocker's unique id must be readable");
+        };
+        let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
+        let _parent = ppid_fault::force_ppid_with(|| Ok(LAUNCHD));
+        // The parent read is two unique-id reads and the zombie read two more: the third is the
+        // zombie read's first.
+        let mut forced = Vec::new();
+        if zombie_read {
+            forced.push(force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(read)));
+            forced.push(force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(read)));
+        }
+        forced.push(force_uniq_read_once(
+            ReadPurpose::Running,
+            UniqRead::Refused(libc::EPERM),
+        ));
+        let err = mac.exited().expect_err("a refused read is an error");
+        let Error::Unassessable { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+        assert_eq!(
+            detail,
+            &format!(
+                "pid {}: its exit watch has not fired, and whether it has exited could not be read",
+                id.pid()
+            ),
+            "zombie read: {zombie_read}"
+        );
+        drop(forced);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// A child whose parent is another process (its tracer, or launchd) gets no `NOTE_EXIT` from XNU, so
+/// its unfired watch cannot say it is running: while the process is no zombie, the look is
+/// `Recheck`, which the driver paces. This process's own pid stands in for the child, and its parent
+/// read is forced.
+///
+/// Mutant: an unfired watch on a child another process holds is `Running`, so a wait on it blocks
+/// for an event that never comes.
+#[skuld::test]
+fn an_unfired_watch_on_a_running_child_another_process_holds_is_a_recheck() {
+    use crate::identity::{ppid_fault, LAUNCHD};
+    use crate::os_process::macos::child::MacChild;
+    use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, held_by_a_tracer_pid};
+
+    let (pid, unique) = echild_yet_resolvable();
+    let mac = MacChild::new(pid, unique).expect("watch the stand-in");
+    for parent in [LAUNCHD, held_by_a_tracer_pid()] {
+        let _parent = ppid_fault::force_ppid_with(move || Ok(parent));
+        assert!(
+            matches!(mac.exited(), Ok(Exit::Recheck)),
+            "held by pid {parent}, the child is no zombie and its watch cannot fire"
+        );
+    }
+}
+
+/// A child whose pid names another process now, or none, has been reaped: exited, with its watch
+/// unfired. The look remembers it, so later looks read nothing. The read of the pid is forced, once
+/// each way.
+///
+/// Mutant: a reaped child is `Recheck` or `Running`; or the confirmation is not remembered.
+#[skuld::test]
+fn a_child_that_was_reaped_is_exited_with_its_watch_unfired_and_remembered() {
+    use crate::identity::uniq_fault::{force_uniq_read_once, record};
+    use crate::identity::UniqInfo;
+    use crate::os_process::macos::child::MacChild;
+
+    for reaped in ["gone", "another process"] {
+        let (mut child, id) = blocker();
+        let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
+            panic!("the blocker's unique id must be readable");
+        };
+        let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
+        let answer = match reaped {
+            "gone" => UniqRead::Gone,
+            _ => UniqRead::Found(UniqInfo {
+                unique_id: read.unique_id ^ 1,
+                ..read
+            }),
+        };
+        let forced = force_uniq_read_once(ReadPurpose::Running, answer);
+        assert!(matches!(mac.exited(), Ok(Exit::Exited)), "{reaped}");
+        drop(forced);
+        let reads = record();
+        assert!(matches!(mac.exited(), Ok(Exit::Exited)), "{reaped}");
+        assert_eq!(reads.purposes(), vec![], "a confirmed exit is not read again: {reaped}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 /// Once a look has confirmed the exit, later looks make no `Exit` read. The watch is armed on a live
@@ -659,7 +744,7 @@ fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
 #[skuld::test]
 fn esrch_at_registration_reads_as_exited_and_rechecks() {
     use crate::os_process::child::{adopt_std, PeekOutcome, TryReapOutcome};
-    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
     use crate::wait::exit_only::seams::force_peek_once;
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
@@ -667,7 +752,7 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     drop(child.stdin.take());
     let id = ProcessId::of(child.id()).found().expect("identity");
     wait_until_zombie(id.pid());
-    let forced = force_proc_registration_esrch_once(Registration::ExitWatch);
+    let forced = force_proc_registration_once(Registration::ExitWatch);
     let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     drop(forced);
     assert!(matches!(os.exited().unwrap(), Exit::Exited));
@@ -675,6 +760,101 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     let _running = force_peek_once(Ok(PeekOutcome::Running));
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+}
+
+/// A running child, a [`MacChild`] over it, and the identity, with `silent_watch` making the shared
+/// exit watch one that never fires (the force is spent on the adoption, so the exit wait's own
+/// registrations are not forced).
+fn a_running_child_with_a_watch(
+    silent_watch: bool,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    ProcessId,
+    crate::os_process::macos::child::MacChild,
+) {
+    use crate::os_process::macos::child::MacChild;
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
+
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
+        panic!("the blocker's unique id must be readable");
+    };
+    let silent = silent_watch.then(|| force_proc_registration_once(Registration::SilentExitWatch));
+    let mac = MacChild::new(id.pid(), read.unique_id).expect("watch the child");
+    drop(silent);
+    (child, stdin, id, mac)
+}
+
+/// An exit wait whose registration found the pid past registration (`ESRCH`, forced) has no event to
+/// come, so a look at a running child is a recheck, never a wait on its kqueue.
+///
+/// Mutant: `ChildExit::look` drops the `unarmed` branch, so the look is `Step::Wait` on a kqueue
+/// nothing will ever signal.
+#[skuld::test]
+fn an_exit_wait_that_found_no_registration_rechecks_instead_of_waiting() {
+    use crate::os_process::drive::Step;
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
+
+    let (mut child, stdin, _id, mac) = a_running_child_with_a_watch(false);
+    let forced = force_proc_registration_once(Registration::Reap);
+    let mut wait = mac.exit_wait().expect("arm the wait");
+    drop(forced);
+    assert!(
+        matches!(wait.look(), Ok(Step::Recheck)),
+        "no event will come: the look must not wait"
+    );
+    drop(wait);
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+/// A drain that read the child's `NOTE_EXIT` while the shared watch still says `Running` (its knote
+/// is not queued yet) is a recheck, never a wait on the drained kqueue, whose `NOTE_EXIT` is gone.
+/// The shared watch is made silent (it never fires), the child exits, and the wait's own kqueue is
+/// the only one that has the event.
+///
+/// Mutant: `ChildExit::look` drops the `exit_seen` branch, so the look is `Step::Wait` on the drained
+/// kqueue and the wake is lost.
+#[skuld::test]
+fn an_exit_wait_whose_drain_read_the_exit_rechecks_while_the_shared_watch_says_running() {
+    use crate::os_process::drive::Step;
+
+    let (mut child, stdin, id, mac) = a_running_child_with_a_watch(true);
+    let mut wait = mac.exit_wait().expect("arm the wait");
+    drop(stdin);
+    // `NOTE_EXIT` precedes the zombie state, so the event is queued on the wait's kqueue by now.
+    wait_until_zombie(id.pid());
+    assert!(
+        matches!(wait.look(), Ok(Step::Recheck)),
+        "the drain read NOTE_EXIT and the shared watch says Running"
+    );
+    drop(wait);
+    child.wait().unwrap();
+}
+
+/// A drain that read the child's `NOTE_EXIT` and `NOTE_REAP` (the child was reaped after the wait
+/// was armed) is read as the pid gone: the look is `Done`, not the recheck a drained `NOTE_EXIT`
+/// alone gets. The shared watch is silent, so the answer is the exit read's and not the watch's.
+///
+/// Mutant: `ChildExit::look` answers `Recheck` for any drained `NOTE_EXIT` before it asks `exited`,
+/// so a reaped child is rechecked for ever.
+#[skuld::test]
+fn an_exit_wait_whose_drain_read_the_reap_is_done_because_the_pid_is_gone() {
+    use crate::os_process::drive::Step;
+
+    let (mut child, stdin, id, mac) = a_running_child_with_a_watch(true);
+    let mut wait = mac.exit_wait().expect("arm the wait");
+    drop(stdin);
+    wait_until_zombie(id.pid());
+    child.wait().unwrap();
+    assert!(
+        matches!(wait.look(), Ok(Step::Done(()))),
+        "NOTE_EXIT and NOTE_REAP were drained, and the pid is gone"
+    );
 }
 
 /// A pid past registration at the reap registration (`ESRCH`, forced) is not a failure either, and it
@@ -687,7 +867,7 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
 fn esrch_at_the_reap_registration_adopts_a_running_child() {
     use crate::os_process::macos::child::MacChild;
     use crate::os_process::macos::kqueue::test_hooks::{
-        force_proc_registration_esrch_once, take_forced_esrch_registration, Registration,
+        force_proc_registration_once, take_forced_registration, Registration,
     };
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
@@ -697,10 +877,10 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
     let UniqRead::Found(read) = uniq_info(id.pid(), ReadPurpose::Kill) else {
         panic!("the blocker's unique id must be readable");
     };
-    let forced = force_proc_registration_esrch_once(Registration::Reap);
+    let forced = force_proc_registration_once(Registration::Reap);
     let os = MacChild::new(id.pid(), read.unique_id).expect("the reap's ESRCH is no failure");
     assert!(
-        !take_forced_esrch_registration(Registration::Reap),
+        !take_forced_registration(Registration::Reap),
         "the reap registration consumed the forcing"
     );
     drop(forced);
