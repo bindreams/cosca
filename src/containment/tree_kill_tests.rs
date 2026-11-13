@@ -228,7 +228,7 @@ fn a_wait_error_keeps_the_record_that_the_root_was_killed() {
     let why = refused_unobserved(4242);
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-    let failure = Swept::new(Ok(()), wait.with_root(&root, true))
+    let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, true))
         .wait()
         .expect_err("a member's exit cannot be observed");
 
@@ -544,7 +544,9 @@ fn a_failed_kill_is_the_answer_and_its_members_are_still_waited_for(wait_fails: 
         root_ended: false,
     };
 
-    let failure = Swept::new(Err(refused), wait).wait().expect_err("the kill was refused");
+    let failure = Swept::new("kill_tree", Err(refused), wait)
+        .wait()
+        .expect_err("the kill was refused");
 
     assert!(
         failure.error.to_string().contains("the kill was refused"),
@@ -564,6 +566,44 @@ fn a_failed_kill_whose_wait_is_ok_is_the_answer_and_its_members_are_waited_for()
 #[skuld::test]
 fn a_failed_kill_whose_wait_fails_too_is_the_answer_and_its_members_are_waited_for() {
     a_failed_kill_is_the_answer_and_its_members_are_still_waited_for(true);
+}
+
+/// A kill that failed stays the answer over a wait that failed too, and the wait's failure is logged
+/// once, at warn, through `Report`, naming the call: it is a failure the caller cannot see in the
+/// answer.
+///
+/// Mutant: the failure is logged at debug, not logged, or logged twice.
+#[skuld::test]
+fn a_failed_waits_failure_behind_a_failed_kill_is_logged_once_at_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+        .unobserved(refused_unobserved(4242))
+        .split();
+    let refused = SweepFailure {
+        error: Error::Containment {
+            detail: "the kill was refused".into(),
+            source: None,
+        },
+        root_ended: false,
+    };
+
+    let failure = Swept::new("graceful_shutdown_tree", Err(refused), wait)
+        .wait()
+        .expect_err("the kill was refused");
+
+    assert!(
+        failure.error.to_string().contains("the kill was refused"),
+        "{}",
+        failure.error
+    );
+    let logged =
+        crate::log_capture::records_since_on_current_thread(mark, "the wait after a failed graceful_shutdown_tree");
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)]
+            if line.contains("pid 4242 was killed, but its exit cannot be observed")),
+        "{logged:?}"
+    );
 }
 
 /// A member the settlement killed again (a tree walk's held member, killed once more after the root's
@@ -810,7 +850,7 @@ mod awaited {
             root_ended: false,
         };
 
-        let (swept, ()) = ::tokio::join!(Swept::new(Err(refused), wait).wait_async(), async {
+        let (swept, ()) = ::tokio::join!(Swept::new("kill_tree", Err(refused), wait).wait_async(), async {
             ::tokio::task::yield_now().await;
             drop(writer);
         });
@@ -958,7 +998,7 @@ mod awaited {
         let why = refused_unobserved(4242);
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-        let failure = Swept::new(Ok(()), wait.with_root(&root, true))
+        let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, true))
             .wait_async()
             .await
             .expect_err("a member's exit cannot be observed");

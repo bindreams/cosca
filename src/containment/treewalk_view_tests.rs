@@ -103,7 +103,7 @@ fn walks() -> [(&'static str, Walk); 4] {
     [
         hard_kill,
         terminate,
-        ("kill_tree", |k, id| open_live(id).kill_tree_with(k)),
+        ("kill_tree", |k, id| open_live(id).kill_tree_with("kill_tree", k)),
         ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
     ]
 }
@@ -587,7 +587,11 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let cause = format!("pid {} identity could not be read", descendant.pid());
-    assert_not_killed(open_live(root).kill_tree_with(&kernel), descendant.pid(), &[&cause]);
+    assert_not_killed(
+        open_live(root).kill_tree_with("kill_tree", &kernel),
+        descendant.pid(),
+        &[&cause],
+    );
     release_with_a_signalled_root("kill_tree", child, libc::SIGKILL);
 
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();

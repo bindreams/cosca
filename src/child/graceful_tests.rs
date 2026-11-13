@@ -100,18 +100,12 @@ fn cleanup(child: &mut crate::Child) {
 fn graceful_tree_watch_error_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
     // Released between the sweep and the reap (see `release_at`).
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .expect_err("the watch error must surface");
-    assert!(
-        crate::log_capture::contains_since(mark, &format!("graceful_shutdown_tree({pid})", pid = id.pid())),
-        "the subsumption trace must fire on the forced watch error"
-    );
     assert!(
         !fault::armed(),
         "seam not consumed — the watch did not run on this thread"
@@ -138,18 +132,12 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
 fn graceful_lone_watch_error_still_escalates_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
     // Released between the kill and the reap (see `release_at`).
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let err = child
         .graceful_shutdown(Duration::from_secs(30))
         .expect_err("the watch error must surface");
-    assert!(
-        crate::log_capture::contains_since(mark, &format!("graceful_shutdown({pid})", pid = id.pid())),
-        "the subsumption trace must fire on the forced watch error"
-    );
     assert!(
         !fault::armed(),
         "seam not consumed — the watch did not run on this thread"
@@ -363,19 +351,6 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect("a successful sweep must supersede the forced terminate refusal");
     crate::test_child::assert_killed("the root", status);
-    // Matches the TERMINATE trace specifically, not the pre-existing watch-error trace (both
-    // share the same "graceful_shutdown_tree({pid})" prefix, so a bare prefix match would
-    // pass even if the wrong log line fired). No `armed()` check here: `take_force_terminate`
-    // runs unconditionally at the very top of `graceful_shutdown_tree`, so by the time any
-    // assertion after calling it runs, the seam is ALWAYS already consumed — asserting that
-    // would be tautologically true and catch nothing.
-    assert!(
-        crate::log_capture::contains_since(
-            mark,
-            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
-        ),
-        "the terminate-refusal trace specifically must fire"
-    );
     assert!(
         crate::log_capture::contains_since(
             mark,
@@ -419,13 +394,6 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     assert!(
         crate::log_capture::contains_since(
             mark,
-            &format!("graceful_shutdown_tree({pid}): terminate_tree refused", pid = id.pid())
-        ),
-        "the terminate-refusal trace specifically must fire"
-    );
-    assert!(
-        crate::log_capture::contains_since(
-            mark,
             &format!(
                 "graceful_shutdown_tree({pid}): tree confirmed clear; discarding the superseded terminate_tree refusal",
                 pid = id.pid()
@@ -464,6 +432,162 @@ fn graceful_tree_unassessable_with_a_source_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
+}
+
+// The sweep's failure is the answer, and what failed decides its variant, not how many things failed:
+// the forced sweep failure is an `Io`, which no variant's meaning covers, so it is the answer as it is
+// and the refusal of the cooperative signal and the grace wait's failure are each logged at warn,
+// naming the call, in that order.
+#[skuld::test]
+fn graceful_tree_io_sweep_error_stays_the_answer_and_the_refusal_and_the_watch_error_are_warns() {
+    use crate::error::Error;
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (mut child, stdin) = kill_only_blocker();
+    term_fault::set_force_terminate(term_fault::Forced::Containment);
+    fault::set_force_watch_error(true);
+    let _armed = term_fault::ArmedKillTreeError::arm();
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect_err("the sweep failed");
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("forced kill_tree failure")),
+        "{err:?}"
+    );
+    let call = format!("graceful_shutdown_tree({})", child.pid());
+    let logged = crate::log_capture::records_since_on_current_thread(mark, &call);
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, refusal), (log::Level::Warn, watch)]
+            if refusal.contains("forced term_group refusal") && watch.contains("forced grace-watch failure")),
+        "{logged:?}"
+    );
+    cleanup(&mut child);
+    drop(stdin);
+}
+
+/// A sweep that left a member has a slot for the call's other failures: the refusal of the
+/// cooperative signal and the grace wait's failure are its `others`, in that order, and not members.
+///
+/// Mutants: they are logged and dropped, or become members.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[skuld::test]
+fn graceful_tree_that_left_members_carries_the_refusal_and_the_watch_error_in_others() {
+    use crate::containment::treewalk::fault::{self as walk_fault, LeftBehind};
+    use crate::error::Error;
+    use std::io::Read as _;
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().expect("spawn");
+    let _stdin = child.stdin().expect("piped stdin");
+    let mut readiness = [0u8; 1];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut readiness)
+        .expect("readiness byte");
+
+    walk_fault::force_incomplete_once(LeftBehind::Descendant);
+    term_fault::set_force_terminate(term_fault::Forced::Containment);
+    fault::set_force_watch_error(true);
+    let err = child
+        .graceful_shutdown_tree(Duration::from_millis(200))
+        .expect_err("a descendant was left");
+
+    let Error::MembersLeft { members, others } = &err else {
+        panic!("expected MembersLeft, got {err:?}");
+    };
+    assert!(
+        members.iter().all(|m| matches!(**m, Error::MemberNotKilled { .. })),
+        "{err:?}"
+    );
+    let Some(Error::Several(others)) = others.as_deref() else {
+        panic!("expected the refusal and the watch failure in others: {err:?}");
+    };
+    let others: Vec<&Error> = others.iter().map(|e| &**e).collect();
+    assert!(
+        matches!(others[..], [Error::Containment { .. }, watch]
+            if watch.to_string().contains("forced grace-watch failure")),
+        "{others:?}"
+    );
+}
+
+/// A refused cooperative signal is never lost: when the reap fails after the tree was proved clear, the
+/// reap's failure is the answer and the refusal is in the call's report. The reap's failure here is
+/// an `Io`, which holds nothing, so the refusal is logged at warn, naming the call.
+///
+/// Mutant: the refusal is dropped when the reap fails.
+#[skuld::test]
+fn a_refused_terminate_is_logged_when_the_reap_fails_after_a_clean_sweep() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::error::Error;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{child_with, root_looking};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited; 4]).reaps([ReapAnswer::Err(std::io::ErrorKind::PermissionDenied)]);
+    // The sweep runs for real, and a Linux sweep reads the root's state, which the helper answers only
+    // on macOS.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let root = root.peeks(std::iter::repeat_with(|| Ok(crate::os_process::child::PeekOutcome::Running)).take(32));
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake);
+    term_fault::set_force_terminate(term_fault::Forced::Containment);
+
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect_err("the reap failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "forced term_group refusal");
+    let call = format!("graceful_shutdown_tree({})", child.pid());
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.starts_with(&call)),
+        "{logged:?}"
+    );
+}
+
+/// The best-effort reap after a failed sweep of an exited root is secondary to the sweep's error,
+/// which stays the answer; its own failure is logged once, at warn, naming the call.
+///
+/// Mutants: the reap's failure is logged at debug, not logged, or put in the answer.
+#[cfg(unix)]
+#[skuld::test]
+fn a_best_effort_reap_that_fails_after_a_failed_sweep_is_logged_once_at_warn() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::error::Error;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{child_with, root_looking};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited; 4]).reaps([ReapAnswer::Err(std::io::ErrorKind::PermissionDenied)]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake);
+    let _armed = term_fault::ArmedKillTreeError::arm();
+
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect_err("the sweep failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("forced kill_tree failure")),
+        "{err:?}"
+    );
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "best-effort reap");
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.contains("graceful_shutdown_tree(")),
+        "{logged:?}"
+    );
 }
 
 // The invariant under test: only an AUTHORITATIVE drain-observable mechanism (cgroup v2, Windows
@@ -1015,10 +1139,11 @@ fn graceful_tree_over_a_leaf_whose_procs_cannot_be_read_fails_fast() {
 
 /// A holders-only escalation whose wait for the holders it killed fails answers with the
 /// holders-only error, as `kill_tree` answers a failed kill over a failed wait; the wait's failure is
-/// logged at debug (`log_failed_wait`), which also shows the member was waited for.
+/// logged once, at warn (`log_failed_wait`). The fake has no drain edge, so the grace wait fails too;
+/// that failure is below the answer.
 ///
 /// Mutants: `finish` puts the wait's failure in the error; `finish` returns the error without
-/// waiting.
+/// waiting; the grace wait's failure is logged and dropped.
 #[cfg(unix)]
 #[skuld::test]
 fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
@@ -1037,15 +1162,19 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
     let error = child.shut_down_holders_only(skip, std::time::Duration::ZERO);
 
     assert!(
-        matches!(&error, crate::error::Error::Unassessable { detail, source: None }
+        matches!(&error, crate::error::Error::Unassessable { detail, .. }
             if detail.contains("sent the SIGTERM only to the marker holders")),
         "the answer is the holders-only error: {error}"
     );
+    assert!(
+        matches!(error.failures_below()[..], [crate::error::Error::Unsupported { .. }]),
+        "the holders' grace wait's failure is its cause: {error:?}"
+    );
     let waited = crate::log_capture::records_since_on_current_thread(mark, "the wait after a holders-only shutdown");
     assert!(
-        matches!(&waited[..], [(log::Level::Debug, line)]
+        matches!(&waited[..], [(log::Level::Warn, line)]
             if line.contains("pid 4242 was killed, but its exit cannot be observed")),
-        "the member was waited for, and its failure is logged at debug: {waited:?}"
+        "the member was waited for, and its failure is logged once, at warn: {waited:?}"
     );
 }
 

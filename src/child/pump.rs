@@ -47,43 +47,38 @@ pub(crate) fn communicate(child: &mut Child, input: Option<&[u8]>) -> Result<Out
     merge(child.wait(), pump_error, finished)
 }
 
-/// The first failure is returned: the wait's, else the pump's, else stdout's, stderr's or stdin's,
-/// in that order. The others are logged, each with its stream named.
-fn merge(
+/// The first failure is the answer, as it is: the wait's, else the pump's, else stdout's, stderr's or
+/// stdin's, in that order. The later ones are its peers, each naming its stream (`stdout: ...`): below
+/// it when it has a slot, else, since no variant's meaning covers a failed pipe, logged at warn
+/// ([`Error::with_peers_or_warn`]).
+pub(crate) fn merge(
     status: Result<std::process::ExitStatus, Error>,
     pump_error: Option<io::Error>,
     Finished { stdin, stdout, stderr }: Finished,
 ) -> Result<Output, Error> {
-    let mut failures: Vec<(&str, io::Error)> = Vec::new();
-    failures.extend(pump_error.map(|e| ("pump", e)));
+    let mut streams: Vec<(&str, io::Error)> = Vec::new();
+    streams.extend(pump_error.map(|e| ("pump", e)));
     let stdout = stdout.unwrap_or_else(|e| {
-        failures.push(("stdout", e));
+        streams.push(("stdout", e));
         Vec::new()
     });
     let stderr = stderr.unwrap_or_else(|e| {
-        failures.push(("stderr", e));
+        streams.push(("stderr", e));
         Vec::new()
     });
-    failures.extend(stdin.err().map(|e| ("stdin", e)));
-    let mut failures = failures.into_iter();
-    let result = match status {
-        Err(e) => Err(e),
-        Ok(status) => match failures.next() {
-            Some((_, e)) => Err(Error::Io(e)),
-            None => Ok(status),
-        },
+    streams.extend(stdin.err().map(|e| ("stdin", e)));
+    let mut streams = streams.into_iter();
+    let named = |streams: std::vec::IntoIter<(&str, io::Error)>| {
+        streams
+            .map(|(stream, e)| Error::Io(crate::error::io_context(stream, e)))
+            .collect::<Vec<_>>()
     };
-    match result {
-        Ok(status) => Ok(Output { status, stdout, stderr }),
-        Err(first) => {
-            for (stream, e) in failures {
-                log::debug!(
-                    "communicate: the {stream} error was not returned: {report}",
-                    report = crate::error::Report(&e)
-                );
-            }
-            Err(first)
-        }
+    match status {
+        Err(wait) => Err(wait.with_peers_or_warn("communicate", named(streams))),
+        Ok(status) => match streams.next() {
+            None => Ok(Output { status, stdout, stderr }),
+            Some((_, first)) => Err(Error::Io(first).with_peers_or_warn("communicate", named(streams))),
+        },
     }
 }
 
@@ -120,10 +115,11 @@ struct Collected {
     error: Option<io::Error>,
 }
 
-struct Finished {
-    stdin: io::Result<()>,
-    stdout: io::Result<Vec<u8>>,
-    stderr: io::Result<Vec<u8>>,
+/// How each stream of a `communicate` ended, for [`merge`].
+pub(crate) struct Finished {
+    pub(crate) stdin: io::Result<()>,
+    pub(crate) stdout: io::Result<Vec<u8>>,
+    pub(crate) stderr: io::Result<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]

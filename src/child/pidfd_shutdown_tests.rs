@@ -82,7 +82,7 @@ fn run(
     // A grace the row does not answer reads as an exit, so a wrongly waited one shows in `sent`.
     let waited = shutdown.needs_grace().then(|| {
         sent.borrow_mut().push("grace");
-        exited.unwrap_or(Ok(true))
+        exited.unwrap_or(Ok(true)).map_err(Error::Io)
     });
     let err = shutdown.finish(
         &call,
@@ -114,10 +114,12 @@ fn a_front_the_sigterm_may_not_reach_is_refused_with_nothing_sent() {
     assert_eq!(warns, Vec::<String>::new());
 }
 
+/// A failed grace wait kills the root at once, and its failure is in the answer: below the call's
+/// `Unassessable`, after the refusal's cause.
+///
+/// Mutant: the failure is logged and dropped.
 #[skuld::test]
-fn a_failed_grace_wait_kills_the_root_at_once() {
-    // `run` installs the capture; this mark is before its debug record.
-    let mark = crate::log_capture::mark();
+fn a_failed_grace_wait_kills_the_root_at_once_and_is_in_the_answer() {
     let (err, sent, warns) = run(
         Gate::Open,
         Ok(Sent::Delivered),
@@ -129,10 +131,33 @@ fn a_failed_grace_wait_kills_the_root_at_once() {
     assert_eq!(sent, ["term", "grace", "kill"]);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
-    let debug = crate::log_capture::records_since_on_current_thread(mark, "grace wait failed");
-    assert_eq!(debug.len(), 1, "{debug:?}");
-    assert_eq!(debug[0].0, log::Level::Debug, "{debug:?}");
-    assert!(debug[0].1.contains("forced wait failure"), "{debug:?}");
+    let below = err.failures_below();
+    assert!(
+        matches!(&below[..], [cause, watch]
+            if cause.to_string().contains("forced") && watch.to_string() == "forced wait failure"),
+        "{below:?}"
+    );
+}
+
+/// With the grace wait failed and the kill failed too, both are in the answer after the refusal's
+/// cause: the kill's, which is the call's failure, then the wait's, as at every graceful site.
+///
+/// Mutant: the watch failure is dropped when the kill fails.
+#[skuld::test]
+fn a_failed_grace_wait_and_a_failed_kill_are_both_in_the_answer_in_order() {
+    let (err, sent, _) = run(
+        Gate::Open,
+        Ok(Sent::Delivered),
+        Some(Err(std::io::Error::other("forced wait failure"))),
+        Gate::Open,
+        Err(Error::Io(std::io::Error::other("forced kill failure"))),
+    );
+    assert_eq!(sent, ["term", "grace", "kill"]);
+    let below: Vec<_> = err.failures_below().into_iter().map(ToString::to_string).collect();
+    assert_eq!(below.len(), 3, "{below:?}");
+    assert!(below[0].contains("forced"), "{below:?}");
+    assert_eq!(below[1], "forced kill failure", "{below:?}");
+    assert_eq!(below[2], "forced wait failure", "{below:?}");
 }
 
 #[skuld::test]
@@ -161,17 +186,9 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     let forced = || Error::Io(std::io::Error::other("forced term failure"));
     let (err, sent, warns) = run(Gate::Open, Err(forced()), None, Gate::Open, Ok(Sent::Delivered));
     // An `Io` is a leaf with no slot for peers: the call's `Unassessable` holds it, after the refusal's cause.
-    let Error::Unassessable {
-        source: Some(source), ..
-    } = &err
-    else {
-        panic!("{err:?}");
-    };
-    let Error::Several(list) = &**source else {
-        panic!("expected Several, got {source:?}");
-    };
+    assert!(matches!(&err, Error::Unassessable { .. }), "{err:?}");
     assert!(
-        matches!(&**list.iter().nth(1).expect("the SIGTERM's error"), Error::Io(e) if e.to_string() == "forced term failure"),
+        matches!(err.failures_below().get(1), Some(Error::Io(e)) if e.to_string() == "forced term failure"),
         "{err:?}"
     );
     assert_eq!(sent, ["term"]);

@@ -1,5 +1,5 @@
 //! Async `communicate`: write input to stdin (drop it for EOF) and read stdout + stderr to EOF
-//! concurrently with `wait`, via `tokio::try_join!` — close-stdin-then-read-both with zero
+//! concurrently with `wait`, via `tokio::join!` — close-stdin-then-read-both with zero
 //! threads. A child closing stdin early (BrokenPipe) is a normal EOF, not an error.
 
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,39 +45,34 @@ impl Child {
             }
             if let Some(mut w) = stdin.take() {
                 if let Some(bytes) = input.as_ref() {
-                    w.write_all(bytes)
-                        .await
-                        .or_else(swallow_broken_pipe)
-                        .map_err(Error::Io)?;
-                    w.flush().await.or_else(swallow_broken_pipe).map_err(Error::Io)?;
+                    w.write_all(bytes).await.or_else(swallow_broken_pipe)?;
+                    w.flush().await.or_else(swallow_broken_pipe)?;
                 }
                 drop(w); // EOF
             }
-            Ok::<(), Error>(())
+            Ok::<(), std::io::Error>(())
         };
         let read_out = async {
             let mut buf = Vec::new();
             if let Some(mut r) = stdout.take() {
-                r.read_to_end(&mut buf).await.map_err(Error::Io)?;
+                r.read_to_end(&mut buf).await?;
             }
-            Ok::<Vec<u8>, Error>(buf)
+            Ok::<Vec<u8>, std::io::Error>(buf)
         };
         let read_err = async {
             let mut buf = Vec::new();
             if let Some(mut r) = stderr.take() {
-                r.read_to_end(&mut buf).await.map_err(Error::Io)?;
+                r.read_to_end(&mut buf).await?;
             }
-            Ok::<Vec<u8>, Error>(buf)
+            Ok::<Vec<u8>, std::io::Error>(buf)
         };
         // `wait` is the sole borrow of `self` here (already mapped to `Error`); the stream futures
         // own their taken locals, so the four-future join has no aliasing conflict.
         let wait = self.inner.wait_async();
 
-        let ((), out, err, status) = ::tokio::try_join!(write, read_out, read_err, wait)?;
-        Ok(Output {
-            status,
-            stdout: out,
-            stderr: err,
-        })
+        // Every one of the four runs to its end, as in the sync call, so no failure is lost to a
+        // cancelled sibling; the shared merge picks the answer and carries or logs the others.
+        let (stdin, stdout, stderr, status) = ::tokio::join!(write, read_out, read_err, wait);
+        crate::child::pump::merge(status, None, crate::child::pump::Finished { stdin, stdout, stderr })
     }
 }

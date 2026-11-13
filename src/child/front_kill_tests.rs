@@ -337,6 +337,39 @@ fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
     assert_ends_unsignalled(&child, stdin);
 }
 
+/// The grace wait's failure is not subsumed by the refusal: the escalation's `Unkillable` is the
+/// answer, with the watch failure as its cause.
+///
+/// Mutant: the watch failure is logged and dropped, or replaces the refusal.
+#[skuld::test]
+fn graceful_shutdown_of_a_front_whose_grace_wait_failed_is_unkillable_with_the_watch_failure_as_its_cause() {
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let mut ready = [0u8; 6];
+    child
+        .stdout()
+        .expect("stdout pipe")
+        .read_exact(&mut ready)
+        .expect("read `ready`");
+    crate::wait::fault::set_force_watch_error(true);
+
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("a live front is not killed");
+
+    match &err {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            source: Some(cause),
+            ..
+        } => assert!(cause.to_string().contains("forced grace-watch failure"), "{err:?}"),
+        other => panic!("expected Unkillable with the watch failure as its cause, got {other:?}"),
+    }
+    assert_ends_unsignalled(&child, stdin);
+}
+
 /// The drop neither kills nor waits for a live front, and says so.
 #[skuld::test]
 fn drop_of_a_live_front_leaves_it_running_unreaped_and_warns() {
@@ -753,11 +786,14 @@ fn a_spawn_that_fails_after_its_fork_flags_a_front_and_no_other_child() {
     }
 }
 
-/// A child that is not a front outside a cgroup keeps its refused escalation the raw `Io`, not
-/// `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its `SIGTERM` is answered as
-/// delivered and its kill is refused, so the escalation runs.
+/// A pkexec child is not a front, so its escalation sends the kill, and a refused one answers as
+/// [`Child::kill`] does: `Unkillable`, with the OS's refusal as its cause and a failed grace wait
+/// beside it. Its `SIGTERM` is answered as delivered and its kill is refused, so the escalation runs.
+///
+/// Mutant: the escalation answers the raw `Io`, skipping the elevation mapping, or drops the watch
+/// failure.
 #[skuld::test]
-fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
+fn a_pkexec_childs_refused_escalation_is_unkillable_as_for_kill() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
@@ -771,14 +807,69 @@ fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
     let fake = child
         .proc
         .script_over(|f| f.signals([Ok(crate::signal::Sent::Delivered), failed_signal(libc::EPERM)]));
-    match child.graceful_shutdown(Duration::ZERO) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
-        other => panic!("expected the raw Io(PermissionDenied), got {other:?}"),
-    }
+    crate::wait::fault::set_force_watch_error(true);
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("the kill is refused");
+    let Error::Elevation {
+        kind: ElevationErrorKind::Unkillable,
+        ..
+    } = &err
+    else {
+        panic!("expected Unkillable, got {err:?}");
+    };
+    let below = err.failures_below();
+    assert!(
+        matches!(&below[..], [Error::Io(e), watch]
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                && watch.to_string().contains("forced grace-watch failure")),
+        "{below:?}"
+    );
     assert_eq!(
         fake.signal_calls(),
         [Sig::Term, Sig::Kill],
         "the escalation was reached"
+    );
+    assert_ends_unsignalled(&child, stdin);
+}
+
+/// A child that cannot run as another user answers a refused escalation with the raw `Io`: it is the
+/// OS call's failure, with its code, whatever else failed. A failed grace wait beside it is logged at
+/// warn, not carried.
+///
+/// Mutant: the `Io` goes below an `Unassessable` once it has a peer, or the watch failure is dropped.
+#[skuld::test]
+fn a_refused_escalation_of_a_child_that_cannot_run_as_another_user_is_the_io_and_the_watch_failure_a_warn() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = [0u8; 6];
+    child
+        .stdout()
+        .expect("stdout pipe")
+        .read_exact(&mut ready)
+        .expect("read `ready`");
+    child
+        .proc
+        .script_over(|f| f.signals([Ok(crate::signal::Sent::Delivered), failed_signal(libc::EPERM)]));
+    crate::wait::fault::set_force_watch_error(true);
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("the kill is refused");
+    match &err {
+        Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        other => panic!("expected the raw Io(PermissionDenied), got {other:?}"),
+    }
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "forced grace-watch failure");
+    let call = format!("graceful_shutdown({})", child.pid());
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.starts_with(&call)),
+        "{logged:?}"
     );
     assert_ends_unsignalled(&child, stdin);
 }

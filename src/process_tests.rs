@@ -209,7 +209,7 @@ fn kill_tree_sends_the_roots_kill_through_the_held_handle() {
     #[cfg(unix)]
     let sends = crate::send_log::Capture::start();
 
-    held.kill_tree_with(&crate::identity::HostKernel)
+    held.kill_tree_with("kill_tree", &crate::identity::HostKernel)
         .expect("the held handle took the kill and the root has no descendant");
 
     // A walk that killed the root by its identity would send the held handle nothing. (On Windows the

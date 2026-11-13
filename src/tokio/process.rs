@@ -104,7 +104,9 @@ impl Process {
     ///
     /// As [`wait`](Process::wait).
     pub async fn kill_tree(&self) -> Result<(), Error> {
-        self.inner.kill_tree_with_async(&crate::identity::HostKernel).await
+        self.inner
+            .kill_tree_with_async("kill_tree", &crate::identity::HostKernel)
+            .await
     }
 
     /// [`kill_tree`](Self::kill_tree) that sends and does not wait, as the sync

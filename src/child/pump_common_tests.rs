@@ -270,25 +270,70 @@ fn failed(kind: io::ErrorKind) -> io::Error {
     io::Error::from(kind)
 }
 
-fn merged_kind(
-    status: Result<std::process::ExitStatus, Error>,
-    pump: Option<io::Error>,
-    finished: Finished,
-) -> Option<io::ErrorKind> {
-    match merge(status, pump, finished) {
-        Err(Error::Io(e)) => Some(e.kind()),
-        Err(other) => panic!("not an I/O error: {other:?}"),
-        Ok(_) => None,
+/// The I/O kind of the one failure `error` is: an `Io`.
+fn io_kind(error: &Error) -> io::ErrorKind {
+    match error {
+        Error::Io(e) => e.kind(),
+        other => panic!("not an I/O error: {other:?}"),
     }
 }
 
-/// With several failures the first is returned, in the order wait, pump, stdout, stderr, stdin.
-/// Each is the one returned when every later one is present too.
+/// The streams a merge's warn lines name, in order.
+fn warned_streams(mark: usize) -> Vec<String> {
+    crate::log_capture::records_since_on_current_thread(mark, "communicate")
+        .into_iter()
+        .map(|(level, line)| {
+            assert_eq!(level, log::Level::Warn, "{line}");
+            ["pump", "stdout", "stderr", "stdin"]
+                .into_iter()
+                .find(|stream| line.contains(&format!("{stream}:")))
+                .unwrap_or_else(|| panic!("no stream named: {line}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The first failure is the answer as it is, in the order wait, pump, stdout, stderr, stdin. When it has
+/// a slot (the wait's `Unassessable` here) the later ones are its cause, in that order, none dropped,
+/// each naming its stream.
 ///
-/// Mutant: any two of the five swapped, or the wait's error returned after a stream's.
+/// Mutant: any two of the five swapped, the wait's error after a stream's, a later failure dropped, or
+/// a carried failure that names no stream.
 #[skuld::test]
-fn the_first_failure_is_returned_in_the_documented_order() {
-    use io::ErrorKind::{BrokenPipe, ConnectionReset, NotFound, PermissionDenied, TimedOut, Unsupported};
+fn a_first_failure_with_a_slot_carries_every_later_one_in_order_naming_its_stream() {
+    use io::ErrorKind::{BrokenPipe, NotFound, PermissionDenied, Unsupported};
+    let wait = Error::Unassessable {
+        detail: "the wait".into(),
+        source: None,
+    };
+    let all = finished(
+        Err(failed(Unsupported)),
+        Err(failed(PermissionDenied)),
+        Err(failed(NotFound)),
+    );
+    let answer = merge(Err(wait), Some(failed(BrokenPipe)), all).expect_err("everything failed");
+    assert!(
+        matches!(&answer, Error::Unassessable { detail, .. } if detail == "the wait"),
+        "{answer:?}"
+    );
+    let below = answer.failures_below();
+    let kinds: Vec<_> = below.iter().map(|e| io_kind(e)).collect();
+    assert_eq!(kinds, [BrokenPipe, PermissionDenied, NotFound, Unsupported]);
+    for (peer, stream) in below.iter().zip(["pump", "stdout", "stderr", "stdin"]) {
+        assert!(peer.to_string().starts_with(&format!("{stream}: ")), "{stream}: {peer}");
+    }
+}
+
+/// An `Io` first is the answer as it is, in the same order, with its OS code, at every count: no
+/// variant's meaning covers a failed pipe. Each later failure is logged at warn, naming its stream and
+/// the call, in order.
+///
+/// Mutants: the `Io` goes below an `Unassessable` once it has peers; a peer is dropped, logged at debug,
+/// or names no stream; the order of the five changes.
+#[skuld::test]
+fn an_io_first_failure_is_the_answer_at_every_count_and_each_later_one_is_a_warn_naming_its_stream() {
+    use io::ErrorKind::{BrokenPipe, ConnectionReset, NotFound, PermissionDenied, Unsupported};
+    crate::log_capture::install();
     let all = || {
         finished(
             Err(failed(Unsupported)),
@@ -296,17 +341,43 @@ fn the_first_failure_is_returned_in_the_documented_order() {
             Err(failed(NotFound)),
         )
     };
-    let wait = || Err(Error::Io(failed(TimedOut)));
-    assert_eq!(merged_kind(wait(), Some(failed(BrokenPipe)), all()), Some(TimedOut));
+
+    let mark = crate::log_capture::mark();
+    let answer = merge(Ok(exit_zero()), Some(failed(BrokenPipe)), all()).expect_err("everything failed");
+    assert_eq!(io_kind(&answer), BrokenPipe, "the pump's failure is first: {answer:?}");
+    assert_eq!(warned_streams(mark), ["stdout", "stderr", "stdin"]);
+
+    let mark = crate::log_capture::mark();
+    let answer = merge(Ok(exit_zero()), None, all()).expect_err("the streams failed");
     assert_eq!(
-        merged_kind(Ok(exit_zero()), Some(failed(BrokenPipe)), all()),
-        Some(BrokenPipe)
+        io_kind(&answer),
+        PermissionDenied,
+        "stdout's failure is first: {answer:?}"
     );
-    assert_eq!(merged_kind(Ok(exit_zero()), None, all()), Some(PermissionDenied));
+    assert_eq!(warned_streams(mark), ["stderr", "stdin"]);
+
+    let mark = crate::log_capture::mark();
     let no_stdout = finished(Err(failed(Unsupported)), Ok(Vec::new()), Err(failed(NotFound)));
-    assert_eq!(merged_kind(Ok(exit_zero()), None, no_stdout), Some(NotFound));
+    let answer = merge(Ok(exit_zero()), None, no_stdout).expect_err("two failed");
+    assert_eq!(io_kind(&answer), NotFound, "{answer:?}");
+    assert_eq!(warned_streams(mark), ["stdin"]);
+
+    let mark = crate::log_capture::mark();
     let only_stdin = finished(Err(failed(ConnectionReset)), Ok(Vec::new()), Ok(Vec::new()));
-    assert_eq!(merged_kind(Ok(exit_zero()), None, only_stdin), Some(ConnectionReset));
+    let answer = merge(Ok(exit_zero()), None, only_stdin).expect_err("one failed");
+    assert_eq!(io_kind(&answer), ConnectionReset, "{answer:?}");
+    assert!(warned_streams(mark).is_empty());
+
+    // The wait's own `Io` is first too.
+    let mark = crate::log_capture::mark();
+    let answer = merge(
+        Err(Error::Io(failed(io::ErrorKind::TimedOut))),
+        Some(failed(BrokenPipe)),
+        all(),
+    )
+    .expect_err("everything failed");
+    assert_eq!(io_kind(&answer), io::ErrorKind::TimedOut, "{answer:?}");
+    assert_eq!(warned_streams(mark), ["pump", "stdout", "stderr", "stdin"]);
 }
 
 /// A failure of a stream is returned even when the child exited successfully, and no failure
@@ -316,9 +387,11 @@ fn the_first_failure_is_returned_in_the_documented_order() {
 #[skuld::test]
 fn a_stream_failure_after_a_successful_exit_is_returned_and_none_returns_the_bytes() {
     let failing = finished(Ok(()), Ok(b"out".to_vec()), Err(failed(io::ErrorKind::NotFound)));
+    let answer = merge(Ok(exit_zero()), None, failing).expect_err("stderr failed");
     assert_eq!(
-        merged_kind(Ok(exit_zero()), None, failing),
-        Some(io::ErrorKind::NotFound)
+        io_kind(&answer),
+        io::ErrorKind::NotFound,
+        "a lone failure is the `Io` as it is"
     );
 
     let out = merge(
