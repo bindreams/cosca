@@ -95,9 +95,9 @@ mod on_windows {
     /// match.
     fn findstr_blocker(raw: bool) -> Command {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.args(["findstr", "x"]);
         if raw {
-            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
+            cmd.executable("findstr");
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");

@@ -44,6 +44,52 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
     );
 }
 
+/// `assert_killed` reads a Windows exit code `1` as a kill, so the default blocker
+/// ([`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV)) must not exit `1` by itself when its stdin
+/// closes: a test that releases it would pass for a kill that never happened (#972).
+#[cfg(windows)]
+mod blocker_release_tests {
+    use crate::test_child::{assert_killed, held_contained_blocker, held_std_blocker};
+
+    fn rejected(who: &str, status: std::process::ExitStatus) {
+        let outcome = std::panic::catch_unwind(|| assert_killed(who, status));
+        assert!(
+            outcome.is_err(),
+            "{who} exited on its own and assert_killed took it for a kill: {status:?}"
+        );
+    }
+
+    #[skuld::test]
+    fn a_std_blocker_released_by_eof_is_not_a_kill() {
+        let mut child = crate::test_spawn::spawn(&mut held_std_blocker(std::process::Stdio::null())).expect("spawn");
+        drop(child.stdin.take());
+        rejected("the released blocker", child.wait().expect("reap"));
+    }
+
+    #[skuld::test]
+    fn a_std_blocker_terminated_is_a_kill() {
+        let mut child = crate::test_spawn::spawn(&mut held_std_blocker(std::process::Stdio::null())).expect("spawn");
+        child.kill().expect("terminate");
+        assert_killed("the terminated blocker", child.wait().expect("reap"));
+    }
+
+    #[skuld::test]
+    fn a_contained_blocker_released_by_eof_is_not_a_kill() {
+        let (child, stdin) = held_contained_blocker(crate::Stdio::null());
+        drop(stdin);
+        rejected("the released blocker", child.wait().expect("reap"));
+    }
+
+    #[skuld::test]
+    fn a_contained_blocker_killed_is_a_kill() {
+        let (child, stdin) = held_contained_blocker(crate::Stdio::null());
+        child.kill_tree().expect("kill");
+        let status = child.wait().expect("reap");
+        drop(stdin);
+        assert_killed("the killed blocker", status);
+    }
+}
+
 /// A signal handled while `watch_macos` is parked must retry the wait, not panic (see
 /// `kevent_eintr`), and the wait must still report the target's exit.
 #[cfg(target_os = "macos")]

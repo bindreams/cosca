@@ -49,7 +49,7 @@ async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate:
     #[cfg(windows)]
     {
         stdin.write_all(b"x\r\n").await.expect("write to the blocker");
-        drop(stdin); // EOF: findstr can now finish reading and exit
+        drop(stdin); // EOF: the blocker can now finish reading and exit
         let mut output = Vec::new();
         child
             .stdout()
@@ -58,10 +58,7 @@ async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate:
             .await
             .expect("read stdout to EOF");
         let status = child.wait().await.expect("the blocker must exit after stdin closes");
-        assert!(
-            status.success(),
-            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
-        );
+        assert!(status.success(), "the blocker must exit 0 on EOF, got {status:?}");
         assert!(
             output.windows(1).any(|w| w == b"x"),
             "the blocker's stdout must contain the echoed match, got {output:?}"

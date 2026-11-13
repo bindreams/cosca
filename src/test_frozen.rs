@@ -25,7 +25,7 @@ use crate::test_spawn::console_flags::Console;
 
 use crate::containment::windows::JobHandle;
 
-/// A `findstr x` blocker created `CREATE_SUSPENDED` through std, with piped stdin; closing it lets the
+/// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) child created `CREATE_SUSPENDED` through std, with piped stdin; closing it lets the
 /// child exit once it runs.
 pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
     let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);

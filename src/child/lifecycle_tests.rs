@@ -22,18 +22,9 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
 }
 
 /// A contained blocker and its stdin writer, which the caller must keep for exactly as long as the
-/// child must stay running. On Windows it is `more.com`, not the `findstr` of
-/// [`crate::test_child::BLOCKER_ARGV`]: released stdin must not look like a kill to
-/// [`crate::test_child::assert_killed`].
+/// child must stay running.
 fn long_lived_contained_child() -> (crate::Child, crate::PipeWriter) {
-    #[cfg(unix)]
-    {
-        crate::test_child::held_contained_blocker(crate::Stdio::null())
-    }
-    #[cfg(windows)]
-    {
-        crate::test_child::windows_blocker()
-    }
+    crate::test_child::held_contained_blocker(crate::Stdio::null())
 }
 
 /// Kill, release stdin, reap. Releasing after the kill makes a no-op `kill_tree` fail the status
@@ -291,7 +282,7 @@ fn drop_kills_and_reaps_the_child() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    // `more.com` exits 0 on EOF, unlike the `findstr` blocker, whose exit 1 is the kill's code.
+    // `more` echoes, so its stdout is nulled.
     #[cfg(windows)]
     {
         cmd.args([crate::test_child::windows_more()]);
