@@ -7,7 +7,12 @@ use std::time::Duration;
 use super::Child;
 #[cfg(test)]
 use crate::child::graceful::fault;
-use crate::child::graceful::{take_forced_watch_error, SignalTreeCooperativelyOutcome};
+use crate::child::graceful::waits::Waits;
+#[cfg(unix)]
+use crate::child::graceful::HoldersShutdown;
+use crate::containment::dispatch::{SweepFailure, Swept};
+use crate::containment::drain_edge::DrainEdge;
+use crate::containment::TreeDrain;
 use crate::error::Error;
 
 impl Child {
@@ -246,190 +251,35 @@ impl Child {
     /// holds** are answered as for the sync
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), with the grace awaited.
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.inner.require_contained()?;
+        crate::child::graceful::waits::shutdown_tree(self, grace).await
+    }
+}
 
-        // The mechanism's look at the root decides the cooperative signal (see `terminate_tree`), and
-        // what the sweep may say was sent before it.
-        let (term, earlier) = match self.inner.signal_tree_cooperatively() {
-            SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
-            SignalTreeCooperativelyOutcome::End(e) => return Err(e),
-            #[cfg(target_os = "linux")]
-            SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
-                return Err(self.shut_down_root_through_pidfd(&skip, grace).await);
-            }
-            #[cfg(unix)]
-            SignalTreeCooperativelyOutcome::HoldersOnly(skip) => {
-                return Err(self.shut_down_holders_only(skip, grace).await);
-            }
-        };
-
-        // The signal went out, so every error of the check after it holds. A refusal is dropped when
-        // the sweep proves the tree clear.
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::AfterTerminate);
-
-        let call = format!("graceful_shutdown_tree({})", self.pid());
-        // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
-        //
-        // `drained`: whether the sweep below is skippable. Only `TreeDrain::AllMembersExited`
-        // (`permits_skipping_sweep`) makes it true — positive kernel-confirmed proof the WHOLE
-        // tree exited, from a mechanism a live process cannot leave without exiting, so the
-        // sweep would be pure overhead. `AllMarkersClosed` (the macOS marker's advisory pipe
-        // EOF — see `TreeDrain`'s own doc) is NOT that proof: a live process can close its own
-        // copy of the marker descriptor and remain alive, undetectable by this edge alone, so
-        // it falls into the same "always sweep" bucket as `MembersRemain` and every mechanism
-        // with no drain edge at all. `root_exited`: whether the root specifically was observed
-        // to have exited. A skipped-sweep tree implies it. On the root-only-watch mechanism
-        // (the `else` arm below) it is that watch's own result. Everywhere else it comes from a
-        // fresh, non-blocking, zero-duration probe of the root alone, immediately below — a
-        // tree-wide verdict that isn't sufficient to skip the sweep says nothing about the root
-        // specifically (only some OTHER member may still be alive), and the probe costs nothing
-        // extra since `grace` was already fully spent by the tree-drain watch that just
-        // returned it. Used only below, to decide whether a
-        // best-effort reap is safe after a sweep failure.
-        let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
-            (false, false, Some(e))
-        } else if let Some(edge) = self.inner.tree.drain_edge() {
-            match edge.wait_async(crate::tokio::wait::deadline_from(grace)).await {
-                Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
-                // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
-                // to the fresh, non-blocking, zero-duration root probe described there.
-                Ok(_) => match self.exited_through_handle(Some(Duration::ZERO)).await {
-                    Ok(exited) => (false, exited, None),
-                    Err(e) => (false, false, Some(e)),
-                },
-                Err(e) => (false, false, Some(e)),
-            }
-        } else {
-            // NON-reaping grace-wait on the root only.
-            match self.exited_through_handle(Some(grace)).await {
-                Ok(exited) => (false, exited, None),
-                Err(e) => (false, false, Some(e)),
-            }
-        };
-        // A sweep Err is the answer, with the terminate and watch failures below it; it must propagate
-        // before the reap on a LIVE root (waiting unswept would hang), but once the root is dead (its
-        // exit was observed, or the sweep's backstop killed it), the reap runs first.
-        if !drained {
-            // The `#[cfg(test)]` arm lets a test PROVE the sweep is skipped when `drained`,
-            // not merely that it would have no-op'd: forcing this call to fail and then
-            // observing `Ok` from the whole function is only possible if this branch was
-            // never entered at all.
-            #[cfg(test)]
-            let sweep_result = if fault::take_force_kill_tree_error() {
-                Err(fault::forced_kill_tree_error().into())
-            } else {
-                self.kill_tree_after("graceful_shutdown_tree", earlier)
-                    .wait_async()
-                    .await
-            };
-            #[cfg(not(test))]
-            let sweep_result = self
-                .kill_tree_after("graceful_shutdown_tree", earlier)
-                .wait_async()
-                .await;
-            if let Err(sweep) = sweep_result {
-                // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if (root_exited || sweep.root_ended) && !self.inner.root_is_unpinned() {
-                    // Best-effort reap so a dead root isn't left a zombie; `sweep`
-                    // (below) is already the error this call reports, so a failure here is
-                    // secondary and is logged, not returned.
-                    if let Err(e) = self.wait().await {
-                        log::warn!(
-                            "graceful_shutdown_tree({id}): the best-effort reap after a swept, exited root also failed: {report}",
-                            id = self.pid(),
-                            report = crate::error::Report(&e)
-                        );
-                    }
-                }
-                return Err(crate::graceful::joined(
-                    &call,
-                    sweep.error,
-                    term.err().into_iter().chain(watch_err),
-                ));
-            }
-        }
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::BeforeReap);
-        #[cfg(target_os = "macos")]
-        if self.inner.root_is_unpinned() {
-            return Err(crate::graceful::joined(
-                &call,
-                crate::signal::unpinned_status(self.pid(), "graceful_shutdown_tree"),
-                term.err().into_iter().chain(watch_err),
-            ));
-        }
-        #[cfg(unix)]
-        let waited = crate::child::graceful::status_unless_reaped_elsewhere(self.wait().await, self.pid());
-        #[cfg(not(unix))]
-        let waited = self.wait().await;
-        // The tree is confirmed clear here, as for the sync call: a reap that succeeded discards the
-        // superseded refusal, one that failed takes it as a peer.
-        if let (Ok(_), Err(e)) = (&waited, &term) {
-            log::debug!(
-                "graceful_shutdown_tree({id}): tree confirmed clear; discarding the superseded terminate_tree refusal: {report}",
-                id = self.pid(),
-                report = crate::error::Report(e)
-            );
-        }
-        crate::graceful::after_reap(&call, waited, term.err(), watch_err)
+/// The async `Child`'s waits for `graceful_shutdown_tree`: each is awaited, on tokio's clock.
+impl Waits for Child {
+    fn child(&self) -> &crate::Child {
+        &self.inner
     }
 
-    /// As the sync call's `shut_down_root_through_pidfd`, with the grace awaited.
-    #[cfg(target_os = "linux")]
-    async fn shut_down_root_through_pidfd(&self, skip: &crate::containment::Skip, grace: Duration) -> Error {
-        let call = self.inner.skip_call(
-            "graceful_shutdown_tree",
-            crate::containment::dispatch::TreeSignal::Term,
-            None,
-        );
-        let shutdown = match crate::child::graceful::PidfdShutdown::start(self.inner.terminate_gate(), || {
-            self.inner.proc.signal(crate::signal::Sig::Term)
-        }) {
-            Ok(shutdown) => shutdown,
-            Err(unkillable) => return unkillable,
-        };
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::AfterTerminate);
-        let exited = if shutdown.needs_grace() {
-            Some(self.exited_through_handle(Some(grace)).await)
-        } else {
-            None
-        };
-        shutdown.finish(
-            &call,
-            skip,
-            exited,
-            || self.inner.kill_gate(),
-            || {
-                self.inner
-                    .kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.inner.may_run_as_another_user()))
-            },
-        )
+    async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error> {
+        edge.wait_async(crate::tokio::wait::deadline_from(grace)).await
     }
 
-    /// As the sync call's `shut_down_holders_only`, with the grace awaited.
+    async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
+        self.exited_through_handle(Some(within)).await
+    }
+
+    async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure> {
+        swept.wait_async().await
+    }
+
+    async fn reap(&mut self) -> Result<ExitStatus, Error> {
+        self.wait().await
+    }
+
     #[cfg(unix)]
-    async fn shut_down_holders_only(&self, skip: crate::containment::Skip, grace: Duration) -> Error {
-        let call = self.inner.skip_call(
-            "graceful_shutdown_tree",
-            crate::containment::dispatch::TreeSignal::Term,
-            None,
-        );
-        // A failed grace wait means the holders are killed now.
-        let watch = self
-            .inner
-            .tree
-            .wait_drained_async(crate::tokio::wait::deadline_from(grace))
-            .await
-            .err();
-        let label = format!("graceful_shutdown_tree({})", self.pid());
-        crate::graceful::joined(
-            &label,
-            self.inner.holders_shutdown(&call, skip).finish_async().await,
-            watch,
-        )
+    async fn holders_finish(&self, shutdown: HoldersShutdown<'_>) -> Error {
+        shutdown.finish_async().await
     }
 }
 

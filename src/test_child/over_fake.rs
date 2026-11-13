@@ -73,14 +73,6 @@ pub(crate) fn holders_only_skip(child: &Child) -> crate::containment::Skip {
     }
 }
 
-/// [`child_with`], as a tokio `Child`.
-#[cfg(all(feature = "tokio", unix))]
-pub(crate) fn tokio_child_with(root: &FakeProcess, fake: FakeContains) -> crate::tokio::Child {
-    crate::tokio::Child {
-        inner: child_with(root, fake),
-    }
-}
-
 /// [`child_reaching`], as a tokio `Child`.
 #[cfg(feature = "tokio")]
 pub(crate) fn tokio_child_reaching(root: &FakeProcess, members: &[ProcessId]) -> crate::tokio::Child {

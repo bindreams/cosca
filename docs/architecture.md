@@ -151,7 +151,10 @@ In order:
    (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
-   `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`). What is
+   `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`).
+   `graceful_shutdown_tree` is one `async fn` (`shutdown_tree`, in `child/graceful/waits.rs`) over a
+   `Waits` trait of its waits: the sync `Child` runs it with blocking waits through `run_ready` (one
+   poll, a panic on `Pending`), and the async `Child` awaits it. What is
    left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
    `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
