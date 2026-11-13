@@ -323,8 +323,12 @@ pub(crate) const STATUS_REAPED_ELSEWHERE: &str = "exit status cannot be collecte
 #[track_caller]
 pub(crate) fn assert_down_without_status(result: Result<std::process::ExitStatus, crate::error::Error>, mark: usize) {
     match result {
-        Err(crate::error::Error::Unassessable { detail, source: None }) => {
+        Err(crate::error::Error::Unassessable {
+            detail,
+            source: Some(cause),
+        }) => {
             assert!(detail.contains(STATUS_REAPED_ELSEWHERE), "{detail}");
+            assert_eq!(crate::error::first_os_code(&*cause), Some(libc::ECHILD), "{cause:?}");
         }
         other => panic!("expected the tree down without the root's status, got {other:?}"),
     }
