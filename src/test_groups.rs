@@ -253,21 +253,67 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     Err(lacks("this host is not Linux".to_owned()))
 }
 
+/// `struct pidfd_info`, version 0 (64 bytes), from the kernel uapi `linux/pidfd.h`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default)]
+struct PidfdInfo {
+    mask: u64,
+    cgroupid: u64,
+    rest: [u32; 12],
+}
+
+/// `PIDFD_GET_INFO` is `_IOWR(PIDFS_IOCTL_MAGIC = 0xFF, 11, struct pidfd_info)`, and `PIDFD_INFO_CGROUPID` is `1 << 2`
+/// (kernel uapi `linux/pidfd.h`).
+#[cfg(target_os = "linux")]
+const PIDFD_GET_INFO: libc::Ioctl = 0xC040_FF0B_u32 as libc::Ioctl;
+#[cfg(target_os = "linux")]
+const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
+
 /// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
-/// (Linux 6.13+), asked through the library's own read on this process's own pidfd. A kernel before 6.13 is a
-/// supported host that reads a task's cgroup through `/proc` instead.
+/// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13, a supported host that reads a
+/// task's cgroup through `/proc` instead, refuses it with `ENOTTY` or `EINVAL`.
 #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
 fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
     let lacks = |why: String| {
         format!(
-            "the group needs Linux 6.13+, whose pidfds answer PIDFD_GET_INFO with a cgroup id, and {why};              set {enabled_var}=0 to turn it off"
+            "the group needs Linux 6.13+, whose pidfds answer PIDFD_GET_INFO with a cgroup id, and {why}; \
+             set {enabled_var}=0 to turn it off"
         )
     };
     #[cfg(target_os = "linux")]
-    match cosca::test_kernel_has_pidfd_get_info() {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(lacks("this kernel does not answer it".to_owned())),
-        Err(e) => Err(lacks(format!("asking this process's own pidfd failed ({e})"))),
+    {
+        // SAFETY: a plain syscall.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        if pidfd < 0 {
+            return Err(lacks(format!(
+                "pidfd_open failed ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let pidfd = pidfd as libc::c_int;
+        let mut info = PidfdInfo {
+            mask: PIDFD_INFO_CGROUPID,
+            ..PidfdInfo::default()
+        };
+        // SAFETY: `pidfd` is the pidfd just opened, and `info` is a valid, writable `struct pidfd_info` of the size
+        // the request encodes.
+        let rc = unsafe { libc::ioctl(pidfd, PIDFD_GET_INFO, &mut info as *mut PidfdInfo) };
+        let errno = std::io::Error::last_os_error();
+        // SAFETY: closes the pidfd opened above, which nothing else holds.
+        unsafe { libc::close(pidfd) };
+        if rc == 0 {
+            // A kernel that took the ioctl but does not fill the cgroup id lacks the feature too.
+            return if info.mask & PIDFD_INFO_CGROUPID != 0 {
+                Ok(())
+            } else {
+                Err(lacks("this kernel's answer carries no cgroup id".to_owned()))
+            };
+        }
+        match errno.raw_os_error() {
+            Some(libc::ENOTTY) | Some(libc::EINVAL) => Err(lacks(format!("this kernel refused the ioctl ({errno})"))),
+            _ => Err(lacks(format!("the ioctl failed ({errno})"))),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     Err(lacks("this host is not Linux".to_owned()))
