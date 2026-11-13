@@ -140,8 +140,9 @@ fn an_own_cgroup_without_a_cgroup_procs_offers_no_cgroup() {
 
 /// The own cgroup is offered only when this process may write and search its directory and write
 /// its `cgroup.procs`: each missing permission means no cgroup. Declares what it needs: a process
-/// the mode bits bind, which root is not.
-#[skuld::test]
+/// the mode bits bind, which root is not, so it drops the module's `cgroup` label (the lane runs as
+/// root) and only the `unprivileged` group selects it.
+#[skuld::test(labels = [])]
 fn a_cgroup_this_process_may_not_fully_use_is_not_offered(#[fixture(unprivileged)] _group: &Group) {
     use std::os::unix::fs::PermissionsExt;
 
