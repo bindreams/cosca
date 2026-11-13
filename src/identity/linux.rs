@@ -94,7 +94,7 @@ fn read_in(kernel: &dyn Kernel, dir: &ProcDir, pid: RawPid) -> (Resolved<Vec<u8>
     };
     match resolve_unreadable(kernel, pid, crate::error::Report(&e)) {
         Resolved::Unknown => {
-            let cause = match pid_stat::failed_read(kernel, dir, pid, e) {
+            let cause = match pid_stat::failed_read(kernel, dir, pid, "stat", e) {
                 Ok(pid_stat::PidStat::Refused(refusal)) => UnknownCause::of_refusal(refusal),
                 Ok(_) => UnknownCause::default(),
                 Err(unreadable) => UnknownCause::of_unreadable(unreadable),

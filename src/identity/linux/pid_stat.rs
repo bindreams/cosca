@@ -26,14 +26,16 @@ pub(crate) enum PidStat {
     Refused(Refusal),
 }
 
-/// Why one pid's `stat` could not be read and is not simply absent. Its words say what failed; the
-/// OS error behind them is the [`source`](std::error::Error::source).
+/// Why one pid's `stat` (or another of its files) could not be read and is not simply absent. Its
+/// words say what failed; the OS error behind them is the [`source`](std::error::Error::source).
 ///
 /// A layer of the error chain: a caller wraps it as the cause of its own error and never folds its
 /// words into a message of its own.
 #[derive(Debug)]
 pub(crate) struct Unreadable {
     pid: u32,
+    /// The file of the pid that was read: `stat`, or `cgroup`.
+    file: &'static str,
     kind: Kind,
     cause: io::Error,
     /// The other read that failed with it, when there is one ([`Kind::RecheckFailed`]): the pid's
@@ -80,12 +82,15 @@ enum Kind {
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Unreadable { pid, kind, .. } = self;
+        let Unreadable { pid, file, kind, .. } = self;
         match kind {
-            Kind::BeyondMount => write!(f, "{pid}/stat lies beyond a mount in /proc and was not read"),
-            Kind::BesideRefusal => write!(f, "{pid}/stat was refused, and the checked /proc refused self/stat too"),
-            Kind::RecheckFailed => write!(f, "{pid}/stat was refused, and the re-check of self/stat failed"),
-            Kind::Other => write!(f, "{pid}/stat could not be read"),
+            Kind::BeyondMount => write!(f, "{pid}/{file} lies beyond a mount in /proc and was not read"),
+            Kind::BesideRefusal => write!(
+                f,
+                "{pid}/{file} was refused, and the checked /proc refused self/stat too"
+            ),
+            Kind::RecheckFailed => write!(f, "{pid}/{file} was refused, and the re-check of self/stat failed"),
+            Kind::Other => write!(f, "{pid}/{file} could not be read"),
         }
     }
 }
@@ -100,17 +105,19 @@ impl std::error::Error for Unreadable {
 pub(crate) fn read_in_scan(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<PidStat, Unreadable> {
     match read_stat_file(kernel, dir, pid) {
         Ok(stat) => Ok(PidStat::Read(stat)),
-        Err(source) => failed_read(kernel, dir, pid, source),
+        Err(source) => failed_read(kernel, dir, pid, "stat", source),
     }
 }
 
-/// What `source`, the error of the failed `stat` read of `pid` through `dir`, means:
-/// [`PidStat::Skipped`] for the errnos that mean the pid is not there for us, [`PidStat::Refused`]
-/// for a [`Refusal`], [`Unreadable`] for every other. The one policy of every by-pid `stat` read.
+/// What `source`, the error of the failed read of `pid`'s `file` (`stat`, or `cgroup`) through `dir`,
+/// means: [`PidStat::Skipped`] for the errnos that mean the pid is not there for us,
+/// [`PidStat::Refused`] for a [`Refusal`], [`Unreadable`] for every other. The one policy of every
+/// by-pid read.
 pub(crate) fn failed_read(
     kernel: &dyn Kernel,
     dir: &ProcDir,
     pid: u32,
+    file: &'static str,
     source: io::Error,
 ) -> Result<PidStat, Unreadable> {
     let (kind, cause, peer) = match source.raw_os_error() {
@@ -125,6 +132,7 @@ pub(crate) fn failed_read(
                 Some(refusal) => {
                     let pid_failure = Unreadable {
                         pid,
+                        file,
                         kind: Kind::BesideRefusal,
                         cause: source,
                         peer: None,
@@ -140,7 +148,45 @@ pub(crate) fn failed_read(
             None => (Kind::Other, source, None),
         },
     };
-    Err(Unreadable { pid, kind, cause, peer })
+    Err(Unreadable {
+        pid,
+        file,
+        kind,
+        cause,
+        peer,
+    })
+}
+
+/// `source`, the error of the failed read of `pid`'s `file` through `dir`, for a caller whose errors
+/// are the read's: an `Unsupported` `io::Error` saying what cosca requires when it is a [`Refusal`]
+/// ([`Refusal::unsupported_io`]), else `source` as it is.
+pub(crate) fn explained_read_failure(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    file: &'static str,
+    source: io::Error,
+) -> io::Error {
+    match refusal_of_read(kernel, dir, pid, file, &source) {
+        Some(refusal) => refusal.unsupported_io(format!("reading pid {pid}'s {file}")),
+        None => source,
+    }
+}
+
+/// The [`Refusal`] that `source`, the error of the failed read of `pid`'s `file` through `dir`, is,
+/// as [`failed_read`] decides it; `None` for every other failure, which the caller keeps as it is.
+pub(crate) fn refusal_of_read(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    file: &'static str,
+    source: &io::Error,
+) -> Option<Refusal> {
+    let copy = io::Error::from_raw_os_error(source.raw_os_error()?);
+    match failed_read(kernel, dir, pid, file, copy) {
+        Ok(PidStat::Refused(refusal)) => Some(refusal),
+        _ => None,
+    }
 }
 
 /// The raw `stat` read; what a failure means is each caller's policy ([`read_in_scan`], the by-pid

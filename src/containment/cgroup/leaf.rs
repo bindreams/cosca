@@ -152,12 +152,21 @@ impl std::error::Error for StateUnknown {
 
 /// `pid`'s state letter. Any failure, the pidfd-bracketed read's included, means the state is
 /// unknown.
+///
+/// The only consumer, [`proc_state`], logs why at `debug` and drops no member: an unknown state only
+/// leaves a failed placement undiagnosed. So a `stat` read that is a refusal
+/// ([`Refusal`](crate::identity::Refusal)) has no slot of its own: its `Unreadable` error says what
+/// cosca requires, for the line that is logged.
 #[cfg(target_os = "linux")]
 fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
     let proc_dir = crate::identity::proc_view_with(kernel)
         .into_dir()
         .map_err(StateUnknown::View)?;
-    let stat = crate::identity::pid_stat::read_stat_file(kernel, &proc_dir, pid).map_err(StateUnknown::Unreadable)?;
+    let stat = crate::identity::pid_stat::read_stat_file(kernel, &proc_dir, pid).map_err(|e| {
+        StateUnknown::Unreadable(crate::identity::pid_stat::explained_read_failure(
+            kernel, &proc_dir, pid, "stat", e,
+        ))
+    })?;
     state_from_stat(stat)
 }
 

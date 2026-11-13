@@ -43,7 +43,7 @@ thread_local! {
     static PIDFD_INFO_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
-    static PROBE_FD_DIR_FAILS: Cell<bool> = const { Cell::new(false) };
+    static PROBE_FD_DIR_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static BEFORE_PROBE_KILL: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
     static PROBE_STEPS: std::cell::RefCell<Vec<ProbeStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -309,9 +309,9 @@ pub(crate) fn probe_close_range_refused() -> bool {
 }
 
 /// While the guard lives, the placement probe's child forked from this thread cannot open its
-/// `/proc/self/fd`, as under a seccomp filter that refuses `openat2`.
-pub(crate) fn fail_probe_fd_dir() -> FailProbeFdDir {
-    PROBE_FD_DIR_FAILS.with(|f| f.set(true));
+/// `/proc/self/fd`: its `openat2` answers `errno`, as under a seccomp filter that refuses it.
+pub(crate) fn fail_probe_fd_dir(errno: i32) -> FailProbeFdDir {
+    PROBE_FD_DIR_FAILS.with(|f| f.set(Some(errno)));
     FailProbeFdDir(())
 }
 
@@ -320,12 +320,13 @@ pub(crate) struct FailProbeFdDir(());
 
 impl Drop for FailProbeFdDir {
     fn drop(&mut self) {
-        PROBE_FD_DIR_FAILS.with(|f| f.set(false));
+        PROBE_FD_DIR_FAILS.with(|f| f.set(None));
     }
 }
 
-/// Read in the forked probe child: a `const` thread-local with no destructor, so async-signal-safe.
-pub(crate) fn probe_fd_dir_fails() -> bool {
+/// The errno the probe child's open of its `/proc/self/fd` answers, if a test makes it fail. Read in
+/// the forked child: a `const` thread-local with no destructor, so async-signal-safe.
+pub(crate) fn probe_fd_dir_fails() -> Option<i32> {
     PROBE_FD_DIR_FAILS.with(Cell::get)
 }
 
