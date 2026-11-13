@@ -25,7 +25,7 @@ use crate::signal::{Sent, Sig};
 /// [`leak`](Unreaped::leak), which gives it up. A value from a sync call, dropped otherwise, does
 /// what `wait` does, then logs one line naming the child, so the drop blocks. A value from a tokio
 /// call, dropped otherwise, never blocks: it lets the child go, as a cancelled
-/// [`wait_async`](Unreaped::wait_async) does (see there). In async code settle either with
+/// `wait_async` does (see there). In async code settle either with
 /// `wait_async` (the `tokio` feature) or `leak` it. `wait` waits for a front until it exits, which
 /// the failed call would have done anyway.
 ///
