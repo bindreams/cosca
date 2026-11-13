@@ -269,6 +269,34 @@ pub(crate) async fn cgroup_wait_tree_drained(
     }
 }
 
+/// The members of `job` a system snapshot names ([`unsignalled_members_of`]), found on tokio's
+/// blocking pool: the scan opens every process on the system, which a runtime thread must not do.
+/// The task owns a duplicate of the job's handle, because it can outlive the future that asked for
+/// it. The scan is bounded work that waits for no exit, as the pool is for.
+#[cfg(all(feature = "tokio", windows))]
+async fn snapshot_members_on_pool(
+    job: &crate::containment::windows::JobHandle,
+) -> Result<Vec<crate::identity::ProcessId>, Error> {
+    use crate::containment::windows::unsignalled_members_of;
+    use std::os::windows::io::AsHandle as _;
+
+    let held = job.handle().try_clone_to_owned().map_err(|e| Error::Unassessable {
+        detail: "the job's handle could not be duplicated for the snapshot of its members".to_owned(),
+        source: Some(Error::io_cause(e)),
+    })?;
+    crate::tokio::wait::on_blocking_pool("the snapshot of a job's members", move || {
+        unsignalled_members_of(held.as_handle())
+    })
+    .await
+    .map_err(|unjoined| {
+        let (crate::tokio::wait::Unjoined::NotRun(cause) | crate::tokio::wait::Unjoined::Unknown(cause)) = unjoined;
+        Error::Unassessable {
+            detail: "the snapshot of the job's members did not run, so their exit cannot be observed".to_owned(),
+            source: Some(std::sync::Arc::new(cause)),
+        }
+    })?
+}
+
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
 /// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
 /// arm, awaiting its leaf's pump — this runs the sync wait's own rounds
@@ -280,8 +308,9 @@ pub(crate) async fn cgroup_wait_tree_drained(
 /// An empty listing is confirmed from a system snapshot, as the sync wait's `confirm_drained` does:
 /// each job member it names is awaited in turn through the by-identity wait a kill's wait uses.
 ///
-/// The round's own work (a listing and up to 63 opens, or a snapshot with one open per process in
-/// it) runs on the polling thread: it waits for no exit and is bounded. Every round reaches an
+/// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
+/// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
+/// runs on the blocking pool ([`snapshot_members_on_pool`]). Every round reaches an
 /// await, so a future that is dropped between rounds is not starved by rounds that find every
 /// member gone.
 #[cfg(all(feature = "tokio", windows))]
@@ -324,7 +353,7 @@ async fn job_wait_tree_drained(
             // The sync wait's `confirm_drained`: each member the snapshot names, in turn, awaited
             // through the same by-identity wait a kill's wait uses.
             Round::Confirm => {
-                for id in job.unsignalled_members()? {
+                for id in snapshot_members_on_pool(job).await? {
                     if !wait_for_member_async(&HostKernel, id, deadline)
                         .await
                         .map_err(|cause| member_unobserved(id.pid(), cause))?

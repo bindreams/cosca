@@ -321,7 +321,7 @@ mod windows {
 
     use std::future::Future as _;
     use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Waker};
     use std::time::Duration;
 
     use crate::containment::drain_edge::DrainEdge;
@@ -611,38 +611,33 @@ mod windows {
     }
 
     /// An empty FIRST listing is no answer, as in the sync wait: the member is alive, in the job,
-    /// when the listing (forced) comes back empty, so the drain waits for it, and answers only once
-    /// it has exited.
+    /// when the listing (forced) comes back empty, so the drain, whose deadline has passed, finds it
+    /// running in the snapshot and answers `MembersRemain`. The snapshot is taken on the blocking
+    /// pool, so a poll cannot tell an answer from a wait still to come: the deadline decides.
     ///
     /// Mutant: an empty first listing answers `AllMembersExited` off the list alone.
     #[skuld::test]
     async fn a_drain_does_not_answer_an_empty_first_listing_while_a_member_runs() {
         use crate::containment::windows::fault::force_job_pid_list;
 
-        let (mut member, job) = spawn_job_member();
+        let (member, job) = spawn_job_member();
         let _forced = force_job_pid_list(Vec::new());
-        let mut wait = pin!(drain(&job, None));
-        let answered = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        drop(member.stdin.take());
-        if answered.is_pending() {
-            assert_eq!(wait.await, TreeDrain::AllMembersExited);
-        }
-        member.wait().expect("reap the member");
-        assert!(
-            answered.is_pending(),
-            "the drain answered {answered:?} off the empty listing while a member's process object was unsignalled"
+        let verdict = drain(&job, crate::tokio::wait::deadline_from(Duration::ZERO)).await;
+        let_member_exit(member);
+        assert_eq!(
+            verdict,
+            TreeDrain::MembersRemain,
+            "the drain answered off the empty listing while a member's process object was unsignalled"
         );
     }
 
-    /// An empty listing is the drain only once the members the snapshot names are signalled, as in
-    /// the sync wait. The second member is alive when the second listing (forced) comes back empty;
-    /// the wait is polled until that listing has been read, and must then be waiting on the second
-    /// member, not have answered.
+    /// A member that left the listing as the other's exit was seen, with the second listing (forced)
+    /// empty, is waited for until it exits: the drain answers once it has, and not before it can.
     ///
-    /// Mutant: an empty listing answers `AllMembersExited` without waiting for the snapshot's members.
+    /// Mutant: the drain never waits for the members the snapshot names.
     #[skuld::test]
-    async fn a_drain_whose_listing_empties_waits_for_the_members_the_snapshot_names() {
-        use crate::containment::windows::fault::{force_job_pid_lists, job_pid_list_queries};
+    async fn a_drain_whose_listing_empties_ends_when_the_members_the_snapshot_names_exit() {
+        use crate::containment::windows::fault::force_job_pid_lists;
 
         let (mut first, mut second, job) = spawn_job_with_two_members();
         let stdin = second.stdin.take().expect("piped stdin");
@@ -654,22 +649,47 @@ mod windows {
         );
         first.kill().expect("end the first member");
         first.wait().expect("reap the first member");
-        let answered = loop {
-            match wait.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-                Poll::Ready(drain) => break Some(drain),
-                Poll::Pending if job_pid_list_queries() >= 2 => break None,
-                Poll::Pending => ::tokio::task::yield_now().await,
-            }
-        };
-        let waiting = answered.is_none();
         drop(stdin);
-        if waiting {
-            assert_eq!(wait.await, TreeDrain::AllMembersExited);
-        }
+        assert_eq!(wait.await, TreeDrain::AllMembersExited);
         second.wait().expect("reap the second member");
+    }
+
+    /// A member the caller may open for its membership but not wait on is one whose exit cannot be
+    /// observed: the async drain fails, naming it, with the OS error as the cause, as the sync one
+    /// does, and never answers `AllMembersExited` while it runs.
+    ///
+    /// Mutant: membership is decided with the access the wait needs.
+    #[skuld::test]
+    fn a_drain_names_a_member_it_may_not_wait_on_when_the_listing_is_empty() {
+        use std::error::Error as _;
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let Some(done) = crate::test_own_process::own_process(
+            crate::test_own_process::test_path!(a_drain_names_a_member_it_may_not_wait_on_when_the_listing_is_empty),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+        let job = JobHandle::create_empty_for_test();
+        job.assign_for_test(member.handle().0)
+            .expect("assign the restricted member to the job");
+        let rt = single_thread_pool_runtime();
+        let forced = crate::containment::windows::fault::force_job_pid_list(Vec::new());
+
+        let verdict = rt.block_on(DrainEdge::Job(&job).wait_async(None));
+
+        drop(forced);
+        let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
         assert!(
-            waiting,
-            "the drain answered {answered:?} off the empty listing while a member's process object was unsignalled"
+            matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
+                if detail.contains(&member.pid().to_string())),
+            "{error:?}"
+        );
+        assert_eq!(
+            crate::error::first_os_code(error.source().expect("the OS error is the cause")),
+            Some(ERROR_ACCESS_DENIED.0 as i32),
+            "{error:?}"
         );
     }
 

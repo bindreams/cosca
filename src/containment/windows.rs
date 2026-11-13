@@ -223,11 +223,20 @@ impl JobHandle {
     }
 }
 
-/// `OpenProcess` for what proving membership and waiting need: `PROCESS_QUERY_LIMITED_INFORMATION` is
-/// what `IsProcessInJob` needs and `PROCESS_SYNCHRONIZE` does not imply it; the least rights that
-/// work, grantable across integrity levels. The handle is the caller's to close, or to pass to
+/// `OpenProcess` for what proving membership and reading the identity need, and no more:
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is what `IsProcessInJob` needs, and the least right that
+/// does, grantable across integrity levels. A process that cannot be opened with it is not provably
+/// the job's. Whether the caller may also wait on a member is the wait's own open's question, so a
+/// member it may not wait on is still a member. The handle is the caller's to close, or to pass to
 /// [`member_to_watch`] or [`member_identity`], which close it unless they return it.
 fn open_for_membership(pid: u32) -> windows::core::Result<HANDLE> {
+    // SAFETY: a standard Win32 call with no borrowed arguments.
+    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+}
+
+/// [`open_for_membership`] with `PROCESS_SYNCHRONIZE` too, for the handle a round's any-wait blocks
+/// on. Closed or passed on as that one is.
+fn open_for_wait(pid: u32) -> windows::core::Result<HANDLE> {
     // SAFETY: a standard Win32 call with no borrowed arguments.
     unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
 }
@@ -1019,7 +1028,10 @@ impl JobHandle {
     /// opens each, one at a time, waits for it and closes it ([`confirm_drained`]). Never reports
     /// `AllMembersExited` falsely (only an empty re-count with no such member left does); with more
     /// than `MAXIMUM_WAIT_OBJECTS - 1` live members it may notice the drain late. The handle stays
-    /// open after [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree.
+    /// open after [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree. A member
+    /// the caller may not wait on (an elevated one, under a caller that is not) is a member whose
+    /// exit cannot be observed: the answer is `Unassessable` naming its pid, with the OS error as the
+    /// cause, never `AllMembersExited`.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1049,13 +1061,14 @@ impl JobHandle {
     pub(crate) fn after_signalled(&self, watch: &Watch) -> Result<Round, crate::error::Error> {
         after_signalled(HANDLE(self.handle().as_raw_handle()), watch)
     }
+}
 
-    /// The members an empty listing leaves to be waited for ([`Round::Confirm`]): see
-    /// [`confirm_drained`].
-    #[cfg(feature = "tokio")]
-    pub(crate) fn unsignalled_members(&self) -> Result<Vec<ProcessId>, crate::error::Error> {
-        unsignalled_members(HANDLE(self.handle().as_raw_handle()))
-    }
+/// The members an empty listing leaves to be waited for ([`Round::Confirm`]) in the job `job` is a
+/// handle to: see [`confirm_drained`]. A handle, not `&JobHandle`, so the async drain can run it on
+/// the blocking pool with a duplicate of the job's handle: the scan opens every process on the system.
+#[cfg(feature = "tokio")]
+pub(crate) fn unsignalled_members_of(job: BorrowedHandle<'_>) -> Result<Vec<ProcessId>, crate::error::Error> {
+    unsignalled_members(HANDLE(job.as_raw_handle()))
 }
 
 /// Whether the process `OpenProcess` returned as `opened` is a member of `job`: its handle to wait
@@ -1311,10 +1324,13 @@ fn confirm_drained(
     Ok(TreeDrain::AllMembersExited)
 }
 
-/// The identity of every process a system snapshot names that is a member of `job`. A pid that cannot
-/// be opened is no member of it, and one that a new process reused answers not-in-job. A failed
-/// snapshot, or a failed membership check on a process that opened, is an error: neither is an empty
-/// job.
+/// The identity of every process a system snapshot names that is a member of `job`, decided with the
+/// least access that answers `IsProcessInJob` ([`open_for_membership`]), so a member the caller may
+/// not wait on is still named; the wait then fails for it, as an error naming its pid
+/// ([`member_unobserved`]), and is never an exit. A pid that cannot be opened even for that is not
+/// provably the job's, as an unrelated system process is not, and one that a new process reused
+/// answers not-in-job. A failed snapshot, or a failed membership check on a process that opened, is
+/// an error: neither is an empty job.
 fn unsignalled_members(job: HANDLE) -> Result<Vec<ProcessId>, crate::error::Error> {
     use crate::identity::HostKernel;
 
@@ -1362,7 +1378,7 @@ fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Err
         if handles.len() == budget {
             break;
         }
-        match member_to_watch(open_for_membership(*pid), job) {
+        match member_to_watch(open_for_wait(*pid), job) {
             // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
             Ok(Some(h)) => handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) }),
             Ok(None) => {}

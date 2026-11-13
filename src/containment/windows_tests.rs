@@ -386,6 +386,51 @@ fn wait_drained_raw_fails_when_the_snapshot_for_an_empty_listing_cannot_be_taken
     );
 }
 
+/// A member the caller may open for its membership but not wait on (an elevated member under a
+/// non-elevated caller) is a member whose exit cannot be observed: the drain says so, naming it,
+/// with the OS error as the cause, and never answers `AllMembersExited` while it runs. The member's
+/// DACL grants `PROCESS_QUERY_LIMITED_INFORMATION` and nothing else.
+///
+/// Mutant: membership is decided with the access the wait needs, so a member the wait is refused
+/// for is not one.
+#[skuld::test]
+fn wait_drained_raw_names_a_member_it_may_not_wait_on_when_the_listing_is_empty() {
+    use std::error::Error as _;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            wait_drained_raw_names_a_member_it_may_not_wait_on_when_the_listing_is_empty
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    // Without a console, so the job's only member is the restricted one: a console host the member
+    // brought along would be another member, running, and which the drain reaches first would
+    // decide the answer.
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+    let forced = super::fault::force_job_pid_list(Vec::new());
+
+    let verdict = super::wait_drained_raw(job.handle(), None);
+
+    drop(forced);
+    let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
+            if detail.contains(&member.pid().to_string())),
+        "{error:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(error.source().expect("the OS error is the cause")),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{error:?}"
+    );
+}
+
 /// An empty listing is the drain only once the members the snapshot names are signalled: the list
 /// drops a member before its process object signals. The second member is alive, in the job, when
 /// the second listing (forced) comes back empty; the wait must block on it, and the hook ends it

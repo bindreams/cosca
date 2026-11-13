@@ -80,7 +80,8 @@ Unix registers the wait with the reactor. Windows registers it with the OS's wai
 (`RegisterWaitForSingleObject`, as tokio's own child wait does, in
 [`registered_wait.rs`](../src/os_process/windows/registered_wait.rs)): one registration per
 process handle, one per handle of a job's drain round (at most 63), and, once the job's list is
-empty, one at a time for each member a system process snapshot still names, so no handle outlives
+empty, one at a time for each member a system process snapshot still names (the snapshot, which
+opens every process on the system, runs on the pool: bounded work), so no handle outlives
 its own wait ([`job_wait_tree_drained`](../src/containment/drain_edge.rs)). The deadline is the registration's
 own timeout, on the real clock, so a Windows wait needs neither tokio's time driver nor its clock (a
 paused clock does not advance it); a timeout the OS counts short registers again for the time that
