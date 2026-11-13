@@ -502,6 +502,21 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
     );
 }
 
+/// A refused `openat2` of the fdinfo read is `Unsupported` with the refusing errno as its cause,
+/// as a refused `/proc` open is. Mutant: "the fdinfo's failure is always `Unassessable`".
+#[skuld::test]
+fn open_verified_is_unsupported_when_the_pidfds_fdinfo_read_is_refused() {
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let result = open_verified_current_with_fdinfo(Err(errno));
+        match result {
+            Err(ref e @ Error::Unsupported { .. }) => {
+                assert_eq!(crate::error::first_os_code(e), Some(errno), "{e:?}")
+            }
+            other => panic!("{errno}: expected Unsupported, got {other:?}"),
+        }
+    }
+}
+
 /// The match case: an fdinfo `Pid:` equal to `id.pid()` proceeds to the start-token comparison
 /// through the same `/proc` dirfd.
 #[skuld::test]

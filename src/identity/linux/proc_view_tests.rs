@@ -339,6 +339,33 @@ fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
     assert!(err.reason.contains("no parseable Pid line"), "{err}");
 }
 
+/// The fdinfo read is an `openat2` through the view, so a refusal of it is the view's `openat2`
+/// refusal, with the errno as its source; any other errno is no refusal. Mutant: "a failed fdinfo
+/// read is only an unreadable view".
+#[skuld::test]
+fn a_refused_fdinfo_read_is_a_refused_openat2() {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut child, pidfd) = spawn_exited_child_with_pidfd();
+    let dir = ProcDir::open().expect("/proc opens");
+    let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
+    for (errno, refused) in [
+        (libc::ENOSYS, true),
+        (libc::EPERM, true),
+        (libc::ENODEV, true),
+        (libc::EACCES, false),
+        (libc::EIO, false),
+    ] {
+        let kernel = FakeKernel::over(&HostKernel).on_read(&path, Err(errno));
+        let why = pidfd_pid_in(&kernel, &dir, pidfd.as_fd()).expect_err("an unreadable fdinfo");
+        let got = why
+            .refusal()
+            .map(|refusal| crate::error::first_os_code(&refusal.cause()));
+        assert_eq!(got, refused.then_some(Some(errno)), "{errno}");
+    }
+    child.wait().expect("reap the child");
+}
+
 fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd) {
     let child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");

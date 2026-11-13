@@ -367,7 +367,7 @@ pub(crate) fn pidfd_pid_in(
     let fdinfo = kernel
         .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
         .and_then(utf8)
-        .map_err(|e| ViewUnreadable::new("the pidfd's fdinfo could not be read", Some(e)))?;
+        .map_err(|e| ViewUnreadable::of_read("the pidfd's fdinfo could not be read", e))?;
     parse_fdinfo_pid(&fdinfo).ok_or_else(|| ViewUnreadable::new("the pidfd's fdinfo has no parseable Pid line", None))
 }
 
