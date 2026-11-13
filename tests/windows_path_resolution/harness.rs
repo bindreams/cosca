@@ -1,7 +1,6 @@
 //! How a canary records and reports the facts it checks.
 
 use crate::provenance::announce_platform;
-use crate::pure::marker_file_name;
 use crate::verdict::{conclude, Disagreements};
 use crate::winapi::{full_path_name, has_bat_extension};
 
@@ -18,15 +17,7 @@ pub(crate) fn canary(subject: &'static str, body: impl FnOnce(&mut Disagreements
 /// when that is set. The workflow fails a run that leaves no marker, so a test-name filter that
 /// selects only surveys, or nothing, cannot pass having asserted nothing.
 fn mark_canary_passed() {
-    let Some(dir) = std::env::var_os("COSCA_CANARY_MARKERS") else {
-        return;
-    };
-    let name = std::thread::current()
-        .name()
-        .map(marker_file_name)
-        .expect("skuld names each test's thread");
-    let path = std::path::Path::new(&dir).join(&name);
-    std::fs::write(&path, b"").unwrap_or_else(|e| panic!("could not write the canary marker {path:?}: {e}"));
+    crate::windows_probe::mark_test_passed(crate::windows_probe::CANARY_MARKERS_ENV);
 }
 
 /// One expected `GetFullPathNameW` result: `(input, the result, why)`.

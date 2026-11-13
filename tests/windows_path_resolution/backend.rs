@@ -59,7 +59,7 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
     ] {
         for route in ["cosca", "raw_fd3"] {
             let mut cmd = crate::common::command(crate::common::Console::Hidden);
-            cmd.commandline(&line).env("COSCA_TESTBIN_MODE", "dump-argv");
+            cmd.commandline(&line).env(crate::common::TESTBIN_MODE_ENV, "dump-argv");
             if route == "raw_fd3" {
                 cmd.fd(3, cosca::Stdio::null()).expect("map fd 3");
             }
@@ -81,7 +81,7 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
         for route in ["std", "cosca", "raw_fd3"] {
             let outcome = if route == "std" {
                 let mut cmd = Command::new(bin);
-                cmd.args(args).env("COSCA_TESTBIN_MODE", "dump-argv");
+                cmd.args(args).env(crate::common::TESTBIN_MODE_ENV, "dump-argv");
                 match crate::common::output_locked(&mut cmd) {
                     Ok(out) if out.status.success() => argv_of(&String::from_utf8_lossy(&out.stdout), bin),
                     Ok(out) => format!("exit={:?}", out.status.code()),
@@ -89,7 +89,9 @@ fn m4_commandline_argv(#[fixture(path_probes)] _group: &Group) {
                 }
             } else {
                 let mut cmd = crate::common::command(crate::common::Console::Hidden);
-                cmd.arg(bin).args(args).env("COSCA_TESTBIN_MODE", "dump-argv");
+                cmd.arg(bin)
+                    .args(args)
+                    .env(crate::common::TESTBIN_MODE_ENV, "dump-argv");
                 if route == "raw_fd3" {
                     cmd.fd(3, cosca::Stdio::null()).expect("map fd 3");
                 }

@@ -1,5 +1,6 @@
 //! Shared helpers for the Windows `ShellExecuteExW`/elevation probe suite: `tests/windows_shell_execute.rs`,
-//! `tests/windows_shell_resolution/` and `tests/windows_elevation_routes/`. The same sharing
+//! `tests/windows_shell_resolution/`, `tests/windows_elevation_routes/` and, for its marker name,
+//! `tests/windows_path_resolution.rs`. The same sharing
 //! mechanism `tests/common/mod.rs` documents for cross-file test helpers — `#[path =
 //! "common/windows_probe.rs"] mod windows_probe;` — applied to this Windows-only subset so the
 //! marker-write, file-name-comparison and COM-apartment-wrapper patterns are defined once instead
@@ -11,12 +12,16 @@ use std::path::Path;
 
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 
+/// The marker directory of `windows_shell_execute.rs` and `windows_path_resolution.rs`.
+pub(crate) const CANARY_MARKERS_ENV: &str = "COSCA_CANARY_MARKERS";
+/// The marker directory of `windows_elevation_routes.rs` and `windows_shell_resolution.rs`.
+pub(crate) const PROBE_MARKERS_ENV: &str = "COSCA_PROBE_MARKERS";
+
 /// Record that the current test ran to a real conclusion, as a file named after the test's thread
 /// in the directory `env_var` names, when that variable is set — a no-op otherwise. Each probe
 /// file's own CI job requires this marker to fail a run whose test filter matched nothing.
-/// `windows_shell_execute.rs` uses `COSCA_CANARY_MARKERS`; `windows_elevation_routes.rs` and
-/// `windows_shell_resolution.rs` use `COSCA_PROBE_MARKERS` — two different marker directories for
-/// two different CI jobs, so the variable name is a parameter here, not baked in.
+/// [`CANARY_MARKERS_ENV`] and [`PROBE_MARKERS_ENV`] are two different marker directories for two
+/// different CI jobs, so the variable name is a parameter here, not baked in.
 pub(crate) fn mark_test_passed(env_var: &str) {
     let Some(dir) = std::env::var_os(env_var) else {
         return;

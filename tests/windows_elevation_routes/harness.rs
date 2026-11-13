@@ -62,6 +62,25 @@ use windows::Win32::System::Threading::{
 /// doc for why no phase attribution is claimed here.
 pub(crate) const CHILD_EXIT_BOUND_MS: u32 = 120_000;
 
+// The `COSCA_PROBE_*` variables this suite uses to talk to its children and to gate itself -----
+
+/// What every name below starts with; a child's env block carries the variables with this prefix.
+pub(crate) const PROBE_PREFIX: &str = "COSCA_PROBE_";
+/// The file a spawned child answers through.
+pub(crate) const PROBE_REPORT_TO_ENV: &str = "COSCA_PROBE_REPORT_TO";
+/// Set in a spawned child so it runs the measurement alone, not the full chain.
+pub(crate) const PROBE_CHILD_ENV: &str = "COSCA_PROBE_CHILD";
+/// `1` when the child was wrapped in a `contain()` job before it ran.
+pub(crate) const PROBE_ANCESTOR_CONTAINED_ENV: &str = "COSCA_PROBE_ANCESTOR_CONTAINED";
+/// A value the caller plants to see it arrive in the child's environment block.
+pub(crate) const PROBE_ENV_CANARY_ENV: &str = "COSCA_PROBE_ENV_CANARY";
+/// The pid whose token the inspection probe reads.
+pub(crate) const PROBE_INSPECT_PID_ENV: &str = "COSCA_PROBE_INSPECT_PID";
+/// `1` marks the host disposable for the probes that register a scheduled task.
+pub(crate) const PROBE_ALLOW_STATE_ENV: &str = "COSCA_PROBE_ALLOW_STATE";
+/// `1` marks the host disposable for the probes that create local accounts.
+pub(crate) const PROBE_ALLOW_ACCOUNTS_ENV: &str = "COSCA_PROBE_ALLOW_ACCOUNTS";
+
 /// The bound for [`spawn_attempts_with`]'s own wait on the children it spawns. Kept well under
 /// [`CHILD_EXIT_BOUND_MS`] (a tenth of it) so that whenever `spawn_attempts_with` runs inside a
 /// process that is itself someone else's child — which happens whenever `COSCA_PROBE_CHILD` is
@@ -348,7 +367,8 @@ fn env_block_from(
     for (k, v) in environment {
         let k = k.to_string_lossy().into_owned();
         let upper = k.to_ascii_uppercase();
-        if ALLOWLIST.contains(&upper.as_str()) || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
+        if ALLOWLIST.contains(&upper.as_str())
+            || (upper.starts_with(PROBE_PREFIX) && upper != crate::windows_probe::PROBE_MARKERS_ENV)
         {
             map.insert(EnvKeyIgnoreCase::new(&k), v.to_string_lossy().into_owned());
         }
@@ -711,7 +731,7 @@ pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
     // Task Scheduler's gating question, asked from wherever this process is running. The docs say
     // a low-privilege process cannot register a RunLevel=HIGHEST task; when this runs inside a
     // medium-integrity child it is that claim under test rather than restated.
-    if std::env::var_os("COSCA_PROBE_ALLOW_STATE").is_some_and(|v| v == "1") {
+    if std::env::var_os(PROBE_ALLOW_STATE_ENV).is_some_and(|v| v == "1") {
         let _ = writeln!(out, "=== can this caller register a RunLevel=HIGHEST task? ===");
         let (lines, _any_create_exited) = schtasks_registration_report();
         for line in lines {
@@ -888,8 +908,8 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE, ancestor_co
             .join(format!("{}.txt", if use_seclogon { "withtoken" } else { "asuser" }));
         let _ = std::fs::remove_file(&report);
         let block = env_block(&[
-            ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
-            ("COSCA_PROBE_CHILD", "1".into()),
+            (PROBE_REPORT_TO_ENV, report.display().to_string()),
+            (PROBE_CHILD_ENV, "1".into()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
