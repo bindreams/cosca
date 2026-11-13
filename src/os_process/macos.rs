@@ -14,7 +14,9 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{has_exited, uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{
+    has_exited, read_refused, uniq_info, Existence, ExitRead, ProcessId, ReadPurpose, UniqInfo, UniqRead,
+};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -87,10 +89,10 @@ pub(crate) fn read_for_open(pid: u32, consequence: &str) -> Result<Option<UniqIn
     match uniq_info(pid, ReadPurpose::Open) {
         UniqRead::Found(info) => Ok(Some(info)),
         UniqRead::Gone => Ok(None),
-        UniqRead::Refused(errno) => Err(Error::Unassessable {
-            detail: format!("pid {pid} identity could not be read; {consequence}"),
-            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
-        }),
+        UniqRead::Refused(errno) => Err(read_refused(
+            format!("pid {pid} identity could not be read; {consequence}"),
+            errno,
+        )),
     }
 }
 
@@ -223,16 +225,6 @@ impl OsProcess for MacProcess {
     }
 }
 
-/// The error of a [`has_exited`] read that was refused with `errno`, for every caller that reads
-/// whether a process has exited: [`Error::Unassessable`] (a liveness read that could not be made),
-/// the errno its `source`.
-pub(crate) fn exit_read_refused(pid: u32, errno: i32) -> Error {
-    Error::Unassessable {
-        detail: format!("pid {pid}: whether it has exited could not be read; {EXIT_CONSEQUENCE}"),
-        source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
-    }
-}
-
 /// A kqueue armed for the exit of one process, and nothing else. Nothing ever reads it: at exit XNU
 /// leaves the `NOTE_EXIT` knote queued (`EV_EOF | EV_ONESHOT`), and a kqueue descriptor polls
 /// readable while its queue is non-empty, so a zero-timeout `poll` is the look and any number of
@@ -313,13 +305,11 @@ impl ExitWatch {
         if !self.exited()? {
             return Ok(Exit::Running(WaitFor::Readable(self.as_fd())));
         }
-        match has_exited(pid, unique, ReadPurpose::Exit) {
-            Ok(true) => {
-                self.confirmed.store(true, Ordering::Relaxed);
-                Ok(Exit::Exited)
-            }
-            Ok(false) => Ok(Exit::Recheck),
-            Err(errno) => Err(exit_read_refused(pid, errno)),
+        if has_exited(pid, unique, ExitRead::Fired)? {
+            self.confirmed.store(true, Ordering::Relaxed);
+            Ok(Exit::Exited)
+        } else {
+            Ok(Exit::Recheck)
         }
     }
 

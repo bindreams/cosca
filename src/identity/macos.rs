@@ -14,6 +14,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::error::Error;
+
 use super::{Key, Liveness, OrderedRead, ParentRead, RawPid, Resolved, UnknownCause};
 
 #[path = "macos/kinfo.rs"]
@@ -246,15 +248,52 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
     }
 }
 
+/// The situation a [`has_exited`] read is made in: it names the read's [`ReadPurpose`] and the words
+/// of its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitRead {
+    /// An exit watch has fired, so the exit has begun: the read confirms it has finished.
+    Fired,
+    /// No watch fired and none is armed: the read asks whether an exit went unannounced.
+    Unannounced,
+}
+
+impl ExitRead {
+    fn purpose(self) -> ReadPurpose {
+        match self {
+            ExitRead::Fired => ReadPurpose::Exit,
+            ExitRead::Unannounced => ReadPurpose::Running,
+        }
+    }
+
+    fn refusal(self, pid: RawPid) -> String {
+        match self {
+            ExitRead::Fired => format!("pid {pid} has begun to exit, but whether it has finished could not be read"),
+            ExitRead::Unannounced => {
+                format!("pid {pid}: no exit was announced for it, and whether it has exited could not be read")
+            }
+        }
+    }
+}
+
+/// The error of an identity read that was refused with `errno`: [`Error::Unassessable`] saying
+/// `detail`, with the errno as its `source`. The one shape every refused identity read takes.
+pub(crate) fn read_refused(detail: String, errno: i32) -> Error {
+    Error::Unassessable {
+        detail,
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+    }
+}
+
 /// Whether the process whose unique id is `expected` has exited, read as a zombie
 /// (`PROC_PIDT_SHORTBSDINFO`'s `SZOMB`) between two unique-id reads, as in [`held_by`]. A pid that
-/// names another process now, or none, has had its process reaped: exited. `Err` is the errno of a
-/// refused read.
-pub(crate) fn has_exited(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Result<bool, i32> {
-    match short_read(pid, expected, purpose, short_status) {
+/// names another process now, or none, has had its process reaped: exited. A refused read is
+/// [`read_refused`], worded by `situation`.
+pub(crate) fn has_exited(pid: RawPid, expected: u64, situation: ExitRead) -> Result<bool, Error> {
+    match short_read(pid, expected, situation.purpose(), short_status) {
         Ok(status) => Ok(status == libc::SZOMB),
         Err(Mismatch::Other | Mismatch::Gone) => Ok(true),
-        Err(Mismatch::Refused(errno)) => Err(errno),
+        Err(Mismatch::Refused(errno)) => Err(read_refused(situation.refusal(pid), errno)),
     }
 }
 
