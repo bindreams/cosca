@@ -7,7 +7,7 @@
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::OnceLock;
 
 use mach2::message::audit_token_t;
@@ -223,6 +223,16 @@ impl OsProcess for MacProcess {
     }
 }
 
+/// The error of a [`has_exited`] read that was refused with `errno`, for every caller that reads
+/// whether a process has exited: [`Error::Unassessable`] (a liveness read that could not be made),
+/// the errno its `source`.
+pub(crate) fn exit_read_refused(pid: u32, errno: i32) -> Error {
+    Error::Unassessable {
+        detail: format!("pid {pid}: whether it has exited could not be read; {EXIT_CONSEQUENCE}"),
+        source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
+    }
+}
+
 /// A kqueue armed for the exit of one process, and nothing else. Nothing ever reads it: at exit XNU
 /// leaves the `NOTE_EXIT` knote queued (`EV_EOF | EV_ONESHOT`), and a kqueue descriptor polls
 /// readable while its queue is non-empty, so a zero-timeout `poll` is the look and any number of
@@ -234,11 +244,18 @@ pub(crate) struct ExitWatch {
     /// The pid was already past registration (`ESRCH`) when the watch was armed: the process has
     /// exited, and no event will ever be queued.
     exited: bool,
+    /// A look has confirmed the exit. A zombie or gone process never runs again, so later looks
+    /// make no read. Set once, never cleared.
+    confirmed: AtomicBool,
 }
 
 impl ExitWatch {
     pub(super) fn new(kq: Kqueue) -> Self {
-        Self { kq, exited: false }
+        Self {
+            kq,
+            exited: false,
+            confirmed: AtomicBool::new(false),
+        }
     }
 
     /// This watch, for a process that is gone: it reads as exited whatever its queue holds.
@@ -266,7 +283,7 @@ impl ExitWatch {
         };
         match subscribed {
             Ok(()) => Ok(Self::new(kq)),
-            Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self { kq, exited: true }),
+            Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self::new(kq).exited_now()),
             Err(e) => Err(e),
         }
     }
@@ -287,21 +304,22 @@ impl ExitWatch {
     /// zombie or gone (`has_exited`, which keys on the unique id: a pid another process holds is
     /// gone), the state from which [`ProcessId::is_alive`] never reads `Alive`; until then it is
     /// `Recheck`, which the driver's uncapped backoff re-reads. A refused read is `Unassessable`
-    /// with the errno as its source, never `Exited`; an unfired watch reads nothing.
+    /// with the errno as its source, never `Exited`; an unfired watch reads nothing, and neither
+    /// does a look after the exit was confirmed.
     pub(crate) fn look(&self, pid: u32, unique: u64) -> Result<Exit<'_>, Error> {
+        if self.confirmed.load(Ordering::Relaxed) {
+            return Ok(Exit::Exited);
+        }
         if !self.exited()? {
             return Ok(Exit::Running(WaitFor::Readable(self.as_fd())));
         }
         match has_exited(pid, unique, ReadPurpose::Exit) {
-            Ok(true) => Ok(Exit::Exited),
+            Ok(true) => {
+                self.confirmed.store(true, Ordering::Relaxed);
+                Ok(Exit::Exited)
+            }
             Ok(false) => Ok(Exit::Recheck),
-            Err(errno) => Err(Error::Unassessable {
-                detail: format!(
-                    "pid {pid} has exited, but its state could not be read to show the exit is complete; \
-                     {EXIT_CONSEQUENCE}"
-                ),
-                source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
-            }),
+            Err(errno) => Err(exit_read_refused(pid, errno)),
         }
     }
 

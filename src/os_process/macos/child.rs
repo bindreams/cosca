@@ -107,7 +107,7 @@ impl OsChild for MacChild {
     /// set, so a zombie its tracer holds is seen as one (`SZOMB`) on the verified unique id.
     fn exited_unannounced(&self) -> Result<bool, Error> {
         crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running)
-            .map_err(|errno| Error::Io(crate::identity::has_exited_error(self.pid, errno)))
+            .map_err(|errno| crate::os_process::macos::exit_read_refused(self.pid, errno))
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the

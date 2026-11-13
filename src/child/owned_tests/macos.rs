@@ -780,14 +780,46 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// peek shows its exit record: `liveness` does not fail where the record answers, as it did not
 /// before the watch was confirmed by a read.
 ///
+/// The watch fired and the forced `Exit` refusal was consumed: the recorded purposes show the
+/// confirming read was made.
+///
 /// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek.
 #[skuld::test]
 fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
+    let reads = uniq_fault::record();
     let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
     assert!(
         matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Dead)),
         "the exit record is visible whatever the confirming read says"
+    );
+    assert!(
+        reads.purposes().contains(&ReadPurpose::Exit),
+        "the watch fired and the forced refusal was consumed: {:?}",
+        reads.purposes()
+    );
+}
+
+/// A child whose exit watch has fired while it runs and whose confirming read is refused is `Alive`
+/// when the peek reads it running with its unique id verified: the evidence is in hand, so
+/// `liveness` does not fail. The registration refusal stands in for the early edge.
+///
+/// Mutant: `OwnedChild::liveness` answers the refusal for a child the peek reads running.
+#[skuld::test]
+fn a_refused_confirmation_is_alive_when_the_peek_reads_the_child_running() {
+    let forced_watch = test_hooks::force_proc_registration_esrch_once(test_hooks::Registration::ExitWatch);
+    let b = Blocker::spawn();
+    drop(forced_watch);
+    let reads = uniq_fault::record();
+    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
+    assert!(
+        matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Alive)),
+        "the peek reads the child running"
+    );
+    assert!(
+        reads.purposes().contains(&ReadPurpose::Exit),
+        "the watch fired and the forced refusal was consumed: {:?}",
+        reads.purposes()
     );
 }
