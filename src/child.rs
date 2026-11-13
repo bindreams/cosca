@@ -275,7 +275,8 @@ impl Child {
     /// This child's stable identity (see [`crate::identity::ProcessId`]), or `None` when the OS
     /// refused to report it at spawn (below Linux 6.9 with no usable `/proc`, or a refused query on
     /// another OS). Such a child is otherwise a child like any other: [`pid`](Self::pid), `wait`,
-    /// `kill` and the drop go through its handle. A containment that names its tree by the root's
+    /// `kill` and the drop go through its handle (on macOS, an exit is then confirmed by the child's
+    /// unique-id read, not by [`ProcessId::is_alive`]). A containment that names its tree by the root's
     /// identity (a tree walk, the macOS fd marker) cannot be had without one, and the spawn fails.
     pub fn id(&self) -> Option<ProcessId> {
         self.id

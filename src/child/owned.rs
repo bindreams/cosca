@@ -238,15 +238,27 @@ impl OwnedChild {
     /// [`OsProcess::exited`](crate::os_process::OsProcess::exited)), so a zombie only a tracer sees
     /// is `Dead`. The reap peek is read only where the edge is silent: an exit record or a reap
     /// elsewhere, and (macOS) the zombie the edge withholds.
+    ///
+    /// One identity read per call. An edge that fired and could not be confirmed (`exited` failed)
+    /// is answered by the peek where the peek can: an exit record or a reap elsewhere is `Dead`;
+    /// otherwise the failure stands. An edge that fired and confirmed `Recheck` has read the child
+    /// running, so `exited_unannounced` is not asked again.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
-        if matches!(self.os.exited()?, Exit::Exited) {
-            return Ok(Liveness::Dead);
-        }
+        let edge = match self.os.exited() {
+            Ok(Exit::Exited) => return Ok(Liveness::Dead),
+            Ok(edge) => edge,
+            Err(refused) => {
+                return match self.peek() {
+                    Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => Ok(Liveness::Dead),
+                    Ok(PeekOutcome::Running) | Err(_) => Err(refused),
+                };
+            }
+        };
         Ok(match self.peek()? {
             PeekOutcome::Exit(_) | PeekOutcome::Foreign(_) => Liveness::Dead,
-            PeekOutcome::Running if self.os.exited_unannounced()? => Liveness::Dead,
+            PeekOutcome::Running if matches!(edge, Exit::Running(_)) && self.os.exited_unannounced()? => Liveness::Dead,
             PeekOutcome::Running => Liveness::Alive,
         })
     }

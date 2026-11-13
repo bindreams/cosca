@@ -952,7 +952,7 @@ fn spawn_reported(
     };
     // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
     #[cfg(target_os = "macos")]
-    let owned = match crate::os_process::macos::child::MacChild::new(pid, unique) {
+    let owned = match crate::os_process::macos::child::MacChild::new(pid, unique, id_read) {
         Ok(os) => {
             drop(child);
             OwnedChild::new(Box::new(os))

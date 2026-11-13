@@ -192,7 +192,7 @@ pub(crate) fn adopt_std(
     };
     #[cfg(target_os = "macos")]
     let os: Box<dyn OsChild> = match crate::signal::read_identity(id.pid()) {
-        Ok(Some(unique)) => match super::macos::child::MacChild::new(id.pid(), unique) {
+        Ok(Some(unique)) => match super::macos::child::MacChild::new(id.pid(), unique, Some(id)) {
             Ok(os) => Box::new(os),
             Err(e) => return Err((e, child)),
         },
