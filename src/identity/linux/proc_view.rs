@@ -29,7 +29,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
 
 use super::kernel::Kernel;
-use super::prove::FailedCall;
+use super::prove::{FailedCall, Refusal};
 use crate::error::Error;
 
 /// What this process's `/proc` says about its own pid namespace.
@@ -69,9 +69,8 @@ pub(crate) struct ViewUnreadable {
     pub(crate) reason: String,
     /// The OS error behind `reason`, when there was one.
     pub(crate) source: Option<io::Error>,
-    /// The `openat2` of `/proc` that failed, when that is why the view could not be established.
-    /// If [`FailedCall::requirement`] is `Some`, the call was refused and no `/proc` view can ever
-    /// be established here.
+    /// The `openat2` that failed, when that is why the view could not be established: of `/proc`
+    /// itself or of a file read to check it.
     openat2: Option<FailedCall>,
 }
 
@@ -93,16 +92,25 @@ impl ViewUnreadable {
         }
     }
 
+    /// The view that the failed read `source` of a file under `/proc` leaves: its errno, if it has
+    /// one, is the `openat2`'s, and [`refusal`](Self::refusal) decides whether that is a refusal.
+    fn of_read(reason: impl Into<String>, source: io::Error) -> Self {
+        ViewUnreadable {
+            openat2: rustix::io::Errno::from_io_error(&source).map(FailedCall::openat2),
+            ..ViewUnreadable::new(reason, Some(source))
+        }
+    }
+
     /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
     /// could not be established. `op` is what could not be done.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
         self.openat2?.unsupported(op)
     }
 
-    /// The `openat2` requirement text, when `openat2` being refused is why the view could not be
-    /// established. For callers whose error type is not [`Error`].
-    pub(crate) fn openat2_requirement(&self) -> Option<String> {
-        self.openat2?.requirement()
+    /// The refused `openat2`, when that is why the view could not be established. For callers whose
+    /// error type is not [`Error`].
+    pub(crate) fn refusal(&self) -> Option<Refusal> {
+        self.openat2?.refusal()
     }
 }
 
@@ -238,7 +246,7 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     let status = match kernel.read(&dir, "self/status").and_then(utf8) {
         Ok(text) => text,
         Err(e) => {
-            return ProcView::Unassessable(ViewUnreadable::new(UNREADABLE_STATUS_REASON, Some(e)));
+            return ProcView::Unassessable(ViewUnreadable::of_read(UNREADABLE_STATUS_REASON, e));
         }
     };
     let verdict = match classify_status(&status, || ns_pid_exists(&dir)) {
@@ -275,9 +283,9 @@ fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> io::Result<bool
         return match ns_pid_exists() {
             Ok(false) => Verdict::Same,
             Ok(true) => Verdict::NoNspid,
-            Err(e) => Verdict::Unassessable(ViewUnreadable::new(
+            Err(e) => Verdict::Unassessable(ViewUnreadable::of_read(
                 "self/status has no NSpid line and self/ns/pid could not be checked",
-                Some(e),
+                e,
             )),
         };
     };
@@ -330,9 +338,9 @@ fn pid_ns_link(link: io::Result<Vec<u8>>, path: &str) -> Result<Vec<u8>, ViewUnr
             ),
             None,
         )),
-        Err(e) => Err(ViewUnreadable::new(
+        Err(e) => Err(ViewUnreadable::of_read(
             format!("self/status has no NSpid line and {path} could not be read"),
-            Some(e),
+            e,
         )),
     }
 }
@@ -359,7 +367,7 @@ pub(crate) fn pidfd_pid_in(
     let fdinfo = kernel
         .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
         .and_then(utf8)
-        .map_err(|e| ViewUnreadable::new("the pidfd's fdinfo could not be read", Some(e)))?;
+        .map_err(|e| ViewUnreadable::of_read("the pidfd's fdinfo could not be read", e))?;
     parse_fdinfo_pid(&fdinfo).ok_or_else(|| ViewUnreadable::new("the pidfd's fdinfo has no parseable Pid line", None))
 }
 
