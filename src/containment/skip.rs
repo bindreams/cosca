@@ -31,7 +31,7 @@ impl Skip {
         tree.is_killed()
             && matches!(
                 &self.why,
-                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(_))
+                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..), _)
             )
     }
 
@@ -69,8 +69,9 @@ pub(crate) enum Why {
         why: String,
         cause: Option<std::sync::Arc<std::io::Error>>,
     },
-    /// The pid may name another process, for this reason.
-    MayNameAnother(Refusal),
+    /// The pid may name another process, for this reason. The second is the errno of the group probe
+    /// that failed before it, if one did, raw ([`Refusal::cause_after`]).
+    MayNameAnother(Refusal, Option<i32>),
 }
 
 #[cfg(unix)]
@@ -90,7 +91,7 @@ impl Why {
     pub(crate) fn cause(&self) -> Option<std::sync::Arc<Error>> {
         match self {
             Why::Untrusted { cause, .. } => cause.as_ref().map(crate::error::shared_io_cause),
-            Why::MayNameAnother(refusal) => refusal.cause(),
+            Why::MayNameAnother(refusal, probe) => refusal.cause_after(*probe),
         }
     }
 
@@ -209,7 +210,7 @@ mod call {
                 }
                 skip => skip,
             };
-            let Why::MayNameAnother(refusal) = &skip.why else {
+            let Why::MayNameAnother(refusal, _) = &skip.why else {
                 unreachable!("an untrusted skip is answered above")
             };
             if skip.is_moot(tree) {
@@ -326,7 +327,7 @@ mod call {
         /// this handle's own reap, with a pid that names no process, it ends with how to end the
         /// descendants the reaped root left.
         pub(crate) fn skipped_detail(&self, skip: &Skip, sent: &str) -> String {
-            let Why::MayNameAnother(refusal) = &skip.why else {
+            let Why::MayNameAnother(refusal, _) = &skip.why else {
                 unreachable!("only a skip that may name another process is worded here")
             };
             let remedy = match refusal {

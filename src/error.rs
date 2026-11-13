@@ -952,9 +952,28 @@ impl Error {
         }
     }
 
+    /// The `source` of an error with `own`, its cause if it has one, and then `peers`, the other
+    /// failures of the same operation: the one error when that is one, else an [`Error::Several`].
+    /// A `Several` own cause or peer is spliced in as its members, not nested in a list of its own.
+    /// Panics when there is neither an own cause nor a peer.
+    pub(crate) fn joined_cause(own: Option<Arc<Error>>, peers: impl IntoIterator<Item = Arc<Error>>) -> Arc<Error> {
+        Failures::collect(own.into_iter().chain(peers).flat_map(Error::spliced))
+            .expect("a cause or a peer")
+            .into_cause()
+    }
+
+    /// The members of `error` when it is an [`Error::Several`], else `error` alone.
+    fn spliced(error: Arc<Error>) -> Vec<Arc<Error>> {
+        match &*error {
+            Error::Several(list) => list.iter().cloned().collect(),
+            _ => vec![error],
+        }
+    }
+
     /// This error with `peers`, the other failures of the same operation, kept: its variant and detail
     /// stay, and its `source` becomes its own cause, if it has one, then the peers, as a
-    /// [`Error::Several`] when that is two or more. A [`Error::Several`] takes them as more members.
+    /// [`Error::Several`] when that is two or more ([`joined_cause`](Error::joined_cause)). A
+    /// [`Error::Several`] takes them as more members.
     ///
     /// An [`Error::MembersLeft`] takes them as its `others`, never as members, which are processes left
     /// running: before the `others` it has, as one flat list.
@@ -968,11 +987,7 @@ impl Error {
         if peers.peek().is_none() {
             return self;
         }
-        fn joined(own: Option<Arc<Error>>, peers: impl Iterator<Item = Arc<Error>>) -> Arc<Error> {
-            Failures::collect(own.into_iter().chain(peers))
-                .expect("a peer")
-                .into_cause()
-        }
+        let joined = Error::joined_cause;
         match self {
             Error::Unsupported {
                 op,
@@ -1027,7 +1042,7 @@ impl Error {
                 unreaped,
                 cleanup,
             },
-            Error::Several(list) => Error::Several(list.extended(peers)),
+            Error::Several(list) => Error::Several(list.extended(peers.flat_map(Error::spliced))),
             Error::MembersLeft { members, others } => {
                 // The peers happened before the sweep, so they go before its own failures, flat.
                 let own = match others {
@@ -1039,7 +1054,11 @@ impl Error {
                 };
                 Error::MembersLeft {
                     members,
-                    others: Some(Failures::collect(peers.chain(own)).expect("a peer").into_cause()),
+                    others: Some(
+                        Failures::collect(peers.flat_map(Error::spliced).chain(own))
+                            .expect("a peer")
+                            .into_cause(),
+                    ),
                 }
             }
             leaf @ (Error::Io(_) | Error::Quote(_) | Error::NoConsole { .. }) => {

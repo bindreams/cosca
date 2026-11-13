@@ -67,7 +67,7 @@ pub(crate) fn holders_only_skip(child: &Child) -> crate::containment::Skip {
     use crate::containment::{Refusal, Why};
     crate::containment::Skip {
         action: "signal its process group".to_owned(),
-        why: Why::MayNameAnother(Refusal::Unpinned(child.pid())),
+        why: Why::MayNameAnother(Refusal::Unpinned(child.pid()), None),
         root_alone: false,
         holders: Some(Ok(())),
     }

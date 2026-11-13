@@ -1118,13 +1118,16 @@ pub(crate) fn root_reaped(own_reap: bool, id: Option<ProcessId>, now: crate::ide
         }
 }
 
+/// The identity `pid` holds now, and why it could not be read when the read knows.
 #[cfg(unix)]
-pub(crate) fn root_identity_now(pid: crate::identity::RawPid) -> crate::identity::Resolved<ProcessId> {
+pub(crate) fn root_identity_now(
+    pid: crate::identity::RawPid,
+) -> (crate::identity::Resolved<ProcessId>, crate::identity::UnknownCause) {
     #[cfg(test)]
     if let Some(forced) = fault::take_forced_root_read() {
         return forced;
     }
-    ProcessId::of(pid)
+    ProcessId::of_explained(pid)
 }
 
 /// Test seam for [`root_identity_now`]. Thread-local, with an RAII reset.
@@ -1157,8 +1160,35 @@ pub(crate) mod fault {
     /// Every read of a root's number on THIS thread answers `read` until the guard drops, after any
     /// [`force_next_root_read`].
     pub(crate) fn force_root_reads(read: Resolved<ProcessId>) -> ForcedRootReads {
-        FORCED_ALWAYS.with(|f| f.set(Some(read)));
+        FORCED_ALWAYS.with(|f| {
+            f.set(Some(ForcedRead {
+                read,
+                #[cfg(target_os = "linux")]
+                call: None,
+            }));
+        });
         ForcedRootReads(())
+    }
+
+    /// Like [`force_root_reads`], answering `Unknown` because `call` failed: the read's cause is that
+    /// call's error.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn force_root_reads_failing(call: crate::identity::FailedCall) -> ForcedRootReads {
+        FORCED_ALWAYS.with(|f| {
+            f.set(Some(ForcedRead {
+                read: Resolved::Unknown,
+                call: Some(call),
+            }));
+        });
+        ForcedRootReads(())
+    }
+
+    /// What [`force_root_reads`] answers: the read, and the failed call behind an `Unknown`.
+    #[derive(Clone, Copy)]
+    struct ForcedRead {
+        read: Resolved<ProcessId>,
+        #[cfg(target_os = "linux")]
+        call: Option<crate::identity::FailedCall>,
     }
 
     #[must_use = "the seam is cleared as soon as the guard is dropped"]
@@ -1171,11 +1201,20 @@ pub(crate) mod fault {
     }
 
     thread_local! {
-        static FORCED_ALWAYS: Cell<Option<Resolved<ProcessId>>> = const { Cell::new(None) };
+        static FORCED_ALWAYS: Cell<Option<ForcedRead>> = const { Cell::new(None) };
     }
 
-    pub(super) fn take_forced_root_read() -> Option<Resolved<ProcessId>> {
-        FORCED.with(|f| f.take()).or_else(|| FORCED_ALWAYS.with(|f| f.get()))
+    pub(super) fn take_forced_root_read() -> Option<(Resolved<ProcessId>, crate::identity::UnknownCause)> {
+        let default = |read| (read, crate::identity::UnknownCause::default());
+        FORCED.with(|f| f.take()).map(default).or_else(|| {
+            FORCED_ALWAYS.with(|f| f.get()).map(|forced| {
+                #[cfg(target_os = "linux")]
+                if let Some(call) = forced.call {
+                    return (forced.read, crate::identity::UnknownCause::of_call(call));
+                }
+                default(forced.read)
+            })
+        })
     }
 }
 

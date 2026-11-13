@@ -261,7 +261,7 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
     let mut child = cmd.spawn().await.expect("spawn");
     let skip = Skip {
         action: "signal its process group".to_owned(),
-        why: Why::MayNameAnother(Refusal::Unpinned(child.pid())),
+        why: Why::MayNameAnother(Refusal::Unpinned(child.pid()), None),
         root_alone: true,
         holders: None,
     };

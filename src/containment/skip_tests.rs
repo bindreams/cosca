@@ -45,10 +45,10 @@ fn a_skip_over_an_unsure_handle_answers_with_its_error_as_the_source() {
         signal: TreeSignal::Term,
         earlier: None,
     };
-    let why = Why::MayNameAnother(Refusal::Unsure(
-        PID,
-        std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM)),
-    ));
+    let why = Why::MayNameAnother(
+        Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+        None,
+    );
 
     let answer = call
         .answer(&killed(false), skip(why), None)
@@ -76,10 +76,10 @@ fn a_sweep_that_skipped_has_the_handles_error_as_its_source_unless_the_holders_f
 
     let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
     let why = || {
-        Why::MayNameAnother(Refusal::Unsure(
-            PID,
-            std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM)),
-        ))
+        Why::MayNameAnother(
+            Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+            None,
+        )
     };
 
     let answer = skip(why()).sweep_error();
@@ -119,31 +119,31 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
     let whys: [Case; 6] = [
         (
             "own reap, pid gone",
-            || Why::MayNameAnother(Refusal::ReapedPidGone(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidGone(PID), None),
             true,
         ),
         (
             "own reap, pid unread",
-            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID, None), None),
             true,
         ),
         (
             "own reap, pid taken",
-            || Why::MayNameAnother(Refusal::ReapedPidTaken(PID)),
+            || Why::MayNameAnother(Refusal::ReapedPidTaken(PID), None),
             false,
         ),
         (
             "reaped elsewhere",
-            || Why::MayNameAnother(Refusal::ReapedElsewhere(PID)),
+            || Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None),
             false,
         ),
         (
             "handle could not say",
             || {
-                Why::MayNameAnother(Refusal::Unsure(
-                    PID,
-                    std::sync::Arc::new(std::io::Error::other("forced")),
-                ))
+                Why::MayNameAnother(
+                    Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::other("forced"))),
+                    None,
+                )
             },
             false,
         ),
@@ -166,10 +166,10 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
 
 /// A skip whose reason holds an error with the code `code`.
 fn unsure(code: i32) -> Why {
-    Why::MayNameAnother(Refusal::Unsure(
-        PID,
-        std::sync::Arc::new(std::io::Error::from_raw_os_error(code)),
-    ))
+    Why::MayNameAnother(
+        Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(code))),
+        None,
+    )
 }
 
 fn term_call(op: &'static str) -> super::SkipCall<'static> {
@@ -268,7 +268,7 @@ fn a_skipped_calls_io_failure_goes_below_the_unassessable_after_the_reason() {
     let alone = term_call("skip_peers_probe_a4")
         .answer(
             &killed(false),
-            skip(Why::MayNameAnother(Refusal::ReapedElsewhere(PID))),
+            skip(Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None)),
             Some(Err(eperm())),
         )
         .answer
@@ -305,6 +305,50 @@ fn an_untrusted_roots_cause_joins_the_failed_holders_sweep() {
 
     assert!(matches!(&answer, Error::Containment { detail, .. } if detail == "the holders' sweep failed"));
     assert_eq!(codes_below(&answer), [Some(libc::EPERM), Some(libc::EACCES)]);
+}
+
+/// A reason that holds two causes (a handle that could not say, and the group probe that failed
+/// before it) joins a failed holders' sweep as two more members of one flat list, in the answer of a
+/// call and of a sweep alike.
+///
+/// Mutant: the reason's `Several` is nested in the list as one member.
+#[skuld::test]
+fn a_reason_with_two_causes_joins_the_failed_holders_sweep_flat() {
+    use crate::error::Error;
+    let reason = || {
+        Why::MayNameAnother(
+            Refusal::Unsure(
+                PID,
+                std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EACCES)),
+            ),
+            Some(libc::EMFILE),
+        )
+    };
+    let holders = || Error::Containment {
+        detail: "the holders' sweep failed".into(),
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
+    };
+    let expected = [Some(libc::EPERM), Some(libc::EACCES), Some(libc::EMFILE)];
+
+    let answer = term_call("skip_peers_probe_d1")
+        .answer(
+            &killed(false),
+            Skip {
+                holders: Some(Err(holders())),
+                ..skip(reason())
+            },
+            None,
+        )
+        .answer
+        .expect_err("a skipped call is no success");
+    assert_eq!(codes_below(&answer), expected, "{answer:?}");
+
+    let swept = Skip {
+        holders: Some(Err(holders())),
+        ..skip(reason())
+    }
+    .sweep_error();
+    assert_eq!(codes_below(&swept), expected, "{swept:?}");
 }
 
 /// The kill after a holders-only `SIGTERM` that failed too (macOS) returns the kill's error with the

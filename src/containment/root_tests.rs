@@ -27,12 +27,14 @@ fn answered(state: impl Fn() -> RootState, has_group: bool, read: Resolved<Proce
         NumberLook::Empty => Answer::Empty,
         NumberLook::Untrusted(_) => Answer::Untrusted,
         NumberLook::GroupGone => panic!("only a look through the root's pidfd answers GroupGone"),
-        NumberLook::MayNameAnother { refusal, exact_root } => Answer::MayNameAnother(
+        NumberLook::MayNameAnother {
+            refusal, exact_root, ..
+        } => Answer::MayNameAnother(
             exact_root,
             match refusal {
                 Refusal::ReapedPidGone(_) => "gone",
                 Refusal::ReapedPidTaken(_) => "taken",
-                Refusal::ReapedPidUnread(_) => "unread",
+                Refusal::ReapedPidUnread(..) => "unread",
                 Refusal::ReapedElsewhere(_) => "elsewhere",
                 Refusal::Unsure(..) => "unsure",
                 Refusal::Unpinned(_) => "unpinned",
@@ -128,7 +130,8 @@ fn a_seen_root_is_decided_on_its_callers_look_and_checked_on_its_own_state() {
         look(&seen, true),
         NumberLook::MayNameAnother {
             exact_root: false,
-            refusal: Refusal::ReapedElsewhere(_)
+            refusal: Refusal::ReapedElsewhere(_),
+            ..
         }
     ));
     assert!(matches!(seen.state(), RootState::Unknown(_)), "{:?}", seen.state());
@@ -179,7 +182,7 @@ fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
             .and_then(std::io::Error::raw_os_error)
     };
     assert_eq!(code(&refusal), Some(libc::EPERM));
-    let unproven = NotItsGroup::Unproven(refusal);
+    let unproven = NotItsGroup::unproven(refusal, None);
     assert!(!unproven.to_string().contains(&os_error), "{unproven}");
     assert_eq!(code(&unproven), Some(libc::EPERM));
     assert!(std::error::Error::source(&NotItsGroup::Empty).is_none());
@@ -207,8 +210,76 @@ fn number_holds_reads_own_from_the_state() {
     drop(_found);
     let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
     let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
-    assert!(matches!(err, Refusal::ReapedPidUnread(_)), "{err}");
+    assert!(matches!(err, Refusal::ReapedPidUnread(..)), "{err}");
     assert!(err.to_string().contains("could not be read"), "{err}");
+}
+
+/// A reaped root whose pid could not be read refuses with the read's error as its `source()`, OS code
+/// included, and the send that wraps the check keeps it as its own.
+///
+/// Mutant: the refusal drops the read's cause.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unread_pid_refusal_has_the_reads_error_as_its_source() {
+    use nix::sys::signal::Signal;
+
+    use crate::containment::unix::send_to_group;
+    use crate::error::first_os_code;
+    use crate::identity::FailedCall;
+    use crate::test_support::stated_root::StatedRoot;
+
+    let _read = crate::child::fault::force_root_reads_failing(FailedCall::pidfd_open(rustix::io::Errno::MFILE));
+    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    assert_eq!(first_os_code(&refusal), Some(libc::EMFILE), "{refusal:?}");
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Reaped { own: true });
+    let sent = send_to_group(PGID, Signal::SIGTERM, Some(&root)).expect_err("the check refuses the send");
+    assert_eq!(first_os_code(&sent), Some(libc::EMFILE), "{sent:?}");
+}
+
+/// macOS has no view and no pidfd to say why a pid read was `Unknown`, so the refusal for an
+/// unreadable pid of a root this handle reaped has no cause and no source: `Unassessable`'s `source`
+/// stays `None`, as it did before the read's cause was kept.
+///
+/// Mutant: the refusal makes up a cause the read does not know.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_unread_pid_refusal_has_no_cause_on_macos() {
+    use crate::containment::NotItsGroup;
+
+    let _read = crate::child::fault::force_root_reads(Resolved::Unknown);
+    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    assert!(matches!(refusal, Refusal::ReapedPidUnread(_, None)), "{refusal:?}");
+    assert!(std::error::Error::source(&refusal).is_none(), "{refusal:?}");
+    assert!(refusal.cause().is_none(), "{refusal:?}");
+    let unproven = NotItsGroup::unproven(refusal, None);
+    assert!(unproven.cause().is_none(), "{unproven:?}");
+}
+
+/// A probe's error joins a `Several` cause of the refusal as one more member of it, not as a list
+/// inside a list.
+///
+/// Mutant: the join nests the refusal's `Several`.
+#[skuld::test]
+fn a_probe_extends_a_several_cause_of_the_refusal() {
+    use std::sync::Arc;
+
+    use crate::containment::NotItsGroup;
+    use crate::error::{first_os_code, Error, Failures};
+
+    let coded = |code| Error::io_cause(std::io::Error::from_raw_os_error(code));
+    let own = Arc::new(Error::Several(Failures::new(
+        coded(libc::EACCES),
+        [coded(libc::EMFILE)],
+    )));
+    let unproven = NotItsGroup::unproven(Refusal::ReapedPidUnread(PGID as u32, Some(own)), Some(libc::EPERM));
+    let cause = unproven.cause().expect("the causes");
+    let codes: Vec<_> = cause
+        .failures()
+        .expect("a list")
+        .iter()
+        .map(|member| first_os_code(&**member))
+        .collect();
+    assert_eq!(codes, [Some(libc::EACCES), Some(libc::EMFILE), Some(libc::EPERM)]);
 }
 
 // check_number through the root's pidfd -----
@@ -265,6 +336,7 @@ mod pidfd {
                 NumberLook::MayNameAnother {
                     refusal: Refusal::ReapedElsewhere(super::PGID as u32),
                     exact_root,
+                    probe: None,
                 },
                 &root,
             )
@@ -338,6 +410,107 @@ mod pidfd {
             checked.expect_err("reaped elsewhere").to_string(),
             reaped_elsewhere_text(pid)
         );
+    }
+
+    /// A pidfd of this test's own process: a root for a check whose group probe is answered by the
+    /// fault seam, so no process of its own is needed.
+    fn own_pidfd() -> std::os::fd::OwnedFd {
+        crate::containment::cgroup::test_support::pidfd_of(std::process::id())
+    }
+
+    /// A refusal that follows a failed group probe has the probe's errno as a cause: the only one
+    /// when the root's state says nothing of its own, else after the state's.
+    ///
+    /// Mutant: the check drops the probe's errno, or puts it before the state's cause.
+    #[skuld::test]
+    fn a_refusal_after_a_failed_group_probe_keeps_the_probes_errno() {
+        use crate::error::first_os_code;
+
+        let pidfd = own_pidfd();
+        let pid = std::process::id();
+        let elsewhere = reaped_elsewhere(pid, pidfd.as_fd());
+        let unsure = StatedRoot::with_state(pid, || {
+            RootState::Unknown(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EACCES)))
+        })
+        .with_pidfd(pidfd.as_fd());
+        let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
+        let alone = check_number(Some(&elsewhere));
+        let beside = check_number(Some(&unsure));
+        drop(answered);
+
+        let alone = alone.expect_err("reaped elsewhere");
+        assert_eq!(first_os_code(&alone), Some(libc::EPERM), "{alone:?}");
+        assert_eq!(alone.to_string(), reaped_elsewhere_text(pid));
+        let beside = beside.expect_err("the handle could not say");
+        let cause = beside.cause().expect("two causes");
+        let codes: Vec<_> = cause
+            .failures()
+            .expect("the state's cause and the probe's")
+            .iter()
+            .map(|member| first_os_code(&**member))
+            .collect();
+        assert_eq!(codes, [Some(libc::EACCES), Some(libc::EPERM)], "{beside:?}");
+        assert_eq!(first_os_code(&beside), Some(libc::EACCES), "{beside:?}");
+    }
+
+    /// A look whose group probe failed keeps its refusal, and a skip built from it has the probe's
+    /// errno as a cause, as the check's refusal does.
+    ///
+    /// The failure is also logged once at debug, with its errno, naming that the look keeps its
+    /// refusal.
+    ///
+    /// Mutant: the look drops the probe's errno, or its failure without a word.
+    #[skuld::test]
+    fn a_look_after_a_failed_group_probe_keeps_the_probes_errno() {
+        use crate::containment::root::{through_the_pidfd, NumberLook};
+        use crate::containment::skip::Why;
+        use crate::containment::Refusal;
+        use crate::error::first_os_code;
+
+        crate::log_capture::install();
+        let pidfd = own_pidfd();
+        let pid = std::process::id();
+        let root = reaped_elsewhere(pid, pidfd.as_fd());
+        let mark = crate::log_capture::mark();
+        let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
+        let decided = through_the_pidfd(
+            NumberLook::MayNameAnother {
+                refusal: Refusal::ReapedElsewhere(pid),
+                exact_root: false,
+                probe: None,
+            },
+            &root,
+        );
+        drop(answered);
+        let NumberLook::MayNameAnother { refusal, probe, .. } = decided else {
+            panic!("a failed probe leaves the look as it was");
+        };
+        let cause = Why::MayNameAnother(refusal, probe).cause().expect("the probe's errno");
+        assert_eq!(first_os_code(&*cause), Some(libc::EPERM), "{cause:?}");
+        let errno = crate::error::Report(&nix::errno::Errno::EPERM).to_string();
+        let logged = crate::log_capture::records_since(mark, "the look keeps its refusal");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains(&errno), "{logged:?} lacks {errno}");
+    }
+
+    /// A failed group probe that the root's state outvotes (an unreaped root) is still logged, once,
+    /// at debug, with its errno.
+    ///
+    /// Mutant: the check drops a probe's failure without a word.
+    #[skuld::test]
+    fn a_failed_group_probe_of_an_unreaped_root_is_logged_once() {
+        crate::log_capture::install();
+        let pidfd = own_pidfd();
+        let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
+        let mark = crate::log_capture::mark();
+        let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
+        let checked = check_number(Some(&root));
+        drop(answered);
+        checked.expect("an unreaped root holds its number");
+        let errno = crate::error::Report(&nix::errno::Errno::EPERM).to_string();
+        let logged = crate::log_capture::records_since(mark, "a signal-0 send to a process group");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains(&errno), "{logged:?} lacks {errno}");
     }
 
     /// The check's signal-0 group send is a send like any other: recorded, through the root's
