@@ -631,27 +631,25 @@ mod windows {
         );
     }
 
-    /// A member that left the listing as the other's exit was seen, with the second listing (forced)
-    /// empty, is waited for until it exits: the drain answers once it has, and not before it can.
+    /// A member alive in the job when the first listing (forced) comes back empty is waited for under
+    /// a drain with no deadline: the drain is still pending while it runs, and answers once it has
+    /// exited. A first poll that is ready is an answer given off the empty listing.
     ///
-    /// Mutant: the drain never waits for the members the snapshot names.
+    /// Mutant: `Round::Confirm` answers `AllMembersExited` without a snapshot.
     #[skuld::test]
-    async fn a_drain_whose_listing_empties_ends_when_the_members_the_snapshot_names_exit() {
-        use crate::containment::windows::fault::force_job_pid_lists;
+    async fn a_drain_whose_listing_is_empty_ends_when_the_member_the_snapshot_names_exits() {
+        use crate::containment::windows::fault::force_job_pid_list;
 
-        let (mut first, mut second, job) = spawn_job_with_two_members();
-        let stdin = second.stdin.take().expect("piped stdin");
-        let _forced = force_job_pid_lists([vec![first.id(), second.id()], Vec::new()]);
+        let (mut member, job) = spawn_job_member();
+        let _forced = force_job_pid_list(Vec::new());
         let mut wait = pin!(drain(&job, None));
         assert!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
-            "live members are waited for"
+            "the drain answered off the empty listing while a member runs"
         );
-        first.kill().expect("end the first member");
-        first.wait().expect("reap the first member");
-        drop(stdin);
+        drop(member.stdin.take());
         assert_eq!(wait.await, TreeDrain::AllMembersExited);
-        second.wait().expect("reap the second member");
+        member.wait().expect("reap the member");
     }
 
     /// A member the caller may open for its membership but not wait on is one whose exit cannot be
@@ -690,6 +688,44 @@ mod windows {
             crate::error::first_os_code(error.source().expect("the OS error is the cause")),
             Some(ERROR_ACCESS_DENIED.0 as i32),
             "{error:?}"
+        );
+    }
+
+    /// A kill's awaited wait names a member it may not wait on once, as the sync wait does: the edge's
+    /// confirmation does not report what the wait for the members already did.
+    ///
+    /// Mutant: the edge is awaited with no memory of the members the kill's wait settled.
+    #[skuld::test]
+    fn an_awaited_kill_wait_names_a_member_it_may_not_wait_on_once() {
+        use crate::containment::dispatch::TreeKillOutcome;
+        use crate::containment::TreeKill;
+
+        let Some(done) = crate::test_own_process::own_process(
+            crate::test_own_process::test_path!(an_awaited_kill_wait_names_a_member_it_may_not_wait_on_once),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+        let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
+            .expect("the restricted member's identity");
+        let job = JobHandle::create_empty_for_test();
+        job.assign_for_test(member.handle().0)
+            .expect("assign the restricted member to the job");
+        let rt = single_thread_pool_runtime();
+        let forced = crate::containment::windows::fault::force_job_pid_list(Vec::new());
+        let (_, wait) =
+            TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
+
+        let verdict = rt.block_on(wait.wait_async());
+
+        drop(forced);
+        let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
+        let report = crate::error::Report(&error).to_string();
+        assert_eq!(
+            report.matches(&format!("pid {}", member.pid())).count(),
+            1,
+            "the member is named once: {report}"
         );
     }
 

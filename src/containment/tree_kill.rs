@@ -185,9 +185,10 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        for id in once_each(members) {
-            if let Err(why) = wait_for_killed_member(kernel, id) {
-                unobserved.push(why);
+        let members: Vec<ProcessId> = once_each(members).collect();
+        for &id in &members {
+            if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
+                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
         if let RootEnd::Waited(root) = root {
@@ -196,7 +197,8 @@ impl<'a> KillWait<'a> {
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge.wait(None).and_then(drained) {
+            // Every member reached is settled: it exited or was reported above, once.
+            if let Err(why) = edge.wait_past(None, &members).and_then(drained) {
                 unobserved.push(why);
             }
         }
@@ -215,9 +217,10 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        for id in once_each(members) {
-            if let Err(why) = wait_for_killed_member_async(kernel, id).await {
-                unobserved.push(why);
+        let members: Vec<ProcessId> = once_each(members).collect();
+        for &id in &members {
+            if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
+                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
         if let RootEnd::Waited(root) = root {
@@ -226,7 +229,7 @@ impl<'a> KillWait<'a> {
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge.wait_async(None).await.and_then(drained) {
+            if let Err(why) = edge.wait_async_past(None, &members).await.and_then(drained) {
                 unobserved.push(why);
             }
         }
@@ -274,20 +277,8 @@ fn drained(verdict: TreeDrain) -> Result<(), Error> {
     }
 }
 
-/// [`wait_for_member`] for a wait with no deadline, as a kill's wait is: the failure names `id`'s pid as
-/// a member whose exit cannot be observed.
-fn wait_for_killed_member(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    let exited = wait_for_member(kernel, id, None).map_err(|why| exit_unobserved(id.pid(), why))?;
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
-}
-
-/// [`wait_for_killed_member`], awaited.
-#[cfg(feature = "tokio")]
-async fn wait_for_killed_member_async(kernel: &dyn Kernel, id: ProcessId) -> Result<(), Error> {
-    let exited = wait_for_member_async(kernel, id, None)
-        .await
-        .map_err(|why| exit_unobserved(id.pid(), why))?;
+/// What a wait with no deadline comes to: it ends only on an exit, so `exited` is `true`.
+fn exit_seen(exited: bool) -> Result<(), Error> {
     debug_assert!(exited, "a wait with no deadline ends only on an exit");
     Ok(())
 }
@@ -297,7 +288,7 @@ async fn wait_for_killed_member_async(kernel: &dyn Kernel, id: ProcessId) -> Res
 /// gone; `Ok(false)` is a member still running at the deadline's final look. One that cannot be opened
 /// for another reason has not exited as far as anyone can tell: the error is that cause.
 pub(crate) fn wait_for_member(kernel: &dyn Kernel, id: ProcessId, deadline: Option<Instant>) -> Result<bool, Error> {
-    match open_member(kernel, id)? {
+    match crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())? {
         Some(os) => crate::os_process::drive::exited_until(&*os, deadline),
         None => Ok(true),
     }
@@ -310,27 +301,19 @@ pub(crate) async fn wait_for_member_async(
     id: ProcessId,
     deadline: Option<Instant>,
 ) -> Result<bool, Error> {
-    match open_member(kernel, id)? {
+    match crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())? {
         Some(os) => crate::tokio::drive::exited_until(&*os, deadline).await,
         None => Ok(true),
     }
 }
 
-fn open_member(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    crate::os_process::open_with(kernel, id).map_err(|failure| failure.into_open_error())
-}
-
 fn wait_for_exit(os: &dyn OsProcess) -> Result<(), Error> {
-    let exited = crate::os_process::drive::exited_until(os, None)?;
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
+    crate::os_process::drive::exited_until(os, None).and_then(exit_seen)
 }
 
 #[cfg(feature = "tokio")]
 async fn wait_for_exit_async(os: &dyn OsProcess) -> Result<(), Error> {
-    let exited = crate::tokio::drive::exited_held(os, None).await?;
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
+    crate::tokio::drive::exited_held(os, None).await.and_then(exit_seen)
 }
 
 pub(crate) fn exit_unobserved(pid: u32, cause: Error) -> Error {

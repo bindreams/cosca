@@ -1046,6 +1046,16 @@ impl JobHandle {
         wait_drained_raw(self.handle(), deadline)
     }
 
+    /// [`wait_drained`](Self::wait_drained) for a caller that has waited for the members `settled`
+    /// already ([`wait_drained_past`]).
+    pub(crate) fn wait_drained_past(
+        &self,
+        deadline: Option<std::time::Instant>,
+        settled: &[ProcessId],
+    ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        wait_drained_past(self.handle(), deadline, settled)
+    }
+
     /// One round of the drain wait: list the live members, open each (up to the wait-set cap) with
     /// `SYNCHRONIZE`, and say what the round decided. `last_round` is whether the caller's deadline
     /// has already passed, on the caller's clock. What a round answers is stated at
@@ -1169,6 +1179,17 @@ pub(crate) fn wait_drained_raw(
     job: BorrowedHandle<'_>,
     deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+    wait_drained_past(job, deadline, &[])
+}
+
+/// [`wait_drained_raw`] for a caller that has already waited for the members `settled` (each exited,
+/// or failed in a way it reported): the confirmation of an empty listing does not wait for them or
+/// report them again.
+pub(crate) fn wait_drained_past(
+    job: BorrowedHandle<'_>,
+    deadline: Option<std::time::Instant>,
+    settled: &[ProcessId],
+) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::TreeDrain;
 
     let job = HANDLE(job.as_raw_handle());
@@ -1186,7 +1207,7 @@ pub(crate) fn wait_drained_raw(
         };
         match round {
             Round::Answer(drain) => return Ok(drain),
-            Round::Confirm => return confirm_drained(job, deadline),
+            Round::Confirm => return confirm_drained(job, deadline, settled),
             // A tracked member exited, or the listing named no live member: the next round
             // re-enumerates the authoritative live set.
             Round::List | Round::Watch(_) => {}
@@ -1304,24 +1325,40 @@ fn after_signalled(job: HANDLE, watch: &Watch) -> Result<Round, crate::error::Er
 /// the snapshot's pid, kept only if the OS says it is in this job, and waited for one at a time
 /// through [`wait_for_member`] (open, wait, close), until `deadline` (`None`: for ever), which
 /// answers `MembersRemain` if one is still running at it. No handle outlives its own wait, and no
-/// wait set bounds the members.
+/// wait set bounds the members. The members `settled` are not waited for.
 ///
 /// A member in the gap is in the snapshot taken after the listing: it is not yet signalled, and a
 /// signalled process is not in a snapshot.
+///
+/// The async drain ([`job_wait_tree_drained`](crate::containment::drain_edge)) is this walk with its
+/// own wait: the members it walks ([`unsettled`]) and what a wait for one comes to ([`waited`]) are
+/// the same functions.
 fn confirm_drained(
     job: HANDLE,
     deadline: Option<std::time::Instant>,
+    settled: &[ProcessId],
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::tree_kill::wait_for_member;
     use crate::containment::TreeDrain;
     use crate::identity::HostKernel;
 
-    for id in unsignalled_members(job)? {
-        if !wait_for_member(&HostKernel, id, deadline).map_err(|cause| member_unobserved(id.pid(), cause))? {
+    for id in unsettled(unsignalled_members(job)?, settled) {
+        if !waited(id, wait_for_member(&HostKernel, id, deadline))? {
             return Ok(TreeDrain::MembersRemain);
         }
     }
     Ok(TreeDrain::AllMembersExited)
+}
+
+/// The members a confirmation walks: those `snapshot` names that the caller has not `settled`.
+pub(crate) fn unsettled(snapshot: Vec<ProcessId>, settled: &[ProcessId]) -> impl Iterator<Item = ProcessId> + '_ {
+    snapshot.into_iter().filter(move |id| !settled.contains(id))
+}
+
+/// What a confirmation's wait for the member `id` comes to: `true` it has exited, `false` it runs at
+/// the deadline, and a wait that could not be made is the failure naming it ([`member_unobserved`]).
+pub(crate) fn waited(id: ProcessId, wait: Result<bool, crate::error::Error>) -> Result<bool, crate::error::Error> {
+    wait.map_err(|cause| member_unobserved(id.pid(), cause))
 }
 
 /// The identity of every process a system snapshot names that is a member of `job`, decided with the

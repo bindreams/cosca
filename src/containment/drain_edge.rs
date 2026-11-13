@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::containment::TreeDrain;
 use crate::error::Error;
+use crate::identity::ProcessId;
 
 /// A tree's own kernel edge for "every member has exited", borrowed from the tree that owns the
 /// resource it watches for the child's whole life (a marker's read end must, to keep its pipe's
@@ -26,11 +27,21 @@ impl DrainEdge<'_> {
     /// Block until every member of the tree has EXITED (not reaped), or until `deadline` (`None`: for
     /// ever): `MembersRemain` at expiry.
     pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
+        self.wait_past(deadline, &[])
+    }
+
+    /// [`wait`](Self::wait) for a caller that has already waited for the members `settled`, each of which
+    /// exited or failed in a way it reported. Only a Job's edge, which confirms an empty listing from a
+    /// system snapshot of its members, has anything to skip: it neither waits for them nor reports them
+    /// again.
+    pub(crate) fn wait_past(&self, deadline: Option<Instant>, settled: &[ProcessId]) -> Result<TreeDrain, Error> {
+        #[cfg(not(windows))]
+        let _ = settled;
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => leaf.wait_drained(deadline),
             #[cfg(windows)]
-            DrainEdge::Job(job) => job.wait_drained(deadline),
+            DrainEdge::Job(job) => job.wait_drained_past(deadline, settled),
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => m.wait_drained(deadline),
         }
@@ -43,11 +54,23 @@ impl DrainEdge<'_> {
     /// ([`deadline_from`](crate::tokio::wait::deadline_from)).
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
+        self.wait_async_past(deadline, &[]).await
+    }
+
+    /// [`wait_past`](Self::wait_past), awaited.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_async_past(
+        &self,
+        deadline: Option<Instant>,
+        settled: &[ProcessId],
+    ) -> Result<TreeDrain, Error> {
+        #[cfg(not(windows))]
+        let _ = settled;
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => cgroup_wait_tree_drained(leaf, deadline).await,
             #[cfg(windows)]
-            DrainEdge::Job(job) => job_wait_tree_drained(job, deadline).await,
+            DrainEdge::Job(job) => job_wait_tree_drained(job, deadline, settled).await,
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => {
                 // Same reissued-fd check as `Marker::wait_drained`: a reissued read-end fd would
@@ -306,7 +329,9 @@ async fn snapshot_members_on_pool(
 /// dropping the future unregisters the round's waits.
 ///
 /// An empty listing is confirmed from a system snapshot, as the sync wait's `confirm_drained` does:
-/// each job member it names is awaited in turn through the by-identity wait a kill's wait uses.
+/// each job member it names, except those `settled`, is awaited in turn through the by-identity wait
+/// a kill's wait uses. The members walked and what a wait for one comes to are the sync wait's own
+/// ([`unsettled`], [`waited`]); the two differ only in how a member is waited for.
 ///
 /// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
 /// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
@@ -317,9 +342,10 @@ async fn snapshot_members_on_pool(
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
+    settled: &[ProcessId],
 ) -> Result<TreeDrain, Error> {
     use crate::containment::tree_kill::wait_for_member_async;
-    use crate::containment::windows::{member_unobserved, Ended, Round};
+    use crate::containment::windows::{unsettled, waited, Ended, Round};
     use crate::identity::HostKernel;
     use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
@@ -353,11 +379,8 @@ async fn job_wait_tree_drained(
             // The sync wait's `confirm_drained`: each member the snapshot names, in turn, awaited
             // through the same by-identity wait a kill's wait uses.
             Round::Confirm => {
-                for id in snapshot_members_on_pool(job).await? {
-                    if !wait_for_member_async(&HostKernel, id, deadline)
-                        .await
-                        .map_err(|cause| member_unobserved(id.pid(), cause))?
-                    {
+                for id in unsettled(snapshot_members_on_pool(job).await?, settled) {
+                    if !waited(id, wait_for_member_async(&HostKernel, id, deadline).await)? {
                         return Ok(TreeDrain::MembersRemain);
                     }
                 }

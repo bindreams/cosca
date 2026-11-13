@@ -23,6 +23,50 @@ fn wait_drained_after_hard_kill_reports_the_drain() {
     assert!(!status.success(), "the member was killed: {status:?}");
 }
 
+/// Against the real OS, with no forced listing: once `wait_drained` answers `AllMembersExited` after
+/// the job's kill, every member the job held (each opened before the kill) is signalled. The job's
+/// list empties before the members are signalled, so a drain answering off the list alone is early.
+///
+/// Mutant: an empty listing answers `AllMembersExited` without the snapshot's members.
+#[skuld::test]
+fn after_the_job_kill_the_drain_answers_only_once_every_member_is_signalled() {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+    use crate::containment::Contains as _;
+
+    let (mut members, job) = crate::test_child::spawn_job_with_members(3);
+    let pids = super::query_job_pid_list(HANDLE(job.handle().as_raw_handle())).expect("list the job's members");
+    assert!(pids.len() >= members.len(), "the job holds its members: {pids:?}");
+    let held: Vec<(u32, OwnedHandle)> = pids
+        .into_iter()
+        .map(|pid| {
+            // SAFETY: a standard Win32 call; the handle returned is ours and owned from here.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.expect("open a member of the job");
+            // SAFETY: `OpenProcess` returned an open handle that nothing else owns.
+            (pid, unsafe { OwnedHandle::from_raw_handle(handle.0) })
+        })
+        .collect();
+
+    job.send_kill(None).into_result().expect("terminate the job");
+    let verdict = job.wait_drained(None).expect("wait for the job to drain");
+
+    assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
+    for (pid, handle) in &held {
+        // SAFETY: `handle` is open for the call.
+        let waited = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) };
+        assert_eq!(
+            waited, WAIT_OBJECT_0,
+            "pid {pid} is a member the drain answered before it was signalled"
+        );
+    }
+    for member in &mut members {
+        member.wait().expect("reap a member");
+    }
+}
+
 /// A kill the OS refuses names no member to wait for: its `Err` is returned, where a wait over members
 /// it did not kill would hang. A handle without `JOB_OBJECT_TERMINATE` lists the live member and is
 /// refused the kill. The wait is made to end the member where it blocks, so a mutant fails by assertion.
@@ -428,6 +472,55 @@ fn wait_drained_raw_names_a_member_it_may_not_wait_on_when_the_listing_is_empty(
         crate::error::first_os_code(error.source().expect("the OS error is the cause")),
         Some(ERROR_ACCESS_DENIED.0 as i32),
         "{error:?}"
+    );
+}
+
+/// A kill's wait names a member it may not wait on once: the edge's confirmation of the empty listing
+/// does not report a member the wait for the members already did.
+///
+/// Mutant: the edge is waited for with no memory of the members the kill's wait settled, so the
+/// confirmation names the same pid a second time.
+#[skuld::test]
+fn a_kill_wait_names_a_member_it_may_not_wait_on_once() {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::TreeKill;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_kill_wait_names_a_member_it_may_not_wait_on_once),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
+        .expect("the restricted member's identity");
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
+
+    let verdict = wait.wait();
+
+    drop(forced);
+    let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
+    let report = crate::error::Report(&error).to_string();
+    assert_eq!(
+        report.matches(&format!("pid {}", member.pid())).count(),
+        1,
+        "the member is named once: {report}"
+    );
+    assert!(
+        report.contains("was killed, but its exit cannot be observed"),
+        "the kill's wait names it: {report}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&error),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "{report}"
     );
 }
 
