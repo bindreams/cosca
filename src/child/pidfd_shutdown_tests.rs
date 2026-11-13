@@ -48,7 +48,7 @@ fn assert_names_the_skip(err: &Error) {
     );
     assert!(detail.starts_with(&said), "{detail}");
     assert!(!detail.contains("forced"), "{detail}");
-    assert!(crate::error::Report(err).to_string().contains("forced"), "{err:?}");
+    assert!(crate::error::said(err).contains("forced"), "{err:?}");
 }
 
 fn unkillable(what: &str) -> Error {
@@ -134,7 +134,8 @@ fn a_failed_grace_wait_kills_the_root_at_once_and_is_in_the_answer() {
     let below = err.failures_below();
     assert!(
         matches!(&below[..], [cause, watch]
-            if cause.to_string().contains("forced") && watch.to_string() == "forced wait failure"),
+            if crate::error::said(*cause).contains("forced")
+                && crate::error::said(*watch) == crate::error::io_said("forced wait failure")),
         "{below:?}"
     );
 }
@@ -153,11 +154,21 @@ fn a_failed_grace_wait_and_a_failed_kill_are_both_in_the_answer_in_order() {
         Err(Error::Io(std::io::Error::other("forced kill failure"))),
     );
     assert_eq!(sent, ["term", "grace", "kill"]);
-    let below: Vec<_> = err.failures_below().into_iter().map(ToString::to_string).collect();
+    assert!(
+        matches!(&err, Error::Unassessable { detail, .. }
+            if detail.contains("then the kill of the root through its pidfd failed")
+                && !detail.contains("forced kill failure")),
+        "the failure is below the answer, not in its words: {err:?}"
+    );
+    let below: Vec<_> = err
+        .failures_below()
+        .into_iter()
+        .map(|failure| crate::error::said(failure))
+        .collect();
     assert_eq!(below.len(), 3, "{below:?}");
     assert!(below[0].contains("forced"), "{below:?}");
-    assert_eq!(below[1], "forced kill failure", "{below:?}");
-    assert_eq!(below[2], "forced wait failure", "{below:?}");
+    assert_eq!(below[1], crate::error::io_said("forced kill failure"), "{below:?}");
+    assert_eq!(below[2], crate::error::io_said("forced wait failure"), "{below:?}");
 }
 
 #[skuld::test]
@@ -186,7 +197,12 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     let forced = || Error::Io(std::io::Error::other("forced term failure"));
     let (err, sent, warns) = run(Gate::Open, Err(forced()), None, Gate::Open, Ok(Sent::Delivered));
     // An `Io` is a leaf with no slot for peers: the call's `Unassessable` holds it, after the refusal's cause.
-    assert!(matches!(&err, Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        matches!(&err, Error::Unassessable { detail, .. }
+            if detail.contains("the SIGTERM to the root through its pidfd failed")
+                && !detail.contains("forced term failure")),
+        "the failure is below the answer, not in its words: {err:?}"
+    );
     assert!(
         matches!(err.failures_below().get(1), Some(Error::Io(e)) if e.to_string() == "forced term failure"),
         "{err:?}"
@@ -195,7 +211,7 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     assert_eq!(warns.len(), 1, "{warns:?}");
     let said = format!(
         "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
-        crate::error::Report(&forced())
+        crate::error::said(&forced())
     );
     assert!(warns[0].contains(&said), "{warns:?}");
 }

@@ -193,7 +193,7 @@ fn below_6_9_sends_nothing_to_the_group(container: Container) {
         .expect("the refused group kill is the teardown's failure");
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
-        cleanup.first().to_string().contains("killing the process group of pid")
+        crate::error::said(&**cleanup.first()).contains("killing the process group of pid")
             && crate::error::first_os_code(&**cleanup.first()) == Some(libc::EINVAL),
         "{cleanup:?}"
     );

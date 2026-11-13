@@ -254,7 +254,7 @@ impl Child {
         }
         if let Some(front) = cgroup_only {
             // The tree kill's failure is the tree's, settled in `DropParts::finish`.
-            let not_reached = match kill.incomplete_for_log() {
+            let not_reached = match kill.incomplete() {
                 None => self.cgroup_kill_reached(front).err().map(NotKilled::by),
                 Some(failure) => Some(NotKilled::in_words(failure)),
             };

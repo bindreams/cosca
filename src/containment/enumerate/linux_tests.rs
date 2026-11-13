@@ -119,7 +119,7 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
             Some(errno),
             "errno {errno}: the read's error is below the layer"
         );
-        let text = crate::error::Report(&error).to_string();
+        let text = crate::error::said(&error);
         if matches!(errno, libc::EXDEV | libc::ELOOP) {
             assert!(text.contains("lies beyond a mount in /proc"), "{errno}: {text}");
         }
@@ -163,7 +163,7 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         match process_parents(&kernel) {
             Err(error @ crate::error::Error::Unassessable { .. }) => {
-                let text = crate::error::Report(&error).to_string();
+                let text = crate::error::said(&error);
                 assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
                 assert_eq!(
                     text.contains("re-check of self/stat failed"),

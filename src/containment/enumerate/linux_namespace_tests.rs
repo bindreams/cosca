@@ -63,7 +63,7 @@ fn fixture_enumerate_stat_overmount() {
 
     match process_parents(&HostKernel) {
         Err(error @ crate::error::Error::Unassessable { .. }) => {
-            let text = crate::error::Report(&error).to_string();
+            let text = crate::error::said(&error);
             assert!(
                 text.contains(&format!("{pid}/stat lies beyond a mount in /proc")),
                 "the error must name the pid and the mount: {text}"

@@ -1011,7 +1011,7 @@ fn main() {
                     outln!("notfound");
                 }
                 Err(e) => {
-                    outln!("othererr={e}");
+                    outln!("othererr={}", cosca::error::Report::new(&e));
                 }
             }
         }
@@ -1047,7 +1047,7 @@ fn main() {
                         outln!("notfound");
                     }
                     Err(e) => {
-                        outln!("othererr={e}");
+                        outln!("othererr={}", cosca::error::Report::new(&e));
                     }
                 }
             });
@@ -1221,7 +1221,7 @@ fn main() {
                 Ok(o) if o.status.success() => outln!("OK"),
                 Ok(o) => outln!("EXIT {:?}", o.status),
                 Err(cosca::error::Error::Unsupported { detail, .. }) => outln!("UNSUPPORTED {detail}"),
-                Err(e) => outln!("ERROR {e}"),
+                Err(e) => outln!("ERROR {}", cosca::error::Report::new(&e)),
             }
         }
         #[cfg(unix)]

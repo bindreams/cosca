@@ -215,13 +215,15 @@ pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error 
     refused(front, pid, Signal::Kill, Some(reason))
 }
 
-/// A caller that holds the error uses [`cgroup_kill_failed`].
-pub(crate) fn cgroup_not_killed(front: Front, pid: u32, failure: Option<&str>) -> Error {
-    let why = match failure {
-        Some(failure) => format!("its cgroup kill failed: {failure}"),
-        None => "its cgroup was not killed".to_owned(),
-    };
-    refused(front, pid, Signal::Kill, Some(Reason::words(why)))
+/// The refusal alone, without the tree's failure; use [`cgroup_kill_failed`] where the failure is
+/// the cause.
+pub(crate) fn cgroup_not_killed(front: Front, pid: u32) -> Error {
+    refused(
+        front,
+        pid,
+        Signal::Kill,
+        Some(Reason::words("its cgroup was not killed")),
+    )
 }
 
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only

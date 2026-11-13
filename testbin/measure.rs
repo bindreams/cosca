@@ -62,7 +62,7 @@ pub(crate) fn cosca_error(e: &cosca::error::Error) -> String {
         Error::Unsupported { .. } => "err(Unsupported)".to_owned(),
         Error::Containment { .. } => "err(Containment)".to_owned(),
         Error::Quote(_) => "err(Quote)".to_owned(),
-        other => format!("err({other})"),
+        other => format!("err({})", cosca::error::Report::new(other)),
     }
 }
 

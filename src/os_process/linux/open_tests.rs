@@ -203,7 +203,7 @@ fn open_verified_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_
     let err = assert_unassessable_with_cause(result, &["outer pid namespace"], true, &marker, mark);
     assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
     assert!(!err.to_string().contains("pidfd_open"), "{err}");
-    let report = crate::error::Report(&err).to_string();
+    let report = crate::error::said(&err);
     assert!(report.contains("pidfd_open"), "{report}");
 }
 
@@ -279,7 +279,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
             },
         ) => {
             assert_eq!(crate::error::first_os_code(source), Some(libc::EINVAL));
-            let report = crate::error::Report(e).to_string();
+            let report = crate::error::said(e);
             assert!(report.contains("pidfd_open"), "{report}");
         }
         other => panic!("Liveness::Unknown on the EINVAL/ENOENT arm must be Unassessable, got {other:?}"),
@@ -310,7 +310,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
         UNASSESSABLE,
         mark,
     );
-    let report = crate::error::Report(&err).to_string();
+    let report = crate::error::said(&err);
     assert!(report.contains("pidfd_open"), "{report}");
 }
 
@@ -632,7 +632,8 @@ fn a_transient_pidfd_open_failure_stays_io_naming_the_syscall() {
     ] {
         match refused_with(errno) {
             Error::Io(e) => {
-                assert_eq!(e.to_string(), format!("pidfd_open: {text} (os error {code})"));
+                assert_eq!(e.to_string(), "pidfd_open");
+                assert_eq!(crate::error::said(&e), format!("pidfd_open: {text} (os error {code})"));
                 let source = std::error::Error::source(&e).expect("the OS error is kept as the source");
                 let source = source.downcast_ref::<std::io::Error>().expect("an io::Error source");
                 assert_eq!(source.raw_os_error(), Some(code));

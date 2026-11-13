@@ -560,9 +560,9 @@ mod on_windows {
         };
         let cleanup = cleanup.as_ref().expect("the cancelled teardown is in the cleanup");
         assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
-        let cause = crate::error::Report(&**source).to_string();
+        let cause = crate::error::said(&**source);
         assert!(!cause.contains("dropped as its handle's drop does"), "{cause}");
-        let said = crate::error::Report(&**cleanup.first()).to_string();
+        let said = crate::error::said(&**cleanup.first());
         assert!(said.contains("dropped as its handle's drop does"), "{said}");
         said
     }
@@ -815,7 +815,7 @@ mod on_windows {
             .expect("resume outside a runtime must not panic")
             .expect_err("the disarm was refused");
 
-        let said = err.to_string();
+        let said = crate::error::said(&err);
         let (cause, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
         assert!(matches!(cause, Error::Io(_)), "{cause:?}");
         assert_eq!(

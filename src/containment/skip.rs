@@ -235,24 +235,28 @@ mod call {
                     "the SIGTERM to the root",
                 ),
             };
-            let sent = match (&skip.holders, &root) {
+            // The warn says each failure in full; the returned `Unassessable` says only that it
+            // failed, for the failure is a peer or a cause of the answer.
+            let sent = |with_errors: bool| match (&skip.holders, &root) {
                 (Some(Ok(())), _) => "signalled only the marker holders".to_owned(),
-                (Some(Err(e)), _) => format!(
+                (Some(Err(e)), _) if with_errors => format!(
                     "signalled only the marker holders, which failed ({})",
                     crate::error::Report(e)
                 ),
+                (Some(Err(_)), _) => "signalled only the marker holders, which failed".to_owned(),
                 (None, None) => "sent nothing".to_owned(),
                 (None, Some(Ok(Sent::Delivered))) => sent_root.to_owned(),
                 (None, Some(Ok(Sent::Gone))) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
                 (None, Some(Ok(_))) => "sent nothing: the root's handle no longer reaches it".to_owned(),
-                (None, Some(Err(e))) => format!(
+                (None, Some(Err(e))) if with_errors => format!(
                     "sent nothing: {failed_root} through its pidfd failed ({})",
                     crate::error::Report(e)
                 ),
+                (None, Some(Err(_))) => format!("sent nothing: {failed_root} through its pidfd failed"),
             };
-            let detail = self.skipped_detail(&skip, &sent);
+            let detail = self.skipped_detail(&skip, &sent(false));
             let cause = skip.why.cause();
-            skip.why.warn(&detail);
+            skip.why.warn(&self.skipped_detail(&skip, &sent(true)));
             let swept = skip.holders.is_some();
             let mut killed_again = Vec::new();
             let holders = match self.signal {
@@ -346,23 +350,24 @@ mod call {
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or
         /// `Unassessable`, with the `SIGTERM`'s failure and the refusal's reason below its variant.
         pub(crate) fn holders_settled(&self, tree: &Tree, skip: Skip, kill: TreeKillOutcome) -> Settled<Error> {
-            let term = match &skip.holders {
-                Some(Err(e)) => format!(", which failed ({})", crate::error::Report(e)),
-                _ => String::new(),
-            };
             let Settled {
                 answer: settled,
                 killed_again,
             } = tree.settle_for_kill_tree(kill, false);
-            let kill_failed = match &settled {
-                Ok(()) => String::new(),
-                Err(e) => format!(", which failed ({})", crate::error::Report(e)),
+            // The warn says each failure in full; the returned `Unassessable` says only that it
+            // failed, for the failure is a peer of the answer.
+            let sent = |with_errors: bool| {
+                let said = |failure: Option<&Error>| match failure {
+                    None => String::new(),
+                    Some(e) if with_errors => format!(", which failed ({})", crate::error::Report(e)),
+                    Some(_) => ", which failed".to_owned(),
+                };
+                let term = said(skip.holders.as_ref().and_then(|h| h.as_ref().err()));
+                let kill_failed = said(settled.as_ref().err());
+                format!("sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}")
             };
-            let sent = format!(
-                "sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}"
-            );
-            let detail = self.skipped_detail(&skip, &sent);
-            skip.why.warn(&detail);
+            let detail = self.skipped_detail(&skip, &sent(false));
+            skip.why.warn(&self.skipped_detail(&skip, &sent(true)));
             // The `SIGTERM`'s failure and the refusal's reason are peers of the kill's failure, as they
             // are of any answer of a skip.
             let cause = skip.why.cause();

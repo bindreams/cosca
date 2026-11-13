@@ -77,7 +77,7 @@ fn what_a_kill_left_is_one_members_left_of_every_member_with_its_cause() {
     let [a, b, c] = CODES;
     let unkilled = || Unkilled {
         members: vec![left_by(2, a), left_by(3, b)],
-        root: Some(left_by(1, c)),
+        root: Some(Box::new(left_by(1, c))),
         resolved: Vec::new(),
     };
 
@@ -677,7 +677,7 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     };
     let unkilled = |members: &[u32], root: Option<u32>| Unkilled {
         members: members.iter().map(|pid| left(*pid)).collect(),
-        root: root.map(left),
+        root: root.map(|pid| Box::new(left(pid))),
         resolved: Vec::new(),
     };
     let skipped = |holders| skipped_kill("walk", holders);
@@ -1234,7 +1234,7 @@ fn a_root_left_over_a_handle_that_is_not_a_walk_asserts() {
         Some(&non_walk()),
         TreeKillOutcome::Ran(Err(Unkilled {
             members: Vec::new(),
-            root: Some(member_left(8)),
+            root: Some(Box::new(member_left(8))),
             resolved: Vec::new(),
         })),
         false,
@@ -1573,7 +1573,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
     let root_left = || {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: Vec::new(),
-            root: Some(member_left(1)),
+            root: Some(Box::new(member_left(1))),
             resolved: Vec::new(),
         }))
     };
@@ -1643,7 +1643,7 @@ fn a_drop_over_an_unvouched_tree_warns_of_what_settle_found() {
             Some(&walker()),
             TreeKillOutcome::Ran(Err(Unkilled {
                 members: Vec::new(),
-                root: Some(member_left(1)),
+                root: Some(Box::new(member_left(1))),
                 resolved: Vec::new(),
             })),
             true,
@@ -1685,7 +1685,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
     let root_left = || {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: Vec::new(),
-            root: Some(member_left(1)),
+            root: Some(Box::new(member_left(1))),
             resolved: Vec::new(),
         }))
     };
@@ -1852,7 +1852,7 @@ fn a_root_the_walk_left_and_the_backstop_failed_to_kill_is_one_member_with_both_
     let error = swept(
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![left_by(2, a)],
-            root: Some(left_by(1, c)),
+            root: Some(Box::new(left_by(1, c))),
             resolved: Vec::new(),
         })),
         Err(io_error(b)),
@@ -2054,7 +2054,7 @@ fn a_walk_that_left_members_stays_the_answer_when_the_backstop_killed_the_root()
     let error = swept(
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![left_by(2, CODES[0])],
-            root: Some(left_by(1, CODES[2])),
+            root: Some(Box::new(left_by(1, CODES[2]))),
             resolved: Vec::new(),
         })),
         Ok(()),

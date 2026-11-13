@@ -422,9 +422,9 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     type Look = Result<ChildWaitOutcome, Error>;
     // A kill: how it is said, what a line of it must not claim, and the clauses and the claims
     // to avoid when the look found the child still running.
-    type KillCase = (
+    type KillCase<'a> = (
         fn() -> Kill,
-        &'static str,
+        &'a str,
         &'static [&'static str],
         Vec<&'static str>,
         &'static [&'static str],
@@ -432,12 +432,14 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     // A look: the level of a line of it, and what the line says of the child.
     type LookCase<'a> = (fn() -> Look, log::Level, Vec<&'a str>);
     let status = std::process::ExitStatus::default().to_string();
+    let denied = format!("could not be terminated ({})", crate::error::io_said("denied"));
+    let boom = format!("the wait failed: {}", crate::error::io_said("boom"));
 
     // Every kill the drop can have, over every look it can see: all 5 x 6 pairs the types allow,
     // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
     // look right after it may still find the zombie not yet collectable. The wording is pinned for
     // each.
-    let kills: [KillCase; 5] = [
+    let kills: [KillCase<'_>; 5] = [
         (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
         (
             || Some(Ok(Sent::Delivered)),
@@ -462,7 +464,7 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
         ),
         (
             || Some(Err(Error::Io(std::io::Error::other("denied")))),
-            "could not be terminated (denied: denied)",
+            denied.as_str(),
             &["killed it"],
             vec![LEAVING_RUNNING],
             &["killed it"],
@@ -493,7 +495,7 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
         (
             || Err(Error::Io(std::io::Error::other("boom"))),
             Warn,
-            vec!["the wait failed: boom", LEFT],
+            vec![boom.as_str(), LEFT],
         ),
     ];
     let running = || -> Look { Ok(ChildWaitOutcome::DeadlinePassed) };

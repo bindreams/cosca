@@ -42,7 +42,7 @@ impl Process {
     /// - [`Error::NotThreadGroupLeader`]: on Linux, `id` names a live thread that is not its
     ///   process's leader.
     /// - [`Error::Io`]: the open failed otherwise (on Linux a failed pidfd call: `pidfd_open`, the
-    ///   pidfd's inode read, or its `poll`, prefixed with the call's name). macOS opens no kqueue:
+    ///   pidfd's inode read, or its `poll`, named for the call below the `Io`). macOS opens no kqueue:
     ///   the first look at the process does ([`wait`](Self::wait)).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
         Self::open_with(&crate::identity::HostKernel, id)

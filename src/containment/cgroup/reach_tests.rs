@@ -507,7 +507,9 @@ fn a_probe_child_that_stays_dumpable_fails_the_probe() {
     let _missing = fault::miss_pidfd_info();
     let _dumpable = fault::keep_probe_dumpable();
     match front_placement(&HostKernel, || Ok(HIGH)) {
-        Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("non-dumpable"), "{e}"),
+        Err(e @ crate::error::Error::Io(_)) => {
+            assert!(crate::error::said(&e).contains("non-dumpable"), "{e:?}");
+        }
         other => panic!("expected Io, got {other:?}"),
     }
 }
@@ -945,8 +947,8 @@ fn a_probe_child_that_dies_early_with_sigchld_ignored_says_so() {
         Some(&ProbeStep::Reap(ProbeEnd::Elsewhere))
     );
     assert!(
-        err.to_string().contains("SIGCHLD"),
-        "the error names the ignored SIGCHLD: {err}"
+        crate::error::said(&err).contains("SIGCHLD"),
+        "the error names the ignored SIGCHLD: {err:?}"
     );
     let records = crate::log_capture::records_since_on_current_thread(mark, "was reaped by another reaper");
     assert!(
@@ -1021,9 +1023,8 @@ fn a_probe_child_that_exits_before_the_read_is_confirmed_is_reported_gone() {
         "the kernel read the child's cgroup and killed the child"
     );
     assert!(
-        err.to_string()
-            .contains("had exited by the time its cgroup read was confirmed"),
-        "the probe reports its child gone: {err}"
+        crate::error::said(&err).contains("had exited by the time its cgroup read was confirmed"),
+        "the probe reports its child gone: {err:?}"
     );
     assert_eq!(
         fault::take_probe_steps().last(),
@@ -1293,7 +1294,7 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
     let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe fails");
     let pid = forked.get().expect("the probe's child was to be killed");
     assert!(
-        matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("ABANDONED")),
+        matches!(&err, crate::error::Error::Io(_)) && crate::error::said(&err).contains("ABANDONED"),
         "the error names the child's status: {err:?}"
     );
     assert_eq!(

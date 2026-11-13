@@ -510,7 +510,7 @@ fn graceful_tree_that_left_members_carries_the_refusal_and_the_watch_error_in_ot
     let others: Vec<&Error> = others.iter().map(|e| &**e).collect();
     assert!(
         matches!(others[..], [Error::Containment { .. }, watch]
-            if watch.to_string().contains("forced grace-watch failure")),
+            if crate::error::said(watch).contains("forced grace-watch failure")),
         "{others:?}"
     );
 }
@@ -1246,7 +1246,7 @@ fn a_wrapped_echild_is_still_a_root_reaped_elsewhere() {
 
         assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
         assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
-        let report = crate::error::Report(&answer).to_string();
+        let report = crate::error::said(&answer);
         assert!(report.contains(&words), "the wait's words are kept: {report}");
     }
 }

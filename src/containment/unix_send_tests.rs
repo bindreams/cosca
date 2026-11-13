@@ -321,7 +321,7 @@ fn a_member_probe_is_a_recorded_send() {
     match result {
         Err(error @ crate::error::Error::Containment { .. }) => {
             // Each member refused is named below the error, with its own cause.
-            let said = crate::error::Report(&error).to_string();
+            let said = crate::error::said(&error);
             assert!(
                 members.iter().all(|m| said.contains(&format!("pid {m}: refused"))),
                 "{said}"

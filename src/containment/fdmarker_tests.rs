@@ -1096,7 +1096,7 @@ fn a_refired_group_signal_that_fails_again_keeps_both_failures() {
         [pgid],
         "the later pass must re-fire the group signal, or the row proves nothing"
     );
-    let said = crate::error::Report(state.group_result.as_ref().expect_err("both passes failed")).to_string();
+    let said = crate::error::said(state.group_result.as_ref().expect_err("both passes failed"));
     assert!(
         said.contains("os error 1") && said.contains("forced by a test"),
         "the group result must keep both failures: {said}"

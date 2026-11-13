@@ -883,9 +883,10 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let cleanup = crate::test_child::cleanup_of(&error);
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
-        cleanup.first().to_string().contains("cosca-finish-elevated-reap-4c1e"),
+        crate::error::said(&**cleanup.first()).contains("cosca-finish-elevated-reap-4c1e"),
         "{cleanup:?}"
     );
+    let detail = crate::test_child::detail_of(&error);
     let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
     assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
     // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
@@ -895,9 +896,7 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
 
     // The password write's failure is the cause: its code is the error's.
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPIPE), "{err:?}");
-    let Error::Elevation { detail, .. } = &err else {
-        panic!("got {err:?}");
-    };
+    assert!(matches!(err, Error::Elevation { .. }), "got {err:?}");
     assert!(
         detail.contains(&format!("the elevated child pid {pid}: the wait failed")),
         "the note must say the wait failed, got {detail:?}"
@@ -991,7 +990,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
 /// (the outcomes `look_after_refused_kill` builds over a child 42): a root the look collected says
 /// what the look showed, "it has exited, and was reaped", whether or not its exit record was
 /// readable (an unreadable one is appended), and the others are worded as `Settlement` words them,
-/// after the refusal. The note is the error's: `Error::Elevation` detail.
+/// after the refusal. The note is the error's: `Error::MayHaveStarted` detail.
 ///
 /// Mutants: a collected root reads "reaped it" after the refusal, with no word of its having
 /// exited; it says it had already exited before the refusal, which nothing shows; an unreadable
@@ -1041,8 +1040,8 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
 }
 
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in
-/// the returned note and in the text the cleanup's one warn carries, logs nothing itself, and
-/// reports nothing when the teardown worked or was not tried.
+/// the text the cleanup's one warn carries and adds nothing to the note (the failure is the cleanup's),
+/// logs nothing itself, and reports nothing when the teardown worked or was not tried.
 #[cfg(unix)]
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
@@ -1069,22 +1068,10 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
             reported,
             "{name}: the carried warn text, got {warn:?}"
         );
-        assert_eq!(
-            note.contains("its contained tree could not be killed"),
-            reported,
-            "{name}: {note:?}"
-        );
-        assert_eq!(
-            note.contains(name),
-            reported,
-            "{name}: the note names the subject, got {note:?}"
-        );
-        // The failure is the error's cleanup: the warn carries its text, the note does not.
+        // The failure is the error's cleanup, which names the kill that failed: the note says
+        // nothing of it, and the warn carries its text.
+        assert_eq!(note, "", "{name}");
         let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
-        assert!(
-            !note.contains(&errno_text),
-            "{name}: the failure is in the note: {note:?}"
-        );
         assert_eq!(
             warn.as_deref().is_some_and(|text| text.contains(&errno_text)),
             reported,
@@ -1128,9 +1115,9 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     child.tree = crate::containment::Tree::delegated();
     let pid = child.pid();
 
-    let (err, fate) = super::finish_elevated(child, failed_write())
-        .expect_err("a failed write fails the spawn")
-        .expect_may_have_started_with();
+    let error = Error::from(super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn"));
+    let detail = crate::test_child::detail_of(&error);
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
     assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
@@ -1140,7 +1127,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
     assert!(reaped, "the root must be killed and reaped, got {err:?}");
-    assert!(err.to_string().contains("was terminated"), "got {err:?}");
+    assert!(detail.contains("was terminated"), "got {detail}");
 }
 
 /// A tree kill that fails does not stop the root's own kill and reap: the two are separate.
@@ -1168,19 +1155,17 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         Some(libc::EISDIR),
         "{cleanup:?}"
     );
+    let detail = crate::test_child::detail_of(&error);
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
     assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
-    let detail = err.to_string();
     assert!(detail.contains("was terminated"), "the root was killed, got {detail}");
     assert!(
-        detail.contains("its contained tree could not be killed"),
-        "the tree's failure is reported, got {detail}"
+        !detail.contains("its contained tree could not be killed"),
+        "the tree's failure is said once, in the cleanup, got {detail}"
     );
-    let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
-    assert!(!detail.contains(&errno_text), "the failure is in the detail: {detail}");
     // The password write's failure is the cause.
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPIPE), "{err:?}");
 }
@@ -1214,7 +1199,7 @@ fn a_failed_password_writes_cleanup_lists_its_failures_in_the_order_they_happene
         "the first tree kill: {cleanup:?}"
     );
     assert!(
-        members[1].to_string().contains("cosca-finish-elevated-order-9b3d"),
+        crate::error::said(&**members[1]).contains("cosca-finish-elevated-order-9b3d"),
         "the root's wait: {cleanup:?}"
     );
     assert_eq!(
@@ -1523,19 +1508,19 @@ fn finish_elevated_detail(child: crate::Child) -> String {
 /// [`finish_elevated_detail`], and the fate the failure reports.
 #[cfg(unix)]
 fn finish_elevated_detail_and_fate(child: crate::Child) -> (String, ChildFate) {
-    let (err, fate) = super::finish_elevated(
-        child,
-        Err(Error::Elevation {
-            kind: crate::error::ElevationErrorKind::AuthFailed,
-            detail: "forced password-write failure".into(),
-            source: None,
-        }),
-    )
-    .expect_err("the spawn fails")
-    .expect_may_have_started_with();
-    let Error::Elevation { detail, .. } = err else {
-        panic!("expected an Elevation error, got {err:?}");
-    };
+    let error = Error::from(
+        super::finish_elevated(
+            child,
+            Err(Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+                source: None,
+            }),
+        )
+        .expect_err("the spawn fails"),
+    );
+    let detail = crate::test_child::detail_of(&error);
+    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
     (detail, fate)
 }
 
@@ -1666,9 +1651,9 @@ fn a_handshake_that_cannot_open_did_not_start() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
-    assert!(
-        matches!(err, Error::Io(ref e) if e.to_string() == format!("eventfd: {}", std::io::Error::from_raw_os_error(libc::EMFILE))),
-        "{err:?}"
+    assert_eq!(
+        crate::error::said(&err),
+        crate::error::io_said(format!("eventfd: {}", std::io::Error::from_raw_os_error(libc::EMFILE)))
     );
 }
 

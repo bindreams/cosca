@@ -49,7 +49,7 @@ fn fixture_group_stat_overmount() {
     let (mut child, pid, _scratch) = overmounted_member();
 
     let err = members(&HostKernel, pid as i32).expect_err("a stat behind a mount must not be read or skipped");
-    let text = crate::error::Report(&err).to_string();
+    let text = crate::error::said(&err);
     assert!(text.contains("mount"), "{text}");
 
     _ = child.kill();

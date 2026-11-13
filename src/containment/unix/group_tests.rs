@@ -723,7 +723,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         assert!(!own.contains("/stat"), "{errno}: {own}");
         // The read's error is below the `Unreadable` layer, with its code.
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {err:?}");
-        let text = crate::error::Report(&err).to_string();
+        let text = crate::error::said(&err);
         if matches!(errno, libc::EXDEV | libc::ELOOP) {
             assert!(text.contains("beyond a mount"), "{errno}: {text}");
         }
@@ -753,7 +753,7 @@ fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         let err =
             members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
-        let text = crate::error::Report(&err).to_string();
+        let text = crate::error::said(&err);
         assert!(text.contains("self/stat"), "{recheck}: {text}");
         assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
         assert_eq!(

@@ -163,12 +163,13 @@ fn a_late_report_may_have_started_and_keeps_its_id() {
     let not_adopted = adopted_id(Report::Late(77), 31).expect_err("not adopted");
     assert_eq!(not_adopted.why, Unadoptable::Late(77));
     let error = not_adopted.error;
+    let said = crate::error::said(&error);
     assert!(
-        !error.to_string().contains("died before exec"),
-        "a late child is not a corpse: {error}"
+        !said.contains("died before exec"),
+        "a late child is not a corpse: {said}"
     );
-    assert!(error.to_string().contains("exec cannot be confirmed"), "{error}");
-    assert!(error.to_string().contains("at least two of"), "{error}");
+    assert!(said.contains("exec cannot be confirmed"), "{said}");
+    assert!(said.contains("at least two of"), "{said}");
     assert!(
         matches!(error, Error::Io(ref e) if e.raw_os_error().is_none()),
         "{error:?}"
@@ -226,7 +227,7 @@ fn a_failed_report_read_or_wait_beside_a_failed_spawn_is_warned_of_and_stds_erro
             warns,
             [format!(
                 "the spawn failed ({}), and so did {step} the child's unique-id report: report failure 4a2d",
-                crate::error::Report(&kept)
+                crate::error::said(&kept)
             )],
             "{report:?}"
         );
@@ -304,11 +305,10 @@ fn an_unwritten_report_then_a_killed_child_is_answered_died_before_exec() {
         !matches!(error, Error::MayHaveStarted { .. }),
         "the program did not start: {error:?}"
     );
+    let said = crate::error::said(&error);
     assert!(
-        error
-            .to_string()
-            .contains("died before exec; the program did not start"),
-        "the spawn is answered as a child that died before exec: {error}"
+        said.contains("died before exec; the program did not start"),
+        "the spawn is answered as a child that died before exec: {said}"
     );
 }
 

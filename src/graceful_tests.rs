@@ -3,7 +3,7 @@
 use std::cell::Cell;
 
 use super::{after_grace, after_tree_grace, GracefulMechanism};
-use crate::error::Error;
+use crate::error::{said, Error};
 
 /// The call a pure policy row names, as a caller's `graceful_shutdown_tree(pid)` does.
 const CALL: &str = "graceful_shutdown_tree(7)";
@@ -28,7 +28,7 @@ fn counted(
 }
 
 fn message(r: Result<(), Error>) -> String {
-    r.expect_err("an error").to_string()
+    said(&r.expect_err("an error"))
 }
 
 // The four strings are a stable, distinct vocabulary. Exact, not `contains`: a refactor that
@@ -180,7 +180,11 @@ fn after_grace_kills_then_reports_the_watch_error() {
 
 /// The texts of the failures below a slot variant's cause.
 fn failures_below(error: &Error) -> Vec<String> {
-    error.failures_below().into_iter().map(ToString::to_string).collect()
+    error
+        .failures_below()
+        .into_iter()
+        .map(|failure| said(failure))
+        .collect()
 }
 
 /// A failure that has a slot, with nothing below it.
@@ -222,7 +226,7 @@ fn after_grace_a_kill_error_with_a_slot_keeps_its_variant() {
     });
     assert!(
         matches!(&out, Err(Error::Containment { detail, source: Some(cause) })
-            if detail == "kill" && cause.to_string() == "watch"),
+            if detail == "kill" && said(cause) == crate::error::io_said("watch")),
         "{out:?}"
     );
 }
@@ -271,15 +275,15 @@ fn a_sweep_that_left_members_carries_the_refusal_and_the_watch_error_in_others()
     let Some(Error::Several(others)) = others.as_deref() else {
         panic!("expected a Several in others: {out:?}");
     };
-    let texts: Vec<_> = others.iter().map(|e| e.to_string()).collect();
+    let texts: Vec<_> = others.iter().map(|e| said(e)).collect();
     assert!(
-        texts[0].contains("refused") && texts[1] == "watch" && texts.len() == 2,
+        texts[0].contains("refused") && texts[1] == crate::error::io_said("watch") && texts.len() == 2,
         "{texts:?}"
     );
 
     let out = after_tree_grace(CALL, Err(io_error("watch")), || Err(left()));
     assert!(
-        matches!(&out, Err(Error::MembersLeft { others: Some(o), .. }) if o.to_string() == "watch"),
+        matches!(&out, Err(Error::MembersLeft { others: Some(o), .. }) if said(o) == crate::error::io_said("watch")),
         "{out:?}"
     );
 }
@@ -291,7 +295,7 @@ fn after_tree_grace_a_sweep_error_with_a_slot_keeps_its_variant() {
     });
     assert!(
         matches!(&out, Err(Error::Containment { detail, source: Some(cause) })
-            if detail == "sweep" && cause.to_string() == "watch"),
+            if detail == "sweep" && said(cause) == crate::error::io_said("watch")),
         "{out:?}"
     );
 }
@@ -316,7 +320,7 @@ fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() 
     );
     let below = failures_below(&out);
     assert!(
-        below.len() == 2 && below[0].contains("refused") && below[1] == "watch",
+        below.len() == 2 && below[0].contains("refused") && below[1] == crate::error::io_said("watch"),
         "{below:?}"
     );
     assert_eq!(
@@ -326,11 +330,11 @@ fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() 
             Some(containment("refused")),
             Some(io_error("watch"))
         )),
-        "watch"
+        crate::error::io_said("watch")
     );
     assert_eq!(
         message_of(super::after_reap(CALL, Err(io_error("reap")), None, None)),
-        "reap"
+        crate::error::io_said("reap")
     );
     assert_eq!(
         super::after_reap(CALL, Ok(status), None, None).expect("neither failed"),
@@ -343,7 +347,7 @@ fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() 
 }
 
 fn message_of(r: Result<std::process::ExitStatus, Error>) -> String {
-    r.expect_err("an error").to_string()
+    said(&r.expect_err("an error"))
 }
 
 #[skuld::test]

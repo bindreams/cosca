@@ -781,7 +781,7 @@ fn a_member_whose_place_cannot_be_checked_after_the_kill_is_an_unobserved_error(
         "a member that cannot be placed is not claimed reached"
     );
     assert_eq!(unobserved.len(), 1, "it is reported: {unobserved:?}");
-    let report = crate::error::Report(&unobserved[0]).to_string();
+    let report = crate::error::said(&unobserved[0]);
     assert!(
         report.contains(&unplaced_id.pid().to_string()) && report.contains("exit cannot be observed"),
         "the error names the member and what is left undone: {report}"
@@ -2356,11 +2356,12 @@ fn a_failed_pump_wakes_every_wait_with_its_error() {
 
     for (waiter, _blocking_rx) in waiters {
         let e = waiter.join().expect("waiter").expect_err("the pump failed");
-        assert!(e.to_string().contains("can no longer be watched"), "{e}");
+        let said = crate::error::said(&e);
+        assert!(said.contains("can no longer be watched"), "{said}");
         // The failed read of the watch is the error's source, with its code (the forced failure is
         // an `EIO`), and its words do not say it was forced.
         assert_eq!(crate::error::first_os_code(&e), Some(libc::EIO), "{e:?}");
-        assert!(!e.to_string().contains("forced"), "{e}");
+        assert!(!said.contains("forced"), "{said}");
     }
     assert!(
         !fault::take_force_pump_failure("cosca-failed-pump".as_ref()),
@@ -3222,7 +3223,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     // The error names the leaf; the member below it names its pid.
     let detail = err.to_string();
     assert!(detail.contains(&leaf_name), "{detail}");
-    let reported = crate::error::Report(&err).to_string();
+    let reported = crate::error::said(&err);
     assert!(reported.contains(&format!("pid {pid}")), "{reported}");
     match how {
         Unsignalled::SendFailed => assert!(matches!(err, crate::error::Error::Containment { .. }), "{err:?}"),
@@ -3490,7 +3491,7 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
     match result {
         // The one member that got no SIGTERM is the call's `source`, with its pid in its own words.
         Err(error @ crate::error::Error::Unassessable { .. }) => {
-            let said = crate::error::Report(&error).to_string();
+            let said = crate::error::said(&error);
             assert!(said.contains("pid 0: "), "{said}");
             assert!(said.contains("pid namespace"), "{said}");
             assert!(
@@ -3590,7 +3591,7 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     let crate::error::Error::Unassessable { .. } = &err else {
         panic!("expected Unassessable, got {err:?}");
     };
-    let reported = crate::error::Report(&err).to_string();
+    let reported = crate::error::said(&err);
     assert!(
         reported.contains(&format!("pid {pid}: its exit could not be read")),
         "{reported}"
@@ -3629,7 +3630,7 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
     let crate::error::Error::Unassessable { .. } = &err else {
         panic!("expected Unassessable, got {err:?}");
     };
-    let rendered = crate::error::Report(&err).to_string();
+    let rendered = crate::error::said(&err);
     assert!(rendered.contains("could not be placed"), "{rendered}");
     assert!(
         rendered.contains("its placement and its exit could not be read"),
@@ -3739,7 +3740,7 @@ fn a_member_whose_placement_fails_is_named_with_the_os_text_once() {
     };
     assert_eq!(detail.matches("(os error 5)").count(), 0, "{detail}");
     assert!(detail.contains(&format!("pid {}", child.id())), "{detail}");
-    let message = cause.to_string();
+    let message = crate::error::said(&**cause);
     assert_eq!(message.matches("(os error 5)").count(), 1, "{message}");
 }
 
@@ -3903,7 +3904,7 @@ fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group
     );
     assert_eq!(noted, [(Some(pids[1]), crate::send_log::Via::Pidfd, libc::SIGTERM)]);
     let said = match result {
-        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::Report(&error).to_string(),
+        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::said(&error),
         other => panic!("expected Unassessable, got {other:?}"),
     };
     assert!(said.contains(&format!("pid {}:", pids[0])), "{said}");
@@ -3983,7 +3984,7 @@ fn cgroup_terminate_reports_a_listed_line_that_is_no_pid(#[fixture(cgroup)] _gro
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     drop(leaf);
     let said = match result {
-        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::Report(&error).to_string(),
+        Err(error @ crate::error::Error::Unassessable { .. }) => crate::error::said(&error),
         other => panic!("expected Unassessable, got {other:?}"),
     };
     assert!(said.contains("\"abc\""), "{said}");

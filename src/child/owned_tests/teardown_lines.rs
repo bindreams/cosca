@@ -33,13 +33,13 @@ const REFUSED: &str = "cosca-refused-5b0e";
 /// What the failed wait's error says in the clause, a log line: the error the teardown holds,
 /// through `Report`.
 pub(crate) fn wait_error() -> String {
-    "other error: other error".to_string()
+    crate::error::io_said("other error")
 }
 
 /// What the refused kill says of itself in the clause, a log line: the error the teardown holds,
 /// through `Report`.
 pub(crate) fn refusal() -> String {
-    format!("{REFUSED}: {REFUSED}")
+    crate::error::io_said(REFUSED)
 }
 
 /// What the teardown's kill answered.

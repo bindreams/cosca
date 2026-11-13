@@ -760,9 +760,12 @@ fn hard_kill_of_a_root_it_may_read_but_not_terminate_is_an_error_naming_it() {
     {
         Err(super::Unkilled {
             members,
-            root: Some(crate::error::Error::MemberNotKilled { pid, source, .. }),
+            root: Some(root),
             ..
         }) if members.is_empty() => {
+            let crate::error::Error::MemberNotKilled { pid, source, .. } = *root else {
+                panic!("expected MemberNotKilled for the root, got {root:?}");
+            };
             assert_eq!(pid, child.pid());
             // The open drops the terminate right the process refuses, and the kill is the OS's
             // refusal, with its error.
@@ -798,15 +801,14 @@ fn hard_kill_of_a_root_that_refuses_the_signal_is_an_error_carrying_the_errno(
         .expect_err("the kill is refused");
     assert!(left.members.is_empty(), "the root is the only member the walk left");
     let err = left.root.expect("the root was left");
-    // The message names the pid; the OS's own words are the source. `Report` prints them twice until the
-    // Display-table slice, because `Error::Io` prints its `io::Error` as its own text and as its source.
+    // The message names the pid; the OS's own words are the source, each layer said once.
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     assert_eq!(err.to_string(), format!("pid {} was not killed", child.pid()));
     assert_eq!(
-        crate::error::Report(&err).to_string(),
-        format!("pid {} was not killed: {os}: {os}", child.pid())
+        crate::error::said(&err),
+        format!("pid {} was not killed: {}", child.pid(), crate::error::io_said(&os))
     );
-    match err {
+    match *err {
         crate::error::Error::MemberNotKilled { pid, source, .. } => {
             assert_eq!(pid, child.pid());
             assert!(
@@ -1161,7 +1163,6 @@ fn a_member_never_read_is_held_with_its_own_cause() {
 fn a_member_never_read_is_reported_the_same_over_every_round() {
     use super::{not_killed, with_earlier, Left};
     use crate::containment::dispatch::Unkilled;
-    use crate::error::Report;
     let code = if cfg!(windows) { 5 } else { 13 };
     let bare = || std::io::Error::from_raw_os_error(code);
     let layered = || Error::Containment {
@@ -1189,13 +1190,13 @@ fn a_member_never_read_is_reported_the_same_over_every_round() {
             root: None,
             resolved: Vec::new(),
         };
-        let first = Report(&round.members[0]).to_string();
+        let first = crate::error::said(&round.members[0]);
         for n in 2..=3 {
             let held = Left::of(&round);
             round = with_earlier(&crate::identity::HostKernel, held, Ok(()))
                 .0
                 .expect_err("never read, so never shown killed");
-            assert_eq!(Report(&round.members[0]).to_string(), first, "{what}, round {n}");
+            assert_eq!(crate::error::said(&round.members[0]), first, "{what}, round {n}");
             let Error::MemberNotKilled { source: again, .. } = &round.members[0] else {
                 panic!("{round:?}");
             };

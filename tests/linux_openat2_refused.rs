@@ -272,11 +272,15 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
             };
             assert_eq!(*platform, "linux", "{call} under {name}");
             assert_eq!(op, &format!("listing process group {pgid}"), "{call} under {name}");
+            assert_eq!(detail, "the group could not be listed", "{call} under {name}");
             assert_eq!(
-                detail,
-                &format!(
-                    "containment::unix::group::members: {}, so pgid {pgid} cannot be listed",
-                    refused_detail(name)
+                cosca::error::Report::new(&err).to_string(),
+                format!(
+                    "listing process group {pgid} is not supported on linux: the group could not be listed: \
+                     an I/O operation failed: containment::unix::group::members: {}, so pgid {pgid} cannot be \
+                     listed: {}",
+                    refused_detail(name),
+                    std::io::Error::from_raw_os_error(errno)
                 ),
                 "{call} under {name}"
             );

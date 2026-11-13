@@ -536,6 +536,7 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
     let crate::error::Error::MayHaveStarted {
         fate: got,
         wrapper_elevated,
+        detail,
         source,
         unreaped,
         cleanup,
@@ -545,6 +546,10 @@ fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error:
     };
     assert!(unreaped.is_none(), "a reaped child is not handed back: {error:?}");
     assert!(cleanup.is_none(), "nothing in the teardown failed: {error:?}");
+    assert!(
+        detail.is_none(),
+        "nothing was done with a child that is not a front: {error:?}"
+    );
     assert_eq!(*got, fate, "{error}");
     assert_eq!(*wrapper_elevated, wrapper, "{error}");
     assert!(

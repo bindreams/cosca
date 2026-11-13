@@ -700,9 +700,10 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
         ),
     };
 
-    let raw = crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide("program path", &token)
-        .expect_err("the raw backend refuses the same token")
-        .to_string();
+    let raw = match crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide("program path", &token) {
+        Err(Error::Io(e)) => e.to_string(),
+        other => panic!("the raw backend refuses the same token as an Io error, got {other:?}"),
+    };
 
     assert_eq!(elevated, raw, "one defect, described two ways");
 }
@@ -1053,14 +1054,17 @@ fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
     assert!(matches!(
         super::shell_execute_failure(HRESULT::from_win32(ERROR_DDE_FAIL.0), 0),
         SpawnFailure::MayHaveStarted {
-            cause: Error::Elevation {
-                kind: ElevationErrorKind::AuthFailed,
-                ..
-            },
+            ref cause,
             fate: ChildFate::Unknown,
             wrapper_elevated: false,
             ..
-        }
+        } if matches!(
+            **cause,
+            Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                ..
+            }
+        )
     ));
 }
 
@@ -1075,7 +1079,7 @@ fn a_failed_shell_execute_has_the_windows_error_as_its_cause() {
     for (code, inst_app) in [(ERROR_FILE_NOT_FOUND.0, 2), (ERROR_DDE_FAIL.0, 0)] {
         let error = match super::shell_execute_failure(HRESULT::from_win32(code), inst_app) {
             SpawnFailure::NotStarted(error) => error,
-            SpawnFailure::MayHaveStarted { cause, .. } => cause,
+            SpawnFailure::MayHaveStarted { cause, .. } => *cause,
         };
         assert_eq!(crate::error::first_os_code(&error), Some(code as i32), "{error:?}");
         match error {
@@ -1091,15 +1095,14 @@ fn a_failed_shell_execute_has_the_windows_error_as_its_cause() {
 
 #[skuld::test]
 fn an_hresult_cause_keeps_its_hex_unless_it_is_a_win32_code() {
-    use crate::error::Report;
     use windows::core::HRESULT;
 
     let win32 = super::hresult_cause(HRESULT(0x8007_0005_u32 as i32));
     assert_eq!(crate::error::first_os_code(&*win32), Some(5));
-    assert!(!Report(&*win32).to_string().contains("HRESULT"), "{win32}");
+    assert!(!crate::error::said(&*win32).contains("HRESULT"), "{win32}");
 
     let other = super::hresult_cause(HRESULT(0x8000_4005_u32 as i32));
-    let text = Report(&*other).to_string();
+    let text = crate::error::said(&*other);
     assert!(text.contains("HRESULT 0x80004005"), "{text}");
 }
 
@@ -1154,7 +1157,7 @@ fn an_untracked_child_fate_follows_how_its_termination_ended() {
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert_eq!(crate::error::first_os_code(&**cleanup.first()), Some(5), "{cleanup:?}");
     assert!(
-        cleanup.first().to_string().contains("terminating the elevated child"),
+        crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("terminating the elevated child: ")),
         "the refusal names its step: {cleanup:?}"
     );
 

@@ -494,15 +494,17 @@ mod macos {
             .proc
             .script_over(|f| f.peeks([Ok(PeekOutcome::Foreign(Foreign::Orphaned))]));
 
-        let (err, fate) =
+        let err = crate::error::Error::from(
             crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
-                .expect_err("the spawn fails")
-                .expect_may_have_started_with();
+                .expect_err("the spawn fails"),
+        );
+        let detail = crate::test_child::detail_of(&err);
+        let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
         drop(writer);
 
         fake.assert_peeks_exhausted();
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
-        assert!(err.to_string().contains("left alone"), "{err}");
+        assert!(detail.contains("left alone"), "{detail}");
         assert_eq!(
             fate,
             crate::error::ChildFate::Gone,

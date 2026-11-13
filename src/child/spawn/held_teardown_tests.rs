@@ -15,16 +15,11 @@ use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{fault, PlacedAtRemoval, Subtree, Swept};
 use crate::elevation::front::Front;
-use crate::error::{ChildFate, Error};
+use crate::error::ChildFate;
 use crate::log_capture::warns_since;
 use crate::os_process::child::{ExitRecord, Foreign, KillRefusal};
 use crate::os_process::fake::{failed_signal, ReapAnswer};
 use crate::test_child::tear_down_held_holding;
-
-/// The `Error` a failed spawn arm tears down after.
-fn failed() -> Error {
-    Error::Io(io::Error::other("the spawn failed"))
-}
 
 /// A subtree of a leaf with id 7, killed through, which places a task by its pidfd's cgroup id.
 fn killed_subtree() -> Subtree {
@@ -49,8 +44,7 @@ fn a_refused_kill_whose_look_failed_is_handed_back() {
             .reaps([ReapAnswer::Err(io::ErrorKind::Other)])
     });
 
-    let (_, fate, handed_back) =
-        tear_down_held_holding(owned, None, None, None, &mut Diagnosis::default(), stdin, failed());
+    let (_, fate, handed_back) = tear_down_held_holding(owned, None, None, None, &mut Diagnosis::default(), stdin);
 
     assert_eq!(fate, ChildFate::Unknown);
     handed_back.unreaped();
@@ -64,22 +58,15 @@ fn a_refused_kill_whose_look_failed_is_handed_back() {
 fn a_front_whose_look_failed_is_handed_back_and_the_error_says_so() {
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Err(io::ErrorKind::Other)]));
 
-    let (error, fate, handed_back) = tear_down_held_holding(
-        owned,
-        Some(Front::Sudo),
-        None,
-        None,
-        &mut Diagnosis::default(),
-        stdin,
-        failed(),
-    );
+    let (detail, fate, handed_back) =
+        tear_down_held_holding(owned, Some(Front::Sudo), None, None, &mut Diagnosis::default(), stdin);
 
     assert_eq!(fate, ChildFate::Unknown);
     handed_back.unreaped();
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("could not be waited on") && error.contains("handed back to the caller"),
-        "{error}"
+        detail.contains("could not be waited on") && detail.contains("handed back to the caller"),
+        "{detail}"
     );
     handed_back.wait();
 }
@@ -92,7 +79,7 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running]));
     let subtree = killed_subtree();
 
-    let (error, fate, handed_back) = {
+    let (detail, fate, handed_back) = {
         let _unreadable = fault::fail_pidfd_info();
         tear_down_held_holding(
             owned,
@@ -101,16 +88,15 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
             Some(&subtree),
             &mut Diagnosis::default(),
             stdin,
-            failed(),
         )
     };
 
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     handed_back.unreaped();
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("where it is cannot be read") && error.contains("handed back to the caller"),
-        "{error}"
+        detail.contains("where it is cannot be read") && detail.contains("handed back to the caller"),
+        "{detail}"
     );
     handed_back.wait();
 }
@@ -124,7 +110,7 @@ fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_sa
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]));
     let subtree = killed_subtree();
 
-    let (error, fate, handed_back) = {
+    let (detail, fate, handed_back) = {
         let _placed = fault::force_pidfd_cgroup_id(7);
         tear_down_held_holding(
             owned,
@@ -133,16 +119,15 @@ fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_sa
             Some(&subtree),
             &mut Diagnosis::default(),
             stdin,
-            failed(),
         )
     };
 
     assert_eq!(fate, ChildFate::Killed);
     handed_back.unreaped();
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("could not be waited on") && error.contains("handed back to the caller"),
-        "{error}"
+        detail.contains("could not be waited on") && detail.contains("handed back to the caller"),
+        "{detail}"
     );
     handed_back.wait();
 }
@@ -158,16 +143,11 @@ fn a_child_that_is_not_a_front_is_killed_and_reaped_and_nothing_is_handed_back()
     let pid = owned.pid().expect("the held child has a pid");
     let mark = crate::log_capture::mark();
 
-    let (error, fate, handed_back) =
-        tear_down_held_holding(owned, None, None, None, &mut Diagnosis::default(), stdin, failed());
+    let (detail, fate, handed_back) = tear_down_held_holding(owned, None, None, None, &mut Diagnosis::default(), stdin);
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(handed_back.is_none(), "a reaped child is not handed back");
-    assert_eq!(
-        error.to_string(),
-        failed().to_string(),
-        "a child that is not a front adds no note"
-    );
+    assert_eq!(detail, None, "a child that is not a front has nothing to say of it");
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
     assert_eq!(
         crate::child::front_kill_tests::reap(pid),
@@ -184,22 +164,15 @@ fn a_child_that_is_not_a_front_is_killed_and_reaped_and_nothing_is_handed_back()
 fn a_front_reaped_elsewhere_is_noted_without_a_hand_back() {
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Foreign(Foreign::Gone)]));
 
-    let (error, fate, handed_back) = tear_down_held_holding(
-        owned,
-        Some(Front::Sudo),
-        None,
-        None,
-        &mut Diagnosis::default(),
-        stdin,
-        failed(),
-    );
+    let (detail, fate, handed_back) =
+        tear_down_held_holding(owned, Some(Front::Sudo), None, None, &mut Diagnosis::default(), stdin);
 
     assert_eq!(fate, ChildFate::Gone);
     assert!(handed_back.is_none());
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("could not be waited on") && !error.contains("handed back"),
-        "{error}"
+        detail.contains("could not be waited on") && !detail.contains("handed back"),
+        "{detail}"
     );
 }
 
@@ -211,22 +184,15 @@ fn a_front_reaped_elsewhere_is_noted_without_a_hand_back() {
 fn a_running_front_with_no_subtree_is_handed_back_and_the_error_says_so() {
     let (owned, stdin) = held_blocker(|f| f.reaps([ReapAnswer::Running]));
 
-    let (error, fate, handed_back) = tear_down_held_holding(
-        owned,
-        Some(Front::Sudo),
-        None,
-        None,
-        &mut Diagnosis::default(),
-        stdin,
-        failed(),
-    );
+    let (detail, fate, handed_back) =
+        tear_down_held_holding(owned, Some(Front::Sudo), None, None, &mut Diagnosis::default(), stdin);
 
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     handed_back.unreaped();
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("the elevated program may be running; handed back to the caller in the error"),
-        "{error}"
+        detail.contains("the elevated program may be running; handed back to the caller in the error"),
+        "{detail}"
     );
     handed_back.wait();
 }
@@ -247,7 +213,7 @@ fn the_diagnosis_leads_the_one_warn_of_the_teardown() {
         why.add("diagnosis 7c2e");
         let mark = crate::log_capture::mark();
 
-        let (_, _, handed_back) = tear_down_held_holding(owned, front, None, None, &mut why, stdin, failed());
+        let (_, _, handed_back) = tear_down_held_holding(owned, front, None, None, &mut why, stdin);
         drop(why);
 
         let warns = warns_since(mark, "");
@@ -272,20 +238,13 @@ fn a_front_that_has_exited_is_reaped_without_waiting() {
     blocker.close_stdin();
     assert!(owned.exited_by(None).expect("watch the front"), "the front exited");
 
-    let (error, fate, handed_back) = tear_down_held_holding(
-        owned,
-        Some(Front::Sudo),
-        None,
-        None,
-        &mut Diagnosis::default(),
-        (),
-        failed(),
-    );
+    let (detail, fate, handed_back) =
+        tear_down_held_holding(owned, Some(Front::Sudo), None, None, &mut Diagnosis::default(), ());
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(handed_back.is_none());
-    let error = error.to_string();
-    assert!(error.contains("and it was reaped"), "{error}");
+    let detail = detail.expect("the teardown says what it did with the front");
+    assert!(detail.contains("and it was reaped"), "{detail}");
     assert_eq!(blocker.finish(), None, "the teardown reaped the front");
 }
 
@@ -295,7 +254,7 @@ fn tear_down_leaving(
     owned: OwnedChild,
     front: Option<Front>,
     why: &mut Diagnosis,
-) -> (Error, ChildFate, Option<crate::Unreaped>) {
+) -> (Option<String>, ChildFate, Option<crate::Unreaped>) {
     let how = HeldTeardown {
         front,
         id: None,
@@ -303,8 +262,8 @@ fn tear_down_leaving(
         disposition: Disposition::Leave,
         policy: SpawnPolicy::SYNC,
     };
-    let (error, torn) = tear_down_held(owned, how, why, failed());
-    (error, torn.fate, torn.unreaped)
+    let (detail, torn) = tear_down_held(owned, how, why);
+    (detail, torn.fate, torn.unreaped)
 }
 
 /// A child whose kill is refused, under a caller that leaves it, is left running and warned of, and
@@ -346,14 +305,14 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
     let blocker = ReapsBlocker::new(&owned, stdin);
     let mark = crate::log_capture::mark();
 
-    let (error, fate, unreaped) = tear_down_leaving(owned, Some(Front::Sudo), &mut Diagnosis::default());
+    let (detail, fate, unreaped) = tear_down_leaving(owned, Some(Front::Sudo), &mut Diagnosis::default());
 
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(unreaped.is_none());
-    let error = error.to_string();
+    let detail = detail.expect("the teardown says what it did with the front");
     assert!(
-        error.contains("the elevated program may be running; left unreaped") && !error.contains("handed back"),
-        "{error}"
+        detail.contains("the elevated program may be running; left unreaped") && !detail.contains("handed back"),
+        "{detail}"
     );
     let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
@@ -381,11 +340,11 @@ fn a_front_with_no_pid_is_named_as_such() {
     )));
     let mark = crate::log_capture::mark();
 
-    let (error, _, unreaped) = tear_down_leaving(pidless, Some(Front::Sudo), &mut Diagnosis::default());
+    let (detail, _, unreaped) = tear_down_leaving(pidless, Some(Front::Sudo), &mut Diagnosis::default());
 
     assert!(unreaped.is_none());
-    let error = error.to_string();
-    assert!(error.contains("the spawned child is what sudo left"), "{error}");
+    let detail = detail.expect("the teardown says what it did with the front");
+    assert!(detail.contains("the spawned child is what sudo left"), "{detail}");
     let warns = warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
@@ -570,7 +529,7 @@ fn tear_down_front_under(
     owned: OwnedChild,
     subtree: Option<&Subtree>,
     policy: SpawnPolicy,
-) -> (Error, ChildFate, Option<crate::Unreaped>) {
+) -> (Option<String>, ChildFate, Option<crate::Unreaped>) {
     let how = HeldTeardown {
         front: Some(Front::Sudo),
         id: None,
@@ -578,8 +537,8 @@ fn tear_down_front_under(
         disposition: Disposition::HandBack,
         policy,
     };
-    let (error, torn) = tear_down_held(owned, how, &mut Diagnosis::default(), failed());
-    (error, torn.fate, torn.unreaped)
+    let (detail, torn) = tear_down_held(owned, how, &mut Diagnosis::default());
+    (detail, torn.fate, torn.unreaped)
 }
 
 /// The wait for a front its leaf's kill reached warns past the threshold the spawn's policy gave

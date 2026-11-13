@@ -671,7 +671,7 @@ async fn async_a_pkexec_childs_refused_escalation_is_unkillable_with_the_watch_f
     assert!(
         matches!(&below[..], [Error::Io(e), watch]
             if e.kind() == std::io::ErrorKind::PermissionDenied
-                && watch.to_string().contains("forced grace-watch failure")),
+                && crate::error::said(*watch).contains("forced grace-watch failure")),
         "{below:?}"
     );
     assert_eq!(
@@ -704,7 +704,10 @@ async fn async_graceful_shutdown_of_a_front_whose_grace_wait_failed_is_unkillabl
             kind: ElevationErrorKind::Unkillable,
             source: Some(cause),
             ..
-        } => assert!(cause.to_string().contains("forced grace-watch failure"), "{err:?}"),
+        } => assert!(
+            crate::error::said(&**cause).contains("forced grace-watch failure"),
+            "{err:?}"
+        ),
         other => panic!("expected Unkillable with the watch failure as its cause, got {other:?}"),
     }
     assert_ends_unsignalled(&mut child, stdin).await;
@@ -792,7 +795,7 @@ async fn async_graceful_tree_that_left_members_carries_the_refusal_and_the_watch
     let others: Vec<&Error> = others.iter().map(|e| &**e).collect();
     assert!(
         matches!(others[..], [Error::Containment { .. }, watch]
-            if watch.to_string().contains("forced grace-watch failure")),
+            if crate::error::said(watch).contains("forced grace-watch failure")),
         "{others:?}"
     );
 }

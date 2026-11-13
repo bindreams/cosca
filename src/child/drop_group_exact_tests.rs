@@ -42,13 +42,16 @@ fn tear_down(child: crate::Child, teardown: Teardown) -> Option<String> {
             None
         }
         Teardown::FinishElevated => {
-            let (err, _fate) = crate::child::spawn::finish_elevated(
-                child,
-                Err(crate::error::Error::Io(std::io::Error::other("no password"))),
-            )
-            .expect_err("the password write failed")
-            .expect_may_have_started_with();
-            Some(err.to_string())
+            let error = crate::error::Error::from(
+                crate::child::spawn::finish_elevated(
+                    child,
+                    Err(crate::error::Error::Io(std::io::Error::other("no password"))),
+                )
+                .expect_err("the password write failed"),
+            );
+            let detail = crate::test_child::detail_of(&error);
+            let (_, _fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
+            Some(detail)
         }
     }
 }

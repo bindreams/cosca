@@ -1,4 +1,4 @@
-use crate::error::{chain, first_os_code, ChildFate, Error, Failures, QuoteError, QuoteErrorKind, Report};
+use crate::error::{chain, first_os_code, io_said, said, ChildFate, Error, Failures, QuoteError, QuoteErrorKind};
 use crate::test_child::over_fake::exited_unreaped;
 use std::sync::Arc;
 
@@ -59,7 +59,8 @@ fn quote_error_kinds_have_distinct_messages() {
 fn error_wraps_quote_error_via_from() {
     let e: Error = QuoteError::new(0, QuoteErrorKind::TrailingBackslash).into();
     assert!(matches!(e, Error::Quote(_)));
-    assert!(e.to_string().contains("trailing backslash"));
+    assert_eq!(e.to_string(), "argument parsing failed");
+    assert_eq!(said(&e), "argument parsing failed: trailing backslash at offset 0");
 }
 
 #[skuld::test]
@@ -183,7 +184,7 @@ fn io_context_keeps_the_os_error_as_its_source() {
     let code = if cfg!(windows) { 5 } else { 13 };
     let e = crate::error::io_context("could not check C:\\t.exe", std::io::Error::from_raw_os_error(code));
     assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(e.to_string().starts_with("could not check C:\\t.exe: "), "{e}");
+    assert_eq!(e.to_string(), "could not check C:\\t.exe");
     let source = std::error::Error::source(e.get_ref().expect("a custom error"))
         .and_then(|s| s.downcast_ref::<std::io::Error>())
         .expect("the OS error is the source");
@@ -198,7 +199,7 @@ fn a_shared_io_context_cause_reports_as_the_original_and_keeps_its_code() {
 
     let handed = crate::error::shared_io(&shared);
 
-    assert_eq!(Report(&handed).to_string(), Report(&*shared).to_string());
+    assert_eq!(said(&handed), said(&*shared));
     assert_eq!(first_os_code(&handed), Some(code));
     assert_eq!(handed.kind(), shared.kind());
 }
@@ -238,7 +239,7 @@ fn a_shared_wrapped_io_error_reports_as_the_original() {
 
         let handed = crate::error::shared_io(&shared);
 
-        assert_eq!(Report(&handed).to_string(), Report(&*shared).to_string(), "{what}");
+        assert_eq!(said(&handed), said(&*shared), "{what}");
         assert_eq!(first_os_code(&handed), expected, "{what}");
         assert_eq!(handed.kind(), shared.kind(), "{what}");
     }
@@ -424,7 +425,7 @@ fn with_note_keeps_each_variant_and_appends() {
         panic!("an Io error stays Io");
     };
     assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(io.to_string().ends_with("; left running"), "{io}");
+    assert_eq!(io.to_string(), "left running", "the note is a layer above the cause");
 
     let e = Error::Unsupported {
         op: "op".into(),
@@ -497,6 +498,7 @@ fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
         Error::MayHaveStarted {
             fate,
             wrapper_elevated,
+            detail: None,
             source: Arc::new(Error::Io(std::io::Error::other("cause"))),
             unreaped: None,
             cleanup: None,
@@ -522,6 +524,7 @@ fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
     let error = |unreaped| Error::MayHaveStarted {
         fate,
         wrapper_elevated: false,
+        detail: None,
         source: Arc::new(Error::Io(std::io::Error::other("cause"))),
         unreaped,
         cleanup: None,
@@ -531,15 +534,17 @@ fn an_error_with_an_unreaped_child_still_reports_its_fate_and_message() {
     assert_eq!(with_child.to_string(), error(None).to_string());
 }
 
-/// A note added to the error keeps the child it carries.
+/// A note added to the error keeps the child it carries, and goes in the variant's own `detail`,
+/// after the one it has; the cause is left as it is.
 ///
-/// Mutant: `with_note` rebuilds the variant without `unreaped`.
+/// Mutants: `with_note` rebuilds the variant without `unreaped`; the note goes to the cause.
 #[skuld::test]
-fn with_note_keeps_the_unreaped_child() {
+fn with_note_keeps_the_unreaped_child_and_extends_the_detail() {
     let id = crate::identity::ProcessId::current();
     let error = Error::MayHaveStarted {
         fate: ChildFate::Running { id: Some(id) },
         wrapper_elevated: false,
+        detail: Some("it was left".into()),
         source: Arc::new(Error::Containment {
             detail: "x".into(),
             source: None,
@@ -549,6 +554,7 @@ fn with_note_keeps_the_unreaped_child() {
     }
     .with_note("front left");
     let Error::MayHaveStarted {
+        detail,
         source,
         unreaped,
         cleanup,
@@ -559,8 +565,9 @@ fn with_note_keeps_the_unreaped_child() {
     };
     assert_eq!(unreaped.as_ref().map(|child| child.pid()), Some(Some(id.pid())));
     assert_eq!(cleanup.as_ref().map(codes_of), Some(vec![Some(CODES[0])]));
+    assert_eq!(detail.as_deref(), Some("it was left; front left"));
     assert!(
-        matches!(**source, Error::Containment { ref detail, .. } if detail == "x; front left"),
+        matches!(**source, Error::Containment { ref detail, .. } if detail == "x"),
         "{source:?}"
     );
 }
@@ -614,11 +621,122 @@ fn io_error_source_is_the_wrapped_io_error() {
     assert_eq!(io.raw_os_error(), Some(13));
 }
 
+/// An `Error::Io` says only that an I/O operation failed: its cause is its `source()`, so a chain
+/// prints the `io::Error`'s words once, not twice.
+///
+/// Mutants: the variant forwards its `io::Error`'s text (`transparent`), or forwards its `source()`.
 #[skuld::test]
-fn io_error_displays_the_wrapped_message_unchanged() {
-    let inner = std::io::Error::other("disk on fire");
-    let expected = inner.to_string();
-    assert_eq!(Error::Io(inner).to_string(), expected);
+fn an_error_io_says_its_own_words_and_the_io_error_is_its_source() {
+    let e = Error::Io(std::io::Error::other("disk on fire"));
+    assert_eq!(e.to_string(), "an I/O operation failed");
+    assert_eq!(said(&e), "an I/O operation failed: disk on fire");
+    let source = std::error::Error::source(&e).expect("the io::Error");
+    assert_eq!(source.to_string(), "disk on fire");
+    assert!(source.is::<std::io::Error>(), "the source is the io::Error itself");
+}
+
+/// The context's own text is the context alone; the cause is below it.
+///
+/// Mutant: the context's `Display` repeats its cause's text.
+#[skuld::test]
+fn an_io_context_says_only_its_context() {
+    let e = crate::error::io_context("could not check x", std::io::Error::from_raw_os_error(CODES[0]));
+    assert_eq!(e.to_string(), "could not check x");
+    assert_eq!(said(&e), format!("could not check x: {}", os_text(CODES[0])));
+}
+
+/// A note on an `Error::Io` is a context: one mechanism, the note a layer above the cause.
+///
+/// Mutant: the note is a second wrapper that prints its cause before the note.
+#[skuld::test]
+fn a_note_on_an_error_io_is_a_context_above_the_cause() {
+    let e = Error::Io(std::io::Error::from_raw_os_error(CODES[0])).with_note("while tearing down");
+    assert_eq!(said(&e), io_said(format!("while tearing down: {}", os_text(CODES[0]))));
+    assert_eq!(first_os_code(&e), Some(CODES[0]));
+}
+
+/// The rows of the Display table: a layer says only its own words.
+#[skuld::test]
+fn a_wrapper_says_its_own_words_and_not_its_causes() {
+    let quote = Error::Quote(QuoteError::new(3, QuoteErrorKind::UnterminatedDoubleQuote));
+    assert_eq!(quote.to_string(), "argument parsing failed");
+    let source = std::error::Error::source(&quote).expect("the quote error");
+    assert_eq!(source.to_string(), "unterminated double quote at offset 3");
+
+    let member = Error::MemberNotKilled {
+        pid: 7,
+        source: coded(CODES[0]),
+    };
+    assert_eq!(member.to_string(), "pid 7 was not killed");
+
+    let started = |wrapper_elevated, cleanup| Error::MayHaveStarted {
+        fate: ChildFate::Killed,
+        wrapper_elevated,
+        detail: None,
+        source: coded(CODES[0]),
+        unreaped: None,
+        cleanup,
+    };
+    assert_eq!(
+        started(false, None).to_string(),
+        "the program may have started, and its child was killed, its exit not collected"
+    );
+    assert_eq!(
+        started(true, None).to_string(),
+        "the program may have started, and its child was killed, its exit not collected \
+         (an elevated program behind it may still run)"
+    );
+    assert_eq!(
+        started(false, Some(failures_of([coded(CODES[1])]))).to_string(),
+        "the program may have started, and its child was killed, its exit not collected; \
+         its teardown failed too (1 failure, in `cleanup`)"
+    );
+}
+
+/// A `MayHaveStarted` says what the failed spawn did with its child in its own words, after the fate
+/// and before the teardown count, and its cause stays below: the `Display` and the `Report` of one over
+/// an `Io` cause and over an `Unassessable` one, each text once.
+///
+/// Mutants: the detail is printed after the teardown count; the detail is in the cause's words; the
+/// detail is dropped from `Report`.
+#[skuld::test]
+fn a_may_have_started_says_its_detail_in_its_own_words_above_its_cause() {
+    let started = |cause: Error, cleanup| Error::MayHaveStarted {
+        fate: ChildFate::Running { id: None },
+        wrapper_elevated: false,
+        detail: Some("it was sent nothing, so the elevated program may be running".into()),
+        source: Arc::new(cause),
+        unreaped: None,
+        cleanup,
+    };
+    let own = "the program may have started, and its child may still be running; \
+               it was sent nothing, so the elevated program may be running";
+
+    let io = started(Error::Io(std::io::Error::other("Broken pipe")), None);
+    assert_eq!(io.to_string(), own);
+    assert_eq!(said(&io), format!("{own}: {}", io_said("Broken pipe")));
+
+    let unassessable = started(
+        Error::Unassessable {
+            detail: "reading pid 7".into(),
+            source: None,
+        },
+        None,
+    );
+    assert_eq!(unassessable.to_string(), own);
+    assert_eq!(
+        said(&unassessable),
+        format!("{own}: could not determine the target process's state: reading pid 7")
+    );
+
+    let torn = started(
+        Error::Io(std::io::Error::other("Broken pipe")),
+        Some(failures_of([coded(CODES[1])])),
+    );
+    assert_eq!(
+        torn.to_string(),
+        format!("{own}; its teardown failed too (1 failure, in `cleanup`)")
+    );
 }
 
 /// The `raw_os_error()` of each of `e`'s [`Error::io_errors`].
@@ -648,14 +766,90 @@ fn report_joins_every_layer_with_a_colon() {
         "outer",
         Some(Box::new(Layer("middle", Some(Box::new(Layer("inner", None)))))),
     );
-    assert_eq!(Report(&e).to_string(), "outer: middle: inner");
+    assert_eq!(said(&e), "outer: middle: inner");
 }
 
 /// A layer that says nothing still takes its place: the joins around it stay.
 #[skuld::test]
 fn report_keeps_a_layer_whose_display_is_empty() {
     let e = Layer("outer", Some(Box::new(Layer("", Some(Box::new(Layer("inner", None)))))));
-    assert_eq!(Report(&e).to_string(), "outer: : inner");
+    assert_eq!(said(&e), "outer: : inner");
+}
+
+/// A holder that keeps its cause as an `Arc<Error>` and lends that `Arc` as its `source()`.
+#[derive(Debug)]
+struct Holder(&'static str, Arc<Error>);
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Holder {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.1)
+    }
+}
+
+/// A list is found behind an `Arc<Error>` layer as behind an `Error` one.
+///
+/// Mutant: `Report` finds a list-holding layer by downcasting to `Error` alone, so an `Arc<Error>`
+/// layer prints its count and none of its members.
+#[skuld::test]
+fn report_of_a_list_behind_an_arc_layer_prints_every_member() {
+    let [a, b] = [coded_text(CODES[0]), coded_text(CODES[1])];
+    let holder = Holder("holder", Arc::new(several(&[CODES[0], CODES[1]])));
+    assert_eq!(said(&holder), format!("holder: 2 failures: (1) {a}; (2) {b}"));
+
+    let started = Holder(
+        "holder",
+        Arc::new(may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])])))),
+    );
+    let words = started.1.to_string();
+    assert_eq!(said(&started), format!("holder: {words}: {a}; cleanup: [(1) {b}]"));
+
+    let left = Holder(
+        "holder",
+        Arc::new(Error::MembersLeft {
+            members: failures_of([not_killed(7, coded(CODES[0]))]),
+            others: Some(walk_not_made()),
+        }),
+    );
+    assert_eq!(
+        said(&left),
+        format!(
+            "holder: 1 member of the tree was left running: (1) pid 7 was not killed: {a}; \
+             others: could not determine the target process's state: the table could not be read"
+        )
+    );
+}
+
+/// A holder that keeps its cause as a `Box<Error>` and lends that `Box` as its `source()`.
+#[derive(Debug)]
+struct BoxHolder(&'static str, Box<Error>);
+
+impl std::fmt::Display for BoxHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for BoxHolder {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.1)
+    }
+}
+
+/// `Report`'s documented limit: a list behind a `Box<Error>` layer prints as its `Display` and its
+/// `source()`, the first member's chain, not every member.
+///
+/// Mutant: `Report` finds a list through a `Box<Error>` layer, so the second member prints.
+#[skuld::test]
+fn report_of_a_list_behind_a_box_layer_prints_its_display_and_source() {
+    let first = coded_text(CODES[0]);
+    let holder = BoxHolder("holder", Box::new(several(&[CODES[0], CODES[1]])));
+    assert_eq!(said(&holder), format!("holder: 2 failures: {first}"));
 }
 
 #[skuld::test]
@@ -664,7 +858,7 @@ fn report_of_a_leaf_is_its_display() {
         detail: "d".into(),
         source: None,
     };
-    assert_eq!(Report(&leaf).to_string(), leaf.to_string());
+    assert_eq!(said(&leaf), leaf.to_string());
 }
 
 #[skuld::test]
@@ -673,9 +867,9 @@ fn report_of_an_io_error_with_context_prints_the_context_and_the_os_error() {
     let os = std::io::Error::from_raw_os_error(code);
     let os_text = os.to_string();
     let e = Error::Io(crate::error::io_context("pidfd_open", os));
-    let report = Report(&e).to_string();
-    assert!(report.starts_with("pidfd_open: "), "{report}");
-    assert!(report.ends_with(&os_text), "{report}");
+    let report = said(&e);
+    assert_eq!(report, io_said(format!("pidfd_open: {os_text}")), "each layer once");
+    assert_eq!(first_os_code(&e), Some(code));
     assert_eq!(
         chain(&e).last().map(ToString::to_string),
         Some(os_text),
@@ -690,6 +884,11 @@ const CODES: [i32; 3] = if cfg!(windows) { [5, 2, 3] } else { [13, 2, 1] };
 
 fn os_text(code: i32) -> String {
     std::io::Error::from_raw_os_error(code).to_string()
+}
+
+/// What [`Report`] prints for [`coded`]: the `Error::Io` layer, then the OS error.
+fn coded_text(code: i32) -> String {
+    io_said(os_text(code))
 }
 
 fn coded(code: i32) -> Arc<Error> {
@@ -814,25 +1013,25 @@ fn a_members_left_of_an_error_that_is_no_member_is_a_contract_breach() {
 /// Mutant: `Report` follows `source()` only, so it prints the first member's chain and none of the others.
 #[skuld::test]
 fn report_of_a_several_prints_every_members_chain() {
-    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let [a, b] = [coded_text(CODES[0]), coded_text(CODES[1])];
     assert_eq!(
-        Report(&several(&[CODES[0], CODES[1]])).to_string(),
-        format!("2 failures: (1) {a}: {a}; (2) {b}: {b}")
+        said(&several(&[CODES[0], CODES[1]])),
+        format!("2 failures: (1) {a}; (2) {b}")
     );
 }
 
 #[skuld::test]
 fn report_of_members_left_prints_every_members_chain() {
-    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let [a, b] = [coded_text(CODES[0]), coded_text(CODES[1])];
     let left = Error::MembersLeft {
         members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
         others: None,
     };
     assert_eq!(
-        Report(&left).to_string(),
+        said(&left),
         format!(
-            "2 members of the tree were left running: (1) pid 7 was not killed: {a}: {a}; \
-             (2) pid 9 was not killed: {b}: {b}"
+            "2 members of the tree were left running: (1) pid 7 was not killed: {a}; \
+             (2) pid 9 was not killed: {b}"
         )
     );
 }
@@ -842,16 +1041,16 @@ fn report_of_members_left_prints_every_members_chain() {
 /// Mutant: `Report` leaves `others` out, or numbers it as a member.
 #[skuld::test]
 fn report_of_members_left_with_other_failures_prints_them_after_the_members() {
-    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let [a, b] = [coded_text(CODES[0]), coded_text(CODES[1])];
     let left = Error::MembersLeft {
         members: failures_of([not_killed(7, coded(CODES[0])), not_killed(9, coded(CODES[1]))]),
         others: Some(walk_not_made()),
     };
     assert_eq!(
-        Report(&left).to_string(),
+        said(&left),
         format!(
-            "2 members of the tree were left running: (1) pid 7 was not killed: {a}: {a}; \
-             (2) pid 9 was not killed: {b}: {b}; \
+            "2 members of the tree were left running: (1) pid 7 was not killed: {a}; \
+             (2) pid 9 was not killed: {b}; \
              others: could not determine the target process's state: the table could not be read"
         )
     );
@@ -861,18 +1060,18 @@ fn report_of_members_left_with_other_failures_prints_them_after_the_members() {
 /// for the outer list's.
 #[skuld::test]
 fn report_of_a_list_in_a_member_brackets_the_inner_list() {
-    let [a, b, c] = CODES.map(os_text);
+    let [a, b, c] = CODES.map(coded_text);
     let inner = Arc::new(several(&[CODES[0], CODES[1]]));
     let left = Error::MembersLeft {
         members: failures_of([not_killed(7, inner), not_killed(9, coded(CODES[2]))]),
         others: None,
     };
     assert_eq!(
-        Report(&left).to_string(),
+        said(&left),
         format!(
             "2 members of the tree were left running: \
-             (1) pid 7 was not killed: 2 failures: [(1) {a}: {a}; (2) {b}: {b}]; \
-             (2) pid 9 was not killed: {c}: {c}"
+             (1) pid 7 was not killed: 2 failures: [(1) {a}; (2) {b}]; \
+             (2) pid 9 was not killed: {c}"
         )
     );
 }
@@ -880,14 +1079,14 @@ fn report_of_a_list_in_a_member_brackets_the_inner_list() {
 /// The list is below the site's own variant: its layer's text comes first, and every member after it.
 #[skuld::test]
 fn report_of_a_several_under_a_variant_prints_the_variant_then_every_member() {
-    let [a, b] = [os_text(CODES[0]), os_text(CODES[1])];
+    let [a, b] = [coded_text(CODES[0]), coded_text(CODES[1])];
     let e = Error::Unassessable {
         detail: "d".into(),
         source: Some(Arc::new(several(&[CODES[0], CODES[1]]))),
     };
     assert_eq!(
-        Report(&e).to_string(),
-        format!("could not determine the target process's state: d: 2 failures: (1) {a}: {a}; (2) {b}: {b}")
+        said(&e),
+        format!("could not determine the target process's state: d: 2 failures: (1) {a}; (2) {b}")
     );
 }
 
@@ -895,6 +1094,7 @@ fn may_have_started(cause: Arc<Error>, cleanup: Option<Failures>) -> Error {
     Error::MayHaveStarted {
         fate: ChildFate::Reaped,
         wrapper_elevated: false,
+        detail: None,
         source: cause,
         unreaped: None,
         cleanup,
@@ -906,9 +1106,9 @@ fn may_have_started(cause: Arc<Error>, cleanup: Option<Failures>) -> Error {
 /// Mutant: `Report` prints a `cleanup` marker with nothing in it.
 #[skuld::test]
 fn report_of_a_may_have_started_without_cleanup_is_its_words_and_its_cause() {
-    let a = os_text(CODES[0]);
+    let a = coded_text(CODES[0]);
     let e = may_have_started(coded(CODES[0]), None);
-    assert_eq!(Report(&e).to_string(), format!("{e}: {a}: {a}"));
+    assert_eq!(said(&e), format!("{e}: {a}"));
 }
 
 /// The cause's chain comes first, and the teardown failures after it, each with its whole chain.
@@ -916,12 +1116,9 @@ fn report_of_a_may_have_started_without_cleanup_is_its_words_and_its_cause() {
 /// Mutants: `Report` leaves the cleanup out; prints it before the cause; numbers the cause among it.
 #[skuld::test]
 fn report_of_a_may_have_started_prints_the_cause_then_every_cleanup_failure() {
-    let [a, b, c] = CODES.map(os_text);
+    let [a, b, c] = CODES.map(coded_text);
     let e = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1]), coded(CODES[2])])));
-    assert_eq!(
-        Report(&e).to_string(),
-        format!("{e}: {a}: {a}; cleanup: [(1) {b}: {b}; (2) {c}: {c}]")
-    );
+    assert_eq!(said(&e), format!("{e}: {a}; cleanup: [(1) {b}; (2) {c}]"));
 }
 
 /// `Display` and `source()` do not reach `cleanup`, so the layer's own words say that the teardown
@@ -930,20 +1127,19 @@ fn report_of_a_may_have_started_prints_the_cause_then_every_cleanup_failure() {
 /// Mutants: the words are dropped, or say nothing of the count, or are said for no cleanup.
 #[skuld::test]
 fn a_may_have_started_says_in_its_display_that_its_teardown_failed_too() {
-    let a = os_text(CODES[0]);
     assert_eq!(
         may_have_started(coded(CODES[0]), None).to_string(),
-        format!("the program may have started, and its child was reaped: {a}")
+        "the program may have started, and its child was reaped"
     );
     let one = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])])));
     assert_eq!(
         one.to_string(),
-        format!("the program may have started, and its child was reaped; its teardown failed too (1 failure, in `cleanup`): {a}")
+        "the program may have started, and its child was reaped; its teardown failed too (1 failure, in `cleanup`)"
     );
     let two = may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1]), coded(CODES[2])])));
     assert_eq!(
         two.to_string(),
-        format!("the program may have started, and its child was reaped; its teardown failed too (2 failures, in `cleanup`): {a}")
+        "the program may have started, and its child was reaped; its teardown failed too (2 failures, in `cleanup`)"
     );
 }
 
@@ -953,26 +1149,26 @@ fn a_may_have_started_says_in_its_display_that_its_teardown_failed_too() {
 /// Mutant: the brackets are left off in a member.
 #[skuld::test]
 fn report_of_a_may_have_started_in_a_member_brackets_its_cause_and_cleanup() {
-    let [a, b, c] = CODES.map(os_text);
+    let [a, b, c] = CODES.map(coded_text);
     let member = Arc::new(may_have_started(coded(CODES[0]), Some(failures_of([coded(CODES[1])]))));
     let outer = Error::Several(failures_of([member.clone(), coded(CODES[2])]));
     assert_eq!(
-        Report(&outer).to_string(),
-        format!("2 failures: (1) {member}: [{a}: {a}; cleanup: [(1) {b}: {b}]]; (2) {c}: {c}")
+        said(&outer),
+        format!("2 failures: (1) {member}: [{a}; cleanup: [(1) {b}]]; (2) {c}")
     );
 }
 
 /// A list in the cause reads in brackets, so the cleanup that follows is not taken for its member.
 #[skuld::test]
 fn report_of_a_may_have_started_brackets_a_list_in_its_cause() {
-    let [a, b, c] = CODES.map(os_text);
+    let [a, b, c] = CODES.map(coded_text);
     let e = may_have_started(
         Arc::new(several(&[CODES[0], CODES[1]])),
         Some(failures_of([coded(CODES[2])])),
     );
     assert_eq!(
-        Report(&e).to_string(),
-        format!("{e}: 2 failures: [(1) {a}: {a}; (2) {b}: {b}]; cleanup: [(1) {c}: {c}]")
+        said(&e),
+        format!("{e}: 2 failures: [(1) {a}; (2) {b}]; cleanup: [(1) {c}]")
     );
 }
 

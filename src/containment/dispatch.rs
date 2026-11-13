@@ -434,7 +434,8 @@ pub(crate) struct Unkilled {
     /// is not a walk, its one error.
     pub(crate) members: Vec<Error>,
     /// The root, when a walk left it. Only a `TreeWalk` walk can: the root's own death then settles it.
-    pub(crate) root: Option<Error>,
+    /// Boxed so that a `Result` of an `Unkilled` stays small.
+    pub(crate) root: Option<Box<Error>>,
     /// The members of `members` whose identity a `TreeWalk` walk read, and whose kill was refused: a
     /// later kill can kill them again by it. The others were never read.
     pub(crate) resolved: Vec<crate::identity::ProcessId>,
@@ -447,7 +448,7 @@ impl Unkilled {
     pub(crate) fn first(&self) -> &Error {
         self.members
             .first()
-            .or(self.root.as_ref())
+            .or(self.root.as_deref())
             .expect("an incomplete kill left a member")
     }
 
@@ -457,7 +458,7 @@ impl Unkilled {
         self.members
             .into_iter()
             .next()
-            .or(self.root)
+            .or(self.root.map(|root| *root))
             .expect("an incomplete kill left a member")
     }
 
@@ -469,7 +470,8 @@ impl Unkilled {
     /// [`Child::kill_tree`](crate::Child::kill_tree) for the contract).
     /// `root_ended`: the root is not running, so a root the walk left is not left.
     pub(crate) fn unsettled(self, root_ended: bool) -> Result<(), Error> {
-        let left = self.members.into_iter().chain(self.root.filter(|_| !root_ended));
+        let root = self.root.filter(|_| !root_ended).map(|root| *root);
+        let left = self.members.into_iter().chain(root);
         let (mut members, mut unnamed) = (Vec::new(), Vec::new());
         for error in left {
             if matches!(error, Error::MemberNotKilled { .. }) {
@@ -668,25 +670,14 @@ impl TreeKillOutcome {
     }
 
     /// Why the kill did not leave the tree killed, or `None` when it [`completed`](Self::completed):
-    /// the first member a kill left, or what a skip left undone. For the text of a gate that reads it.
-    /// Its error is worded by its Display.
+    /// the first member a kill left, or what a skip left undone. For the text of a gate or a log line
+    /// that reads it: its error is worded as the whole chain, through [`Report`](crate::error::Report).
     #[cfg(unix)]
     pub(crate) fn incomplete(&self) -> Option<String> {
-        self.incomplete_by(|error| error.to_string())
-    }
-
-    /// [`incomplete`](Self::incomplete) for a text that only reaches a log line: its error is worded
-    /// as the whole chain, through [`Report`](crate::error::Report).
-    #[cfg(unix)]
-    pub(crate) fn incomplete_for_log(&self) -> Option<String> {
-        self.incomplete_by(|error| crate::error::Report(error).to_string())
-    }
-
-    #[cfg(unix)]
-    fn incomplete_by(&self, word: impl Fn(&Error) -> String) -> Option<String> {
         if self.completed() {
             return None;
         }
+        let word = |error: &Error| crate::error::Report(error).to_string();
         Some(match self {
             TreeKillOutcome::Ran(Err(left)) | TreeKillOutcome::Answered(Err(left)) => word(left.first()),
             TreeKillOutcome::Skipped(Skip {
