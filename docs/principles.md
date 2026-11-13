@@ -310,12 +310,11 @@ escalates to a kill). A backoff that re-checks a deterministic condition, with n
 arbitrary retry or loop caps. A test child kept alive is a held child, never a `sleep` or `ping`: use
 `BLOCKER_ARGV` for a held child, the `held_*` constructors and `member_command` in
 [`src/test_child.rs`](../src/test_child.rs), `ROOT_LEAVING_A_MEMBER` in
-[`identity_group_tests.rs`](../src/child/spawn/identity_group_tests.rs), or on Windows `windows_more` and
-`held_std_killable_blocker` in [`src/test_child.rs`](../src/test_child.rs) and `spawn_restricted*` in
-[`windows_fixture.rs`](../src/identity/windows_fixture.rs). On Windows a held
-child released by EOF must not exit with the code a kill gives (1): `more.com` exits 0, `findstr x`
-(`BLOCKER_ARGV` there) exits 1, so a test that tells a kill from a release uses the `more.com`
-helpers, not `BLOCKER_ARGV`.
+[`identity_group_tests.rs`](../src/child/spawn/identity_group_tests.rs), or on Windows
+`spawn_restricted*` in [`windows_fixture.rs`](../src/identity/windows_fixture.rs). On Windows a held
+child released by EOF must not exit with the code a kill gives (1): `BLOCKER_ARGV` there is
+`more.com`, which exits 0 on EOF and 1 when terminated, so `assert_killed` tells a kill from a
+release.
 
 **Why:** a sleep is a bet that something has happened by then, and loses on a slow or loaded
 machine.

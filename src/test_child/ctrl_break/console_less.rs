@@ -53,7 +53,7 @@ fn spawn_group_leader() -> std::process::Child {
     use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     crate::test_spawn::spawn_with(
-        &mut crate::test_child::held_std_killable_blocker(),
+        &mut crate::test_child::held_std_blocker(std::process::Stdio::null()),
         CREATE_NEW_PROCESS_GROUP.0,
         crate::test_spawn::console_flags::Console::Hidden,
     )

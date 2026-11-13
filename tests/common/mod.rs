@@ -171,9 +171,9 @@ pub fn inheritable_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
 }
 
 /// Blocks reading stdin; ends only by a kill or stdin EOF. `cat` on Unix; `more.com` on Windows
-/// (exits 0 on EOF, unlike `findstr x`). Spawn with piped stdin, null stdout.
+/// (exits 0 on EOF). Spawn with piped stdin, null stdout.
 ///
-/// This and [`assert_killed`] duplicate `test_child::windows_more` / `test_child::assert_killed`
+/// This and [`assert_killed`] duplicate `test_child::BLOCKER_ARGV` / `test_child::assert_killed`
 /// because `tests/` is a separate compilation unit that cannot name the library's `cfg(test)` items.
 pub fn stdin_blocker_program() -> std::path::PathBuf {
     #[cfg(unix)]

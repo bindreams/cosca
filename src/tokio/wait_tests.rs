@@ -41,8 +41,8 @@ fn std_blocker_with_stdout() -> std::process::Child {
 
 /// Proves `child` (a [`std_blocker_with_stdout`]) is genuinely still alive: `is_alive()` alone
 /// races the asynchronous `SIGKILL`/`TerminateProcess`. On Unix, round-trips a byte through the
-/// piped stdout. On Windows, `findstr` does not echo: closes stdin and requires a clean exit and
-/// the echoed match, as `child::graceful_tests::assert_still_running` does, which reaps `child`.
+/// piped stdout. On Windows, closes stdin and requires a clean exit and
+/// the echoed line, as `child::graceful_tests::assert_still_running` does, which reaps `child`.
 fn assert_child_still_alive(child: &mut std::process::Child) {
     #[cfg(unix)]
     crate::test_child::assert_echoes(
@@ -58,7 +58,7 @@ fn assert_child_still_alive(child: &mut std::process::Child) {
             .expect("piped stdin")
             .write_all(b"x\r\n")
             .expect("write to the blocker");
-        child.stdin = None; // close stdin: EOF, findstr can now finish and exit
+        child.stdin = None; // close stdin: EOF, the blocker can now finish and exit
         let mut output = Vec::new();
         child
             .stdout
@@ -67,13 +67,10 @@ fn assert_child_still_alive(child: &mut std::process::Child) {
             .read_to_end(&mut output)
             .expect("read stdout to EOF");
         let status = child.wait().expect("the blocker must exit after stdin closes");
-        assert!(
-            status.success(),
-            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
-        );
+        assert!(status.success(), "the blocker must exit 0 on EOF, got {status:?}");
         assert!(
             output.windows(1).any(|w| w == b"x"),
-            "the blocker's stdout must contain the echoed match, got {output:?}"
+            "the blocker's stdout must contain the echoed line, got {output:?}"
         );
     }
 }

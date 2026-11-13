@@ -43,7 +43,7 @@ fn session(argv: &[&str]) -> Command {
 /// fails the assertion on how the root ended, instead of leaving a wait unbounded. A drop that
 /// blocks until the root is reaped gets its writer through [`release_at_drop_kill`].
 fn session_blocker() -> (crate::Child, crate::PipeWriter) {
-    let mut cmd = session(crate::test_child::BLOCKER_ARGV);
+    let mut cmd = session(&crate::test_child::BLOCKER_ARGV);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");

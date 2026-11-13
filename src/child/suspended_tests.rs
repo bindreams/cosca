@@ -2,8 +2,7 @@
 //!
 //! Every Windows child is a windowless `more.com` blocker (no console window on a developer's
 //! desktop), held by a pipe the test keeps, so it ends only when the code under test kills it.
-//! `more.com` exits 0 on EOF, so a kill that sent nothing fails on how the child ended; `findstr x`
-//! would exit 1, the kill's own code.
+//! `more.com` exits 0 on EOF, so a kill that sent nothing fails on how the child ended.
 
 use static_assertions::assert_impl_all;
 
@@ -50,11 +49,10 @@ mod on_windows {
     /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
     /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> crate::Command {
-        let more = crate::test_child::windows_more();
         let mut cmd = crate::test_child::command(Console::Hidden);
-        cmd.args([&more]);
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
-            cmd.executable(&more);
+            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
