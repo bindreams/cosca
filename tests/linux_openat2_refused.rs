@@ -280,7 +280,7 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
                      an I/O operation failed: containment::unix::group::members: {}, so pgid {pgid} cannot be \
                      listed: {}",
                     refused_detail(name),
-                    std::io::Error::from_raw_os_error(errno)
+                    cosca::error::Report::new(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(errno)))
                 ),
                 "{call} under {name}"
             );
