@@ -87,6 +87,11 @@ pub(crate) enum ReadPurpose {
     Peek,
     /// A peek that found the child running, and the liveness read that follows it.
     Running,
+    /// The look that confirms a fired exit watch is a zombie or a reaped process
+    /// ([`ExitWatch::look`](crate::os_process::macos::ExitWatch::look)): its own purpose, so a
+    /// forced read there does not collide with the `Running` reads of the peek and
+    /// `exited_unannounced`.
+    Exit,
     /// A peek that got `ECHILD`: does the pid still name our child, and who holds it?
     Echild,
     /// The own-zombie read before the first reap, for the second peek.
@@ -251,15 +256,6 @@ pub(crate) fn has_exited(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Re
         Err(Mismatch::Other | Mismatch::Gone) => Ok(true),
         Err(Mismatch::Refused(errno)) => Err(errno),
     }
-}
-
-/// The error of a [`has_exited`] that was refused with `errno`: the child cannot be shown to be
-/// running.
-pub(crate) fn has_exited_error(pid: RawPid, errno: i32) -> std::io::Error {
-    crate::error::io_context(
-        format!("pid {pid}: its identity could not be read; it cannot be shown to be running"),
-        std::io::Error::from_raw_os_error(errno),
-    )
 }
 
 /// Why a [`short_read`] did not read the process it was asked for.

@@ -39,7 +39,7 @@ impl MacChild {
     pub(crate) fn new(pid: u32, unique: u64) -> Result<MacChild, Error> {
         let exit = ExitWatch::proc_exit(pid)?;
         let reap = Kqueue::new()?;
-        // Whether the registration got `ESRCH` is no news here: `exit` read the same.
+        // An ESRCH here is not read as an exit: only the exit watch reports one.
         register_exit_events(&reap, pid).map_err(Error::Io)?;
         Ok(MacChild {
             pid,
@@ -84,12 +84,11 @@ impl OsProcess for MacChild {
         via_audit_token(self.pid, Some(self.unique), sig).map_err(Error::Io)
     }
 
+    /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it:
+    /// see [`ExitWatch::look`]. The reap ([`try_reap`](OsChild::try_reap)) does not come through
+    /// here: it reads the watch raw and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        if self.exit.exited()? {
-            Ok(Exit::Exited)
-        } else {
-            Ok(Exit::Running(WaitFor::Readable(self.exit.as_fd())))
-        }
+        self.exit.look(self.pid, self.unique)
     }
 }
 
@@ -107,8 +106,13 @@ impl OsChild for MacChild {
     /// XNU withholds `NOTE_EXIT` from a parent that does not trace the child while `p_oppid` is
     /// set, so a zombie its tracer holds is seen as one (`SZOMB`) on the verified unique id.
     fn exited_unannounced(&self) -> Result<bool, Error> {
-        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running)
-            .map_err(|errno| Error::Io(crate::identity::has_exited_error(self.pid, errno)))
+        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running).map_err(|errno| {
+            crate::os_process::macos::exit_read_refused(
+                self.pid,
+                errno,
+                "its exit watch has not fired, and whether it has exited could not be read",
+            )
+        })
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the

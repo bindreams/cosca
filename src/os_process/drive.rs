@@ -264,6 +264,7 @@ impl Waitable for ProcessExit<'_> {
         Ok(match self.0.exited()? {
             Exit::Exited => Step::Done(()),
             Exit::Running(wait_for) => Step::Wait(wait_for),
+            Exit::Recheck => Step::Recheck,
         })
     }
 }

@@ -238,15 +238,38 @@ impl OwnedChild {
     /// [`OsProcess::exited`](crate::os_process::OsProcess::exited)), so a zombie only a tracer sees
     /// is `Dead`. The reap peek is read only where the edge is silent: an exit record or a reap
     /// elsewhere, and (macOS) the zombie the edge withholds.
+    ///
+    /// An edge that fired and could not be confirmed (`exited` failed) is answered by the peek where
+    /// the peek can: an exit record or a reap elsewhere is `Dead`; otherwise the failure stands,
+    /// also when the peek reads the child running, which proves nothing (a tracer can hold the
+    /// zombie, which the real parent's `waitid` does not see). A `Recheck` (the exit watch fired, and
+    /// the process is not yet a zombie) answers `Alive` until the zombie, as `ProcessId::is_alive`
+    /// does, unless the peek shows the exit record.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
-        if matches!(self.os.exited()?, Exit::Exited) {
-            return Ok(Liveness::Dead);
-        }
+        let edge = match self.os.exited() {
+            Ok(Exit::Exited) => return Ok(Liveness::Dead),
+            Ok(edge) => edge,
+            Err(refused) => {
+                return match self.peek() {
+                    Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => Ok(Liveness::Dead),
+                    Ok(PeekOutcome::Running) => Err(refused),
+                    Err(peek) => {
+                        log::debug!(
+                            "liveness: child {:?}: the exit confirmation was refused ({}), and the peek behind it failed too ({})",
+                            self.pid(),
+                            crate::error::Report(&refused),
+                            crate::error::Report(&peek)
+                        );
+                        Err(refused)
+                    }
+                };
+            }
+        };
         Ok(match self.peek()? {
             PeekOutcome::Exit(_) | PeekOutcome::Foreign(_) => Liveness::Dead,
-            PeekOutcome::Running if self.os.exited_unannounced()? => Liveness::Dead,
+            PeekOutcome::Running if matches!(edge, Exit::Running(_)) && self.os.exited_unannounced()? => Liveness::Dead,
             PeekOutcome::Running => Liveness::Alive,
         })
     }
