@@ -194,7 +194,7 @@ fn an_unreadable_identity_keeps_a_session_root() {
 /// `BestEffort` with no cgroup leaf made (forced, so whatever the host gives) is the process group.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn an_unreadable_identity_keeps_a_strongest_root_in_a_process_group() {
+fn an_unreadable_identity_keeps_a_best_effort_root_in_a_process_group() {
     let (mode, _forced) = super::identity_group_tests::Container::Leafless.arm();
     assert_contained_root_is_kept_without_an_identity(mode, crate::Containment::ProcessGroup);
 }
