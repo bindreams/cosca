@@ -4,6 +4,7 @@
 
 use std::time::Instant;
 
+use crate::containment::tree_kill::Settled;
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
@@ -26,11 +27,23 @@ impl DrainEdge<'_> {
     /// Block until every member of the tree has EXITED (not reaped), or until `deadline` (`None`: for
     /// ever): `MembersRemain` at expiry.
     pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
+        self.wait_past(deadline, &Settled::default())
+    }
+
+    /// [`wait`](Self::wait) for a caller that has already waited for the members `settled`, each of which
+    /// exited or failed in a way it reported. Only a Job's edge, which confirms an empty listing from a
+    /// system snapshot of its members, has anything to skip: it neither waits for them nor reports them
+    /// again.
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "only a Job's edge reads what a wait settled")
+    )]
+    pub(crate) fn wait_past(&self, deadline: Option<Instant>, settled: &Settled) -> Result<TreeDrain, Error> {
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => leaf.wait_drained(deadline),
             #[cfg(windows)]
-            DrainEdge::Job(job) => job.wait_drained(deadline),
+            DrainEdge::Job(job) => job.wait_drained_past(deadline, settled),
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => m.wait_drained(deadline),
         }
@@ -43,11 +56,25 @@ impl DrainEdge<'_> {
     /// ([`deadline_from`](crate::tokio::wait::deadline_from)).
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
+        self.wait_async_past(deadline, &Settled::default()).await
+    }
+
+    /// [`wait_past`](Self::wait_past), awaited.
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "only a Job's edge reads what a wait settled")
+    )]
+    pub(crate) async fn wait_async_past(
+        &self,
+        deadline: Option<Instant>,
+        settled: &Settled,
+    ) -> Result<TreeDrain, Error> {
         match self {
             #[cfg(target_os = "linux")]
             DrainEdge::Cgroup(leaf) => cgroup_wait_tree_drained(leaf, deadline).await,
             #[cfg(windows)]
-            DrainEdge::Job(job) => job_wait_tree_drained(job, deadline).await,
+            DrainEdge::Job(job) => job_wait_tree_drained(job, deadline, settled).await,
             #[cfg(target_os = "macos")]
             DrainEdge::Marker(m) => {
                 // Same reissued-fd check as `Marker::wait_drained`: a reissued read-end fd would
@@ -269,6 +296,45 @@ pub(crate) async fn cgroup_wait_tree_drained(
     }
 }
 
+/// The members of `job` a system snapshot names ([`unsignalled_members_of`]), found on tokio's
+/// blocking pool: the scan opens every process on the system, which a runtime thread must not do.
+/// The task owns a duplicate of the job's handle, because it can outlive the future that asked for
+/// it. The scan is bounded work that waits for no exit, as the pool is for.
+#[cfg(all(feature = "tokio", windows))]
+async fn snapshot_members_on_pool(
+    job: &crate::containment::windows::JobHandle,
+) -> Result<Vec<crate::containment::windows::Found>, Error> {
+    use crate::containment::windows::unsignalled_members_of;
+    use std::os::windows::io::AsHandle as _;
+
+    let held = job.handle().try_clone_to_owned().map_err(|e| Error::Unassessable {
+        detail: "the job's handle could not be duplicated for the snapshot of its members".to_owned(),
+        source: Some(Error::io_cause(e)),
+    })?;
+    crate::tokio::wait::on_blocking_pool("the snapshot of a job's members", move || {
+        unsignalled_members_of(held.as_handle())
+    })
+    .await
+    .map_err(|unjoined| {
+        use crate::tokio::wait::Unjoined;
+
+        let (detail, cause) = match unjoined {
+            Unjoined::NotRun(cause) => (
+                "the snapshot of the job's members did not run, so their exit cannot be observed",
+                cause,
+            ),
+            Unjoined::Unknown(cause) => (
+                "nothing can be said of what the snapshot of the job's members did, so their exit cannot be observed",
+                cause,
+            ),
+        };
+        Error::Unassessable {
+            detail: detail.to_owned(),
+            source: Some(std::sync::Arc::new(cause)),
+        }
+    })?
+}
+
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
 /// Job objects expose no pollable handle, so — unlike the macOS arm, on the reactor, and the Linux
 /// arm, awaiting its leaf's pump — this runs the sync wait's own rounds
@@ -277,15 +343,22 @@ pub(crate) async fn cgroup_wait_tree_drained(
 /// the registrations' own timeout (see [`registered_wait`](crate::os_process::windows::registered_wait));
 /// dropping the future unregisters the round's waits.
 ///
+/// An empty listing is confirmed from a system snapshot, as the sync wait's `confirm_drained` does:
+/// each job member it names, except those `settled`, is awaited in turn through the by-identity wait
+/// a kill's wait uses.
+///
 /// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
-/// exit and is bounded. Every round reaches an await, so a future that is dropped between rounds
-/// is not starved by rounds that find every member gone.
+/// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
+/// runs on the blocking pool ([`snapshot_members_on_pool`]).
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
+    settled: &Settled,
 ) -> Result<TreeDrain, Error> {
-    use crate::containment::windows::{Ended, Round};
+    use crate::containment::tree_kill::wait_for_member_async;
+    use crate::containment::windows::{ConfirmStep, ConfirmWalk, Ended, Round};
+    use crate::identity::HostKernel;
     use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
     // The registered waits run on the real clock, not tokio's.
@@ -293,34 +366,45 @@ async fn job_wait_tree_drained(
     loop {
         // A round that starts past the deadline is the last, as in the sync wait.
         let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
-        let watch = match job.drain_round(last_round)? {
-            Round::Answer(drain) => return Ok(drain),
-            Round::List => {
-                ::tokio::task::yield_now().await;
-                continue;
-            }
-            Round::Watch(watch) => watch,
-        };
-        let ended = if last_round {
-            watch.poll()?
-        } else {
-            match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
-                Woke::Signalled => Ended::Signalled,
-                // The deadline passed first. One look at the handles, as the sync wait's zero-ms
-                // wait is: a member that exited as it passed is seen, and the last round lists.
-                Woke::TimedOut => watch.poll()?,
-            }
-        };
-        match ended {
-            Ended::Deadline => return Ok(TreeDrain::MembersRemain),
-            Ended::Signalled => {
-                if let Some(drain) = job.after_signalled(&watch)? {
-                    return Ok(drain);
+        let round = match job.drain_round(last_round)? {
+            Round::Watch(watch) => {
+                let ended = if last_round {
+                    watch.poll()?
+                } else {
+                    match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
+                        Woke::Signalled => Ended::Signalled,
+                        // The deadline passed first: one look at the handles, as the sync wait takes.
+                        Woke::TimedOut => watch.poll()?,
+                    }
+                };
+                match ended {
+                    Ended::Deadline => return Ok(TreeDrain::MembersRemain),
+                    Ended::Signalled => job.after_signalled(&watch)?,
                 }
-                // A signal that was already waiting at registration resolves without a pending
-                // poll, so this round may have reached no suspension: yield before listing again.
-                ::tokio::task::yield_now().await;
             }
+            round => round,
+        };
+        match round {
+            Round::Answer(drain) => return Ok(drain),
+            Round::Confirm => {
+                let Some(count) = job.count_to_confirm()? else {
+                    return Ok(TreeDrain::AllMembersExited);
+                };
+                let mut walk = ConfirmWalk::new(job, count, snapshot_members_on_pool(job).await, settled);
+                loop {
+                    match walk.next() {
+                        ConfirmStep::Wait(id) => {
+                            walk.waited(id, wait_for_member_async(&HostKernel, id, deadline).await)
+                        }
+                        ConfirmStep::Done(answer) => return answer,
+                    }
+                }
+            }
+            Round::List | Round::Watch(_) => {}
         }
+        // A signal that was already waiting at registration resolves without a pending poll, and a
+        // round that found every member gone reached no suspension at all: yield before listing
+        // again.
+        ::tokio::task::yield_now().await;
     }
 }

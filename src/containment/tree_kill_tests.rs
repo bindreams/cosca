@@ -17,6 +17,9 @@ use crate::os_process::fake::{Answer, FakeProcess};
 use crate::test_child::over_fake::tokio_child_reaching;
 use crate::test_child::over_fake::{child_over, child_reaching, live_member, root_looking};
 
+/// The pid a row gives the fake root, which has no process to read one from.
+const ROOT_PID: u32 = 4242;
+
 /// `kill_tree` returns once every member its kill reached has exited. The member is alive when the
 /// wait looks at it, so the wait blocks on it, and the test ends it there: a `kill_tree` that
 /// returns without waiting never blocks, and the member is not ended.
@@ -228,7 +231,7 @@ fn a_wait_error_keeps_the_record_that_the_root_was_killed() {
     let why = refused_unobserved(4242);
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-    let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, true))
+    let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, true))
         .wait()
         .expect_err("a member's exit cannot be observed");
 
@@ -257,15 +260,15 @@ fn the_roots_state_is_set_by_root_killed_and_kept_by_with_root() {
         "the last answer is the state"
     );
     assert!(
-        killed(true).with_root(&root, false).root_killed(),
+        killed(true).with_root(&root, ROOT_PID, false).root_killed(),
         "a kill that did not land through the handle keeps what the walk recorded"
     );
     assert!(
-        killed(true).with_root(&root, true).waits_for_root(),
+        killed(true).with_root(&root, ROOT_PID, true).waits_for_root(),
         "a kill that landed is waited for through the handle"
     );
     assert!(
-        !killed(false).with_root(&root, false).waits_for_root(),
+        !killed(false).with_root(&root, ROOT_PID, false).waits_for_root(),
         "a root whose kill did not land is not waited for"
     );
 }
@@ -295,7 +298,7 @@ fn a_root_whose_look_fails_is_named_as_the_root() {
     let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
 
     let err = KillWait::none()
-        .with_root(&root, true)
+        .with_root(&root, ROOT_PID, true)
         .wait()
         .expect_err("the root's exit cannot be observed");
 
@@ -329,7 +332,7 @@ fn a_wait_goes_to_the_members_then_the_root() {
     });
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
 
-    wait.with_root(&root, true).wait().expect("every wait ended");
+    wait.with_root(&root, ROOT_PID, true).wait().expect("every wait ended");
 
     assert_eq!(id.is_alive(), Liveness::Dead, "the member has exited");
     assert_eq!(root.looks(), 1, "the root was looked at once the member had exited");
@@ -364,7 +367,7 @@ fn the_edge_is_waited_for_after_the_root() {
     });
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), edge).split();
 
-    wait.with_root(&root, true).wait().expect("every wait ended");
+    wait.with_root(&root, ROOT_PID, true).wait().expect("every wait ended");
 
     assert_eq!(job_pid_list_queries(), 1, "the edge was asked once, after the root");
 }
@@ -476,7 +479,7 @@ fn the_roots_error_comes_before_the_edges() {
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
     let err = wait
-        .with_root(&root, true)
+        .with_root(&root, ROOT_PID, true)
         .wait()
         .expect_err("neither the root's exit nor the edge could be observed");
 
@@ -753,7 +756,7 @@ mod awaited {
         let root = root_looking([Answer::Exited]);
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
 
-        let (waited, ()) = ::tokio::join!(wait.with_root(&root, true).wait_async(), async {
+        let (waited, ()) = ::tokio::join!(wait.with_root(&root, ROOT_PID, true).wait_async(), async {
             ::tokio::task::yield_now().await;
             assert_eq!(
                 root.looks(),
@@ -795,7 +798,7 @@ mod awaited {
         let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
         let err = wait
-            .with_root(&root, true)
+            .with_root(&root, ROOT_PID, true)
             .wait_async()
             .await
             .expect_err("neither the root's exit nor the edge could be observed");
@@ -998,7 +1001,7 @@ mod awaited {
         let why = refused_unobserved(4242);
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-        let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, true))
+        let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, true))
             .wait_async()
             .await
             .expect_err("a member's exit cannot be observed");

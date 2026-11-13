@@ -121,10 +121,9 @@ impl Job {
         self.0.disarm().map_err(Error::Io)
     }
 
-    /// Block until the job's process list is empty, or forever if it never is. This call observes
-    /// the list, not each member: the list can empty before every member's process object is
-    /// signalled. A caller that needs the members gone uses [`kill_tree`](Job::kill_tree), which
-    /// waits for each.
+    /// Block until the job has no member left, or forever if it never does. An empty process list
+    /// is not the drain, and the limit stated at [`Child::wait_tree`](crate::Child::wait_tree) holds; a
+    /// caller that needs a member it hides named uses [`kill_tree`](Job::kill_tree).
     pub fn wait_tree(&self) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(None)
     }
@@ -132,7 +131,8 @@ impl Job {
     /// Like [`wait_tree`](Job::wait_tree), but give up and report
     /// [`TreeDrain::MembersRemain`](crate::containment::TreeDrain::MembersRemain) once `timeout`
     /// elapses, the tree not having been seen drained. The answer is the job's process list as of
-    /// its last look, in which a member that has just exited can still appear.
+    /// its last look, in which a member that has just exited can still appear. The limit stated at
+    /// [`Child::wait_tree`](crate::Child::wait_tree) holds.
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(crate::wait::deadline_from(timeout))
     }

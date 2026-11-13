@@ -79,8 +79,10 @@ that exits only after another wait returned would queue behind it for ever on a 
 Unix registers the wait with the reactor. Windows registers it with the OS's wait pool
 (`RegisterWaitForSingleObject`, as tokio's own child wait does, in
 [`registered_wait.rs`](../src/os_process/windows/registered_wait.rs)): one registration per
-process handle, and one per member handle in each round of a job's drain wait
-([`job_wait_tree_drained`](../src/containment/drain_edge.rs)). The deadline is the registration's
+process handle, one per handle of a job's drain round (at most 63) and, once the list is empty, one
+at a time per member a system snapshot names (the snapshot runs on the blocking pool), so no
+handle outlives its own wait ([`job_wait_tree_drained`](../src/containment/drain_edge.rs)); the
+limit of that wait is stated at `Child::wait_tree`. The deadline is the registration's
 own timeout, on the real clock, so a Windows wait needs neither tokio's time driver nor its clock (a
 paused clock does not advance it); a timeout the OS counts short registers again for the time that
 is left. A wait owns a duplicate of the handle it waits on, so forgetting it leaks a registration but
