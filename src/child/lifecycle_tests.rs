@@ -618,11 +618,11 @@ mod settlement {
     #[track_caller]
     fn assert_failed_wait_worded(settlement: &Settlement) {
         let returned = "S: the wait failed";
-        let logged = "S: the wait failed: cosca-wait-e5a1: cosca-wait-e5a1";
+        let logged = format!("S: the wait failed: {}", crate::error::io_said("cosca-wait-e5a1"));
         for (disposition, said, goes) in [
             (None, returned, ""),
-            (Some(Disposition::Leave), logged, LEFT),
-            (Some(Disposition::HandBack), logged, HANDED_BACK),
+            (Some(Disposition::Leave), logged.as_str(), LEFT),
+            (Some(Disposition::HandBack), logged.as_str(), HANDED_BACK),
         ] {
             assert_eq!(
                 worded(settlement, disposition),
@@ -707,16 +707,13 @@ mod settlement {
             TeardownOutcome::of_settlement(&Settlement::new(answer, false), None, "S", None, Disposition::Leave)
         };
         let failure = Settlement::new(failed(), false).failure().expect("the failed wait");
-        assert!(
-            failure.to_string().starts_with("waiting for the child: ")
-                && failure.to_string().contains("cosca-wait-e5a1"),
-            "{failure}"
-        );
+        let step = crate::error::io_said("waiting for the child: cosca-wait-e5a1");
+        assert_eq!(crate::error::said(&*failure), step);
 
         let remains = outcome(failed()).remains();
         let failures = remains.failures.expect("the teardown's failure");
         assert_eq!(failures.iter().len(), 1, "{failures:?}");
-        assert!(failures.first().to_string().contains("cosca-wait-e5a1"), "{failures:?}");
+        assert_eq!(crate::error::said(&**failures.first()), step);
 
         for answer in [passed(), foreign(Foreign::Gone), unreadable()] {
             assert!(Settlement::new(answer, false).failure().is_none());
@@ -757,7 +754,7 @@ mod settlement {
         let (warn, remains) = outcome(failed()).take_warn("lead");
         assert_eq!(
             warn.as_deref(),
-            Some(format!("S: the wait failed: cosca-wait-e5a1: cosca-wait-e5a1{LEFT}").as_str())
+            Some(format!("S: the wait failed: {}{LEFT}", crate::error::io_said("cosca-wait-e5a1")).as_str())
         );
         assert!(remains.uncollected);
         assert_eq!(

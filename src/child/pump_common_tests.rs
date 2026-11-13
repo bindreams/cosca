@@ -320,7 +320,8 @@ fn a_first_failure_with_a_slot_carries_every_later_one_in_order_naming_its_strea
     let kinds: Vec<_> = below.iter().map(|e| io_kind(e)).collect();
     assert_eq!(kinds, [BrokenPipe, PermissionDenied, NotFound, Unsupported]);
     for (peer, stream) in below.iter().zip(["pump", "stdout", "stderr", "stdin"]) {
-        assert!(peer.to_string().starts_with(&format!("{stream}: ")), "{stream}: {peer}");
+        let named = peer.io_errors().next().map(ToString::to_string);
+        assert_eq!(named.as_deref(), Some(stream), "{peer:?}");
     }
 }
 

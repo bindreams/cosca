@@ -41,7 +41,7 @@ fn a_may_have_started_failure_becomes_the_wrapping_variant() {
         "{text}"
     );
     assert!(
-        std::error::Error::source(&error).is_some_and(|s| s.to_string() == "attach"),
+        std::error::Error::source(&error).is_some_and(|s| crate::error::said(s) == crate::error::io_said("attach")),
         "the cause is the source"
     );
 }
@@ -66,8 +66,7 @@ fn a_cause_that_is_itself_may_have_started_asserts() {
     drop(Error::from(SpawnFailure::started(once, ChildFate::Unknown, None)));
 }
 
-/// `behind_front` only sets the flag: the cause and fate stand, and a not-started failure is
-/// unchanged.
+/// `behind_front` sets the flag alone.
 ///
 /// Mutant: `behind_front` drops the flag, changes the fate, or marks a not-started failure.
 #[skuld::test]
@@ -103,8 +102,7 @@ fn behind_front_sets_the_flag_alone() {
     assert!(matches!(not, Error::Io(_)), "{not:?}");
 }
 
-/// A run-to-completion helper's failure after its spawn carries the cause, the fate and the
-/// wrapper flag: the flag survives for every cause, `read`'s invalid UTF-8 included.
+/// `after_the_spawn` keeps the cause, the fate and the wrapper flag.
 ///
 /// Mutant: `after_the_spawn` drops the flag.
 #[skuld::test]
@@ -114,6 +112,7 @@ fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
         let Error::MayHaveStarted {
             fate,
             wrapper_elevated,
+            detail: None,
             source,
             unreaped: None,
             cleanup: None,
@@ -130,8 +129,7 @@ fn after_the_spawn_keeps_the_cause_the_fate_and_the_wrapper_flag() {
     }
 }
 
-/// A helper that hands its child back puts it in the error with a `Running` fate, for a plain child
-/// and a wrapper alike.
+/// A helper that hands its child back puts it in the error with a `Running` fate.
 ///
 /// Mutant: `after_the_spawn` drops the child it is given.
 #[skuld::test]
@@ -159,8 +157,7 @@ fn after_the_spawn_with_a_child_carries_it_with_a_running_fate() {
     }
 }
 
-/// A failure that carries a child keeps it through `map`, `behind_front` and the conversion to
-/// an `Error`; a failure built by `started` carries none.
+/// A failure keeps its child through `map`, `behind_front` and the conversion to an `Error`.
 ///
 /// Mutants: any of the three drops `unreaped`; `started` invents one.
 #[skuld::test]
@@ -185,8 +182,7 @@ fn a_failure_carries_its_unreaped_child_through_map_behind_front_and_from() {
     assert!(matches!(none, Error::MayHaveStarted { unreaped: None, .. }), "{none:?}");
 }
 
-/// A child is handed back only with the fate `Running` and its own identity: anything else is a
-/// contract breach, and asserts in debug.
+/// A handed-back child needs a `Running` fate, or debug asserts.
 ///
 /// Mutant: `From` does not check the fate against the child.
 #[skuld::test]
@@ -194,9 +190,10 @@ fn a_failure_carries_its_unreaped_child_through_map_behind_front_and_from() {
 fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
     let id = crate::identity::ProcessId::current();
     drop(Error::from(SpawnFailure::MayHaveStarted {
-        cause: io("attach"),
+        cause: Box::new(io("attach")),
         fate: ChildFate::Reaped,
         wrapper_elevated: false,
+        detail: None,
         unreaped: Some(exited_unreaped(id)),
         cleanup: None,
     }));
@@ -210,9 +207,10 @@ fn an_unreaped_child_whose_fate_is_not_running_asserts_in_debug() {
 fn an_unreaped_child_whose_fate_names_no_identity_asserts_in_debug() {
     let id = crate::identity::ProcessId::current();
     drop(Error::from(SpawnFailure::MayHaveStarted {
-        cause: io("attach"),
+        cause: Box::new(io("attach")),
         fate: ChildFate::Running { id: None },
         wrapper_elevated: false,
+        detail: None,
         unreaped: Some(exited_unreaped(id)),
         cleanup: None,
     }));
@@ -227,9 +225,10 @@ fn an_unreaped_child_whose_fate_names_another_process_asserts_in_debug() {
     let id = crate::identity::ProcessId::current();
     let other = crate::identity::ProcessId::from_parts_for_test(id.pid() + 1, crate::identity::Key::for_test(1));
     drop(Error::from(SpawnFailure::MayHaveStarted {
-        cause: io("attach"),
+        cause: Box::new(io("attach")),
         fate: ChildFate::Running { id: Some(other) },
         wrapper_elevated: false,
+        detail: None,
         unreaped: Some(exited_unreaped(id)),
         cleanup: None,
     }));
@@ -250,11 +249,11 @@ fn map_keeps_the_answer_the_fate_and_the_flag() {
         matches!(
             mapped,
             SpawnFailure::MayHaveStarted {
-                cause: Error::Io(ref e),
+                ref cause,
                 fate: ChildFate::Killed,
                 wrapper_elevated: true,
                 ..
-            } if e.to_string() == "b"
+            } if matches!(&**cause, Error::Io(e) if e.to_string() == "b")
         ),
         "{mapped:?}"
     );
@@ -262,10 +261,11 @@ fn map_keeps_the_answer_the_fate_and_the_flag() {
     assert!(matches!(mapped, SpawnFailure::NotStarted(Error::Io(ref e)) if e.to_string() == "b"));
 }
 
-/// A note added to a may-have-started error lands on its cause, which keeps its variant, and the
-/// fate is kept.
+/// A note on a may-have-started error with no `detail` is its `detail`; the cause is left alone.
+///
+/// Mutant: the note goes to the cause, or is dropped.
 #[skuld::test]
-fn a_note_on_a_may_have_started_error_reaches_its_cause() {
+fn a_note_on_a_may_have_started_error_is_its_detail() {
     let error = Error::from(SpawnFailure::started(
         Error::Containment {
             detail: "x".into(),
@@ -275,12 +275,16 @@ fn a_note_on_a_may_have_started_error_reaches_its_cause() {
         None,
     ))
     .with_note("front left");
-    let Error::MayHaveStarted { fate, source, .. } = &error else {
+    let Error::MayHaveStarted {
+        fate, detail, source, ..
+    } = &error
+    else {
         panic!("expected MayHaveStarted, got {error:?}");
     };
     assert_eq!(*fate, ChildFate::Gone);
+    assert_eq!(detail.as_deref(), Some("front left"));
     assert!(
-        matches!(**source, Error::Containment { ref detail, .. } if detail == "x; front left"),
+        matches!(**source, Error::Containment { ref detail, .. } if detail == "x"),
         "{source:?}"
     );
 }

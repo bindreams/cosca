@@ -127,7 +127,7 @@ fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() 
         matches!(
             &err,
             crate::error::Error::Unassessable { source: Some(source), .. }
-                if source.to_string().contains("forced identity-check failure 8e2f")
+                if crate::error::said(&**source).contains("forced identity-check failure 8e2f")
         ),
         "a failed peek is Unassessable with the peek's own error as source, not a vanish: {err:?}"
     );

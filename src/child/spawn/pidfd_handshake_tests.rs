@@ -138,7 +138,10 @@ fn a_refused_probe_fails_unsupported() {
 fn a_probe_that_hits_emfile_fails_io() {
     let kernel = FakeKernel::new().on_pidfd_open(std::process::id(), Err(Errno::MFILE));
     match probe_pidfd_support_with(&kernel).expect_err("a failed probe must fail") {
-        Error::Io(e) => assert_eq!(e.to_string(), "pidfd_open: Too many open files (os error 24)"),
+        err @ Error::Io(_) => assert_eq!(
+            crate::error::said(&err),
+            crate::error::io_said("pidfd_open: Too many open files (os error 24)")
+        ),
         other => panic!("expected Io, got {other:?}"),
     }
 }
@@ -159,7 +162,10 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     drop(forced);
 
     match err.expect("a failed pidfd_open must fail the spawn") {
-        Error::Io(e) => assert_eq!(e.to_string(), "pidfd_open: Too many open files (os error 24)"),
+        err @ Error::Io(_) => assert_eq!(
+            crate::error::said(&err),
+            crate::error::io_said("pidfd_open: Too many open files (os error 24)")
+        ),
         other => panic!("expected Io, got {other:?}"),
     }
     assert_eq!(fault::spawns(), 1, "the child was forked and held");
@@ -277,9 +283,11 @@ fn an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait() {
         "the helper must shut the parent's end, whatever copies of it exist"
     );
     match err.expect("an undelivered go-ahead must fail the spawn") {
-        Error::Io(e) => assert_eq!(
-            e.to_string(),
-            "pidfd handshake: sending the child its go-ahead: No buffer space available (os error 105)"
+        err @ Error::Io(_) => assert_eq!(
+            crate::error::said(&err),
+            crate::error::io_said(
+                "pidfd handshake: sending the child its go-ahead: No buffer space available (os error 105)"
+            )
         ),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -302,8 +310,8 @@ fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
 
     let err = expect_not_started(err.expect("a child that never ran the program must fail the spawn"));
     assert!(
-        err.to_string().ends_with("died before exec: the program never ran"),
-        "{err}"
+        crate::error::said(&err).ends_with("died before exec: the program never ran"),
+        "{err:?}"
     );
     assert_no_child_of_this_thread("the child is reaped through its pidfd");
     assert!(!program_ran(cmd, reader));
@@ -554,8 +562,10 @@ fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
         .expect("the unreaped child is named")
         .expect("it has a pid");
     assert_eq!(
-        err.to_string(),
-        format!("the spawned child (pid {pid}) died before it could send its pidfd")
+        crate::error::said(&err),
+        crate::error::io_said(format!(
+            "the spawned child (pid {pid}) died before it could send its pidfd"
+        ))
     );
     // The test owns this cleanup: the pid is this thread's unreaped zombie.
     let mut status = 0;
@@ -619,7 +629,7 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
         | fault::WatchFault::Peek(errno)
         | fault::WatchFault::Poll(errno)) = fault_kind;
         let error = killed_child_with_a_failing_watch(fault_kind);
-        let said = error.to_string();
+        let said = crate::error::said(&error);
         assert!(
             said.contains("its exit could not be watched") && said.contains(&errno.to_string()),
             "{fault_kind:?}: {said}"
@@ -658,7 +668,8 @@ fn a_failed_watch_is_wrapped_once_over_its_raw_cause() {
 #[skuld::test]
 fn a_number_that_names_no_child_forces_eof() {
     for errno in [Errno::SRCH, Errno::NOENT, Errno::INVAL] {
-        let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno)).to_string();
+        let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno));
+        let said = crate::error::said(&said);
         assert!(said.ends_with("died before it could send its pidfd"), "{errno}: {said}");
     }
 }
@@ -885,8 +896,8 @@ fn fixture_reused_number_init() {
     );
     let err = err.expect("a child that never ran the program must fail the spawn");
     assert!(
-        err.to_string().ends_with("died before exec: the program never ran"),
-        "{err}"
+        crate::error::said(&err).ends_with("died before exec: the program never ran"),
+        "{err:?}"
     );
     reuser.kill().expect("kill the reuser");
     reuser.wait().expect("reap the reuser");
@@ -974,11 +985,11 @@ fn fixture_unreported_death_init() {
     assert_ends_closed(ends, "a child that died before reporting");
     let err = err.expect("a child that died before reporting fails the spawn");
     assert_eq!(
-        err.to_string(),
-        format!(
+        crate::error::said(&err),
+        crate::error::io_said(format!(
             "the spawned child (pid {}) died before it could send its pidfd",
             reuser.id()
-        )
+        ))
     );
     assert!(!program_ran(cmd, reader));
 }
@@ -1041,11 +1052,11 @@ fn fixture_unshared_thread() {
         panic!("the spawn must fail");
     };
     assert!(
-        err.to_string().starts_with(
-            "starting the pidfd handshake thread (Linux refuses new threads to a thread that has \
-             unshared or entered a pid or time namespace for its children"
-        ),
-        "{err}"
+        crate::error::said(&err).starts_with(&crate::error::io_said(
+            "starting the pidfd handshake thread (Linux refuses new threads to a thread \
+             that has unshared or entered a pid or time namespace for its children"
+        )),
+        "{err:?}"
     );
     assert_eq!(fault::spawns(), 0, "nothing may be forked");
     assert!(!program_ran(cmd, reader));
@@ -1110,8 +1121,8 @@ fn an_abandoned_child_is_worded_by_its_cause() {
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
     let err = super::conclude(Ok(ended_cat()), failed, None).err();
     assert_eq!(
-        err.map(|e| e.expect_not_started().to_string()).as_deref(),
-        Some("the report was cut short")
+        err.map(|e| crate::error::said(&e.expect_not_started())).as_deref(),
+        Some(crate::error::io_said("the report was cut short").as_str())
     );
     let why = said(mark);
     assert!(
@@ -1210,9 +1221,10 @@ fn fixture_thread_reuse_init() {
         .expect("the unreaped child is named")
         .expect("it has a pid");
     assert_eq!(
-        err.expect("a child that died before reporting fails the spawn")
-            .to_string(),
-        format!("the spawned child (pid {pid}) died before it could send its pidfd")
+        crate::error::said(&err.expect("a child that died before reporting fails the spawn")),
+        crate::error::io_said(format!(
+            "the spawned child (pid {pid}) died before it could send its pidfd"
+        ))
     );
     assert!(!program_ran(cmd, reader));
 }
@@ -1492,7 +1504,7 @@ fn conclude_answers_every_remaining_pair() {
         .expect("the spawn fails")
         .expect_not_started();
     assert!(
-        matches!(&error, Error::Io(e) if e.to_string().contains("its exit could not be watched: what: cause")),
+        crate::error::said(&error).contains("its exit could not be watched: what: cause"),
         "{error:?}"
     );
 
@@ -1574,7 +1586,9 @@ fn a_refused_pidfd_open_beside_a_failed_spawn_answers_unsupported_with_the_spawn
     };
     assert_eq!(causes.iter().len(), 2, "{causes:?}");
     assert!(
-        causes.iter().any(|cause| cause.to_string().contains("spawn 2b7c")),
+        causes
+            .iter()
+            .any(|cause| crate::error::said(&**cause).contains("spawn 2b7c")),
         "{causes:?}"
     );
     assert_eq!(handshake_warns_since(mark), Vec::<String>::new());

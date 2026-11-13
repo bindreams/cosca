@@ -172,7 +172,11 @@ fn a_refused_kill_whose_look_found_the_exit_record_unreadable_leaves_nothing_unc
         let torn = child_with_an_unreadable_exit().look_after_refused_kill(Some(id()), refused, disposition);
         assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
         assert_collected_with_an_unreadable_record(&torn, disposition, "reaped it");
-        assert!(!warn_of(&torn).unwrap_or_default().contains("failed"), "{torn:?}");
+        // The refusal's own words say "an I/O operation failed"; the look did not fail.
+        assert!(
+            !warn_of(&torn).unwrap_or_default().contains("the wait failed"),
+            "{torn:?}"
+        );
     }
 }
 
@@ -498,7 +502,10 @@ fn teardown_after_a_refused_kill_of_an_exited_child_reaps_it_at_debug() {
         said_of(&torn),
         Some((
             log::Level::Debug,
-            format!("child 4242 could not be terminated ({refusal}: {refusal}): reaped it")
+            format!(
+                "child 4242 could not be terminated ({}): reaped it",
+                crate::error::io_said(&refusal)
+            )
         ))
     );
     assert_eq!(fake.looks(), 1);
@@ -525,10 +532,11 @@ fn teardown_after_a_refused_kill_with_a_failed_look_is_unknown() {
     assert!(!left.contains("leaving it running"), "{torn:?}");
     // The refused kill and the failed look are the teardown's failures, each naming its step.
     let failures = torn.remains().failures.expect("the teardown's failures");
-    let steps: Vec<_> = failures.iter().map(|failure| failure.to_string()).collect();
+    let steps: Vec<_> = failures.iter().map(|failure| crate::error::said(&**failure)).collect();
     assert!(
-        matches!(steps.as_slice(), [kill, wait] if kill.starts_with("killing the child: ")
-            && wait.starts_with("waiting for the child: ")),
+        matches!(steps.as_slice(), [kill, wait]
+            if kill.starts_with(&crate::error::io_said("killing the child: "))
+            && wait.starts_with(&crate::error::io_said("waiting for the child: "))),
         "{steps:?}"
     );
 }
@@ -550,7 +558,10 @@ fn teardown_after_a_refused_kill_of_a_child_reaped_elsewhere_is_gone_at_debug() 
         said_of(&torn),
         Some((
             log::Level::Debug,
-            format!("child 4242 could not be terminated ({refusal}: {refusal}): reaped by someone else")
+            format!(
+                "child 4242 could not be terminated ({}): reaped by someone else",
+                crate::error::io_said(&refusal)
+            )
         ))
     );
     assert_eq!(fake.looks(), 1);
@@ -574,8 +585,9 @@ fn teardown_after_a_refused_kill_of_a_child_launchd_holds_is_gone_and_returns_th
         warn_of(&torn),
         Some(
             format!(
-                "child 4242 could not be terminated ({refusal}: {refusal}): not ours to reap (launchd holds its zombie, because \
-                 its tracer died)"
+                "child 4242 could not be terminated ({}): not ours to reap (launchd holds its zombie, because \
+                 its tracer died)",
+                crate::error::io_said(&refusal)
             )
             .as_str()
         )

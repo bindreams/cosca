@@ -169,7 +169,12 @@ fn cosca_outcome(e: &cosca::error::Error) -> String {
         cosca::error::Error::Containment { .. } => "Containment".to_string(),
         cosca::error::Error::Io(io) => raw_outcome(io),
         cosca::error::Error::Unsupported { .. } => "Unsupported".to_string(),
-        other => format!("Other-{}", other.to_string().replace(char::is_whitespace, "_")),
+        other => format!(
+            "Other-{}",
+            cosca::error::Report::new(other)
+                .to_string()
+                .replace(char::is_whitespace, "_")
+        ),
     }
 }
 

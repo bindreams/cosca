@@ -34,14 +34,14 @@ use crate::signal::{Sent, Sig};
 /// pid.
 ///
 /// ```
-/// use cosca::error::Error;
+/// use cosca::error::{Error, Report};
 ///
 /// fn settle(error: Error) {
 ///     if let Error::MayHaveStarted { unreaped: Some(child), .. } = error {
 ///         eprintln!("waiting for pid {:?}", child.pid());
 ///         match child.wait() {
 ///             Ok(status) => eprintln!("it exited: {status}"),
-///             Err(e) => eprintln!("could not wait for it: {e}"),
+///             Err(e) => eprintln!("could not wait for it: {}", Report::new(&e)),
 ///         }
 ///     }
 /// }

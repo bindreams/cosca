@@ -632,20 +632,26 @@ impl PidfdShutdown {
             }
         };
         let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";
-        let sent = match (&self.term, &kill) {
-            (Err(e), _) => format!(
+        // The warn says each failure in full; the returned `Unassessable` says only that it failed,
+        // for the failure is a peer or a cause of the answer.
+        let sent = |with_errors: bool| match (&self.term, &kill) {
+            (Err(e), _) if with_errors => format!(
                 "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
                 crate::error::Report(e)
             ),
+            (Err(_), _) => "sent nothing: the SIGTERM to the root through its pidfd failed".to_owned(),
             (Ok(Sent::Delivered), None) => format!("{termed}, and it exited within the grace; sent nothing else"),
             (Ok(Sent::Delivered), Some(Ok(Sent::Delivered))) => {
                 format!("{termed}, then killed the root through its pidfd after the grace, and sent nothing else")
             }
-            (Ok(Sent::Delivered), Some(Err(e))) => {
+            (Ok(Sent::Delivered), Some(Err(e))) if with_errors => {
                 format!(
                     "{termed}, then the kill of the root through its pidfd failed ({})",
                     crate::error::Report(e)
                 )
+            }
+            (Ok(Sent::Delivered), Some(Err(_))) => {
+                format!("{termed}, then the kill of the root through its pidfd failed")
             }
             (Ok(Sent::Delivered), Some(Ok(_))) => {
                 format!("{termed}, and its pidfd showed it gone after the grace; sent nothing else")
@@ -653,8 +659,8 @@ impl PidfdShutdown {
             (Ok(Sent::Gone), _) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
             (Ok(_), _) => "sent nothing: the root's handle no longer reaches it".to_owned(),
         };
-        let detail = call.skipped_detail(skip, &sent);
-        skip.why.warn(&detail);
+        let detail = call.skipped_detail(skip, &sent(false));
+        skip.why.warn(&call.skipped_detail(skip, &sent(true)));
         // The refusal's reason, and a kill that failed after a SIGTERM that did, are peers of the error
         // the call returns; the warn above says each in a line.
         let cause = skip.why.cause();

@@ -452,9 +452,7 @@ fn a_proc_whose_descriptor_names_another_directory_is_refused() {
         panic!("a /proc that names another directory must refuse the bind");
     };
     assert!(
-        crate::error::Report(&error)
-            .to_string()
-            .contains("is not this process's descriptor"),
+        crate::error::said(&error).contains("is not this process's descriptor"),
         "{error}"
     );
     assert!(

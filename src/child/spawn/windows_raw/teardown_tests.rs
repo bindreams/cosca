@@ -547,7 +547,7 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_reports_the_refusal_as_its_cl
         "{cleanup:?}"
     );
     assert!(
-        cleanup.first().to_string().starts_with("killing the child: "),
+        crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("killing the child: ")),
         "{cleanup:?}"
     );
     owner.end_with_code_zero()();
@@ -576,7 +576,7 @@ fn a_failed_spawn_teardown_with_a_failed_wait_reports_the_wait_as_its_cleanup() 
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
         matches!(&**cleanup.first(), crate::error::Error::Io(e) if e.kind() == KIND)
-            && cleanup.first().to_string().starts_with("waiting for the child: "),
+            && crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("waiting for the child: ")),
         "{cleanup:?}"
     );
     drop(unreaped);

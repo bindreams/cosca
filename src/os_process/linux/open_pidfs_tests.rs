@@ -119,7 +119,8 @@ fn a_poll_that_reports_pollerr_is_io_naming_poll() {
         .on_pidfs_ino(PID, Ok(Some(100)));
     let result = open_verified_error_with(&kernel, id(100));
     assert!(
-        matches!(&result, Err(Error::Io(e)) if e.to_string().starts_with("poll: ")),
+        matches!(&result, Err(e @ Error::Io(_))
+            if crate::error::said(e).starts_with(&crate::error::io_said("poll: "))),
         "{result:?}"
     );
 }
@@ -146,7 +147,8 @@ fn a_pidfd_whose_inode_cannot_be_read_is_io() {
         .on_pidfs_ino(PID, Err(Errno::BADF));
     let result = open_verified_error_with(&kernel, id(100));
     assert!(
-        matches!(&result, Err(Error::Io(e)) if e.to_string().starts_with("pidfs_ino: ")),
+        matches!(&result, Err(e @ Error::Io(_))
+            if crate::error::said(e).starts_with(&crate::error::io_said("pidfs_ino: "))),
         "{result:?}"
     );
 }
@@ -164,7 +166,10 @@ fn a_refused_inode_read_is_io_not_unsupported() {
         let Err(e @ Error::Io(_)) = &result else {
             panic!("{errno}: {result:?}");
         };
-        assert!(e.to_string().starts_with("pidfs_ino: "), "{errno}: {e}");
+        assert!(
+            crate::error::said(e).starts_with(&crate::error::io_said("pidfs_ino: ")),
+            "{errno}: {e:?}"
+        );
         assert_eq!(crate::error::first_os_code(e), Some(errno.raw_os_error()), "{errno}");
     }
 }

@@ -156,7 +156,7 @@ pub fn spawn_breakaway_report(addr: &str) -> ! {
             grandchild.wait().expect("reap the grandchild");
             "ok".to_owned()
         }
-        Err(e) => format!("err:{e}").replace(char::is_whitespace, "_"),
+        Err(e) => format!("err:{}", cosca::error::Report::new(&e)).replace(char::is_whitespace, "_"),
     };
     writeln!(sock, "breakaway:{verdict}").expect("report");
     sock.flush().expect("flush");

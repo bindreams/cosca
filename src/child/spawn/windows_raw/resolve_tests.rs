@@ -799,18 +799,19 @@ fn embedded_nul_in_key_is_rejected_as_invalid_input() {
 /// key or value" reports a NUL in a PROGRAM PATH as a broken environment.
 #[skuld::test]
 fn a_nul_refusal_names_the_field_that_carried_it() {
+    let said = |e: &crate::error::Error| crate::error::said(e);
     let key = build_env_block_from(&[], &[EnvOp::Set(OsString::from("a\u{0}b"), "1".into())]).unwrap_err();
-    assert!(key.to_string().contains("environment key"), "{key}");
+    assert!(said(&key).contains("environment key"), "{key:?}");
 
     let val = build_env_block_from(&[], &[EnvOp::Set("K".into(), OsString::from("a\u{0}b"))]).unwrap_err();
-    assert!(val.to_string().contains("environment value"), "{val}");
+    assert!(said(&val).contains("environment value"), "{val:?}");
 
     // The `what` really is the caller's, not a constant the two legs above happen to share.
     let other = ensure_no_nul_wide("program token", OsStr::new("a\u{0}b")).unwrap_err();
-    assert!(other.to_string().contains("program token"), "{other}");
+    assert!(said(&other).contains("program token"), "{other:?}");
     assert!(
-        !other.to_string().contains("environment"),
-        "a program token is not the environment: {other}"
+        !said(&other).contains("environment"),
+        "a program token is not the environment: {other:?}"
     );
 }
 

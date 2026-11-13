@@ -30,12 +30,15 @@ pub(crate) enum SpawnFailure {
     /// The program may have started: the child reached `exec` (on Windows, `CreateProcess` or
     /// `ShellExecuteEx` succeeded), or cosca cannot prove it did not.
     MayHaveStarted {
-        /// What failed. Never itself an [`Error::MayHaveStarted`].
-        cause: Error,
+        /// What failed. Never itself an [`Error::MayHaveStarted`]. Boxed so that a `Result` of a
+        /// `SpawnFailure` stays small (`clippy::result_large_err`).
+        cause: Box<Error>,
         /// What the failed spawn did with the child.
         fate: ChildFate,
         /// Whether the child is an elevation front (see [`Error::MayHaveStarted`]).
         wrapper_elevated: bool,
+        /// What the spawn did with the child, beyond `fate` (see [`Error::MayHaveStarted`]).
+        detail: Option<String>,
         /// The child, when the spawn hands it to the caller (see [`Error::MayHaveStarted`]).
         unreaped: Option<Box<Unreaped>>,
         /// What failed in the teardown the spawn ran on the child (see [`Error::MayHaveStarted`]).
@@ -49,11 +52,51 @@ impl SpawnFailure {
     /// with its identity, or `Unknown` (the look at it failed), or `Killed` (the wait for it failed).
     pub(crate) fn started(cause: Error, fate: ChildFate, unreaped: Option<Unreaped>) -> SpawnFailure {
         SpawnFailure::MayHaveStarted {
-            cause,
+            cause: Box::new(cause),
             fate,
             wrapper_elevated: false,
+            detail: None,
             unreaped: unreaped.map(Box::new),
             cleanup: None,
+        }
+    }
+
+    /// This failure with `detail`, what the spawn did with its child beyond its fate, if there is
+    /// any. A failure that says the program did not start has no child to say it of.
+    #[cfg(unix)]
+    pub(crate) fn with_detail(self, detail: Option<String>) -> SpawnFailure {
+        let Some(detail) = detail else {
+            return self;
+        };
+        match self {
+            SpawnFailure::MayHaveStarted {
+                cause,
+                fate,
+                wrapper_elevated,
+                detail: earlier,
+                unreaped,
+                cleanup,
+            } => {
+                debug_assert!(
+                    earlier.is_none(),
+                    "a failure's detail is set once: {earlier:?}, then {detail:?}"
+                );
+                SpawnFailure::MayHaveStarted {
+                    cause,
+                    fate,
+                    wrapper_elevated,
+                    detail: Some(detail),
+                    unreaped,
+                    cleanup,
+                }
+            }
+            other => {
+                debug_assert!(
+                    false,
+                    "a spawn that did not start has no detail of its child: {other:?}"
+                );
+                other
+            }
         }
     }
 
@@ -69,12 +112,14 @@ impl SpawnFailure {
                 cause,
                 fate,
                 wrapper_elevated,
+                detail,
                 unreaped,
                 cleanup: earlier,
             } => SpawnFailure::MayHaveStarted {
                 cause,
                 fate,
                 wrapper_elevated,
+                detail,
                 unreaped,
                 cleanup: Failures::merged(earlier, Some(cleanup)),
             },
@@ -98,12 +143,14 @@ impl SpawnFailure {
                 cause,
                 fate,
                 wrapper_elevated,
+                detail,
                 unreaped,
                 cleanup,
             } => SpawnFailure::MayHaveStarted {
-                cause: f(cause),
+                cause: Box::new(f(*cause)),
                 fate,
                 wrapper_elevated,
+                detail,
                 unreaped,
                 cleanup,
             },
@@ -117,6 +164,7 @@ impl SpawnFailure {
             SpawnFailure::MayHaveStarted {
                 cause,
                 fate,
+                detail,
                 unreaped,
                 cleanup,
                 ..
@@ -124,6 +172,7 @@ impl SpawnFailure {
                 cause,
                 fate,
                 wrapper_elevated: true,
+                detail,
                 unreaped,
                 cleanup,
             },
@@ -194,7 +243,7 @@ impl SpawnFailure {
         match self {
             SpawnFailure::MayHaveStarted {
                 cause, fate, unreaped, ..
-            } => (cause, fate, unreaped.map(|unreaped| *unreaped)),
+            } => (*cause, fate, unreaped.map(|unreaped| *unreaped)),
             SpawnFailure::NotStarted(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
             #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, .. } => {
@@ -313,13 +362,14 @@ impl From<SpawnFailure> for Error {
                 cause,
                 fate,
                 wrapper_elevated,
+                detail,
                 unreaped,
                 cleanup,
             } => {
                 debug_assert!(
-                    !matches!(cause, Error::MayHaveStarted { .. }),
+                    !matches!(*cause, Error::MayHaveStarted { .. }),
                     "a `may have started` failure's cause is itself `may have started`: {}",
-                    crate::error::Report(&cause)
+                    crate::error::Report(&*cause)
                 );
                 debug_assert!(
                     unreaped.as_ref().is_none_or(|child| match fate {
@@ -332,7 +382,8 @@ impl From<SpawnFailure> for Error {
                 Error::MayHaveStarted {
                     fate,
                     wrapper_elevated,
-                    source: std::sync::Arc::new(cause),
+                    detail,
+                    source: std::sync::Arc::new(*cause),
                     unreaped,
                     cleanup,
                 }

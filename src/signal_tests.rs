@@ -337,10 +337,7 @@ mod root_state {
         assert!(std::sync::Arc::ptr_eq(original, &copy));
         let handed = crate::error::shared_io(&copy);
         assert_eq!(crate::error::first_os_code(&handed), Some(libc::EPERM));
-        assert_eq!(
-            crate::error::Report(&handed).to_string(),
-            crate::error::Report(&**original).to_string()
-        );
+        assert_eq!(crate::error::said(&handed), crate::error::said(&**original));
     }
 
     /// Why a root's number is untrusted says this layer's words: the error of an `Unknown` root is

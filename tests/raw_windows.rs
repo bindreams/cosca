@@ -112,10 +112,12 @@ fn embedded_nul_in_commandline_is_rejected() {
         .commandline("a\u{0}b")
         .spawn()
         .unwrap_err();
-    assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
+    let cosca::error::Error::Io(io) = &e else {
+        panic!("expected an Io error, got {e:?}");
+    };
     // The refusal must name the command line. One NUL checker serves every wide string the backend
     // builds, so a message fixed to the environment would send the caller to audit `env()`.
-    assert!(e.to_string().contains("command line"), "{e}");
+    assert!(io.to_string().contains("command line"), "{io}");
 }
 
 #[cfg(windows)]
@@ -128,8 +130,10 @@ fn embedded_nul_in_cwd_is_rejected() {
         .commandline("x argv0-report")
         .current_dir(std::path::PathBuf::from("a\u{0}b"));
     let e = c.spawn().unwrap_err();
-    assert!(matches!(e, cosca::error::Error::Io(_)), "{e:?}");
-    assert!(e.to_string().contains("working directory"), "{e}");
+    let cosca::error::Error::Io(io) = &e else {
+        panic!("expected an Io error, got {e:?}");
+    };
+    assert!(io.to_string().contains("working directory"), "{io}");
 }
 
 #[cfg(windows)]

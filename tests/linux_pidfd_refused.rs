@@ -186,9 +186,11 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
             panic!("{name}: expected the group sweep to be Unsupported, got {err:?}");
         };
         assert!(op.starts_with("listing process group"), "{name}: {op}");
+        assert_eq!(detail, "the group could not be listed", "{name}");
+        let said = cosca::error::Report::new(&err).to_string();
         assert!(
-            detail.contains(&format!("pidfd_open answered {name}")),
-            "{name}: the group sweep names the refusal: {detail}"
+            said.contains(&format!("pidfd_open answered {name}")),
+            "{name}: the group sweep names the refusal: {said}"
         );
         assert_eq!(common::os_code(&err), Some(code), "{name}: the errno is the source");
         let status = child.wait().expect("reap the root");
@@ -317,11 +319,16 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_nami
             runtime.block_on(child.graceful_shutdown_tree(Duration::from_secs(30)))
         });
         match result {
-            Err(Error::Unsupported { op, detail, .. }) => {
+            Err(err @ Error::Unsupported { .. }) => {
+                let Error::Unsupported { op, detail, .. } = &err else {
+                    unreachable!("matched above")
+                };
                 assert!(op.starts_with("listing process group"), "{name}: {op}");
+                assert_eq!(detail, "the group could not be listed", "{name}");
+                let said = cosca::error::Report::new(&err).to_string();
                 assert!(
-                    detail.contains(&format!("pidfd_open answered {name}")),
-                    "{name}: the refusal is the cause: {detail}"
+                    said.contains(&format!("pidfd_open answered {name}")),
+                    "{name}: the refusal is the cause: {said}"
                 );
             }
             other => panic!("{name}: expected Unsupported, got {other:?}"),

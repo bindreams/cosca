@@ -185,7 +185,7 @@ fn a_failed_open_is_not_an_exit() {
         .split();
     let err = wait.wait().expect_err("neither member can be opened");
 
-    let said = crate::error::Report(&err).to_string();
+    let said = crate::error::said(&err);
     assert!(said.contains(&format!("pid {} was killed", first_id.pid())), "{said}");
     assert!(said.contains(&format!("pid {} was killed", second_id.pid())), "{said}");
     // The first member's error stands, with the second below it as a peer: each is named once.
@@ -299,7 +299,7 @@ fn a_root_whose_look_fails_is_named_as_the_root() {
         .wait()
         .expect_err("the root's exit cannot be observed");
 
-    let said = crate::error::Report(&err).to_string();
+    let said = crate::error::said(&err);
     assert!(
         said.contains("the root was killed, but its exit cannot be observed"),
         "{said}"

@@ -210,6 +210,52 @@ fn a_front_whose_cgroup_kill_failed_has_the_failure_as_its_cause() {
     assert_refused_by_one_read(&e, "its cgroup kill failed");
 }
 
+/// A refusal of a front whose cgroup was not killed says so and carries no failure: the tree's
+/// failure stands before it in a failed spawn's `cleanup`, so a `Report` of the spawn prints each
+/// failure once, the tree's first.
+///
+/// Mutant: the refusal repeats the tree's failure in its words.
+#[skuld::test]
+fn a_front_whose_cgroup_was_not_killed_says_so_and_the_report_prints_each_failure_once() {
+    use std::sync::Arc;
+
+    use crate::error::{ChildFate, Failures};
+
+    let refusal = super::cgroup_not_killed(Front::Sudo, PID);
+    assert!(std::error::Error::source(&refusal).is_none(), "{refusal:?}");
+    let refusal_words = refusal.to_string();
+    assert!(
+        refusal_words.contains(&format!("pid {PID} is what sudo left"))
+            && refusal_words.ends_with(" (its cgroup was not killed)"),
+        "{refusal_words}"
+    );
+
+    let tree = Error::Containment {
+        detail: "the kernel refused the write of leaf/cgroup.kill".into(),
+        source: Some(Arc::new(Error::Io(io::Error::from_raw_os_error(libc::EISDIR)))),
+    };
+    let started = Error::MayHaveStarted {
+        fate: ChildFate::Running { id: None },
+        wrapper_elevated: true,
+        detail: None,
+        source: Arc::new(Error::Io(io::Error::from_raw_os_error(libc::EPIPE))),
+        unreaped: None,
+        cleanup: Failures::collect([Arc::new(tree), Arc::new(refusal)]),
+    };
+    let epipe = io::Error::from_raw_os_error(libc::EPIPE).to_string();
+    let eisdir = io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    assert_eq!(
+        crate::error::said(&started),
+        format!(
+            "the program may have started, and its child may still be running; its teardown failed too (2 failures, \
+             in `cleanup`): {}; cleanup: [(1) process containment failed: the kernel \
+             refused the write of leaf/cgroup.kill: {}; (2) {refusal_words}]",
+            crate::error::io_said(&epipe),
+            crate::error::io_said(&eisdir)
+        )
+    );
+}
+
 /// The tracked process is the program itself, or there is no elevation: signalled like any child,
 /// with nothing read.
 #[skuld::test]
@@ -317,8 +363,8 @@ fn assert_refused_by_two_reads(error: &Error, words: &[&str], reads: [&str; 2]) 
     let Error::Several(failures) = &**source else {
         panic!("expected the two reads as a Several, got {source:?}");
     };
-    let texts: Vec<_> = failures.iter().map(|failure| failure.to_string()).collect();
-    assert_eq!(texts, reads, "{error:?}");
+    let texts: Vec<_> = failures.iter().map(|failure| crate::error::said(&**failure)).collect();
+    assert_eq!(texts, reads.map(crate::error::io_said), "{error:?}");
 }
 
 /// A front whose place cannot be read is not shown reached: refused, with every read that failed

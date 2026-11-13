@@ -71,7 +71,7 @@ fn an_identity_read_gone_takes_the_echild_path() {
 fn assert_refused_read(err: &std::io::Error, words: &str) {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     assert_eq!(crate::error::first_os_code(err), Some(libc::EPERM), "{err}");
-    let said = crate::error::Report(err).to_string();
+    let said = crate::error::said(err);
     assert!(said.contains(words), "{said}");
     assert!(!said.contains("errno"), "{said}");
 }

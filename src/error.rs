@@ -193,6 +193,20 @@ impl Failures {
 /// `#[non_exhaustive]`: the crate is still growing failure modes, so callers carry a
 /// wildcard arm rather than have each new variant break them.
 ///
+/// # Display says one layer
+///
+/// The `Display` of an error says only its own layer's words; what caused it is its
+/// [`source`](std::error::Error::source). To print a whole error, causes and every failure of a
+/// list included, use [`Report`]: `Report::new(&e)`. An [`Error::Io`] reads `an I/O operation
+/// failed`; the `io::Error` below it has the OS's words.
+///
+/// # Other failures of a call
+///
+/// A call keeps its answer's OS code whatever else failed in it. When a call had other failures,
+/// they are below a slot variant's `source()`, as the members of an [`Error::Several`]. An
+/// [`Error::Io`] has no slot for them, so the call's answer stays the `Io` and its other failures
+/// are logged at warn.
+///
 /// # The OS code
 ///
 /// The OS code of a failure may sit on an `io::Error` down the `source()` chain of any variant,
@@ -204,7 +218,7 @@ impl Failures {
 #[derive(Debug)]
 pub enum Error {
     Quote(QuoteError),
-    /// An I/O error.
+    /// An I/O error. Its `Display` is fixed; the [`io::Error`](std::io::Error) is its `source()`.
     Io(std::io::Error),
     /// An operation isn't available on this platform / in this build.
     ///
@@ -236,8 +250,8 @@ pub enum Error {
     /// operation:
     ///
     /// - from [`Process::open`](crate::Process::open) and [`open_pid`](crate::Process::open_pid)
-    ///   (and their `tokio` twins) it is [`Error::Io`] prefixed with the call's name
-    ///   (`pidfd_open:`, `pidfs_ino:`, `poll:`); the inode read (`pidfs_ino`) and `poll` of a
+    ///   (and their `tokio` twins) it is [`Error::Io`] whose `io::Error` is named for the call
+    ///   (`pidfd_open`, `pidfs_ino`, `poll`), with the errno below it; the inode read (`pidfs_ino`) and `poll` of a
     ///   pidfd are never refusals;
     /// - from an identity read or a tree walk it is [`Error::Unassessable`] carrying the errno.
     ///
@@ -369,7 +383,8 @@ pub enum Error {
         source: Option<Arc<Error>>,
     },
     /// A spawn failed, and the program may have started: retrying it may run it twice. `source` is
-    /// what failed, and `fate` is what the failed spawn did with its child.
+    /// what failed, and `fate` is what the failed spawn did with its child (`detail` says more of it,
+    /// where `fate` does not say it all).
     ///
     /// Every error a spawn returns answers whether the program could have started, meaning the
     /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded). This
@@ -407,6 +422,10 @@ pub enum Error {
         /// program may outlive it: `fate` is then about the front only (see [`ChildFate`]), and the
         /// message says so. A pkexec child is the program itself, so this is `false` for it.
         wrapper_elevated: bool,
+        /// What the failed spawn did with its child, beyond `fate`: which front the child is and why
+        /// it was sent nothing, or that the elevated child was terminated. `None` when `fate` says it
+        /// all. `Display` says it after the fate; the cause is `source`.
+        detail: Option<String>,
         source: Arc<Error>,
         /// The child itself, when the spawn could not end it and hands it to the caller; see
         /// [`Unreaped`](crate::Unreaped) for how to settle it. Then `fate` is the one of a child that
@@ -419,7 +438,7 @@ pub enum Error {
         /// failed: a refused kill, a failed wait, the members a tree kill left. In the order they
         /// happened. Not in `source` (the cause alone); they come beside it, as an exception's
         /// context does beside its cause. `Display` says that the teardown failed too and how many
-        /// failures are here; `Report` prints them in full.
+        /// failures are here; [`Report`] prints them in full.
         cleanup: Option<Failures>,
     },
 }
@@ -427,8 +446,8 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Quote(e) => write!(f, "argument parsing failed: {e}"),
-            Error::Io(e) => write!(f, "{e}"),
+            Error::Quote(_) => f.write_str("argument parsing failed"),
+            Error::Io(_) => f.write_str("an I/O operation failed"),
             Error::Unsupported {
                 op, platform, detail, ..
             } => write!(f, "{op} is not supported on {platform}: {detail}"),
@@ -455,7 +474,7 @@ impl std::fmt::Display for Error {
             Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
-                source,
+                detail,
                 cleanup,
                 ..
             } => {
@@ -464,12 +483,14 @@ impl std::fmt::Display for Error {
                     "the program may have started, and {fate}{}",
                     elevated_note(fate, *wrapper_elevated)
                 )?;
-                match cleanup.as_ref().map(|failures| failures.iter().len()) {
-                    None => {}
-                    Some(1) => f.write_str("; its teardown failed too (1 failure, in `cleanup`)")?,
-                    Some(n) => write!(f, "; its teardown failed too ({n} failures, in `cleanup`)")?,
+                if let Some(detail) = detail {
+                    write!(f, "; {detail}")?;
                 }
-                write!(f, ": {source}")
+                match cleanup.as_ref().map(|failures| failures.iter().len()) {
+                    None => Ok(()),
+                    Some(1) => f.write_str("; its teardown failed too (1 failure, in `cleanup`)"),
+                    Some(n) => write!(f, "; its teardown failed too ({n} failures, in `cleanup`)"),
+                }
             }
         }
     }
@@ -610,8 +631,8 @@ fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
     }
 }
 
-/// `source` with `context` prepended to its message, of `source`'s own kind, and kept as the new
-/// error's [`source`](std::error::Error::source), so its OS code survives: several codes share one
+/// An `io::Error` of `source`'s own kind that says `context` and nothing else, with `source` as its
+/// [`source`](std::error::Error::source), so its OS code survives: several codes share one
 /// [`std::io::ErrorKind`], and the code is what tells a caller which failure it was.
 pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> std::io::Error {
     std::io::Error::new(
@@ -679,7 +700,32 @@ pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option
         .find_map(std::io::Error::raw_os_error)
 }
 
-/// An error as one line: every layer of its [`chain`], each layer's `Display` joined with `": "`.
+/// The [`Error`] a layer of a chain is: an `Error`, or the `Arc<Error>` a holder keeps its cause as
+/// and lends as its `source()`. The `Arc` forwards its `Display` and `source()` to the error it
+/// holds, so it is that error's layer.
+fn cosca_error<'a>(layer: &'a (dyn std::error::Error + 'static)) -> Option<&'a Error> {
+    layer
+        .downcast_ref::<Error>()
+        .or_else(|| layer.downcast_ref::<Arc<Error>>().map(|held| &**held))
+}
+
+/// An error as one line: every layer of its `source()` chain, each layer's `Display` joined with
+/// `": "`. It is the way to print a whole cosca [`Error`]: `{e}` says one layer, and a `source()`
+/// walk shows only the first member of a list and never `cleanup`.
+///
+/// It takes any error, including a consumer's own whose chain holds a cosca error. A list is found
+/// only on a layer held as an [`Error`] or an `Arc<Error>`, not behind a `Box<Error>`: such a layer
+/// prints as its `Display` and its `source()`.
+///
+/// ```
+/// use cosca::error::{Error, Report};
+///
+/// let e = Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+/// assert_eq!(e.to_string(), "an I/O operation failed");
+/// assert_eq!(Report::new(&e).to_string(), "an I/O operation failed: entity not found");
+/// ```
+///
+/// The format, for a list:
 ///
 /// A layer that holds a [`Failures`] ([`Error::Several`], [`Error::MembersLeft`]) is followed by
 /// every member's whole chain, `(1) <chain>; (2) <chain>`, and the walk of the layer's own `source`
@@ -693,9 +739,15 @@ pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option
 /// the cause reads in brackets, as it does in a member. As a member of an outer list, the cause and
 /// the cleanup together read in brackets (`(1) <words>: [<cause>; cleanup: [...]]; (2) ...`), so the
 /// outer `;` stays the outer list's.
-pub(crate) struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
+#[derive(Debug)]
+pub struct Report<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
-impl Report<'_> {
+impl<'a> Report<'a> {
+    /// A [`Report`] of `error`, printed whole by its `Display`.
+    pub fn new(error: &'a (dyn std::error::Error + 'static)) -> Self {
+        Report(error)
+    }
+
     fn write(
         error: &(dyn std::error::Error + 'static),
         nested: bool,
@@ -706,11 +758,12 @@ impl Report<'_> {
                 f.write_str(": ")?;
             }
             write!(f, "{layer}")?;
+            let own = cosca_error(layer);
             if let Some(Error::MayHaveStarted {
                 source,
                 cleanup: Some(cleanup),
                 ..
-            }) = layer.downcast_ref::<Error>()
+            }) = own
             {
                 f.write_str(if nested { ": [" } else { ": " })?;
                 Report::write(&**source, true, f)?;
@@ -718,14 +771,14 @@ impl Report<'_> {
                 Report::write_members(cleanup, f)?;
                 return f.write_str(if nested { "]]" } else { "]" });
             }
-            let Some(failures) = layer.downcast_ref::<Error>().and_then(Error::failures) else {
+            let Some(failures) = own.and_then(Error::failures) else {
                 continue;
             };
             f.write_str(if nested { ": [" } else { ": " })?;
             Report::write_members(failures, f)?;
             if let Some(Error::MembersLeft {
                 others: Some(others), ..
-            }) = layer.downcast_ref::<Error>()
+            }) = own
             {
                 f.write_str("; others: ")?;
                 Report::write(&**others, true, f)?;
@@ -754,6 +807,18 @@ impl std::fmt::Display for Report<'_> {
     }
 }
 
+/// Test-only: the [`Report`] text of `error`.
+#[cfg(test)]
+pub(crate) fn said(error: &(dyn std::error::Error + 'static)) -> String {
+    Report::new(error).to_string()
+}
+
+/// Test-only: the [`Report`] text of an [`Error::Io`] whose `io::Error` says `cause`.
+#[cfg(test)]
+pub(crate) fn io_said(cause: impl std::fmt::Display) -> String {
+    said(&Error::Io(std::io::Error::other(cause.to_string())))
+}
+
 #[derive(Debug)]
 struct IoContext {
     context: String,
@@ -762,7 +827,7 @@ struct IoContext {
 
 impl std::fmt::Display for IoContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.context, self.source)
+        f.write_str(&self.context)
     }
 }
 
@@ -880,7 +945,7 @@ impl Error {
     /// [`Error::Several`], or its one cause; none when it has no cause.
     #[cfg(test)]
     pub(crate) fn failures_below(&self) -> Vec<&Error> {
-        match std::error::Error::source(self).and_then(|source| source.downcast_ref::<Error>()) {
+        match std::error::Error::source(self).and_then(cosca_error) {
             Some(Error::Several(list)) => list.iter().map(|member| &**member).collect(),
             Some(cause) => vec![cause],
             None => Vec::new(),
@@ -950,12 +1015,14 @@ impl Error {
             Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
+                detail,
                 source,
                 unreaped,
                 cleanup,
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
+                detail,
                 source: joined(Some(source), peers),
                 unreaped,
                 cleanup,
@@ -1047,16 +1114,15 @@ impl Error {
         chain(self).filter_map(|s| s.downcast_ref::<std::io::Error>())
     }
 
-    /// This error with `note` appended to what it says, its variant and kind kept: a caller that
-    /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
-    /// original error as the [`source`](std::error::Error::source), so the OS code stays where the
-    /// walk described on [`Error`] finds it. A compound error ([`Error::MemberNotKilled`],
-    /// [`Error::MembersLeft`], [`Error::Several`]) has no detail of its own to carry a note: it is
-    /// asserted in debug never to be given one.
+    /// This error with `note` added, variant and kind kept. A variant with a `detail` gets the note
+    /// after it; an [`Error::Io`] gets an [`io_context`] layer, so the OS code stays findable. A
+    /// spawn's own account of its child belongs in `MayHaveStarted.detail`, not a note. A compound
+    /// error ([`Error::MemberNotKilled`], [`Error::MembersLeft`], [`Error::Several`]) has no
+    /// `detail`: it is asserted in debug never to be given a note.
     pub(crate) fn with_note(self, note: &str) -> Error {
         let append = |detail: String| format!("{detail}; {note}");
         match self {
-            Error::Io(source) => Error::Io(io_note(note.to_owned(), source)),
+            Error::Io(source) => Error::Io(io_context(note, source)),
             Error::Unsupported {
                 op,
                 platform,
@@ -1103,23 +1169,17 @@ impl Error {
             Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
+                detail,
                 source,
                 unreaped,
                 cleanup,
             } => Error::MayHaveStarted {
                 fate,
                 wrapper_elevated,
-                cleanup,
-                // A freshly built cause has one owner and takes the note; a shared one cannot be
-                // rewritten, so in release it stays as it is.
-                source: match Arc::try_unwrap(source) {
-                    Ok(owned) => Arc::new(owned.with_note(note)),
-                    Err(shared) => {
-                        debug_assert!(false, "a spawn's cause has one owner: {shared:?}");
-                        shared
-                    }
-                },
+                detail: Some(detail.map_or_else(|| note.to_owned(), append)),
+                source,
                 unreaped,
+                cleanup,
             },
             Error::Quote(e) => {
                 debug_assert!(
@@ -1130,31 +1190,6 @@ impl Error {
                 Error::Quote(e)
             }
         }
-    }
-}
-
-/// `source` with `note` after its message, of `source`'s own kind, and kept as the new error's
-/// [`source`](std::error::Error::source).
-fn io_note(note: String, source: std::io::Error) -> std::io::Error {
-    std::io::Error::new(source.kind(), IoNote { note, source })
-}
-
-/// An I/O error with a note after its message; the error itself is the source.
-#[derive(Debug)]
-struct IoNote {
-    note: String,
-    source: std::io::Error,
-}
-
-impl std::fmt::Display for IoNote {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}; {}", self.source, self.note)
-    }
-}
-
-impl std::error::Error for IoNote {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
     }
 }
 

@@ -236,10 +236,8 @@ pub(crate) fn failed_password_write_detail<R>(
         panic!("expected MayHaveStarted, got {error:?}");
     };
     let cleanup = cleanup.clone();
-    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, release);
-    let Error::Elevation { detail, .. } = err else {
-        panic!("expected an Elevation error, got {err:?}");
-    };
+    let detail = crate::test_child::detail_of(&error);
+    let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, release);
     (detail, cleanup, fate, handed_back)
 }
 
@@ -387,7 +385,10 @@ fn graceful_shutdown_of_a_front_whose_grace_wait_failed_is_unkillable_with_the_w
             kind: ElevationErrorKind::Unkillable,
             source: Some(cause),
             ..
-        } => assert!(cause.to_string().contains("forced grace-watch failure"), "{err:?}"),
+        } => assert!(
+            crate::error::said(&**cause).contains("forced grace-watch failure"),
+            "{err:?}"
+        ),
         other => panic!("expected Unkillable with the watch failure as its cause, got {other:?}"),
     }
     assert_ends_unsignalled(&child, stdin);
@@ -578,26 +579,26 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
     let gates = crate::elevation::front::seams::count_kill_gates();
-    let (err, fate) = crate::child::spawn::finish_elevated(
-        child,
-        Err(Error::Elevation {
-            kind: ElevationErrorKind::AuthFailed,
-            detail: "forced password-write failure".into(),
-            source: None,
-        }),
-    )
-    .expect_err("a failed write fails the spawn")
-    .expect_may_have_started_with();
+    let err = Error::from(
+        crate::child::spawn::finish_elevated(
+            child,
+            Err(Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+                source: None,
+            }),
+        )
+        .expect_err("a failed write fails the spawn"),
+    );
+    let detail = crate::test_child::detail_of(&err);
+    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     assert_eq!(
         fate,
         crate::error::ChildFate::Reaped,
         "the non-blocking look reaps the exited front"
     );
-    assert_eq!(gates.count(), 1, "{err}");
+    assert_eq!(gates.count(), 1, "{detail}");
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
-    let Error::Elevation { detail, .. } = &err else {
-        panic!("expected an Elevation error, got {err:?}");
-    };
     assert!(detail.contains("the elevated child had already exited"), "{detail}");
     assert!(!detail.contains("terminated"), "{detail}");
 }
@@ -629,19 +630,17 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
     let cleanup = crate::test_child::cleanup_of(&error);
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
-        cleanup.first().to_string().contains("forced reap failure"),
+        crate::error::said(&**cleanup.first()).contains("forced reap failure"),
         "{cleanup:?}"
     );
-    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
+    let detail = crate::test_child::detail_of(&error);
+    let (_, fate, handed_back) = crate::test_child::expect_may_have_started_parts(error, ());
     assert_eq!(fate, crate::error::ChildFate::Killed, "the exit was not collected");
     // Not shown collected, so handed back. The forced failure reaps first, so settling it finds it
     // reaped elsewhere and returns at once.
     handed_back.unreaped();
     drop(handed_back);
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
-    let Error::Elevation { detail, .. } = &err else {
-        panic!("expected an Elevation error, got {err:?}");
-    };
     assert!(detail.contains("(it had already exited): the wait failed"), "{detail}");
     assert!(
         !detail.contains("forced reap failure"),
@@ -685,14 +684,14 @@ fn terminate_of_a_live_sudo_front_is_sent() {
 }
 
 /// Spawns of a `cat` marked as an elevation-derived `sudo` front, in `contain` mode if any, that fail
-/// after their fork: once in the attach, once in the identity check. Returns each failure with the
-/// child's pid and the child it handed back, if it did. The failed spawn closes the `cat`'s stdin, so
-/// a front left alone exits 0.
+/// after their fork: once in the attach, once in the identity check. Returns each failure's cause and
+/// `detail` (what the spawn did with the front) with the child's pid and the child it handed back, if
+/// it did. The failed spawn closes the `cat`'s stdin, so a front left alone exits 0.
 #[cfg(target_os = "linux")]
 pub(crate) fn failed_front_spawns(
     contain: Option<ContainMode>,
     spawn: impl Fn(&mut Command) -> Result<(), Error>,
-) -> [(Error, u32, crate::test_child::HandedBack<()>); 2] {
+) -> [(Error, String, u32, crate::test_child::HandedBack<()>); 2] {
     use crate::child::spawn::fault;
     // Each arm, and whether it comes after the identity read, which then names the front.
     let arms: [(fn(bool), bool); 2] = [
@@ -710,8 +709,9 @@ pub(crate) fn failed_front_spawns(
         let err = spawn(&mut cmd);
         force_arm(false);
         // Both arms come after `exec`.
-        let (err, fate, handed_back) =
-            crate::test_child::expect_may_have_started_parts(err.expect_err("the forced arm fails the spawn"), ());
+        let err = err.expect_err("the forced arm fails the spawn");
+        let detail = crate::test_child::detail_of(&err);
+        let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, ());
         let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
             panic!("the seam must capture a resolved identity");
         };
@@ -724,7 +724,7 @@ pub(crate) fn failed_front_spawns(
             }
         };
         assert_eq!(fate, expected, "{err}");
-        (err, id.pid(), handed_back)
+        (err, detail, id.pid(), handed_back)
     })
 }
 
@@ -746,22 +746,21 @@ pub(crate) fn reap(pid: u32) -> Option<std::process::ExitStatus> {
     Some(std::os::unix::process::ExitStatusExt::from_raw(raw))
 }
 
-/// The two failures keep their variants (an attach's `Containment`, an identity check's `Io`) and
-/// carry the front's fate in their text, `fate`.
+/// The two failures' causes are an attach's `Containment` and an identity check's `Io`, and their
+/// `detail` carries the front's fate, `fate`.
 #[cfg(target_os = "linux")]
 #[track_caller]
-pub(crate) fn assert_noted(failures: &[(Error, u32, crate::test_child::HandedBack<()>); 2], fate: &str) {
-    let [(attach, attach_pid, _), (identity, identity_pid, _)] = failures;
+pub(crate) fn assert_noted(failures: &[(Error, String, u32, crate::test_child::HandedBack<()>); 2], fate: &str) {
+    let [(attach, attach_detail, attach_pid, _), (identity, identity_detail, identity_pid, _)] = failures;
     assert!(
         matches!(attach, Error::Containment { .. }),
-        "the attach failure keeps its variant: {attach:?}"
+        "the attach failure's cause is a Containment: {attach:?}"
     );
     assert!(
         matches!(identity, Error::Io(_)),
-        "the identity failure keeps its variant: {identity:?}"
+        "the identity failure's cause is an Io: {identity:?}"
     );
-    for (err, pid) in [(attach, attach_pid), (identity, identity_pid)] {
-        let text = err.to_string();
+    for (text, pid) in [(attach_detail, attach_pid), (identity_detail, identity_pid)] {
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(text.contains(fate), "{text}");
     }
@@ -779,7 +778,7 @@ fn a_failed_spawn_hands_back_an_elevation_front_and_says_so() {
         &failures,
         "the elevated program may be running; handed back to the caller in the error",
     );
-    for (_, pid, handed_back) in failures {
+    for (_, _, pid, handed_back) in failures {
         assert_eq!(handed_back.unreaped().pid(), Some(pid));
         // The failed spawn closed the front's stdin, so it exits by itself, unsignalled.
         let status = handed_back.wait();
@@ -852,7 +851,7 @@ fn a_pkexec_childs_refused_escalation_is_unkillable_as_for_kill() {
     assert!(
         matches!(&below[..], [Error::Io(e), watch]
             if e.kind() == std::io::ErrorKind::PermissionDenied
-                && watch.to_string().contains("forced grace-watch failure")),
+                && crate::error::said(*watch).contains("forced grace-watch failure")),
         "{below:?}"
     );
     assert_eq!(
@@ -924,13 +923,15 @@ impl Drop for AttachFails {
     }
 }
 
-/// `err` is a failed attach that left the front `pid` running and unreaped, and the log says the
-/// attach failed, not that its identity could not be read: it was verified.
+/// `err` is a failed attach whose `detail` says it left the front `pid` running and unreaped, and the
+/// log says the attach failed, not that its identity could not be read: it was verified.
 #[cfg(target_os = "macos")]
 #[track_caller]
-pub(crate) fn assert_attach_failure_left_the_front(err: &Error, pid: u32, mark: usize) {
-    assert!(matches!(err, Error::Containment { .. }), "the variant is kept: {err:?}");
-    let text = err.to_string();
+pub(crate) fn assert_attach_failure_left_the_front(err: &Error, text: &str, pid: u32, mark: usize) {
+    assert!(
+        matches!(err, Error::Containment { .. }),
+        "the cause is a Containment: {err:?}"
+    );
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
     assert!(text.contains("; left unreaped"), "{text}");
     assert!(
@@ -952,14 +953,14 @@ pub(crate) fn assert_attach_failure_left_the_front(err: &Error, pid: u32, mark: 
 fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (err, id, fate) = fail_a_front_spawn(|_| {}, fail_the_attach, |cmd| cmd.spawn().map(drop));
+    let (err, detail, id, fate) = fail_a_front_spawn(|_| {}, fail_the_attach, |cmd| cmd.spawn().map(drop));
     // The attach comes after the identity read, so the front is named by it.
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: Some(id) },
         "the front is left running"
     );
-    assert_attach_failure_left_the_front(&err, id.pid(), mark);
+    assert_attach_failure_left_the_front(&err, &detail, id.pid(), mark);
 }
 
 /// macOS: an identity check that found the front gone, reaped by someone else, says it could not be
@@ -967,13 +968,13 @@ fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_an_identity_check_that_found_the_front_gone_does_not_claim_it_unreaped() {
-    let (err, _id, fate) = fail_a_front_spawn(|_| {}, identity_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
+    let (_, detail, _id, fate) = fail_a_front_spawn(|_| {}, identity_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
     assert_eq!(
         fate,
         crate::error::ChildFate::Gone,
         "the check found it reaped by someone else"
     );
-    assert_noted_unaccounted(&err);
+    assert_noted_unaccounted(&detail);
 }
 
 /// While it lives, this thread's identity checks find the spawned child gone.
@@ -995,11 +996,11 @@ impl Drop for IdentityFindsGone {
     }
 }
 
-/// `err` notes a front that could not be waited on, and never says it is left unreaped.
+/// `text`, the `detail` of a failed spawn, notes a front that could not be waited on, and never says
+/// it is left unreaped.
 #[cfg(target_os = "macos")]
 #[track_caller]
-pub(crate) fn assert_noted_unaccounted(err: &Error) {
-    let text = err.to_string();
+pub(crate) fn assert_noted_unaccounted(text: &str) {
     assert!(text.contains("what sudo left"), "{text}");
     assert!(text.contains("could not be waited on"), "{text}");
     assert!(!text.contains("left unreaped"), "{text}");
@@ -1021,14 +1022,14 @@ fn an_unverified_childs_fate_follows_its_identity() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
-    let (err, id, fate) = fail_a_front_spawn(|_| {}, fail_the_report_read, |cmd| cmd.spawn().map(drop));
+    let (err, detail, id, fate) = fail_a_front_spawn(|_| {}, fail_the_report_read, |cmd| cmd.spawn().map(drop));
     // No unique id was read, so no identity names it.
     assert_eq!(
         fate,
         crate::error::ChildFate::Running { id: None },
         "the front is left running"
     );
-    assert_unadopted_front_noted(&err, id.pid());
+    assert_unadopted_front_noted(&err, &detail, id.pid());
 }
 
 /// macOS: a contained spawn whose check of the front's identity is refused (`Unknown`) cannot attach
@@ -1038,7 +1039,7 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_contained_front_whose_identity_is_refused_is_left_and_noted() {
-    let (err, id, fate) = fail_a_front_spawn(
+    let (err, detail, id, fate) = fail_a_front_spawn(
         |cmd| _ = cmd.contain(),
         refuse_the_identity,
         |cmd| cmd.spawn().map(drop),
@@ -1049,7 +1050,7 @@ fn macos_a_contained_front_whose_identity_is_refused_is_left_and_noted() {
         crate::error::ChildFate::Running { id: None },
         "the front is left running"
     );
-    assert_unadopted_front_noted(&err, id.pid());
+    assert_unadopted_front_noted(&err, &detail, id.pid());
 }
 
 /// While it lives, this thread's reads of a spawned child's own unique-id report fail.
@@ -1083,14 +1084,14 @@ impl Drop for RefusedIdentity {
 }
 
 /// Spawns, through `spawn` and with `force` armed, a `cat` front, `configure`d, whose stdin is a pipe this function
-/// owns, and returns the spawn's error with the front's pid once the front has been shown to end
-/// unsignalled, after its stdin closed.
+/// owns, and returns the spawn's cause and `detail` with the front's pid once the front has been shown
+/// to end unsignalled, after its stdin closed.
 #[cfg(target_os = "macos")]
 pub(crate) fn fail_a_front_spawn<G>(
     configure: impl FnOnce(&mut Command),
     force: impl FnOnce() -> G,
     spawn: impl FnOnce(&mut Command) -> Result<(), Error>,
-) -> (Error, crate::identity::ProcessId, crate::error::ChildFate) {
+) -> (Error, String, crate::identity::ProcessId, crate::error::ChildFate) {
     use std::os::fd::OwnedFd;
 
     use crate::child::spawn::fault;
@@ -1105,6 +1106,7 @@ pub(crate) fn fail_a_front_spawn<G>(
         spawn(&mut cmd).expect_err("the forced failure fails the spawn")
     };
     // Every failure this forces comes after the front ran.
+    let detail = crate::test_child::detail_of(&err);
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the spawn captured the child") else {
         panic!("the spawn must capture a resolved identity");
@@ -1112,18 +1114,18 @@ pub(crate) fn fail_a_front_spawn<G>(
     drop(writer);
     let status = reap(id.pid()).expect("the front was left unreaped");
     assert!(status.success(), "the front was signalled: {status:?}");
-    (err, id, fate)
+    (err, detail, id, fate)
 }
 
-/// `err` keeps its `Unassessable` variant, and notes that the front `pid` is left unreaped.
+/// `err`, the cause, is an `Unassessable`, and `text`, the `detail`, notes that the front `pid` is left
+/// unreaped.
 #[cfg(target_os = "macos")]
 #[track_caller]
-pub(crate) fn assert_unadopted_front_noted(err: &Error, pid: u32) {
+pub(crate) fn assert_unadopted_front_noted(err: &Error, text: &str, pid: u32) {
     assert!(
         matches!(err, Error::Unassessable { .. }),
-        "the variant is kept: {err:?}"
+        "the cause is an Unassessable: {err:?}"
     );
-    let text = err.to_string();
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
     assert!(
         text.contains("the elevated program may be running; left unreaped"),

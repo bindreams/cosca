@@ -306,7 +306,7 @@ fn a_refused_has_exited_read_keeps_its_errno_and_kind_and_words_none() {
     let err = crate::identity::has_exited_error(77, libc::EPERM);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
-    let said = crate::error::Report(&err).to_string();
+    let said = crate::error::said(&err);
     assert!(!said.contains("errno"), "{said}");
 }
 

@@ -745,7 +745,7 @@ fn macos_attach_failure_teardown_returns_its_failures_for_the_cleanup() {
             .all(|failure| matches!(&**failure, crate::error::Error::Io(_))),
         "{failures:?}"
     );
-    let texts: Vec<String> = failures.iter().map(|failure| failure.to_string()).collect();
+    let texts: Vec<String> = failures.iter().map(|failure| crate::error::said(&**failure)).collect();
     assert!(
         texts[0].contains("killing the child") && texts[1].contains("looking at the child's exit"),
         "each failure names its step: {texts:?}"

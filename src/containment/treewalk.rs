@@ -668,7 +668,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     } else {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: left,
-            root: root_left,
+            root: root_left.map(Box::new),
             resolved,
         }))
     };

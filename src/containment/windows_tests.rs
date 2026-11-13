@@ -968,11 +968,7 @@ fn fail_win32_keeps_the_win32_code_and_kind() {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
     assert_eq!(err.raw_os_error(), None, "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(ERROR_ACCESS_DENIED), "{err:?}");
-    assert!(
-        err.to_string()
-            .starts_with("ResumeThread failed for thread 1 of pid 9: "),
-        "{err}"
-    );
+    assert_eq!(err.to_string(), "ResumeThread failed for thread 1 of pid 9");
 }
 
 /// A tie in creation times is cosca's finding, not a failed call: no OS code.
@@ -1074,11 +1070,7 @@ fn process_pid_of_failure_carries_the_win32_code() {
         std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE).kind(),
         "{err:?}"
     );
-    assert!(
-        err.to_string()
-            .starts_with("GetProcessId failed on the child's handle: "),
-        "{err}"
-    );
+    assert_eq!(err.to_string(), "GetProcessId failed on the child's handle");
 }
 
 /// A handle that names no process breaks the caller's contract. Debug builds assert it.
@@ -1475,7 +1467,7 @@ fn attach_job_whose_resume_and_job_kill_both_fail_returns_the_kill_as_cleanup() 
         "{warns:?}"
     );
     assert!(
-        cleanup.first().to_string().contains("terminating the job"),
+        crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("terminating the job: ")),
         "the cleanup member names its step: {cleanup:?}"
     );
     drop(kill_failure);

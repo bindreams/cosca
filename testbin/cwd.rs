@@ -156,7 +156,7 @@ mod probe {
         match cmd.output() {
             Ok(out) => Ok((out.status.success(), out.stdout)),
             Err(cosca::error::Error::Io(e)) => Err(e),
-            Err(other) => Err(std::io::Error::other(other.to_string())),
+            Err(other) => Err(std::io::Error::other(cosca::error::Report::new(&other).to_string())),
         }
     }
 

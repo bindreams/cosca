@@ -810,7 +810,7 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
             Err(Error::Unsupported {
                 op: format!("listing process group {pgid}"),
                 platform: std::env::consts::OS,
-                detail: source.to_string(),
+                detail: "the group could not be listed".to_owned(),
                 source: Some(Error::io_cause(source)),
             })
         }

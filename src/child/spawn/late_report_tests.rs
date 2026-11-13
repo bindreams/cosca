@@ -116,7 +116,8 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
     assert_eq!(fate, ChildFate::Reaped, "a late child is killed and reaped");
     assert_kill_sent(pid, &sent.entries());
     assert!(is_reaped(pid), "nothing is left to wait for");
-    assert!(err.to_string().contains("exec cannot be confirmed"), "{err}");
+    let said = crate::error::said(&err);
+    assert!(said.contains("exec cannot be confirmed"), "{said}");
     assert_one_warn(pid, mark, &[SAID_REAPED], &[SAID_REFUSED_RUNNING, SAID_NOT_SENT]);
 }
 
@@ -204,7 +205,8 @@ fn macos_sync_spawn_with_fds_0_and_1_closed_tears_down_a_child_whose_report_came
     drop(first);
     let err = spawned.expect_err("a child whose exec std could not see is not adopted");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
-    assert!(err.to_string().contains("exec cannot be confirmed"), "{err}");
+    let said = crate::error::said(&err);
+    assert!(said.contains("exec cannot be confirmed"), "{said}");
     assert_eq!(fate, ChildFate::Reaped, "the child is torn down through its id");
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
@@ -306,7 +308,8 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
         let _late = unique_report::seams::find_the_report_unwritten();
         cmd.spawn().expect_err("a late front is not adopted")
     };
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let said = crate::test_child::detail_of(&err);
+    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     assert_eq!(fate, ChildFate::Running { id: None }, "a front is left running");
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
@@ -320,7 +323,7 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
         &["elevation front", "left unreaped", ZOMBIE],
         &["was sent SIGKILL", SAID_REFUSED_RUNNING, SAID_NOT_SENT],
     );
-    assert!(err.to_string().contains("; left unreaped"), "{err}");
+    assert!(said.contains("; left unreaped"), "{said}");
     // The writer stays open until the reap: closing it would let the child exit by itself.
     end_unsignalled_and_reap(pid);
     drop(writer);
@@ -524,9 +527,7 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
     let cleanup = cleanup.expect("the failed sweep is the cleanup");
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
-        crate::error::Report(&**cleanup.first())
-            .to_string()
-            .contains("test fault injected"),
+        crate::error::said(&**cleanup.first()).contains("test fault injected"),
         "{cleanup:?}"
     );
 }
@@ -594,13 +595,13 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
         id: None,
         sweeps: vec![Err(Unkilled {
             members: Vec::new(),
-            root: Some(crate::error::Error::MemberNotKilled {
+            root: Some(Box::new(crate::error::Error::MemberNotKilled {
                 pid: 4242,
                 source: std::sync::Arc::new(crate::error::Error::Containment {
                     detail: "refused".into(),
                     source: None,
                 }),
-            }),
+            })),
             resolved: Vec::new(),
         })],
         notes: Vec::new(),

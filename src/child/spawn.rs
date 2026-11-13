@@ -175,7 +175,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         kill
     });
     let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
-    let tree_failure_warned = tree.as_ref().and_then(TreeKillOutcome::incomplete_for_log);
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let pid = child.pid();
     let (root_note, torn) = if view.unpinned_root() {
@@ -201,11 +200,10 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     .map(|()| crate::signal::Sent::Delivered)
             }
             // No kill reached the cgroup: refused as `kill` refuses, naming why.
-            crate::elevation::front::Gate::CgroupOnly(front) => Err(crate::elevation::front::cgroup_not_killed(
-                front,
-                child.pid(),
-                tree_failure.as_deref(),
-            )),
+            // The tree's failure, if there is one, is the cleanup's entry before this refusal.
+            crate::elevation::front::Gate::CgroupOnly(front) => {
+                Err(crate::elevation::front::cgroup_not_killed(front, child.pid()))
+            }
             crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
             gate => child.kill_sent_gated(gate),
         };
@@ -305,7 +303,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 tree_note.clear();
                 // The tree was killed after all: its first failure is not the error's.
                 tree_failures.clear();
-                report.tree = tree_failure_warned.as_ref().map(|first| {
+                report.tree = tree_failure.as_ref().map(|first| {
                     format!(
                         "tree teardown after a failed password write needed the drop's tree kill, made early \
                          ({subject}): the cleanup's kill failed: {first}"
@@ -324,12 +322,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     "; the drop's tree kill, made early, failed too ({})",
                     crate::error::Report(&*again)
                 );
+                // Its failure is the cleanup's entry after the first's: the note says nothing of it.
                 early_failures.push(Arc::clone(&again));
-                Some((
-                    "; the drop's tree kill, made early, failed too".to_owned(),
-                    added_warned,
-                    Err(again),
-                ))
+                Some((String::new(), added_warned, Err(again)))
             }
         };
         if let Some((added, added_warned, again)) = more {
@@ -353,7 +348,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     child.reported = warned;
     let behind_front = child.front().is_some();
     let unreaped = hands_back.then(|| child.into_unreaped());
-    // The password write's failure is the cause, with what the cleanup did said after it. What failed
+    // The password write's failure is the cause, with what the cleanup did in the `detail`. What failed
     // in the cleanup is beside it, in the order it happened: the tree's first kill, the root's refused
     // kill or failed wait, then the tree's kill made early.
     let cleanup = Failures::merged(
@@ -361,14 +356,15 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         Failures::collect(early_failures),
     );
     Err(failed_after_the_spawn(
-        write_err.with_note(&format!("{root_note}{tree_note}")),
+        write_err,
         Torn {
             fate,
             unreaped,
             cleanup,
         },
         behind_front,
-    ))
+    )
+    .with_detail(Some(format!("{root_note}{tree_note}"))))
 }
 
 /// What [`finish_elevated`] says of a root its delivered kill reached, once the wait for it ended as
@@ -463,14 +459,11 @@ pub(crate) fn report_tree_teardown(
     use crate::containment::dispatch::SettleOutcome;
 
     match tree {
-        // The failure is the error's `cleanup`; the note says only what was done, and the warn
-        // carries the failure's whole chain.
+        // The failure is the error's `cleanup`, whose entry names the kill that failed: the note adds
+        // nothing, and the warn carries the failure's whole chain.
         Some(Err(e)) => {
             let report = crate::error::Report(&*e).to_string();
-            (
-                format!("; its contained tree could not be killed ({subject})"),
-                Some(tree_teardown_warn(subject, &report)),
-            )
+            (String::new(), Some(tree_teardown_warn(subject, &report)))
         }
         Some(Ok(SettleOutcome::Unvouched { kind })) => {
             let text = kind.unvouched_text();
@@ -817,7 +810,7 @@ fn spawn_reported(
             // A child the teardown could not end comes back in the error.
             #[cfg(target_os = "linux")]
             let (
-                error,
+                detail,
                 Torn {
                     fate: child_fate,
                     unreaped,
@@ -833,7 +826,6 @@ fn spawn_reported(
                     policy,
                 },
                 &mut why,
-                error,
             );
             // Windows has no elevation front to leave: every child is killed and reaped.
             #[cfg(windows)]
@@ -850,12 +842,14 @@ fn spawn_reported(
                 &mut why,
             );
             #[cfg(target_os = "macos")]
-            let (error, unreaped, cleanup) = (
-                note_front(fate, error, front, Some(pid)),
+            let (detail, unreaped, cleanup) = (
+                front_detail(fate, front, Some(pid)),
                 None,
                 None::<crate::error::Failures>,
             );
             let failure = SpawnFailure::started(error, child_fate, unreaped);
+            #[cfg(unix)]
+            let failure = failure.with_detail(detail);
             // The group's refused kill came before the teardown's failures.
             #[cfg(target_os = "linux")]
             let failure = failure.with_cleanup(group_kill_failure);
@@ -908,7 +902,7 @@ fn spawn_reported(
             // dying, and is waited for (`tear_down_held`).
             #[cfg(target_os = "linux")]
             let (
-                error,
+                detail,
                 Torn {
                     fate: child_fate,
                     unreaped,
@@ -924,11 +918,11 @@ fn spawn_reported(
                     policy,
                 },
                 &mut why,
-                error,
             );
             // What failed in the attach's own cleanup comes first: it happened before the teardown.
             #[cfg(target_os = "linux")]
             return Err(SpawnFailure::started(error, child_fate, unreaped)
+                .with_detail(detail)
                 .with_cleanup(attach_cleanup)
                 .with_cleanup(cleanup));
             #[cfg(windows)]
@@ -950,11 +944,10 @@ fn spawn_reported(
                     .with_cleanup(cleanup));
             }
             #[cfg(target_os = "macos")]
-            return Err(
-                SpawnFailure::started(note_front(fate, error, front, Some(pid)), child_fate, None)
-                    .with_cleanup(attach_cleanup)
-                    .with_cleanup(teardown_cleanup),
-            );
+            return Err(SpawnFailure::started(error, child_fate, None)
+                .with_detail(front_detail(fate, front, Some(pid)))
+                .with_cleanup(attach_cleanup)
+                .with_cleanup(teardown_cleanup));
         }
     };
     // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
@@ -978,10 +971,9 @@ fn spawn_reported(
                     teardown_after_attach_failure(child, unique, id_read, policy.teardown_warn_after);
                 (None, child_fate, failures)
             };
-            return Err(
-                SpawnFailure::started(note_front(fate, error, front, Some(pid)), child_fate, None)
-                    .with_cleanup(cleanup),
-            );
+            return Err(SpawnFailure::started(error, child_fate, None)
+                .with_detail(front_detail(fate, front, Some(pid)))
+                .with_cleanup(cleanup));
         }
     };
     Ok(Child::from_parts(
@@ -1657,11 +1649,12 @@ fn abandon_unadopted(
                 warn_late_front(pid, None);
                 drop(child);
                 return SpawnFailure::started(
-                    FrontFate::LeftUnreaped.note(error, front, Some(pid)),
+                    error,
                     // The id was reported, but no `ProcessId` was read from it.
                     ChildFate::Running { id: None },
                     None,
-                );
+                )
+                .with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)));
             }
             // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
             // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
@@ -1674,10 +1667,8 @@ fn abandon_unadopted(
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.
             let (error, fate) = teardown_after_failed_adoption(child, error, None);
-            SpawnFailure::started(
-                FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid)),
-                fate,
-                None,
+            SpawnFailure::started(error, fate, None).with_detail(
+                FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).detail(front, Some(pid)),
             )
         }
     }
@@ -2701,36 +2692,31 @@ impl FrontFate {
         }
     }
 
-    /// A failed spawn's `error`, with what became of the front `pid` (unknown: `None`) noted, its
-    /// variant and kind kept (see [`Error::with_note`]). Not a front's: `error` itself.
+    /// The [`Error::MayHaveStarted`] `detail` for the front `pid`; `None` if the child is not a front.
     #[cfg(unix)]
-    pub(crate) fn note(self, error: Error, front: Option<crate::elevation::front::Front>, pid: Option<u32>) -> Error {
-        self.noting(error, front, pid, false)
+    pub(crate) fn detail(self, front: Option<crate::elevation::front::Front>, pid: Option<u32>) -> Option<String> {
+        self.detailing(front, pid, false)
     }
 
-    /// [`note`](Self::note) for a front the failed spawn hands back to the caller, in the error, where
-    /// `note` says it is left unreaped.
+    /// [`detail`](Self::detail) for a front the failed spawn hands back to the caller, in the error,
+    /// where `detail` says it is left unreaped.
     #[cfg(target_os = "linux")]
-    pub(crate) fn note_handed_back(
+    pub(crate) fn detail_handed_back(
         self,
-        error: Error,
         front: Option<crate::elevation::front::Front>,
         pid: Option<u32>,
-    ) -> Error {
-        self.noting(error, front, pid, true)
+    ) -> Option<String> {
+        self.detailing(front, pid, true)
     }
 
     #[cfg(unix)]
-    fn noting(
+    fn detailing(
         self,
-        error: Error,
         front: Option<crate::elevation::front::Front>,
         pid: Option<u32>,
         handed_back: bool,
-    ) -> Error {
-        let Some(front) = front else {
-            return error;
-        };
+    ) -> Option<String> {
+        let front = front?;
         let what = crate::elevation::front::describe(front, pid);
         // Where the front goes, in the one wording of every teardown (`Disposition::suffix`).
         use crate::child::owned::teardown::Disposition;
@@ -2758,23 +2744,18 @@ impl FrontFate {
                 "it was sent nothing, and where it is cannot be read, so the elevated program may be running{left}"
             ),
         };
-        error.with_note(&format!("{what}; {fate}"))
+        Some(format!("{what}; {fate}"))
     }
 }
 
-/// A failed spawn's `error` with what became of the front `pid` noted ([`FrontFate::note`]). `fate`
-/// is `None` for a child that is not a front: `error` itself.
+/// [`FrontFate::detail`] for a `fate` that may be unknown (`None`).
 #[cfg(target_os = "macos")]
-fn note_front(
+fn front_detail(
     fate: Option<FrontFate>,
-    error: Error,
     front: Option<crate::elevation::front::Front>,
     pid: Option<u32>,
-) -> Error {
-    match fate {
-        Some(fate) => fate.note(error, front, pid),
-        None => error,
-    }
+) -> Option<String> {
+    fate.and_then(|fate| fate.detail(front, pid))
 }
 
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn

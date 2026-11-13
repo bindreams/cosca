@@ -93,7 +93,7 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
                 "the cause is the source, not the detail: {detail}"
             );
             let source = source.expect("the cause is the source");
-            assert!(source.to_string().contains("no such file"), "{source}");
+            assert_eq!(crate::error::said(&*source), crate::error::io_said("no such file"));
         }
         other => panic!("expected BackendUnavailable, got {other:?}"),
     }
