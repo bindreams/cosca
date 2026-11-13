@@ -48,7 +48,9 @@ pub(crate) struct JobHandle {
     /// confirmation waited for every member ([`confirm_drained`]); `0` before one. A process the job
     /// ever had counts, wherever it came from (an assignment, a member's child, a process of a job
     /// nested under it), and the count never falls, so an empty listing at the same count has no process
-    /// that was not confirmed.
+    /// that was not confirmed. Measured on 10.0.26100 (`findings/2026-11-13-974-deny-set.md`): the
+    /// count of the outer job rose 3 to 4 for a nested member's child, and 4 to 5 for a process
+    /// assigned straight to a nested job.
     confirmed: AtomicU32,
 }
 
@@ -1075,13 +1077,8 @@ impl JobHandle {
     ///
     /// # Limit
     ///
-    /// A Job member that refuses the caller query access is not seen once the Job's list is empty.
-    /// `wait_tree` after `send_kill_tree` (or after a kill made outside cosca) can answer while that
-    /// member is still finishing its exit. `kill_tree` reports such a member as unobserved. (The
-    /// system snapshot's processes are opened for `PROCESS_QUERY_LIMITED_INFORMATION` alone to ask
-    /// whether each is in the Job: another user's, an elevated, or a query-refusing-DACL process
-    /// cannot be shown to be, so it is skipped, as is one whose `IsProcessInJob` fails. A live member
-    /// is always in the Job's list, so the answer can come only while it exits.)
+    /// The limit is stated at [`Child::wait_tree`](crate::Child::wait_tree): the snapshot skips a
+    /// process that refuses query access, and one whose `IsProcessInJob` fails.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1177,9 +1174,10 @@ fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Re
                     _ = unsafe { CloseHandle(h) };
                     Ok(None)
                 }
-                // The query itself failed, so membership is unknown. Recorded like any other
-                // actionable failure rather than silently dropped: if it holds for every member
-                // it would otherwise be invisible.
+                // The query itself failed, so membership is unknown, and the caller decides what that
+                // is: for a pid the job's own list named it is a member whose exit cannot be
+                // observed (an error); for a pid only the system snapshot named it is skipped, as
+                // one that cannot be opened is (the limit stated at `Child::wait_tree`).
                 Err(e) => {
                     // SAFETY: opened by the caller and not stored anywhere.
                     _ = unsafe { CloseHandle(h) };
@@ -1424,9 +1422,8 @@ fn confirm_drained(
     let Some(count) = job.count_to_confirm()? else {
         return Ok(TreeDrain::AllMembersExited);
     };
-    let (walk, skipped) = unsettled(unsignalled_members(job.raw)?, settled);
-    for next in walk {
-        let id = next?;
+    let (walk, skipped) = unsettled(unsignalled_members(job.raw)?, settled)?;
+    for id in walk {
         if !waited(id, wait_for_member(&HostKernel, id, deadline))? {
             return Ok(TreeDrain::MembersRemain);
         }
@@ -1441,20 +1438,22 @@ fn confirm_drained(
 /// identity could not be read.
 pub(crate) type Found = Result<ProcessId, (u32, crate::error::Error)>;
 
-/// The members a confirmation walks: those `found` that the caller has not `settled`, each as its
-/// identity or the error naming it ([`member_unobserved`]), and whether any was left out as settled.
-pub(crate) fn unsettled(found: Vec<Found>, settled: &Settled) -> (Vec<Result<ProcessId, crate::error::Error>>, bool) {
+/// The members a confirmation walks: those `found` that the caller has not `settled`, and whether any
+/// was left out as settled. A member whose identity could not be read and that is not settled is the
+/// error naming it ([`member_unobserved`]), returned before any wait: a deadline never hides it behind
+/// the wait for another member.
+pub(crate) fn unsettled(found: Vec<Found>, settled: &Settled) -> Result<(Vec<ProcessId>, bool), crate::error::Error> {
     let mut walk = Vec::new();
     let mut skipped = false;
     for member in found {
         match member {
             Ok(id) if settled.covers(id.pid(), Some(id)) => skipped = true,
-            Ok(id) => walk.push(Ok(id)),
+            Ok(id) => walk.push(id),
             Err((pid, _)) if settled.covers(pid, None) => skipped = true,
-            Err((pid, cause)) => walk.push(Err(member_unobserved(pid, cause))),
+            Err((pid, cause)) => return Err(member_unobserved(pid, cause)),
         }
     }
-    (walk, skipped)
+    Ok((walk, skipped))
 }
 
 /// What a confirmation's wait for the member `id` comes to: `true` it has exited, `false` it runs at
@@ -1469,10 +1468,8 @@ pub(crate) fn waited(id: ProcessId, wait: Result<bool, crate::error::Error>) -> 
 /// ([`member_unobserved`]), and is never an exit. A pid that cannot be opened even for that is not
 /// provably the job's, as an unrelated system process is not, and one that a new process reused
 /// answers not-in-job. So is one whose `IsProcessInJob` fails, which is logged: membership cannot be
-/// shown for it, as for one that cannot be opened. That is the stated limit of the wait: a Job member
-/// that refuses the caller query access is not seen once the Job's list is empty, so a wait after
-/// `send_kill_tree` can answer while it is still finishing its exit, and `kill_tree` reports it as
-/// unobserved (see [`wait_drained`](JobHandle::wait_drained)). A member whose start time cannot be
+/// shown for it, as for one that cannot be opened. That is the stated limit of the wait (see
+/// [`wait_drained`](JobHandle::wait_drained)). A member whose start time cannot be
 /// read is in the result as the pid and the cause ([`Found`]), for the walk to report unless it is
 /// settled. A failed snapshot is an error: it is not an empty job.
 fn unsignalled_members(job: HANDLE) -> Result<Vec<Found>, crate::error::Error> {

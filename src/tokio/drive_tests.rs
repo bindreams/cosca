@@ -652,6 +652,52 @@ mod windows {
         member.wait().expect("reap the member");
     }
 
+    /// A drain that moves from watching its round's members to confirming an empty listing waits for
+    /// the member the snapshot names. Two members are listed (forced) and watched; the first exits,
+    /// and the next listing (forced) is empty while the second runs. The snapshot runs on the blocking
+    /// pool, which has one thread: a task queued after it ends after it, so once that task has run
+    /// the snapshot's result has landed, and a drain that does not wait for the member it names
+    /// answers on its next poll, where this one is still pending.
+    ///
+    /// Mutant: the confirmation takes the snapshot but does not wait for the members it names.
+    #[skuld::test]
+    fn a_drain_moving_from_watching_to_confirming_waits_for_the_member_the_snapshot_names() {
+        use crate::containment::windows::fault::{force_job_pid_lists, job_pid_list_queries};
+
+        let (mut first, mut second, job) = spawn_job_with_two_members();
+        let stdin = second.stdin.take().expect("piped stdin");
+        let rt = single_thread_pool_runtime();
+        let _forced = force_job_pid_lists([vec![first.id(), second.id()], Vec::new()]);
+        rt.block_on(async {
+            let mut wait = pin!(drain(&job, None));
+            assert!(
+                wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                "live members are watched"
+            );
+            first.kill().expect("end the first member");
+            first.wait().expect("reap the first member");
+            // The first member's exit ends the watch; the round after it reads the empty listing and
+            // hands the snapshot to the pool.
+            while job_pid_list_queries() < 2 {
+                assert!(
+                    wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                    "the second member runs"
+                );
+                ::tokio::task::yield_now().await;
+            }
+            ::tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("the task queued behind the snapshot");
+            assert!(
+                wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+                "the drain answered once the snapshot had run, without waiting for the member it names"
+            );
+            drop(stdin);
+            assert_eq!(wait.await, TreeDrain::AllMembersExited);
+        });
+        second.wait().expect("reap the second member");
+    }
+
     /// A process that joins the job after a confirmed drain is confirmed too, as in the sync wait: the
     /// job's count has risen, so the next empty listing (forced) takes the snapshot, finds the new
     /// member running and, at an elapsed deadline, answers `MembersRemain`.

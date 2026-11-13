@@ -382,9 +382,8 @@ async fn job_wait_tree_drained(
                 let Some(count) = job.count_to_confirm()? else {
                     return Ok(TreeDrain::AllMembersExited);
                 };
-                let (walk, skipped) = unsettled(snapshot_members_on_pool(job).await?, settled);
-                for next in walk {
-                    let id = next?;
+                let (walk, skipped) = unsettled(snapshot_members_on_pool(job).await?, settled)?;
+                for id in walk {
                     if !waited(id, wait_for_member_async(&HostKernel, id, deadline).await)? {
                         return Ok(TreeDrain::MembersRemain);
                     }

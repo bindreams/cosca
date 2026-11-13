@@ -67,6 +67,12 @@ impl Unnamed {
         Unnamed { pid: None, why }
     }
 
+    /// The pid of the member, for a row that states which one the listing named.
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     /// The error saying the member's exit cannot be observed, for a row that states its words.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn why(&self) -> &Error {
@@ -80,30 +86,36 @@ impl Unnamed {
 /// reports them again. A pid is all there is to tell an unnamed member by: a process with that pid
 /// that joins the tree during the one wait is taken for it.
 #[derive(Default)]
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "only a Job's edge confirms members it did not list")
-)]
 pub(crate) struct Settled {
+    #[cfg(windows)]
     members: Vec<ProcessId>,
+    #[cfg(windows)]
     unnamed: Vec<u32>,
 }
 
 impl Settled {
-    pub(crate) fn new(members: &[ProcessId], unnamed: &[Unnamed]) -> Settled {
-        Settled {
-            members: members.to_vec(),
-            unnamed: unnamed.iter().filter_map(|unnamed| unnamed.pid).collect(),
+    /// The members a wait waited for, and the pids of those the listing could not name. Only a Job's
+    /// edge reads them, so they are kept on Windows alone.
+    pub(crate) fn new(members: Vec<ProcessId>, unnamed: Vec<u32>) -> Settled {
+        #[cfg(windows)]
+        return Settled { members, unnamed };
+        #[cfg(not(windows))]
+        {
+            let _ = (members, unnamed);
+            Settled::default()
         }
     }
 
-    /// Whether the process `pid`, whose identity is `id` where it could be read, is settled.
-    #[cfg_attr(
-        not(windows),
-        allow(dead_code, reason = "only a Job's edge confirms members it did not list")
-    )]
+    /// Whether the process `pid`, whose identity is `id` where it could be read, is settled. One whose
+    /// identity could not be read is matched by its pid, against the members waited for as well as
+    /// those the listing could not name.
+    #[cfg(windows)]
     pub(crate) fn covers(&self, pid: u32, id: Option<ProcessId>) -> bool {
-        self.unnamed.contains(&pid) || id.is_some_and(|id| self.members.contains(&id))
+        self.unnamed.contains(&pid)
+            || match id {
+                Some(id) => self.members.contains(&id),
+                None => self.members.iter().any(|member| member.pid() == pid),
+            }
     }
 }
 
@@ -251,8 +263,7 @@ impl<'a> KillWait<'a> {
             kernel,
         } = self;
         let members: Vec<ProcessId> = once_each(members).collect();
-        let settled = Settled::new(&members, &unnamed);
-        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        let (unnamed_pids, mut unobserved) = split_unnamed(unnamed);
         for &id in &members {
             if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
                 unobserved.push(exit_unobserved(id.pid(), why));
@@ -265,6 +276,7 @@ impl<'a> KillWait<'a> {
         }
         if let Some(edge) = edge {
             // Every member reached is settled: it exited or was reported above, once.
+            let settled = Settled::new(members, unnamed_pids);
             if let Err(why) = edge.wait_past(None, &settled).and_then(drained) {
                 unobserved.push(why);
             }
@@ -285,8 +297,7 @@ impl<'a> KillWait<'a> {
             kernel,
         } = self;
         let members: Vec<ProcessId> = once_each(members).collect();
-        let settled = Settled::new(&members, &unnamed);
-        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        let (unnamed_pids, mut unobserved) = split_unnamed(unnamed);
         for &id in &members {
             if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
                 unobserved.push(exit_unobserved(id.pid(), why));
@@ -298,12 +309,19 @@ impl<'a> KillWait<'a> {
             }
         }
         if let Some(edge) = edge {
+            let settled = Settled::new(members, unnamed_pids);
             if let Err(why) = edge.wait_async_past(None, &settled).await.and_then(drained) {
                 unobserved.push(why);
             }
         }
         answer_of(unobserved)
     }
+}
+
+/// The pids of the members a listing could not name, and the error for each, in order.
+fn split_unnamed(unnamed: Vec<Unnamed>) -> (Vec<u32>, Vec<Error>) {
+    let pids = unnamed.iter().filter_map(|unnamed| unnamed.pid).collect();
+    (pids, unnamed.into_iter().map(|unnamed| unnamed.why).collect())
 }
 
 /// `members`, each one once, in the order they were reached.

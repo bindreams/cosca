@@ -529,7 +529,7 @@ fn a_drain_that_left_a_settled_member_out_does_not_stand_for_it_later() {
         .expect("assign the restricted member to the job");
     let forced = super::fault::force_job_pid_lists([Vec::new(), Vec::new()]);
 
-    let first = job.wait_drained_past(None, &Settled::new(&[id], &[]));
+    let first = job.wait_drained_past(None, &Settled::new(vec![id], Vec::new()));
     let second = job.wait_drained(None);
 
     drop(forced);
@@ -595,14 +595,10 @@ fn a_listed_pid_whose_membership_cannot_be_established_is_unobserved_with_its_pi
     job.hard_kill().expect("end the member");
     let_member_exit(child);
     assert!(members.iter().all(|id| id.pid() != pid), "{members:?}");
-    let named: Vec<String> = unobserved.iter().map(|unnamed| format!("{unnamed:?}")).collect();
     assert_eq!(
-        named
-            .iter()
-            .filter(|unnamed| unnamed.contains(&format!("pid: Some({pid})")))
-            .count(),
+        unobserved.iter().filter(|unnamed| unnamed.pid() == Some(pid)).count(),
         1,
-        "{named:?}"
+        "{unobserved:?}"
     );
 }
 
@@ -681,6 +677,97 @@ fn a_kill_wait_reports_a_member_whose_identity_cannot_be_read_once() {
         DrainEdge::Job(&job),
     )
     .split();
+
+    let verdict = wait.wait();
+
+    drop(forced);
+    let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
+    let report = crate::error::Report(&error).to_string();
+    assert_eq!(
+        report.matches(&format!("pid {pid}")).count(),
+        1,
+        "the member is named once: {report}"
+    );
+}
+
+/// A snapshot member whose start time cannot be read is the drain's error whatever the deadline: one
+/// still-running member the confirmation would wait for at a deadline does not hide it. A member that
+/// runs (A) is in the job beside one that cannot be identified (B, a forced failure); the wait is
+/// bounded by an elapsed deadline, so a walk that waits for A first answers `MembersRemain`.
+///
+/// Mutant: the walk reports B's error only once it reaches it, after waiting for A.
+#[skuld::test]
+fn a_member_whose_identity_cannot_be_read_is_reported_though_another_still_runs_at_the_deadline() {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            a_member_whose_identity_cannot_be_read_is_reported_though_another_still_runs_at_the_deadline
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    use std::os::windows::io::AsRawHandle as _;
+
+    let job = super::JobHandle::create_empty_for_test();
+    // A is spawned first, so the snapshot most likely names it first (the order the mutant needs); B
+    // is assigned first, as the OS lets a process of the fixture's own job into a new job only first.
+    let running = crate::test_child::spawn_more_blocker();
+    let unreadable = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let pid = unreadable.pid();
+    job.assign_for_test(unreadable.handle().0)
+        .expect("assign the unreadable member to the job");
+    job.assign_for_test(running.as_raw_handle())
+        .expect("assign the running member to the job");
+    let _failed = super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, pid);
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(&job, zero);
+
+    drop(forced);
+    job.hard_kill().expect("end the members");
+    let_member_exit(running);
+    let error = verdict.expect_err("a member whose identity cannot be read is not a drain, nor remaining");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, .. } if detail.contains(&pid.to_string())),
+        "{error:?}"
+    );
+}
+
+/// A member the kill's wait already reported by its identity (it refuses the wait's open) is reported
+/// once, though the confirmation finds it in the snapshot with its start time unreadable (a forced
+/// failure): the entry with no identity matches the member by its pid.
+///
+/// Mutant: `Settled::covers` matches an entry with no identity only against the pids the listing could
+/// not name, so the member is named a second time.
+#[skuld::test]
+fn a_kill_wait_reports_a_member_it_waited_for_once_when_the_snapshot_cannot_read_its_identity() {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::TreeKill;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            a_kill_wait_reports_a_member_it_waited_for_once_when_the_snapshot_cannot_read_its_identity
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let pid = member.pid();
+    let id = crate::identity::windows_identity_from_handle_result(member.handle(), pid)
+        .expect("the restricted member's identity");
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+    let _failed = super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, pid);
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
 
     let verdict = wait.wait();
 
