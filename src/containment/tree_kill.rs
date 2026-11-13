@@ -120,8 +120,9 @@ enum RootEnd<'a> {
     /// The mechanism's own kill ended it (a tree walk), for a caller that holds the root's handle but no
     /// backstop ([`Process::kill_tree`](crate::Process::kill_tree)).
     Killed,
-    /// Its kill landed, and it is waited for through its owner's handle.
-    Waited(&'a dyn OsProcess),
+    /// Its kill landed, and it is waited for through its owner's handle. `pid` is the root's, as its
+    /// owner knows it.
+    Waited { os: &'a dyn OsProcess, pid: u32 },
 }
 
 impl<'a> TreeKill<'a> {
@@ -227,14 +228,15 @@ impl<'a> KillWait<'a> {
 
     /// Whether the wait is for the root too: its kill landed, so it is dead whatever the wait finds.
     pub(crate) fn waits_for_root(&self) -> bool {
-        matches!(self.root, RootEnd::Waited(_))
+        matches!(self.root, RootEnd::Waited { .. })
     }
 
-    /// Wait for the root through its owner's handle if `landed`, whether its kill landed. A kill that
-    /// did not land leaves what the mechanism recorded ([`TreeKill::root_killed`]) as it is.
-    pub(crate) fn with_root(mut self, root: &'a dyn OsProcess, landed: bool) -> KillWait<'a> {
+    /// Wait for the root, whose pid its owner knows as `pid`, through its owner's handle if `landed`,
+    /// whether its kill landed. A kill that did not land leaves what the mechanism recorded
+    /// ([`TreeKill::root_killed`]) as it is.
+    pub(crate) fn with_root(mut self, root: &'a dyn OsProcess, pid: u32, landed: bool) -> KillWait<'a> {
         if landed {
-            self.root = RootEnd::Waited(root);
+            self.root = RootEnd::Waited { os: root, pid };
         }
         self
     }
@@ -264,9 +266,9 @@ impl<'a> KillWait<'a> {
                 unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited(root) = root {
+        if let RootEnd::Waited { os: root, pid } = root {
             let waited = wait_for_exit(root);
-            settle_root(root, waited.is_err(), &mut members, &mut reported);
+            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
             if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
@@ -302,9 +304,9 @@ impl<'a> KillWait<'a> {
                 unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited(root) = root {
+        if let RootEnd::Waited { os: root, pid } = root {
             let waited = wait_for_exit_async(root).await;
-            settle_root(root, waited.is_err(), &mut members, &mut reported);
+            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
             if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
@@ -324,30 +326,17 @@ fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
     unnamed.iter().filter_map(|unnamed| unnamed.pid).collect()
 }
 
-/// Settle the root, once its wait ended: its identity, if its handle can read one, is a settled member
-/// (it is matched by identity alone, never by its pid), and its pid is `reported` when the wait `failed`,
-/// so a snapshot entry for the root whose identity cannot be read is not named again. A handle that
-/// names no process (a fake's) settles nothing, quietly. A real root whose pid or identity cannot be
-/// read is logged at `warn`: what it would have settled is lost, so a snapshot entry for it can be
-/// walked and named a second time. Only a Job's edge reads the settlement.
+/// Settle the root, whose pid its owner gave as `pid`, once its wait ended: its identity, if its handle
+/// can read one, is a settled member (it is matched by identity alone, never by its pid), and `pid` is
+/// `reported` when the wait `failed`, so a snapshot entry for the root whose identity cannot be read is
+/// not named again. A root whose identity cannot be read is logged at `warn`: what it would have
+/// settled is lost, so a snapshot entry for it that reads an identity can be named a second time. Only a
+/// Job's edge reads the settlement.
 #[cfg(windows)]
-fn settle_root(root: &dyn OsProcess, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
+fn settle_root(root: &dyn OsProcess, pid: u32, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
     use std::os::windows::io::AsRawHandle as _;
 
-    use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
-
     let raw = windows::Win32::Foundation::HANDLE(root.os_handle().as_raw_handle());
-    let pid = match crate::containment::windows::process_pid_of(raw) {
-        Ok(pid) => pid,
-        Err(e) if crate::error::first_os_code(&e) == Some(ERROR_INVALID_HANDLE.0 as i32) => return,
-        Err(e) => {
-            log::warn!(
-                "the root's pid cannot be read, so the drain's snapshot may name the root again: {report}",
-                report = crate::error::Report(&e)
-            );
-            return;
-        }
-    };
     if failed {
         reported.push(pid);
     }
@@ -363,7 +352,14 @@ fn settle_root(root: &dyn OsProcess, failed: bool, members: &mut Vec<ProcessId>,
 
 /// Only a Job's edge reads the root's settlement ([`Settled`]).
 #[cfg(not(windows))]
-fn settle_root(_root: &dyn OsProcess, _failed: bool, _members: &mut Vec<ProcessId>, _reported: &mut Vec<u32>) {}
+fn settle_root(
+    _root: &dyn OsProcess,
+    _pid: u32,
+    _failed: bool,
+    _members: &mut Vec<ProcessId>,
+    _reported: &mut Vec<u32>,
+) {
+}
 
 /// `members`, each one once, in the order they were reached.
 fn once_each(members: Vec<ProcessId>) -> impl Iterator<Item = ProcessId> {

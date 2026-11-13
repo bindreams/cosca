@@ -379,12 +379,9 @@ impl Child {
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
     /// Windows job with no member left, a macOS marker with no holder left. A status is never
-    /// collected by this call, only the root's own `wait`/`try_wait` does that. On Windows an
-    /// empty process list is not taken as the drain, the first one included (it is empty on its first
-    /// read after a kill): the job's list can empty before a member's process object is signalled,
-    /// so the call waits for each job member a system process snapshot still names. The limit stated at
-    /// [`Child::wait_tree`](crate::Child::wait_tree) holds; a caller that needs a member it hides named
-    /// uses [`kill_tree`](Self::kill_tree). Requires a mechanism with a real
+    /// collected by this call, only the root's own `wait`/`try_wait` does that. On Windows an empty
+    /// process list is not the drain, within the limit stated at
+    /// [`Child::wait_tree`](crate::Child::wait_tree). Requires a mechanism with a real
     /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
     /// nested-`Delegated` child do not). No polling interval: macOS waits on the reactor; Linux

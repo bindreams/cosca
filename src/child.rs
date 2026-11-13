@@ -744,7 +744,7 @@ impl Child {
                 return Swept::new(
                     op,
                     answered.answer.map_err(|error| SweepFailure { error, root_ended }),
-                    wait.with_root(self.proc.os_process(), root_ended),
+                    wait.with_root(self.proc.os_process(), self.pid(), root_ended),
                 );
             }
             other => {
@@ -798,7 +798,7 @@ impl Child {
         Swept::new(
             op,
             settled.answer,
-            wait.with_root(self.proc.os_process(), root_ended && !unpinned),
+            wait.with_root(self.proc.os_process(), self.pid(), root_ended && !unpinned),
         )
     }
 

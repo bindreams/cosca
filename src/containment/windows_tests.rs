@@ -970,7 +970,7 @@ fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Compl
     )
     .split();
 
-    let verdict = wait.with_root(&root, true).wait();
+    let verdict = wait.with_root(&root, member.pid(), true).wait();
 
     drop(forced);
     let error = verdict.expect_err("a root whose exit cannot be observed is not a drain");
