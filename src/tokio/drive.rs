@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::error::Error;
 #[cfg(unix)]
 use crate::os_process::drive::pause_end;
-use crate::os_process::drive::{wait_ended, Control, Next, ProcessExit, RunOutcome, Step, Waitable};
+use crate::os_process::drive::{exit_wait, wait_ended, Control, Next, RunOutcome, Step, Waitable};
 use crate::os_process::{OsProcess, WaitFor};
 
 /// What the entry point does before any open or look: the watch-fault seam.
@@ -38,15 +38,8 @@ pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) ->
 /// names.
 pub(crate) async fn exited_until(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     enter()?;
-    exited(p, deadline).await
-}
-
-/// [`run`] over a process's [`OsProcess::exited`] look, against an absolute `deadline`.
-async fn exited(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
-    Ok(matches!(
-        run(&mut ProcessExit(p), deadline).await?,
-        RunOutcome::Done(())
-    ))
+    let mut wait = exit_wait(p, remaining(deadline))?;
+    Ok(matches!(run(&mut *wait, deadline).await?, RunOutcome::Done(())))
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait. On Unix it
@@ -72,7 +65,7 @@ enum Act<'a> {
 /// ever. A failed wait goes to [`Waitable::block_failed`], which ends the loop with the error unless
 /// it is survived. Dropping the future releases the wait: the fd is deregistered on Unix, and the
 /// registered wait is unregistered on Windows. A Windows `deadline` is on the real clock.
-pub(crate) async fn run<W: Waitable>(
+pub(crate) async fn run<W: Waitable + ?Sized>(
     w: &mut W,
     deadline: Option<std::time::Instant>,
 ) -> Result<RunOutcome<W::Output>, Error> {

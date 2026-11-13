@@ -711,6 +711,42 @@ fn a_best_effort_reap_that_fails_after_a_failed_sweep_is_logged_once_at_warn() {
     );
 }
 
+/// The best-effort reap after a failed sweep of an exited root is one attempt that does not wait: a
+/// zombie that is not ours yet (a tracer holds it, or the OS is finishing the exit) stays with the
+/// handle, and the sweep's error is the answer, with nothing logged.
+///
+/// Mutant: the best-effort reap is the blocking reap, which loops on the `Recheck` into a reap the
+/// fake has no answer for.
+#[cfg(unix)]
+#[skuld::test]
+fn a_best_effort_reap_that_is_not_ready_after_a_failed_sweep_leaves_the_zombie_with_the_handle() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::error::Error;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{child_with, root_looking};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited; 4]).reaps([ReapAnswer::Recheck]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake);
+    let _armed = term_fault::ArmedKillTreeError::arm();
+
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect_err("the sweep failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("forced kill_tree failure")),
+        "{err:?}"
+    );
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, "best-effort reap"),
+        Vec::<(log::Level, String)>::new()
+    );
+}
+
 // The invariant under test: only an AUTHORITATIVE drain-observable mechanism (cgroup v2, Windows
 // job object — kernel-owned membership a live process cannot leave without exiting) may skip
 // the hard sweep when a tree drains on its own within `grace`. macOS's fd marker IS

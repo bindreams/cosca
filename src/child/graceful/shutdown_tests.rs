@@ -1,4 +1,4 @@
-//! `run_ready`, the sync driver's one poll, and `status_of_reap`, the one answer of both cores for the reap.
+//! `run_ready`, the sync driver's one poll, and `graceful_status_of_reap`, the one answer of both cores for the reap.
 
 use super::run_ready;
 use crate::child::owned::ChildWaitOutcome;
@@ -32,7 +32,7 @@ fn a_root_reaped_elsewhere_answers_unassessable_with_its_echild_as_the_source() 
 
     for foreign in [Foreign::Gone, Foreign::Other] {
         for op in ["graceful_shutdown", "graceful_shutdown_tree"] {
-            let answer = super::status_of_reap(4242, op, Ok(ChildWaitOutcome::Foreign(foreign)))
+            let answer = super::graceful_status_of_reap(4242, op, Ok(ChildWaitOutcome::Foreign(foreign)))
                 .expect_err("no exit status was collected");
 
             let Error::Unassessable { detail, .. } = &answer else {
@@ -63,7 +63,7 @@ fn a_failed_reap_stays_the_answer_whatever_it_holds() {
     let failed = Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD));
     let words = failed.to_string();
 
-    let answer = super::status_of_reap(4242, "graceful_shutdown", Err(failed)).expect_err("the reap failed");
+    let answer = super::graceful_status_of_reap(4242, "graceful_shutdown", Err(failed)).expect_err("the reap failed");
 
     assert!(matches!(answer, Error::Io(_)), "{answer:?}");
     assert_eq!(answer.to_string(), words);
@@ -78,14 +78,14 @@ fn an_exit_record_is_the_status_and_an_unreadable_one_invalid_data() {
     use crate::os_process::child::ExitRecord;
 
     let status = std::process::ExitStatus::default();
-    let answered = super::status_of_reap(
+    let answered = super::graceful_status_of_reap(
         4242,
         "graceful_shutdown",
         Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))),
     );
     assert_eq!(answered.expect("an exit"), status);
 
-    let answer = super::status_of_reap(
+    let answer = super::graceful_status_of_reap(
         4242,
         "graceful_shutdown",
         Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
@@ -110,7 +110,7 @@ fn a_zombie_launchd_holds_answers_the_unpinned_refusal_quietly() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     for op in ["graceful_shutdown", "graceful_shutdown_tree"] {
-        let answer = super::status_of_reap(4242, op, Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)))
+        let answer = super::graceful_status_of_reap(4242, op, Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)))
             .expect_err("no exit status");
 
         let Error::Unassessable { detail, source: None } = &answer else {

@@ -35,8 +35,8 @@ pub(crate) trait Waits {
     async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure>;
 
     /// The root's reap, as the wait ended: the exit record or the foreign verdict, unfolded and with no
-    /// warn ([`status_of_reap`] answers for it). The async driver closes an untaken stdin first, as its
-    /// `wait` does.
+    /// warn ([`graceful_status_of_reap`] answers for it). The async driver closes an untaken stdin
+    /// first, as its `wait` does.
     async fn reap(&mut self) -> Result<ChildWaitOutcome, Error>;
 
     /// The error of a holders-only shutdown, once the holders its kill reached have exited.
@@ -92,7 +92,7 @@ pub(crate) fn run_ready<F: Future>(f: F) -> F::Output {
 /// zombie launchd holds is the macOS refusal ([`unpinned_status`](crate::signal::unpinned_status));
 /// a root reaped elsewhere (or whose pid names another process now) is the same, with the `ECHILD`
 /// every wait answers for it as its `source()`. Neither warns: the caller's answer is the report.
-fn status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome, Error>) -> Result<ExitStatus, Error> {
+fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome, Error>) -> Result<ExitStatus, Error> {
     use crate::child::lifecycle::{echild, unbounded_status, Orphaned};
 
     match outcome? {
@@ -126,10 +126,7 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     let call = || format!("graceful_shutdown({pid})");
     // A watch failure must not strand the child between the soft signal and the escalation: the
     // kill and the reap still run, then the failure surfaces.
-    let watch = match take_forced_watch_error() {
-        Some(e) => Err(e),
-        None => w.root_exited(grace).await,
-    };
+    let watch = w.root_exited(grace).await;
     // The escalation is `kill`, with the `SIGTERM` named as already sent.
     let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
@@ -138,7 +135,7 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     })?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);
-    let waited = status_of_reap(pid, "graceful_shutdown", w.reap().await);
+    let waited = graceful_status_of_reap(pid, "graceful_shutdown", w.reap().await);
     crate::graceful::after_reap(call, waited, None, watch)
 }
 
@@ -185,6 +182,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     } else if w.child().tree.drain_edge().is_some() {
         match w.tree_drained(grace).await {
             Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
+            // One look: a zero grace arms no wait, and so no kqueue.
             Ok(_) => match w.root_exited(Duration::ZERO).await {
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),
@@ -211,8 +209,10 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
         };
         if let Err(sweep) = sweep_result {
             if root_exited || sweep.root_ended {
-                // Best-effort: a dead root must not stay a zombie; `sweep` is the reported error.
-                if let Err(e) = w.reap().await {
+                // Best-effort: a dead root must not stay a zombie; `sweep` is the reported error. One
+                // attempt that does not wait, through the handle: a zombie a tracer holds, or a root
+                // that is not ours to reap, stays with the handle for its `wait` or `Drop`.
+                if let Err(e) = w.child().proc.wait(Some(crate::wait::now())) {
                     log::warn!(
                         "graceful_shutdown_tree({pid}): the best-effort reap after a swept, exited root also failed: {report}",
                         report = crate::error::Report(&e)
@@ -228,7 +228,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     }
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);
-    let waited = status_of_reap(pid, "graceful_shutdown_tree", w.reap().await);
+    let waited = graceful_status_of_reap(pid, "graceful_shutdown_tree", w.reap().await);
     // The tree is confirmed clear (drained, or the sweep returned Ok), which disproves a `term`
     // refusal: a successful reap discards it; a failed reap keeps it as a peer.
     if let (Ok(_), Err(e)) = (&waited, &term) {

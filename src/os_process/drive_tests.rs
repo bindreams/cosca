@@ -563,6 +563,90 @@ fn exited_held_zero_is_one_look() {
     assert_eq!(exited.looks(), 1);
 }
 
+/// A [`Waitable`] that asks for `rechecks` rechecks and is then done.
+struct AfterRechecks(usize);
+
+impl Waitable for AfterRechecks {
+    type Output = ();
+
+    fn look(&mut self) -> Result<Step<'_, ()>, Error> {
+        Ok(match self.0.checked_sub(1) {
+            Some(left) => {
+                self.0 = left;
+                Step::Recheck
+            }
+            None => Step::Done(()),
+        })
+    }
+}
+
+/// A process whose [`OsProcess::exit_wait`] is its own: it asks for `rechecks` rechecks and is then
+/// done, and each one made is counted. Its own look is `process`'s, which answers what the row
+/// scripts, so a driver that loops on the look instead is seen.
+#[derive(Debug)]
+pub(crate) struct OwnWait {
+    pub(crate) process: FakeProcess,
+    rechecks: usize,
+    made: std::sync::atomic::AtomicUsize,
+}
+
+impl OwnWait {
+    pub(crate) fn new(rechecks: usize, process: FakeProcess) -> Self {
+        Self {
+            process,
+            rechecks,
+            made: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn made(&self) -> usize {
+        self.made.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl OsProcess for OwnWait {
+    fn signal(&self, sig: crate::signal::Sig) -> Result<crate::signal::Sent, Error> {
+        self.process.signal(sig)
+    }
+
+    fn exited(&self) -> Result<Exit<'_>, Error> {
+        self.process.exited()
+    }
+
+    fn exit_wait(&self) -> Result<crate::os_process::ExitWait<'_>, Error> {
+        self.made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(AfterRechecks(self.rechecks)))
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn os_handle(&self) -> crate::os_process::child::OsHandle<'_> {
+        self.process.os_handle()
+    }
+}
+
+/// The wait comes from the process's own [`OsProcess::exit_wait`], made once, and the loop runs on
+/// it, not on the process's look.
+///
+/// Mutant: `exited_until` builds [`ProcessExit`] itself, so the process's own wait is never made and
+/// the look (which the fake has no answer for) panics.
+#[skuld::test]
+fn exited_until_loops_on_the_wait_the_process_makes() {
+    let p = OwnWait::new(2, fake([]));
+    assert!(super::exited_until(&p, None).unwrap());
+    assert_eq!(p.made(), 1);
+}
+
+/// A deadline that has passed makes one look and no wait of the process's own: nothing is armed.
+///
+/// Mutant: the zero-grace probe makes the process's wait first, which on macOS arms a kqueue.
+#[skuld::test]
+fn exited_until_at_a_passed_deadline_looks_once_and_makes_no_wait() {
+    let p = OwnWait::new(0, fake([Answer::Running]));
+    assert!(!super::exited_held(&p, Some(Duration::ZERO)).unwrap());
+    assert_eq!(p.made(), 0);
+    assert_eq!(p.process.looks(), 1);
+}
+
 // `run` =====
 
 /// `run` over a fake's looks, against `deadline`.

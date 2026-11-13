@@ -243,8 +243,8 @@ impl OwnedChild {
     /// the peek can: an exit record or a reap elsewhere is `Dead`; otherwise the failure stands,
     /// also when the peek reads the child running, which proves nothing (a tracer can hold the
     /// zombie, which the real parent's `waitid` does not see). A `Recheck` (the exit watch fired, and
-    /// the process is not yet a zombie) answers `Alive` until the zombie, as `ProcessId::is_alive`
-    /// does, unless the peek shows the exit record.
+    /// the process is not yet a zombie, or another process holds the running child) answers `Alive`
+    /// until the zombie, as `ProcessId::is_alive` does, unless the peek shows the exit record.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
@@ -405,7 +405,9 @@ impl OwnedChild {
     /// ([`OsProcess::exited`](crate::os_process::OsProcess::exited)): a zombie its tracer holds
     /// counts, and so does one launchd holds. On macOS XNU withholds `NOTE_EXIT` from a parent that
     /// does not hold the child (`p_oppid` set, `kern_event.c:1203-1210`), so while another process is
-    /// the parent the look reads the zombie itself and the wait re-looks with the driver's backoff.
+    /// the parent the look reads the zombie itself and the wait re-looks with the driver's backoff. A
+    /// tracer that attaches during the wait wakes it, through the wait's own kqueue
+    /// ([`OsProcess::exit_wait`](crate::os_process::OsProcess::exit_wait)).
     /// Reaps nothing: during a graceful tree shutdown the root stays an unreaped zombie until the
     /// group kill is done, so its pid names no one else (principle 4). Takes no lock, so it may run
     /// while another thread waits.

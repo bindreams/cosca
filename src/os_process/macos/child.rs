@@ -1,9 +1,11 @@
 //! macOS: an [`OsChild`] over the child's pid and unique id. There is no handle, so every act checks
 //! the pid's unique id first, and a child is an unreaped zombie at worst, which pins the number.
 //!
-//! Two kqueues, deliberately. The exit kqueue ([`ExitWatch`]) is never read, so a look at it is a
-//! zero-timeout `poll` that takes nothing from any waiter. The reap kqueue is drained by the one
-//! waiter that holds the reap, inside [`OsChild::try_reap`], and waited on by it afterwards.
+//! Three kinds of kqueue, deliberately, so that a kqueue that is read has one reader. The exit kqueue
+//! ([`ExitWatch`]) is never read, so a look at it is a zero-timeout `poll` that takes nothing from
+//! any waiter. The reap kqueue is drained by the one waiter that holds the reap, inside
+//! [`OsChild::try_reap`], and waited on by it afterwards. Each exit wait ([`OsProcess::exit_wait`])
+//! arms and drains one of its own.
 
 use std::os::fd::AsFd;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
@@ -12,7 +14,8 @@ use super::{ExitWatch, Kqueue};
 use crate::error::Error;
 use crate::identity::{has_exited, held_by, Held, ReadPurpose};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
-use crate::os_process::{Exit, OsProcess, WaitFor};
+use crate::os_process::drive::{Step, Waitable};
+use crate::os_process::{Exit, ExitWait, OsProcess, WaitFor};
 use crate::signal::{via_audit_token, Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
 use crate::wait::macos::{drain_exit_events, register_exit_events, OnTracer, TracerWatch};
@@ -94,6 +97,9 @@ impl OsProcess for MacChild {
     /// parent is this process and whose watch has not fired is `Running` on the watch, with no
     /// zombie read. A refused read is [`Error::Unassessable`] with its errno as the source.
     ///
+    /// A look reads the parent as of now: a tracer that attaches after it is caught by the wait
+    /// ([`exit_wait`](OsProcess::exit_wait)), not by the look.
+    ///
     /// The reap ([`try_reap`](OsChild::try_reap)) does not come through here: it reads the watch raw
     /// and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
@@ -101,6 +107,59 @@ impl OsProcess for MacChild {
             Exit::Running(wait_for) => self.exited_past_the_watch(wait_for),
             look => Ok(look),
         }
+    }
+
+    /// The wait that catches what a look cannot: a tracer attaching after the look (the attach's
+    /// `SIGSTOP` is a `NOTE_SIGNAL`, and from then on no `NOTE_EXIT` reaches this process). It owns a
+    /// kqueue armed before its first look, and no other wait or look reads it.
+    fn exit_wait(&self) -> Result<ExitWait<'_>, Error> {
+        Ok(Box::new(ChildExit::arm(self)?))
+    }
+}
+
+/// One wait for a [`MacChild`]'s exit, on a kqueue of its own: armed for `NOTE_EXIT`, `NOTE_SIGNAL`
+/// and `NOTE_REAP` of the child and for `SIGCHLD`, as the reap waiter's is. Every look drains it
+/// first, so what woke the wait is taken, and what comes after the drain stays queued for the wait
+/// the look returns: no wake is lost, and none is taken from another waiter. The shared exit watch
+/// is still only polled.
+struct ChildExit<'a> {
+    child: &'a MacChild,
+    kq: Kqueue,
+    /// The registration found the pid past registration (`ESRCH`): no event will come.
+    unarmed: bool,
+    /// A drain read the child's `NOTE_EXIT`. The shared watch's knote may not be queued yet, so the
+    /// look it reads can still say `Running`: that is a recheck, never a wait on a kqueue whose
+    /// `NOTE_EXIT` is gone.
+    exit_seen: bool,
+}
+
+impl<'a> ChildExit<'a> {
+    fn arm(child: &'a MacChild) -> Result<Self, Error> {
+        let kq = Kqueue::new()?;
+        let unarmed = register_exit_events(&kq, child.pid).map_err(Error::Io)?;
+        Ok(Self {
+            child,
+            kq,
+            unarmed,
+            exit_seen: false,
+        })
+    }
+}
+
+impl Waitable for ChildExit<'_> {
+    type Output = ();
+
+    fn look(&mut self) -> Result<Step<'_, ()>, Error> {
+        // A `NOTE_REAP` is a foreign reap: the look below reads it as the pid gone.
+        let (_reaped, exited) =
+            drain_exit_events(&self.kq, self.child.pid, &mut TracerWatch::default()).map_err(Error::Io)?;
+        self.exit_seen |= exited;
+        Ok(match self.child.exited()? {
+            Exit::Exited => Step::Done(()),
+            Exit::Recheck => Step::Recheck,
+            Exit::Running(_) if self.unarmed || self.exit_seen => Step::Recheck,
+            Exit::Running(_) => Step::Wait(WaitFor::Readable(self.kq.as_fd())),
+        })
     }
 }
 

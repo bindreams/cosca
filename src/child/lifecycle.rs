@@ -322,8 +322,18 @@ impl Child {
     /// runtime and blocks no thread.
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&mut self) -> Result<ExitStatus, Error> {
-        let outcome = self.proc.wait_async().await?;
+        let outcome = self.reap_outcome_async().await?;
         self.status_of_reap(outcome)
+    }
+
+    /// [`reap_outcome`](Child::reap_outcome), awaited: the one async reap of the root.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn reap_outcome_async(&mut self) -> Result<ChildWaitOutcome, Error> {
+        #[cfg(test)]
+        if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
+            return Err(error);
+        }
+        self.proc.wait_async().await
     }
 
     /// The status [`wait`](Child::wait) answers for the root's `outcome` ([`reap_outcome`](Child::reap_outcome)): a

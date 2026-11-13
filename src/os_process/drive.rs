@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use backon::{BackoffBuilder as _, ExponentialBackoff, ExponentialBuilder};
 
-use super::{Exit, OsProcess, WaitFor};
+use super::{Exit, ExitWait, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::wait::remaining;
 
@@ -28,12 +28,19 @@ pub(crate) fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Resul
 /// [`exited_held`] against an absolute `deadline` (`None`: unbounded).
 pub(crate) fn exited_until(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
     enter()?;
-    exited(p, deadline)
+    let mut wait = exit_wait(p, remaining(deadline))?;
+    Ok(matches!(run(&mut *wait, deadline)?, RunOutcome::Done(())))
 }
 
-/// [`run`] over a process's [`OsProcess::exited`] look.
-fn exited(p: &dyn OsProcess, deadline: Option<Instant>) -> Result<bool, Error> {
-    Ok(matches!(run(&mut ProcessExit(p), deadline)?, RunOutcome::Done(())))
+/// The wait for `p`'s exit that a deadline with `left` to run (`None`: unbounded) loops on: the
+/// process's own ([`OsProcess::exit_wait`]), which may arm a readiness source of its own. A deadline
+/// that has passed makes one look and no wait, so it is [`ProcessExit`], which arms nothing. Both
+/// drivers take their wait from here.
+pub(crate) fn exit_wait(p: &dyn OsProcess, left: Option<Duration>) -> Result<ExitWait<'_>, Error> {
+    if left == Some(Duration::ZERO) {
+        return Ok(Box::new(ProcessExit(p)));
+    }
+    p.exit_wait()
 }
 
 /// `timeout` as an absolute deadline, fixed up front so no wake extends the total wait.
@@ -140,7 +147,7 @@ pub(crate) enum Ended {
 
 /// Maps a driver's wait result to [`Ended`]. A failed wait goes to [`Waitable::block_failed`], which
 /// ends the loop with the error unless the `Waitable` survives it.
-pub(crate) fn wait_ended<W: Waitable>(w: &mut W, waited: Result<bool, Error>) -> Result<Ended, Error> {
+pub(crate) fn wait_ended<W: Waitable + ?Sized>(w: &mut W, waited: Result<bool, Error>) -> Result<Ended, Error> {
     Ok(match waited {
         Ok(true) => Ended::NotReleased,
         Ok(false) => Ended::Released,
@@ -206,14 +213,14 @@ impl Control {
 /// a recheck) and look again. `deadline` is absolute (from [`absolute`]); `None` waits for ever. The
 /// loop control is [`Control`]'s, which the asynchronous driver runs too. A failed block goes to
 /// [`Waitable::block_failed`], which ends the loop with the error unless it is survived.
-pub(crate) fn run<W: Waitable>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
+pub(crate) fn run<W: Waitable + ?Sized>(w: &mut W, deadline: Option<Instant>) -> Result<RunOutcome<W::Output>, Error> {
     run_with(w, deadline, pause)
 }
 
 /// [`run`] with the way to pause for a [`Step::Recheck`]: `pause` is given the length of
 /// [`pause_end`]'s pause, read immediately before the call, and returns once it has passed. No
 /// pause is made, and `pause` is not called, once the deadline has passed.
-fn run_with<W: Waitable>(
+fn run_with<W: Waitable + ?Sized>(
     w: &mut W,
     deadline: Option<Instant>,
     mut pause: impl FnMut(Duration),
@@ -255,9 +262,9 @@ fn pause(d: Duration) {
 }
 
 /// An open process's exit, as a [`Waitable`]: `look` is [`OsProcess::exited`].
-pub(crate) struct ProcessExit<'a>(pub(crate) &'a dyn OsProcess);
+pub(crate) struct ProcessExit<'a, P: OsProcess + ?Sized>(pub(crate) &'a P);
 
-impl Waitable for ProcessExit<'_> {
+impl<P: OsProcess + ?Sized> Waitable for ProcessExit<'_, P> {
     type Output = ();
 
     fn look(&mut self) -> Result<Step<'_, ()>, Error> {

@@ -290,18 +290,14 @@ impl Child {
     /// Closes the stdin pipe first if it was not taken, so a child that reads stdin to EOF can
     /// exit. That includes a stdin that is a merge target.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
-        let outcome = self.reap_outcome().await?;
-        self.inner.status_of_reap(outcome)
+        drop(self.inner.pipes.remove(&Fd::STDIN));
+        self.inner.wait_async().await
     }
 
     /// The root's reap, as [`crate::Child::reap_outcome`] answers it, awaited: closes an untaken stdin first.
     pub(crate) async fn reap_outcome(&mut self) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
-        #[cfg(test)]
-        if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
-            return Err(error);
-        }
         drop(self.inner.pipes.remove(&Fd::STDIN));
-        self.inner.proc.wait_async().await
+        self.inner.reap_outcome_async().await
     }
 
     /// Exit status if the child has already exited (non-blocking).

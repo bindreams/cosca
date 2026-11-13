@@ -44,12 +44,23 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// itself.
     fn exited(&self) -> Result<Exit<'_>, Error>;
 
+    /// What one wait for the process's exit loops on ([`drive::exited_until`]): its own `Waitable`,
+    /// which may own the readiness source it blocks on, since a source that is read has one reader.
+    /// The default looks with [`exited`](OsProcess::exited) and waits on what that returns. It
+    /// is made before the wait's first look, so a source it arms misses no change after it.
+    fn exit_wait(&self) -> Result<ExitWait<'_>, Error> {
+        Ok(Box::new(drive::ProcessExit(self)))
+    }
+
     /// The OS object that names the process, lent to platform-only consumers (Job Objects, resume,
     /// cgroup attach). A fake lends its own wake fd or event, which names no process: code that
     /// uses a handle is tested against real processes.
     #[cfg(any(target_os = "linux", windows))]
     fn os_handle(&self) -> child::OsHandle<'_>;
 }
+
+/// The wait [`OsProcess::exit_wait`] makes: `Send`, so the asynchronous driver's future is.
+pub(crate) type ExitWait<'a> = Box<dyn drive::Waitable<Output = ()> + Send + 'a>;
 
 /// What one look at a process found.
 #[derive(Debug)]
@@ -72,7 +83,9 @@ pub(crate) enum Exit<'a> {
 #[derive(Debug)]
 pub(crate) enum WaitFor<'a> {
     /// Unix: a descriptor that polls readable once the process has exited, and that nothing reads:
-    /// the pidfd on Linux, a kqueue armed for the exit on macOS.
+    /// the pidfd on Linux, a kqueue armed for the exit on macOS. A macOS [`OsProcess::exit_wait`]
+    /// hands out another: the kqueue it owns, readable on any change it armed for (exit, signal,
+    /// reap), which only that wait reads, draining it before each look.
     #[cfg(unix)]
     Readable(BorrowedFd<'a>),
     /// Windows: the process handle; signalled once the process has exited.

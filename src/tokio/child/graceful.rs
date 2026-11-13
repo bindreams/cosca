@@ -129,7 +129,7 @@ impl Child {
     ///
     /// **macOS, a root launchd holds** is answered as for the sync
     /// [`graceful_shutdown`](crate::Child::graceful_shutdown): refused by the cooperative half, and
-    /// never killed or waited on, with no warn.
+    /// a root launchd comes to hold during the call is not killed or waited on, with no warn.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         crate::child::graceful::shutdown::shutdown_lone(self, grace).await
     }
