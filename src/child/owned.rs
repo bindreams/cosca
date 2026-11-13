@@ -237,20 +237,20 @@ impl OwnedChild {
     /// Whether the child is running, answered from its exit edge (see
     /// [`OsProcess::exited`](crate::os_process::OsProcess::exited)), so a zombie only a tracer sees
     /// is `Dead`. The reap peek is read only where the edge is silent: an exit record or a reap
-    /// elsewhere, and (macOS) the zombie the edge withholds.
+    /// elsewhere.
     ///
     /// An edge that fired and could not be confirmed (`exited` failed) is answered by the peek where
     /// the peek can: an exit record or a reap elsewhere is `Dead`; otherwise the failure stands,
     /// also when the peek reads the child running, which proves nothing (a tracer can hold the
     /// zombie, which the real parent's `waitid` does not see). A `Recheck` (the exit watch fired, and
-    /// the process is not yet a zombie) answers `Alive` until the zombie, as `ProcessId::is_alive`
-    /// does, unless the peek shows the exit record.
+    /// the process is not yet a zombie, or another process holds the running child) answers `Alive`
+    /// until the zombie, as `ProcessId::is_alive` does, unless the peek shows the exit record.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
-        let edge = match self.os.exited() {
+        match self.os.exited() {
             Ok(Exit::Exited) => return Ok(Liveness::Dead),
-            Ok(edge) => edge,
+            Ok(Exit::Running(_) | Exit::Recheck) => {}
             Err(refused) => {
                 return match self.peek() {
                     Ok(PeekOutcome::Exit(_) | PeekOutcome::Foreign(_)) => Ok(Liveness::Dead),
@@ -266,10 +266,9 @@ impl OwnedChild {
                     }
                 };
             }
-        };
+        }
         Ok(match self.peek()? {
             PeekOutcome::Exit(_) | PeekOutcome::Foreign(_) => Liveness::Dead,
-            PeekOutcome::Running if matches!(edge, Exit::Running(_)) && self.os.exited_unannounced()? => Liveness::Dead,
             PeekOutcome::Running => Liveness::Alive,
         })
     }
@@ -404,10 +403,13 @@ impl OwnedChild {
 
     /// Whether the child has exited by `deadline` (`None`: for ever), read through the OS's own look
     /// ([`OsProcess::exited`](crate::os_process::OsProcess::exited)): a zombie its tracer holds
-    /// counts on Linux; on macOS only at the hand-back (XNU withholds `NOTE_EXIT` from a
-    /// non-tracer parent while `p_oppid` is set, `kern_event.c:1203-1210`). Reaps nothing: during a
-    /// graceful tree shutdown the root stays an unreaped zombie until the group kill is done, so its
-    /// pid names no one else (principle 4). Takes no lock, so it may run while another thread waits.
+    /// counts, and so does one launchd holds. On macOS, while another process is the parent the look
+    /// reads the zombie itself and the wait re-looks with the driver's backoff (`MacChild::exited`
+    /// says why). A tracer that attaches during the wait wakes it, through the wait's own kqueue
+    /// ([`OsProcess::exit_wait`](crate::os_process::OsProcess::exit_wait)).
+    /// Reaps nothing: during a graceful tree shutdown the root stays an unreaped zombie until the
+    /// group kill is done, so its pid names no one else. Takes no lock, so it may run
+    /// while another thread waits.
     pub(crate) fn exited_by(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         crate::os_process::drive::exited_until(&*self.os, deadline)
     }

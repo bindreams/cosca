@@ -808,7 +808,7 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
 /// Mutant: `OwnedChild::liveness` answers `Alive` for a child the peek reads running.
 #[skuld::test]
 fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
-    let forced_watch = test_hooks::force_proc_registration_esrch_once(test_hooks::Registration::ExitWatch);
+    let forced_watch = test_hooks::force_proc_registration_once(test_hooks::Registration::ExitWatch);
     let b = Blocker::spawn();
     drop(forced_watch);
     let reads = uniq_fault::record();

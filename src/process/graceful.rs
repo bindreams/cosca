@@ -34,8 +34,8 @@ impl Process {
         self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        let call = format!("graceful_shutdown({})", self.id.pid());
-        crate::graceful::after_grace(&call, self.wait_timeout(grace), || self.kill())
+        let call = || format!("graceful_shutdown({})", self.id.pid());
+        crate::graceful::after_grace(call, self.wait_timeout(grace), || self.kill())?.map_or(Ok(()), Err)
     }
 
     /// Best-effort hard sweep of the foreign process's tree: an identity-walk that re-verifies

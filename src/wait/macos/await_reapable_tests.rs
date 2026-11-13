@@ -330,7 +330,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
     };
     let (mut child, stdin) = spawn_blocker();
     let pid = child.id();
-    let _esrch = test_hooks::force_proc_registration_esrch_once(test_hooks::Registration::Reap);
+    let _esrch = test_hooks::force_proc_registration_once(test_hooks::Registration::Reap);
     let mut stdin = Some(stdin);
     // Between re-peeks: flip the disposition, then let the child exit.
     let _flip = test_hooks::on_esrch_repeek(move || {

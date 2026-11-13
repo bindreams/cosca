@@ -85,12 +85,13 @@ pub(crate) enum ReadPurpose {
     Open,
     /// A peek that found an exit record, just before its consume.
     Peek,
-    /// A peek that found the child running, and the liveness read that follows it.
+    /// A peek that found the child running, and the reads of a child's look whose exit watch has not
+    /// fired (its parent, then whether it is a zombie).
     Running,
     /// The look that confirms a fired exit watch is a zombie or a reaped process
     /// ([`ExitWatch::look`](crate::os_process::macos::ExitWatch::look)): its own purpose, so a
-    /// forced read there does not collide with the `Running` reads of the peek and
-    /// `exited_unannounced`.
+    /// forced read there does not collide with the `Running` reads of the peek and of a child's
+    /// unfired watch.
     Exit,
     /// A peek that got `ECHILD`: does the pid still name our child, and who holds it?
     Echild,

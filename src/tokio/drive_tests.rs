@@ -900,6 +900,32 @@ async fn exited_held_takes_the_watch_fault_seam() {
     assert_eq!(p.looks(), 0, "the seam comes before any look");
 }
 
+/// The wait comes from the process's own [`crate::os_process::OsProcess::exit_wait`], made once, and
+/// the loop runs on it.
+///
+/// Mutant: `exited_until` builds [`ProcessExit`] itself: the process's wait is never made and its
+/// look (which the fake has no answer for) panics.
+#[cfg(unix)]
+#[skuld::test]
+async fn exited_until_loops_on_the_wait_the_process_makes() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let p = crate::os_process::drive::drive_tests::OwnWait::new(2, fake([]));
+    assert!(super::exited_until(&p, None).await.unwrap());
+    assert_eq!(p.made(), 1);
+}
+
+/// A deadline that has passed makes one look and no wait of the process's own.
+///
+/// Mutant: the probe makes the process's wait first.
+#[skuld::test]
+async fn exited_until_at_a_passed_deadline_looks_once_and_makes_no_wait() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let own = crate::os_process::drive::drive_tests::OwnWait::new(0, fake([Answer::Running]));
+    assert!(!super::exited_held(&own, Some(Duration::ZERO)).await.unwrap());
+    assert_eq!(own.made(), 0);
+    assert_eq!(own.process.looks(), 1);
+}
+
 /// Mutant: `exited_held` drops the timeout, or does not resolve for an exited process.
 #[skuld::test]
 async fn exited_held_resolves_for_an_exited_fake() {

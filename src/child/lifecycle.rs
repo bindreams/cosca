@@ -249,17 +249,9 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
     answer
 }
 
-/// [`wait_to_exit`] with no threshold, as the status the public blocking waits answer:
-/// `Child::wait`, `Unreaped::wait` and `Child::wait_root` with `None`.
+/// [`wait_to_exit`] with no threshold, as the status an unbounded blocking wait answers.
 pub(super) fn wait_for_status(proc: &OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
     unbounded_status(proc.pid(), wait_to_exit(proc, None)?, orphaned)
-}
-
-/// [`wait_for_status`] awaited, through [`OwnedChild::wait_async`], as the async `Child::wait` answers.
-#[cfg(feature = "tokio")]
-pub(super) async fn wait_for_status_async(proc: &mut OwnedChild, orphaned: Orphaned) -> Result<ExitStatus, Error> {
-    let outcome = proc.wait_async().await?;
-    unbounded_status(proc.pid(), outcome, orphaned)
 }
 
 /// The status an unbounded wait's `outcome` on the child `pid` answers: a deadline that passed is
@@ -290,7 +282,7 @@ pub(super) fn orphaned_note(pid: Option<u32>) -> String {
 }
 
 /// The `ECHILD` every wait answers when the child was reaped by someone else.
-fn echild() -> io::Error {
+pub(crate) fn echild() -> io::Error {
     #[cfg(unix)]
     {
         io::Error::from_raw_os_error(libc::ECHILD)
@@ -310,27 +302,10 @@ impl Child {
     /// no waitable handle. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded (blocks until exit) rather than panicking.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, Orphaned::Warn)
-    }
-
-    /// [`wait_timeout`](Child::wait_timeout) that does not report a zombie launchd holds (macOS):
-    /// for a caller that reports it with its own refusal.
-    #[cfg(unix)]
-    pub(crate) fn wait_timeout_quiet(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, Orphaned::Quiet)
-    }
-
-    fn wait_timeout_by(&self, timeout: Duration, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
-        // The sync lone path's watch goes through `OwnedChild::wait`, not
-        // `exited_by`, so it needs its own head of the shared watch fault seam.
-        #[cfg(test)]
-        if crate::wait::fault::take_force_watch_error() {
-            return Err(crate::wait::fault::forced_watch_error());
-        }
         // `Instant + Duration` panics on overflow (e.g. Duration::MAX). Convert to a deadline
         // with a saturating checked_add: on overflow the timeout is effectively infinite, so
         // block until exit.
-        self.wait_root(crate::wait::now().checked_add(timeout), orphaned)
+        self.wait_root(crate::wait::now().checked_add(timeout), Orphaned::Warn)
     }
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
@@ -346,7 +321,24 @@ impl Child {
     /// runtime and blocks no thread.
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&mut self) -> Result<ExitStatus, Error> {
-        wait_for_status_async(&mut self.proc, Orphaned::Warn).await
+        let outcome = self.reap_outcome_async().await?;
+        self.status_of_reap(outcome)
+    }
+
+    /// [`reap_outcome`](Child::reap_outcome), awaited: the one async reap of the root.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn reap_outcome_async(&mut self) -> Result<ChildWaitOutcome, Error> {
+        #[cfg(test)]
+        if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
+            return Err(error);
+        }
+        self.proc.wait_async().await
+    }
+
+    /// The status [`wait`](Child::wait) answers for the root's `outcome` ([`reap_outcome`](Child::reap_outcome)): a
+    /// zombie launchd holds is warned of, a root reaped elsewhere is `ECHILD`.
+    pub(crate) fn status_of_reap(&self, outcome: ChildWaitOutcome) -> Result<ExitStatus, Error> {
+        unbounded_status(self.proc.pid(), outcome, Orphaned::Warn)
     }
 
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is

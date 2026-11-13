@@ -34,7 +34,12 @@ pub(crate) fn echild_yet_resolvable() -> (u32, u64) {
 /// The parent read of a live process another process holds, as a tracer holds a child: not
 /// launchd.
 pub(crate) fn held_by_a_tracer() -> ppid_fault::Forced {
-    ppid_fault::force_ppid_once(Ok(4242))
+    ppid_fault::force_ppid_once(Ok(held_by_a_tracer_pid()))
+}
+
+/// The tracer's pid in the parent read [`held_by_a_tracer`] forces.
+pub(crate) fn held_by_a_tracer_pid() -> u32 {
+    4242
 }
 
 /// The parent read of a zombie whose tracer died: XNU reparented it to launchd.

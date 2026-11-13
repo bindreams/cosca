@@ -1680,28 +1680,6 @@ pub(crate) fn term_ignoring_blocker() -> (crate::Child, crate::PipeWriter) {
     (child, stdin)
 }
 
-/// Async twin of [`term_ignoring_blocker`].
-#[cfg(all(unix, feature = "tokio"))]
-pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    use ::tokio::io::AsyncReadExt as _;
-
-    let mut cmd = tokio_command(Console::Hidden);
-    cmd.args(TERM_IGNORING_BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
-    let mut child = cmd.spawn().await.expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    let mut readiness = [0u8; 1];
-    child
-        .stdout()
-        .expect("piped stdout")
-        .read_exact(&mut readiness)
-        .await
-        .expect("readiness byte");
-    (child, stdin)
-}
-
 /// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, the
 /// kill's exit code `1` on Windows, so a crash on the release fails too. A Windows child that
 /// itself exits `1` on EOF cannot be told from a kill, so it is no blocker for this.

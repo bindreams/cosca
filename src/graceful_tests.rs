@@ -157,23 +157,59 @@ fn signal_refuses_a_child_cosca_did_not_create() {
 // after_grace / after_tree_grace =====
 // Pure: the policy takes the watch result and one closure, so no process is involved.
 
+fn call() -> String {
+    CALL.to_owned()
+}
+
+/// `after_grace`, then the watch failure it hands back surfaced, as a call with nothing after the kill does.
+fn grace_surfacing(watch: Result<bool, Error>, kill: &mut dyn FnMut() -> Result<(), Error>) -> Result<(), Error> {
+    after_grace(call, watch, kill)?.map_or(Ok(()), Err)
+}
+
+/// The watch failure is handed back to the caller, not surfaced, once the kill is done: the lone core
+/// reaps before it answers.
+///
+/// Mutant: `after_grace` surfaces the watch failure itself.
+#[skuld::test]
+fn after_grace_hands_back_the_watch_error_once_the_kill_is_done() {
+    let (out, kills) = counted(Ok(()), |k| {
+        let handed = after_grace(call, Err(io_error("watch")), k).expect("the kill succeeded");
+        assert!(message(handed.map_or(Ok(()), Err)).contains("watch"));
+        Ok(())
+    });
+    out.expect("handed back");
+    assert_eq!(kills, 1);
+}
+
+/// The call's label is built for a kill error only.
+///
+/// Mutant: the label is built whatever happens.
+#[skuld::test]
+fn after_grace_builds_the_label_for_a_kill_error_only() {
+    let (out, _) = counted(Ok(()), |k| {
+        after_grace(|| panic!("the label was built"), Ok(false), k)?;
+        Ok(())
+    });
+    out.expect("no kill error");
+}
+
 #[skuld::test]
 fn after_grace_is_done_without_a_kill_when_the_process_exited_in_grace() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Ok(true), k));
+    let (out, kills) = counted(Ok(()), |k| grace_surfacing(Ok(true), k));
     out.expect("exited in grace is done");
     assert_eq!(kills, 0);
 }
 
 #[skuld::test]
 fn after_grace_kills_when_the_grace_ran_out() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Ok(false), k));
+    let (out, kills) = counted(Ok(()), |k| grace_surfacing(Ok(false), k));
     out.expect("a successful kill is done");
     assert_eq!(kills, 1);
 }
 
 #[skuld::test]
 fn after_grace_kills_then_reports_the_watch_error() {
-    let (out, kills) = counted(Ok(()), |k| after_grace(CALL, Err(io_error("watch")), k));
+    let (out, kills) = counted(Ok(()), |k| grace_surfacing(Err(io_error("watch")), k));
     assert!(message(out).contains("watch"));
     assert_eq!(kills, 1, "an unobservable grace escalates");
 }
@@ -201,7 +237,7 @@ fn containment(detail: &str) -> Error {
 fn after_grace_an_io_kill_error_stays_the_answer_and_the_watch_error_is_a_warn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (out, kills) = counted(Err(io_error("kill")), |k| after_grace(CALL, Err(io_error("watch")), k));
+    let (out, kills) = counted(Err(io_error("kill")), |k| grace_surfacing(Err(io_error("watch")), k));
     assert!(matches!(&out, Err(Error::Io(e)) if e.to_string() == "kill"), "{out:?}");
     assert_eq!(kills, 1);
     let logged = crate::log_capture::records_since_on_current_thread(mark, "watch");
@@ -214,16 +250,14 @@ fn after_grace_an_io_kill_error_stays_the_answer_and_the_watch_error_is_a_warn()
 // With no watch failure the kill's error is returned as it is: a raw `Io` keeps its code.
 #[skuld::test]
 fn after_grace_a_lone_kill_error_stays_as_it_is() {
-    let (out, _) = counted(Err(io_error("kill")), |k| after_grace(CALL, Ok(false), k));
+    let (out, _) = counted(Err(io_error("kill")), |k| grace_surfacing(Ok(false), k));
     assert!(matches!(out, Err(Error::Io(_))), "{out:?}");
 }
 
 // A kill error that has a slot keeps its variant, with the watch failure as its cause.
 #[skuld::test]
 fn after_grace_a_kill_error_with_a_slot_keeps_its_variant() {
-    let (out, _) = counted(Err(containment("kill")), |k| {
-        after_grace(CALL, Err(io_error("watch")), k)
-    });
+    let (out, _) = counted(Err(containment("kill")), |k| grace_surfacing(Err(io_error("watch")), k));
     assert!(
         matches!(&out, Err(Error::Containment { detail, source: Some(cause) })
             if detail == "kill" && said(cause) == crate::error::io_said("watch")),
@@ -308,7 +342,7 @@ fn after_tree_grace_a_sweep_error_with_a_slot_keeps_its_variant() {
 fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() {
     let status = std::process::ExitStatus::default();
     let out = super::after_reap(
-        CALL,
+        call,
         Err(containment("reap")),
         Some(containment("refused")),
         Some(io_error("watch")),
@@ -325,7 +359,7 @@ fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() 
     );
     assert_eq!(
         message_of(super::after_reap(
-            CALL,
+            call,
             Ok(status),
             Some(containment("refused")),
             Some(io_error("watch"))
@@ -333,15 +367,15 @@ fn after_reap_takes_the_refusal_and_the_watch_error_as_peers_of_a_failed_reap() 
         crate::error::io_said("watch")
     );
     assert_eq!(
-        message_of(super::after_reap(CALL, Err(io_error("reap")), None, None)),
+        message_of(super::after_reap(call, Err(io_error("reap")), None, None)),
         crate::error::io_said("reap")
     );
     assert_eq!(
-        super::after_reap(CALL, Ok(status), None, None).expect("neither failed"),
+        super::after_reap(call, Ok(status), None, None).expect("neither failed"),
         status
     );
     assert_eq!(
-        super::after_reap(CALL, Ok(status), Some(containment("refused")), None).expect("a superseded refusal"),
+        super::after_reap(call, Ok(status), Some(containment("refused")), None).expect("a superseded refusal"),
         status
     );
 }

@@ -149,6 +149,130 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::test_child::assert_killed("the escalated child", status);
 }
 
+/// A reap that fails after the kill is the answer, and the grace wait's failure beside it is logged
+/// at warn, naming the call: the reap's failure is an `Io`, which holds nothing.
+///
+/// Mutant: the watch failure is dropped when the reap fails.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failed_lone_reap_is_the_answer_and_the_watch_failure_a_warn_naming_the_call() {
+    use crate::child::spawn::failure::seams;
+    use crate::error::Error;
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (child, stdin) = kill_only_blocker();
+    fault::set_force_watch_error(true);
+    let _armed = seams::fail_the_next_wait();
+
+    let err = child.graceful_shutdown(Duration::ZERO).expect_err("the reap failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains(seams::FAILURE)),
+        "{err:?}"
+    );
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "forced grace-watch failure");
+    let call = format!("graceful_shutdown({})", child.pid());
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.starts_with(&call)),
+        "{logged:?}"
+    );
+    // The kill landed: the seam consumed, this wait reaps what it killed.
+    let status = child.wait().expect("reap the killed child");
+    crate::test_child::assert_killed("the escalated child", status);
+    drop(stdin);
+}
+
+/// A root reaped behind the handle's back has exited, as the grace watch (which reaps nothing) sees it:
+/// no escalation follows, and the answer is the one `graceful_shutdown_tree` gives (`Unassessable`, the
+/// reap's `ECHILD` its `source()`), with no warn beside it.
+///
+/// Mutant: the grace watch reaps, so the foreign reap is its failure, and the escalation and a warn
+/// for it follow; the reap's verdict is folded into an `Io`.
+#[cfg(unix)]
+#[skuld::test]
+fn graceful_lone_shutdown_of_a_root_reaped_elsewhere_answers_unassessable_with_the_reaps_echild() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
+
+    crate::log_capture::install();
+    let mut child = session_cat().spawn().expect("spawn");
+    let _stdin = child.stdin().expect("stdin pipe");
+    let pid = child.pid();
+    kill_own_child(pid);
+    reap_behind(pid);
+    let escalated = Arc::new(AtomicBool::new(false));
+    let _hook = term_fault::at(term_fault::HookPoint::BeforeEscalation, {
+        let escalated = Arc::clone(&escalated);
+        move || escalated.store(true, Ordering::Relaxed)
+    });
+    let mark = crate::log_capture::mark();
+
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("a root reaped elsewhere has no exit status");
+
+    assert!(
+        matches!(&err, crate::error::Error::Unassessable { detail, .. }
+            if detail.contains("exit status cannot be collected: the root was reaped elsewhere")
+                && detail.contains("graceful_shutdown sent its signals")),
+        "{err:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ECHILD), "{err:?}");
+    assert!(
+        !escalated.load(Ordering::Relaxed),
+        "a root the watch saw exit was escalated against"
+    );
+    assert_eq!(crate::log_capture::warns_since(mark, ""), Vec::<String>::new());
+}
+
+/// Whichever foreign verdict the reap gives for a root that exited within the grace (reaped elsewhere,
+/// or its pid named another process now), the answer is the same: no kill, no warn, `Unassessable`
+/// with the `ECHILD` as its `source()`.
+///
+/// Mutant: one of the verdicts is folded into an `Io`, or answers a status.
+#[cfg(unix)]
+#[skuld::test]
+fn graceful_lone_shutdown_answers_every_foreign_reap_as_unassessable_with_the_echild() {
+    use crate::os_process::child::Foreign;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{child_over, root_looking};
+
+    crate::log_capture::install();
+    for foreign in [Foreign::Gone, Foreign::Other] {
+        let mark = crate::log_capture::mark();
+        let root = root_looking([Answer::Exited]).reaps([ReapAnswer::Foreign(foreign)]);
+        let child = child_over(&root);
+
+        let err = child
+            .graceful_shutdown(Duration::from_secs(3600))
+            .expect_err("a root reaped elsewhere has no exit status");
+
+        assert!(
+            matches!(&err, crate::error::Error::Unassessable { detail, .. }
+                if detail.contains("exit status cannot be collected: the root was reaped elsewhere")),
+            "{foreign:?}: {err:?}"
+        );
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(libc::ECHILD),
+            "{foreign:?}: {err:?}"
+        );
+        assert_eq!(
+            root.signal_calls(),
+            vec![crate::signal::Sig::Term],
+            "{foreign:?}: no kill"
+        );
+        assert_eq!(
+            crate::log_capture::warns_since(mark, ""),
+            Vec::<String>::new(),
+            "{foreign:?}"
+        );
+    }
+}
+
 // The graceful path: an uncontained `cat` dies to `SIGTERM`'s default disposition within the
 // grace. Its stdin is released via `release_at` after `terminate` returns; a `terminate` that sent
 // nothing yields exit 0 and fails the assertion.
@@ -584,6 +708,42 @@ fn a_best_effort_reap_that_fails_after_a_failed_sweep_is_logged_once_at_warn() {
     assert!(
         matches!(&logged[..], [(log::Level::Warn, line)] if line.contains("graceful_shutdown_tree(")),
         "{logged:?}"
+    );
+}
+
+/// The best-effort reap after a failed sweep of an exited root is one attempt that does not wait: a
+/// zombie that is not ours yet (a tracer holds it, or the OS is finishing the exit) stays with the
+/// handle, and the sweep's error is the answer, with nothing logged.
+///
+/// Mutant: the best-effort reap is the blocking reap, which loops on the `Recheck` into a reap the
+/// fake has no answer for.
+#[cfg(unix)]
+#[skuld::test]
+fn a_best_effort_reap_that_is_not_ready_after_a_failed_sweep_leaves_the_zombie_with_the_handle() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::error::Error;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{child_with, root_looking};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let root = root_looking([Answer::Exited; 4]).reaps([ReapAnswer::Recheck]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake);
+    let _armed = term_fault::ArmedKillTreeError::arm();
+
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect_err("the sweep failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("forced kill_tree failure")),
+        "{err:?}"
+    );
+    assert_eq!(
+        crate::log_capture::records_since_on_current_thread(mark, "best-effort reap"),
+        Vec::<(log::Level, String)>::new()
     );
 }
 
@@ -1177,77 +1337,4 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
             if line.contains("pid 4242 was killed, but its exit cannot be observed")),
         "the member was waited for, and its failure is logged once, at warn: {waited:?}"
     );
-}
-
-/// A root reaped elsewhere (`ECHILD`) leaves no exit status: the answer is `Unassessable`, with the
-/// `ECHILD` as its `source()`, so a caller can tell this from any other refusal.
-///
-/// Mutant: the answer drops the error of the wait.
-#[cfg(unix)]
-#[skuld::test]
-fn a_root_reaped_elsewhere_answers_unassessable_with_its_echild_as_the_source() {
-    use crate::error::Error;
-
-    let waited = Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD)));
-
-    let answer = super::status_unless_reaped_elsewhere(waited, 4242).expect_err("no exit status was collected");
-
-    assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
-    assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
-}
-
-/// An `ECHILD` deep in the chain of a variant that is not an `Error::Io` is not a root reaped
-/// elsewhere: the wait's answer is kept as it is.
-///
-/// Mutant: any error with an `ECHILD` anywhere down its chain counts.
-#[cfg(unix)]
-#[skuld::test]
-fn an_echild_below_a_variant_that_is_not_io_is_not_a_root_reaped_elsewhere() {
-    use crate::error::Error;
-
-    let echild = || Error::io_cause(std::io::Error::from_raw_os_error(libc::ECHILD));
-    let waits = [
-        Error::Containment {
-            detail: "the wait's own failure".into(),
-            source: Some(echild()),
-        },
-        Error::MemberNotKilled {
-            pid: 4243,
-            source: echild(),
-        },
-    ];
-    for waited in waits {
-        let words = waited.to_string();
-
-        let answer = super::status_unless_reaped_elsewhere(Err(waited), 4242).expect_err("the wait failed");
-
-        assert_eq!(answer.to_string(), words, "kept as it is: {answer:?}");
-        assert!(!matches!(answer, Error::Unassessable { .. }), "{answer:?}");
-    }
-}
-
-/// A wait's `ECHILD` below a context or a note is still a reap elsewhere: the answer is the same
-/// `Unassessable`, and the wait's error, words included, is its `source()`.
-///
-/// Mutant: only a bare `Error::Io` with the code itself counts.
-#[cfg(unix)]
-#[skuld::test]
-fn a_wrapped_echild_is_still_a_root_reaped_elsewhere() {
-    use crate::error::Error;
-
-    let echild = || std::io::Error::from_raw_os_error(libc::ECHILD);
-    let waits = [
-        Error::Io(crate::error::io_context("waiting for pid 4242", echild())),
-        Error::Io(echild()).with_note("while tearing down"),
-    ];
-    for waited in waits {
-        let words = waited.to_string();
-
-        let answer = super::status_unless_reaped_elsewhere(Err(waited), 4242).expect_err("no exit status");
-
-        assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
-        assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
-        let report = crate::error::said(&answer);
-        assert!(report.contains(&words), "the wait's words are kept: {report}");
-    }
 }

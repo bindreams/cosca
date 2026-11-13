@@ -49,21 +49,31 @@ fn held() -> (crate::Child, crate::PipeWriter) {
     (tracee, stdin)
 }
 
-/// Runs `tracee.wait()` on a thread and returns once that thread is about to block on its first
-/// `poll` of the reap kqueue, whose knote is registered: no event can be lost after that.
+/// Runs `wait(tracee)` on a thread and returns once that thread is about to block on its first
+/// `poll` of a kqueue, whose knote is registered: no event can be lost after that.
+fn blocked_in<'s, G, R: Send + 's>(
+    scope: &'s std::thread::Scope<'s, '_>,
+    tracee: &'s crate::Child,
+    arm: impl FnOnce() -> G + Send + 's,
+    wait: impl FnOnce(&'s crate::Child) -> R + Send + 's,
+) -> std::thread::ScopedJoinHandle<'s, R> {
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let waiter = scope.spawn(move || {
+        let _armed = arm();
+        let _blocked = crate::wait::block_probe::on_blocking(move || _ = blocked_tx.send(()));
+        wait(tracee)
+    });
+    blocked_rx.recv().expect("the waiter must reach its blocking poll");
+    waiter
+}
+
+/// [`blocked_in`] for `tracee.wait()`, which blocks on the reap kqueue.
 fn wait_blocked<'s, G>(
     scope: &'s std::thread::Scope<'s, '_>,
     tracee: &'s crate::Child,
     arm: impl FnOnce() -> G + Send + 's,
 ) -> std::thread::ScopedJoinHandle<'s, Result<std::process::ExitStatus, crate::error::Error>> {
-    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
-    let waiter = scope.spawn(move || {
-        let _armed = arm();
-        let _blocked = crate::wait::block_probe::on_blocking(move || _ = blocked_tx.send(()));
-        tracee.wait()
-    });
-    blocked_rx.recv().expect("the waiter must reach its blocking poll");
-    waiter
+    blocked_in(scope, tracee, arm, |tracee| tracee.wait())
 }
 
 /// An `OwnedChild` wait blocked while a tracer holds the child stays blocked through the child's
@@ -129,6 +139,125 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
         let status = waiter.join().expect("waiter").expect("the wait ends with the status");
         assert!(status.success(), "{status:?}");
     });
+}
+
+/// A tracee whose tracer holds its zombie has exited for the grace watch, though XNU sends its
+/// `NOTE_EXIT` to the tracer alone: the look reads the zombie itself, so the watch ends with the
+/// tracer still holding it. While the tracee runs, the held look is a `Recheck`, so it reads as
+/// running at an expired deadline.
+///
+/// Mutant: `exited_by` waits on the exit watch alone, which fires only at the hand-back: the
+/// unbounded watch below never returns.
+#[skuld::test]
+fn a_zombie_a_tracer_holds_has_exited_for_the_grace_watch_before_the_hand_back(
+    #[fixture(tracer_group)] _group: &Group,
+) {
+    let (tracee, stdin) = held();
+    let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+    assert_eq!(helper.recv(), Report::Attached);
+    assert!(
+        !tracee.proc.exited_by(Some(Instant::now())).expect("a held live root"),
+        "a held root that runs has not exited"
+    );
+    drop(stdin);
+    assert_eq!(helper.recv(), Report::Exited);
+    assert!(
+        tracee.proc.exited_by(None).expect("a held zombie"),
+        "the held zombie has exited"
+    );
+    assert_eq!(
+        tracee.try_wait().expect("try_wait"),
+        None,
+        "a held zombie is not ours yet"
+    );
+    helper.signal();
+    assert_eq!(helper.recv(), Report::Reaped);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A zombie that launchd holds has exited for the grace watch, with a long grace unspent. The tracer's
+/// hold is the real state, and its parent read is forced to launchd, as when the tracer died while the
+/// tracee was exiting.
+///
+/// Mutant: the look reads past the exit watch only for a parent that is a tracer, not for launchd.
+#[skuld::test]
+fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(tracer_group)] _group: &Group) {
+    use crate::identity::{ppid_fault, LAUNCHD};
+
+    let (tracee, stdin) = held();
+    let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+    assert_eq!(helper.recv(), Report::Attached);
+    drop(stdin);
+    assert_eq!(helper.recv(), Report::Exited);
+    {
+        let _launchd = ppid_fault::force_ppid_with(|| Ok(LAUNCHD));
+        let long = Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(
+            tracee.proc.exited_by(Some(long)).expect("a zombie launchd holds"),
+            "the zombie has exited: no grace is spent on it"
+        );
+    }
+    helper.signal();
+    assert_eq!(helper.recv(), Report::Reaped);
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A real tracer that attaches while the grace watch is blocked (`graceful_shutdown`'s wait, here
+/// [`OwnedChild::exited_by`](crate::child::owned::OwnedChild::exited_by) with no deadline): the
+/// attach's `SIGSTOP` wakes the watch on its own kqueue, its look finds another process holding the
+/// child, and the watch ends once the tracer holds the child's zombie. XNU sends that `NOTE_EXIT` to
+/// the tracer alone.
+///
+/// Mutant: the exit wait registers no `NOTE_SIGNAL`, or blocks on the shared exit kqueue, whose
+/// `NOTE_EXIT` is withheld: the watch never returns.
+#[skuld::test]
+fn a_tracer_that_attaches_during_the_grace_watch_wakes_it(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, stdin) = held();
+    std::thread::scope(|s| {
+        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None));
+        let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+        assert_eq!(helper.recv(), Report::Attached);
+        drop(stdin);
+        assert_eq!(helper.recv(), Report::Exited);
+        assert!(
+            watcher.join().expect("watcher").expect("the watch"),
+            "the held zombie has exited"
+        );
+        helper.signal();
+        assert_eq!(helper.recv(), Report::Reaped);
+    });
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
+}
+
+/// A thread that asks `is_alive` while the grace watch is blocked takes nothing from it: the attach
+/// that follows still wakes the watch, which ends once the tracer holds the zombie. The watch's
+/// kqueue is its own, and `is_alive` reads only the shared exit watch.
+///
+/// Mutant: the watch blocks on a kqueue that `is_alive` reads, which takes the attach's event.
+#[skuld::test]
+fn is_alive_during_the_grace_watch_does_not_swallow_its_wake(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, stdin) = held();
+    std::thread::scope(|s| {
+        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None));
+        assert_eq!(tracee.is_alive(), crate::identity::Liveness::Alive);
+        let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
+        assert_eq!(helper.recv(), Report::Attached);
+        // Whatever it answers for a held child, it must not take the watch's wake.
+        let _liveness = tracee.is_alive();
+        drop(stdin);
+        assert_eq!(helper.recv(), Report::Exited);
+        assert!(
+            watcher.join().expect("watcher").expect("the watch"),
+            "the held zombie has exited"
+        );
+        helper.signal();
+        assert_eq!(helper.recv(), Report::Reaped);
+    });
+    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
+    assert!(status.success(), "{status:?}");
 }
 
 /// The live blocker [`tracer::spawn_tracee`] makes, its stdin (closing it ends the tracee), and its
