@@ -15,9 +15,10 @@ use windows::Win32::System::Threading::{
 
 use crate::harness::{
     contain, env_block, report_cmdline, require_gate, splice_child_report, wait_for, wide, ScratchAccount,
-    CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    CHILD_EXIT_BOUND_MS, PROBE_ALLOW_ACCOUNTS_ENV, PROBE_ANCESTOR_CONTAINED_ENV, PROBE_ENV_CANARY_ENV,
+    PROBE_REPORT_TO_ENV, WAIT_INCOMPLETE_TOKEN,
 };
-use crate::windows_probe::mark_test_passed;
+use crate::windows_probe::{mark_test_passed, PROBE_MARKERS_ENV};
 
 /// **Question 1.** Does `CreateProcessWithLogonW`, handed the credentials of a local
 /// ADMINISTRATOR, produce an ELEVATED child? `runas.exe` is built on this API and is widely
@@ -29,7 +30,7 @@ use crate::windows_probe::mark_test_passed;
 #[skuld::test]
 fn does_create_process_with_logon_elevate(#[fixture(elevation_routes)] _group: &Group) {
     require_gate(
-        "COSCA_PROBE_ALLOW_ACCOUNTS",
+        PROBE_ALLOW_ACCOUNTS_ENV,
         "creates and deletes a local administrator account",
     );
     let mut measured_admin = false;
@@ -62,7 +63,7 @@ fn does_create_process_with_logon_elevate(#[fixture(elevation_routes)] _group: &
         "the standard-user scratch account produced no token report, so the contrast against the \
          Administrators account — the whole point of running both — was never measured."
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// The body of the probe above, for one account. Split out so the administrator and the standard
@@ -151,9 +152,9 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
     // see `measure_this_token`'s doc for why this must be its own explicit marker rather than
     // inferred from `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone.
     let block = env_block(&[
-        ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
-        ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
-        ("COSCA_PROBE_ENV_CANARY", "carried-through".into()),
+        (PROBE_REPORT_TO_ENV, report.display().to_string()),
+        (PROBE_ANCESTOR_CONTAINED_ENV, "1".into()),
+        (PROBE_ENV_CANARY_ENV, "carried-through".into()),
         ("TEMP", dir.path().display().to_string()),
         ("TMP", dir.path().display().to_string()),
     ]);

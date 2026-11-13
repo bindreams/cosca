@@ -106,6 +106,9 @@ mod verdict;
 #[cfg(windows)]
 #[path = "windows_path_resolution/winapi.rs"]
 mod winapi;
+#[cfg(windows)]
+#[path = "common/windows_probe.rs"]
+mod windows_probe;
 
 #[cfg(windows)]
 use common::test_groups;

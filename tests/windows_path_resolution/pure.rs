@@ -148,12 +148,6 @@ pub fn all_succeeded(steps: impl IntoIterator<Item = (&'static str, Result<(), S
     }
 }
 
-/// The marker file for the test `test_name` (skuld's libtest-style trial name): `::` is not
-/// allowed in a Windows file name, so module separators become `.`.
-pub fn marker_file_name(test_name: &str) -> String {
-    test_name.replace("::", ".")
-}
-
 /// Terminate a child, then reap it only if termination succeeded: a child that was not
 /// terminated may still be alive, and an unbounded wait on it could block forever. Returns the
 /// outcome of each step that ran, for [`all_succeeded`].

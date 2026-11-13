@@ -7,7 +7,7 @@ use crate::harness::{
     elevation_type_name, integrity_name, open_own_token, require_gate, schtasks_registration_report,
     token_elevation_type, token_integrity_rid,
 };
-use crate::windows_probe::mark_test_passed;
+use crate::windows_probe::{mark_test_passed, PROBE_MARKERS_ENV};
 
 /// Can a caller REGISTER a task that runs with `RunLevel=Highest`? If registration needs
 /// elevation the route is dead for an unelevated caller regardless of what a registered task
@@ -18,7 +18,10 @@ use crate::windows_probe::mark_test_passed;
 /// the one that decides the route.
 #[skuld::test]
 fn can_this_caller_register_a_runlevel_highest_task(#[fixture(elevation_routes)] _group: &Group) {
-    require_gate("COSCA_PROBE_ALLOW_STATE", "registers and deletes a scheduled task");
+    require_gate(
+        crate::harness::PROBE_ALLOW_STATE_ENV,
+        "registers and deletes a scheduled task",
+    );
     let etype_str = open_own_token(TOKEN_QUERY)
         .and_then(|t| token_elevation_type(t.0))
         .map_or_else(
@@ -41,5 +44,5 @@ fn can_this_caller_register_a_runlevel_highest_task(#[fixture(elevation_routes)]
         "not one schtasks /create call exited with a status, so nothing was measured — schtasks \
          itself could not be launched"
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }

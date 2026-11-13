@@ -12,6 +12,9 @@ use crate::graceful_hooks::{self, HookPoint};
 use crate::identity::{Liveness, Resolved};
 use crate::test_child::{held_writer_stdin, tokio_command, Console, BLOCKER_ARGV};
 
+/// Set on a command to check that its environment survives the async spawn.
+const SPAWN_TEST_ENV: &str = "COSCA_SPAWN_TEST";
+
 /// The sync spawn's own code runs on a blocking-pool thread, not on the runtime's.
 ///
 /// Mutant: the async spawn runs the sync spawn in place.
@@ -50,7 +53,7 @@ async fn the_spawn_runs_on_a_blocking_pool_thread() {
 async fn a_completed_spawn_leaves_the_command_as_the_sync_spawn_does() {
     let (stdin, writer) = held_writer_stdin();
     let mut cmd = tokio_command(Console::Hidden);
-    cmd.args(BLOCKER_ARGV.iter().copied()).env("COSCA_SPAWN_TEST", "kept");
+    cmd.args(BLOCKER_ARGV.iter().copied()).env(SPAWN_TEST_ENV, "kept");
     cmd.stdin(stdin).expect("stdin");
     let mut child = cmd.spawn().await.expect("spawn");
     drop(writer);
@@ -90,7 +93,7 @@ fn a_spawn_dropped_after_its_first_poll_runs_to_its_end_on_the_pool() {
     let (release, held) = std::sync::mpsc::channel::<()>();
     let hold = rt.spawn_blocking(move || held.recv());
     let mut cmd = tokio_command(Console::Hidden);
-    cmd.args(BLOCKER_ARGV.iter().copied()).env("COSCA_SPAWN_TEST", "gone");
+    cmd.args(BLOCKER_ARGV.iter().copied()).env(SPAWN_TEST_ENV, "gone");
     cmd.stdin(stdin).expect("stdin");
     cmd.stdout(crate::Stdio::null()).expect("stdout");
     rt.block_on(async {

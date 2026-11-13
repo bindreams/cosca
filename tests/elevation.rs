@@ -20,6 +20,16 @@ mod common;
 
 use common::test_groups::{elevation, Group};
 
+/// The sudo password the `Auth::Stdin` and `Auth::Askpass` live tests feed `sudo`.
+#[cfg(unix)]
+const PASSWORD_ENV: &str = "COSCA_TESTCFG_ELEVATION_PASSWORD";
+/// A directory only an administrator can write, where the Windows elevated child leaves its marker.
+#[cfg(windows)]
+const MARKER_DIR_ENV: &str = "COSCA_TESTCFG_ELEVATION_MARKER_DIR";
+/// Pins the lane's `kill()` outcome, `ok` or `unkillable`; unset allows either.
+#[cfg(windows)]
+const EXPECT_KILL_ENV: &str = "COSCA_TESTCFG_ELEVATION_EXPECT_KILL";
+
 fn testbin() -> PathBuf {
     let mut p = std::env::current_exe().unwrap();
     p.pop();
@@ -149,8 +159,8 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 #[skuld::test]
 fn posix_stdin_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let pw = std::env::var("COSCA_TESTCFG_ELEVATION_PASSWORD")
-        .expect("COSCA_TESTCFG_ELEVATION_PASSWORD must hold the sudo password for the Auth::Stdin live test");
+    let pw = std::env::var(PASSWORD_ENV)
+        .unwrap_or_else(|_| panic!("{PASSWORD_ENV} must hold the sudo password for the Auth::Stdin live test"));
     let mut c = common::command(common::Console::Hidden);
     c.args(["whoami"])
         .elevation_backend(cosca::elevation::Backend::Sudo)
@@ -200,8 +210,8 @@ impl Drop for SecretDir {
 #[skuld::test]
 fn posix_askpass_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let pw = std::env::var("COSCA_TESTCFG_ELEVATION_PASSWORD")
-        .expect("COSCA_TESTCFG_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
+    let pw = std::env::var(PASSWORD_ENV)
+        .unwrap_or_else(|_| panic!("{PASSWORD_ENV} must hold the sudo password for the Auth::Askpass live test"));
     // A minimal askpass script that echoes the password. Its directory is removed on every exit: the script holds
     // the password.
     let dir = SecretDir::new();
@@ -291,9 +301,9 @@ fn already_elevated_inherit_spawn_reports_already_elevated(#[fixture(elevation)]
 #[skuld::test]
 fn windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let dir = std::env::var_os("COSCA_TESTCFG_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os(MARKER_DIR_ENV)
         .map(PathBuf::from)
-        .expect("COSCA_TESTCFG_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .unwrap_or_else(|| panic!("{MARKER_DIR_ENV} must point at an admin-only writable dir"));
     let marker = dir.join(format!("elev-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = common::command(common::Console::Hidden);
@@ -372,7 +382,7 @@ fn doas_non_interactive_auth_reaches_root(#[fixture(elevation)] _group: &Group) 
 #[cfg(windows)]
 fn assert_kill_matches_payload(killed: &Result<(), cosca::error::Error>, payload: &mut common::payload::Payload) {
     use std::io::Read as _;
-    let expected = std::env::var("COSCA_TESTCFG_ELEVATION_EXPECT_KILL").ok();
+    let expected = std::env::var(EXPECT_KILL_ENV).ok();
     match (killed, expected.as_deref()) {
         (
             Err(cosca::error::Error::Elevation {
@@ -397,7 +407,7 @@ fn assert_kill_matches_payload(killed: &Result<(), cosca::error::Error>, payload
             }
         }
         (other, expected) => panic!(
-            "kill() answered {other:?}, which COSCA_TESTCFG_ELEVATION_EXPECT_KILL={expected:?} does not allow (unset: `Ok` with a dead payload, or the typed Unkillable)"
+            "kill() answered {other:?}, which {EXPECT_KILL_ENV}={expected:?} does not allow (unset: `Ok` with a dead payload, or the typed Unkillable)"
         ),
     }
 }
@@ -591,9 +601,9 @@ fn m10_the_consent_route_child_runs_in_lp_directory(#[fixture(elevation)] _group
 #[skuld::test]
 async fn async_windows_elevated_child_writes_admin_marker(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
-    let dir = std::env::var_os("COSCA_TESTCFG_ELEVATION_MARKER_DIR")
+    let dir = std::env::var_os(MARKER_DIR_ENV)
         .map(PathBuf::from)
-        .expect("COSCA_TESTCFG_ELEVATION_MARKER_DIR must point at an admin-only writable dir");
+        .unwrap_or_else(|| panic!("{MARKER_DIR_ENV} must point at an admin-only writable dir"));
     let marker = dir.join(format!("elev-async-{}.marker", std::process::id()));
     let exe = testbin();
     let mut c = common::tokio_command(common::Console::Hidden);

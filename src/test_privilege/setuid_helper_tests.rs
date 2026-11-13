@@ -1,6 +1,6 @@
 //! Unit tests for [`super::setuid::check_helper`]: each panic that stops a misprovisioned lane.
 
-use super::setuid::{check_helper, stat, Meta};
+use super::setuid::{check_helper, stat, Meta, HELPER};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -37,7 +37,7 @@ fn setuid_check_helper_panics_naming_the_variable_when_it_is_unset() {
     let msg = panic_message(|| {
         check_helper(None, stat_of(SETUID_ROOT), 1000);
     });
-    assert!(msg.contains("COSCA_TESTCFG_SETUID_HELPER is not set"), "{msg}");
+    assert!(msg.contains(&format!("{HELPER} is not set")), "{msg}");
 }
 
 #[skuld::test]

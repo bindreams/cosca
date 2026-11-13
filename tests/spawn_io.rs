@@ -223,10 +223,11 @@ fn merge_to_merge_is_rejected() {
 
 #[skuld::test]
 fn env_variable_reaches_child() {
+    const VAR: &str = "COSCA_TESTCFG_VAR";
     let mut cmd = common::command(common::Console::Hidden);
     cmd.executable(testbin())
-        .args(["cosca_testbin", "env", "COSCA_TESTCFG_VAR"])
-        .env("COSCA_TESTCFG_VAR", "hello123")
+        .args(["cosca_testbin", "env", VAR])
+        .env(VAR, "hello123")
         .stdout(Stdio::pipe())
         .expect("stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
@@ -235,7 +236,7 @@ fn env_variable_reaches_child() {
     reader.read_to_string(&mut out).expect("read");
     drop(reader);
     let _ = child.wait();
-    assert_eq!(out.trim(), "COSCA_TESTCFG_VAR=hello123");
+    assert_eq!(out.trim(), format!("{VAR}=hello123"));
 }
 
 #[skuld::test]
