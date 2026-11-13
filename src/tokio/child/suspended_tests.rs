@@ -2,7 +2,7 @@
 //!
 //! Every Windows child is a windowless blocker (no console window on a developer's desktop): by
 //! default `more.com`, which exits 0 on EOF, so a kill that sent nothing fails on how the child
-//! ended; `findstr x` where a test needs its match or its exit 1. Tests that need a job, a
+//! ended; `findstr x` where a test needs its match. Tests that need a job, a
 //! `TreeWalk` root or any other containment are named for it; the uncontained ones are the ones
 //! that are safe to run on a developer's host.
 
@@ -79,11 +79,10 @@ mod on_windows {
     /// A windowless blocker that exits 0 once its stdin closes; `raw` routes it to the raw
     /// `CreateProcessW` backend by giving it an `executable()`.
     fn blocker(raw: bool) -> Command {
-        let more = crate::test_child::windows_more();
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        cmd.args([&more]);
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
         if raw {
-            cmd.executable(&more);
+            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
@@ -95,9 +94,9 @@ mod on_windows {
     /// match.
     fn findstr_blocker(raw: bool) -> Command {
         let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.args(["findstr", "x"]);
         if raw {
-            cmd.executable(crate::test_child::BLOCKER_ARGV[0]);
+            cmd.executable("findstr");
         }
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         cmd.stdout(crate::Stdio::null()).expect("stdout null");
@@ -1053,7 +1052,7 @@ mod on_windows {
     /// that stayed frozen never exits, so the wait is bounded by the suite slow-timeout.
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
-        let mut cmd = findstr_blocker(false);
+        let mut cmd = blocker(false);
         drop(cmd.spawn_suspended().await.expect("spawn suspended"));
 
         // A spawn takes the stdio configuration out of the command, so the second one is given its own.
@@ -1063,7 +1062,10 @@ mod on_windows {
 
         let status = child.wait().await.expect("await the exit");
 
-        assert_eq!(status.code(), Some(1), "the spawn after a frozen one must run");
+        assert!(
+            status.success(),
+            "the spawn after a frozen one must run to its end: {status:?}"
+        );
     }
 
     #[skuld::test]

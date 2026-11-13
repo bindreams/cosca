@@ -43,9 +43,9 @@ fn kill_only_blocker() -> (crate::Child, Held) {
 /// a byte through `cat`'s piped stdout over the stdin writer the caller holds; a killed-but-unreaped
 /// `cat` cannot echo.
 ///
-/// On Windows, `findstr` does not echo and `is_alive()` races the asynchronous `TerminateProcess`.
-/// Instead, write a line containing `x`, close stdin, and require both a clean exit (`findstr`'s
-/// "a match was found" code) and the echoed match on stdout; a killed process produces neither.
+/// On Windows, `is_alive()` races the asynchronous `TerminateProcess`. Instead, write a line
+/// `x`, close stdin, and require both a clean exit (`more.com`'s own; a kill gives code 1) and the
+/// echoed line on stdout; a killed process produces neither.
 /// This consumes `stdin` and reaps the child.
 fn assert_still_running(child: &mut crate::Child, mut stdin: crate::PipeWriter) {
     #[cfg(unix)]
@@ -57,7 +57,7 @@ fn assert_still_running(child: &mut crate::Child, mut stdin: crate::PipeWriter) 
     {
         use std::io::{Read as _, Write as _};
         stdin.write_all(b"x\r\n").expect("write to the blocker");
-        drop(stdin); // EOF: findstr can now finish reading and exit
+        drop(stdin); // EOF: the blocker can now finish reading and exit
         let mut output = Vec::new();
         child
             .stdout()
@@ -65,13 +65,10 @@ fn assert_still_running(child: &mut crate::Child, mut stdin: crate::PipeWriter) 
             .read_to_end(&mut output)
             .expect("read stdout to EOF");
         let status = child.wait().expect("the blocker must exit after stdin closes");
-        assert!(
-            status.success(),
-            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
-        );
+        assert!(status.success(), "the blocker must exit 0 on EOF, got {status:?}");
         assert!(
             output.windows(1).any(|w| w == b"x"),
-            "the blocker's stdout must contain the echoed match, got {output:?}"
+            "the blocker's stdout must contain the echoed line, got {output:?}"
         );
     }
 }

@@ -22,17 +22,7 @@ fn expected_drained_verdict(containment: crate::containment::Containment) -> cra
 
 /// Async twin of `child::lifecycle_tests::long_lived_contained_child`.
 async fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    #[cfg(unix)]
-    {
-        crate::test_child::held_contained_blocker_async(crate::Stdio::null()).await
-    }
-    #[cfg(windows)]
-    {
-        crate::test_child::windows_blocker_async(|cmd| {
-            cmd.contain();
-        })
-        .await
-    }
+    crate::test_child::held_contained_blocker_async(crate::Stdio::null()).await
 }
 
 /// Async twin of `child::lifecycle_tests::kill_then_release`.
