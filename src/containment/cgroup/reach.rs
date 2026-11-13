@@ -517,13 +517,6 @@ impl Probe {
         let channel = self.channel.take().expect("a probe is ended once");
         kill_and_reap(self.pid, &self.pidfd, channel)
     }
-
-    /// Ends a child that reported [`SETUP_FAILED`]: it exits [`ABANDONED`] by itself right after
-    /// its report, so it is not killed, only reaped (see [`reap_exiting`]).
-    fn end_exiting(mut self) -> io::Result<ProbeEnd> {
-        let channel = self.channel.take().expect("a probe is ended once");
-        reap_exiting(self.pid, &self.pidfd, channel)
-    }
 }
 
 impl Drop for Probe {
@@ -799,14 +792,6 @@ fn kill_and_reap(pid: libc::pid_t, pidfd: &OwnedFd, channel: std::os::unix::net:
     reap_through(pid, pidfd)
 }
 
-/// Closes the probe's `channel` and reaps its child `pid`, which exits by itself right after it
-/// reported [`SETUP_FAILED`]: the child's own status, never a kill's. Waits for the exit with no
-/// bound; the child makes no call that blocks between its report and its `_exit`.
-fn reap_exiting(pid: libc::pid_t, pidfd: &OwnedFd, channel: std::os::unix::net::UnixStream) -> io::Result<ProbeEnd> {
-    drop(channel);
-    reap_through(pid, pidfd)
-}
-
 /// Sends the probe's child `SIGKILL` through its `pidfd` and returns the kernel's answer; in a test
 /// build `seam`, if set, answers in its place.
 fn kill_probe(pidfd: BorrowedFd<'_>, seam: Option<rustix::io::Errno>) -> rustix::io::Result<()> {
@@ -872,52 +857,50 @@ fn reaped_elsewhere(pid: libc::pid_t) {
     );
 }
 
-/// What the probe's child's `end` says of it, in words.
-fn describe_end(end: ProbeEnd) -> String {
-    match end {
-        ProbeEnd::Signal(signo) => format!("killed by signal {signo}"),
+/// What the probe's child's `end` says of it, in words, as `read` set the scene: a child that
+/// reported [`SETUP_FAILED`] states the step it reported failing (the errno is the error's source)
+/// and that it was ended, then how; a child that was `Gone` says why first; every end is a full
+/// clause. The end is as the reap returned it.
+fn describe_end(read: &ProbeRead, end: ProbeEnd) -> String {
+    let ended = match end {
+        ProbeEnd::Signal(signo) => format!("it was killed by signal {signo}"),
+        ProbeEnd::Exit(ABANDONED) if matches!(read, ProbeRead::SetupFailed(_)) => {
+            format!("it exited ABANDONED ({ABANDONED})")
+        }
         ProbeEnd::Exit(ABANDONED) => format!(
-            "exited ABANDONED ({ABANDONED}): it could not set up its descriptors, its socket closed with no release byte, or its parent was gone"
+            "it exited ABANDONED ({ABANDONED}): it could not set up its descriptors, its socket closed with no release byte, or its parent was gone"
         ),
-        ProbeEnd::Exit(status) => format!("exited with status {status}"),
+        ProbeEnd::Exit(status) => format!("it exited with status {status}"),
         ProbeEnd::Elsewhere => {
-            "reaped by another reaper or, with SIGCHLD ignored, by the kernel as it exited, so its status is lost"
+            "it was reaped by another reaper or, with SIGCHLD ignored, by the kernel as it exited, so its status is lost"
                 .to_owned()
         }
-    }
-}
-
-/// What a [`SETUP_FAILED`] child's `end` says of it, in words: the cause is the errno it reported,
-/// which is the error's source.
-fn describe_setup_failed_end(end: ProbeEnd) -> String {
-    match end {
-        ProbeEnd::Exit(ABANDONED) => format!("exited ABANDONED ({ABANDONED}) after reporting that failure"),
-        other => describe_end(other),
+    };
+    match read {
+        ProbeRead::SetupFailed(_) => format!(
+            "the probe's child could not open its /proc/self/fd (it reported the failure); it was ended: {ended}"
+        ),
+        ProbeRead::Gone(why) => format!("{why}: {ended}"),
+        ProbeRead::Answer(_) => ended,
     }
 }
 
 /// Logs how the probe's child `pid` ended: `debug` for the ends the probe makes (the kill, the
-/// release) and for the exit of a child that reported [`SETUP_FAILED`] (`setup_failed`), whose cause
-/// is the returned error; `warn` for any other, which is the child's own doing.
-fn log_probe_end(pid: libc::pid_t, end: ProbeEnd, setup_failed: bool) {
-    match end {
-        ProbeEnd::Signal(libc::SIGKILL) | ProbeEnd::Exit(RELEASED) => {
+/// release) and for any end of a child that reported [`SETUP_FAILED`], whose cause is the returned
+/// error; `warn` for any other, which is the child's own doing.
+fn log_probe_end(pid: libc::pid_t, read: &ProbeRead, end: ProbeEnd) {
+    match (read, end) {
+        (ProbeRead::SetupFailed(_), _) | (_, ProbeEnd::Signal(libc::SIGKILL) | ProbeEnd::Exit(RELEASED)) => {
             log::debug!(
                 "containment::cgroup: the placement probe's child {pid} ended: {}",
-                describe_end(end)
-            );
-        }
-        ProbeEnd::Exit(ABANDONED) if setup_failed => {
-            log::debug!(
-                "containment::cgroup: the placement probe's child {pid} ended: {}",
-                describe_setup_failed_end(end)
+                describe_end(read, end)
             );
         }
         // `reaped_elsewhere` logged it.
-        ProbeEnd::Elsewhere => {}
-        other => log::warn!(
+        (_, ProbeEnd::Elsewhere) => {}
+        (_, other) => log::warn!(
             "containment::cgroup: the placement probe's child {pid} ended on its own: {}",
-            describe_end(other)
+            describe_end(read, other)
         ),
     }
 }
@@ -1018,24 +1001,17 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Ok(_) => ProbeRead::Gone("the probe's child died before it was ready"),
         Err(e) => ProbeRead::Answer(Err(Unreadable::Probe(e))),
     };
-    let setup_failed = matches!(read, ProbeRead::SetupFailed(_));
-    let end = if setup_failed { probe.end_exiting() } else { probe.end() }.map_err(Unreadable::Probe)?;
-    log_probe_end(pid, end, setup_failed);
+    let end = probe.end().map_err(Unreadable::Probe)?;
+    log_probe_end(pid, &read, end);
     match read {
         ProbeRead::Answer(answer) => answer,
-        ProbeRead::Gone(why) => Err(Unreadable::Probe(io::Error::other(format!(
-            "{why}: it {}",
-            describe_end(end)
-        )))),
+        ProbeRead::Gone(_) => Err(Unreadable::Probe(io::Error::other(describe_end(&read, end)))),
         ProbeRead::SetupFailed(errno) => {
             let call = crate::identity::FailedCall::openat2(rustix::io::Errno::from_raw_os_error(errno));
             Err(match call.refusal() {
                 Some(refusal) => Unreadable::Refused(refusal),
                 None => Unreadable::Probe(crate::error::io_context(
-                    format!(
-                        "the probe's child could not open its /proc/self/fd: it {}",
-                        describe_setup_failed_end(end)
-                    ),
+                    describe_end(&read, end),
                     io::Error::from_raw_os_error(errno),
                 )),
             })
