@@ -778,11 +778,23 @@ fn spawn_reported(
         // A vanish is not a refusal: the child was reaped by another party.
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
-            settle_before_teardown(
+            let never_ran = settle_before_teardown(
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
             );
+            // A child the leaf's verdict says never ran its program (its hook ended it before
+            // `exec`) is the attach's not-started failure, whoever reaped it: its zombie is gone,
+            // but the verdict is not.
+            #[cfg(target_os = "linux")]
+            if let Some(failure) = never_ran {
+                drop(prepared);
+                let torn = held_teardown::tear_down_unexecuted(owned, None, policy, &mut why);
+                return Err(failure::failed_attach(true, failure.cause, None, None, torn));
+            }
+            // Only Linux's verdict says so.
+            #[cfg(not(target_os = "linux"))]
+            let _ = never_ran;
             // Linux 6.9+: the group the root may have left members in, whoever reaped the root.
             #[cfg(target_os = "linux")]
             let group_kill_failure = if front.is_none() {
@@ -872,10 +884,15 @@ fn spawn_reported(
         prepared,
     ) {
         Ok(v) => v,
-        Err(crate::containment::dispatch::AttachFailure {
-            cause: error,
-            cleanup: attach_cleanup,
-        }) => {
+        Err(failure) => {
+            // Only Linux's attach says the program never ran.
+            #[cfg(target_os = "linux")]
+            let not_started = failure.not_started;
+            let crate::containment::dispatch::AttachFailure {
+                cause: error,
+                cleanup: attach_cleanup,
+                ..
+            } = failure;
             log::debug!("attach failed: {report}", report = crate::error::Report(&error));
             // macOS: a front is left running and unreaped, sent nothing; any other child is killed
             // and reaped through its verified unique id.
@@ -899,32 +916,31 @@ fn spawn_reported(
             // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
             // neither kills nor reaps). On Linux a front is the exception, and a failed attach has
             // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`).
+            // dying, and is waited for (`tear_down_held`). A not-started child, front or not (a
+            // front never ran its `sudo`), is killed and reaped.
             #[cfg(target_os = "linux")]
-            let (
-                detail,
-                Torn {
-                    fate: child_fate,
-                    unreaped,
-                    cleanup,
-                },
-            ) = held_teardown::tear_down_held(
-                owned,
-                held_teardown::HeldTeardown {
-                    front,
-                    id: id_read,
-                    subtree: subtree.as_ref(),
-                    disposition: crate::child::owned::teardown::Disposition::HandBack,
-                    policy,
-                },
-                &mut why,
-            );
-            // What failed in the attach's own cleanup comes first: it happened before the teardown.
+            let (detail, torn) = if not_started {
+                (
+                    None,
+                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why),
+                )
+            } else {
+                held_teardown::tear_down_held(
+                    owned,
+                    held_teardown::HeldTeardown {
+                        front,
+                        id: id_read,
+                        subtree: subtree.as_ref(),
+                        disposition: crate::child::owned::teardown::Disposition::HandBack,
+                        policy,
+                    },
+                    &mut why,
+                )
+            };
+            // A not-started failure carries only the cause and fate; the teardown's failures went
+            // to its warn. Otherwise the attach's cleanup failures come before the teardown's.
             #[cfg(target_os = "linux")]
-            return Err(SpawnFailure::started(error, child_fate, unreaped)
-                .with_detail(detail)
-                .with_cleanup(attach_cleanup)
-                .with_cleanup(cleanup));
+            return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
             #[cfg(windows)]
             {
                 let Torn {
@@ -2759,15 +2775,16 @@ fn front_detail(
 }
 
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn
-/// down, so the teardown never races the verdict's reads.
+/// down, so the teardown never races the verdict's reads. A verdict that says the program never ran
+/// comes back as the attach's not-started failure.
 pub(crate) fn settle_before_teardown(
     prepared: &mut crate::containment::Prepared,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
-) {
+) -> Option<crate::containment::dispatch::AttachFailure> {
     prepared.settle_verdict(
         #[cfg(target_os = "linux")]
         child,
-    );
+    )
 }
 
 /// Linux 6.9+: kill the process group of a failed spawn's root before its teardown, as

@@ -910,7 +910,7 @@ fn end_through_pidfd(
 
 /// Says `torn` as the failed spawn's one warn, and logs at warn ([`warn_of_teardown_failures`]) each
 /// failure that warn does not hold.
-fn say_teardown_of_failed_spawn(torn: HandleTeardown, why: &mut super::Diagnosis) -> Remains {
+pub(super) fn say_teardown_of_failed_spawn(torn: HandleTeardown, why: &mut super::Diagnosis) -> Remains {
     let held = torn.outcome.said_in_the_one_warn(why);
     let remains = torn.say_as_failed_spawn(why);
     warn_of_teardown_failures(&remains, held);

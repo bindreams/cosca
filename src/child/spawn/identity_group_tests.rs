@@ -72,9 +72,9 @@ pub(crate) struct Failed {
 pub(crate) enum Container {
     Session,
     /// A cgroup leaf whose placement write is made to fail, so the process group set before the
-    /// spawn is the containment.
+    /// spawn is the containment. Asks for `BestEffort`: `Strongest` fails that spawn.
     LeafNotTaken,
-    /// `Strongest` with no cgroup leaf made (what a host without a delegated cgroup gives), so the
+    /// `BestEffort` with no cgroup leaf made (what a host without a delegated cgroup gives), so the
     /// process group set before the spawn is the containment.
     Leafless,
 }
@@ -85,12 +85,14 @@ impl Container {
         match self {
             Container::Session => (crate::ContainMode::Session, PlacementForced),
             Container::LeafNotTaken => {
-                crate::containment::cgroup::fault::set_force_placement_write_result(0);
-                (crate::ContainMode::Strongest, PlacementForced)
+                crate::containment::cgroup::fault::set_force_placement_write_result(
+                    crate::containment::cgroup::fault::ForcedWrite::Returns0,
+                );
+                (crate::ContainMode::BestEffort, PlacementForced)
             }
             Container::Leafless => {
                 crate::containment::cgroup::fault::set_force_leaf_open_failure(true);
-                (crate::ContainMode::Strongest, PlacementForced)
+                (crate::ContainMode::BestEffort, PlacementForced)
             }
         }
     }

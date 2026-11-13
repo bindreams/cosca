@@ -51,7 +51,9 @@
 //! from the fork, is checked to return 0 in the child only on those.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
-//! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
+//! is not used: on an older kernel a spawn gets a process group under both
+//! [`ContainMode::Strongest`] and [`ContainMode::BestEffort`], as documented on
+//! [`ContainMode`]. It also assumes kernel
 //! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
 //! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
 //! described under [`Command::kill_on_drop`].

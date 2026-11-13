@@ -42,8 +42,8 @@ impl Command {
     /// The child is created suspended and executes no instruction until `resume`. A frozen child
     /// has exactly the lifetime guarantees of the containment the command asked for, and no more:
     ///
-    /// - A [`Strongest`] root (`contain()`) is in its kill-on-close job before `spawn_suspended`
-    ///   returns, so the job ends it if this process dies while it is frozen.
+    /// - A [`Strongest`] or [`BestEffort`] root (`contain()`) is in its kill-on-close job before
+    ///   `spawn_suspended` returns, so the job ends it if this process dies while it is frozen.
     /// - Any other child (no containment, a [`TreeWalk`] root, a member of an enclosing cosca tree)
     ///   gets no job of its own. **If this process dies while it is frozen, such a child stays
     ///   frozen until someone kills it**; its recorded [`id`](SuspendedChild::id) names it. A job
@@ -61,14 +61,16 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// As [`spawn`](Self::spawn), and one more that `spawn` would not give: a [`Strongest`] root
-    /// whose job assignment fails is an [`Error::Containment`] (`spawn` falls back to [`TreeWalk`]
-    /// there; a frozen root without a job is not worth having). A frozen spawn that fails after the
-    /// process exists reports [`Error::MayHaveStarted`].
+    /// As [`spawn`](Self::spawn), and one more that `spawn` would not give: a [`Strongest`] or
+    /// [`BestEffort`] root whose job assignment fails is an [`Error::Containment`] (`spawn` falls
+    /// back to [`TreeWalk`] there, as Windows does for `Strongest` until that mode fails there as
+    /// it does on Linux and macOS; a frozen root without a job is not worth having). A frozen spawn
+    /// that fails after the process exists reports [`Error::MayHaveStarted`].
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.
     ///
     /// [`Strongest`]: crate::ContainMode::Strongest
+    /// [`BestEffort`]: crate::ContainMode::BestEffort
     /// [`TreeWalk`]: crate::ContainMode::TreeWalk
     pub fn spawn_suspended(&mut self) -> Result<SuspendedChild, Error> {
         platform::spawn(self)

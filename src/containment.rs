@@ -21,7 +21,9 @@ use std::fmt;
 
 /// The teardown mechanism actually achieved for a spawned child (queried via
 /// `Child::containment()`). Runtime-detected — the same binary meets hosts with
-/// and without cgroup v2 / inside and outside an existing job.
+/// and without cgroup v2 / inside and outside an existing job. A request that asks for
+/// [`ContainMode::Strongest`] gets the strongest mechanism its host offers or an error; one that
+/// asks for [`ContainMode::BestEffort`] may get a weaker one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Containment {
@@ -38,7 +40,8 @@ pub enum Containment {
     ///
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
     /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
-    /// not contained in a leaf, and degrades as for any other failed step. The first
+    /// not contained in a leaf: it fails under `Strongest`, and degrades, as for any other failed
+    /// step, under `BestEffort`. The first
     /// [`wait_tree`](crate::Child::wait_tree) on a handle that finds the tree still running, and
     /// may block, also starts one thread, owned by that handle, which reads the watch for every
     /// wait on it; dropping the handle stops and joins it. A wait that finds the tree drained, or
@@ -192,10 +195,47 @@ impl fmt::Display for Containment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainMode {
-    /// The strongest kernel container available on this host, falling back
-    /// (cgroup → job → process group → …) to [`ContainMode::TreeWalk`] rather
-    /// than to no containment.
+    /// The strongest kernel container this host offers, or an error: the mechanism is chosen by
+    /// what the host offers, and a failure to set it up fails the spawn with [`Error::Containment`]
+    /// naming the mechanism and the cause, before the program runs. It never falls back to a
+    /// weaker one; [`ContainMode::BestEffort`] does.
+    ///
+    /// - **Linux:** a cgroup v2 leaf, when the host offers one: `/proc/self/cgroup` names this
+    ///   process's cgroup in the unified hierarchy, and the kernel lets this process use it. The
+    ///   setup calls decide that, not a permission check beforehand. A host that offers none (no
+    ///   `/proc/self/cgroup`, a cgroup v1 host, or a refusal from the kernel (`EACCES`, `EPERM` or
+    ///   `EROFS`) when the own cgroup is opened, the leaf is made, or the leaf's `cgroup.procs` is
+    ///   opened, or an own cgroup its mount does not show) gets a process group, with no error; so
+    ///   does a host whose new leaf has no `cgroup.kill` (a kernel before Linux 5.14), and the
+    ///   leaf is removed. Every other failure fails the spawn: a limit such as `cgroup.max.depth`,
+    ///   the report channel, the inotify watch, and the child's own placement write, whose failure
+    ///   stops the child before `exec`.
+    /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
+    ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
+    ///   installs the marker too, and degrades when it fails.
+    /// - **Windows:** a Job Object, falling back to [`ContainMode::TreeWalk`] when the child
+    ///   cannot be assigned to it, as `BestEffort` does. This is unchanged for now: Windows will
+    ///   fail instead, as the other platforms do.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
     Strongest,
+    /// The strongest kernel container that sets up, else the next one down, rather than an error.
+    /// A cgroup v2 leaf on Linux, a Job Object on Windows and the inherited-fd marker on macOS,
+    /// each falling back (to a process group on Linux and macOS, to [`ContainMode::TreeWalk`] on
+    /// Windows) rather than to no containment. A fallback is logged at `warn` (on Windows it is
+    /// not, yet), and [`Child::containment`](crate::Child::containment) reports what the spawn
+    /// got.
+    ///
+    /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
+    ///   leaf's directory, `cgroup.procs`, report channel or inotify watch), or a child whose
+    ///   placement write failed, degrades to the process group the spawn set up. A child that sends
+    ///   no report of its placement never ran its program (its hook ends it before `exec`), so
+    ///   that spawn fails with [`Error::Containment`], as under `Strongest`, instead of handing
+    ///   back a child that never ran.
+    /// - **macOS:** a failed install of the fd marker degrades to the process group.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
+    BestEffort,
     /// Identity-aware process-tree walk at teardown — selectable directly (e.g.
     /// for a child known to `setsid` out of a process group). The spawn fails if the OS refuses to
     /// report the root's identity.
@@ -216,8 +256,18 @@ pub enum ContainMode {
     /// to `ProcessGroup` containment. `Session` provides TTY detach and
     /// session grouping; it is not a security sandbox.
     ///
-    /// On non-Unix platforms this request is silently treated as `Strongest`.
+    /// On macOS this request installs the fd marker as well, and still degrades to the session
+    /// when that fails. On non-Unix platforms this request is silently treated as `Strongest`.
     Session,
+}
+
+impl ContainMode {
+    /// Whether the mechanism this mode picks is the only one it accepts: a failure to set it up
+    /// fails the spawn, where every other mode degrades to the mechanism below it.
+    #[cfg(unix)]
+    pub(crate) fn is_strict(self) -> bool {
+        matches!(self, ContainMode::Strongest)
+    }
 }
 
 /// Whether a kill-group root marks its descendants as already-contained.
@@ -348,3 +398,7 @@ pub(crate) mod marker_eof;
 #[cfg(test)]
 #[path = "containment_tests.rs"]
 mod containment_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "containment/strongest_tests.rs"]
+mod strongest_tests;

@@ -52,7 +52,8 @@ fn cgroup_fd_path_names_the_calling_threads_own_descriptor(#[fixture(cgroup)] _g
 fn a_leaf_that_cannot_be_held_after_its_mkdir_is_removed() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_leaf_open_failure(true);
-    let err = match LeafDir::create(dir.path(), "cosca-unheld") {
+    let parent = LeafDir::open_parent(dir.path()).expect("hold the parent");
+    let err = match LeafDir::create(parent, "cosca-unheld") {
         Err(e) => e,
         Ok(_) => panic!("the forced open failure must fail the creation"),
     };
@@ -116,7 +117,8 @@ fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Grou
                 std::io::Error::last_os_error()
             );
         }
-        let leaf = LeafDir::create(&parent, &name).expect("create the leaf");
+        let held = LeafDir::open_parent(&parent).expect("hold the parent");
+        let leaf = LeafDir::create(held, &name).expect("create the leaf");
         let sub = sub_in_thread;
         std::fs::create_dir(&sub).expect("make a child cgroup");
         // SAFETY: as above.

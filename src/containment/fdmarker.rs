@@ -539,37 +539,35 @@ pub(crate) struct PreparedMarker {
 /// (documented, non-zero) window where a concurrent `fork()` in this process could see this fd
 /// before its own `exec`; see the module docs.
 ///
-/// `None` on any failure — the caller falls back to the pre-existing mechanism rather than
-/// failing the spawn.
+/// `Err` on any failure: [`Error::Containment`] naming the step that failed, with the OS error that
+/// failed it as its source. Nothing is logged here: [`ContainMode::Strongest`] returns it, and any
+/// other mode falls back to the pre-existing mechanism and logs it (see `dispatch::prepare`).
 pub(crate) fn install(
     steps: &mut crate::child::spawn::in_child::InChild,
     reserved: &[RawFd],
-) -> Option<PreparedMarker> {
+) -> Result<PreparedMarker, Error> {
+    let failed = |detail: &str, source: Option<std::io::Error>| Error::Containment {
+        detail: detail.to_owned(),
+        source: source.map(Error::io_cause),
+    };
     let (read, write) = match create_pipe() {
         Ok(p) => p,
-        Err(e) => {
-            log::warn!(
-                "fd marker: pipe() failed ({report}); falling back to the pre-existing containment channel for this mode",
-                report = crate::error::Report(&e)
-            );
-            return None;
-        }
+        Err(e) => return Err(failed("fd marker: pipe() failed", Some(e))),
     };
 
     // A supervisor whose soft RLIMIT_NOFILE sits below `want` (HIGH_FLOOR=64 in the common
     // case, or higher with a large reserved set) makes F_DUPFD_CLOEXEC fail EINVAL here on
-    // EVERY contained spawn, not just an occasional one — diagnosable from this log line alone
+    // EVERY contained spawn, not just an occasional one — diagnosable from the error alone,
     // since `nix::errno::Errno`'s `Display` names the symbolic errno (e.g. "EINVAL: Invalid
     // argument"), not just a bare OS error number.
     let want = safe_marker_fd(write.as_fd().as_raw_fd(), reserved);
     let write: OwnedFd = match place_write_end(write, want) {
         Ok(fd) => fd,
         Err(e) => {
-            log::warn!(
-                "fd marker: could not place the marker descriptor ({report}); falling back to the pre-existing containment channel for this mode",
-                report = crate::error::Report(&e)
-            );
-            return None;
+            return Err(failed(
+                "fd marker: could not place the marker descriptor",
+                Some(e.into()),
+            ))
         }
     };
     let fd = write.as_raw_fd();
@@ -586,8 +584,7 @@ pub(crate) fn install(
     );
 
     let Some(handle) = read_handle(write.as_fd()) else {
-        log::warn!("fd marker: the marker pipe has no readable handle; falling back to the pre-existing containment channel for this mode");
-        return None;
+        return Err(failed("fd marker: the marker pipe has no readable handle", None));
     };
     // CONTRACT: `handle == 0` must never reach a live `Marker` — 0 is the sentinel this whole
     // mechanism treats as "matches no live pipe" (see `a_dead_handle_finds_no_holders`'s doc
@@ -598,12 +595,14 @@ pub(crate) fn install(
     // happen to read back the same sentinel. Rejected as a failed install, exactly like the
     // other two `install()` failure arms, rather than trusted silently.
     if handle == 0 {
-        log::warn!("fd marker: the marker pipe's write end reported a zero handle; falling back to the pre-existing containment channel for this mode");
         debug_assert!(
             false,
             "fd marker: pipe_handle_of the write end returned 0, the reserved sentinel"
         );
-        return None;
+        return Err(failed(
+            "fd marker: the marker pipe's write end reported a zero handle",
+            None,
+        ));
     }
     // CONTRACT, checked HERE specifically because both ends are provably still open (unlike
     // at `Marker::sweep` time, where the write side may already be fully drained — see there):
@@ -622,24 +621,28 @@ pub(crate) fn install(
     // read_handle`'s doc comment for why `Marker` needs this instead of re-deriving a peer
     // check later): captured now, while it is certain to succeed, rather than assumed later.
     let Some(read_handle_value) = pipe_handle_of(read.as_fd()) else {
-        log::warn!("fd marker: the marker pipe's read end has no readable handle; falling back to the pre-existing containment channel for this mode");
-        return None;
+        return Err(failed(
+            "fd marker: the marker pipe's read end has no readable handle",
+            None,
+        ));
     };
     // Same CONTRACT as the write end's handle above, and for the identical reason:
     // `Marker::sweep`'s entry check compares a LIVE read against this exact value, so a zero
     // here would make that check accept any other pipe descriptor that also happens to report
     // a zero handle, defeating the whole point of the entry contract.
     if read_handle_value == 0 {
-        log::warn!("fd marker: the marker pipe's read end reported a zero handle; falling back to the pre-existing containment channel for this mode");
         debug_assert!(
             false,
             "fd marker: pipe_handle_of the read end returned 0, the reserved sentinel"
         );
-        return None;
+        return Err(failed(
+            "fd marker: the marker pipe's read end reported a zero handle",
+            None,
+        ));
     }
 
     steps.preserve(write);
-    Some(PreparedMarker {
+    Ok(PreparedMarker {
         read: OwnedFd::from(read),
         handle,
         read_handle: read_handle_value,
@@ -694,7 +697,7 @@ fn read_handle(fd: BorrowedFd<'_>) -> Option<u64> {
 /// actually calls: it consumes the armed fault ONLY if it matches `want`, leaving it untouched
 /// (for a DIFFERENT wrapper's own check) otherwise — so exactly one of the three wrappers in
 /// one `install` call ever sees a match, matching the single-fault-per-call contract
-/// `each_install_failure_arm_falls_back_and_says_which_step_failed` relies on.
+/// `each_install_failure_arm_fails_and_says_which_step_failed` relies on.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
@@ -811,16 +814,15 @@ pub(crate) mod fault {
         });
     }
 
-    /// Every `install` failure log line (`"fd marker: pipe() failed"`, etc.) carries no
-    /// per-call discriminator — there is no handle yet to key on, since `install` hasn't
-    /// succeeded. Two DIFFERENT tests asserting on the same literal text via `log_capture`
-    /// (`fdmarker_tests.rs`'s `each_install_failure_arm_falls_back_and_says_which_step_failed`
-    /// and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one`)
-    /// would otherwise be able to satisfy each other's `contains_since` check when trials
-    /// overlap, since `log_capture` is one process-global buffer. Trials overlap only under
+    /// The fallback line `prepare` logs for a failed `install` (`"fd marker: pipe() failed"`, etc.)
+    /// carries no per-call discriminator — there is no handle yet to key on, since `install` hasn't
+    /// succeeded. A test asserting on that literal text via `log_capture` (`dispatch_tests.rs`'s
+    /// `a_failed_marker_install_leaves_prepare_without_one_unless_strongest`) could otherwise be
+    /// satisfied by another test's fallback (`unpinned_public_tests.rs`'s `degraded_blocker`) when
+    /// trials overlap, since `log_capture` is one process-global buffer. Trials overlap only under
     /// `--nocapture` with `--test-threads` > 1 (skuld forces one thread while capturing;
     /// nextest runs each test in its own process). `FAULT` itself is thread-local (race-free), but the LOG ASSERTION is not, so both
-    /// tests must hold this for their whole body instead.
+    /// must hold this for their whole body instead.
     static LOG_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn lock_for_log_assertion() -> std::sync::MutexGuard<'static, ()> {

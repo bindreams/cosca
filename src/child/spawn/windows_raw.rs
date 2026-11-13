@@ -241,6 +241,7 @@ pub(crate) fn spawn_raw(
         Err(crate::containment::dispatch::AttachFailure {
             cause: e,
             cleanup: attach_cleanup,
+            ..
         }) => {
             let Torn {
                 fate,

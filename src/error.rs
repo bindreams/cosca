@@ -295,6 +295,12 @@ pub enum Error {
     },
     /// A containment mechanism could not be established, or could not tear the tree down: a member
     /// confirmed running, a failed `killpg` or kill write, or the mechanism's own stale bookkeeping.
+    ///
+    /// A [`Strongest`](crate::ContainMode::Strongest) spawn returns it, on Linux and macOS, when
+    /// the mechanism the host offers cannot be set up (the cgroup leaf, or the fd marker): the
+    /// program did not run, and `detail` names the mechanism. A
+    /// [`BestEffort`](crate::ContainMode::BestEffort) spawn returns it on Linux too, for a child
+    /// that sent no report of its placement in its cgroup leaf and so never ran the program.
     Containment {
         detail: String,
         source: Option<Arc<Error>>,
@@ -418,7 +424,8 @@ pub enum Error {
     /// arm is in `resume`'s `# Errors`.
     ///
     /// A failed spawn, sync or tokio, hands back the child when the spawn or run could not end it:
-    /// on Linux, when the identity read or the attach fails after the handshake, on every Unix,
+    /// on Linux, when the identity read or the attach fails after the handshake (an attach failure
+    /// that proves the program never ran hands nothing back: it is not this variant), on every Unix,
     /// when the elevation backend's password write fails, and on Windows, when a
     /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused
     /// too. The other failed spawns leave a child they could not end running and warn.

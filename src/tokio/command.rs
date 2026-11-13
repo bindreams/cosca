@@ -111,8 +111,12 @@ impl Command {
         self.inner.kill_on_drop(yes);
         self
     }
-    /// Contain the child's tree with the strongest available mechanism. See
-    /// [`Command::contain`](crate::Command::contain) for a child reaped by something else.
+    /// Contain the child's tree with the strongest mechanism the host offers, or fail the spawn
+    /// with [`Error::Containment`](crate::error::Error::Containment): this is
+    /// [`ContainMode::Strongest`](crate::ContainMode::Strongest), as for
+    /// [`Command::contain`](crate::Command::contain), which also covers a child reaped by something
+    /// else. [`contain_with`](Self::contain_with)`(`[`BestEffort`](crate::ContainMode::BestEffort)`)`
+    /// degrades instead.
     ///
     /// A spawn that fails after forking the child tears it down, as the sync
     /// [`Command::spawn`](SyncCommand::spawn) does. On Linux the spawn's pidfd kills and reaps the
@@ -128,7 +132,8 @@ impl Command {
         self
     }
 
-    /// Contain with a specific [`ContainMode`](crate::ContainMode).
+    /// Contain with a specific [`ContainMode`](crate::ContainMode), as
+    /// [`Command::contain_with`](crate::Command::contain_with).
     pub fn contain_with(&mut self, mode: crate::ContainMode) -> &mut Command {
         self.inner.contain_with(mode);
         self

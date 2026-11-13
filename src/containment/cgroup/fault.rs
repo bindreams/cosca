@@ -16,7 +16,7 @@ thread_local! {
     static WAITED_PIDFD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
+    static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<ForcedWrite>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -25,6 +25,7 @@ thread_local! {
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+    static FORCE_OWN_CGROUP: std::cell::RefCell<Option<(String, std::path::PathBuf)>> = const { std::cell::RefCell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
     static REFUSED_KILL_WRITES: Cell<u32> = const { Cell::new(0) };
@@ -593,12 +594,32 @@ pub(crate) fn report_channel_failure_armed() -> bool {
     FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.get())
 }
 
-/// Make the NEXT placement write return `ret` without writing — 0, which no file a test can open
-/// returns for a one-byte write. A child forked from this thread inherits the flag and takes it.
-pub(crate) fn set_force_placement_write_result(ret: isize) {
-    FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.set(Some(ret)));
+/// Make the NEXT lookup of the own cgroup on this thread read `file` as `/proc/self/cgroup`, with
+/// the cgroup filesystem at `root`: the host fact a real spawn cannot be given (an own cgroup this
+/// process is refused, or that the mount does not show).
+pub(crate) fn set_force_own_cgroup(file: &str, root: &std::path::Path) {
+    FORCE_OWN_CGROUP.with(|f| *f.borrow_mut() = Some((file.to_owned(), root.to_path_buf())));
 }
-pub(crate) fn take_force_placement_write_result() -> Option<isize> {
+pub(crate) fn take_force_own_cgroup() -> Option<(String, std::path::PathBuf)> {
+    FORCE_OWN_CGROUP.with(|f| f.borrow_mut().take())
+}
+
+/// What a forced placement write does instead of writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedWrite {
+    /// Returns 0, which no file a test can open returns for a one-byte write.
+    Returns0,
+    /// Fails with this errno (`EBUSY` or `EPERM`, which no file a test can open fails with on
+    /// demand).
+    FailsWith(i32),
+}
+
+/// Make the NEXT placement write do `forced` without writing. A child forked from this thread
+/// inherits the flag and takes it.
+pub(crate) fn set_force_placement_write_result(forced: ForcedWrite) {
+    FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.set(Some(forced)));
+}
+pub(crate) fn take_force_placement_write_result() -> Option<ForcedWrite> {
     FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.take())
 }
 
