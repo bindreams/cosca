@@ -537,7 +537,7 @@ impl Command {
     /// principle 3 for the one early exception in a failed elevation).
     ///
     /// **Both handles block until the root is reaped and a cgroup leaf has drained**; only the async
-    /// drop warns, once past 1 s. The async [`Child`](crate::tokio::Child) blocks on the dropping
+    /// drop warns, once past 1 s. The async `tokio::Child` blocks on the dropping
     /// thread, which may be a tokio worker: a destructor cannot be awaited. Its root's kill bounds
     /// the wait, as does the tree's `cgroup.kill`, unless a process stays stuck in uninterruptible
     /// I/O (D state) or a foreign tracer holds the root's zombie. See that `Drop`'s rustdoc. On
