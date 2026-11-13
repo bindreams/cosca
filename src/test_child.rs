@@ -329,6 +329,24 @@ pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::wi
     (child, job)
 }
 
+/// A live job with two running members, each a [`spawn_more_blocker`]: [`spawn_job_member`]'s, and a
+/// second one assigned to the same job. A test that ends the first holds the second alive through
+/// its stdin.
+#[cfg(windows)]
+pub(crate) fn spawn_job_with_two_members() -> (
+    std::process::Child,
+    std::process::Child,
+    crate::containment::windows::JobHandle,
+) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let (first, job) = spawn_job_member();
+    let second = spawn_more_blocker();
+    job.assign_for_test(second.as_raw_handle())
+        .expect("assign the second member to the job");
+    (first, second, job)
+}
+
 /// End a [`spawn_job_member`]'s member: EOF on its stdin, and reaped once it has exited.
 #[cfg(windows)]
 pub(crate) fn let_member_exit(mut child: std::process::Child) {

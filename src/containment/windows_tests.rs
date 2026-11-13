@@ -1,7 +1,7 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
-use crate::test_child::{let_member_exit, spawn_job_member, Console};
+use crate::test_child::{let_member_exit, spawn_job_member, spawn_job_with_two_members, Console};
 
 #[skuld::test]
 fn job_handle_debug_does_not_panic() {
@@ -309,6 +309,102 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listin
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
     assert_eq!(super::fault::job_pid_list_queries(), 1, "exactly one listing");
     drop(forced);
+}
+
+/// An empty listing is the drain only once the members the round before held are signalled: the
+/// list drops a member before its process object signals. The second member is alive, in the job,
+/// when the second listing (forced) comes back empty; the wait must block on its handle, and the
+/// hook ends it when the wait arms, so the drain is answered only after its exit.
+///
+/// Mutant: an empty listing answers `AllMembersExited` without looking at the handles held.
+#[skuld::test]
+fn wait_drained_raw_waits_for_the_held_members_when_the_listing_empties() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    let (mut first, mut second, job) = spawn_job_with_two_members();
+    let stdin = second.stdin.take().expect("piped stdin");
+    first.kill().expect("end the first member");
+    first.wait().expect("reap the first member");
+    let forced = super::fault::force_job_pid_lists([vec![first.id(), second.id()], Vec::new()]);
+    crate::wait::wait_ms_probe::take();
+    let released = Rc::new(Cell::new(false));
+    crate::wait::wait_ms_probe::on_second_arm({
+        let released = released.clone();
+        move || {
+            released.set(true);
+            drop(stdin); // EOF: the second member exits
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let verdict = super::wait_drained_raw(job.handle(), Some(deadline));
+
+    crate::wait::wait_ms_probe::take();
+    drop(forced);
+    let ended = released.get();
+    // The held member ends either way: on a failure the hook never ran.
+    let_member_exit(second);
+    assert!(
+        ended,
+        "the drain was answered by the empty listing while a member's process object was unsignalled"
+    );
+    assert_eq!(
+        verdict.expect("wait_drained_raw"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+}
+
+/// A member that left the listing in an earlier round is still waited for when a later listing is
+/// empty. Lists: both members, then the signalled first one alone (the second left the list while
+/// unsignalled), then none. The second member stays alive, so the bounded wait ends in
+/// `MembersRemain` at its deadline rather than answering the drain off the empty listing.
+///
+/// Mutant: only the handles of the last round are confirmed at an empty listing.
+#[skuld::test]
+fn wait_drained_raw_keeps_waiting_for_a_member_that_left_the_listing_in_an_earlier_round() {
+    use std::time::Duration;
+
+    let (mut first, second, job) = spawn_job_with_two_members();
+    first.kill().expect("end the first member");
+    first.wait().expect("reap the first member");
+    let forced = super::fault::force_job_pid_lists([vec![first.id(), second.id()], vec![first.id()], Vec::new()]);
+    let deadline = crate::wait::deadline_from(Duration::from_millis(50));
+
+    let verdict = super::wait_drained_raw(job.handle(), deadline);
+
+    drop(forced);
+    let_member_exit(second);
+    assert_eq!(
+        verdict.expect("wait_drained_raw"),
+        crate::containment::TreeDrain::MembersRemain,
+        "the drain was answered while a member's process object was unsignalled"
+    );
+}
+
+/// A round past the deadline whose final listing is empty polls the members it held, and answers
+/// `MembersRemain` for one that is still running.
+///
+/// Mutant: the final empty listing answers `AllMembersExited` without looking at the handles held.
+#[skuld::test]
+fn wait_drained_raw_with_an_elapsed_deadline_polls_the_members_its_empty_final_listing_leaves() {
+    let (mut first, second, job) = spawn_job_with_two_members();
+    first.kill().expect("end the first member");
+    first.wait().expect("reap the first member");
+    let forced = super::fault::force_job_pid_lists([vec![first.id(), second.id()], Vec::new()]);
+    let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
+
+    let verdict = super::wait_drained_raw(job.handle(), zero);
+
+    assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
+    drop(forced);
+    let_member_exit(second);
+    assert_eq!(
+        verdict.expect("wait_drained_raw"),
+        crate::containment::TreeDrain::MembersRemain,
+        "the drain was answered while a member's process object was unsignalled"
+    );
 }
 
 /// A real, still-running job member reports `MembersRemain` at an already-elapsed deadline —

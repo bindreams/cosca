@@ -321,7 +321,7 @@ mod windows {
 
     use std::future::Future as _;
     use std::pin::pin;
-    use std::task::{Context, Waker};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use crate::containment::drain_edge::DrainEdge;
@@ -329,7 +329,7 @@ mod windows {
     use crate::containment::TreeDrain;
     use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
-    use crate::test_child::{let_member_exit, spawn_job_member};
+    use crate::test_child::{let_member_exit, spawn_job_member, spawn_job_with_two_members};
     use crate::tokio::test_runtime::single_thread_pool_runtime;
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::{instant_near_ceiling, wait_ms_probe, TOKIO_TIMER_ROUNDING_MARGIN};
@@ -608,6 +608,67 @@ mod windows {
             "answered before its deadline"
         );
         let_member_exit(member);
+    }
+
+    /// An empty listing is the drain only once the members the round before held are signalled, as
+    /// in the sync wait. The second member is alive when the second listing (forced) comes back
+    /// empty; the wait is polled until that listing has been read, and must then be waiting on the
+    /// second member's handle, not have answered.
+    ///
+    /// Mutant: an empty listing answers `AllMembersExited` without looking at the handles held.
+    #[skuld::test]
+    async fn a_drain_whose_listing_empties_waits_for_the_members_it_held() {
+        use crate::containment::windows::fault::{force_job_pid_lists, job_pid_list_queries};
+
+        let (mut first, mut second, job) = spawn_job_with_two_members();
+        let stdin = second.stdin.take().expect("piped stdin");
+        let _forced = force_job_pid_lists([vec![first.id(), second.id()], Vec::new()]);
+        let mut wait = pin!(drain(&job, None));
+        assert!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+            "live members are waited for"
+        );
+        first.kill().expect("end the first member");
+        first.wait().expect("reap the first member");
+        let answered = loop {
+            match wait.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(drain) => break Some(drain),
+                Poll::Pending if job_pid_list_queries() >= 2 => break None,
+                Poll::Pending => ::tokio::task::yield_now().await,
+            }
+        };
+        let waiting = answered.is_none();
+        drop(stdin);
+        if waiting {
+            assert_eq!(wait.await, TreeDrain::AllMembersExited);
+        }
+        second.wait().expect("reap the second member");
+        assert!(
+            waiting,
+            "the drain answered {answered:?} off the empty listing while a member's process object was unsignalled"
+        );
+    }
+
+    /// A member that left the listing in an earlier round is still waited for when a later listing
+    /// is empty. The second member stays alive, so the bounded drain ends in `MembersRemain`.
+    ///
+    /// Mutant: only the handles of the last round are confirmed at an empty listing.
+    #[skuld::test]
+    async fn a_drain_keeps_waiting_for_a_member_that_left_the_listing_in_an_earlier_round() {
+        use crate::containment::windows::fault::force_job_pid_lists;
+
+        let (mut first, second, job) = spawn_job_with_two_members();
+        first.kill().expect("end the first member");
+        first.wait().expect("reap the first member");
+        let _forced = force_job_pid_lists([vec![first.id(), second.id()], vec![first.id()], Vec::new()]);
+        let deadline = crate::tokio::wait::deadline_from(Duration::from_millis(50));
+        let verdict = drain(&job, deadline).await;
+        let_member_exit(second);
+        assert_eq!(
+            verdict,
+            TreeDrain::MembersRemain,
+            "the drain was answered while a member's process object was unsignalled"
+        );
     }
 
     /// A drain dropped while it waits unregisters its waits and leaves the job waitable: the next

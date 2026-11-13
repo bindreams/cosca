@@ -285,42 +285,57 @@ async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
 ) -> Result<TreeDrain, Error> {
-    use crate::containment::windows::{Ended, Round};
+    use crate::containment::windows::{exited, Ended, Round, Watch};
     use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
     // The registered waits run on the real clock, not tokio's.
     let deadline = crate::tokio::wait::to_real_clock(deadline);
+    let mut watch = Watch::default();
     loop {
         // A round that starts past the deadline is the last, as in the sync wait.
         let last_round = deadline.is_some_and(|at| crate::wait::now() >= at);
-        let watch = match job.drain_round(last_round)? {
-            Round::Answer(drain) => return Ok(drain),
-            Round::List => {
-                ::tokio::task::yield_now().await;
-                continue;
-            }
-            Round::Watch(watch) => watch,
-        };
-        let ended = if last_round {
-            watch.poll()?
-        } else {
-            match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
-                Woke::Signalled => Ended::Signalled,
-                // The deadline passed first. One look at the handles, as the sync wait's zero-ms
-                // wait is: a member that exited as it passed is seen, and the last round lists.
-                Woke::TimedOut => watch.poll()?,
-            }
-        };
-        match ended {
-            Ended::Deadline => return Ok(TreeDrain::MembersRemain),
-            Ended::Signalled => {
-                if let Some(drain) = job.after_signalled(&watch)? {
-                    return Ok(drain);
+        let round = match job.drain_round(last_round, &mut watch)? {
+            Round::Wait => {
+                let ended = if last_round {
+                    watch.poll()?
+                } else {
+                    match wait_any(watch.handles(), deadline).await.map_err(Error::Io)? {
+                        Woke::Signalled => Ended::Signalled,
+                        // The deadline passed first. One look at the handles, as the sync wait's
+                        // zero-ms wait is: a member that exited as it passed is seen, and the last
+                        // round lists.
+                        Woke::TimedOut => watch.poll()?,
+                    }
+                };
+                match ended {
+                    Ended::Deadline => return Ok(TreeDrain::MembersRemain),
+                    Ended::Signalled => job.after_signalled(&mut watch)?,
                 }
-                // A signal that was already waiting at registration resolves without a pending
-                // poll, so this round may have reached no suspension: yield before listing again.
-                ::tokio::task::yield_now().await;
             }
+            round => round,
+        };
+        match round {
+            Round::Answer(drain) => return Ok(drain),
+            // The sync wait's `settle`: each member that left the list, in turn, until all are
+            // signalled. At the deadline one look at the handle, as for the round's own.
+            Round::Settle => {
+                for handle in watch.settling() {
+                    if !last_round
+                        && wait_any(std::iter::once(handle), deadline).await.map_err(Error::Io)? == Woke::Signalled
+                    {
+                        continue;
+                    }
+                    if !exited(handle).map_err(Error::Io)? {
+                        return Ok(TreeDrain::MembersRemain);
+                    }
+                }
+                return Ok(TreeDrain::AllMembersExited);
+            }
+            Round::List | Round::Wait => {}
         }
+        // A signal that was already waiting at registration resolves without a pending poll, and a
+        // round that found every member gone reached no suspension at all: yield before listing
+        // again.
+        ::tokio::task::yield_now().await;
     }
 }
