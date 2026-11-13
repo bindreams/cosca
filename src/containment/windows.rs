@@ -46,11 +46,9 @@ pub(crate) struct JobHandle {
     raw: HANDLE,
     /// The job's [`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::TotalProcesses`] as of the last drain whose
     /// confirmation waited for every member ([`confirm_drained`]); `0` before one. A process the job
-    /// ever had counts, wherever it came from (an assignment, a member's child, a process of a job
-    /// nested under it), and the count never falls, so an empty listing at the same count has no process
-    /// that was not confirmed. Measured on 10.0.26100 (`findings/2026-11-13-974-deny-set.md`): the
-    /// count of the outer job rose 3 to 4 for a nested member's child, and 4 to 5 for a process
-    /// assigned straight to a nested job.
+    /// ever had counts, wherever it came from, and the count never falls, so an empty listing at the
+    /// same count has no process that was not confirmed. Measured on Windows 11 10.0.26100:
+    /// `TotalProcesses` rises for an assignment, a member's child, a nested Job's member and its child.
     confirmed: AtomicU32,
 }
 
@@ -1175,9 +1173,10 @@ fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Re
                     Ok(None)
                 }
                 // The query itself failed, so membership is unknown, and the caller decides what that
-                // is: for a pid the job's own list named it is a member whose exit cannot be
-                // observed (an error); for a pid only the system snapshot named it is skipped, as
-                // one that cannot be opened is (the limit stated at `Child::wait_tree`).
+                // is. `drain_round` logs a listed pid and skips it when a sibling is watchable, and
+                // fails when it is the only one. The kill's listing (`list_members`) reports it as a
+                // member whose exit cannot be observed. The snapshot scan skips it, as it skips a pid
+                // it cannot open (the limit stated at `Child::wait_tree`).
                 Err(e) => {
                     // SAFETY: opened by the caller and not stored anywhere.
                     _ = unsafe { CloseHandle(h) };
@@ -1392,74 +1391,168 @@ fn after_signalled(job: HANDLE, watch: &Watch) -> Result<Round, crate::error::Er
 
 /// An empty listing is the drain once the job's members that a system process snapshot still names
 /// have exited: a member leaves the job's list before its process object is signalled, and the list
-/// is empty on its first read after a kill whether or not the members have exited. Each is opened by
-/// the snapshot's pid, kept only if the OS says it is in this job, and waited for one at a time
-/// through [`wait_for_member`] (open, wait, close), until `deadline` (`None`: for ever), which
-/// answers `MembersRemain` if one is still running at it. No handle outlives its own wait, and no
-/// wait set bounds the members. The members `settled` are not waited for.
-///
-/// A member in the gap is in the snapshot taken after the listing: it is not yet signalled, and a
-/// signalled process is not in a snapshot.
-///
-/// A job that has had no process since a confirmation that walked every member has none to wait for:
-/// its count of processes ever ([`JobHandle::count_to_confirm`]) says so, and no snapshot is taken.
-/// The count is stored once every member the snapshot named was waited for, none of them `settled`
-/// (a settled member that is still running was not waited for, and a later drain must not stand for
-/// it).
-///
-/// The async drain ([`job_wait_tree_drained`](crate::containment::drain_edge)) is this walk with its
-/// own wait: the members it walks ([`unsettled`]) and what a wait for one comes to ([`waited`]) are
-/// the same functions.
+/// is empty on its first read after a kill whether or not the members have exited. A job that has had
+/// no process since a confirmation that waited for every member has none to wait for: its count of
+/// processes ever ([`JobHandle::count_to_confirm`]) says so, and no snapshot is taken. Otherwise the
+/// snapshot's members are walked ([`ConfirmWalk`]), each waited for through
+/// [`wait_for_member`](crate::containment::tree_kill::wait_for_member) (open, wait, close) against
+/// `deadline` (`None`: for ever). The async drain
+/// ([`job_wait_tree_drained`](crate::containment::drain_edge)) walks the same [`ConfirmWalk`], with its
+/// own wait.
 fn confirm_drained(
     job: &JobHandle,
     deadline: Option<std::time::Instant>,
     settled: &Settled,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-    use crate::containment::tree_kill::wait_for_member;
     use crate::containment::TreeDrain;
-    use crate::identity::HostKernel;
 
     let Some(count) = job.count_to_confirm()? else {
         return Ok(TreeDrain::AllMembersExited);
     };
-    let (walk, skipped) = unsettled(unsignalled_members(job.raw)?, settled)?;
-    for id in walk {
-        if !waited(id, wait_for_member(&HostKernel, id, deadline))? {
-            return Ok(TreeDrain::MembersRemain);
+    walk_confirm(
+        ConfirmWalk::new(job, count, unsignalled_members(job.raw), settled),
+        deadline,
+    )
+}
+
+/// The blocking driver of a [`ConfirmWalk`].
+fn walk_confirm(
+    mut walk: ConfirmWalk<'_>,
+    deadline: Option<std::time::Instant>,
+) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+    use crate::containment::tree_kill::wait_for_member;
+    use crate::identity::HostKernel;
+
+    loop {
+        match walk.next() {
+            ConfirmStep::Wait(id) => walk.waited(id, wait_for_member(&HostKernel, id, deadline)),
+            ConfirmStep::Done(answer) => return answer,
         }
     }
-    if !skipped {
-        job.confirmed_at(count);
-    }
-    Ok(TreeDrain::AllMembersExited)
 }
 
 /// A process a snapshot names that is a member of the job: its identity, or its pid and why the
 /// identity could not be read.
 pub(crate) type Found = Result<ProcessId, (u32, crate::error::Error)>;
 
-/// The members a confirmation walks: those `found` that the caller has not `settled`, and whether any
-/// was left out as settled. A member whose identity could not be read and that is not settled is the
-/// error naming it ([`member_unobserved`]), returned before any wait: a deadline never hides it behind
-/// the wait for another member.
-pub(crate) fn unsettled(found: Vec<Found>, settled: &Settled) -> Result<(Vec<ProcessId>, bool), crate::error::Error> {
-    let mut walk = Vec::new();
-    let mut skipped = false;
-    for member in found {
-        match member {
-            Ok(id) if settled.covers(id.pid(), Some(id)) => skipped = true,
-            Ok(id) => walk.push(id),
-            Err((pid, _)) if settled.covers(pid, None) => skipped = true,
-            Err((pid, cause)) => return Err(member_unobserved(pid, cause)),
-        }
-    }
-    Ok((walk, skipped))
+/// What a [`ConfirmWalk`] asks of its driver.
+pub(crate) enum ConfirmStep {
+    /// Wait for this member to exit, against the one deadline of the confirmation (past it, a wait is
+    /// a poll: the open still happens), and hand the outcome to [`ConfirmWalk::waited`].
+    Wait(ProcessId),
+    /// The confirmation's answer.
+    Done(Result<crate::containment::TreeDrain, crate::error::Error>),
 }
 
-/// What a confirmation's wait for the member `id` comes to: `true` it has exited, `false` it runs at
-/// the deadline, and a wait that could not be made is the failure naming it ([`member_unobserved`]).
-pub(crate) fn waited(id: ProcessId, wait: Result<bool, crate::error::Error>) -> Result<bool, crate::error::Error> {
-    wait.map_err(|cause| member_unobserved(id.pid(), cause))
+/// The confirmation of an empty listing as a step core, which the blocking driver ([`walk_confirm`])
+/// and the async one ([`job_wait_tree_drained`](crate::containment::drain_edge)) both run: they differ
+/// only in how a wait for a member is made.
+///
+/// 1. Every member the snapshot names that is not settled is waited for, whatever an earlier wait came
+///    to: [`next`](Self::next) asks for them all, in the snapshot's order, against one deadline. A
+///    member still running at the deadline, or a failed wait, ends nothing early.
+/// 2. Failures come last and outrank `MembersRemain`: a member whose identity the snapshot could not
+///    read, and a wait that failed (a refused open, a failed wait), are collected, and the answer is
+///    them (one, or every one once in an [`Error::Several`]); else `MembersRemain` if a member was not
+///    seen to exit; else `AllMembersExited`, and the job's count is stored
+///    ([`JobHandle::confirmed_at`]). With no deadline that is [`KillWait::wait`]'s contract: the error
+///    comes once every other member has been waited for.
+/// 3. A snapshot entry is settled by what the kill's wait did ([`Settled`]).
+///
+/// The count is not stored when a settled member was left out: it may still be running, and a later
+/// drain must not stand for it.
+///
+/// [`KillWait::wait`]: crate::containment::tree_kill::KillWait::wait
+/// [`Error::Several`]: crate::error::Error::Several
+pub(crate) struct ConfirmWalk<'a> {
+    job: &'a JobHandle,
+    /// The job's count of processes ever when the snapshot was taken ([`JobHandle::count_to_confirm`]).
+    count: u32,
+    /// The members still to be waited for, in the snapshot's order.
+    queue: std::collections::VecDeque<ProcessId>,
+    /// What cannot be observed, in the order it was found: a failed snapshot, a member whose identity
+    /// the snapshot could not read, a failed wait.
+    failures: Vec<crate::error::Error>,
+    /// A member was not seen to exit.
+    remain: bool,
+    /// A settled member was left out of the walk.
+    left_out: bool,
+    /// [`ConfirmStep::Done`] was given.
+    done: bool,
+}
+
+impl<'a> ConfirmWalk<'a> {
+    /// The walk of `snapshot`, the result of the system snapshot taken after the empty listing, when
+    /// the job's `count` was read ([`JobHandle::count_to_confirm`]), less what `settled` has settled.
+    pub(crate) fn new(
+        job: &'a JobHandle,
+        count: u32,
+        snapshot: Result<Vec<Found>, crate::error::Error>,
+        settled: &Settled,
+    ) -> ConfirmWalk<'a> {
+        let mut walk = ConfirmWalk {
+            job,
+            count,
+            queue: std::collections::VecDeque::new(),
+            failures: Vec::new(),
+            remain: false,
+            left_out: false,
+            done: false,
+        };
+        match snapshot {
+            Err(failed) => walk.failures.push(failed),
+            Ok(found) => {
+                for member in found {
+                    match member {
+                        Ok(id) if settled.covers_identity(id) => walk.left_out = true,
+                        Ok(id) => walk.queue.push_back(id),
+                        Err((pid, _)) if settled.covers_unreadable(pid) => walk.left_out = true,
+                        Err((pid, cause)) => walk.failures.push(member_unobserved(pid, cause)),
+                    }
+                }
+            }
+        }
+        walk
+    }
+
+    /// The next member to wait for, or the answer once every one has been.
+    pub(crate) fn next(&mut self) -> ConfirmStep {
+        debug_assert!(!self.done, "a confirmation walk was asked for a step after its answer");
+        match self.queue.pop_front() {
+            Some(id) => ConfirmStep::Wait(id),
+            None => {
+                self.done = true;
+                ConfirmStep::Done(self.answer())
+            }
+        }
+    }
+
+    /// What the wait for the member `id` (the last [`ConfirmStep::Wait`]) came to: `Ok(true)` it has
+    /// exited, `Ok(false)` it was running at the deadline, and a wait that could not be made is a
+    /// failure naming it ([`member_unobserved`]).
+    pub(crate) fn waited(&mut self, id: ProcessId, outcome: Result<bool, crate::error::Error>) {
+        match outcome {
+            Ok(true) => {}
+            Ok(false) => self.remain = true,
+            Err(cause) => self.failures.push(member_unobserved(id.pid(), cause)),
+        }
+    }
+
+    fn answer(&mut self) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        use crate::containment::TreeDrain;
+
+        let mut failures = std::mem::take(&mut self.failures).into_iter();
+        if let Some(first) = failures.next() {
+            return Err(first.with_peers(failures.map(std::sync::Arc::new)));
+        }
+        if self.remain {
+            return Ok(TreeDrain::MembersRemain);
+        }
+        if !self.left_out {
+            self.job.confirmed_at(self.count);
+        }
+        Ok(TreeDrain::AllMembersExited)
+    }
 }
 
 /// The identity of every process a system snapshot names that is a member of `job`, decided with the
@@ -1513,7 +1606,7 @@ fn total_processes(job: HANDLE) -> io::Result<u32> {
 }
 
 /// The failure of a drain that cannot establish whether the job's member `pid` has exited.
-pub(crate) fn member_unobserved(pid: u32, cause: crate::error::Error) -> crate::error::Error {
+fn member_unobserved(pid: u32, cause: crate::error::Error) -> crate::error::Error {
     crate::error::Error::Unassessable {
         detail: format!("a member of the job, pid {pid}, could not be waited for"),
         source: Some(std::sync::Arc::new(cause)),
@@ -2199,3 +2292,7 @@ pub(crate) fn job_kills_on_close(job: &JobHandle) -> bool {
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(test)]
+#[path = "windows_confirm_tests.rs"]
+mod windows_confirm_tests;

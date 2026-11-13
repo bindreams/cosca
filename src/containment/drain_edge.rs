@@ -330,8 +330,8 @@ async fn snapshot_members_on_pool(
 ///
 /// An empty listing is confirmed from a system snapshot, as the sync wait's `confirm_drained` does:
 /// each job member it names, except those `settled`, is awaited in turn through the by-identity wait
-/// a kill's wait uses. The members walked and what a wait for one comes to are the sync wait's own
-/// ([`unsettled`], [`waited`]); the two differ only in how a member is waited for.
+/// a kill's wait uses. It is the sync wait's own [`ConfirmWalk`]; the two differ only in how a member
+/// is waited for.
 ///
 /// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
 /// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
@@ -345,7 +345,7 @@ async fn job_wait_tree_drained(
     settled: &Settled,
 ) -> Result<TreeDrain, Error> {
     use crate::containment::tree_kill::wait_for_member_async;
-    use crate::containment::windows::{unsettled, waited, Ended, Round};
+    use crate::containment::windows::{ConfirmStep, ConfirmWalk, Ended, Round};
     use crate::identity::HostKernel;
     use crate::os_process::windows::registered_wait::{wait_any, Woke};
 
@@ -376,22 +376,21 @@ async fn job_wait_tree_drained(
         };
         match round {
             Round::Answer(drain) => return Ok(drain),
-            // The sync wait's `confirm_drained`: each member the snapshot names, in turn, awaited
-            // through the same by-identity wait a kill's wait uses.
+            // The sync wait's `confirm_drained`: the same walk, each member awaited through the same
+            // by-identity wait a kill's wait uses.
             Round::Confirm => {
                 let Some(count) = job.count_to_confirm()? else {
                     return Ok(TreeDrain::AllMembersExited);
                 };
-                let (walk, skipped) = unsettled(snapshot_members_on_pool(job).await?, settled)?;
-                for id in walk {
-                    if !waited(id, wait_for_member_async(&HostKernel, id, deadline).await)? {
-                        return Ok(TreeDrain::MembersRemain);
+                let mut walk = ConfirmWalk::new(job, count, snapshot_members_on_pool(job).await, settled);
+                loop {
+                    match walk.next() {
+                        ConfirmStep::Wait(id) => {
+                            walk.waited(id, wait_for_member_async(&HostKernel, id, deadline).await)
+                        }
+                        ConfirmStep::Done(answer) => return answer,
                     }
                 }
-                if !skipped {
-                    job.confirmed_at(count);
-                }
-                return Ok(TreeDrain::AllMembersExited);
             }
             Round::List | Round::Watch(_) => {}
         }
