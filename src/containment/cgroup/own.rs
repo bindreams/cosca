@@ -1,6 +1,8 @@
 //! The first half of making a leaf: finding the supervisor's own cgroup, and asking whether the host
 //! offers it for a leaf. [`ContainMode::Strongest`](crate::ContainMode::Strongest) decides on this
-//! answer alone, before it touches anything.
+//! answer, and on `cgroup.kill` as the new leaf shows it: the own directory cannot say whether the
+//! kernel has it, because the hierarchy's true root never shows `cgroup.kill`, and a leaf never is
+//! the root.
 
 use std::fs;
 use std::io;
@@ -105,6 +107,34 @@ fn offered_in(file: io::Result<String>, root: &Path) -> Result<Option<OwnCgroup>
             );
             Ok(None)
         }
+    }
+}
+
+/// The leaf a `Strongest` spawn gets from what the host offers (`offered`, as [`offered_cgroup`]
+/// answers): `None` is a process group, `Some` a leaf that is made, and an error fails the spawn.
+///
+/// A leaf with no `cgroup.kill` (a kernel before 5.14) is the kernel saying it has no cgroup that
+/// can kill a tree, so the host offers none: a process group, with the leaf removed. It is read on
+/// the new leaf and not on the own directory, because the hierarchy's root never shows
+/// `cgroup.kill`. Every other failure to set up a cgroup the host offers is an error.
+#[cfg(target_os = "linux")]
+pub(crate) fn leaf_if_offered(
+    offered: Result<Option<OwnCgroup>, LeafError>,
+    teardown_warn_after: Option<std::time::Duration>,
+) -> Result<Option<CgroupLeaf>, crate::error::Error> {
+    let Some(own) = offered.map_err(LeafError::into_containment)? else {
+        return Ok(None);
+    };
+    match create_leaf_in(&own, teardown_warn_after) {
+        Ok(leaf) => Ok(Some(leaf)),
+        Err(e @ LeafError::KillUnsupported { .. }) => {
+            log::debug!(
+                "cgroup v2: no cgroup is offered: {report}",
+                report = crate::error::Report(&e)
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e.into_containment()),
     }
 }
 

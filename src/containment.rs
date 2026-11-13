@@ -203,11 +203,12 @@ pub enum ContainMode {
     /// - **Linux:** a cgroup v2 leaf, when the host offers one: `/proc/self/cgroup` names this
     ///   process's cgroup in the unified hierarchy, and this process may write that directory. A
     ///   host that offers none (no `/proc/self/cgroup`, a cgroup v1 host, a cgroup that is not
-    ///   writable) gets a process group, with no error. Once a cgroup is offered, every step after
-    ///   that fails the spawn: making the leaf (a missing `cgroup.kill`, before Linux 5.14, is one),
-    ///   opening its `cgroup.procs`, its report channel, its inotify watch, and the child's own
-    ///   placement write, whose failure stops the child before `exec`. The offer is read again at
-    ///   every spawn; none is remembered.
+    ///   writable) gets a process group, with no error; so does a host whose new leaf has no
+    ///   `cgroup.kill` (a kernel before Linux 5.14), and the leaf is removed. Once a cgroup is
+    ///   offered, every other step after that fails the spawn: making the leaf, opening its
+    ///   `cgroup.procs`, its report channel, its inotify watch, and the child's own placement
+    ///   write, whose failure stops the child before `exec`. The offer is read again at every
+    ///   spawn; none is remembered.
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and still degrades when it fails, as it always has.

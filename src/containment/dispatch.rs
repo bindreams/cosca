@@ -1318,18 +1318,14 @@ pub(crate) fn prepare(
                 }
             }
 
-            use crate::containment::cgroup::LeafError;
             let strict = mode.is_some_and(ContainMode::is_strict);
             let leaf = if strict {
                 // `Strongest` decides on what the host offers, and a failure of any step after
                 // that fails the spawn. A host that offers no cgroup is the process group set above.
-                match crate::containment::cgroup::offered_cgroup().map_err(LeafError::into_containment)? {
-                    Some(own) => Some(
-                        crate::containment::cgroup::create_leaf_in(&own, teardown_warn_after)
-                            .map_err(LeafError::into_containment)?,
-                    ),
-                    None => None,
-                }
+                crate::containment::cgroup::leaf_if_offered(
+                    crate::containment::cgroup::offered_cgroup(),
+                    teardown_warn_after,
+                )?
             } else {
                 // A failed leaf creation degrades this spawn to the process group set above, and
                 // `log_degrade` names the step that failed and the kernel's reason for it.

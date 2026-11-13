@@ -54,3 +54,46 @@ fn an_own_cgroup_that_cannot_be_written_offers_no_cgroup() {
 
     assert!(matches!(offered, Ok(None)), "{offered:?}");
 }
+
+/// The own cgroup under a temp directory, offered: a writable directory, whose new leaf has no
+/// `cgroup.kill`, as on a kernel before 5.14.
+fn offered_under(root: &Path) -> Result<Option<OwnCgroup>, LeafError> {
+    std::fs::create_dir(root.join("own")).expect("create the own cgroup");
+    offered_in(Ok("0::/own\n".to_owned()), root)
+}
+
+/// A host whose leaf shows no `cgroup.kill` (a kernel before 5.14) offers no cgroup that can kill a
+/// tree: a `Strongest` spawn gets a process group, no error, and the leaf it made is removed. The
+/// own cgroup's own directory could not say so: the hierarchy's root never shows `cgroup.kill`.
+#[skuld::test]
+fn a_leaf_without_cgroup_kill_is_a_process_group_for_strongest_and_leaves_no_leaf() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let offered = offered_under(root.path());
+
+    let leaf = leaf_if_offered(offered, None);
+
+    assert!(matches!(leaf, Ok(None)), "a process group, not an error and not a leaf");
+    let left: Vec<_> = std::fs::read_dir(root.path().join("own"))
+        .expect("read the own cgroup")
+        .collect();
+    assert!(left.is_empty(), "the failed leaf is removed: {left:?}");
+}
+
+/// Every other failure to set up a cgroup the host offers fails the spawn: here the `cgroup.kill`
+/// lookup fails with something other than absence.
+#[skuld::test]
+fn a_failed_leaf_step_other_than_a_missing_cgroup_kill_fails_strongest() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let offered = offered_under(root.path());
+    crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
+
+    let leaf = leaf_if_offered(offered, None);
+
+    let Err(error) = leaf else {
+        panic!("a failed cgroup.kill lookup must fail the spawn");
+    };
+    assert!(
+        matches!(error, crate::error::Error::Containment { ref detail, .. } if detail.contains("cgroup.kill")),
+        "{error:?}"
+    );
+}
