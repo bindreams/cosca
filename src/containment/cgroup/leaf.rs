@@ -9,7 +9,7 @@ use super::*;
 use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
-use std::fs::{self, File};
+use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
@@ -1338,19 +1338,36 @@ impl CgroupLeaf {
     /// after it.
     #[must_use = "a child that named itself and was given no handle is a breach for a caller to act on"]
     pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) -> WithoutChild {
-        let Some(received) = self.shut_exchange() else {
+        let Some(received) = self.abandon(warn) else {
             debug_assert!(false, "the leaf answers for a child once");
             return WithoutChild::AlreadyAbandoned;
         };
-        // What the abandonment finds wrong on the way, warned once when it ends.
-        let mut why = crate::child::spawn::Diagnosis::default();
-        self.kill_entered(&mut why);
-        self.remove_abandoned(warn);
         if received.pid.is_some() {
             WithoutChild::Named
         } else {
             WithoutChild::Unnamed
         }
+    }
+
+    /// [`abandon_without_child`](Self::abandon_without_child) for a spawn that failed, answering the
+    /// errno the child's placement write failed with, if it reported one before the spawn failed.
+    /// A child that stopped for it is a [`refusing`](ReportSlot::refusing) slot's.
+    pub(crate) fn abandon_failed_spawn(&mut self, warn: &mut dyn TeardownWarn) -> Option<i32> {
+        match self.abandon(warn)?.placement() {
+            PlacementReport::WriteFailed(errno) => Some(errno),
+            PlacementReport::Placed | PlacementReport::NotReported => None,
+        }
+    }
+
+    /// Ends the exchange, kills through the leaf if the child entered it, and removes the leaf.
+    /// What the child sent before, or `None` once an abandonment has done it.
+    fn abandon(&mut self, warn: &mut dyn TeardownWarn) -> Option<Received> {
+        let received = self.shut_exchange()?;
+        // What the abandonment finds wrong on the way, warned once when it ends.
+        let mut why = crate::child::spawn::Diagnosis::default();
+        self.kill_entered(&mut why);
+        self.remove_abandoned(warn);
+        Some(received)
     }
 
     /// Takes and shuts the report channel, and records whether the child entered the leaf: what an
@@ -1592,29 +1609,26 @@ fn warn_leaf_left_behind(leaf_path: &Path, what_failed: fmt::Arguments<'_>) {
 }
 
 /// Detect the current process's cgroup v2 path and create a leaf sub-cgroup
-/// for containment. Returns the failing step on any failure, so the caller can
-/// fall back to the process-group mechanism *and say why it had to*.
+/// for containment, as `ContainMode::BestEffort` does. Returns the failing step on any failure, so
+/// the caller can fall back to the process-group mechanism *and say why it had to*.
 ///
 /// Failure conditions include: cgroup v2 not mounted at `/sys/fs/cgroup`,
 /// current process not in a v2 cgroup (v1-only system), leaf directory not
 /// writable (undelegated slice), or `cgroup.kill` absent (kernel < 5.14).
 #[cfg(target_os = "linux")]
 pub(crate) fn try_create_leaf(teardown_warn_after: Option<std::time::Duration>) -> Result<CgroupLeaf, LeafError> {
-    let cgroup_file = fs::read_to_string("/proc/self/cgroup").map_err(LeafError::ReadProcSelfCgroup)?;
-    let rel_path = parse_v2_relative_path(&cgroup_file).ok_or_else(|| {
-        let (line_count, controllers) = summarize_cgroup_controllers(&cgroup_file);
-        LeafError::NoUnifiedLine {
-            line_count,
-            controllers,
-        }
-    })?;
+    create_leaf_in(&find_own_cgroup()?, teardown_warn_after)
+}
 
-    let mut leaf = create_leaf_under(
-        &Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')),
-        teardown_warn_after,
-    )?;
+/// Create a leaf sub-cgroup of `own`, the supervisor's own cgroup. The failing step on any failure.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_leaf_in(
+    own: &OwnCgroup,
+    teardown_warn_after: Option<std::time::Duration>,
+) -> Result<CgroupLeaf, LeafError> {
+    let mut leaf = create_leaf_under(own.dir(), teardown_warn_after)?;
     let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
-    leaf.cgroup_path = Some(format!("{}/{name}", rel_path.trim_end_matches('/')));
+    leaf.cgroup_path = Some(format!("{}/{name}", own.rel_path().trim_end_matches('/')));
     Ok(leaf)
 }
 
@@ -1637,7 +1651,7 @@ pub(crate) fn leaf_name() -> io::Result<String> {
 /// Create a containment leaf directly under `current` — the supervisor's own cgroup in
 /// production, and a temp directory in the tests that fail each precondition for real.
 ///
-/// Every early return names its step: the caller degrades either way, but never silently.
+/// Every early return names its step: the caller fails or degrades, but never silently.
 /// `teardown_warn_after`: see [`CgroupLeaf`]'s field of that name.
 #[cfg(target_os = "linux")]
 pub(crate) fn create_leaf_under(
@@ -1660,7 +1674,7 @@ pub(crate) fn create_leaf_under(
     let fail = |leaf_path: &Path, err: LeafError| -> LeafError {
         #[cfg(test)]
         if fault::take_force_occupy_before_unwind() {
-            fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
+            std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
         }
         if let Err(e) = dir.rmdir() {
             if !removed_after_drain(&e) {
@@ -1831,6 +1845,9 @@ pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Re
 /// message that could not be sent: a parent still waiting for it would misread the child for its
 /// whole life, so the spawn fails instead.
 ///
+/// A [`refusing`](ReportSlot::refusing) slot's failed write is an `Err` too, with its errno, after
+/// the report is sent: the program never runs, and the parent reads the cause from the report.
+///
 /// # Safety
 /// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
 /// open, writable fd in the child process, and `slot`'s channel must still be open.
@@ -1883,6 +1900,11 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Safety: the caller guarantees the slot's channel is open.
     match unsafe { slot.send_report(report) }? {
         Delivery::Abandoned => Err(abandoned()),
+        // A refusing slot's child stops here: the report is sent, and the parent reads the cause
+        // from it, not from the errno `std` carries back.
+        Delivery::Queued | Delivery::Decided if slot.refusing && report != REPORT_PLACED => {
+            Err(io::Error::from_raw_os_error(report))
+        }
         Delivery::Queued | Delivery::Decided => Ok(()),
     }
 }

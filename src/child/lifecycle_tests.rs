@@ -361,8 +361,8 @@ fn drop_kills_a_contained_tree() {
     );
 }
 
-/// `Strongest` with no cgroup leaf made (forced, so whatever the host gives) is a process group,
-/// the mechanism `.contain()` gives a Linux host without a delegated cgroup.
+/// `BestEffort` with no cgroup leaf made (forced, so whatever the host gives) is a process group,
+/// the mechanism `.contain()` gives a Linux host that offers no delegated cgroup.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn drop_kills_a_process_group_contained_tree() {

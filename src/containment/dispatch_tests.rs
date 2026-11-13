@@ -2184,25 +2184,20 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
     );
 }
 
-/// A failed install degrades to the pre-existing mechanism rather than failing the spawn.
+/// `prepare` for a root asking for `mode` whose marker install is made to fail.
 #[cfg(target_os = "macos")]
-#[skuld::test]
-fn a_failed_marker_install_leaves_prepare_without_one() {
-    use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
-    use crate::containment::{ContainMode, ContainRequest, Nesting};
-    // This test doesn't assert on log content itself, but triggering `Fault::Pipe` DOES emit
-    // "fd marker: pipe() failed" into the shared `log_capture` buffer once any test has called
-    // `log_capture::install()` — held for the whole body so it cannot land inside the sibling
-    // fd-marker test module's fault-injection log-scanning test's scanned window on another
-    // thread.
-    let _serialize = lock_for_log_assertion();
+fn prepare_with_a_failing_marker_install(
+    mode: crate::containment::ContainMode,
+) -> Result<super::Prepared, crate::error::Error> {
+    use crate::containment::fdmarker::fault::{set_fault, Fault};
+    use crate::containment::{ContainRequest, Nesting};
     let mut cmd = std::process::Command::new("/usr/bin/true");
     set_fault(Some(Fault::Pipe));
-    let prepared = super::prepare(
+    super::prepare(
         &mut cmd,
         &mut crate::child::spawn::in_child::InChild::default(),
         &ContainRequest {
-            mode: Some(ContainMode::Strongest),
+            mode: Some(mode),
             nesting: Nesting::Mark,
         },
         &crate::command::flags::FlagsRequest::default(),
@@ -2211,8 +2206,49 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
         &[],
         None,
     )
-    .expect("prepare is infallible off Windows");
-    assert!(prepared.marker.is_none(), "the forced failure must yield no marker");
+}
+
+/// A failed install degrades every mode but `Strongest` to the pre-existing mechanism rather than
+/// failing the spawn, and says so at `warn`: `BestEffort`, and an explicit `Session` or `TreeWalk`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_failed_marker_install_leaves_prepare_without_one_unless_strongest() {
+    use crate::containment::ContainMode;
+    // Held for the whole body: the warn's text has no per-call discriminator, and the `Fault::Pipe`
+    // of another test's spawn emits it too (see `lock_for_log_assertion`).
+    let _serialize = crate::containment::fdmarker::fault::lock_for_log_assertion();
+    crate::log_capture::install();
+    for mode in [ContainMode::BestEffort, ContainMode::Session, ContainMode::TreeWalk] {
+        let mark = crate::log_capture::mark();
+        let prepared =
+            prepare_with_a_failing_marker_install(mode).unwrap_or_else(|e| panic!("{mode:?} degrades, got {e:?}"));
+        assert!(
+            prepared.marker.is_none(),
+            "{mode:?}: the forced failure must yield no marker"
+        );
+        assert!(
+            crate::log_capture::contains_since(mark, "fd marker: pipe() failed"),
+            "{mode:?}: the fallback is logged"
+        );
+        assert!(
+            crate::log_capture::contains_since(mark, "falling back to the pre-existing containment channel"),
+            "{mode:?}: the fallback says what it fell back to"
+        );
+    }
+}
+
+/// `Strongest` has no mechanism below the marker to degrade to: a failed install fails the spawn,
+/// naming the marker.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_failed_marker_install_fails_a_strongest_prepare() {
+    let Err(error) = prepare_with_a_failing_marker_install(crate::containment::ContainMode::Strongest) else {
+        panic!("a failed marker install must fail a Strongest prepare");
+    };
+    assert!(
+        matches!(error, crate::error::Error::Containment { ref detail, .. } if detail.contains("fd marker")),
+        "{error:?}"
+    );
 }
 
 /// An elevation-derived spawn must not install a marker: `sudo` closes every descriptor >= 3.
@@ -2373,9 +2409,20 @@ enum ChildReport {
     NotReported,
 }
 
-/// Run the decision for a leaf at `leaf_path` whose child reported `report`.
+/// Run the decision for a leaf at `leaf_path` whose child reported `report`, for a root that asked
+/// for `Strongest`.
 #[cfg(target_os = "linux")]
 fn decide(leaf_path: &std::path::Path, report: ChildReport) -> crate::containment::Tree {
+    decide_for(crate::containment::ContainMode::Strongest, leaf_path, report).expect("attach_tree")
+}
+
+/// [`decide`] for a root that asked for `mode`: the decision, which may be a failed attach.
+#[cfg(target_os = "linux")]
+fn decide_for(
+    mode: crate::containment::ContainMode,
+    leaf_path: &std::path::Path,
+    report: ChildReport,
+) -> Result<crate::containment::Tree, super::AttachFailure> {
     use crate::containment::cgroup::{place_self_in_cgroup_pre_exec, CgroupLeaf};
 
     let leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
@@ -2390,7 +2437,7 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> crate::containmen
         ChildReport::NotReported => {}
     }
     let prepared = super::Prepared {
-        mode: Some(crate::containment::ContainMode::Strongest),
+        mode: Some(mode),
         is_root: true,
         cgroup_leaf: Some(leaf),
     };
@@ -2403,7 +2450,6 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> crate::containmen
         ),
         prepared,
     )
-    .expect("attach_tree")
 }
 
 /// A leaf directory whose `cgroup.procs` lists some OTHER pid, never this test's.
@@ -2455,20 +2501,46 @@ fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
     assert!(tree.cgroup_leaf_for_test().is_some(), "got {tree:?}");
 }
 
-/// A child whose write failed never entered the leaf, so neither did anything it forked: the
-/// spawn degrades and the empty leaf is removed.
+/// A child whose write failed never entered the leaf, so neither did anything it forked: a
+/// `BestEffort` spawn degrades and the empty leaf is removed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_failed_write_degrades_and_removes_the_leaf() {
+fn a_failed_write_degrades_a_best_effort_spawn_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-decision-leaf");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
-    let tree = decide(&leaf_path, ChildReport::WriteFailed);
+    let tree = decide_for(
+        crate::containment::ContainMode::BestEffort,
+        &leaf_path,
+        ChildReport::WriteFailed,
+    )
+    .expect("attach_tree");
 
     assert_eq!(tree.containment(), crate::containment::Containment::ProcessGroup);
     assert!(tree.signals_a_group_for_test(), "got {tree:?}");
     assert!(!leaf_path.exists(), "the degrade must remove the leaf it created");
+}
+
+/// The same child under `Strongest`: the attach fails, naming the cgroup, and the empty leaf is
+/// removed. The failed attach's teardown ends the child.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
+    for report in [ChildReport::WriteFailed, ChildReport::NotReported] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-decision-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+        let failure = decide_for(crate::containment::ContainMode::Strongest, &leaf_path, report)
+            .expect_err("a Strongest root the leaf did not take fails its attach");
+
+        assert!(
+            matches!(failure.cause, crate::error::Error::Containment { ref detail, .. } if detail.contains("cgroup")),
+            "{failure:?}"
+        );
+        assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
+    }
 }
 
 /// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf
@@ -2484,7 +2556,7 @@ fn a_degrade_never_kills_through_the_leaf() {
         let leaf_path = leaf_listing_another_pid(dir.path());
 
         let mark = crate::log_capture::mark();
-        let tree = decide(&leaf_path, report);
+        let tree = decide_for(crate::containment::ContainMode::BestEffort, &leaf_path, report).expect("attach_tree");
 
         assert_eq!(tree.containment(), crate::containment::Containment::ProcessGroup);
         assert!(

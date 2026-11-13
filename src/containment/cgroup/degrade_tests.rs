@@ -375,3 +375,37 @@ fn no_unified_line_never_quotes_a_line_it_could_not_parse() {
         "an unparsed line's content must not be echoed: {controllers:?}"
     );
 }
+
+/// The error of a `Strongest` spawn that could not have its cgroup names the cgroup and the step,
+/// and keeps the kernel's refusal as its source: a failed call's OS error, none for a step that
+/// failed on a fact.
+#[skuld::test]
+fn a_leaf_error_becomes_a_containment_error_that_keeps_the_os_error() {
+    let leaf = PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0");
+    let error = LeafError::CreateLeafDir {
+        path: leaf.clone(),
+        source: std::io::Error::from_raw_os_error(13),
+    }
+    .into_containment();
+    let crate::error::Error::Containment {
+        detail,
+        source: Some(source),
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(
+        detail.contains("cgroup") && detail.contains(&*leaf.to_string_lossy()),
+        "{detail:?}"
+    );
+    assert!(
+        matches!(&**source, crate::error::Error::Io(e) if e.raw_os_error() == Some(13)),
+        "{source:?}"
+    );
+
+    let error = LeafError::KillUnsupported { path: leaf }.into_containment();
+    assert!(
+        matches!(error, crate::error::Error::Containment { ref detail, source: None } if detail.contains("cgroup.kill")),
+        "{error:?}"
+    );
+}

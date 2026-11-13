@@ -1845,10 +1845,12 @@ fn cgroup_a_front_placeable_through_proc_is_not_refused(#[fixture(cgroup)] _grou
 }
 
 /// A `cat` front spawned for a cgroup leaf that does not take it (its placement write is made to
-/// fail, so the attach falls back to its process group), with its stdin a pipe the caller owns.
+/// fail, so a `BestEffort` attach falls back to its process group), with its stdin a pipe the
+/// caller owns.
 pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = in_cgroup(cat());
+    let mut cmd = cat();
+    cmd.contain_with(ContainMode::BestEffort);
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
     cmd.set_elevation_report(sudo_report());

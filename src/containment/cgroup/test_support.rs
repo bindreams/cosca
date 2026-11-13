@@ -317,6 +317,7 @@ pub(crate) fn childs_copy(
     let slot = crate::containment::cgroup::ReportSlot {
         fd: end.as_raw_fd(),
         parent_fd: -1,
+        refusing: false,
     };
     (end, slot)
 }

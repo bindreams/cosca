@@ -633,7 +633,7 @@ fn spawn_reported(
     let (mut prepared, child, pidfd, parent_ends) = {
         // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
         let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
-        let prepared = crate::containment::prepare(
+        let mut prepared = crate::containment::prepare(
             &mut std_cmd,
             &mut steps,
             &cmd.contain_request(),
@@ -662,7 +662,17 @@ fn spawn_reported(
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
         #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-        let held = handshake.run(|| std_cmd.spawn())?;
+        let held = match handshake.run(|| std_cmd.spawn()) {
+            Ok(held) => held,
+            // A `Strongest` child stopped by its leaf's refusal says so itself, through the leaf's
+            // report; `std`'s errno cannot tell it from a `chdir`'s.
+            Err(failure) => {
+                return Err(match prepared.refused_placement() {
+                    Some(refused) => failure.map(|_| refused),
+                    None => failure,
+                })
+            }
+        };
         (prepared, held.child, held.pidfd, parent_ends)
     };
     #[cfg(windows)]

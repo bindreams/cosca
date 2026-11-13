@@ -21,7 +21,9 @@ use std::fmt;
 
 /// The teardown mechanism actually achieved for a spawned child (queried via
 /// `Child::containment()`). Runtime-detected — the same binary meets hosts with
-/// and without cgroup v2 / inside and outside an existing job.
+/// and without cgroup v2 / inside and outside an existing job. A request that asks for
+/// [`ContainMode::Strongest`] gets the strongest mechanism its host offers or an error; one that
+/// asks for [`ContainMode::BestEffort`] may get a weaker one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Containment {
@@ -38,7 +40,8 @@ pub enum Containment {
     ///
     /// Each leaf holds an inotify instance for its lifetime, to watch its drain; it counts against
     /// `fs.inotify.max_user_instances` (128 per user by default). A spawn that cannot get one is
-    /// not contained in a leaf, and degrades as for any other failed step. The first
+    /// not contained in a leaf: it fails under `Strongest`, and degrades, as for any other failed
+    /// step, under `BestEffort`. The first
     /// [`wait_tree`](crate::Child::wait_tree) on a handle that finds the tree still running, and
     /// may block, also starts one thread, owned by that handle, which reads the watch for every
     /// wait on it; dropping the handle stops and joins it. A wait that finds the tree drained, or
@@ -192,10 +195,35 @@ impl fmt::Display for Containment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainMode {
-    /// The strongest kernel container available on this host, falling back
-    /// (cgroup → job → process group → …) to [`ContainMode::TreeWalk`] rather
-    /// than to no containment.
+    /// The strongest kernel container this host offers, or an error: the mechanism is chosen by
+    /// what the host offers, and a failure to set it up fails the spawn with [`Error::Containment`]
+    /// naming the mechanism and the cause, before the program runs. It never falls back to a
+    /// weaker one; [`ContainMode::BestEffort`] does.
+    ///
+    /// - **Linux:** a cgroup v2 leaf, when the host offers one: `/proc/self/cgroup` names this
+    ///   process's cgroup in the unified hierarchy, and this process may write that directory. A
+    ///   host that offers none (no `/proc/self/cgroup`, a cgroup v1 host, a cgroup that is not
+    ///   writable) gets a process group, with no error. Once a cgroup is offered, every step after
+    ///   that fails the spawn: making the leaf (a missing `cgroup.kill`, before Linux 5.14, is one),
+    ///   opening its `cgroup.procs`, its report channel, its inotify watch, and the child's own
+    ///   placement write, whose failure stops the child before `exec`. The offer is read again at
+    ///   every spawn; none is remembered.
+    /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
+    ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
+    ///   installs the marker too, and still degrades when it fails, as it always has.
+    /// - **Windows:** a Job Object, falling back to [`ContainMode::TreeWalk`] when the child
+    ///   cannot be assigned to it, as `BestEffort` does. This is unchanged for now: Windows will
+    ///   fail instead, as the other platforms do.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
     Strongest,
+    /// The strongest kernel container that sets up, else the next one down, rather than an error:
+    /// what [`ContainMode::Strongest`] did before it began to fail. A cgroup v2 leaf on Linux, a
+    /// Job Object on Windows and the inherited-fd marker on macOS, each falling back (to a process
+    /// group on Linux and macOS, to [`ContainMode::TreeWalk`] on Windows) rather than to no
+    /// containment. A fallback is logged at `warn` (on Windows it is not, yet), and
+    /// [`Child::containment`](crate::Child::containment) reports what the spawn got.
+    BestEffort,
     /// Identity-aware process-tree walk at teardown — selectable directly (e.g.
     /// for a child known to `setsid` out of a process group). The spawn fails if the OS refuses to
     /// report the root's identity.
@@ -216,8 +244,18 @@ pub enum ContainMode {
     /// to `ProcessGroup` containment. `Session` provides TTY detach and
     /// session grouping; it is not a security sandbox.
     ///
-    /// On non-Unix platforms this request is silently treated as `Strongest`.
+    /// On macOS this request installs the fd marker as well, and still degrades to the session
+    /// when that fails. On non-Unix platforms this request is silently treated as `Strongest`.
     Session,
+}
+
+impl ContainMode {
+    /// Whether the mechanism this mode picks is the only one it accepts: a failure to set it up
+    /// fails the spawn, where every other mode degrades to the mechanism below it.
+    #[cfg(unix)]
+    pub(crate) fn is_strict(self) -> bool {
+        matches!(self, ContainMode::Strongest)
+    }
 }
 
 /// Whether a kill-group root marks its descendants as already-contained.
@@ -348,3 +386,7 @@ pub(crate) mod marker_eof;
 #[cfg(test)]
 #[path = "containment_tests.rs"]
 mod containment_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "containment/strongest_tests.rs"]
+mod strongest_tests;

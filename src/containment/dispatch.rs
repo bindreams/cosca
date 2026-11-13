@@ -13,13 +13,13 @@ pub(crate) struct Prepared {
     pub mode: Option<ContainMode>,
     pub is_root: bool,
     /// Pre-created cgroup leaf (Linux only). `Some` means the child must be
-    /// placed in the cgroup by the in-child placement step; `None` means fall back
-    /// to the process-group mechanism.
+    /// placed in the cgroup by the in-child placement step; `None` means the process-group
+    /// mechanism: the host offers no cgroup, or a `BestEffort` spawn could not make a leaf.
     #[cfg(target_os = "linux")]
     pub cgroup_leaf: Option<crate::containment::cgroup::CgroupLeaf>,
     /// The marker pipe for a contained macOS root. `None` for a nested member, an
-    /// uncontained or elevation-derived spawn, or a failed install (which degrades to the
-    /// process group).
+    /// uncontained or elevation-derived spawn, or a failed install of any mode but `Strongest`
+    /// (which degrades to the process group, or the tree walk for `TreeWalk`).
     #[cfg(target_os = "macos")]
     pub marker: Option<crate::containment::fdmarker::PreparedMarker>,
     /// The cooperative-signal mechanism implied by the creation-flag word this spawn passed to
@@ -88,6 +88,27 @@ impl Prepared {
                 );
             }
         }
+    }
+
+    /// A `Strongest` spawn that failed before its attach: the leaf it made is abandoned and removed,
+    /// and if the child stopped before `exec` because its placement write failed, the answer is that
+    /// refusal as [`Error::Containment`], which replaces `std`'s errno (that cannot tell a placement
+    /// from a `chdir`). `None` for any other spawn or cause.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refused_placement(&mut self) -> Option<Error> {
+        if !self.mode.is_some_and(ContainMode::is_strict) {
+            return None;
+        }
+        let leaf = self.cgroup_leaf.as_mut()?;
+        let mut warn = leaf.warn();
+        let errno = leaf.abandon_failed_spawn(&mut warn)?;
+        Some(Error::Containment {
+            detail: format!(
+                "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run",
+                leaf.path().display()
+            ),
+            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+        })
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group
@@ -1160,7 +1181,9 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
 /// Windows can honour.
 ///
-/// Fallible only on Windows, where the composed creation-flag word may name a reserved bit. The
+/// Fallible on Windows, where the composed creation-flag word may name a reserved bit, and for a
+/// `Strongest` spawn on Linux (the cgroup the host offers cannot be used) and macOS (the fd marker
+/// cannot be installed): [`Error::Containment`], with nothing forked. The Windows
 /// composition runs at the very top — before anything is mutated, so a refusal leaves nothing to
 /// unwind, and above the uncontained early return, so an uncontained spawn carries the caller's
 /// flags too.
@@ -1295,24 +1318,40 @@ pub(crate) fn prepare(
                 }
             }
 
-            // A failed leaf creation degrades this spawn to the process group set above. The
-            // decision is unchanged; only the silence is — `log_degrade` names the step that
-            // failed and the kernel's reason for it.
-            let leaf = match crate::containment::cgroup::try_create_leaf(teardown_warn_after) {
-                Ok(leaf) => Some(leaf),
-                Err(e) => {
-                    crate::containment::cgroup::log_degrade(&e);
-                    None
+            use crate::containment::cgroup::LeafError;
+            let strict = mode.is_some_and(ContainMode::is_strict);
+            let leaf = if strict {
+                // `Strongest` decides on what the host offers, and a failure of any step after
+                // that fails the spawn. A host that offers no cgroup is the process group set above.
+                match crate::containment::cgroup::offered_cgroup().map_err(LeafError::into_containment)? {
+                    Some(own) => Some(
+                        crate::containment::cgroup::create_leaf_in(&own, teardown_warn_after)
+                            .map_err(LeafError::into_containment)?,
+                    ),
+                    None => None,
+                }
+            } else {
+                // A failed leaf creation degrades this spawn to the process group set above, and
+                // `log_degrade` names the step that failed and the kernel's reason for it.
+                match crate::containment::cgroup::try_create_leaf(teardown_warn_after) {
+                    Ok(leaf) => Some(leaf),
+                    Err(e) => {
+                        crate::containment::cgroup::log_degrade(&e);
+                        None
+                    }
                 }
             };
             if let Some(ref l) = leaf {
-                // The child's self-placement step. A failed placement (e.g. EBUSY — "no internal
-                // processes" rule) returns Ok, so the spawn proceeds and `attach` falls back to the
-                // already-configured process group. Only a report the child cannot send fails the
-                // spawn. Both the sync and the tokio spawn add this one step through `prepare`.
+                // The child's self-placement step. Under `Strongest` a failed placement stops the
+                // child before `exec` (see `ReportSlot::refusing`). Otherwise it returns Ok (e.g.
+                // EBUSY — "no internal processes" rule), so the spawn proceeds and `attach` falls
+                // back to the already-configured process group. Only a report the child cannot send
+                // fails the spawn either way. Both the sync and the tokio spawn add this one step
+                // through `prepare`.
+                let slot = l.placement_slot();
                 // SAFETY: the leaf, which owns both the fd and the report channel, stays in
                 // `Prepared` until after the spawn.
-                unsafe { steps.place(l.procs_fd(), l.placement_slot()) };
+                unsafe { steps.place(l.procs_fd(), if strict { slot.refusing() } else { slot }) };
             }
             return Ok(Prepared {
                 mode,
@@ -1341,11 +1380,21 @@ pub(crate) fn prepare(
 
     // macOS: install the inherited-fd marker for every contained root, regardless of the
     // requested mode (decision: the marker survives what the mode-specific mechanism above
-    // does not). `marker_wanted` gates on root/mode/suppression; `install` degrades to `None`
-    // on any failure rather than failing the spawn.
+    // does not). `marker_wanted` gates on root/mode/suppression. A failed install fails a
+    // `Strongest` spawn; every other mode degrades to the mechanism the marker outranks.
     #[cfg(target_os = "macos")]
     let marker = if crate::containment::fdmarker::marker_wanted(mode, is_root, marker_suppressed) {
-        crate::containment::fdmarker::install(steps, reserved_fds)
+        match crate::containment::fdmarker::install(steps, reserved_fds) {
+            Ok(marker) => Some(marker),
+            Err(e) if mode.is_some_and(ContainMode::is_strict) => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "{report}; falling back to the pre-existing containment channel for this mode",
+                    report = crate::error::Report(&e)
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1458,7 +1507,8 @@ fn attach_tree(
                     return Ok(Tree::contained(Mechanism::Group(Group::session(pgid))));
                 }
 
-                // Strongest: cgroup v2 if available, else process group.
+                // Strongest and BestEffort: the cgroup leaf if `prepare` made one, else the
+                // process group.
                 if let Some(mut leaf) = prepared.cgroup_leaf.take() {
                     // The pre_exec write can fail (EBUSY — the "no internal processes" rule
                     // when the supervisor is itself an undelegated leaf). The child's own
@@ -1474,13 +1524,23 @@ fn attach_tree(
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
                         Err(reason) => {
+                            // `Strongest` fails the spawn: the failed attach's teardown ends the child.
+                            if prepared.mode.is_some_and(ContainMode::is_strict) {
+                                leaf.remove_unentered();
+                                return Err(Error::Containment {
+                                    detail: format!("cgroup v2: {}", crate::error::Report(&reason)),
+                                    source: None,
+                                }
+                                .into());
+                            }
                             crate::containment::cgroup::log_degrade(&reason);
                             leaf.remove_unentered();
                             return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
                         }
                     }
                 }
-                // No cgroup leaf: fall back to process group (set pre-spawn).
+                // No cgroup leaf (none offered, or a `BestEffort` spawn made none): the process
+                // group set pre-spawn.
                 return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
             } else {
                 // Nested member: it joined the ancestor's cgroup/process group (or the

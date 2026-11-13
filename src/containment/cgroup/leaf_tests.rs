@@ -2665,6 +2665,34 @@ fn placement_hook_proceeds_past_a_failed_placement() {
     assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EBADF));
 }
 
+/// A refusing slot's failed placement fails the spawn with the write's errno, after the report that
+/// carries the same errno to the parent is sent. A placement that succeeds proceeds, as it does for
+/// any slot.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_refusing_placement_hook_fails_a_failed_placement_and_reports_it() {
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    // SAFETY: fd -1 is never writable, so the placement fails with EBADF; the channel is open.
+    let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, channel.slot().refusing()) };
+    assert_eq!(
+        result.expect_err("a refused placement fails the spawn").raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EBADF));
+
+    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
+    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
+    let result =
+        unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, channel.slot().refusing()) };
+    assert!(result.is_ok(), "a placed child proceeds: {result:?}");
+    assert_eq!(channel.report_for_test(), PlacementReport::Placed);
+}
+
 /// A report that cannot be sent to a parent still waiting for it fails the spawn.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -2675,7 +2703,11 @@ fn placement_hook_fails_when_its_report_cannot_be_sent() {
         .expect("open /dev/null");
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
     // fd -1 is never open, so the send fails with EBADF.
-    let slot = crate::containment::cgroup::ReportSlot { fd: -1, parent_fd: -1 };
+    let slot = crate::containment::cgroup::ReportSlot {
+        fd: -1,
+        parent_fd: -1,
+        refusing: false,
+    };
     // SAFETY: `procs_fd` is open and closed by the hook; the slot's fd is deliberately invalid.
     let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot) };
     assert_eq!(
@@ -2852,7 +2884,11 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
         .open("/dev/null")
         .expect("open /dev/null");
     let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    let slot = crate::containment::cgroup::ReportSlot { fd: -1, parent_fd: -1 };
+    let slot = crate::containment::cgroup::ReportSlot {
+        fd: -1,
+        parent_fd: -1,
+        refusing: false,
+    };
     let mut cmd = std::process::Command::new("/bin/true");
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };

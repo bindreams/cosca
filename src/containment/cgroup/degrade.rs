@@ -6,8 +6,9 @@ use std::io;
 use std::path::PathBuf;
 
 /// Why a cgroup v2 leaf could not be created. Each variant names its step, and its path where it
-/// has one; a variant for a failed call keeps that call's OS error as its `source`. The caller
-/// degrades to a process group either way, stating which precondition was missing.
+/// has one; a variant for a failed call keeps that call's OS error as its `source`. A
+/// `BestEffort` caller degrades to a process group, stating which precondition was missing; a
+/// `Strongest` one fails the spawn with it ([`LeafError::into_containment`]).
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -74,6 +75,30 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
+}
+
+impl LeafError {
+    /// The failure of a spawn that asked for a cgroup and could not have it: [`Error::Containment`]
+    /// naming the failed step and its path, with the OS error that failed it as its source.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "called only by the linux-gated spawn")
+    )]
+    pub(crate) fn into_containment(self) -> crate::error::Error {
+        let detail = format!("cgroup v2: {self}");
+        let source = match self {
+            LeafError::ReadProcSelfCgroup(source)
+            | LeafError::OpenReportChannel(source)
+            | LeafError::CreateLeafDir { source, .. }
+            | LeafError::CheckKill { source, .. }
+            | LeafError::OpenProcs { source, .. }
+            | LeafError::WatchDrain { source, .. } => Some(crate::error::Error::io_cause(source)),
+            LeafError::NoUnifiedLine { .. } | LeafError::KillUnsupported { .. } => None,
+        };
+        crate::error::Error::Containment { detail, source }
+    }
 }
 
 /// What the child's own `pre_exec` self-placement write reported back to the parent.

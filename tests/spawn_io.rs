@@ -21,8 +21,8 @@ fn testbin() -> &'static str {
 ///
 /// Unix-gated, not Linux-gated: BOTH Unix containment mechanisms that can degrade explain
 /// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker
-/// (`fdmarker::install`) — so routing only the Linux one leaves the macOS reasons on the floor
-/// on the host that has them.
+/// (the fallback `containment::prepare` logs for a failed install) — so routing only the Linux
+/// one leaves the macOS reasons on the floor on the host that has them.
 ///
 /// A thin alias for [`common::install_log_capture`], not a logger of its own — see that
 /// function's doc for why only one logger may exist in this test binary. It already echoes
@@ -1349,9 +1349,8 @@ fn treewalk_kills_process_group_escapee() {
 #[skuld::test]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    // A usable delegated cgroup must exist.
-    // If try_create_leaf() returns None, containment falls back to ProcessGroup
-    // and the assert below will fail loudly — that's intentional.
+    // A usable delegated cgroup must exist. Where the host offers none, `.contain()` gives a
+    // ProcessGroup and the assert below fails loudly — that's intentional.
     let (child, mut gc_stream) = spawn_contained_tree(|cmd| _ = cmd.contain());
     assert_eq!(
         child.containment(),

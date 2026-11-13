@@ -252,9 +252,9 @@ pub(crate) fn held_std_killable_blocker() -> std::process::Command {
 }
 
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
-/// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
-/// cgroup leaf first and logs a warning where none is delegated, so a test that holds a
-/// [`warn_watch`](crate::log_capture::warn_watch) would warn on one host and not on another. See
+/// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` makes a
+/// cgroup leaf where the host offers a delegated cgroup and gives a process group where it does not,
+/// so the same test would get a different mechanism on one host than on another. See
 /// principle 9 of `docs/principles.md`. Mirrors `tests/common`'s helper of the same name, which a
 /// separate compilation unit cannot share.
 #[cfg(unix)]
