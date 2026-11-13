@@ -135,6 +135,18 @@ pub fn test_spawn_lock() -> TestSpawnLockGuard {
     TestSpawnLockGuard(child::spawn::spawn_lock())
 }
 
+/// Test-only: whether this kernel answers `PIDFD_GET_INFO` (Linux 6.13+) with a cgroup id, asked of this
+/// process's own pidfd through the library's own read. `Ok(false)` is a kernel before 6.13. Exposed for the
+/// `PIDFD_GET_INFO` test group (`src/test_groups.rs`), which integration roots compile too; `#[doc(hidden)]`
+/// like [`test_spawn_lock`].
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn test_kernel_has_pidfd_get_info() -> std::io::Result<bool> {
+    let own = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())?;
+    use std::os::fd::AsFd as _;
+    Ok(containment::cgroup::pidfd_cgroup_id(own.as_fd())?.is_some())
+}
+
 /// Holds [`test_spawn_lock`]'s lock until dropped.
 #[doc(hidden)]
 #[must_use = "if unused the spawn lock is released immediately; bind the guard for the whole window"]

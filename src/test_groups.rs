@@ -204,6 +204,7 @@ test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attach
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
 test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");
 test_group!(PIDFD_GROUP_SIGNAL => pidfd_group_signal, env = "COSCA_TEST_PIDFD_GROUP_SIGNAL", precondition = kernel_signals_groups_through_pidfds);
+test_group!(PIDFD_GET_INFO => pidfd_get_info, env = "COSCA_TEST_PIDFD_GET_INFO", precondition = kernel_answers_pidfd_get_info);
 test_group!(CLONE3 => clone3, env = "COSCA_TEST_CLONE3");
 test_group!(STRAY_SIGNAL => stray_signal, env = "COSCA_TEST_STRAY_SIGNAL", consent = "may signal an unrelated process (a number no live process of the test pins, or a walk from a reaped root's pid)");
 test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
@@ -247,6 +248,26 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
             return Err(lacks(format!("this kernel refused the flag ({errno})")));
         }
         Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(lacks("this host is not Linux".to_owned()))
+}
+
+/// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
+/// (Linux 6.13+), asked through the library's own read on this process's own pidfd. A kernel before 6.13 is a
+/// supported host that reads a task's cgroup through `/proc` instead.
+#[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
+fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
+    let lacks = |why: String| {
+        format!(
+            "the group needs Linux 6.13+, whose pidfds answer PIDFD_GET_INFO with a cgroup id, and {why};              set {enabled_var}=0 to turn it off"
+        )
+    };
+    #[cfg(target_os = "linux")]
+    match cosca::test_kernel_has_pidfd_get_info() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(lacks("this kernel does not answer it".to_owned())),
+        Err(e) => Err(lacks(format!("asking this process's own pidfd failed ({e})"))),
     }
     #[cfg(not(target_os = "linux"))]
     Err(lacks("this host is not Linux".to_owned()))
