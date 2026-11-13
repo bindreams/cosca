@@ -11,9 +11,10 @@ use crate::containment::{Skip, SkipCall};
 use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
-/// backend so it applies uniformly to whichever watch `graceful_shutdown_tree` actually
-/// performs — root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
-/// ([`DrainEdge::wait`](crate::containment::drain_edge::DrainEdge::wait)). Outside test builds the seam module does
+/// backend so it applies to the two watches of `graceful_shutdown_tree`'s main path — root-only
+/// ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
+/// ([`DrainEdge::wait`](crate::containment::drain_edge::DrainEdge::wait)). The holders-only and root-through-pidfd
+/// paths do not take it: their grace waits are their own. Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
 #[cfg(test)]
 pub(crate) fn take_forced_watch_error() -> Option<Error> {
@@ -28,11 +29,11 @@ pub(crate) fn take_forced_watch_error() -> Option<Error> {
 /// [`fault::set_force_kill_tree_error`]), taken once; the sweep is not sent when it is `Some`. Outside test
 /// builds it is a constant `None`.
 #[cfg(test)]
-pub(crate) fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
+fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
     fault::take_force_kill_tree_error().then(|| fault::forced_kill_tree_error().into())
 }
 #[cfg(not(test))]
-pub(crate) fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
+fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
     None
 }
 
@@ -296,7 +297,7 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
     /// is not this process's to reap.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        tree::run_ready(tree::shutdown_tree(&mut tree::BlockingDriver(self), grace))
+        shutdown::run_ready(shutdown::shutdown_tree(&mut shutdown::BlockingDriver(self), grace))
     }
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
@@ -358,7 +359,7 @@ impl Child {
         }
     }
 
-    /// The end of a holders-only shutdown ([`tree::holders_only`]): the mechanism's kill
+    /// The end of a holders-only shutdown ([`shutdown::holders_only`]): the mechanism's kill
     /// with the same root, taken under a hold of its own, which is not held across the grace. The pending
     /// shutdown is finished by its caller, sync or async, which waits for what that kill reached.
     #[cfg(unix)]
@@ -675,8 +676,8 @@ pub(crate) mod fault {
     }
 }
 
-#[path = "graceful/tree.rs"]
-pub(crate) mod tree;
+#[path = "graceful/shutdown.rs"]
+pub(crate) mod shutdown;
 
 #[cfg(test)]
 #[path = "graceful_tests.rs"]

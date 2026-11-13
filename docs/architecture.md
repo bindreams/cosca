@@ -152,7 +152,7 @@ In order:
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
    `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`).
-   `graceful_shutdown_tree` is one `async fn` (`shutdown_tree`, in `child/graceful/tree.rs`) over a
+   `graceful_shutdown_tree` is one `async fn` (`shutdown_tree`, in `child/graceful/shutdown.rs`) over a
    `Waits` trait of its waits: the sync `Child` runs it with blocking waits through `run_ready` (one
    poll, a panic on `Pending`), and the async `Child` awaits it. What is
    left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a

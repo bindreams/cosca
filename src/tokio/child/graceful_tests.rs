@@ -85,7 +85,7 @@ async fn keeps_an_untaken_stdin_open_through_the_grace(tree: bool) {
     {
         cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
         cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-        // A process group on Linux: no cgroup is asked for, so the row needs no delegated one.
+        // `contain_without_cgroup_async` asks for `Session` on Linux: no cgroup, so the row needs no delegated one.
         crate::test_child::contain_without_cgroup_async(&mut cmd);
     }
     #[cfg(windows)]
@@ -763,7 +763,7 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
 
     let (error, ()) = ::tokio::join!(
         async {
-            let error = crate::child::graceful::tree::holders_only(&child, skip, Duration::ZERO).await;
+            let error = crate::child::graceful::shutdown::holders_only(&child, skip, Duration::ZERO).await;
             done.set(true);
             error
         },

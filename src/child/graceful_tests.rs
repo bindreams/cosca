@@ -1159,8 +1159,8 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
     let child = child_with(&root, fake.reaching_unobserved(4242));
     let skip = holders_only_skip(&child);
 
-    let error = super::tree::run_ready(super::tree::holders_only(
-        &super::tree::BlockingDriver(&child),
+    let error = super::shutdown::run_ready(super::shutdown::holders_only(
+        &super::shutdown::BlockingDriver(&child),
         skip,
         std::time::Duration::ZERO,
     ));

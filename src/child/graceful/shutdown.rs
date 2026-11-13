@@ -12,7 +12,6 @@ use std::time::Duration;
 use super::fault;
 use super::{take_forced_sweep, take_forced_watch_error, Child, SignalTreeCooperativelyOutcome};
 use crate::containment::dispatch::{SweepFailure, Swept};
-use crate::containment::drain_edge::DrainEdge;
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
@@ -23,12 +22,8 @@ pub(crate) trait Waits {
     /// The child the call acts on: its gates, signals, tree and pid.
     fn child(&self) -> &Child;
 
-    /// Until every member of the tree has exited (not reaped), through `edge`, or `grace` is over.
-    async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error>;
-
-    /// [`Tree::wait_drained`](crate::containment::Tree::wait_drained) for `grace`: the drain edge, or
-    /// `Unsupported` where the mechanism has none.
-    #[cfg(unix)]
+    /// Until every member of the tree has exited (not reaped), or `grace` is over: the public
+    /// `wait_tree_timeout`, through the tree's drain edge, or `Unsupported` where the mechanism has none.
     async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error>;
 
     /// Whether the root has exited within `within`, looked at through its handle. Non-reaping, so its
@@ -54,13 +49,8 @@ impl Waits for BlockingDriver<'_> {
         self.0
     }
 
-    async fn drain(&self, edge: &DrainEdge<'_>, grace: Duration) -> Result<TreeDrain, Error> {
-        edge.wait(crate::wait::deadline_from(grace))
-    }
-
-    #[cfg(unix)]
     async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
-        self.0.tree.wait_drained(crate::wait::deadline_from(grace))
+        self.0.wait_tree_timeout(grace)
     }
 
     async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
@@ -145,8 +135,8 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     // sweep failure.
     let (drained, root_exited, watch_err) = if let Some(e) = take_forced_watch_error() {
         (false, false, Some(e))
-    } else if let Some(edge) = w.child().tree.drain_edge() {
-        match w.drain(&edge, grace).await {
+    } else if w.child().tree.drain_edge().is_some() {
+        match w.tree_drained(grace).await {
             Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
             // Not sufficient proof alone to skip the sweep (see the doc above) — fall back
             // to the fresh, non-blocking, zero-duration root probe described there.
@@ -283,5 +273,5 @@ pub(crate) async fn holders_only<W: Waits>(w: &W, skip: crate::containment::Skip
 }
 
 #[cfg(test)]
-#[path = "tree_tests.rs"]
-mod tree_tests;
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;
