@@ -149,7 +149,7 @@ impl Waitable for Scripted {
             Move::Recheck => Step::Recheck,
             Move::Wait => match self.source.exited()? {
                 Exit::Running(wait_for) => Step::Wait(wait_for),
-                Exit::Exited => unreachable!("the source answers Running"),
+                Exit::Exited | Exit::Recheck => unreachable!("the source answers Running"),
             },
             #[cfg(target_os = "linux")]
             Move::WaitFails => {

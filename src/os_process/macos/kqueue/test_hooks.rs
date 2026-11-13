@@ -11,7 +11,7 @@ type EveryRoundHook = Box<dyn FnMut(u32)>;
 thread_local! {
     static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
-    static FORCE_ESRCH_REGISTRATION: Cell<bool> = const { Cell::new(false) };
+    static FORCE_ESRCH_REGISTRATION: Cell<Option<Registration>> = const { Cell::new(None) };
     static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
@@ -39,15 +39,33 @@ pub(crate) fn take_events() -> Vec<(i16, u32)> {
     AWAIT_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
 }
 
-/// The next `await_reapable` on this thread sees its `EVFILT_PROC` registration answered `ESRCH`
-/// without calling `kevent`.
-pub(crate) fn force_proc_registration_esrch_once() -> ForcedOnce {
-    FORCE_ESRCH_REGISTRATION.with(|f| f.set(true));
-    ForcedOnce(|| FORCE_ESRCH_REGISTRATION.with(|f| f.set(false)))
+/// Which `EVFILT_PROC` registration a forced `ESRCH` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// The reap registration (`await_reapable`'s `register`), which `await_reapable` makes for a
+    /// wait and `MacChild::new` makes through `register_exit_events`.
+    Reap,
+    /// An exit watch's (`ExitWatch::proc_exit`): the process reads as exited, as one past
+    /// `P_REF_DEAD` does before it is a zombie.
+    ExitWatch,
 }
 
-pub(crate) fn take_forced_esrch_registration() -> bool {
-    FORCE_ESRCH_REGISTRATION.with(Cell::take)
+/// The next `EVFILT_PROC` registration of kind `which` on this thread is answered `ESRCH` without
+/// calling `kevent`. A registration of the other kind leaves it armed.
+pub(crate) fn force_proc_registration_esrch_once(which: Registration) -> ForcedOnce {
+    FORCE_ESRCH_REGISTRATION.with(|f| f.set(Some(which)));
+    ForcedOnce(|| FORCE_ESRCH_REGISTRATION.with(|f| f.set(None)))
+}
+
+/// Whether the registration of kind `which` is the forced one, which it then consumes.
+pub(crate) fn take_forced_esrch_registration(which: Registration) -> bool {
+    FORCE_ESRCH_REGISTRATION.with(|f| {
+        let forced = f.get() == Some(which);
+        if forced {
+            f.set(None);
+        }
+        forced
+    })
 }
 
 /// Run `hook` on the waiting thread just before the wait's next re-peek. The guard drops an
