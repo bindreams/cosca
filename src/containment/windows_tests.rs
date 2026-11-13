@@ -106,7 +106,9 @@ fn a_job_kill_the_os_refuses_waits_for_no_member() {
 
 /// The members are listed before `TerminateJobObject`, not after it: a member that has left the job's
 /// list by the time the kill runs is still named. The member is ended and reaped right before the kill,
-/// so the job's list is empty when the kill runs, whatever order the kernel signals a process in.
+/// so it is off the job's list when the kill runs, whatever order the kernel signals a process in.
+/// The member is `cmd /C more`, whose children (`more.com`, and the `conhost.exe` its console brings)
+/// join the job as `cmd` starts them, so the list holds the member among others.
 ///
 /// Mutant: the list is read after the kill.
 #[skuld::test]
@@ -133,10 +135,10 @@ fn a_job_lists_its_members_before_it_terminates_them() {
     let (sent, wait) = job.kill(None).split();
 
     sent.into_result().expect("the job's kill");
-    assert_eq!(
-        wait.members_for_test(),
-        [id],
-        "the member was named before the kill ended it"
+    assert!(
+        wait.members_for_test().contains(&id),
+        "the member was named before the kill ended it: {:?}",
+        wait.members_for_test()
     );
 }
 
