@@ -222,12 +222,12 @@ pub(crate) fn failed_after_teardown(cause: Error, behind_front: bool, torn_down:
 /// says, which `detail` and `attach_cleanup` add to (see [`Error::MayHaveStarted`]). `not_started`:
 /// the attach says the program never ran.
 ///
-/// A teardown that has nothing to report leaves that answer as it is. One that does (a child it
-/// could not end, which comes back, or a failure beside the cause) has nowhere to put it in a
-/// not-started error, which is the cause alone; the failure is then a [`MayHaveStarted`], like every
-/// other failed spawn's, whose cause still says the program did not run.
+/// A not-started attach failure is always [`NotStartedWithChild`]: its child never ran, so its
+/// teardown ([`tear_down_unexecuted`](super::held_teardown::tear_down_unexecuted)) hands nothing back,
+/// has no front to detail, and has said its own failures in the failed spawn's warn, which a
+/// not-started error, the cause alone, has no place for.
 ///
-/// [`MayHaveStarted`]: SpawnFailure::MayHaveStarted
+/// [`NotStartedWithChild`]: SpawnFailure::NotStartedWithChild
 #[cfg(target_os = "linux")]
 pub(crate) fn failed_attach(
     not_started: bool,
@@ -241,7 +241,11 @@ pub(crate) fn failed_attach(
         unreaped,
         cleanup,
     } = torn;
-    if not_started && unreaped.is_none() && cleanup.is_none() && detail.is_none() && attach_cleanup.is_none() {
+    if not_started {
+        debug_assert!(
+            unreaped.is_none() && detail.is_none() && attach_cleanup.is_none(),
+            "a child that never ran has nothing to hand back, detail or clean up after the attach"
+        );
         return SpawnFailure::NotStartedWithChild { cause, fate };
     }
     SpawnFailure::started(cause, fate, unreaped)

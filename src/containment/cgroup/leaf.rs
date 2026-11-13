@@ -1877,7 +1877,16 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Safety: ZERO is a valid buffer; procs_fd is valid (caller guarantees).
     let write = || unsafe { libc::write(procs_fd, ZERO.as_ptr().cast(), ZERO.len()) };
     #[cfg(test)]
-    let ret = forced.unwrap_or_else(write);
+    let ret = match forced {
+        // A forced `-errno`: the failed write the kernel would have answered with it.
+        Some(failed) if failed < -1 => {
+            // Safety: errno is this thread's own.
+            unsafe { *libc::__errno_location() = -failed as i32 };
+            -1
+        }
+        Some(ret) => ret,
+        None => write(),
+    };
     #[cfg(not(test))]
     let ret = write();
     // Read errno before `close`, which is free to clobber it.

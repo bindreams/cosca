@@ -1514,7 +1514,9 @@ fn attach_tree(
                         // removed without writing cgroup.kill.
                         Err(reason) => {
                             use crate::containment::cgroup::NotEntered;
-                            let path = leaf.path().display();
+                            let path = leaf.path().display().to_string();
+                            leaf.remove_unentered();
+                            let report = reason.report();
                             // The program never ran, so the spawn fails as one that did not start
                             // (the failed attach's teardown ends the child), when:
                             // - the child sent no report: its hook ends the child before `exec`
@@ -1524,31 +1526,40 @@ fn attach_tree(
                             //   before `exec` when it is not placed.
                             // A failed write under `BestEffort` is a child that went on to run
                             // in the process group set before the spawn: a degrade.
-                            let not_started = match reason.report() {
-                                NotEntered::NotReported => Some(Error::Containment {
-                                    detail: format!(
-                                        "cgroup v2: the child did not report its placement in leaf cgroup \
+                            let detail = match report {
+                                NotEntered::NotReported => Some(format!(
+                                    "cgroup v2: the child did not report its placement in leaf cgroup \
+                                     {path}, so the program did not run"
+                                )),
+                                NotEntered::WriteFailed(_) if prepared.mode.is_some_and(ContainMode::is_strict) => {
+                                    Some(format!(
+                                        "cgroup v2: the child could not be placed in its leaf cgroup \
                                          {path}, so the program did not run"
-                                    ),
-                                    source: None,
-                                }),
-                                NotEntered::WriteFailed(errno) if prepared.mode.is_some_and(ContainMode::is_strict) => {
-                                    Some(Error::Containment {
-                                        detail: format!(
-                                            "cgroup v2: the child could not be placed in its leaf cgroup \
-                                             {path}, so the program did not run: {reason}"
-                                        ),
-                                        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
-                                    })
+                                    ))
                                 }
                                 NotEntered::WriteFailed(_) => None,
                             };
-                            let Some(cause) = not_started else {
+                            let Some(detail) = detail else {
                                 crate::containment::cgroup::log_degrade(&reason);
-                                leaf.remove_unentered();
                                 return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
                             };
-                            leaf.remove_unentered();
+                            // What was found of the child and its leaf (`cgroup.procs`, its state)
+                            // is what a reader debugging a refused placement needs: said at `debug`.
+                            log::debug!(
+                                "cgroup v2: the program did not run: {report}",
+                                report = crate::error::Report(&reason)
+                            );
+                            let cause = match report {
+                                // The child's own report is the proof; there is no cause beneath it.
+                                NotEntered::NotReported => Error::Containment { detail, source: None },
+                                // The write's errno is the cause, and the failed diagnosis read, if
+                                // there was one, a second cause beside it.
+                                NotEntered::WriteFailed(errno) => Error::Containment {
+                                    detail,
+                                    source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+                                }
+                                .with_peers(reason.into_read_failure().map(Error::io_cause)),
+                            };
                             return Err(AttachFailure {
                                 cause,
                                 cleanup: None,

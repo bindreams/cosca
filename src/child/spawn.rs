@@ -904,23 +904,33 @@ fn spawn_reported(
             // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
             // neither kills nor reaps). On Linux a front is the exception, and a failed attach has
             // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`).
+            // dying, and is waited for (`tear_down_held`). A child the attach says never ran the
+            // program (its hook ended it before `exec`) is no exception: a front among them never
+            // ran its `sudo`, so it is killed and reaped like any other, with no front detail.
             #[cfg(target_os = "linux")]
-            let (detail, torn) = held_teardown::tear_down_held(
-                owned,
-                held_teardown::HeldTeardown {
-                    front,
-                    id: id_read,
-                    subtree: subtree.as_ref(),
-                    disposition: crate::child::owned::teardown::Disposition::HandBack,
-                    policy,
-                },
-                &mut why,
-            );
-            // A child the leaf's refusal stopped before `exec` never ran the program: the spawn says
-            // so, as for every other child the spawn ends before it ran, unless its teardown has
-            // something to hand back or report. What failed in the attach's own cleanup comes first:
-            // it happened before the teardown.
+            let (detail, torn) = if not_started {
+                (
+                    None,
+                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why),
+                )
+            } else {
+                held_teardown::tear_down_held(
+                    owned,
+                    held_teardown::HeldTeardown {
+                        front,
+                        id: id_read,
+                        subtree: subtree.as_ref(),
+                        disposition: crate::child::owned::teardown::Disposition::HandBack,
+                        policy,
+                    },
+                    &mut why,
+                )
+            };
+            // A child that never ran the program is a not-started failure, as every other child the
+            // spawn ends before it ran: a not-started error is its cause and the child's fate, so
+            // the teardown's own failures were said in its warn. Any other failed attach may have
+            // started the program; what failed in its own cleanup comes first, as it happened
+            // before the teardown.
             #[cfg(target_os = "linux")]
             return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
             #[cfg(windows)]

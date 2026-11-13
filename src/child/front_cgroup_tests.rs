@@ -1914,6 +1914,34 @@ fn cgroup_a_front_its_leaf_did_not_take_is_handed_back_by_a_failed_identity_chec
     assert_left_unsignalled(&detail, pid, handed_back);
 }
 
+/// An elevated `Strongest` spawn whose placement is refused answers not started, as a child that is
+/// not a front does: the front never ran `sudo`, so it is killed and reaped, with no front detail
+/// and nothing handed back.
+///
+/// Mutant: a not-started attach failure of a front is torn down as a front and answers
+/// `MayHaveStarted`.
+#[skuld::test]
+fn cgroup_a_front_whose_placement_is_refused_answers_not_started(#[fixture(cgroup)] _group: &Group) {
+    let mut cmd = in_cgroup(cat());
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.set_elevation_report(sudo_report());
+    crate::containment::cgroup::fault::set_force_placement_write_result(0);
+
+    let spawned = crate::child::spawn::spawn(&mut cmd);
+    // The forked child took its own copy; this thread's stays armed for the next test.
+    crate::containment::cgroup::fault::take_force_placement_write_result();
+
+    let Err(failure) = spawned else {
+        panic!("a refused placement must fail a Strongest spawn");
+    };
+    let (error, fate) = failure.expect_not_started_with_child();
+    assert!(matches!(error, crate::error::Error::Containment { .. }), "{error:?}");
+    assert!(
+        !matches!(fate, crate::error::ChildFate::Running { .. }),
+        "the front was killed and reaped: {fate:?}"
+    );
+}
+
 /// A front spawn that cannot capture its leaf's subtree (the cgroup id read fails) says so at
 /// `debug`, with the cause: a failed spawn's teardown could not place the front. Mutant: "the
 /// error is dropped".

@@ -247,6 +247,21 @@ impl NotPlaced {
     }
 }
 
+impl NotPlaced {
+    /// The error of the `cgroup.procs` read that failed, if it did: the diagnosis's own failure,
+    /// which is not why the child is not in the leaf.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the linux-gated attach")
+    )]
+    pub(crate) fn into_read_failure(self) -> Option<io::Error> {
+        match self {
+            NotPlaced::Absent { .. } => None,
+            NotPlaced::Unreadable { source, .. } => Some(source),
+        }
+    }
+}
+
 impl fmt::Display for NotPlaced {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

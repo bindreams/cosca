@@ -338,54 +338,29 @@ fn a_not_started_attach_with_a_clean_teardown_stays_not_started() {
     );
 }
 
-/// A refused child whose teardown could not end it comes back with its handle, its cleanup and its
-/// detail beside the cause, as every other failed spawn's does, and the cause still says the program
-/// did not run.
+/// A failed attach that says the program never ran is a not-started failure whatever its teardown
+/// left: the child never ran, so there is nothing to hand back, and the teardown's own failures went
+/// into the failed spawn's warn.
 ///
-/// Mutants: the not-started answer drops `unreaped`, `cleanup`, `detail` or `attach_cleanup`.
+/// Mutant: `failed_attach` answers `MayHaveStarted` when the teardown has a failure or leaves the
+/// child running.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_not_started_attach_whose_teardown_left_something_keeps_it() {
+fn a_not_started_attach_is_not_started_whatever_the_teardown_left() {
     let id = crate::identity::ProcessId::current();
     let running = ChildFate::Running { id: Some(id) };
-    let cleanup = |what: &str| crate::error::Failures::collect([std::sync::Arc::new(io(what))]);
-    let torn = |unreaped: bool, teardown: Option<crate::error::Failures>| Torn {
+    let torn = Torn {
         fate: running,
-        unreaped: unreaped.then(|| *exited_unreaped(id)),
-        cleanup: teardown,
+        unreaped: None,
+        cleanup: crate::error::Failures::collect([std::sync::Arc::new(io("teardown"))]),
     };
-    // Each way a teardown has something to report, alone.
-    let cases = [
-        ("unreaped", torn(true, None), None, None),
-        ("cleanup", torn(false, cleanup("teardown")), None, None),
-        ("detail", torn(false, None), Some("a detail".to_owned()), None),
-        ("attach cleanup", torn(false, None), None, cleanup("attach")),
-    ];
-    for (what, torn, detail, attach_cleanup) in cases {
-        let failure = super::failed_attach(true, io("refused"), detail, attach_cleanup, torn);
 
-        let error = Error::from(failure);
-        let Error::MayHaveStarted {
-            unreaped,
-            cleanup,
-            detail,
-            source,
-            ..
-        } = error
-        else {
-            panic!("{what}: a teardown that left something is `MayHaveStarted`, got {error:?}");
-        };
-        assert!(
-            matches!(*source, Error::Io(ref e) if e.to_string() == "refused"),
-            "{what}"
-        );
-        let carried = match what {
-            "unreaped" => unreaped.is_some_and(|child| child.pid() == Some(id.pid())),
-            "detail" => detail.as_deref() == Some("a detail"),
-            _ => cleanup.is_some_and(|failures| failures.iter().len() == 1),
-        };
-        assert!(carried, "{what}: what the teardown left did not reach the caller");
-    }
+    let failure = super::failed_attach(true, io("refused"), None, None, torn);
+
+    assert!(
+        matches!(failure, SpawnFailure::NotStartedWithChild { fate, .. } if fate == running),
+        "{failure:?}"
+    );
 }
 
 /// A failed attach that did not say the program never ran is `MayHaveStarted`, a clean teardown or

@@ -208,7 +208,10 @@ pub enum ContainMode {
     ///   offered, every other step after that fails the spawn: making the leaf, opening its
     ///   `cgroup.procs`, its report channel, its inotify watch, and the child's own placement
     ///   write, whose failure stops the child before `exec`. The offer is read again at every
-    ///   spawn; none is remembered.
+    ///   spawn; none is remembered. The inspection asks the kernel with `faccessat2`; a container
+    ///   whose seccomp profile refuses it with `EPERM` (older container runtimes) cannot answer, so
+    ///   a `Strongest` spawn there fails with [`Error::Containment`] and
+    ///   [`BestEffort`](ContainMode::BestEffort) serves it.
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and degrades when it fails.
@@ -225,9 +228,17 @@ pub enum ContainMode {
     /// not, yet), and [`Child::containment`](crate::Child::containment) reports what the spawn
     /// got.
     ///
-    /// On Linux, a child that sends no report of its placement in the leaf never ran its program
-    /// (its hook ends it before `exec`), so that spawn fails with [`Error::Containment`], as under
-    /// `Strongest`, instead of handing back a child that never ran.
+    /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
+    ///   leaf's directory, `cgroup.procs`, report channel or inotify watch), or a child whose
+    ///   placement write failed, degrades to the process group the spawn set up. `BestEffort` does
+    ///   not inspect the own cgroup first, so a seccomp profile that refuses `faccessat2` does not
+    ///   stop it. A child that sends no report of its placement never ran its program (its hook ends
+    ///   it before `exec`), so that spawn fails with [`Error::Containment`], as under `Strongest`,
+    ///   instead of handing back a child that never ran.
+    /// - **macOS:** a failed install of the fd marker degrades to the process group.
+    ///
+    /// A host whose new leaf has no `cgroup.kill` (a kernel before Linux 5.14) gets a process
+    /// group under `Strongest` too.
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
     BestEffort,

@@ -593,7 +593,9 @@ pub(crate) fn report_channel_failure_armed() -> bool {
 }
 
 /// Make the NEXT placement write return `ret` without writing — 0, which no file a test can open
-/// returns for a one-byte write. A child forked from this thread inherits the flag and takes it.
+/// returns for a one-byte write, or `-errno`, a write that failed with that errno (`EBUSY`, which no
+/// file a test can open fails with on demand). A child forked from this thread inherits the flag and
+/// takes it.
 pub(crate) fn set_force_placement_write_result(ret: isize) {
     FORCE_PLACEMENT_WRITE_RESULT.with(|f| f.set(Some(ret)));
 }

@@ -2436,8 +2436,12 @@ fn decide_for(
             // no-op. The slot's pipe lives as long as `leaf`.
             _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
         }
-        // SAFETY: the slot's pipe lives as long as `leaf`.
-        ChildReport::WriteFailedWith(errno) => unsafe { leaf.placement_slot().report_write_failed_for_test(errno) },
+        ChildReport::WriteFailedWith(errno) => {
+            crate::containment::cgroup::fault::set_force_placement_write_result(-(errno as isize));
+            // SAFETY: fd -1 is never writable, and the forced result stands for its write; closing -1
+            // is a no-op. The slot's pipe lives as long as `leaf`.
+            _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+        }
         ChildReport::NotReported => {}
     }
     let prepared = super::Prepared {
@@ -2527,19 +2531,23 @@ fn a_failed_write_degrades_a_best_effort_spawn_and_removes_the_leaf() {
 }
 
 /// The same child under `Strongest`: the attach fails as a spawn that did not start (the program
-/// never ran: the child's report proves it), the error names the leaf, says what was found of the
-/// child, and keeps the placement write's errno as its source, and the empty leaf is removed. The
-/// failed attach's teardown ends the child.
+/// never ran: the child's report proves it), the error names the leaf and says this layer only, and
+/// keeps the placement write's errno as its source, with the unreadable `cgroup.procs` of the diagnosis
+/// beside it as a second cause, and the empty leaf is removed. The diagnosis itself goes to the debug
+/// log. The failed attach's teardown ends the child.
 ///
-/// Mutants: the source is the whole diagnosis as one message, so the errno is not on the chain;
-/// the failure is not a not-started one.
+/// Mutants: the detail carries the OS words or the errno; the errno is not the first cause; the
+/// failed diagnosis read is dropped; the diagnosis is not logged; the failure is not a not-started
+/// one.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
+    crate::log_capture::install();
     for errno in [libc::EBADF, libc::EBUSY] {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-decision-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
+        let mark = crate::log_capture::mark();
 
         let failure = decide_for(
             crate::containment::ContainMode::Strongest,
@@ -2549,21 +2557,36 @@ fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
         .expect_err("a Strongest root the leaf did not take fails its attach");
 
         assert!(failure.not_started, "the program never ran: {failure:?}");
-        let crate::error::Error::Containment { detail, source } = &failure.cause else {
+        let crate::error::Error::Containment { detail, .. } = &failure.cause else {
             panic!("{failure:?}");
         };
-        let placed = format!(
-            "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run: ",
-            leaf_path.display()
+        assert_eq!(
+            detail,
+            &format!(
+                "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run",
+                leaf_path.display()
+            ),
+            "the detail says only this layer: the errno and its words are the source's"
         );
-        assert!(detail.starts_with(&placed), "{detail:?}");
-        assert!(
-            detail.contains(&format!("errno {errno}")),
-            "the detail says what the child reported: {detail:?}"
-        );
-        let source = source.as_deref().expect("the write's errno is the source");
-        assert!(matches!(source, crate::error::Error::Io(e) if e.raw_os_error() == Some(errno)));
         assert_eq!(crate::error::first_os_code(&failure.cause), Some(errno));
+        // The leaf has no `cgroup.procs`, so the diagnosis read failed too: its error is a second
+        // cause beside the write's, not lost.
+        let causes: Vec<Option<i32>> = failure
+            .cause
+            .failures_below()
+            .into_iter()
+            .map(|cause| match cause {
+                crate::error::Error::Io(e) => e.raw_os_error(),
+                other => panic!("a cause that is not an OS error: {other:?}"),
+            })
+            .collect();
+        assert_eq!(causes, [Some(errno), Some(libc::ENOENT)]);
+        let logs = crate::log_capture::records_since_on_current_thread(mark, "is not in the leaf cgroup");
+        assert!(
+            logs.iter()
+                .any(|(level, said)| *level == log::Level::Debug && said.contains("could not be read")),
+            "the diagnosis is logged at debug: {logs:?}"
+        );
         assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
     }
 }
