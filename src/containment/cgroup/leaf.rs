@@ -825,8 +825,8 @@ impl CgroupLeaf {
     }
 
     /// The one subtree a pass over the listed members places each of them in. Where the leaf's id
-    /// cannot be read, the pidfd route places a member only by an id it was told is under the leaf
-    /// (a listing's, see [`Subtree::with_nested`]); any other is placed through `/proc`.
+    /// cannot be read, the pidfd route places a member only by the id of a cgroup the listing's walk
+    /// visited; `/proc` places any other.
     fn listing_subtree(&self) -> Subtree {
         self.subtree_with(match self.id() {
             Ok(id) => Some(id),
@@ -867,10 +867,8 @@ impl CgroupLeaf {
             }
         };
         // `cgroup.kill` reaches the cgroups under the leaf too, so their members are listed as well.
-        let (nested, ids, failure) = self.dir.nested_procs();
-        // The walk that listed them also found where each cgroup under the leaf is, so a member in one
-        // is placed without a walk of its own.
-        let subtree = self.listing_subtree().with_nested(ids);
+        let (nested, failure) = self.dir.nested_procs();
+        let subtree = self.listing_subtree();
         let (mut members, mut unobserved) = (Vec::new(), Vec::new());
         if let Some(e) = failure {
             unobserved.push(Error::Unassessable {

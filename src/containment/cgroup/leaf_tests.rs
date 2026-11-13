@@ -546,7 +546,6 @@ fn a_member_placed_through_proc_is_listed_with_no_cgroup_id(#[fixture(cgroup)] _
     );
 }
 
-/// The id of the cgroup directory `dir`.
 #[cfg(target_os = "linux")]
 fn id_of(dir: &std::path::Path) -> u64 {
     crate::containment::cgroup::cgroup_id(
@@ -568,6 +567,17 @@ fn count_walks() -> (
     std::rc::Rc<std::cell::Cell<usize>>,
     crate::containment::cgroup::fault::BeforeWalkOpen,
 ) {
+    count_walks_and(|_| {})
+}
+
+/// [`count_walks`], also running `then` with the path of each cgroup a walk is about to open.
+#[cfg(target_os = "linux")]
+fn count_walks_and(
+    mut then: impl FnMut(&std::path::Path) + 'static,
+) -> (
+    std::rc::Rc<std::cell::Cell<usize>>,
+    crate::containment::cgroup::fault::BeforeWalkOpen,
+) {
     let walks = std::rc::Rc::new(std::cell::Cell::new(0));
     let guard = crate::containment::cgroup::fault::set_before_walk_open({
         let walks = walks.clone();
@@ -575,14 +585,14 @@ fn count_walks() -> (
             if at == std::path::Path::new(".") {
                 walks.set(walks.get() + 1);
             }
+            then(at);
         }
     });
     (walks, guard)
 }
 
 /// The members of the cgroups under a leaf are placed by the listing's own walk of them, so the
-/// listing walks the leaf's descendants once, for that listing, and not again for each member. Three
-/// members in a cgroup under the leaf, whose pidfds read that cgroup's id.
+/// listing walks the leaf's descendants once, for that listing, and not again for each member.
 ///
 /// Mutant: each listed member of a nested cgroup is placed by a walk of the leaf's descendants.
 #[cfg(target_os = "linux")]
@@ -616,11 +626,7 @@ fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(
         named, expected,
         "every member is named, placed by the nested cgroup's id"
     );
-    assert_eq!(
-        walks.get(),
-        1,
-        "the listing of the cgroups under the leaf is the one walk of its descendants"
-    );
+    assert_eq!(walks.get(), 1, "one walk");
 }
 
 /// A member the leaf's own `cgroup.procs` lists, that moved into a cgroup under the leaf before it was
@@ -654,13 +660,17 @@ fn a_member_that_moved_into_a_cgroup_under_the_leaf_is_placed_without_a_walk(#[f
     assert_eq!(walks.get(), 1, "only the listing's own walk");
 }
 
-/// A member of a cgroup under the leaf whose id the listing cannot read is placed through `/proc`,
-/// with no walk of its own, which would read the same id and fail at it too.
+/// A member of a cgroup whose id the listing cannot read is not in the listing's set, so a walk
+/// looks for it: that walk fails at the same cgroup, and `/proc` places the member. One walk of its
+/// own, besides the listing's.
 ///
-/// Mutant: a member whose id the listing's walk did not find is placed by a walk.
+/// Mutant: a member whose id the listing's set lacks is placed by `/proc` with no walk, or a failed
+/// walk fails the member.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_member_of_a_cgroup_whose_id_cannot_be_read_is_placed_without_a_walk(#[fixture(cgroup)] _group: &Group) {
+fn a_member_of_a_cgroup_whose_id_cannot_be_read_is_placed_through_proc_after_one_walk(
+    #[fixture(cgroup)] _group: &Group,
+) {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::WalkStep;
 
@@ -682,6 +692,163 @@ fn a_member_of_a_cgroup_whose_id_cannot_be_read_is_placed_without_a_walk(#[fixtu
         [(id, None)],
         "placed through /proc, so no cgroup id placed it"
     );
+    assert_eq!(walks.get(), 2, "the listing's walk and the member's own");
+}
+
+/// A cgroup under the leaf whose id cannot be read does not cost the members of the others a walk:
+/// a member of a readable cgroup is placed by its id, with the listing's walk alone.
+///
+/// Mutant: an unreadable id anywhere under the leaf sends every member to a walk or to `/proc`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_of_a_readable_cgroup_is_placed_without_a_walk_beside_an_unreadable_one(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::WalkStep;
+
+    let leaf = lane_leaf();
+    let readable = leaf.leaf_path.join("readable");
+    std::fs::create_dir(&readable).expect("make a cgroup under the leaf");
+    std::fs::create_dir(readable.join("unreadable")).expect("make a cgroup under that");
+    let readable_id = id_of(&readable);
+    let (member, id) = cat_member();
+    place(&member, &readable);
+    let _read = fault::force_pidfd_cgroup_id(readable_id);
+    let _walk = fault::fail_walk_step("./readable/unreadable", WalkStep::Id, libc::EIO);
+    let (walks, _count) = count_walks();
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, Some(readable_id))],
+        "placed by the readable cgroup's id"
+    );
+    assert_eq!(walks.get(), 1, "only the listing's own walk");
+}
+
+/// A member two cgroups down is placed by its cgroup's id, with the listing's walk alone.
+///
+/// Mutant: the ids recorded are those of the leaf's children alone.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_two_cgroups_down_is_placed_without_a_walk(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
+    let leaf = lane_leaf();
+    let deeper = leaf.leaf_path.join("nested").join("deeper");
+    std::fs::create_dir_all(&deeper).expect("make two cgroups under the leaf");
+    let deeper_id = id_of(&deeper);
+    let (member, id) = cat_member();
+    place(&member, &deeper);
+    let _read = fault::force_pidfd_cgroup_id(deeper_id);
+    let (walks, _count) = count_walks();
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, Some(deeper_id))],
+        "placed by the id of the cgroup it is in"
+    );
+    assert_eq!(walks.get(), 1, "only the listing's own walk");
+}
+
+/// A member listed in the leaf's own `cgroup.procs`, whose pidfd reads an id the listing's set lacks
+/// (a cgroup made under the leaf after the listing's walk passed the leaf), takes exactly one walk,
+/// which finds it under the leaf: it is listed, placed by that id.
+///
+/// Mutant: a member whose id the set lacks is not looked for under the leaf, or looked for twice.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_in_a_cgroup_made_after_the_listing_is_placed_by_one_walk(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault::{self, ForcedPidfdCgroupId};
+
+    let leaf = lane_leaf();
+    std::fs::create_dir(leaf.leaf_path.join("first")).expect("make a cgroup under the leaf");
+    let (member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    // Once the listing has passed the leaf, a cgroup appears in it, which the pidfd reads.
+    let late = leaf.leaf_path.join("late");
+    let made: Rc<RefCell<Option<(ForcedPidfdCgroupId, u64)>>> = Rc::new(RefCell::new(None));
+    let (walks, _count) = count_walks_and({
+        let made = made.clone();
+        move |at| {
+            if at == std::path::Path::new("./first") && made.borrow().is_none() {
+                std::fs::create_dir(&late).expect("make a cgroup under the leaf mid-listing");
+                let late_id = id_of(&late);
+                *made.borrow_mut() = Some((fault::force_pidfd_cgroup_id(late_id), late_id));
+            }
+        }
+    });
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    let late_id = made.borrow().as_ref().expect("the cgroup was made mid-listing").1;
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, Some(late_id))],
+        "found under the leaf by the walk"
+    );
+    assert_eq!(walks.get(), 2, "the listing's walk and the member's own, one");
+}
+
+/// The same member, whose pidfd reads the id of a cgroup outside the leaf, takes the one walk, which
+/// finds it nowhere: it is no member, and is not listed.
+///
+/// Mutant: a member whose id the set lacks is listed without a walk.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_in_a_cgroup_outside_the_leaf_is_not_listed_after_one_walk(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
+    let leaf = lane_leaf();
+    std::fs::create_dir(leaf.leaf_path.join("first")).expect("make a cgroup under the leaf");
+    let (member, _id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let outside = id_of(leaf.leaf_path.parent().expect("a leaf has a parent cgroup"));
+    let _read = fault::force_pidfd_cgroup_id(outside);
+    let (walks, _count) = count_walks();
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert!(listed.is_empty(), "outside the leaf: {listed:?}");
+    assert_eq!(walks.get(), 2, "the listing's walk and the member's own, one");
+}
+
+/// A member the leaf's `cgroup.procs` lists that another process then moves into a cgroup under the
+/// leaf, before the listing pins it, is listed once, and takes no walk of its own: the listing's walk
+/// had visited that cgroup. A real move, with no id forced.
+///
+/// Mutant: a member that moved into a cgroup under the leaf is dropped or walked for.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_moved_into_a_cgroup_under_the_leaf_before_it_is_pinned_is_listed(#[fixture(cgroup)] _group: &Group) {
+    let leaf = lane_leaf();
+    let nested = leaf.leaf_path.join("nested");
+    std::fs::create_dir_all(nested.join("deeper")).expect("make two cgroups under the leaf");
+    let (member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    // The listing has read the leaf's `cgroup.procs` and `nested`'s, and is about to open `deeper`.
+    let (walks, _count) = count_walks_and({
+        let pid = member.0.id().to_string();
+        move |at| {
+            if at == std::path::Path::new("./nested/deeper") {
+                std::fs::write(nested.join("cgroup.procs"), &pid).expect("move the member into nested");
+            }
+        }
+    });
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(listed.iter().map(|m| m.id).collect::<Vec<_>>(), [id]);
     assert_eq!(walks.get(), 1, "only the listing's own walk");
 }
 
