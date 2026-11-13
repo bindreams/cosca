@@ -10,7 +10,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
-use crate::identity::ProcessId;
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::{Exit, OsProcess, WaitFor};
 use crate::signal::{via_audit_token, Sent, Sig};
@@ -21,10 +20,6 @@ use crate::wait::macos::{drain_exit_events, register_exit_events, OnTracer, Trac
 #[derive(Debug)]
 pub(crate) struct MacChild {
     pid: u32,
-    /// The child's identity, when the spawn could read it ([`Child::id`](crate::Child::id)). With
-    /// one, the exit is confirmed by what [`ProcessId::is_alive`] reads; without, by the unique-id
-    /// read `exited_unannounced` makes.
-    id: Option<ProcessId>,
     /// The child's unique id: never reused, so it tells the child from a process that took its pid.
     unique: u64,
     /// Armed for the child's exit and never read: [`OsProcess::exited`], and `try_reap`'s "an exit
@@ -38,19 +33,16 @@ pub(crate) struct MacChild {
 }
 
 impl MacChild {
-    /// Take over the child `pid`, whose unique id the spawn read as `unique` and whose identity it
-    /// read as `id`, if it could. A pid already past registration (`ESRCH`) is not a failure: the
-    /// child has exited, and `exited` says so. Any other refusal is, and the caller tears the child
-    /// down.
-    pub(crate) fn new(pid: u32, unique: u64, id: Option<ProcessId>) -> Result<MacChild, Error> {
-        debug_assert!(id.is_none_or(|id| id.pid() == pid), "the identity must be the child's");
+    /// Take over the child `pid`, whose unique id the spawn read as `unique`. A pid already past
+    /// registration (`ESRCH`) is not a failure: the child has exited, and `exited` says so. Any other
+    /// refusal is, and the caller tears the child down.
+    pub(crate) fn new(pid: u32, unique: u64) -> Result<MacChild, Error> {
         let exit = ExitWatch::proc_exit(pid)?;
         let reap = Kqueue::new()?;
         // Whether the registration got `ESRCH` is no news here: `exit` read the same.
         register_exit_events(&reap, pid).map_err(Error::Io)?;
         Ok(MacChild {
             pid,
-            id,
             unique,
             exit,
             reap,
@@ -96,7 +88,7 @@ impl OsProcess for MacChild {
     /// see [`ExitWatch::look`]. The reap ([`try_reap`](OsChild::try_reap)) does not come through
     /// here: it reads the watch raw and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        self.exit.look(self.pid, self.unique, self.id.as_ref())
+        self.exit.look(self.pid, self.unique)
     }
 }
 

@@ -14,7 +14,7 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{has_exited, uniq_info, Existence, Liveness, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{has_exited, uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -209,8 +209,7 @@ impl OsProcess for MacProcess {
         }
     }
 
-    /// `Exited` once the process is a zombie or gone, as [`ProcessId::is_alive`] reads it: see
-    /// [`ExitWatch::look`].
+    /// `Exited` once the process is a zombie or gone: see [`ExitWatch::look`].
     fn exited(&self) -> Result<Exit<'_>, Error> {
         // Two threads that look first may each arm a watch; one is kept and the other closed.
         let watch = match self.watch.get() {
@@ -220,7 +219,7 @@ impl OsProcess for MacProcess {
                 self.watch.get_or_init(|| armed)
             }
         };
-        watch.look(self.id.pid(), self.unique, Some(&self.id))
+        watch.look(self.id.pid(), self.unique)
     }
 }
 
@@ -280,38 +279,29 @@ impl ExitWatch {
         crate::os_process::poll::is_readable(self.kq.as_fd()).map_err(Error::Io)
     }
 
-    /// One look at the process `pid` (unique id `unique`, identity `id` when it has one), which this
-    /// watch is armed for: the answer both [`MacProcess`] and [`MacChild`](child::MacChild) give for
-    /// [`OsProcess::exited`].
+    /// One look at the process `unique` names at `pid`, which this watch is armed for: the answer
+    /// both [`MacProcess`] and [`MacChild`](child::MacChild) give for [`OsProcess::exited`].
     ///
     /// The watch fires early: `NOTE_EXIT` precedes `p_stat = SZOMB`, and a pid past `P_REF_DEAD`
-    /// refuses registration before either. A fired watch is `Exited` only once the process reads
-    /// as exited: by [`ProcessId::is_alive`] when it has an identity, else (a child the spawn could
-    /// not read an identity for) by the unique-id read `OsChild::exited_unannounced` makes. `Alive`
-    /// is `Recheck`, which the driver's uncapped backoff re-reads. A read that is refused is
-    /// `Unassessable`, never `Exited`; an unfired watch reads nothing.
-    pub(crate) fn look(&self, pid: u32, unique: u64, id: Option<&ProcessId>) -> Result<Exit<'_>, Error> {
+    /// refuses registration before either. A fired watch is `Exited` only once the process is a
+    /// zombie or gone (`has_exited`, which keys on the unique id: a pid another process holds is
+    /// gone), the state from which [`ProcessId::is_alive`] never reads `Alive`; until then it is
+    /// `Recheck`, which the driver's uncapped backoff re-reads. A refused read is `Unassessable`
+    /// with the errno as its source, never `Exited`; an unfired watch reads nothing.
+    pub(crate) fn look(&self, pid: u32, unique: u64) -> Result<Exit<'_>, Error> {
         if !self.exited()? {
             return Ok(Exit::Running(WaitFor::Readable(self.as_fd())));
         }
-        let refused = |source| Error::Unassessable {
-            detail: format!(
-                "pid {pid} has exited, but its state could not be read to show the exit is complete; \
-                 {EXIT_CONSEQUENCE}"
-            ),
-            source,
-        };
-        match id {
-            Some(id) => match id.is_alive() {
-                Liveness::Dead => Ok(Exit::Exited),
-                Liveness::Alive => Ok(Exit::Recheck),
-                Liveness::Unknown => Err(refused(None)),
-            },
-            None => match has_exited(pid, unique, ReadPurpose::Running) {
-                Ok(true) => Ok(Exit::Exited),
-                Ok(false) => Ok(Exit::Recheck),
-                Err(errno) => Err(refused(Some(Error::io_cause(io::Error::from_raw_os_error(errno))))),
-            },
+        match has_exited(pid, unique, ReadPurpose::Exit) {
+            Ok(true) => Ok(Exit::Exited),
+            Ok(false) => Ok(Exit::Recheck),
+            Err(errno) => Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid} has exited, but its state could not be read to show the exit is complete; \
+                     {EXIT_CONSEQUENCE}"
+                ),
+                source: Some(Error::io_cause(io::Error::from_raw_os_error(errno))),
+            }),
         }
     }
 

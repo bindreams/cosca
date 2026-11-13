@@ -283,8 +283,7 @@ impl OsChild for SharedMac {
 /// The child `pid`, whose unique id is `unique`, watched through a fresh [`MacChild`]: an
 /// `OwnedChild` over it, which reaps the child, and the handle the round hooks read.
 pub(super) fn watch(pid: u32, unique: u64) -> (OwnedChild, Arc<MacChild>) {
-    let id = crate::identity::ProcessId::of(pid).found();
-    let mac = Arc::new(MacChild::new(pid, unique, id).expect("watch the child"));
+    let mac = Arc::new(MacChild::new(pid, unique).expect("watch the child"));
     (OwnedChild::new(Box::new(SharedMac(Arc::clone(&mac)))), mac)
 }
 
@@ -775,4 +774,20 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     drop(forced);
     assert!(status.success(), "{status:?}");
     exit_seams::assert_peeks_exhausted();
+}
+
+/// A child whose exit watch has fired and whose confirming read is refused is `Dead` when the reap
+/// peek shows its exit record: `liveness` does not fail where the record answers, as it did not
+/// before the watch was confirmed by a read.
+///
+/// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek.
+#[skuld::test]
+fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
+    assert!(
+        matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Dead)),
+        "the exit record is visible whatever the confirming read says"
+    );
 }

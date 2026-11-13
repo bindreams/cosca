@@ -275,8 +275,7 @@ impl Child {
     /// This child's stable identity (see [`crate::identity::ProcessId`]), or `None` when the OS
     /// refused to report it at spawn (below Linux 6.9 with no usable `/proc`, or a refused query on
     /// another OS). Such a child is otherwise a child like any other: [`pid`](Self::pid), `wait`,
-    /// `kill` and the drop go through its handle (on macOS, an exit is then confirmed by the child's
-    /// unique-id read, not by [`ProcessId::is_alive`]). A containment that names its tree by the root's
+    /// `kill` and the drop go through its handle. A containment that names its tree by the root's
     /// identity (a tree walk, the macOS fd marker) cannot be had without one, and the spawn fails.
     pub fn id(&self) -> Option<ProcessId> {
         self.id
@@ -645,9 +644,9 @@ impl Child {
     /// the root's pid checks each process it signals by its identity.
     ///
     /// **`Ok` means every member the kill reached has exited**, and so has the root once its kill
-    /// landed: the call waits for them, with no deadline. "Exited" is the state
-    /// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive) reads as `Dead`: on macOS a zombie or gone,
-    /// not merely a fired exit edge. What it waits on is what its mechanism's
+    /// landed: the call waits for them, with no deadline. On macOS "exited" is a zombie or gone, not
+    /// merely a fired exit edge, so [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive) never reads
+    /// `Alive` for a member afterwards. What it waits on is what its mechanism's
     /// kill reached, and a member forked after the kill's listing is not seen. On a cgroup leaf, a
     /// member another process moves across the leaf's boundary while the call runs is a stated
     /// limit, in both directions. A member found outside the leaf after the kill is taken to have

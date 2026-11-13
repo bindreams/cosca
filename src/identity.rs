@@ -626,7 +626,8 @@ impl ProcessId {
     /// before it is marked a zombie, which is the state this reads. So `Alive` is briefly
     /// reachable for a process that has already exited; Linux and Windows signal only after their
     /// equivalent transition. cosca's own waits ([`Process::wait`](crate::Process::wait),
-    /// `kill_tree`) return only once this reads `Dead`. Confirm a process is finished after any
+    /// `kill_tree`) return only once the process is a zombie or gone, so this never reads `Alive`
+    /// after one. Confirm a process is finished after any
     /// other exit event by reaping it, or by `waitid(WEXITED | WNOWAIT)` — never by asking this.
     pub fn is_alive(&self) -> Liveness {
         self.is_alive_with(&HostKernel)

@@ -42,8 +42,7 @@ pub(crate) fn take_events() -> Vec<(i16, u32)> {
 /// Which `EVFILT_PROC` registration a forced `ESRCH` is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Registration {
-    /// The reap kqueue's: `await_reapable`'s, and the one a [`MacChild`](super::super::child::MacChild)
-    /// makes.
+    /// `await_reapable`'s.
     Reap,
     /// An exit watch's (`ExitWatch::proc_exit`): the process reads as exited, as one past
     /// `P_REF_DEAD` does before it is a zombie.
