@@ -1,6 +1,6 @@
 //! The grandchild pid report of the `spawn-grandchild*` testbin roots.
 //!
-//! A root started with [`GC_PID_ADDR_ENV`] connects to that address (waiting for the accept ack,
+//! A root started with [`GC_PID_ADDR_ENV`](super::GC_PID_ADDR_ENV) connects to that address (waiting for the accept ack,
 //! like any control connection), then spawns its grandchild, writes the grandchild's pid as one
 //! `<pid>\n` line, and then BLOCKS until the harness writes a second ack byte. The harness
 //! captures the grandchild's [`ProcessId`] before writing that release. Until then the root is
@@ -23,10 +23,6 @@ use cosca::identity::{Liveness, ProcessId, Resolved};
 use super::accept::{
     accept_or_die, ack_now, died_before_connecting, died_before_reporting, wait_readable, Target, WatchEvent,
 };
-
-/// Env var telling a `spawn-grandchild*` testbin root where to report its grandchild's pid.
-/// Unset, the root reports nothing, so other consumers of these modes see no extra connection.
-pub const GC_PID_ADDR_ENV: &str = "COSCA_TESTCFG_GC_PID_ADDR";
 
 thread_local! {
     static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };
@@ -263,7 +259,7 @@ pub fn report_grandchild(report: TcpListener, root: &mut cosca::Child) -> Proces
     id
 }
 
-/// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`] set
+/// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`](super::GC_PID_ADDR_ENV) set
 /// to `report`'s address: captures the grandchild's identity through the report protocol first.
 /// `report` closes once accepted, `listener` on return.
 pub fn accept_tree(

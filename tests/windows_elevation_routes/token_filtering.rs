@@ -30,9 +30,10 @@ use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, R
 use crate::harness::{
     contain, describe, elevation_type_name, env_block, linked_token, measure, open_own_token, require_gate,
     self_report_cmdline, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide, ScratchAccount,
-    Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    Token, CHILD_EXIT_BOUND_MS, PROBE_ALLOW_ACCOUNTS_ENV, PROBE_ANCESTOR_CONTAINED_ENV, PROBE_CHILD_ENV,
+    PROBE_ENV_CANARY_ENV, PROBE_INSPECT_PID_ENV, PROBE_REPORT_TO_ENV, WAIT_INCOMPLETE_TOKEN,
 };
-use crate::windows_probe::mark_test_passed;
+use crate::windows_probe::{mark_test_passed, PROBE_MARKERS_ENV};
 
 /// The helper a spawning probe re-execs this binary as (`--cosca-probe-helper measure-token`):
 /// `COSCA_PROBE_REPORT_TO` names the file to answer through, and `COSCA_PROBE_CHILD` suppresses the
@@ -48,17 +49,18 @@ use crate::windows_probe::mark_test_passed;
 /// Panics without `COSCA_PROBE_REPORT_TO`: the helper serves only a spawned child, and has nothing
 /// to answer through otherwise.
 pub(crate) fn measure_this_token() {
-    let dest = std::env::var_os("COSCA_PROBE_REPORT_TO")
-        .expect("measure-token runs only as a spawned child: COSCA_PROBE_REPORT_TO names its report file");
+    let dest = std::env::var_os(PROBE_REPORT_TO_ENV).unwrap_or_else(|| {
+        panic!("measure-token runs only as a spawned child: {PROBE_REPORT_TO_ENV} names its report file")
+    });
     let mut out = String::new();
     // `ShellExecuteEx` cannot carry an environment at all, so whether an explicitly built block
     // survives a token-based spawn is one of the capabilities being measured. The canary is only
     // set by a probe that passed one.
-    if let Ok(v) = std::env::var("COSCA_PROBE_ENV_CANARY") {
+    if let Ok(v) = std::env::var(PROBE_ENV_CANARY_ENV) {
         let _ = writeln!(out, "  env block: the caller's COSCA_PROBE_ENV_CANARY arrived as {v:?}");
     }
-    if std::env::var_os("COSCA_PROBE_CHILD").is_none() {
-        let ancestor_contained = std::env::var_os("COSCA_PROBE_ANCESTOR_CONTAINED").is_some_and(|v| v == "1");
+    if std::env::var_os(PROBE_CHILD_ENV).is_none() {
+        let ancestor_contained = std::env::var_os(PROBE_ANCESTOR_CONTAINED_ENV).is_some_and(|v| v == "1");
         measure(&mut out, ancestor_contained);
     } else {
         // A child of `spawn_attempts_with` does not recurse into more spawn attempts of its own:
@@ -93,9 +95,11 @@ fn measure_another_process_token(#[fixture(elevation_routes)] _group: &Group) {
     // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
     // on trust from the caller — see the image-identity check below for why that distinction
     // matters.
-    let (pid, expect_explorer): (u32, bool) = match std::env::var("COSCA_PROBE_INSPECT_PID") {
+    let (pid, expect_explorer): (u32, bool) = match std::env::var(PROBE_INSPECT_PID_ENV) {
         Ok(v) => (
-            v.trim().parse().expect("COSCA_PROBE_INSPECT_PID must be a decimal PID"),
+            v.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{PROBE_INSPECT_PID_ENV} must be a decimal PID")),
             false,
         ),
         // With no target named, go looking for the interesting one: the shell of a signed-in
@@ -199,7 +203,7 @@ fn measure_another_process_token(#[fixture(elevation_routes)] _group: &Group) {
         out.contains("integrity="),
         "the target process's token could not be described, so nothing was measured"
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// The UAC policy in force. Without these values a token-shape measurement is uninterpretable: on
@@ -239,7 +243,7 @@ fn measure_uac_policy(#[fixture(elevation_routes)] _group: &Group) {
         any,
         "not one UAC policy value could be read, so no token result below is interpretable"
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// Question 2, measured at whatever integrity this process runs at. Read together with
@@ -276,7 +280,7 @@ fn linked_token_chain_here(#[fixture(elevation_routes)] _group: &Group) {
         "the chain's step 1 produced neither a success nor a real error code, so nothing was \
          measured:\n{out}"
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// **Question 2, properly.** Derive a medium-integrity token, start this binary under it, and read
@@ -370,8 +374,8 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
         // ever resuming it (`CREATE_SUSPENDED`), so by the time it runs, it is already a job member
         // — see `measure_this_token`'s doc for why this must be its own explicit marker.
         let block = env_block(&[
-            ("COSCA_PROBE_REPORT_TO", child_report.display().to_string()),
-            ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
+            (PROBE_REPORT_TO_ENV, child_report.display().to_string()),
+            (PROBE_ANCESTOR_CONTAINED_ENV, "1".into()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
@@ -467,7 +471,7 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     } else {
         println!("PROBE unelevated-view: measured, and correctly labelled as an unelevated caller's view.");
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// A medium-integrity token for an account that has no UAC split to borrow one from: disable the
@@ -629,7 +633,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
              CreateProcess-based route would buy."
         );
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// **Question 2's first step.** Which logon types return a FILTERED token for an account in
@@ -637,7 +641,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
 /// applied, so this is where the chain either starts or dies.
 #[skuld::test]
 fn which_logon_types_return_a_filtered_token(#[fixture(elevation_routes)] _group: &Group) {
-    require_gate("COSCA_PROBE_ALLOW_ACCOUNTS", "creates and deletes local user accounts");
+    require_gate(PROBE_ALLOW_ACCOUNTS_ENV, "creates and deletes local user accounts");
     let mut measured_admin = false;
     let mut measured_std = false;
     for admin in [true, false] {
@@ -712,5 +716,5 @@ fn which_logon_types_return_a_filtered_token(#[fixture(elevation_routes)] _group
          contrast against the Administrators account — the whole point of running both — was never \
          measured"
     );
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }

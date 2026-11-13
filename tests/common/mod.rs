@@ -40,6 +40,10 @@ pub mod seccomp;
 mod accept;
 pub use accept::*;
 
+#[path = "../../testbin/env_names.rs"]
+mod env_names;
+pub use env_names::*;
+
 #[cfg(target_os = "macos")]
 pub mod kevent_eintr;
 

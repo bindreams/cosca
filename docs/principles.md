@@ -368,7 +368,8 @@ whole group nobody decided to disable, and a process-wide mutation corrupts whic
 the process.
 
 Any other test setting (a path, a knob, an internal marker) is `COSCA_TESTCFG_<NAME>`; `cosca-path`'s
-`COSCA_TEST_NON_ROOT` keeps the group shape.
+`COSCA_TEST_NON_ROOT` keeps the group shape. A test environment variable's name is one const, in the
+file its setter and reader share.
 
 **Applies to:** all tests.
 
