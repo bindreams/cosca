@@ -346,7 +346,8 @@ delegated cgroup with `unshare` permitted. A test whose verdict depends on the m
 child got asks for that mechanism and asserts it. The ways to ask: `contain_without_cgroup` (a session
 on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `cgroup` fixture
 (`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests` (`ProcessGroup`,
-in-crate tests only). The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
+in-crate tests only). A kernel feature the host has (`PIDFD_GROUP_SIGNAL`, `PIDFD_GET_INFO`) is environment; the
+mechanism is what a contained child got. The mechanism a request gets comes from `tests/common/contain_gives.rs`; macOS
 promotes every contained request to `FdMarker`. A consent group that gates a risk (principle 10)
 names the risk.
 

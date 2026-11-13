@@ -260,26 +260,10 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     Err(lacks("this host is not Linux".to_owned()))
 }
 
-/// `struct pidfd_info`, version 0 (64 bytes), from the kernel uapi `linux/pidfd.h`.
-#[cfg(target_os = "linux")]
-#[repr(C)]
-#[derive(Default)]
-struct PidfdInfo {
-    mask: u64,
-    cgroupid: u64,
-    rest: [u32; 12],
-}
-
-/// `PIDFD_GET_INFO` is `_IOWR(PIDFS_IOCTL_MAGIC = 0xFF, 11, struct pidfd_info)`, and `PIDFD_INFO_CGROUPID` is `1 << 2`
-/// (kernel uapi `linux/pidfd.h`).
-#[cfg(target_os = "linux")]
-const PIDFD_GET_INFO: libc::Ioctl = 0xC040_FF0B_u32 as libc::Ioctl;
-#[cfg(target_os = "linux")]
-const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
-
 /// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
 /// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13, a supported host that reads a
-/// task's cgroup through `/proc` instead, refuses it with `ENOTTY` or `EINVAL`.
+/// task's cgroup through `/proc` instead, refuses it with `ENOTTY` or `EINVAL`. It does not call the library's
+/// `pidfd_cgroup_id`, so a defect there cannot read as a missing kernel feature.
 #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
 fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
     let lacks = |why: String| {
@@ -300,13 +284,19 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
             )
         };
         let pidfd = own_pidfd().map_err(|e| probe_failed(format!("pidfd_open failed: {e}")))?;
-        let mut info = PidfdInfo {
-            mask: PIDFD_INFO_CGROUPID,
-            ..PidfdInfo::default()
-        };
+        // SAFETY: all-zero is a valid `pidfd_info` (plain integers); it is `#[non_exhaustive]`, so it cannot be built
+        // by a literal.
+        let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
+        info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
         // SAFETY: `pidfd` is open, and `info` is a valid, writable `struct pidfd_info` of the size the request
         // encodes.
-        let rc = unsafe { libc::ioctl(pidfd.as_raw_fd(), PIDFD_GET_INFO, &mut info as *mut PidfdInfo) };
+        let rc = unsafe {
+            libc::ioctl(
+                pidfd.as_raw_fd(),
+                libc::PIDFD_GET_INFO,
+                &mut info as *mut libc::pidfd_info,
+            )
+        };
         if rc != 0 {
             let errno = std::io::Error::last_os_error();
             return match errno.raw_os_error() {
@@ -315,7 +305,7 @@ fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
             };
         }
         // A kernel that took the ioctl but does not fill the cgroup id lacks the feature too.
-        if info.mask & PIDFD_INFO_CGROUPID == 0 {
+        if info.mask & u64::from(libc::PIDFD_INFO_CGROUPID) == 0 {
             return Err(lacks("this kernel's answer carries no cgroup id".to_owned()));
         }
         Ok(())
