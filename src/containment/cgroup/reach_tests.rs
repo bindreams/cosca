@@ -1328,75 +1328,53 @@ fn a_probe_dropped_unended_is_killed_and_reaped() {
     assert_eq!(no_child_holds(pid), Ok(true), "the probe's child {pid} is left");
 }
 
-/// A probe's child that cannot open its `/proc/self/fd` for a reason that is no refusal exits
-/// `ABANDONED`, whether or not `close_range` works: the probe's error names that status and the
-/// errno the child reported, and a `warn` names the child and the status. Mutant: "the child's exit
-/// status is dropped" (the error is the generic one), "the child's errno is dropped" (the error has
-/// no code).
+/// A probe's child that cannot open its `/proc/self/fd` for a reason that is no refusal reports the
+/// errno and exits `ABANDONED` by itself, whether or not `close_range` works: the probe reaps it
+/// without a kill, so its end is always that exit; the error states the reported cause and the
+/// errno, and the end is logged at `debug`, not `warn`. Mutant: "the child's errno is dropped" (the
+/// error has no code), "the probe kills a child that reported" (a kill step, a status that follows
+/// the scheduler).
 #[skuld::test]
 fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
     crate::log_capture::install();
     let _missing = fault::miss_pidfd_info();
     let _no_dir = fault::fail_probe_fd_dir(libc::EMFILE);
-    let forked = std::rc::Rc::new(std::cell::Cell::new(None));
-    let _seen = fault::set_before_probe_kill({
-        let forked = forked.clone();
-        move |pid| {
-            forked.set(Some(pid));
-            None
-        }
-    });
     fault::take_probe_steps();
     let mark = crate::log_capture::mark();
     let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe fails");
-    let pid = forked.get().expect("the probe's child was to be killed");
+    let said = crate::error::said(&err);
     assert!(
-        matches!(&err, crate::error::Error::Io(_)) && crate::error::said(&err).contains("ABANDONED"),
-        "the error names the child's status: {err:?}"
+        matches!(&err, crate::error::Error::Io(_))
+            && said.contains(
+                "the probe's child could not open its /proc/self/fd: it exited ABANDONED (1) after reporting that failure"
+            ),
+        "the error states the reported cause and the child's status: {said}"
+    );
+    assert!(
+        !said.contains("its parent was gone"),
+        "the error does not offer the causes of an unreported exit: {said}"
     );
     assert_eq!(
         crate::error::first_os_code(&err),
         Some(libc::EMFILE),
         "the error carries the errno the child reported: {err:?}"
     );
-    // The child's own exit and the probe's kill race to end it; the answer is the same for both.
-    let steps = fault::take_probe_steps();
-    assert!(
-        matches!(
-            steps[..],
-            [
-                ProbeStep::Kill(libc::SIGKILL),
-                ProbeStep::Reap(ProbeEnd::Exit(super::ABANDONED) | ProbeEnd::Signal(libc::SIGKILL))
-            ]
-        ),
-        "{steps:?}"
-    );
-    let warns = warns_since(mark, "");
-    assert!(
-        warns
-            .iter()
-            .any(|w| w.contains(&format!("child {pid}")) && w.contains("ABANDONED")),
-        "a warn names the probe's child {pid} and its status: {warns:?}"
-    );
-}
-
-/// A probe child that reported `SETUP_FAILED` ended `ABANDONED` whether it exited itself or the
-/// probe's kill reached it first; no other end is rewritten. The kill cannot be made to land
-/// between the child's report and its exit, so the reap's two outcomes are given.
-#[skuld::test]
-fn a_setup_failed_child_ends_abandoned_whether_it_exited_or_was_killed() {
-    let failed = super::ProbeRead::SetupFailed(libc::EMFILE);
-    let killed = ProbeEnd::Signal(libc::SIGKILL);
-    let abandoned = ProbeEnd::Exit(super::ABANDONED);
-    assert_eq!(super::settled_end(&failed, killed), abandoned);
-    assert_eq!(super::settled_end(&failed, abandoned), abandoned);
     assert_eq!(
-        super::settled_end(&failed, ProbeEnd::Signal(libc::SIGSEGV)),
-        ProbeEnd::Signal(libc::SIGSEGV)
+        fault::take_probe_steps(),
+        [ProbeStep::Reap(ProbeEnd::Exit(super::ABANDONED))],
+        "a child that reported is reaped, not killed"
     );
-    assert_eq!(super::settled_end(&failed, ProbeEnd::Elsewhere), ProbeEnd::Elsewhere);
-    assert_eq!(super::settled_end(&super::ProbeRead::Gone("x"), killed), killed);
-    assert_eq!(super::settled_end(&super::ProbeRead::Answer(Ok(())), killed), killed);
+    let records = crate::log_capture::records_since_on_current_thread(mark, "placement probe's child");
+    assert!(
+        records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Debug && text.contains("ABANDONED")),
+        "the end is logged at debug: {records:?}"
+    );
+    assert!(
+        records.iter().all(|(level, _)| *level > log::Level::Warn),
+        "the child's reported failure does not warn: {records:?}"
+    );
 }
 
 /// The errnos by which `openat2` is refused (see `identity::Refusal`).

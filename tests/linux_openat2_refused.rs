@@ -278,9 +278,9 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
                 format!(
                     "listing process group {pgid} is not supported on linux: the group could not be listed: \
                      an I/O operation failed: containment::unix::group::members: {}, so pgid {pgid} cannot be \
-                     listed: {}",
+                     listed: an I/O operation failed: {}",
                     refused_detail(name),
-                    cosca::error::Report::new(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(errno)))
+                    std::io::Error::from_raw_os_error(errno)
                 ),
                 "{call} under {name}"
             );
