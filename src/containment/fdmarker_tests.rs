@@ -48,7 +48,7 @@ pub(crate) fn inert_root() -> crate::identity::ProcessId {
 pub(crate) fn install_on(
     cmd: &mut std::process::Command,
     reserved: &[std::os::fd::RawFd],
-) -> Option<super::PreparedMarker> {
+) -> Result<super::PreparedMarker, crate::error::Error> {
     crate::child::spawn::in_child::register_alone(cmd, |steps| super::install(steps, reserved))
 }
 
@@ -570,9 +570,10 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     _ = child.wait();
 }
 
-/// Each real failure arm of `install` degrades to "no marker" and says so, with the message
-/// naming which step failed. The seams replace the SYSCALL result, so the genuine branch —
-/// its own log line and its own early return — is what executes.
+/// Each real failure arm of `install` fails with `Error::Containment` naming which step failed
+/// (what `prepare` returns for `Strongest` and logs for the modes that degrade). The seams replace
+/// the SYSCALL result, so the genuine branch — its own error and its own early return — is what
+/// executes.
 ///
 /// **Deliberate, documented exception to this crate's no-mocks rule**, not an oversight: these
 /// three syscalls (`pipe()`, `F_DUPFD_CLOEXEC`, and "the marker pipe has no readable handle")
@@ -586,20 +587,14 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
 /// covering here; the SYSCALLS themselves (`pipe()`, `F_DUPFD_CLOEXEC`, `proc_pidfdinfo`) are
 /// exercised for real, unmocked, by every OTHER test in this file's success paths. **State this
 /// plainly rather than implying more:** this test proves `install`'s three early-return arms
-/// compile, log the right message, and degrade to `None` — it does NOT prove `install` degrades
-/// correctly under a genuine OS-level `pipe()`/`fcntl`/`proc_pidfdinfo` failure (`EMFILE`,
-/// `ENFILE`, …), whose exact errno/shape this seam does not attempt to reproduce.
+/// compile and fail with the right message — it does NOT prove `install` fails correctly under a
+/// genuine OS-level `pipe()`/`fcntl`/`proc_pidfdinfo` failure (`EMFILE`, `ENFILE`, …), whose exact
+/// errno/shape this seam does not attempt to reproduce.
 #[skuld::test]
-fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
+fn each_install_failure_arm_fails_and_says_which_step_failed() {
     use super::fault::{set_fault, Fault};
-    // Held for the whole test: these log lines carry no per-call discriminator, so this test
-    // and `dispatch_tests.rs`'s `a_failed_marker_install_leaves_prepare_without_one` (which
-    // asserts on the identical text) could otherwise satisfy each other's `contains_since`
-    // check across threads in the shared `log_capture` buffer.
-    let _serialize = super::fault::lock_for_log_assertion();
     // `install` makes its pipe under `spawn_lock`, as a spawn does.
     let _spawn_lock = test_spawn_lock();
-    crate::log_capture::install();
     for (fault, marker) in [
         (Fault::Pipe, "fd marker: pipe() failed"),
         (Fault::Place, "fd marker: could not place the marker descriptor"),
@@ -607,14 +602,10 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
     ] {
         let mut cmd = std::process::Command::new("/usr/bin/true");
         set_fault(Some(fault));
-        let mark = crate::log_capture::mark();
+        let failed = install_on(&mut cmd, &[]).err();
         assert!(
-            install_on(&mut cmd, &[]).is_none(),
-            "a failed {fault:?} step must yield no marker"
-        );
-        assert!(
-            crate::log_capture::contains_since(mark, marker),
-            "the {fault:?} failure must log {marker:?}"
+            matches!(failed, Some(crate::error::Error::Containment { ref detail, .. }) if detail == marker),
+            "a failed {fault:?} step must fail with {marker:?}, got {failed:?}"
         );
         assert!(
             super::fault::take_fault().is_none(),

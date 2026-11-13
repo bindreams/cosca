@@ -75,9 +75,13 @@ pub(crate) struct LeafDir {
 }
 
 impl LeafDir {
+    /// Hold the directory `path`, the parent a leaf is made under.
+    pub(crate) fn open_parent(path: &Path) -> io::Result<OwnedFd> {
+        open_dir(rustix::fs::CWD, path)
+    }
+
     /// Create the leaf `name` under `parent` and hold both.
-    pub(crate) fn create(parent: &Path, name: &str) -> io::Result<LeafDir> {
-        let parent = open_dir(rustix::fs::CWD, parent)?;
+    pub(crate) fn create(parent: OwnedFd, name: &str) -> io::Result<LeafDir> {
         rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o777))?;
         #[cfg(test)]
         let held = if super::fault::take_force_leaf_open_failure() {

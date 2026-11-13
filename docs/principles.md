@@ -269,9 +269,12 @@ reap everything are legitimate hosts.
 
 ## 6. Good defaults, with escape hatches for advanced users
 
-Defaults are safe: a child is killed on drop, and `contain()` picks the strongest mechanism by
-default. Don't forbid what advanced users legitimately need; document exactly what holds when they
-opt out.
+Defaults are safe: a child is killed on drop, and `contain()` picks the strongest mechanism the host
+offers by default, or fails the spawn before the program runs: it never falls back to a weaker one
+(`ContainMode::Strongest`; on Windows, until that platform fails too). The fallback is the opt-in,
+`contain_with(ContainMode::BestEffort)`: the strongest that sets up, else the next one down, with
+a `warn` for each fallback. Don't forbid what advanced users legitimately need; document exactly what
+holds when they opt out.
 
 **Why:** a library that refuses a legitimate use gets replaced by hand-rolled code with no
 guarantees at all.
@@ -347,10 +350,12 @@ delegated cgroup with `unshare` permitted. A test whose verdict depends on the m
 child got asks for that mechanism and asserts it. The ways to ask: `contain_without_cgroup` (a
 session on Linux), an explicit `ContainMode::Session` or `ContainMode::TreeWalk`, the `cgroup`
 fixture (`CgroupV2`), and `Container::Leafless` of the in-crate `identity_group_tests`
-(`ProcessGroup`, in-crate tests only). A kernel feature the host has (`PIDFD_GROUP_SIGNAL`,
-`PIDFD_GET_INFO`) is environment; the mechanism is what a contained child got. The mechanism a
-request gets comes from `tests/common/contain_gives.rs`; macOS promotes every contained request to
-`FdMarker`. A consent group that gates a risk (principle 10) names the risk.
+(`ProcessGroup`, `ContainMode::BestEffort` with the leaf made to fail, in-crate tests only). A kernel
+feature the host has (`PIDFD_GROUP_SIGNAL`, `PIDFD_GET_INFO`) is environment; the mechanism is what a
+contained child got. A test of what a failed setup gives asserts the error under `Strongest` and the
+degrade under `BestEffort`; a test that needs the degrade asks for `BestEffort`, never relies on
+`Strongest` falling back. The mechanism a request gets comes from `tests/common/contain_gives.rs`;
+macOS promotes every contained request to `FdMarker`. A consent group that gates a risk (principle 10) names the risk.
 
 `COSCA_TEST_UNPRIVILEGED` has no consent variable and no precondition: it holds the tests that
 mean something only without privilege (`RLIMIT_NPROC` does not bind root). It is a `test_group!` row

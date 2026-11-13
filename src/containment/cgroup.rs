@@ -3,8 +3,8 @@
 //! When cgroup v2 is mounted, delegated, and writable with `cgroup.kill`
 //! support, the spawned child is placed in a freshly created leaf sub-cgroup.
 //! Teardown writes `"1"` to `cgroup.kill` — the kernel atomically kills every
-//! process in the leaf (fork-proof). Falls back to the process-group mechanism
-//! when any precondition fails (see `try_create_leaf`).
+//! process in the leaf (fork-proof). Which mode fails and which degrades is in `ContainMode`'s
+//! docs; see `leaf_if_offered` and `try_create_leaf`.
 //!
 //! # Delegation prerequisite
 //! cgroup v2 requires "no internal processes": a non-root cgroup may not
@@ -14,9 +14,9 @@
 //! it contains no processes itself). This is the normal case in properly
 //! delegated slices (systemd user slices, container environments). On hosts
 //! where the supervisor IS a leaf (root cgroup, or an undelegated slice), the
-//! child's `cgroup.procs` write will fail with EBUSY/EINVAL; the placement
-//! step handles this gracefully by falling back to the process-group
-//! mechanism without aborting the spawn.
+//! child's `cgroup.procs` write will fail with EBUSY/EINVAL. Under `Strongest` the child stops
+//! before `exec` and the spawn fails, naming the cgroup; under `BestEffort` the placement
+//! step falls back to the process-group mechanism without aborting the spawn.
 //!
 //! # Async-signal-safety
 //! `place_self_in_cgroup_pre_exec` is called from the spawn's in-child hook
@@ -130,6 +130,12 @@ pub(crate) use kill_record::*;
 mod reach;
 #[cfg(target_os = "linux")]
 pub(crate) use reach::*;
+
+#[cfg(target_os = "linux")]
+#[path = "cgroup/own.rs"]
+mod own;
+#[cfg(target_os = "linux")]
+pub(crate) use own::*;
 
 #[cfg(target_os = "linux")]
 #[path = "cgroup/leaf.rs"]

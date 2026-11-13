@@ -563,9 +563,10 @@ pub fn silence_async(cmd: &mut cosca::tokio::Command) {
 }
 
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](cosca::ContainMode::Session)
-/// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` tries a
-/// cgroup leaf first and logs a warning where none is delegated, so the same test would warn on one
-/// host and not on another. See principle 9 of `docs/principles.md`.
+/// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` makes a
+/// cgroup leaf where the host offers a delegated cgroup and gives a process group where it does not,
+/// so the same test would get a different mechanism on one host than on another. See principle 9 of
+/// `docs/principles.md`.
 pub fn contain_without_cgroup(cmd: &mut cosca::Command) -> &mut cosca::Command {
     #[cfg(target_os = "linux")]
     return cmd.contain_with(cosca::ContainMode::Session);

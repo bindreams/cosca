@@ -1879,14 +1879,18 @@ fn cgroup_a_front_placeable_through_proc_is_not_refused(#[fixture(cgroup)] _grou
 }
 
 /// A `cat` front spawned for a cgroup leaf that does not take it (its placement write is made to
-/// fail, so the attach falls back to its process group), with its stdin a pipe the caller owns.
+/// fail, so a `BestEffort` attach falls back to its process group), with its stdin a pipe the
+/// caller owns.
 pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = in_cgroup(cat());
+    let mut cmd = cat();
+    cmd.contain_with(ContainMode::BestEffort);
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
         .expect("stdin");
     cmd.set_elevation_report(sudo_report());
-    crate::containment::cgroup::fault::set_force_placement_write_result(0);
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
     (cmd, writer.into())
 }
 
@@ -1944,6 +1948,52 @@ fn cgroup_a_front_its_leaf_did_not_take_is_handed_back_by_a_failed_identity_chec
     let (detail, pid, handed_back) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop), stdin);
     assert!(!handed_back.is_none(), "a sync spawn hands the front back");
     assert_left_unsignalled(&detail, pid, handed_back);
+}
+
+/// An elevated `Strongest` spawn whose placement is refused answers not started, as a child that is
+/// not a front does: the front never ran `sudo`, so it is killed and reaped, with no front detail
+/// and nothing handed back.
+///
+/// Mutant: a not-started attach failure of a front is torn down as a front and answers
+/// `MayHaveStarted`.
+#[skuld::test]
+fn cgroup_a_front_whose_placement_is_refused_answers_not_started(#[fixture(cgroup)] _group: &Group) {
+    let mut cmd = in_cgroup(cat());
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.set_elevation_report(sudo_report());
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
+
+    let pid = std::rc::Rc::new(std::cell::Cell::new(None));
+    let _seen = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, {
+        let pid = std::rc::Rc::clone(&pid);
+        move || pid.set(Some(crate::child::spawn::fault::spawn_pid()))
+    });
+    let spawned = crate::child::spawn::spawn(&mut cmd);
+    // The forked child took its own copy; this thread's stays armed for the next test.
+    crate::containment::cgroup::fault::take_force_placement_write_result();
+
+    let Err(failure) = spawned else {
+        panic!("a refused placement must fail a Strongest spawn");
+    };
+    let (error, fate) = failure.expect_not_started_with_child();
+    assert!(matches!(error, crate::error::Error::Containment { .. }), "{error:?}");
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "the front was killed and reaped");
+    // No front detail: the front never ran `sudo`, so the error does not say the elevated program
+    // may be running.
+    let said = crate::error::Report(&error).to_string();
+    assert!(!said.contains("what sudo left"), "{said}");
+    // Reaped by the spawn: this process has no such child left to wait for.
+    let pid = pid.get().expect("the spawn forked a front");
+    let mut status = 0;
+    // SAFETY: `status` is a valid out-parameter; WNOHANG never blocks.
+    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    assert_eq!(
+        (waited, std::io::Error::last_os_error().raw_os_error()),
+        (-1, Some(libc::ECHILD)),
+        "the front's pid is gone"
+    );
 }
 
 /// A front spawn that cannot capture its leaf's subtree (the cgroup id read fails) says so at

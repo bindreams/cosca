@@ -3,8 +3,10 @@
 //! Two mechanisms are available:
 //! - **ProcessGroup** (`process_group(0)` / `setpgid`): the child becomes a
 //!   process-group leader (pgid == pid). Teardown sends `killpg`. cgroup v2
-//!   preempts this on Linux when available. macOS uses this for
-//!   `ContainMode::Strongest`.
+//!   preempts this on Linux when the host offers it: `ContainMode::Strongest` has a process
+//!   group only where none is offered, and `ContainMode::BestEffort` also where the leaf cannot
+//!   be set up. On macOS the fd marker preempts it, and `ContainMode::BestEffort` has it where the
+//!   marker cannot be installed.
 //! - **Session** (`setsid`): the child becomes a session leader *and*
 //!   process-group leader in a new session, detached from any controlling
 //!   terminal. Teardown is identical (`killpg` on the session's initial pgroup,

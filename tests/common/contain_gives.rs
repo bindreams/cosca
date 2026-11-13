@@ -33,7 +33,8 @@ pub const fn tree_walk_gives() -> cosca::Containment {
 
 /// The mechanism whose tree a test can wait on to drain: a cgroup leaf on Linux, the same one
 /// `contain_without_cgroup` gets elsewhere. On Linux the cgroup leaf exists only for a test that
-/// takes the `cgroup` fixture and asks `.contain()`; without both, `.contain()` degrades.
+/// takes the `cgroup` fixture and asks `.contain()`; without the fixture, `.contain()` gets a
+/// process group where the host offers no delegated cgroup.
 pub const fn drainable_gives() -> cosca::Containment {
     #[cfg(target_os = "linux")]
     return cosca::Containment::CgroupV2;

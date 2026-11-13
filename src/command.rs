@@ -580,8 +580,14 @@ impl Command {
     }
 
     /// Contain the child's whole process tree using the strongest mechanism
-    /// available, so dropping or `kill_tree`-ing the child tears down every
+    /// the host offers, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
+    ///
+    /// This is [`ContainMode::Strongest`]: where the mechanism the host offers cannot be set up,
+    /// the spawn fails with [`Error::Containment`] before the program runs, and never falls back to
+    /// a weaker one. `contain_with(ContainMode::BestEffort)` is the request that does. On Windows
+    /// `contain()` falls back to [`ContainMode::TreeWalk`] when the child cannot be assigned to its
+    /// Job Object.
     ///
     /// # A child reaped by something else
     /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
@@ -630,7 +636,8 @@ impl Command {
         self.contain_with(ContainMode::Strongest)
     }
 
-    /// Contain with a specific [`ContainMode`].
+    /// Contain with a specific [`ContainMode`]: [`BestEffort`](ContainMode::BestEffort) to accept a
+    /// weaker mechanism where the strongest cannot be set up.
     pub fn contain_with(&mut self, mode: ContainMode) -> &mut Command {
         self.contain.mode = Some(mode);
         self

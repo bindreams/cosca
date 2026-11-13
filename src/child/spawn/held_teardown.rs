@@ -79,6 +79,41 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
     (detail, torn)
 }
 
+/// Tears `child` down after a failed attach that proved it never ran the program (its hook ended it
+/// before `exec`, as the handshake ends a child it never told to go): killed and reaped, whether or
+/// not it is an elevation front, which never ran its `sudo`. It has this process's credentials, so
+/// nothing but its being gone refuses its kill ([`Past::Unexecuted`]). Its failures are said in the
+/// failed spawn's one warn, led by `why`; a not-started error has no place for them, and the child
+/// is never handed back.
+///
+/// `id`: the identity the spawn read, `None` when that read failed. A look on the pidfd that failed
+/// may have left the wait on it failing too ([`Past::WaitMayFail`]), so a child it cannot collect is
+/// left, as `abandon_unreported` leaves one, and the warn says so.
+#[cfg(target_os = "linux")]
+pub(crate) fn tear_down_unexecuted(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    policy: SpawnPolicy,
+    why: &mut Diagnosis,
+) -> Torn {
+    let past = if id.is_some() {
+        Past::Unexecuted
+    } else {
+        Past::WaitMayFail
+    };
+    let kill = Kill {
+        disposition: Disposition::Leave,
+        tree: None,
+    };
+    let torn = tear_down_expecting(&child, id, kill, past, policy.teardown_warn_after);
+    let remains = super::pidfd_handshake::say_teardown_of_failed_spawn(torn, why);
+    Torn {
+        fate: remains.fate,
+        unreaped: None,
+        cleanup: None,
+    }
+}
+
 /// Kills `child`, which a failed spawn holds, and reaps it, and says how that went as the failed
 /// spawn's one warn, `why` leading it. The child itself comes back if `disposition` hands back one
 /// the teardown could not collect, to do what `policy` says when dropped; the wait for the killed

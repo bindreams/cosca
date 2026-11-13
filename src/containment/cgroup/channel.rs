@@ -137,6 +137,7 @@ impl ReportChannel {
                 .expect("the child's end is open until the wait")
                 .as_raw_fd(),
             parent_fd: self.read.as_raw_fd(),
+            refusing: false,
         }
     }
 
@@ -278,10 +279,18 @@ pub(crate) struct ReportSlot {
     /// The parent's end, which a forked child inherits a copy of until `exec`: see
     /// [`ReportSlot::close_parents_end`].
     pub(super) parent_fd: RawFd,
+    /// Whether a child whose placement write fails stops, instead of carrying on to `exec` outside
+    /// the leaf: see [`ReportSlot::refusing`].
+    pub(super) refusing: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl ReportSlot {
+    /// This slot, for a spawn that must not run its program outside the leaf.
+    pub(crate) fn refusing(self) -> ReportSlot {
+        ReportSlot { refusing: true, ..self }
+    }
+
     /// Send the intent: this process's pid.
     ///
     /// # Safety
