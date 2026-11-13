@@ -22,6 +22,14 @@ use std::os::windows::process::CommandExt as _;
 #[path = "../tests/common/console_flags.rs"]
 pub(crate) mod console_flags;
 
+// The integration tests' raw spawn, compiled from its real source.
+#[cfg(windows)]
+#[path = "../tests/common/raw_spawn.rs"]
+pub(crate) mod raw_spawn;
+#[cfg(windows)]
+#[path = "../tests/common/windows_env.rs"]
+mod windows_env;
+
 thread_local! {
     static BETWEEN_SPAWN_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
 }

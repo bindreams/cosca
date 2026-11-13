@@ -69,6 +69,30 @@ mod factory;
 pub use factory::*;
 mod locked;
 pub use locked::*;
+#[cfg(windows)]
+mod raw_spawn;
+#[cfg(windows)]
+pub use raw_spawn::*;
+
+#[cfg(windows)]
+impl Target for RawChild {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn has_exited(&mut self) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the process handle is live and this `RawChild` owns it.
+        let waited = unsafe { WaitForSingleObject(HANDLE(self.process().as_raw_handle()), 0) };
+        debug_assert!(
+            waited == WAIT_OBJECT_0 || waited == WAIT_TIMEOUT,
+            "a wait on a live handle: {waited:?}"
+        );
+        waited == WAIT_OBJECT_0
+    }
+}
 mod contain_gives;
 #[cfg(unix)]
 pub use contain_gives::session_gives;

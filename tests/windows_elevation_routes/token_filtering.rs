@@ -7,7 +7,7 @@ use crate::test_groups::{elevation_routes, Group};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use windows::core::{HRESULT, PCWSTR, PWSTR};
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE};
 use windows::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, DuplicateTokenEx, FreeSid, LogonUserW, SecurityImpersonation,
@@ -20,16 +20,17 @@ use windows::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CreateProcessW, CreateProcessWithTokenW, GetProcessTimes, OpenProcess, OpenProcessToken,
+    CreateProcessAsUserW, CreateProcessWithTokenW, GetProcessTimes, OpenProcess, OpenProcessToken,
     QueryFullProcessImageNameW, CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     STARTUPINFOW,
 };
 
+use crate::common::{console_flags::Console, spawn_locked_raw_with, RawOptions, RawStdio};
 use crate::harness::{
     contain, describe, elevation_type_name, env_block, linked_token, measure, open_own_token, require_gate,
-    self_report_cmdline, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide, wide_path,
-    ScratchAccount, Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    self_report_cmdline, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide, ScratchAccount,
+    Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -574,35 +575,30 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
 
     // Absolute, extensionless, NONEXISTENT — the shape `raw_executable("tool")` produces.
     let missing = dir.path().join("tool");
-    let app = wide_path(&missing);
-    let si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
+    // `lpApplicationName` is the path and there is no command line, the input the doc names.
+    // `CREATE_SUSPENDED`: the child must not run before `contain` assigns it to a kill-on-close job.
+    let options = RawOptions {
+        exact_image: true,
+        no_command_line: true,
+        stdio: RawStdio::Null,
         ..Default::default()
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `app` is NUL-terminated and outlives the call; no command line is supplied, which is
-    // legal when lpApplicationName is present. `CREATE_SUSPENDED`: the child must not run before
-    // `contain` assigns it to a kill-on-close job.
-    let res = unsafe {
-        CreateProcessW(
-            PCWSTR(app.as_ptr()),
-            None,
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
-    };
-    let started = res.is_ok();
-    if started {
+    let res = spawn_locked_raw_with(
+        &missing,
+        &[] as &[&str],
+        &[],
+        CREATE_SUSPENDED.0,
+        Console::Hidden,
+        options,
+    )
+    .map(|child| {
+        // `contain` and `wait_for` close the handles themselves.
+        let pi = child.into_process_information();
         let job = contain(&pi, "PROBE createprocessw-pathext");
         wait_for(&pi, &job, CHILD_EXIT_BOUND_MS)
             .unwrap_or_else(|e| panic!("PROBE createprocessw-pathext: child did not exit cleanly: {e}"));
-    }
+    });
+    let started = res.is_ok();
     let bat_ran = marker.exists();
     println!(
         "PROBE createprocessw-pathext: started={started} bat_ran={bat_ran} err={:?}",
@@ -622,8 +618,8 @@ fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_route
         // question, and must not be mislabelled as this exact-image confirmation.
         let err = res.as_ref().expect_err("`started` is false, so `res` is an `Err`");
         assert_eq!(
-            err.code(),
-            HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0),
+            err.raw_os_error(),
+            Some(ERROR_FILE_NOT_FOUND.0 as i32),
             "PROBE createprocessw-pathext: CreateProcessW failed with an unexpected error (not \
              ERROR_FILE_NOT_FOUND): {err} — the harness could not even ask the question"
         );
