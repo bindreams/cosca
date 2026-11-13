@@ -403,7 +403,11 @@ fn group_look(root: &dyn Root) -> NumberLook {
 fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
     let (why, root_alone) = match look {
         NumberLook::Untrusted(state) => (Why::untrusted(&state), false),
-        NumberLook::MayNameAnother { refusal, exact_root } => (Why::MayNameAnother(refusal), exact_root),
+        NumberLook::MayNameAnother {
+            refusal,
+            exact_root,
+            probe,
+        } => (Why::MayNameAnother(refusal, probe), exact_root),
         NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
             unreachable!("a send to a group that is not skipped has no skip to say")
         }
@@ -688,23 +692,17 @@ enum Through {
 /// Whether the process group `pidfd`'s process leads still has a member, zombies included, from a
 /// signal-0 send with `PIDFD_SIGNAL_PROCESS_GROUP`, which names the group exactly. While it has one,
 /// the group's number is still its own: the kernel does not reissue a pid that is any process's
-/// group id. `None` where the kernel refuses the flag (before Linux 6.9), or gives an answer that
-/// says neither. `EPERM` is one of those: the kernel gives it for a group whose every member is
-/// another user's, and a seccomp filter may give it for any group, one that took the number
-/// included.
+/// group id. `Ok(None)` where the kernel refuses the flag (before Linux 6.9). Any other errno is
+/// the `Err`: it says nothing of the group (the kernel gives `EPERM` for a group whose every member
+/// is another user's, and a seccomp filter may give it for any group, one that took the number
+/// included), and a caller left to decide without it keeps it as a cause.
 #[cfg(target_os = "linux")]
-pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Option<bool> {
+pub(crate) fn pidfd_group_has_member(pidfd: std::os::fd::BorrowedFd<'_>) -> Result<Option<bool>, nix::errno::Errno> {
     match probe_signal(Target::Group, Sys::Pidfd(pidfd, libc::PIDFD_SIGNAL_PROCESS_GROUP)) {
-        Ok(()) => Some(true),
-        Err(nix::errno::Errno::ESRCH) => Some(false),
-        Err(nix::errno::Errno::EINVAL) => None,
-        Err(e) => {
-            log::debug!(
-                "containment::unix: a signal-0 send to a process group through its root's pidfd answered {report}",
-                report = crate::error::Report(&e)
-            );
-            None
-        }
+        Ok(()) => Ok(Some(true)),
+        Err(nix::errno::Errno::ESRCH) => Ok(Some(false)),
+        Err(nix::errno::Errno::EINVAL) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

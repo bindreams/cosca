@@ -27,7 +27,7 @@ fn non_walk() -> crate::containment::mechanism::Mechanism {
 fn skipped_kill(action: &str, holders: Option<Result<(), crate::error::Error>>) -> super::TreeKillOutcome {
     super::TreeKillOutcome::Skipped(crate::containment::Skip {
         action: action.into(),
-        why: crate::containment::skip::Why::MayNameAnother(crate::containment::root::Refusal::ReapedElsewhere(1)),
+        why: crate::containment::skip::Why::MayNameAnother(crate::containment::root::Refusal::ReapedElsewhere(1), None),
         root_alone: false,
         holders,
     })
