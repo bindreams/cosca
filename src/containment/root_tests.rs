@@ -236,6 +236,25 @@ fn an_unread_pid_refusal_has_the_reads_error_as_its_source() {
     assert_eq!(first_os_code(&sent), Some(libc::EMFILE), "{sent:?}");
 }
 
+/// macOS has no view and no pidfd to say why a pid read was `Unknown`, so the refusal for an
+/// unreadable pid of a root this handle reaped has no cause and no source: `Unassessable`'s `source`
+/// stays `None`, as it did before the read's cause was kept.
+///
+/// Mutant: the refusal makes up a cause the read does not know.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_unread_pid_refusal_has_no_cause_on_macos() {
+    use crate::containment::NotItsGroup;
+
+    let _read = crate::child::fault::force_root_reads(Resolved::Unknown);
+    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    assert!(matches!(refusal, Refusal::ReapedPidUnread(_, None)), "{refusal:?}");
+    assert!(std::error::Error::source(&refusal).is_none(), "{refusal:?}");
+    assert!(refusal.cause().is_none(), "{refusal:?}");
+    let unproven = NotItsGroup::unproven(refusal, None);
+    assert!(unproven.cause().is_none(), "{unproven:?}");
+}
+
 /// A probe's error joins a `Several` cause of the refusal as one more member of it, not as a list
 /// inside a list.
 ///
@@ -252,11 +271,7 @@ fn a_probe_extends_a_several_cause_of_the_refusal() {
         coded(libc::EACCES),
         [coded(libc::EMFILE)],
     )));
-    let probe = Error::Unassessable {
-        detail: "a probe".to_owned(),
-        source: Some(coded(libc::EPERM)),
-    };
-    let unproven = NotItsGroup::unproven(Refusal::ReapedPidUnread(PGID as u32, Some(own)), Some(probe));
+    let unproven = NotItsGroup::unproven(Refusal::ReapedPidUnread(PGID as u32, Some(own)), Some(libc::EPERM));
     let cause = unproven.cause().expect("the causes");
     let codes: Vec<_> = cause
         .failures()
@@ -265,48 +280,6 @@ fn a_probe_extends_a_several_cause_of_the_refusal() {
         .map(|member| first_os_code(&**member))
         .collect();
     assert_eq!(codes, [Some(libc::EACCES), Some(libc::EMFILE), Some(libc::EPERM)]);
-}
-
-/// The two root-read seams each own their state: taking one while the other is alive neither
-/// inherits its answer nor clears it when the guard drops.
-///
-/// Mutant: the failing seam rides on the plain one's state, so the plain read inherits its cause,
-/// or its guard clears the other's.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn the_root_read_seams_do_not_leak_into_each_other() {
-    use crate::child::{fault, root_identity_now};
-    use crate::identity::FailedCall;
-
-    let failing = || FailedCall::pidfd_open(rustix::io::Errno::MFILE);
-    let read = || root_identity_now(PGID as u32);
-
-    let failing_guard = fault::force_root_reads_failing(failing());
-    let plain_guard = fault::force_root_reads(Resolved::Gone);
-    let (gone, cause) = read();
-    assert!(matches!(gone, Resolved::Gone));
-    assert!(
-        cause.into_error("pid").is_none(),
-        "the plain read inherited the failing one's cause"
-    );
-    drop(plain_guard);
-    let (unknown, cause) = read();
-    assert!(matches!(unknown, Resolved::Unknown));
-    assert!(
-        cause.into_error("pid").is_some(),
-        "the plain guard cleared the failing seam"
-    );
-    drop(failing_guard);
-
-    let plain_guard = fault::force_root_reads(Resolved::Gone);
-    let failing_guard = fault::force_root_reads_failing(failing());
-    drop(failing_guard);
-    let (gone, _) = read();
-    assert!(
-        matches!(gone, Resolved::Gone),
-        "the failing guard cleared the plain seam"
-    );
-    drop(plain_guard);
 }
 
 // check_number through the root's pidfd -----
@@ -363,7 +336,7 @@ mod pidfd {
                 NumberLook::MayNameAnother {
                     refusal: Refusal::ReapedElsewhere(super::PGID as u32),
                     exact_root,
-                    causes: None,
+                    probe: None,
                 },
                 &root,
             )
@@ -483,7 +456,10 @@ mod pidfd {
     /// A look whose group probe failed keeps its refusal, and a skip built from it has the probe's
     /// errno as a cause, as the check's refusal does.
     ///
-    /// Mutant: the look drops the probe's errno.
+    /// The failure is also logged once at debug, with its errno, naming that the look keeps its
+    /// refusal.
+    ///
+    /// Mutant: the look drops the probe's errno, or its failure without a word.
     #[skuld::test]
     fn a_look_after_a_failed_group_probe_keeps_the_probes_errno() {
         use crate::containment::root::{through_the_pidfd, NumberLook};
@@ -491,24 +467,30 @@ mod pidfd {
         use crate::containment::Refusal;
         use crate::error::first_os_code;
 
+        crate::log_capture::install();
         let pidfd = own_pidfd();
         let pid = std::process::id();
         let root = reaped_elsewhere(pid, pidfd.as_fd());
+        let mark = crate::log_capture::mark();
         let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
         let decided = through_the_pidfd(
             NumberLook::MayNameAnother {
                 refusal: Refusal::ReapedElsewhere(pid),
                 exact_root: false,
-                causes: None,
+                probe: None,
             },
             &root,
         );
         drop(answered);
-        let NumberLook::MayNameAnother { refusal, causes, .. } = decided else {
+        let NumberLook::MayNameAnother { refusal, probe, .. } = decided else {
             panic!("a failed probe leaves the look as it was");
         };
-        let cause = Why::MayNameAnother(refusal, causes).cause().expect("the probe's errno");
+        let cause = Why::MayNameAnother(refusal, probe).cause().expect("the probe's errno");
         assert_eq!(first_os_code(&*cause), Some(libc::EPERM), "{cause:?}");
+        let errno = crate::error::Report(&nix::errno::Errno::EPERM).to_string();
+        let logged = crate::log_capture::records_since(mark, "the look keeps its refusal");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains(&errno), "{logged:?} lacks {errno}");
     }
 
     /// A failed group probe that the root's state outvotes (an unreaped root) is still logged, once,

@@ -69,10 +69,9 @@ pub(crate) enum Why {
         why: String,
         cause: Option<std::sync::Arc<std::io::Error>>,
     },
-    /// The pid may name another process, for this reason. The second is the causes of the look,
-    /// when a failed group probe adds its error to the refusal's own
-    /// ([`NumberLook::MayNameAnother`](crate::containment::root::NumberLook::MayNameAnother)).
-    MayNameAnother(Refusal, Option<std::sync::Arc<Error>>),
+    /// The pid may name another process, for this reason. The second is the errno of the group probe
+    /// that failed before it, if one did, raw ([`Refusal::cause_after`]).
+    MayNameAnother(Refusal, Option<i32>),
 }
 
 #[cfg(unix)]
@@ -92,7 +91,7 @@ impl Why {
     pub(crate) fn cause(&self) -> Option<std::sync::Arc<Error>> {
         match self {
             Why::Untrusted { cause, .. } => cause.as_ref().map(crate::error::shared_io_cause),
-            Why::MayNameAnother(refusal, causes) => causes.clone().or_else(|| refusal.cause()),
+            Why::MayNameAnother(refusal, probe) => refusal.cause_after(*probe),
         }
     }
 

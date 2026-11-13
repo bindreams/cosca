@@ -816,16 +816,20 @@ impl Error {
 
     /// The `source` of an error with `own`, its cause if it has one, and then `peers`, the other
     /// failures of the same operation: the one error when that is one, else an [`Error::Several`].
-    /// A `Several` own cause is extended with the peers, not nested in a list of its own. Needs one
-    /// of them at least.
+    /// A `Several` own cause or peer is spliced in as its members, not nested in a list of its own.
+    /// Panics when there is neither an own cause nor a peer.
     pub(crate) fn joined_cause(own: Option<Arc<Error>>, peers: impl IntoIterator<Item = Arc<Error>>) -> Arc<Error> {
-        let own = own.into_iter().flat_map(|own| match &*own {
-            Error::Several(list) => list.iter().cloned().collect(),
-            _ => vec![Arc::clone(&own)],
-        });
-        Failures::collect(own.chain(peers))
+        Failures::collect(own.into_iter().chain(peers).flat_map(Error::spliced))
             .expect("a cause or a peer")
             .into_cause()
+    }
+
+    /// The members of `error` when it is an [`Error::Several`], else `error` alone.
+    fn spliced(error: Arc<Error>) -> Vec<Arc<Error>> {
+        match &*error {
+            Error::Several(list) => list.iter().cloned().collect(),
+            _ => vec![error],
+        }
     }
 
     /// This error with `peers`, the other failures of the same operation, kept: its variant and detail
@@ -893,7 +897,7 @@ impl Error {
                 source: joined(Some(source), peers),
                 unreaped,
             },
-            Error::Several(list) => Error::Several(list.extended(peers)),
+            Error::Several(list) => Error::Several(list.extended(peers.flat_map(Error::spliced))),
             walk @ Error::MembersLeft { .. } => {
                 debug_assert!(
                     false,
