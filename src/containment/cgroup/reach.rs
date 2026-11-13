@@ -172,13 +172,16 @@ impl PlacedAtRemoval {
 /// leaf is removed: the leaf's own cgroup id (`None` if unreadable: tasks are then placed through
 /// `/proc`), its directory, its unified-hierarchy path, the ids of the cgroups its sweep removed,
 /// its front's place before its removal, and whether a kill through it has landed (the leaf's own
-/// record).
+/// record). A member listing adds the ids of the cgroups its own walk found under the leaf
+/// ([`with_nested`](Self::with_nested)).
 #[derive(Debug)]
 pub(crate) struct Subtree {
     leaf_id: Option<u64>,
     dir: Option<Arc<OwnedFd>>,
     path: Option<String>,
     swept: super::Swept,
+    /// Boxed so the subtree stays small where it is held by value.
+    nested: Option<Box<super::NestedIds>>,
     placed: PlacedAtRemoval,
     killed: Arc<KillRecord>,
 }
@@ -197,9 +200,18 @@ impl Subtree {
             dir,
             path,
             swept,
+            nested: None,
             placed,
             killed,
         }
+    }
+
+    /// This subtree, also holding the cgroups `nested` names: each is under the leaf, so a task in
+    /// one is placed without a walk. A walk is also skipped for an id `nested` lacks when it could not
+    /// read some cgroup's id (the walk would meet the same cgroup): the task is placed through `/proc`.
+    pub(crate) fn with_nested(mut self, nested: super::NestedIds) -> Subtree {
+        self.nested = Some(Box::new(nested));
+        self
     }
 
     /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. A task
@@ -215,11 +227,13 @@ impl Subtree {
     }
 
     /// [`holds`](Self::holds), also giving the cgroup id that placed the task (the leaf's, a swept
-    /// one, one the walk found under the leaf, or `seen`; `None` where `/proc` placed it or it is
-    /// outside), and told `seen`, the id the task had when an id placed it in this subtree: a task
-    /// still in that cgroup is where it was, so no walk of the leaf's descendants is made for it, and
-    /// the leaf's own id is not needed. The pidfd route also answers when the leaf's id is
-    /// unknown, from `seen`; an `ESRCH` from it is the task's exit and is returned.
+    /// one, a nested one, one the walk found under the leaf, or `seen`; `None` where `/proc` placed
+    /// it or it is outside), and told `seen`, the id the task had when an id placed it in this
+    /// subtree: a task still in that cgroup is where it was, so no walk of the leaf's descendants is
+    /// made for it, and the leaf's own id is not needed. A cgroup [`with_nested`](Self::with_nested)
+    /// names is known to be under the leaf as `seen` is. Where the leaf's id is unknown, the pidfd
+    /// route answers only from `seen` or a nested id, and `/proc` places any other task; an `ESRCH`
+    /// from the pidfd is the task's exit and is returned.
     pub(crate) fn holds_seen(
         &self,
         pid: u32,
@@ -228,27 +242,43 @@ impl Subtree {
     ) -> io::Result<(bool, Option<u64>)> {
         let mut elsewhere = false;
         let id = match pidfd {
-            Some(pidfd) if self.leaf_id.is_some() || seen.is_some() => match pidfd_cgroup_id(pidfd) {
-                Ok(id) => id,
-                // With no leaf id the pidfd's only shortcuts to `seen`: a refusal places by `/proc`,
-                // as a task with no `seen` is. `ESRCH` is the task's exit, which the caller reads.
-                Err(e) if self.leaf_id.is_none() && e.raw_os_error() != Some(libc::ESRCH) => {
-                    log::debug!(
-                        "the cgroup id of pid {pid} could not be read ({report}), so it is placed through /proc",
-                        report = crate::error::Report(&e)
-                    );
-                    None
+            Some(pidfd)
+                if self.leaf_id.is_some()
+                    || seen.is_some()
+                    || self.nested.as_deref().is_some_and(|n| !n.is_empty()) =>
+            {
+                match pidfd_cgroup_id(pidfd) {
+                    Ok(id) => id,
+                    // With no leaf id the pidfd's only shortcuts to `seen`: a refusal places by `/proc`,
+                    // as a task with no `seen` is. `ESRCH` is the task's exit, which the caller reads.
+                    Err(e) if self.leaf_id.is_none() && e.raw_os_error() != Some(libc::ESRCH) => {
+                        log::debug!(
+                            "the cgroup id of pid {pid} could not be read ({report}), so it is placed through /proc",
+                            report = crate::error::Report(&e)
+                        );
+                        None
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
+            }
             _ => None,
         };
         if let Some(id) = id {
-            if self.leaf_id == Some(id) || self.swept.holds(id) || seen == Some(id) {
+            if self.leaf_id == Some(id)
+                || self.swept.holds(id)
+                || self.nested.as_deref().is_some_and(|n| n.holds(id))
+                || seen == Some(id)
+            {
                 return Ok((true, Some(id)));
             }
             if self.leaf_id.is_some() {
-                if let Some(under) = self.walk_places(id) {
+                // A cgroup whose id was unread may be the task's, and a walk would fail at it too.
+                let walked = if self.nested.as_deref().is_some_and(super::NestedIds::unreadable) {
+                    None
+                } else {
+                    self.walk_places(id)
+                };
+                if let Some(under) = walked {
                     return Ok((under, under.then_some(id)));
                 }
                 elsewhere = true;

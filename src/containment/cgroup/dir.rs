@@ -247,7 +247,7 @@ impl LeafDir {
     }
 
     /// [`procs_under`] the leaf.
-    pub(crate) fn nested_procs(&self) -> (Vec<(String, Option<u64>)>, Option<io::Error>) {
+    pub(crate) fn nested_procs(&self) -> (Vec<String>, NestedIds, Option<io::Error>) {
         procs_under(self.dir.as_fd())
     }
 }
@@ -271,6 +271,31 @@ impl Swept {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&id)
+    }
+}
+
+/// The ids of the cgroups under a leaf that [`procs_under`] visited, each known to be under it. A
+/// [`Default`] one is empty and holds no cgroup.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NestedIds {
+    ids: std::collections::HashSet<u64>,
+    /// Some visited cgroup's id could not be read, so an id absent from `ids` may be that cgroup's.
+    unreadable: bool,
+}
+
+impl NestedIds {
+    /// Whether the cgroup `id` was visited.
+    pub(crate) fn holds(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Whether some visited cgroup's id could not be read.
+    pub(crate) fn unreadable(&self) -> bool {
+        self.unreadable
     }
 }
 
@@ -329,18 +354,19 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     }
 }
 
-/// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, each with the id of the
-/// cgroup it was read in (see [`cgroup_id`]; `None` if that cannot be read, which fails nothing: the
-/// line is then placed as one with no id), and the failure that ended the listing early. A
-/// [`traverse`] of the tree, with the same bounds as [`find_descendant`]: two descriptors at most,
-/// one visit per cgroup; the id is read only in a cgroup that lists a member. A cgroup removed during
-/// the walk has no member left to list and is skipped, as is `dir` itself gone. A cgroup that could
-/// not be read or listed, or one behind a mount (`EXDEV`), ends the listing with its error; the lines
-/// read before it are returned.
-pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<(String, Option<u64>)>, Option<io::Error>) {
+/// The lines of `cgroup.procs` of every cgroup under `dir`, not `dir` itself, the ids of those
+/// cgroups (see [`cgroup_id`]; one that cannot be read fails nothing, and [`NestedIds::unreadable`]
+/// says so), and the failure that ended the listing early. A [`traverse`] of the tree, with the same
+/// bounds as [`find_descendant`]: two descriptors at most, one visit per cgroup, whose id is read
+/// through the walk's [`WalkStep::Id`] gate. A cgroup removed during the walk has no member left to
+/// list and is skipped, as is `dir` itself gone. A cgroup that could not be read or listed, or one
+/// behind a mount (`EXDEV`), ends the listing with its error; the lines and ids read before it are
+/// returned.
+pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<String>, NestedIds, Option<io::Error>) {
     use std::io::Read as _;
 
     let mut lines = Vec::new();
+    let mut nested = NestedIds::default();
     let traversed = traverse(&mut Tree::new(), dir, false, |tree, node, cgroup| {
         let read = rustix::fs::openat(cgroup, "cgroup.procs", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
             .map_err(io::Error::from)
@@ -350,20 +376,24 @@ pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<(String, Option<u64>)>, O
             });
         match read {
             Ok(content) => {
-                let id = if content.lines().next().is_some() {
-                    cgroup_id(cgroup)
-                        .inspect_err(|e| {
-                            log::debug!(
-                                "cgroup v2: the id of {} cannot be read ({report}), so its members are placed without it",
-                                tree.path(node).display(),
-                                report = crate::error::Report(e)
-                            );
-                        })
-                        .ok()
-                } else {
-                    None
-                };
-                lines.extend(content.lines().map(|line| (line.to_owned(), id)));
+                lines.extend(content.lines().map(str::to_owned));
+                match step_fault(tree, node, WalkStep::Id)
+                    .map_err(io::Error::from)
+                    .and_then(|()| cgroup_id(cgroup))
+                {
+                    Ok(id) => {
+                        nested.ids.insert(id);
+                    }
+                    Err(e) if gone_io(&e) => return Ok(Visit::Skip),
+                    Err(e) => {
+                        log::debug!(
+                            "cgroup v2: the id of {} cannot be read ({report}), so a member of it is placed without it",
+                            tree.path(node).display(),
+                            report = crate::error::Report(&e)
+                        );
+                        nested.unreadable = true;
+                    }
+                }
                 Ok(Visit::Continue)
             }
             Err(e) if gone_io(&e) => Ok(Visit::Skip),
@@ -376,7 +406,7 @@ pub(crate) fn procs_under(dir: BorrowedFd<'_>) -> (Vec<(String, Option<u64>)>, O
         Ok(Traversed::Stopped) => unreachable!("the visitor of a listing never stops the walk"),
         Err(failure) => Some(failure.into_error()),
     };
-    (lines, failure)
+    (lines, nested, failure)
 }
 
 /// What a visitor of [`traverse`] decides of the cgroup it was shown.

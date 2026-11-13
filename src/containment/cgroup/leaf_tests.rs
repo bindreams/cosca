@@ -546,43 +546,30 @@ fn a_member_placed_through_proc_is_listed_with_no_cgroup_id(#[fixture(cgroup)] _
     );
 }
 
-/// The members of the cgroups under a leaf are placed by the id of the cgroup the listing read them
-/// in, so the listing walks the leaf's descendants once, for that listing, and not again for each of
-/// them. Three members in a cgroup under the leaf, whose pidfds read that cgroup's id.
-///
-/// Mutant: each listed member of a nested cgroup is placed by a walk of the leaf's descendants.
+/// The id of the cgroup directory `dir`.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(#[fixture(cgroup)] _group: &Group) {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    use crate::containment::cgroup::fault;
-
-    let leaf = lane_leaf();
-    let nested = leaf.leaf_path.join("nested");
-    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
-    std::fs::create_dir(nested.join("deeper")).expect("make a cgroup under that");
-    let nested_id = crate::containment::cgroup::cgroup_id(
+fn id_of(dir: &std::path::Path) -> u64 {
+    crate::containment::cgroup::cgroup_id(
         rustix::fs::open(
-            &nested,
+            dir,
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )
-        .expect("open the cgroup under the leaf")
+        .expect("open the cgroup")
         .as_fd(),
     )
-    .expect("its id");
-    let mut members = Vec::new();
-    for _ in 0..3 {
-        let (member, id) = cat_member();
-        place(&member, &nested);
-        members.push((member, id));
-    }
-    let _read = fault::force_pidfd_cgroup_id(nested_id);
-    // Every walk opens the leaf itself first.
-    let walks = Rc::new(Cell::new(0));
-    let _count = fault::set_before_walk_open({
+    .expect("its id")
+}
+
+/// While the guard lives, counts the walks of the leaf's descendants this thread starts: each opens
+/// the leaf itself first.
+#[cfg(target_os = "linux")]
+fn count_walks() -> (
+    std::rc::Rc<std::cell::Cell<usize>>,
+    crate::containment::cgroup::fault::BeforeWalkOpen,
+) {
+    let walks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let guard = crate::containment::cgroup::fault::set_before_walk_open({
         let walks = walks.clone();
         move |at| {
             if at == std::path::Path::new(".") {
@@ -590,6 +577,33 @@ fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(
             }
         }
     });
+    (walks, guard)
+}
+
+/// The members of the cgroups under a leaf are placed by the listing's own walk of them, so the
+/// listing walks the leaf's descendants once, for that listing, and not again for each member. Three
+/// members in a cgroup under the leaf, whose pidfds read that cgroup's id.
+///
+/// Mutant: each listed member of a nested cgroup is placed by a walk of the leaf's descendants.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
+    let leaf = lane_leaf();
+    let nested = leaf.leaf_path.join("nested");
+    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
+    std::fs::create_dir(nested.join("deeper")).expect("make a cgroup under that");
+    let nested_id = id_of(&nested);
+    let members: Vec<_> = (0..3)
+        .map(|_| {
+            let (member, id) = cat_member();
+            place(&member, &nested);
+            (member, id)
+        })
+        .collect();
+    let _read = fault::force_pidfd_cgroup_id(nested_id);
+    let (walks, _count) = count_walks();
 
     let (listed, unobserved) = leaf.list_members(None);
 
@@ -607,10 +621,68 @@ fn the_listing_walks_the_leafs_descendants_once_however_many_members_are_nested(
         1,
         "the listing of the cgroups under the leaf is the one walk of its descendants"
     );
-    for (mut member, _) in members {
-        member.0.kill().expect("end the member");
-        _ = member.0.wait();
-    }
+}
+
+/// A member the leaf's own `cgroup.procs` lists, that moved into a cgroup under the leaf before it was
+/// pinned, is placed by the id of that cgroup, which the listing's walk found: no walk of its own.
+/// The move is made by a pidfd that reads the nested cgroup's id for a member still in the leaf.
+///
+/// Mutant: a member the leaf's own `cgroup.procs` lists is placed by a walk when its id is not the
+/// leaf's.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_that_moved_into_a_cgroup_under_the_leaf_is_placed_without_a_walk(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+
+    let leaf = lane_leaf();
+    let nested = leaf.leaf_path.join("nested");
+    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
+    let nested_id = id_of(&nested);
+    let (member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+    let _read = fault::force_pidfd_cgroup_id(nested_id);
+    let (walks, _count) = count_walks();
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, Some(nested_id))],
+        "placed by the nested cgroup's id"
+    );
+    assert_eq!(walks.get(), 1, "only the listing's own walk");
+}
+
+/// A member of a cgroup under the leaf whose id the listing cannot read is placed through `/proc`,
+/// with no walk of its own, which would read the same id and fail at it too.
+///
+/// Mutant: a member whose id the listing's walk did not find is placed by a walk.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_member_of_a_cgroup_whose_id_cannot_be_read_is_placed_without_a_walk(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::WalkStep;
+
+    let leaf = lane_leaf();
+    let nested = leaf.leaf_path.join("nested");
+    std::fs::create_dir(&nested).expect("make a cgroup under the leaf");
+    let nested_id = id_of(&nested);
+    let (member, id) = cat_member();
+    place(&member, &nested);
+    let _read = fault::force_pidfd_cgroup_id(nested_id);
+    let _walk = fault::fail_walk_step("./nested", WalkStep::Id, libc::EIO);
+    let (walks, _count) = count_walks();
+
+    let (listed, unobserved) = leaf.list_members(None);
+
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+    assert_eq!(
+        listed.iter().map(|m| (m.id, m.seen)).collect::<Vec<_>>(),
+        [(id, None)],
+        "placed through /proc, so no cgroup id placed it"
+    );
+    assert_eq!(walks.get(), 1, "only the listing's own walk");
 }
 
 /// The members are listed before `cgroup.kill`, not after it: a member that has gone from the leaf by
