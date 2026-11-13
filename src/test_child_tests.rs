@@ -23,16 +23,16 @@ mod restore_mode_tests {
     }
 }
 
-/// [`windows_more`](super::windows_more) exits 0 when its stdin closes. Every Windows test that
-/// takes a non-zero exit as proof of a kill relies on this: were it non-zero, a natural end would
-/// read as a kill.
+/// The Windows [`BLOCKER_ARGV`](super::BLOCKER_ARGV) child exits 0 when its stdin closes. Every
+/// Windows test that takes a non-zero exit as proof of a kill relies on this: were it non-zero, a
+/// natural end would read as a kill.
 #[cfg(windows)]
 #[skuld::test]
-fn windows_more_exits_zero_when_its_stdin_closes() {
+fn the_windows_blocker_exits_zero_when_its_stdin_closes() {
     use super::Console;
 
     let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args([super::windows_more()]);
+    cmd.args(super::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     let mut child = cmd.spawn().expect("spawn");

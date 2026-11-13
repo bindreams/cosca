@@ -235,11 +235,11 @@ pub(crate) fn adopt_pidfd(
     }
 }
 
-/// A running blocker child (see [`crate::test_child::held_std_killable_blocker`]) adopted by
+/// A running blocker child (see [`crate::test_child::held_std_blocker`]) adopted by
 /// [`adopt_std`], its identity, and the write end of its stdin: closing it ends the child.
 #[cfg(test)]
 pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId, std::process::ChildStdin) {
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = crate::identity::ProcessId::of(child.id())

@@ -522,10 +522,7 @@ fn sync_kill_tree_backstop_is_load_bearing() {
     #[cfg(target_os = "macos")]
     use crate::containment::fdmarker::fault;
     let mut cmd = crate::test_child::command(Console::Hidden);
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args([crate::test_child::windows_more()]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     #[cfg(windows)]
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");
@@ -556,10 +553,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     #[cfg(target_os = "macos")]
     use crate::containment::fdmarker::fault;
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args([crate::test_child::windows_more()]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     #[cfg(windows)]
     cmd.stdout(crate::Stdio::null()).expect("set stdout null");

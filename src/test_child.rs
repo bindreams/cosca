@@ -96,10 +96,11 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
-/// `findstr x` on Windows. Every fixture that needs a child "still alive at some later check"
-/// uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the child on
-/// its own and let a mutant that skips the kill under test pass for the wrong reason. Stdin is
-/// what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
+/// `more.com` by its `System32` path on Windows. It exits 0 on EOF, and a kill never gives it 0, so
+/// [`assert_killed`] tells the two apart. Every fixture that needs a child "still alive at some
+/// later check" uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the
+/// child on its own and let a mutant that skips the kill under test pass for the wrong reason.
+/// Stdin is what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
 ///
 /// - [`leaked_writer_stdin`]: the write end is never closed, so only a kill by the code under
 ///   test ends the child (teardown tests that own no handle on it).
@@ -112,11 +113,24 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 /// non-interactive shell) unless it is redirected explicitly, and would exit at once. Write it
 /// `exec 3<&0; cat <&3 3<&- &`: `<&3` gives it the real pipe and `3<&-` closes the spare copy.
 ///
-/// Neither `cat` nor `findstr` is proof of life by itself: `Existence::Present` is
+/// Neither `cat` nor `more.com` is proof of life by itself: `Existence::Present` is
 /// zombie-inclusive, and `SIGKILL`/`TerminateProcess` land asynchronously. A liveness claim needs
-/// an echo round trip through a piped stdout, or (Windows, where `findstr` does not echo) a
-/// clean exit after a closed stdin.
-pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } else { &["cat"] };
+/// an echo round trip through a piped stdout, or (Windows) a clean exit after a closed stdin.
+pub(crate) static BLOCKER_ARGV: std::sync::LazyLock<&'static [&'static str]> = std::sync::LazyLock::new(|| {
+    #[cfg(windows)]
+    {
+        let more: &'static str = Box::leak(
+            windows_more()
+                .into_os_string()
+                .into_string()
+                .expect("a UTF-8 System32 path")
+                .into_boxed_str(),
+        );
+        Box::leak(Box::new([more]))
+    }
+    #[cfg(not(windows))]
+    &["cat"]
+});
 
 /// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
 /// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
@@ -224,31 +238,14 @@ pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, crate::PipeWriter) {
 }
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
-/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
+/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`. `more` echoes,
+/// so a Windows caller nulls the stdout.
 pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
     let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
     cmd.args(&BLOCKER_ARGV[1..])
         .stdin(std::process::Stdio::piped())
         .stdout(stdout);
     cmd
-}
-
-/// [`held_std_blocker`] with a null stdout, for a test that tells a kill from the child's own exit
-/// by its status. On Windows it is `more.com` (see [`windows_more`]): it exits 0 on EOF, where the
-/// `findstr x` of [`BLOCKER_ARGV`] exits 1, the code `TerminateProcess(_, 1)` reports too, so a
-/// released `findstr` would pass for a killed one.
-pub(crate) fn held_std_killable_blocker() -> std::process::Command {
-    #[cfg(unix)]
-    {
-        held_std_blocker(std::process::Stdio::null())
-    }
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new(windows_more());
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null());
-        cmd
-    }
 }
 
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
@@ -572,7 +569,7 @@ fn held_blocker(
 }
 
 /// Async twin of [`held_contained_blocker`].
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub(crate) async fn held_contained_blocker_async(
     stdout: crate::Stdio,
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
@@ -698,11 +695,18 @@ pub(crate) fn stat_of_a_new_owner(pid: u32) -> Vec<u8> {
     format!("{head}) {}\n", fields.join(" ")).into_bytes()
 }
 
-/// A live [`BLOCKER_ARGV`] (`findstr`) child with piped stdin and stdout, and its identity.
+/// A live `findstr x` child with piped stdin and stdout, and its identity. Not a
+/// [`BLOCKER_ARGV`] child: its tests tell a kill from a release by the match it echoes, not by the
+/// exit code.
 #[cfg(windows)]
 pub(crate) fn live_findstr_blocker() -> (std::process::Child, crate::identity::ProcessId) {
-    let child =
-        crate::test_spawn::spawn(&mut held_std_blocker(std::process::Stdio::piped())).expect("spawn the blocker");
+    let child = crate::test_spawn::spawn(
+        std::process::Command::new("findstr")
+            .arg("x")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn the blocker");
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the live blocker resolves");
@@ -1607,67 +1611,11 @@ pub(crate) fn system32(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// `more.com` by its `System32` path: blocks reading stdin and exits 0 on EOF,
-/// unlike `findstr x`, whose exit 1 is indistinguishable from a kill.
+/// `more.com` by its `System32` path, the Windows [`BLOCKER_ARGV`]. For tests that need `more.com`
+/// itself (image name or command-line path).
 #[cfg(windows)]
 pub(crate) fn windows_more() -> std::path::PathBuf {
     system32("more.com")
-}
-
-/// A contained [`windows_more`] child blocked on a piped stdin the caller holds. It ends only by a
-/// real kill or the caller closing the pipe (exit 0). Stdout is nulled because `more` echoes.
-#[cfg(windows)]
-pub(crate) fn windows_blocker() -> (crate::Child, crate::PipeWriter) {
-    windows_blocker_with(Console::Hidden)
-}
-
-/// [`windows_blocker`] on this process's console, for a test of the graceful signals.
-#[cfg(windows)]
-pub(crate) fn windows_blocker_on_console() -> (crate::Child, crate::PipeWriter) {
-    windows_blocker_with(Console::Asked)
-}
-
-#[cfg(windows)]
-fn windows_blocker_with(console: Console) -> (crate::Child, crate::PipeWriter) {
-    let mut cmd = command(console);
-    cmd.args([windows_more()]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
-}
-
-/// Async twin of [`windows_blocker`]; `configure` selects the containment under test.
-#[cfg(all(windows, feature = "tokio"))]
-pub(crate) async fn windows_blocker_async(
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    windows_blocker_async_with(Console::Hidden, configure).await
-}
-
-/// [`windows_blocker_async`] on this process's console, for a test of the graceful signals.
-#[cfg(all(windows, feature = "tokio"))]
-pub(crate) async fn windows_blocker_on_console_async(
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    windows_blocker_async_with(Console::Asked, configure).await
-}
-
-#[cfg(all(windows, feature = "tokio"))]
-async fn windows_blocker_async_with(
-    console: Console,
-    configure: impl FnOnce(&mut crate::tokio::Command),
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    let mut cmd = tokio_command(console);
-    cmd.args([windows_more()]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
-    configure(&mut cmd);
-    let mut child = cmd.spawn().await.expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
 }
 
 /// The argv of a child that ignores `SIGTERM` (an ignored disposition survives the `exec`), tells
@@ -1755,7 +1703,8 @@ pub(crate) async fn term_ignoring_blocker_async() -> (crate::tokio::Child, crate
 }
 
 /// A blocker died to a kill, not by exiting on its own once its stdin closed: `SIGKILL` on Unix, the
-/// kill's exit code `1` on Windows (`more.com` exits 0 on EOF), so a crash on the release fails too.
+/// kill's exit code `1` on Windows, so a crash on the release fails too. A Windows child that
+/// itself exits `1` on EOF cannot be told from a kill, so it is no blocker for this.
 /// Separate compilation units cannot share it: `tests/common` keeps its own copy.
 pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
     #[cfg(unix)]

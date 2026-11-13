@@ -256,7 +256,7 @@ fn a_child_with_a_fired_watch() -> (
     use crate::os_process::macos::child::MacChild;
     use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -662,7 +662,7 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_esrch_once, Registration};
     use crate::wait::exit_only::seams::force_peek_once;
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     drop(child.stdin.take());
     let id = ProcessId::of(child.id()).found().expect("identity");
@@ -690,7 +690,7 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
         force_proc_registration_esrch_once, take_forced_esrch_registration, Registration,
     };
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity");
@@ -727,7 +727,7 @@ fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
     use crate::wait::exit_only::macos_tests::echild_yet_resolvable;
 
     let (pid, unique) = echild_yet_resolvable();
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut tracer = crate::test_spawn::spawn(&mut cmd).expect("spawn the stand-in tracer");
     let tracer_stdin = tracer.stdin.take();
     let tracer_pid = tracer.id();
@@ -765,7 +765,7 @@ fn adoption_fails_when_a_kqueue_cannot_be_made() {
     }
     use crate::os_process::child::adopt_std;
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity");

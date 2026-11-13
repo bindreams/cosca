@@ -203,7 +203,7 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
     use crate::test_child::reaped_elsewhere::kill_own_child;
     use crate::test_support::foreign_tracer::{self, REAP};
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     foreign_tracer::allow_any_tracer(&mut cmd);
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let _stdin = child.stdin.take().expect("piped stdin");
@@ -245,7 +245,7 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     use crate::error::ChildFate;
     use crate::os_process::linux::LinuxProcess;
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let id = ProcessId::of(child.id())
         .found()
@@ -277,7 +277,7 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
     use crate::os_process::OsProcess as _;
 
     crate::log_capture::install();
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let id = ProcessId::of(child.id())
         .found()
@@ -307,7 +307,7 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
     use crate::identity::{FakeKernel, HostKernel};
     use crate::os_process::child::adopt_pidfd;
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id())
@@ -338,7 +338,7 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
 fn adopting_an_exited_unreaped_child_succeeds_and_reaps_nothing() {
     use crate::os_process::child::{adopt_std, TryReapOutcome};
 
-    let mut cmd = crate::test_child::held_std_killable_blocker();
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     drop(child.stdin.take());
     let id = ProcessId::of(child.id())
