@@ -39,10 +39,7 @@ impl MacChild {
     pub(crate) fn new(pid: u32, unique: u64) -> Result<MacChild, Error> {
         let exit = ExitWatch::proc_exit(pid)?;
         let reap = Kqueue::new()?;
-        // An `ESRCH` here is dropped, not read as an exit: the exit watch is the one that says so.
-        // A pid past registration refuses both registrations, so in practice the exit watch has
-        // fired too, and `exited` confirms it (`has_exited`) while `try_reap` peeks `waitid` and
-        // rechecks on the fired watch.
+        // An ESRCH here is not read as an exit: only the exit watch reports one.
         register_exit_events(&reap, pid).map_err(Error::Io)?;
         Ok(MacChild {
             pid,
@@ -109,7 +106,13 @@ impl OsChild for MacChild {
     /// XNU withholds `NOTE_EXIT` from a parent that does not trace the child while `p_oppid` is
     /// set, so a zombie its tracer holds is seen as one (`SZOMB`) on the verified unique id.
     fn exited_unannounced(&self) -> Result<bool, Error> {
-        crate::identity::has_exited(self.pid, self.unique, crate::identity::ExitRead::Unannounced)
+        crate::identity::has_exited(self.pid, self.unique, crate::identity::ReadPurpose::Running).map_err(|errno| {
+            crate::os_process::macos::exit_read_refused(
+                self.pid,
+                errno,
+                "its exit watch has not fired, and whether it has exited could not be read",
+            )
+        })
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the

@@ -486,40 +486,33 @@ fn a_refused_identity_read_for_an_open_keeps_its_errno_as_the_source() {
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
 }
 
-/// A refused `has_exited` read is `Unassessable` with the errno as its source, whatever the
-/// situation, and says that situation: a fired watch says the exit has begun; no watch says none was
-/// announced. Neither words the errno nor claims an exit watch is armed when none is.
-///
-/// Mutant: one text for both situations, or an `Error::Io`, or the errno lost.
+/// A refused `has_exited` read is `Unassessable` with the errno as its source, and the message
+/// does not word it as an "errno". Both readers of it (`ExitWatch::look` and
+/// `MacChild::exited_unannounced`) build it with this function, each with its own situation text.
 #[skuld::test]
-fn a_refused_has_exited_read_is_unassessable_with_the_errno_and_says_its_situation() {
-    use crate::identity::uniq_fault::force_uniq_read_once;
-    use crate::identity::{has_exited, ExitRead};
-
-    let refused = |situation, purpose| {
-        let _refused = force_uniq_read_once(purpose, UniqRead::Refused(libc::EPERM));
-        has_exited(77, 1, situation).expect_err("a refused read is an error")
-    };
-    let fired = refused(ExitRead::Fired, ReadPurpose::Exit);
-    let unannounced = refused(ExitRead::Unannounced, ReadPurpose::Running);
-    for err in [&fired, &unannounced] {
+fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_words_none() {
+    for (situation, said) in [
+        (
+            "its exit watch fired, but whether it has exited could not be read",
+            "pid 77: its exit watch fired, but whether it has exited could not be read",
+        ),
+        (
+            "its exit watch has not fired, and whether it has exited could not be read",
+            "pid 77: its exit watch has not fired, and whether it has exited could not be read",
+        ),
+    ] {
+        let err = super::exit_read_refused(77, libc::EPERM, situation);
         assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-        assert_eq!(crate::error::first_os_code(err), Some(libc::EPERM), "{err:?}");
-        assert!(!crate::error::said(err).contains("errno"), "{err:?}");
+        assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+        assert_eq!(crate::error::said(&err), said);
+        assert!(!said.contains("errno"), "{said}");
     }
-    assert_eq!(
-        crate::error::said(&fired),
-        "pid 77 has begun to exit, but whether it has finished could not be read"
-    );
-    assert_eq!(
-        crate::error::said(&unannounced),
-        "pid 77: no exit was announced for it, and whether it has exited could not be read"
-    );
 }
 
-/// A refused read of `exited_unannounced` is `Unassessable` with the errno as its source.
+/// A refused read of `exited_unannounced`, on a plain `MacChild::new`, is `Unassessable` with the
+/// errno as its source and says its watch has not fired.
 ///
-/// Mutant: `MacChild::exited_unannounced` wraps the errno as `Error::Io`.
+/// Mutant: `MacChild::exited_unannounced` wraps the errno as `Error::Io`, or words another situation.
 #[skuld::test]
 fn a_refused_unannounced_read_is_unassessable_with_the_errno() {
     use crate::identity::uniq_fault::force_uniq_read_once;
@@ -535,6 +528,13 @@ fn a_refused_unannounced_read_is_unassessable_with_the_errno() {
     let err = mac.exited_unannounced().expect_err("a refused read is an error");
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    assert_eq!(
+        crate::error::said(&err),
+        format!(
+            "pid {}: its exit watch has not fired, and whether it has exited could not be read",
+            id.pid()
+        )
+    );
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -673,10 +673,12 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 
-/// An `ESRCH` at the reap registration (forced) does not fail the adoption of a child. The forcing was
-/// the reap's: the exit watch's registration left it armed, and the assert shows it was consumed.
+/// A pid past registration at the reap registration (`ESRCH`, forced) is not a failure either, and it
+/// is no news about the exit: the exit watch registered on its own and the running child reads
+/// `Running`. The forcing was the reap's (the exit watch's registration left it armed).
 ///
-/// Mutant: `ESRCH` at the reap registration fails the adoption.
+/// Mutant: `ESRCH` at the reap registration fails the adoption, or reads the child as exited (marks
+/// the exit watch fired).
 #[skuld::test]
 fn esrch_at_the_reap_registration_adopts_a_running_child() {
     use crate::os_process::macos::child::MacChild;
@@ -692,13 +694,16 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
         panic!("the blocker's unique id must be readable");
     };
     let forced = force_proc_registration_esrch_once(Registration::Reap);
-    let adopted = MacChild::new(id.pid(), read.unique_id);
+    let os = MacChild::new(id.pid(), read.unique_id).expect("the reap's ESRCH is no failure");
     assert!(
         !take_forced_esrch_registration(Registration::Reap),
         "the reap registration consumed the forcing"
     );
     drop(forced);
-    adopted.expect("the reap's ESRCH is no failure");
+    assert!(
+        matches!(os.exited().unwrap(), Exit::Running(_)),
+        "the exit watch registered on its own: the child runs"
+    );
     drop(stdin);
     child.wait().unwrap();
 }

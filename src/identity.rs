@@ -977,8 +977,8 @@ pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
 /// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::{
-    has_exited, held_by, link, origin, own_unique_id, read_refused, uniq_info, ExitRead, Held, Link, Origin,
-    ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
+    has_exited, held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose, UniqInfo, UniqRead,
+    LAUNCHD,
 };
 
 /// The identity-read forcing seams.

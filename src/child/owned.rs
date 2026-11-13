@@ -242,11 +242,9 @@ impl OwnedChild {
     /// An edge that fired and could not be confirmed (`exited` failed) is answered by the peek where
     /// the peek can: an exit record or a reap elsewhere is `Dead`; otherwise the failure stands,
     /// also when the peek reads the child running, which proves nothing (a tracer can hold the
-    /// zombie, which the real parent's `waitid` does not see). A `Recheck` edge (the watch
-    /// fired and the process is not yet a zombie: it is exiting) answers `Alive` until the zombie, as
-    /// [`ProcessId::is_alive`](crate::identity::ProcessId::is_alive) does, unless the peek shows
-    /// the exit record first;
-    /// `exited_unannounced` is not asked, since the edge is not silent.
+    /// zombie, which the real parent's `waitid` does not see). A `Recheck` (the exit watch fired, and
+    /// the process is not yet a zombie) answers `Alive` until the zombie, as `ProcessId::is_alive`
+    /// does, unless the peek shows the exit record.
     pub(crate) fn liveness(&self) -> Result<crate::identity::Liveness, Error> {
         use crate::identity::Liveness;
         use crate::os_process::Exit;
@@ -259,7 +257,9 @@ impl OwnedChild {
                     Ok(PeekOutcome::Running) => Err(refused),
                     Err(peek) => {
                         log::debug!(
-                            "liveness: the peek behind a refused exit confirmation failed too: {}",
+                            "liveness: child {:?}: the exit confirmation was refused ({}), and the peek behind it failed too ({})",
+                            self.pid(),
+                            crate::error::Report(&refused),
                             crate::error::Report(&peek)
                         );
                         Err(refused)
