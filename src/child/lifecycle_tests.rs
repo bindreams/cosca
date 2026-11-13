@@ -424,18 +424,17 @@ fn a_loud_wait_warns_of_an_orphaned_zombie() {
     }
 }
 
-/// `try_wait` and a quiet `wait_timeout` leave the zombie launchd holds unreported: their callers
-/// report it with the refusal they go on to make.
+/// `try_wait` leaves the zombie launchd holds unreported: its callers report it with the refusal
+/// they go on to make.
 ///
 /// Mutant: `Child` warns whatever the caller asked.
 #[cfg(unix)]
 #[skuld::test]
-fn a_quiet_wait_does_not_warn_of_an_orphaned_zombie() {
+fn try_wait_does_not_warn_of_an_orphaned_zombie() {
     crate::log_capture::install();
     let child = child_of_an_orphaned_zombie(2);
     let mark = crate::log_capture::mark();
     assert_reaped_elsewhere(child.try_wait());
-    assert_reaped_elsewhere(child.wait_timeout_quiet(Duration::from_secs(3600)));
     assert_eq!(orphan_warns_since(mark), 0);
 }
 

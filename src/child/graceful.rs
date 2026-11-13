@@ -11,8 +11,8 @@ use crate::containment::{Skip, SkipCall};
 use crate::error::Error;
 
 /// The `crate::wait::fault` grace-watch seam, consumed HERE rather than inside a specific
-/// backend so it applies to the two watches of `graceful_shutdown_tree`'s main path — root-only
-/// ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
+/// backend so it applies to the watches of `graceful_shutdown` and of `graceful_shutdown_tree`'s main path —
+/// root-only ([`OwnedChild::exited_by`](super::owned::OwnedChild::exited_by)) or whole-tree
 /// ([`DrainEdge::wait`](crate::containment::drain_edge::DrainEdge::wait)). The holders-only and root-through-pidfd
 /// paths do not take it: their grace waits are their own. Outside test builds the seam module does
 /// not exist at all, so this compiles to a constant `None`.
@@ -155,35 +155,19 @@ impl Child {
     /// only through a cgroup that holds it. Outside one it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     ///
+    /// The grace watch reaps nothing: a root that exited within it, even one whose zombie a tracer
+    /// holds or whose reap another process took, is not escalated against, and the reap that
+    /// follows answers for it, with the status or its own failure (a root reaped elsewhere is an
+    /// [`Error::Io`](crate::error::Error::Io) with `ECHILD`).
+    ///
     /// **macOS, a root launchd holds** is refused by the cooperative half, as for
-    /// [`kill`](Child::kill). A root orphaned during the grace is not killed: the escalation returns
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying the kill sent nothing though
-    /// the `SIGTERM` was sent, and the grace wait does not warn.
+    /// [`kill`](Child::kill). A root launchd comes to hold during the call is not killed or waited
+    /// on, and nothing warns. If its exit was seen, the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) saying its exit status cannot be
+    /// collected. If it was orphaned after the grace ran out, the escalation returns `Unassessable`
+    /// saying the kill sent nothing though the `SIGTERM` was sent.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.terminate()?;
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::AfterTerminate);
-
-        // Quiet about a zombie launchd holds: the refusal below is the one report of it.
-        #[cfg(unix)]
-        let watch = self.wait_timeout_quiet(grace);
-        #[cfg(not(unix))]
-        let watch = self.wait_timeout(grace);
-        if let Ok(Some(status)) = &watch {
-            return Ok(*status); // exited within grace (already reaped by wait_timeout)
-        }
-        let mut watch = watch.err();
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::BeforeEscalation);
-        // A watch failure must not strand the child between the soft signal and the escalation, so
-        // the escalation's failures end the call only after it has been given to them. The escalation is
-        // `kill`, as for any child, with the `SIGTERM` named as already sent.
-        let call = format!("graceful_shutdown({})", self.pid());
-        self.kill_after(Some("the SIGTERM"))
-            .map_err(|e| crate::graceful::joined(&call, e, watch.take()))?;
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::BeforeReap);
-        crate::graceful::after_reap(&call, self.wait(), None, watch)
+        shutdown::run_ready(shutdown::shutdown_lone(&mut shutdown::BlockingDriver(self), grace))
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: send the group its graceful

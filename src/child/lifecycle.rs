@@ -310,27 +310,10 @@ impl Child {
     /// no waitable handle. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded (blocks until exit) rather than panicking.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, Orphaned::Warn)
-    }
-
-    /// [`wait_timeout`](Child::wait_timeout) that does not report a zombie launchd holds (macOS):
-    /// for a caller that reports it with its own refusal.
-    #[cfg(unix)]
-    pub(crate) fn wait_timeout_quiet(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        self.wait_timeout_by(timeout, Orphaned::Quiet)
-    }
-
-    fn wait_timeout_by(&self, timeout: Duration, orphaned: Orphaned) -> Result<Option<ExitStatus>, Error> {
-        // The sync lone path's watch goes through `OwnedChild::wait`, not
-        // `exited_by`, so it needs its own head of the shared watch fault seam.
-        #[cfg(test)]
-        if crate::wait::fault::take_force_watch_error() {
-            return Err(crate::wait::fault::forced_watch_error());
-        }
         // `Instant + Duration` panics on overflow (e.g. Duration::MAX). Convert to a deadline
         // with a saturating checked_add: on overflow the timeout is effectively infinite, so
         // block until exit.
-        self.wait_root(crate::wait::now().checked_add(timeout), orphaned)
+        self.wait_root(crate::wait::now().checked_add(timeout), Orphaned::Warn)
     }
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`

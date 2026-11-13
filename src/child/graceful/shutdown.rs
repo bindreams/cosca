@@ -1,5 +1,5 @@
-//! `graceful_shutdown_tree`, written once for the sync and the async `Child`; a [`Waits`]
-//! supplies each wait ([`BlockingDriver`] blocks, `tokio::Child` awaits).
+//! `graceful_shutdown` and `graceful_shutdown_tree`, each written once for the sync and the async
+//! `Child`; a [`Waits`] supplies each wait ([`BlockingDriver`] blocks, `tokio::Child` awaits).
 
 use std::future::Future;
 use std::pin::pin;
@@ -14,7 +14,7 @@ use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::TreeDrain;
 use crate::error::Error;
 
-/// The waits [`shutdown_tree`] makes. A deadline is a `Duration` from the wait's start, which each
+/// The waits [`shutdown_lone`] and [`shutdown_tree`] make. A deadline is a `Duration` from the wait's start, which each
 /// driver turns into an instant on its own clock.
 pub(crate) trait Waits {
     /// The child the call acts on: its gates, signals, tree and pid.
@@ -80,6 +80,45 @@ pub(crate) fn run_ready<F: Future>(f: F) -> F::Output {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("run_ready: the future is pending, but a blocking driver's waits are all ready"),
     }
+}
+
+/// [`Child::graceful_shutdown`](crate::Child::graceful_shutdown), for any [`Waits`]: the signal, the
+/// grace, the kill unless the root exited, and the reap.
+pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Result<ExitStatus, Error> {
+    w.child().terminate()?;
+    #[cfg(test)]
+    fault::run_hook(fault::HookPoint::AfterTerminate);
+
+    let pid = w.child().pid();
+    let call = format!("graceful_shutdown({pid})");
+    // A watch failure must not strand the child between the soft signal and the escalation: the
+    // kill and the reap still run, then the failure surfaces.
+    let watch = match take_forced_watch_error() {
+        Some(e) => Err(e),
+        None => w.root_exited(grace).await,
+    };
+    let exited = matches!(watch, Ok(true));
+    let mut watch = watch.err();
+    if !exited {
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeEscalation);
+        // The escalation is `kill`, with the `SIGTERM` named as already sent.
+        w.child()
+            .kill_after(Some("the SIGTERM"))
+            .map_err(|e| crate::graceful::joined(&call, e, watch.take()))?;
+    }
+    #[cfg(test)]
+    fault::run_hook(fault::HookPoint::BeforeReap);
+    // A zombie launchd holds is not ours to reap: waiting on it only warns.
+    #[cfg(target_os = "macos")]
+    if w.child().root_is_unpinned() {
+        return Err(crate::graceful::joined(
+            &call,
+            crate::signal::unpinned_status(pid, "graceful_shutdown"),
+            watch,
+        ));
+    }
+    crate::graceful::after_reap(&call, w.reap().await, None, watch)
 }
 
 /// [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), for any [`Waits`]: the signal,

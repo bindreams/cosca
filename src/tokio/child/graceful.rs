@@ -5,8 +5,6 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use super::Child;
-#[cfg(test)]
-use crate::child::graceful::fault;
 use crate::child::graceful::shutdown::Waits;
 #[cfg(unix)]
 use crate::child::graceful::HoldersShutdown;
@@ -125,31 +123,15 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     ///
-    /// **macOS, a root launchd holds** is refused by the cooperative half, as for the sync
-    /// [`Child::kill`](crate::Child::kill). A root orphaned during the grace is not killed: the
-    /// escalation returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying the kill
-    /// sent nothing though the `SIGTERM` was sent.
+    /// The grace watch reaps nothing: a root that exited within it, even one whose reap another
+    /// process took, is not escalated against, and the reap that follows answers for it, as for the
+    /// sync [`graceful_shutdown`](crate::Child::graceful_shutdown).
+    ///
+    /// **macOS, a root launchd holds** is answered as for the sync
+    /// [`graceful_shutdown`](crate::Child::graceful_shutdown): refused by the cooperative half, and
+    /// never killed or waited on, with no warn.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        self.terminate()?;
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::AfterTerminate);
-        // A watch failure must not strand the child between the soft signal and the escalation —
-        // kill and reap still run (grace unobservable => escalate now).
-        let call = format!("graceful_shutdown({})", self.pid());
-        let watch = self.exited_through_handle(Some(grace)).await;
-        let exited = matches!(watch, Ok(true));
-        let mut watch = watch.err();
-        if !exited {
-            #[cfg(test)]
-            fault::run_hook(fault::HookPoint::BeforeEscalation);
-            // The escalation is `kill`, with the `SIGTERM` named as already sent.
-            self.inner
-                .kill_after(Some("the SIGTERM"))
-                .map_err(|e| crate::graceful::joined(&call, e, watch.take()))?;
-        }
-        #[cfg(test)]
-        fault::run_hook(fault::HookPoint::BeforeReap);
-        crate::graceful::after_reap(&call, self.wait().await, None, watch)
+        crate::child::graceful::shutdown::shutdown_lone(self, grace).await
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: send the group its graceful
