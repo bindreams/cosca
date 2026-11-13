@@ -22,19 +22,11 @@ use crate::os_process::linux::fork::{fork_with_pidfd, Fork, Path};
 use crate::wait::exit_only::linux::peek;
 use crate::wait::exit_only::Target;
 
-/// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
-/// The request is the same 32 bits under glibc's `unsigned long` and musl's `int`.
-const PIDFD_GET_INFO: libc::Ioctl = 0xC040_FF0B_u32 as libc::Ioctl;
-const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
-
-/// The first version of `struct pidfd_info`, whose size is in [`PIDFD_GET_INFO`].
-#[repr(C)]
-#[derive(Default)]
-struct PidfdInfo {
-    mask: u64,
-    cgroupid: u64,
-    rest: [u32; 12],
-}
+/// `PIDFD_GET_INFO` for the first version of `struct pidfd_info` (`PIDFD_INFO_SIZE_VER0` bytes): `_IOWR(PIDFS_IOCTL_MAGIC
+/// = 0xFF, 11, ...)` of `linux/pidfd.h`. libc's own `PIDFD_GET_INFO` encodes `size_of::<libc::pidfd_info>()`, which a
+/// libc that adds the struct's later fields would change.
+const PIDFD_GET_INFO_VER0: libc::Ioctl = libc::_IOWR::<[u8; libc::PIDFD_INFO_SIZE_VER0 as usize]>(0xFF, 11);
+const _: () = assert!(size_of::<libc::pidfd_info>() >= libc::PIDFD_INFO_SIZE_VER0 as usize);
 
 /// The cgroup id of the task `pidfd` names, or `None` on a kernel with no `PIDFD_GET_INFO` (before
 /// 6.13). An error is a refusal of a kernel that has it, such as `ESRCH` for a task already reaped.
@@ -51,14 +43,20 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
     if let Some(id) = super::fault::forced_pidfd_cgroup_id() {
         return Ok(Some(id));
     }
-    let mut info = PidfdInfo {
-        mask: PIDFD_INFO_CGROUPID,
-        ..PidfdInfo::default()
+    // SAFETY: all-zero is a valid `pidfd_info` (plain integers).
+    let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
+    info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
+    // SAFETY: `info` is a valid, writable `struct pidfd_info`, at least as large as the first version the request
+    // encodes.
+    let rc = unsafe {
+        libc::ioctl(
+            pidfd.as_raw_fd(),
+            PIDFD_GET_INFO_VER0,
+            &mut info as *mut libc::pidfd_info,
+        )
     };
-    // SAFETY: `info` is a valid, writable `struct pidfd_info` of the size the request encodes.
-    let rc = unsafe { libc::ioctl(pidfd.as_raw_fd(), PIDFD_GET_INFO, &mut info as *mut PidfdInfo) };
     if rc == 0 {
-        if info.mask & PIDFD_INFO_CGROUPID == 0 {
+        if info.mask & u64::from(libc::PIDFD_INFO_CGROUPID) == 0 {
             return Ok(None);
         }
         return Ok(Some(info.cgroupid));

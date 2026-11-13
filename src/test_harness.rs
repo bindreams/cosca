@@ -74,6 +74,11 @@ pub const ELEVATION: skuld::Label;
 #[skuld::label]
 pub const PIDFD_GROUP_SIGNAL: skuld::Label;
 
+/// Selects the `PIDFD_GET_INFO` group's tests: those that need Linux 6.13+, whose pidfds answer
+/// `PIDFD_GET_INFO` with a task's cgroup id.
+#[skuld::label]
+pub const PIDFD_GET_INFO: skuld::Label;
+
 /// Selects the `CLONE3` group's tests: those that need a host whose seccomp profile and kernel allow
 /// `clone3`. Docker's default seccomp profile answers `clone3` with `ENOSYS` (without
 /// `CAP_SYS_ADMIN`): set `COSCA_TEST_CLONE3=0` under any default Docker profile.

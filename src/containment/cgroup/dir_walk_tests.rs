@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::{cgroup_id, find_descendant, Walked};
 use crate::containment::cgroup::fault::fail_walk_step;
 use crate::containment::cgroup::WalkStep;
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, pidfd_get_info, Group};
 
 /// A cgroup under the lane's own, removed with every cgroup made under it when dropped. Removal is
 /// by `rmdir` alone, deepest first: nothing is deleted through a mount.
@@ -143,7 +143,10 @@ pub(crate) fn id_at(path: &Path) -> u64 {
 
 /// A leaf's id is the cgroup id its members read through their pidfds (6.13 and later).
 #[skuld::test]
-fn cgroup_a_leaf_id_is_the_cgroup_id_its_members_read(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_leaf_id_is_the_cgroup_id_its_members_read(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
     let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
     let own = own
         .lines()
@@ -153,7 +156,7 @@ fn cgroup_a_leaf_id_is_the_cgroup_id_its_members_read(#[fixture(cgroup)] _group:
         .expect("pidfd_open");
     let read = crate::containment::cgroup::pidfd_cgroup_id(pidfd.as_fd())
         .expect("PIDFD_GET_INFO")
-        .expect("the lane's kernel has PIDFD_GET_INFO");
+        .expect("the pidfd_get_info group promised a kernel that answers PIDFD_GET_INFO");
     assert_eq!(id_at(&Path::new("/sys/fs/cgroup").join(own)), read);
 }
 
