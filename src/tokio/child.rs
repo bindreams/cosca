@@ -382,8 +382,11 @@ impl Child {
     /// collected by this call, only the root's own `wait`/`try_wait` does that. On Windows an
     /// empty process list is not taken as the drain, the first one included (it is empty on its first
     /// read after a kill): the job's list can empty before a member's process object is signalled,
-    /// so the call waits for each job member a system process snapshot still names. A caller that
-    /// needs a member whose exit cannot be observed named uses [`kill_tree`](Self::kill_tree).
+    /// so the call waits for each job member a system process snapshot still names. A Job member that
+    /// refuses the caller query access is not seen once the Job's list is empty. `wait_tree` after
+    /// `send_kill_tree` (or after a kill made outside cosca) can answer while that member is still
+    /// finishing its exit. `kill_tree` reports such a member as unobserved. A caller that needs a member
+    /// whose exit cannot be observed named uses [`kill_tree`](Self::kill_tree).
     /// Requires a mechanism with a real
     /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
@@ -400,7 +403,9 @@ impl Child {
     /// overflow `Instant` is treated as unbounded, matching [`wait_tree`](Child::wait_tree).
     /// `MembersRemain` means the tree was not seen drained by the deadline; on Windows the wait
     /// answers from the job's list as of its last look, in which a member that has just exited can
-    /// still appear.
+    /// still appear. The Windows limit of [`wait_tree`](Child::wait_tree) holds: a Job member that
+    /// refuses the caller query access is not seen once the Job's list is empty, and `kill_tree`
+    /// reports such a member as unobserved.
     pub async fn wait_tree_timeout(
         &self,
         timeout: std::time::Duration,

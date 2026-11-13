@@ -669,7 +669,9 @@ impl Child {
     /// says every member was reached, not that any has exited. A caller that needs the members gone
     /// uses [`kill_tree`](Self::kill_tree), or [`wait_tree`](Child::wait_tree) after a send-only
     /// kill, which waits for the tree's drain (on Windows, for each job member a system process
-    /// snapshot still names).
+    /// snapshot still names; a member that refuses the caller query access is not seen once the Job's
+    /// list is empty, so that wait can answer while it is still finishing its exit, which
+    /// `kill_tree` reports as unobserved).
     pub fn send_kill_tree(&self) -> Result<(), Error> {
         self.send_kill_tree_after("send_kill_tree", None)
             .map_err(|failure| failure.error)

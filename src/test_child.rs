@@ -308,7 +308,7 @@ pub(crate) fn live_blocker() -> (crate::Child, crate::PipeWriter, crate::identit
 
 /// `cmd /C more`, blocked reading its own piped stdin until EOF: a blocker every Windows host has.
 #[cfg(windows)]
-fn spawn_more_blocker() -> std::process::Child {
+pub(crate) fn spawn_more_blocker() -> std::process::Child {
     crate::test_spawn::spawn(
         std::process::Command::new("cmd")
             .args(["/C", "more"])

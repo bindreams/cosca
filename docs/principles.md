@@ -81,8 +81,12 @@ Unix registers the wait with the reactor. Windows registers it with the OS's wai
 [`registered_wait.rs`](../src/os_process/windows/registered_wait.rs)): one registration per
 process handle, one per handle of a job's drain round (at most 63), and, once the job's list is
 empty, one at a time for each member a system process snapshot still names (the snapshot, which
-opens every process on the system, runs on the pool: bounded work), so no handle outlives
-its own wait ([`job_wait_tree_drained`](../src/containment/drain_edge.rs)). The deadline is the registration's
+opens every process on the system, runs on the pool: bounded work; it is skipped while the job's
+count of processes ever is unchanged since a confirmation that waited for every member), so no
+handle outlives its own wait ([`job_wait_tree_drained`](../src/containment/drain_edge.rs)). A Job
+member that refuses the caller query access is not seen once the Job's list is empty, so a
+`wait_tree` after `send_kill_tree` can answer while it is still finishing its exit (`kill_tree`
+reports such a member as unobserved). The deadline is the registration's
 own timeout, on the real clock, so a Windows wait needs neither tokio's time driver nor its clock (a
 paused clock does not advance it); a timeout the OS counts short registers again for the time that
 is left. A wait owns a duplicate of the handle it waits on, so forgetting it leaks a registration but

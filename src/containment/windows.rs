@@ -14,6 +14,7 @@ use std::io;
 use std::mem::size_of;
 use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0,
@@ -21,9 +22,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
@@ -31,6 +33,7 @@ use windows::Win32::System::Threading::{
     THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
+use crate::containment::tree_kill::{Settled, Unnamed};
 use crate::error::{io_context, win32_io_error};
 use crate::identity::ProcessId;
 
@@ -41,6 +44,12 @@ use crate::identity::ProcessId;
 /// method can run while it closes, so none can see a recycled handle value.
 pub(crate) struct JobHandle {
     raw: HANDLE,
+    /// The job's [`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::TotalProcesses`] as of the last drain whose
+    /// confirmation waited for every member ([`confirm_drained`]); `0` before one. A process the job
+    /// ever had counts, wherever it came from (an assignment, a member's child, a process of a job
+    /// nested under it), and the count never falls, so an empty listing at the same count has no process
+    /// that was not confirmed.
+    confirmed: AtomicU32,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -62,7 +71,10 @@ impl std::fmt::Debug for JobHandle {
 impl JobHandle {
     fn new(handle: HANDLE) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
-        JobHandle { raw: handle }
+        JobHandle {
+            raw: handle,
+            confirmed: AtomicU32::new(0),
+        }
     }
 
     /// The job handle, open for as long as `self` is borrowed.
@@ -194,9 +206,10 @@ impl JobHandle {
     /// naturally can still show its deleted pid for one listing, so [`wait_drained_raw`] lists again
     /// and a drain is only an empty listing. `root`, the root's pid, is left out: its owner waits for
     /// it. A member that cannot be named, or the listing itself failing, is returned as an error
-    /// saying its exit cannot be observed; the kill goes ahead regardless.
-    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<crate::error::Error>) {
-        use crate::containment::tree_kill::exit_unobserved;
+    /// saying its exit cannot be observed, with its pid where it has one; the kill goes ahead
+    /// regardless. A pid the job's own list names whose membership cannot be established is one such
+    /// member, not an absent one.
+    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<Unnamed>) {
         use crate::error::Error;
 
         let pids = match query_job_pid_list(self.raw) {
@@ -208,7 +221,7 @@ impl JobHandle {
                         .to_owned(),
                     source: Some(Error::io_cause(e)),
                 };
-                return (Vec::new(), vec![why]);
+                return (Vec::new(), vec![Unnamed::nameless(why)]);
             }
         };
         let (mut members, mut unobserved) = (Vec::new(), Vec::new());
@@ -216,7 +229,8 @@ impl JobHandle {
             match member_identity(self.raw, pid, open_for_membership(pid)) {
                 Ok(Some(id)) => members.push(id),
                 Ok(None) => {}
-                Err(cause) => unobserved.push(exit_unobserved(pid, cause)),
+                Err(NotNamed::Membership(e)) => unobserved.push(Unnamed::member(pid, Error::Io(e))),
+                Err(NotNamed::Identity(cause)) => unobserved.push(Unnamed::member(pid, cause)),
             }
         }
         (members, unobserved)
@@ -241,25 +255,47 @@ fn open_for_wait(pid: u32) -> windows::core::Result<HANDLE> {
     unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
 }
 
+/// Why a process was not named a member of a job by its identity.
+enum NotNamed {
+    /// Whether it is a member could not be established: the open was refused, or `IsProcessInJob`
+    /// failed.
+    Membership(io::Error),
+    /// It is a member, and its start time could not be read.
+    Identity(crate::error::Error),
+}
+
 /// The identity of the process `OpenProcess` returned as `opened`, if it is a member of `job`; `None`
-/// if it is not one (its pid is gone or was reused). The handle is closed on every path. The error is
-/// the cause that kept membership or the identity from being established.
+/// if it is not one (its pid is gone or was reused). The handle is closed on every path. A process
+/// that is not shown to be a member, or a member that cannot be identified, is [`NotNamed`] for that
+/// reason, which a caller treats by what it knows of the pid.
 fn member_identity(
     job: HANDLE,
     pid: u32,
     opened: windows::core::Result<HANDLE>,
-) -> Result<Option<ProcessId>, crate::error::Error> {
+) -> Result<Option<ProcessId>, NotNamed> {
     use crate::error::Error;
 
-    let Some(handle) = member_to_watch(opened, job).map_err(Error::Io)? else {
+    #[cfg(test)]
+    if let Err(e) = forced(fault::Step::Membership, Some(pid)) {
+        if let Ok(handle) = opened {
+            // SAFETY: opened by the caller and kept nowhere else.
+            _ = unsafe { CloseHandle(handle) };
+        }
+        return Err(NotNamed::Membership(win32_io_error(e)));
+    }
+    let Some(handle) = member_to_watch(opened, job).map_err(NotNamed::Membership)? else {
         return Ok(None);
     };
     let id = crate::identity::windows_identity_from_handle_result(handle, pid);
+    #[cfg(test)]
+    let id = forced(fault::Step::Identity, Some(pid)).and(id);
     // SAFETY: opened by the caller and kept nowhere else.
     _ = unsafe { CloseHandle(handle) };
-    id.map(Some).map_err(|e| Error::Unassessable {
-        detail: "its start time could not be read".to_owned(),
-        source: Some(Error::io_cause(win32_io_error(e))),
+    id.map(Some).map_err(|e| {
+        NotNamed::Identity(Error::Unassessable {
+            detail: "its start time could not be read".to_owned(),
+            source: Some(Error::io_cause(win32_io_error(e))),
+        })
     })
 }
 
@@ -717,6 +753,10 @@ pub(crate) mod fault {
         /// The assignment of a Strongest root's job.
         Assign,
         JobKill,
+        /// The membership check of a process by pid (`member_identity`), keyed by the pid.
+        Membership,
+        /// The read of a member's identity by pid (`member_identity`), keyed by the pid.
+        Identity,
     }
 
     /// The forced pid lists of this thread.
@@ -1025,13 +1065,23 @@ impl JobHandle {
     /// before its process object is signalled, and after a kill the list can be empty while members
     /// have not been signalled, so an empty re-count (the first one too) is the drain only once the
     /// members a system process snapshot still names that are in this job have exited: the wait
-    /// opens each, one at a time, waits for it and closes it ([`confirm_drained`]). Never reports
-    /// `AllMembersExited` falsely (only an empty re-count with no such member left does); with more
+    /// opens each, one at a time, waits for it and closes it ([`confirm_drained`]). Only an empty
+    /// re-count with no such member left answers `AllMembersExited`, within the limit below; with more
     /// than `MAXIMUM_WAIT_OBJECTS - 1` live members it may notice the drain late. The handle stays
     /// open after [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree. A member
-    /// the caller may not wait on (an elevated one, under a caller that is not) is a member whose
-    /// exit cannot be observed: the answer is `Unassessable` naming its pid, with the OS error as the
-    /// cause, never `AllMembersExited`.
+    /// the caller may open for membership but not wait on (an elevated one, under a caller that is not)
+    /// is a member whose exit cannot be observed: the answer is `Unassessable` naming its pid, with the
+    /// OS error as the cause, never `AllMembersExited`.
+    ///
+    /// # Limit
+    ///
+    /// A Job member that refuses the caller query access is not seen once the Job's list is empty.
+    /// `wait_tree` after `send_kill_tree` (or after a kill made outside cosca) can answer while that
+    /// member is still finishing its exit. `kill_tree` reports such a member as unobserved. (The
+    /// system snapshot's processes are opened for `PROCESS_QUERY_LIMITED_INFORMATION` alone to ask
+    /// whether each is in the Job: another user's, an elevated, or a query-refusing-DACL process
+    /// cannot be shown to be, so it is skipped, as is one whose `IsProcessInJob` fails. A live member
+    /// is always in the Job's list, so the answer can come only while it exits.)
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1043,7 +1093,7 @@ impl JobHandle {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        wait_drained_raw(self.handle(), deadline)
+        wait_drained_raw(self, deadline)
     }
 
     /// [`wait_drained`](Self::wait_drained) for a caller that has waited for the members `settled`
@@ -1051,9 +1101,31 @@ impl JobHandle {
     pub(crate) fn wait_drained_past(
         &self,
         deadline: Option<std::time::Instant>,
-        settled: &[ProcessId],
+        settled: &Settled,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-        wait_drained_past(self.handle(), deadline, settled)
+        wait_drained_past(self, deadline, settled)
+    }
+
+    /// What the confirmation of an empty listing must do ([`Round::Confirm`]): `None` if the
+    /// job has had no process since a confirmation that waited for them all, so that none is left to
+    /// wait for (a job that never had one has the count `0`, which the stored count starts at), and
+    /// `Some(count)`, the job's [`total_processes`] read now, if the members its snapshot names must be
+    /// waited for. Pass `count` to [`confirmed_at`](Self::confirmed_at) once they have been. The count
+    /// is read after the listing that was empty and before the snapshot, so a process that joins
+    /// later shows in the next count.
+    pub(crate) fn count_to_confirm(&self) -> Result<Option<u32>, crate::error::Error> {
+        let count = total_processes(self.raw).map_err(|e| crate::error::Error::Unassessable {
+            detail: "the number of processes the job has had could not be read, so its drain cannot be confirmed"
+                .to_owned(),
+            source: Some(crate::error::Error::io_cause(e)),
+        })?;
+        Ok((count != self.confirmed.load(Ordering::Relaxed)).then_some(count))
+    }
+
+    /// Record that every member of the job was waited for when its count was `count`
+    /// ([`count_to_confirm`](Self::count_to_confirm)).
+    pub(crate) fn confirmed_at(&self, count: u32) {
+        self.confirmed.store(count, Ordering::Relaxed);
     }
 
     /// One round of the drain wait: list the live members, open each (up to the wait-set cap) with
@@ -1077,7 +1149,7 @@ impl JobHandle {
 /// handle to: see [`confirm_drained`]. A handle, not `&JobHandle`, so the async drain can run it on
 /// the blocking pool with a duplicate of the job's handle: the scan opens every process on the system.
 #[cfg(feature = "tokio")]
-pub(crate) fn unsignalled_members_of(job: BorrowedHandle<'_>) -> Result<Vec<ProcessId>, crate::error::Error> {
+pub(crate) fn unsignalled_members_of(job: BorrowedHandle<'_>) -> Result<Vec<Found>, crate::error::Error> {
     unsignalled_members(HANDLE(job.as_raw_handle()))
 }
 
@@ -1161,8 +1233,7 @@ fn thread_entries_closing(
     walked
 }
 
-/// The blocking driver of the drain wait's rounds ([`drain_round`]), taking a borrowed handle rather
-/// than `&JobHandle`.
+/// The blocking driver of the drain wait's rounds ([`drain_round`]).
 ///
 /// `MembersRemain` means the tree was not seen drained by the deadline. A round that starts past the
 /// deadline (an already-elapsed or `Duration::ZERO` one, or one reached after a wait ended on a
@@ -1174,25 +1245,27 @@ fn thread_entries_closing(
 ///
 /// An empty listing, the first one too, is no answer by itself: [`confirm_drained`] waits for the
 /// members a system snapshot still names, until the deadline, and `AllMembersExited` answers only
-/// once none is left; one still running at the deadline is `MembersRemain`.
+/// once none is left; one still running at the deadline is `MembersRemain`. The job that no process
+/// has joined since such a confirmation has none to wait for, and an empty listing of it answers
+/// `AllMembersExited` with no snapshot ([`JobHandle::count_to_confirm`]).
 pub(crate) fn wait_drained_raw(
-    job: BorrowedHandle<'_>,
+    job: &JobHandle,
     deadline: Option<std::time::Instant>,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
-    wait_drained_past(job, deadline, &[])
+    wait_drained_past(job, deadline, &Settled::default())
 }
 
 /// [`wait_drained_raw`] for a caller that has already waited for the members `settled` (each exited,
 /// or failed in a way it reported): the confirmation of an empty listing does not wait for them or
 /// report them again.
 pub(crate) fn wait_drained_past(
-    job: BorrowedHandle<'_>,
+    job_handle: &JobHandle,
     deadline: Option<std::time::Instant>,
-    settled: &[ProcessId],
+    settled: &Settled,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::TreeDrain;
 
-    let job = HANDLE(job.as_raw_handle());
+    let job = HANDLE(job_handle.handle().as_raw_handle());
     loop {
         // A round that starts past the deadline is the last: it lists and answers, with at most one
         // more listing (`final_listing`).
@@ -1207,7 +1280,7 @@ pub(crate) fn wait_drained_past(
         };
         match round {
             Round::Answer(drain) => return Ok(drain),
-            Round::Confirm => return confirm_drained(job, deadline, settled),
+            Round::Confirm => return confirm_drained(job_handle, deadline, settled),
             // A tracked member exited, or the listing named no live member: the next round
             // re-enumerates the authoritative live set.
             Round::List | Round::Watch(_) => {}
@@ -1330,29 +1403,58 @@ fn after_signalled(job: HANDLE, watch: &Watch) -> Result<Round, crate::error::Er
 /// A member in the gap is in the snapshot taken after the listing: it is not yet signalled, and a
 /// signalled process is not in a snapshot.
 ///
+/// A job that has had no process since a confirmation that walked every member has none to wait for:
+/// its count of processes ever ([`JobHandle::count_to_confirm`]) says so, and no snapshot is taken.
+/// The count is stored once every member the snapshot named was waited for, none of them `settled`
+/// (a settled member that is still running was not waited for, and a later drain must not stand for
+/// it).
+///
 /// The async drain ([`job_wait_tree_drained`](crate::containment::drain_edge)) is this walk with its
 /// own wait: the members it walks ([`unsettled`]) and what a wait for one comes to ([`waited`]) are
 /// the same functions.
 fn confirm_drained(
-    job: HANDLE,
+    job: &JobHandle,
     deadline: Option<std::time::Instant>,
-    settled: &[ProcessId],
+    settled: &Settled,
 ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
     use crate::containment::tree_kill::wait_for_member;
     use crate::containment::TreeDrain;
     use crate::identity::HostKernel;
 
-    for id in unsettled(unsignalled_members(job)?, settled) {
+    let Some(count) = job.count_to_confirm()? else {
+        return Ok(TreeDrain::AllMembersExited);
+    };
+    let (walk, skipped) = unsettled(unsignalled_members(job.raw)?, settled);
+    for next in walk {
+        let id = next?;
         if !waited(id, wait_for_member(&HostKernel, id, deadline))? {
             return Ok(TreeDrain::MembersRemain);
         }
     }
+    if !skipped {
+        job.confirmed_at(count);
+    }
     Ok(TreeDrain::AllMembersExited)
 }
 
-/// The members a confirmation walks: those `snapshot` names that the caller has not `settled`.
-pub(crate) fn unsettled(snapshot: Vec<ProcessId>, settled: &[ProcessId]) -> impl Iterator<Item = ProcessId> + '_ {
-    snapshot.into_iter().filter(move |id| !settled.contains(id))
+/// A process a snapshot names that is a member of the job: its identity, or its pid and why the
+/// identity could not be read.
+pub(crate) type Found = Result<ProcessId, (u32, crate::error::Error)>;
+
+/// The members a confirmation walks: those `found` that the caller has not `settled`, each as its
+/// identity or the error naming it ([`member_unobserved`]), and whether any was left out as settled.
+pub(crate) fn unsettled(found: Vec<Found>, settled: &Settled) -> (Vec<Result<ProcessId, crate::error::Error>>, bool) {
+    let mut walk = Vec::new();
+    let mut skipped = false;
+    for member in found {
+        match member {
+            Ok(id) if settled.covers(id.pid(), Some(id)) => skipped = true,
+            Ok(id) => walk.push(Ok(id)),
+            Err((pid, _)) if settled.covers(pid, None) => skipped = true,
+            Err((pid, cause)) => walk.push(Err(member_unobserved(pid, cause))),
+        }
+    }
+    (walk, skipped)
 }
 
 /// What a confirmation's wait for the member `id` comes to: `true` it has exited, `false` it runs at
@@ -1366,9 +1468,14 @@ pub(crate) fn waited(id: ProcessId, wait: Result<bool, crate::error::Error>) -> 
 /// not wait on is still named; the wait then fails for it, as an error naming its pid
 /// ([`member_unobserved`]), and is never an exit. A pid that cannot be opened even for that is not
 /// provably the job's, as an unrelated system process is not, and one that a new process reused
-/// answers not-in-job. A failed snapshot, or a failed membership check on a process that opened, is
-/// an error: neither is an empty job.
-fn unsignalled_members(job: HANDLE) -> Result<Vec<ProcessId>, crate::error::Error> {
+/// answers not-in-job. So is one whose `IsProcessInJob` fails, which is logged: membership cannot be
+/// shown for it, as for one that cannot be opened. That is the stated limit of the wait: a Job member
+/// that refuses the caller query access is not seen once the Job's list is empty, so a wait after
+/// `send_kill_tree` can answer while it is still finishing its exit, and `kill_tree` reports it as
+/// unobserved (see [`wait_drained`](JobHandle::wait_drained)). A member whose start time cannot be
+/// read is in the result as the pid and the cause ([`Found`]), for the walk to report unless it is
+/// settled. A failed snapshot is an error: it is not an empty job.
+fn unsignalled_members(job: HANDLE) -> Result<Vec<Found>, crate::error::Error> {
     use crate::identity::HostKernel;
 
     let mut members = Vec::new();
@@ -1376,11 +1483,36 @@ fn unsignalled_members(job: HANDLE) -> Result<Vec<ProcessId>, crate::error::Erro
         let Ok(handle) = open_for_membership(pid) else {
             continue;
         };
-        if let Some(id) = member_identity(job, pid, Ok(handle)).map_err(|cause| member_unobserved(pid, cause))? {
-            members.push(id);
+        match member_identity(job, pid, Ok(handle)) {
+            Ok(Some(id)) => members.push(Ok(id)),
+            Ok(None) => {}
+            Err(NotNamed::Membership(e)) => log::debug!(
+                "the drain's snapshot names pid {pid}, whose membership of the job cannot be established ({report}); \
+                 it is not waited for",
+                report = crate::error::Report(&e)
+            ),
+            Err(NotNamed::Identity(cause)) => members.push(Err((pid, cause))),
         }
     }
     Ok(members)
+}
+
+/// The number of processes the job has ever had (`TotalProcesses`): an assignment, a member's child,
+/// and a process of a job nested under it each count, and it never falls.
+fn total_processes(job: HANDLE) -> io::Result<u32> {
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: `info` is the structure the class asks for, and the job handle is open for the call.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job),
+            JobObjectBasicAccountingInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            None,
+        )
+    }
+    .map_err(win32_io_error)?;
+    Ok(info.TotalProcesses)
 }
 
 /// The failure of a drain that cannot establish whether the job's member `pid` has exited.

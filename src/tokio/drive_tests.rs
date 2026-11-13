@@ -652,6 +652,34 @@ mod windows {
         member.wait().expect("reap the member");
     }
 
+    /// A process that joins the job after a confirmed drain is confirmed too, as in the sync wait: the
+    /// job's count has risen, so the next empty listing (forced) takes the snapshot, finds the new
+    /// member running and, at an elapsed deadline, answers `MembersRemain`.
+    ///
+    /// Mutant: a confirmed drain's stored count is trusted whatever the job's count is now.
+    #[skuld::test]
+    async fn a_member_assigned_after_a_confirmed_drain_is_confirmed_too() {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use crate::containment::windows::fault::force_job_pid_list;
+
+        let (child, job) = spawn_job_member();
+        let_member_exit(child);
+        assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
+        let second = crate::test_child::spawn_more_blocker();
+        job.assign_for_test(second.as_raw_handle())
+            .expect("assign a new member to the job");
+        let _forced = force_job_pid_list(Vec::new());
+        let verdict = drain(&job, crate::tokio::wait::deadline_from(Duration::ZERO)).await;
+        job.hard_kill().expect("end the member");
+        let_member_exit(second);
+        assert_eq!(
+            verdict,
+            TreeDrain::MembersRemain,
+            "the drain stood for a member it never confirmed"
+        );
+    }
+
     /// A member the caller may open for its membership but not wait on is one whose exit cannot be
     /// observed: the async drain fails, naming it, with the OS error as the cause, as the sync one
     /// does, and never answers `AllMembersExited` while it runs.

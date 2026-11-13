@@ -34,12 +34,77 @@ pub(crate) struct KillWait<'a> {
     /// is waited for once.
     members: Vec<ProcessId>,
     /// Members a send reached but could not name by identity, so their exit cannot be observed.
-    unobserved: Vec<Error>,
+    unobserved: Vec<Unnamed>,
     /// The tree's own edge for "no member runs", chosen by the mechanism: only a kernel tree whose
     /// kill landed has one. It is waited for with no deadline.
     edge: Option<DrainEdge<'a>>,
     root: RootEnd<'a>,
     kernel: &'a dyn Kernel,
+}
+
+/// A member a kill's send reached but whose identity could not be had (or a listing that failed
+/// whole), so its exit cannot be observed. `why` says so; `pid` names the member where the listing
+/// had one, so a later wait that meets the same member does not report it again ([`Settled`]).
+#[derive(Debug)]
+pub(crate) struct Unnamed {
+    pid: Option<u32>,
+    why: Error,
+}
+
+impl Unnamed {
+    /// The member `pid`, whose identity could not be had for `cause`.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn member(pid: u32, cause: Error) -> Unnamed {
+        Unnamed {
+            pid: Some(pid),
+            why: exit_unobserved(pid, cause),
+        }
+    }
+
+    /// A member, or a listing, with no pid to name: `why` is the whole error.
+    #[cfg(any(target_os = "linux", windows, test))]
+    pub(crate) fn nameless(why: Error) -> Unnamed {
+        Unnamed { pid: None, why }
+    }
+
+    /// The error saying the member's exit cannot be observed, for a row that states its words.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn why(&self) -> &Error {
+        &self.why
+    }
+}
+
+/// The members a kill's wait has already settled when it waits on the tree's edge: those it waited for
+/// (each exited, or was reported once) by identity, and those the listing could not name, which it
+/// reported already, by pid (the identity is what could not be read). The edge neither waits for nor
+/// reports them again. A pid is all there is to tell an unnamed member by: a process with that pid
+/// that joins the tree during the one wait is taken for it.
+#[derive(Default)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Job's edge confirms members it did not list")
+)]
+pub(crate) struct Settled {
+    members: Vec<ProcessId>,
+    unnamed: Vec<u32>,
+}
+
+impl Settled {
+    pub(crate) fn new(members: &[ProcessId], unnamed: &[Unnamed]) -> Settled {
+        Settled {
+            members: members.to_vec(),
+            unnamed: unnamed.iter().filter_map(|unnamed| unnamed.pid).collect(),
+        }
+    }
+
+    /// Whether the process `pid`, whose identity is `id` where it could be read, is settled.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only a Job's edge confirms members it did not list")
+    )]
+    pub(crate) fn covers(&self, pid: u32, id: Option<ProcessId>) -> bool {
+        self.unnamed.contains(&pid) || id.is_some_and(|id| self.members.contains(&id))
+    }
 }
 
 /// What a [`KillWait`] does about the root, which its owner holds.
@@ -80,7 +145,7 @@ impl<'a> TreeKill<'a> {
     /// be observed.
     #[cfg(test)]
     pub(crate) fn unobserved(mut self, why: Error) -> TreeKill<'a> {
-        self.wait.unobserved.push(why);
+        self.wait.unobserved.push(Unnamed::nameless(why));
         self
     }
 
@@ -92,14 +157,14 @@ impl<'a> TreeKill<'a> {
     pub(crate) fn listed(
         sent: TreeKillOutcome,
         members: Vec<ProcessId>,
-        unobserved: Vec<Error>,
+        unobserved: Vec<Unnamed>,
         edge: DrainEdge<'a>,
     ) -> TreeKill<'a> {
         if !matches!(sent, TreeKillOutcome::Ran(Ok(()))) {
-            for why in &unobserved {
+            for unnamed in &unobserved {
                 log::debug!(
                     "the kill failed, so a member the listing could not name is not waited for: {report}",
-                    report = crate::error::Report(why)
+                    report = crate::error::Report(&unnamed.why)
                 );
             }
             return TreeKill::of(sent);
@@ -180,12 +245,14 @@ impl<'a> KillWait<'a> {
     pub(crate) fn wait(self) -> Result<(), Error> {
         let KillWait {
             members,
-            mut unobserved,
+            unobserved: unnamed,
             edge,
             root,
             kernel,
         } = self;
         let members: Vec<ProcessId> = once_each(members).collect();
+        let settled = Settled::new(&members, &unnamed);
+        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
         for &id in &members {
             if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
                 unobserved.push(exit_unobserved(id.pid(), why));
@@ -198,7 +265,7 @@ impl<'a> KillWait<'a> {
         }
         if let Some(edge) = edge {
             // Every member reached is settled: it exited or was reported above, once.
-            if let Err(why) = edge.wait_past(None, &members).and_then(drained) {
+            if let Err(why) = edge.wait_past(None, &settled).and_then(drained) {
                 unobserved.push(why);
             }
         }
@@ -212,12 +279,14 @@ impl<'a> KillWait<'a> {
     pub(crate) async fn wait_async(self) -> Result<(), Error> {
         let KillWait {
             members,
-            mut unobserved,
+            unobserved: unnamed,
             edge,
             root,
             kernel,
         } = self;
         let members: Vec<ProcessId> = once_each(members).collect();
+        let settled = Settled::new(&members, &unnamed);
+        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
         for &id in &members {
             if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
                 unobserved.push(exit_unobserved(id.pid(), why));
@@ -229,7 +298,7 @@ impl<'a> KillWait<'a> {
             }
         }
         if let Some(edge) = edge {
-            if let Err(why) = edge.wait_async_past(None, &members).await.and_then(drained) {
+            if let Err(why) = edge.wait_async_past(None, &settled).await.and_then(drained) {
                 unobserved.push(why);
             }
         }

@@ -4,9 +4,9 @@
 
 use std::time::Instant;
 
+use crate::containment::tree_kill::Settled;
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::identity::ProcessId;
 
 /// A tree's own kernel edge for "every member has exited", borrowed from the tree that owns the
 /// resource it watches for the child's whole life (a marker's read end must, to keep its pipe's
@@ -27,14 +27,14 @@ impl DrainEdge<'_> {
     /// Block until every member of the tree has EXITED (not reaped), or until `deadline` (`None`: for
     /// ever): `MembersRemain` at expiry.
     pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        self.wait_past(deadline, &[])
+        self.wait_past(deadline, &Settled::default())
     }
 
     /// [`wait`](Self::wait) for a caller that has already waited for the members `settled`, each of which
     /// exited or failed in a way it reported. Only a Job's edge, which confirms an empty listing from a
     /// system snapshot of its members, has anything to skip: it neither waits for them nor reports them
     /// again.
-    pub(crate) fn wait_past(&self, deadline: Option<Instant>, settled: &[ProcessId]) -> Result<TreeDrain, Error> {
+    pub(crate) fn wait_past(&self, deadline: Option<Instant>, settled: &Settled) -> Result<TreeDrain, Error> {
         #[cfg(not(windows))]
         let _ = settled;
         match self {
@@ -54,7 +54,7 @@ impl DrainEdge<'_> {
     /// ([`deadline_from`](crate::tokio::wait::deadline_from)).
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&self, deadline: Option<Instant>) -> Result<TreeDrain, Error> {
-        self.wait_async_past(deadline, &[]).await
+        self.wait_async_past(deadline, &Settled::default()).await
     }
 
     /// [`wait_past`](Self::wait_past), awaited.
@@ -62,7 +62,7 @@ impl DrainEdge<'_> {
     pub(crate) async fn wait_async_past(
         &self,
         deadline: Option<Instant>,
-        settled: &[ProcessId],
+        settled: &Settled,
     ) -> Result<TreeDrain, Error> {
         #[cfg(not(windows))]
         let _ = settled;
@@ -299,7 +299,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
 #[cfg(all(feature = "tokio", windows))]
 async fn snapshot_members_on_pool(
     job: &crate::containment::windows::JobHandle,
-) -> Result<Vec<crate::identity::ProcessId>, Error> {
+) -> Result<Vec<crate::containment::windows::Found>, Error> {
     use crate::containment::windows::unsignalled_members_of;
     use std::os::windows::io::AsHandle as _;
 
@@ -342,7 +342,7 @@ async fn snapshot_members_on_pool(
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
     deadline: Option<Instant>,
-    settled: &[ProcessId],
+    settled: &Settled,
 ) -> Result<TreeDrain, Error> {
     use crate::containment::tree_kill::wait_for_member_async;
     use crate::containment::windows::{unsettled, waited, Ended, Round};
@@ -379,10 +379,18 @@ async fn job_wait_tree_drained(
             // The sync wait's `confirm_drained`: each member the snapshot names, in turn, awaited
             // through the same by-identity wait a kill's wait uses.
             Round::Confirm => {
-                for id in unsettled(snapshot_members_on_pool(job).await?, settled) {
+                let Some(count) = job.count_to_confirm()? else {
+                    return Ok(TreeDrain::AllMembersExited);
+                };
+                let (walk, skipped) = unsettled(snapshot_members_on_pool(job).await?, settled);
+                for next in walk {
+                    let id = next?;
                     if !waited(id, wait_for_member_async(&HostKernel, id, deadline).await)? {
                         return Ok(TreeDrain::MembersRemain);
                     }
+                }
+                if !skipped {
+                    job.confirmed_at(count);
                 }
                 return Ok(TreeDrain::AllMembersExited);
             }

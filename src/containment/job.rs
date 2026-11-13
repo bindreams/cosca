@@ -124,8 +124,11 @@ impl Job {
     /// Block until the job has no member left, or forever if it never does. An empty process list
     /// is not taken as the drain, the first one included (it is empty on its first read after a kill):
     /// the list can empty before a member's process object is signalled, so the call waits for each
-    /// job member a system process snapshot still names. A caller that needs a member whose exit
-    /// cannot be observed named uses [`kill_tree`](Job::kill_tree).
+    /// job member a system process snapshot still names. A Job member that refuses the caller query
+    /// access is not seen once the Job's list is empty. `wait_tree` after `send_kill_tree` (or after a
+    /// kill made outside cosca) can answer while that member is still finishing its exit. `kill_tree`
+    /// reports such a member as unobserved. A caller that needs a member whose exit cannot be observed
+    /// named uses [`kill_tree`](Job::kill_tree).
     pub fn wait_tree(&self) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(None)
     }
@@ -133,7 +136,9 @@ impl Job {
     /// Like [`wait_tree`](Job::wait_tree), but give up and report
     /// [`TreeDrain::MembersRemain`](crate::containment::TreeDrain::MembersRemain) once `timeout`
     /// elapses, the tree not having been seen drained. The answer is the job's process list as of
-    /// its last look, in which a member that has just exited can still appear.
+    /// its last look, in which a member that has just exited can still appear. The limit of
+    /// [`wait_tree`](Job::wait_tree) holds: a Job member that refuses the caller query access is not
+    /// seen once the Job's list is empty, and `kill_tree` reports such a member as unobserved.
     pub fn wait_tree_timeout(&self, timeout: Duration) -> Result<TreeDrain, Error> {
         self.wait_tree_deadline(crate::wait::deadline_from(timeout))
     }
