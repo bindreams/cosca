@@ -31,8 +31,14 @@ fn enter() -> Result<(), Error> {
 /// Non-reaping. The watch-fault seam and the deadline come before the first look, so the timeout
 /// counts from the call.
 pub(crate) async fn exited_held(p: &dyn OsProcess, timeout: Option<Duration>) -> Result<bool, Error> {
+    exited_until(p, absolute(timeout)).await
+}
+
+/// [`exited_held`] against an absolute `deadline` (`None`: unbounded), on the clock [`absolute`]
+/// names.
+pub(crate) async fn exited_until(p: &dyn OsProcess, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     enter()?;
-    exited(p, absolute(timeout)).await
+    exited(p, deadline).await
 }
 
 /// [`run`] over a process's [`OsProcess::exited`] look, against an absolute `deadline`.

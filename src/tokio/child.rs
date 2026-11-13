@@ -378,11 +378,10 @@ impl Child {
     }
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a
-    /// Windows job whose process list is empty, a macOS marker with no holder left. A status is
-    /// never collected by this call, only the root's own `wait`/`try_wait` does that. This call
-    /// observes the list or the leaf, not each member: on Windows the job's list can empty before
-    /// every member's process object is signalled. A caller that needs the members gone uses
-    /// [`kill_tree`](Self::kill_tree), which waits for each. Requires a mechanism with a real
+    /// Windows job with no member left, a macOS marker with no holder left. A status is never
+    /// collected by this call, only the root's own `wait`/`try_wait` does that. On Windows an empty
+    /// process list is not the drain, within the limit stated at
+    /// [`Child::wait_tree`](crate::Child::wait_tree). Requires a mechanism with a real
     /// kernel drain edge (`Unsupported` otherwise — cgroup v2, a Windows job object, and the macOS
     /// fd marker have one; `ProcessGroup`/`Session`/`TreeWalk` and an uncontained or
     /// nested-`Delegated` child do not). No polling interval: macOS waits on the reactor; Linux
@@ -398,7 +397,7 @@ impl Child {
     /// overflow `Instant` is treated as unbounded, matching [`wait_tree`](Child::wait_tree).
     /// `MembersRemain` means the tree was not seen drained by the deadline; on Windows the wait
     /// answers from the job's list as of its last look, in which a member that has just exited can
-    /// still appear.
+    /// still appear. The Windows limit stated at [`Child::wait_tree`](crate::Child::wait_tree) holds.
     pub async fn wait_tree_timeout(
         &self,
         timeout: std::time::Duration,

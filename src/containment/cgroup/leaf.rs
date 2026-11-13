@@ -6,6 +6,7 @@ use std::io;
 use std::path::PathBuf;
 
 use super::*;
+use crate::containment::tree_kill::Unnamed;
 use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
@@ -845,10 +846,9 @@ impl CgroupLeaf {
     /// and its identity read from it, so a pid reused since `cgroup.procs` was read is not listed;
     /// the pidfd is then closed, so no descriptor is held per member. `root`, the root's pid, is left
     /// out: its owner waits for it. A leaf already gone has no member. A member that cannot be named,
-    /// or the listing itself failing, is returned as an error saying its exit cannot be observed; the
-    /// kill goes ahead regardless.
-    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<Listed>, Vec<crate::error::Error>) {
-        use crate::containment::tree_kill::exit_unobserved;
+    /// or the listing itself failing, is returned as an error saying its exit cannot be observed, with
+    /// its pid where it has one; the kill goes ahead regardless.
+    pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<Listed>, Vec<Unnamed>) {
         use crate::error::Error;
 
         let content = match self.dir.read("cgroup.procs") {
@@ -862,7 +862,7 @@ impl CgroupLeaf {
                     ),
                     source: Some(Error::io_cause(e)),
                 };
-                return (Vec::new(), vec![why]);
+                return (Vec::new(), vec![Unnamed::nameless(why)]);
             }
         };
         // `cgroup.kill` reaches the cgroups under the leaf too, so their members are listed as well.
@@ -870,33 +870,33 @@ impl CgroupLeaf {
         let subtree = self.listing_subtree();
         let (mut members, mut unobserved) = (Vec::new(), Vec::new());
         if let Some(e) = failure {
-            unobserved.push(Error::Unassessable {
+            unobserved.push(Unnamed::nameless(Error::Unassessable {
                 detail: format!(
                     "cgroup leaf {}: the cgroups under it could not all be listed before the kill, so the exit of \
                      their members cannot be observed",
                     self.leaf_path.display()
                 ),
                 source: Some(Error::io_cause(e)),
-            });
+            }));
         }
         for line in content.lines().chain(nested.iter().map(String::as_str)) {
             match line.trim().parse::<u32>() {
-                Ok(0) => unobserved.push(Error::Unassessable {
+                Ok(0) => unobserved.push(Unnamed::nameless(Error::Unassessable {
                     detail: "a member of the leaf in a pid namespace this process cannot see was killed, but its exit \
                              cannot be observed"
                         .to_owned(),
                     source: None,
-                }),
+                })),
                 Ok(pid) if Some(pid) == root => {}
                 Ok(pid) => match self.listed_member(pid, &subtree) {
                     Ok(Some(id)) => members.push(id),
                     Ok(None) => {}
-                    Err(why) => unobserved.push(exit_unobserved(pid, why)),
+                    Err(why) => unobserved.push(Unnamed::member(pid, why)),
                 },
-                Err(_) => unobserved.push(Error::Unassessable {
+                Err(_) => unobserved.push(Unnamed::nameless(Error::Unassessable {
                     detail: format!("cgroup.procs line {line:?} is no pid, so that member's exit cannot be observed"),
                     source: None,
-                }),
+                })),
             }
         }
         (members, unobserved)
@@ -939,16 +939,14 @@ impl CgroupLeaf {
         &self,
         kernel: &dyn crate::identity::Kernel,
         members: Vec<Listed>,
-    ) -> (Vec<ProcessId>, Vec<crate::error::Error>) {
-        use crate::containment::tree_kill::exit_unobserved;
-
+    ) -> (Vec<ProcessId>, Vec<Unnamed>) {
         let subtree = self.listing_subtree();
         let (mut reached, mut unobserved) = (Vec::new(), Vec::new());
         for member in members {
             match kill_reached(kernel, &subtree, member) {
                 Ok(true) => reached.push(member.id),
                 Ok(false) => {}
-                Err(why) => unobserved.push(exit_unobserved(member.id.pid(), why)),
+                Err(why) => unobserved.push(Unnamed::member(member.id.pid(), why)),
             }
         }
         (reached, unobserved)

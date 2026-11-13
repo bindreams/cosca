@@ -308,7 +308,7 @@ pub(crate) fn live_blocker() -> (crate::Child, crate::PipeWriter, crate::identit
 
 /// `cmd /C more`, blocked reading its own piped stdin until EOF: a blocker every Windows host has.
 #[cfg(windows)]
-fn spawn_more_blocker() -> std::process::Child {
+pub(crate) fn spawn_more_blocker() -> std::process::Child {
     crate::test_spawn::spawn(
         std::process::Command::new("cmd")
             .args(["/C", "more"])
@@ -327,6 +327,39 @@ pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::wi
     let child = spawn_more_blocker();
     let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
     (child, job)
+}
+
+/// A live job with `count` (at least one) running members, each a [`spawn_more_blocker`]:
+/// [`spawn_job_member`]'s, and the rest assigned to the same job. A test that ends some holds the
+/// others alive through their stdin.
+#[cfg(windows)]
+pub(crate) fn spawn_job_with_members(
+    count: usize,
+) -> (Vec<std::process::Child>, crate::containment::windows::JobHandle) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let (first, job) = spawn_job_member();
+    let mut members = vec![first];
+    for _ in 1..count {
+        let member = spawn_more_blocker();
+        job.assign_for_test(member.as_raw_handle())
+            .expect("assign a member to the job");
+        members.push(member);
+    }
+    (members, job)
+}
+
+/// [`spawn_job_with_members`] for two.
+#[cfg(windows)]
+pub(crate) fn spawn_job_with_two_members() -> (
+    std::process::Child,
+    std::process::Child,
+    crate::containment::windows::JobHandle,
+) {
+    let (mut members, job) = spawn_job_with_members(2);
+    let second = members.pop().expect("two members");
+    let first = members.pop().expect("two members");
+    (first, second, job)
 }
 
 /// End a [`spawn_job_member`]'s member: EOF on its stdin, and reaped once it has exited.
