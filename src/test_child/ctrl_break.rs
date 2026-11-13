@@ -296,13 +296,6 @@ pub(crate) fn spawn_ignoring_root() -> (crate::Child, TcpStream) {
     (child, sock)
 }
 
-/// [`spawn_ignoring_root`] for the tokio `Child`.
-#[cfg(feature = "tokio")]
-pub(crate) async fn spawn_ignoring_root_async() -> (crate::tokio::Child, TcpStream) {
-    let (child, sock, _) = spawn_member_async(Handler::Ignore, None, crate::ContainMode::Strongest, |_| {}).await;
-    (child, sock)
-}
-
 /// [`spawn_member`] for the tokio `Child`.
 #[cfg(feature = "tokio")]
 pub(crate) async fn spawn_member_async(

@@ -579,14 +579,6 @@ pub(crate) async fn held_contained_blocker_async(
     held_blocker_async(stdout, Console::Hidden, |cmd| _ = cmd.contain()).await
 }
 
-/// Async twin of [`held_contained_blocker_on_console`].
-#[cfg(feature = "tokio")]
-pub(crate) async fn held_contained_blocker_on_console_async(
-    stdout: crate::Stdio,
-) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    held_blocker_async(stdout, Console::Asked, |cmd| _ = cmd.contain()).await
-}
-
 /// Async twin of [`held_contained_blocker_without_cgroup`].
 #[cfg(all(unix, feature = "tokio"))]
 pub(crate) async fn held_contained_blocker_without_cgroup_async(
