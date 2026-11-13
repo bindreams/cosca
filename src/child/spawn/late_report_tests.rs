@@ -515,7 +515,7 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
 #[skuld::test]
 fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_left() {
     let (pid, fate, survived, mark, cleanup) =
-        late_tree_walk(|| crate::containment::enumerate::force_blind_snapshot_for_next_call(true));
+        late_tree_walk(|| crate::containment::enumerate::force_blind_snapshots(1));
     assert!(survived, "a walk that could not take its snapshot kills nothing");
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
@@ -615,10 +615,11 @@ fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
     let named = running.failure_note(false).expect("the root is still running");
     assert!(named.contains("pid 4242 was not killed"), "{named}");
     assert_eq!(running.failures.len(), 1, "{:?}", running.failures);
+    // The held error says its own layer (a member left); the member is below it, with its cause.
+    let held = crate::error::said(&*running.failures[0]);
     assert!(
-        running.failures[0].to_string().contains("pid 4242 was not killed"),
-        "the failure is held as an error: {:?}",
-        running.failures
+        held.contains("pid 4242 was not killed") && held.contains("refused"),
+        "the failure is held as an error: {held}"
     );
 }
 
@@ -1081,7 +1082,7 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
         marker: None,
     };
     let (fate, _warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
-        crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+        crate::containment::enumerate::force_blind_snapshots(1);
         vec![Box::new(refuse_the_kill())]
     });
     assert!(
@@ -1311,9 +1312,9 @@ fn late_tree_not_zombie(
 const NOT_SWEPT_AGAIN: &str = "not shown an unreaped zombie, so its tree was not killed again by its pid";
 
 /// A marked tree whose root is not shown a zombie after its kill: its marker's holders are still
-/// swept, and the root's pid is not walked again. The first sweep is spoiled (a blind snapshot, and
-/// no kill of the root by its identity, so no second pass), so only that holders' sweep can reach
-/// the grandchild.
+/// swept, and the root's pid is not walked again. The first sweep is spoiled (blind snapshots for
+/// both of its passes, the second following a first that found the root, and no kill of the root by
+/// its identity), so only that holders' sweep can reach the grandchild.
 ///
 /// Mutant: a root not shown a zombie gets no sweep of its marker's holders.
 #[skuld::test]
@@ -1325,7 +1326,8 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
         },
         crate::os_process::child::Foreign::Gone,
         || {
-            crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+            // Two blind snapshots: pass 1 finds the root (not killed), so a second pass follows.
+            crate::containment::enumerate::force_blind_snapshots(2);
             crate::containment::fdmarker::fault::set_force_root_kill_noop(true);
         },
     );

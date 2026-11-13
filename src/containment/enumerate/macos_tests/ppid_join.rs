@@ -144,7 +144,7 @@ fn ppid_of_reports_gone_for_an_unallocatable_pid() {
 /// becomes an empty list).
 #[skuld::test]
 fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
-    super::super::force_blind_snapshot_for_next_call(true);
+    super::super::force_blind_snapshots(1);
     match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("proc_listallpids"), "{detail}");
@@ -191,8 +191,10 @@ fn a_failed_edge_allocation_is_unassessable_not_an_empty_snapshot() {
     let _forced = super::super::fault::force_join_alloc_failure();
     match process_parents(&HostKernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
-            assert!(detail.contains("edge buffer"), "{detail}");
-            assert!(source.is_some());
+            assert!(detail.contains("the process snapshot could not be taken"), "{detail}");
+            let cause = source.expect("the failed allocation is the source");
+            let said = crate::error::said(&*cause);
+            assert!(said.contains("an edge buffer could not be allocated"), "{said}");
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }

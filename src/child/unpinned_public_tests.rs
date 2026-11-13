@@ -160,6 +160,53 @@ impl Untrusted {
             Untrusted::Unknown => "RootState::Unknown",
         }
     }
+
+    /// The `source` of a refusal for this state: none for `Unpinned`, whose refusal asked nothing of
+    /// the OS, and the failed peek (`result`) for `Unknown`.
+    pub(crate) fn cause(self) -> Cause {
+        match self {
+            Untrusted::Unpinned => Cause::None,
+            Untrusted::Unknown => Cause::Unreadable,
+        }
+    }
+}
+
+/// What a refusal carries as its `source`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Cause {
+    /// Nothing.
+    None,
+    /// The failed peek `Untrusted::Unknown` scripts.
+    Unreadable,
+    /// The grace wait's `ECHILD`, from a zombie launchd holds: a failure of the same call, carried
+    /// below the refusal.
+    Echild,
+    /// The failure the test forces on the cooperative signal (`Forced::Containment`), carried below
+    /// the sweep's refusal.
+    ForcedTerm,
+}
+
+impl Cause {
+    /// `source` is this cause, and the right one: the injected fault or the OS code, not just any error.
+    #[track_caller]
+    pub(crate) fn assert(self, source: &Option<std::sync::Arc<Error>>) {
+        match (self, source) {
+            (Cause::None, None) => {}
+            (Cause::None, Some(cause)) => panic!("expected no source, got {cause:?}"),
+            (_, None) => panic!("expected {self:?} as the source, got none"),
+            (Cause::Unreadable, Some(cause)) => {
+                let said = crate::error::said(&**cause);
+                assert!(said.contains("unreadable"), "{said}");
+            }
+            (Cause::Echild, Some(cause)) => {
+                assert_eq!(crate::error::first_os_code(&**cause), Some(libc::ECHILD), "{cause:?}");
+            }
+            (Cause::ForcedTerm, Some(cause)) => assert!(
+                matches!(&**cause, Error::Containment { detail, .. } if detail.contains("forced term_group refusal")),
+                "{cause:?}"
+            ),
+        }
+    }
 }
 
 /// [`Untrusted::script`] for [`Untrusted::Unpinned`].
@@ -170,42 +217,63 @@ pub(crate) fn orphan(child: &mut crate::Child) -> FakeProcess {
 /// The lone refusal: `Unassessable`, no source, naming launchd and the call that sent nothing.
 #[track_caller]
 pub(crate) fn assert_refused(err: &Error, op: &str) {
+    assert_refused_caused_by(err, op, Cause::None);
+}
+
+/// [`assert_refused`], for a call whose earlier failure is the refusal's `source`.
+#[track_caller]
+pub(crate) fn assert_refused_caused_by(err: &Error, op: &str, cause: Cause) {
     match err {
-        Error::Unassessable { detail, source: None } => assert!(
-            detail.contains("launchd")
-                && detail.contains(&format!("{op} sent nothing"))
-                && !detail.contains("(launchd"),
-            "{detail}"
-        ),
-        other => panic!("expected Unassessable without a source, got {other:?}"),
+        Error::Unassessable { detail, source } => {
+            assert!(
+                detail.contains("launchd")
+                    && detail.contains(&format!("{op} sent nothing"))
+                    && !detail.contains("(launchd"),
+                "{detail}"
+            );
+            cause.assert(source);
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
     }
 }
 
-/// The tree refusal: `Unassessable`, no source, naming the state, the call that sent nothing and
-/// that its signals are named by the root's number.
+/// The tree refusal: `Unassessable` with the state's own cause ([`Untrusted::cause`]), naming the
+/// state, the call that sent nothing and that its signals are named by the root's number.
 #[track_caller]
 pub(crate) fn assert_tree_refused(err: &Error, op: &str, state: Untrusted) {
+    assert_tree_refused_caused_by(err, op, state, state.cause());
+}
+
+/// [`assert_tree_refused`], for a call whose earlier failure is the refusal's `source`.
+#[track_caller]
+pub(crate) fn assert_tree_refused_caused_by(err: &Error, op: &str, state: Untrusted, cause: Cause) {
     match err {
-        Error::Unassessable { detail, source: None } => assert!(
-            detail.contains(state.why())
-                && detail.contains(&format!("{op} sent nothing"))
-                && detail.contains("named by the root's number"),
-            "{state:?}: {detail}"
-        ),
-        other => panic!("{state:?}: expected Unassessable without a source, got {other:?}"),
+        Error::Unassessable { detail, source } => {
+            assert!(
+                detail.contains(state.why())
+                    && detail.contains(&format!("{op} sent nothing"))
+                    && detail.contains("named by the root's number"),
+                "{state:?}: {detail}"
+            );
+            cause.assert(source);
+        }
+        other => panic!("{state:?}: expected Unassessable, got {other:?}"),
     }
 }
 
 /// `err` is the `Unassessable` of an fd marker's kill that signalled only its holders, for a root in
-/// `state`.
+/// `state`, with the state's own cause.
 #[track_caller]
 pub(crate) fn assert_holders_only(err: &Error, op: &str, state: Untrusted) {
     match err {
-        Error::Unassessable { detail, source: None } => assert!(
-            detail.contains(state.why()) && detail.contains(&format!("{op} signalled only the marker holders")),
-            "{state:?}: {detail}"
-        ),
-        other => panic!("{state:?}: expected Unassessable without a source, got {other:?}"),
+        Error::Unassessable { detail, source } => {
+            assert!(
+                detail.contains(state.why()) && detail.contains(&format!("{op} signalled only the marker holders")),
+                "{state:?}: {detail}"
+            );
+            state.cause().assert(source);
+        }
+        other => panic!("{state:?}: expected Unassessable, got {other:?}"),
     }
 }
 
