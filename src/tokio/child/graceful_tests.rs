@@ -12,6 +12,22 @@ use crate::child::graceful::fault as term_fault;
 #[cfg(unix)]
 use crate::wait::fault;
 
+/// Awaits `f` and fails if it blocked its thread on an OS wait: a driver wait that called its blocking
+/// twin would stall every task on this runtime thread.
+async fn never_blocking<F: std::future::Future>(f: F) -> F::Output {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let blocked = Rc::new(Cell::new(false));
+    let _hook = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || blocked.set(true)
+    });
+    let output = f.await;
+    assert!(!blocked.get(), "the call blocked a runtime thread");
+    output
+}
+
 /// What keeps a [`kill_only_blocker`] running while the caller holds it.
 #[cfg(unix)]
 type Held = crate::tokio::ChildStdin;
@@ -79,35 +95,7 @@ async fn async_graceful_shutdown_graceful_path() {
 /// and only the kill ends it), so a grace that closed stdin shows as a clean exit. The reap closes
 /// the stdin: `tree` is the call's `graceful_shutdown_tree`, whose reap is `Waits::reap`.
 async fn keeps_an_untaken_stdin_open_through_the_grace(tree: bool) {
-    crate::tokio::test_runtime::assert_current_thread();
-    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-    #[cfg(unix)]
-    {
-        cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
-        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-        // `contain_without_cgroup_async` asks for `Session` on Linux: no cgroup, so the row needs no delegated one.
-        crate::test_child::contain_without_cgroup_async(&mut cmd);
-    }
-    #[cfg(windows)]
-    {
-        cmd.executable(crate::test_child::windows_more()).args(["more"]);
-        cmd.stdout(crate::Stdio::null()).expect("null stdout");
-        cmd.contain();
-    }
-    cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
-    let mut child = cmd.spawn().await.expect("spawn");
-    #[cfg(unix)]
-    {
-        use ::tokio::io::AsyncReadExt as _;
-        let mut ready = [0u8; 1];
-        child
-            .stdout()
-            .expect("piped stdout")
-            .read_exact(&mut ready)
-            .await
-            .expect("the readiness byte: the trap is installed");
-    }
-
+    let mut child = contained_child_ignoring_the_signal(contain_without_cgroup).await;
     let grace = Duration::from_secs(1);
     let status = if tree {
         child.graceful_shutdown_tree(grace).await
@@ -126,6 +114,50 @@ async fn keeps_an_untaken_stdin_open_through_the_grace(tree: bool) {
     assert!(child.stdin().is_none(), "the reap closed the untaken stdin");
 }
 
+/// Contains `cmd` with no cgroup (a `Session` on Linux), so a row needs no delegated one.
+fn contain_without_cgroup(cmd: &mut crate::tokio::Command) {
+    #[cfg(unix)]
+    crate::test_child::contain_without_cgroup_async(cmd);
+    #[cfg(windows)]
+    cmd.contain();
+}
+
+/// A child, contained as `contain` says, that outlives the grace: it ignores `SIGTERM` (Unix, ready once
+/// the trap is set) or reads its untaken piped stdin to EOF (Windows).
+async fn contained_child_ignoring_the_signal(contain: impl FnOnce(&mut crate::tokio::Command)) -> crate::tokio::Child {
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    #[cfg(unix)]
+    {
+        cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+        cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    }
+    #[cfg(windows)]
+    {
+        cmd.executable(crate::test_child::windows_more()).args(["more"]);
+        cmd.stdout(crate::Stdio::null()).expect("null stdout");
+    }
+    contain(&mut cmd);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
+    #[cfg_attr(
+        windows,
+        allow(unused_mut, reason = "only the Unix readiness read takes `stdout` mutably")
+    )]
+    let mut child = cmd.spawn().await.expect("spawn");
+    #[cfg(unix)]
+    {
+        use ::tokio::io::AsyncReadExt as _;
+        let mut ready = [0u8; 1];
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_exact(&mut ready)
+            .await
+            .expect("the readiness byte: the trap is installed");
+    }
+    child
+}
+
 /// Mutant: `graceful_shutdown` closes the untaken stdin before or during the grace.
 #[skuld::test]
 async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace() {
@@ -136,6 +168,121 @@ async fn async_graceful_shutdown_keeps_an_untaken_stdin_open_through_the_grace()
 #[skuld::test]
 async fn async_graceful_shutdown_tree_keeps_an_untaken_stdin_open_through_the_grace() {
     keeps_an_untaken_stdin_open_through_the_grace(true).await;
+}
+
+/// A tree call whose grace runs out awaits the grace watch and the sweep's wait, and blocks no runtime
+/// thread. Its reap finds the root dead, so it never waits: [`async_the_reap_of_a_running_root_awaits_its_exit`]
+/// pins that wait.
+async fn awaits_the_grace_and_the_sweep(contain: impl FnOnce(&mut crate::tokio::Command)) {
+    let mut child = contained_child_ignoring_the_signal(contain).await;
+    let status = never_blocking(child.graceful_shutdown_tree(Duration::from_secs(1)))
+        .await
+        .expect("the shutdown");
+    #[cfg(unix)]
+    crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "the child must not end by an EOF on its stdin: {status:?}"
+    );
+}
+
+/// The grace watch is the root's alone on Linux (a session: no drain edge) and the job's drain, then the
+/// root's probe, on Windows.
+///
+/// Mutants: `Waits::root_exited` (Linux), or `tree_drained` or `sweep` (Windows), of the async `Child`
+/// calls its blocking twin.
+#[skuld::test]
+async fn async_graceful_shutdown_tree_awaits_the_grace_and_the_sweep() {
+    awaits_the_grace_and_the_sweep(contain_without_cgroup).await;
+}
+
+/// The grace watch is the cgroup's drain.
+///
+/// Mutants: `Waits::tree_drained` or `sweep` of the async `Child` calls its blocking twin.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_graceful_shutdown_tree_awaits_the_grace_and_the_sweep_in_a_cgroup(#[fixture(cgroup)] _group: &Group) {
+    awaits_the_grace_and_the_sweep(|cmd| _ = cmd.contain()).await;
+}
+
+/// The async `Child`'s reap of a root still running awaits its exit: the sibling that ends the root finds
+/// the call pending, and no runtime thread blocks on it.
+///
+/// Mutant: `Waits::reap` of the async `Child` calls the blocking `wait`.
+#[skuld::test]
+async fn async_the_reap_of_a_running_root_awaits_its_exit() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::child::graceful::shutdown::Waits as _;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    // A held root: it runs until its stdin's write end is dropped.
+    let (member, writer, _) = crate::test_child::over_fake::live_member();
+    let mut child = crate::tokio::Child { inner: member };
+    let stdin = Rc::new(Cell::new(Some(writer)));
+    let blocked = Rc::new(Cell::new(false));
+    // A wait that blocks the thread ends the root from inside the block, so the row fails instead of
+    // hanging.
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let (stdin, blocked) = (stdin.clone(), blocked.clone());
+        move || {
+            blocked.set(true);
+            drop(stdin.take());
+        }
+    });
+
+    let (reaped, ()) = ::tokio::join!(child.reap(), async {
+        ::tokio::task::yield_now().await;
+        drop(stdin.take());
+    });
+
+    assert!(!blocked.get(), "the reap blocked a runtime thread");
+    reaped.expect("reap");
+}
+
+/// The root-through-its-pidfd path (a root whose number may name another process) awaits the grace
+/// through the root's handle and blocks no runtime thread. The call is made on the path itself, since
+/// only a reused pid leads the public call there.
+///
+/// Mutant: `Waits::root_exited` of the async `Child` calls its blocking twin.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_the_root_through_its_pidfd_awaits_the_grace() {
+    use std::os::unix::process::ExitStatusExt;
+
+    use crate::containment::{Refusal, Skip, Why};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().await.expect("spawn");
+    let skip = Skip {
+        action: "signal its process group".to_owned(),
+        why: Why::MayNameAnother(Refusal::Unpinned(child.pid())),
+        root_alone: true,
+        holders: None,
+    };
+
+    let error = never_blocking(crate::child::graceful::shutdown::root_through_pidfd(
+        &child,
+        &skip,
+        Duration::from_secs(30),
+    ))
+    .await;
+
+    assert!(
+        matches!(error, crate::error::Error::Unassessable { .. }),
+        "the root alone was signalled, not the tree: {error}"
+    );
+    let status = child.wait().await.expect("reap");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the root ends by the SIGTERM the call sent through its pidfd: {status:?}"
+    );
 }
 
 /// The grace watch of the root alone (a mechanism with no drain edge) resolves on the root's exit, and
@@ -392,6 +539,11 @@ async fn async_a_failed_reap_is_the_answer_and_the_watch_failure_a_warn_naming_t
 
 /// The tree's drain edge, awaited, answers that the tree drained: the sweep is skipped. See
 /// `child::graceful_tests::drained_tree_sweep_decision` for the same decision through the sync driver.
+/// The wait blocks no runtime thread.
+///
+/// Mutant (Windows; a cgroup that has drained by the first look blocks nothing, see
+/// [`async_graceful_shutdown_tree_awaits_the_grace_and_the_sweep_in_a_cgroup`]): `Waits::tree_drained` of
+/// the async `Child` calls its blocking twin.
 #[cfg(any(windows, target_os = "linux"))]
 async fn drained_tree_skips_the_sweep(contain: impl FnOnce(&mut crate::tokio::Command), expected: crate::Containment) {
     crate::tokio::test_runtime::assert_current_thread();
@@ -456,7 +608,7 @@ async fn drained_tree_skips_the_sweep(contain: impl FnOnce(&mut crate::tokio::Co
             crate::test_child::ctrl_break::assert_break_sent_to(pid)
         })
     };
-    let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
+    let result = never_blocking(child.graceful_shutdown_tree(Duration::from_secs(30))).await;
     #[cfg(windows)]
     check.assert_fired();
     let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
@@ -604,8 +756,9 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
 // fixture that plays the Unix root shell's role, and why the readiness tag travels over a raw
 // TCP socket rather than stdout. Blocking `std::net::TcpListener` (not an async socket), exactly
 // like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
-// real connection, not a poll loop, and the same shape already accepted for an async test. It is the
-// Windows row of the job's drain wait, awaited, answering that members remain.
+// real connection, not a poll loop, and the same shape already accepted for an async test.
+//
+// Mutants: `Waits::tree_drained`, `root_exited` or `reap` of the async `Child` calls its blocking twin.
 #[cfg(windows)]
 #[skuld::test]
 async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
@@ -650,8 +803,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("readiness tag");
     term_fault::set_force_kill_tree_error(true);
-    let err = child
-        .graceful_shutdown_tree(Duration::from_secs(2))
+    let err = never_blocking(child.graceful_shutdown_tree(Duration::from_secs(2)))
         .await
         .expect_err("the forced sweep failure must surface");
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");

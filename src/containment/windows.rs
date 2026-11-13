@@ -1196,7 +1196,13 @@ impl Watch {
     /// Block until a handle is signalled or the real `deadline` passes. A `WAIT_TIMEOUT` is never
     /// trusted: the real deadline is rechecked each round (see `win32_timeout_ms`).
     fn wait(&self, deadline: Option<std::time::Instant>) -> Result<Ended, crate::error::Error> {
-        self.ended(crate::wait::wait_until(deadline, |ms| self.wait_for(ms)))
+        self.ended(crate::wait::wait_until(deadline, |ms| {
+            #[cfg(test)]
+            crate::wait::block_probe::record_blocking(
+                (ms != u32::MAX).then(|| std::time::Duration::from_millis(ms.into())),
+            );
+            self.wait_for(ms)
+        }))
     }
 
     /// Look once, without waiting, for a last round: an elapsed deadline arms `ms == 0` in
