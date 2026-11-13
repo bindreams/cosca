@@ -2567,6 +2567,51 @@ fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
     }
 }
 
+/// A child whose placement report cannot be sent stops in its hook, before `exec`, and the spawn
+/// fails as one that did not start, under `BestEffort` too: the program never ran, and the
+/// child's exit tells the parent so (a child that died before reporting for another reason is
+/// still a degrade).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unsent_report_fails_a_best_effort_attach_as_a_spawn_that_did_not_start() {
+    use crate::containment::cgroup::test_support::{fork_running, handle_of, pidfd_of, unsendable};
+    use crate::containment::cgroup::{placement_hook, CgroupLeaf};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-decision-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let leaf = CgroupLeaf::for_test_at(leaf_path.clone());
+    let slot = unsendable(leaf.placement_slot());
+    let guard = fork_running(&[], move || {
+        // SAFETY: this is the forked child; the descriptors are deliberately not open.
+        _ = unsafe { placement_hook(-1, slot) };
+    });
+    let pid = guard.defuse();
+    let pidfd = pidfd_of(pid);
+    let prepared = super::Prepared {
+        mode: Some(crate::containment::ContainMode::BestEffort),
+        is_root: true,
+        cgroup_leaf: Some(leaf),
+    };
+
+    let result = super::attach_tree(
+        pid,
+        Ok(crate::identity::ProcessId::current()),
+        handle_of(pid, &pidfd),
+        prepared,
+    );
+
+    let mut status = 0;
+    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
+    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
+    let failure = result.expect_err("an unsent report fails the attach");
+    assert!(failure.not_started, "the program never ran: {failure:?}");
+    assert!(matches!(failure.cause, crate::error::Error::Io(_)), "{failure:?}");
+    let said = crate::error::Report(&failure.cause).to_string();
+    assert!(said.contains("could not send"), "{said}");
+    assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
+}
+
 /// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf
 /// will not go away: whatever is in it, cosca did not put there. The leaf left behind is
 /// reported.

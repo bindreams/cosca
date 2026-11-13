@@ -872,12 +872,15 @@ fn spawn_reported(
         prepared,
     ) {
         Ok(v) => v,
-        Err(crate::containment::dispatch::AttachFailure {
-            cause: error,
-            cleanup: attach_cleanup,
+        Err(failure) => {
+            // Only Linux's attach says the program never ran.
             #[cfg(target_os = "linux")]
-            not_started,
-        }) => {
+            let not_started = failure.not_started;
+            let crate::containment::dispatch::AttachFailure {
+                cause: error,
+                cleanup: attach_cleanup,
+                ..
+            } = failure;
             log::debug!("attach failed: {report}", report = crate::error::Report(&error));
             // macOS: a front is left running and unreaped, sent nothing; any other child is killed
             // and reaped through its verified unique id.

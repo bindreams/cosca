@@ -1410,8 +1410,12 @@ pub(crate) struct AttachFailure {
     pub(crate) cleanup: Option<Failures>,
     /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
     /// before `exec` because its placement in its leaf was refused. Every other failure may have
-    /// started the program. Only Linux places a child after its spawn.
-    #[cfg(target_os = "linux")]
+    /// started the program. Only Linux places a child after its spawn, so only it sets and reads
+    /// this.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the Linux arm of the spawn")
+    )]
     pub(crate) not_started: bool,
 }
 
@@ -1420,7 +1424,6 @@ impl From<Error> for AttachFailure {
         AttachFailure {
             cause,
             cleanup: None,
-            #[cfg(target_os = "linux")]
             not_started: false,
         }
     }
@@ -1524,6 +1527,17 @@ fn attach_tree(
                                         detail,
                                         source: Some(Arc::new(Error::Io(std::io::Error::other(reason)))),
                                     },
+                                    cleanup: None,
+                                    not_started: true,
+                                });
+                            }
+                            // A child whose hook could not send its report stopped before `exec`,
+                            // whatever the mode: the spawn fails as one that did not start, not as
+                            // a degrade that hands back a child that never ran.
+                            if matches!(reason.report(), crate::containment::cgroup::NotEntered::ReportUnsent) {
+                                leaf.remove_unentered();
+                                return Err(AttachFailure {
+                                    cause: Error::Io(std::io::Error::other(reason)),
                                     cleanup: None,
                                     not_started: true,
                                 });

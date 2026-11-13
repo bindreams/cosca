@@ -1863,6 +1863,7 @@ pub(crate) fn attach_job(
                 source: Some(crate::error::Error::io_cause(resume_err)),
             },
             cleanup: crate::error::Failures::collect(cleanup),
+            not_started: false,
         });
     }
 

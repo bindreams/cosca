@@ -182,6 +182,9 @@ impl fmt::Display for PlacementReport {
 pub(crate) enum NotEntered {
     /// It exited before reporting its placement outcome (see [`PlacementReport::NotReported`]).
     NotReported,
+    /// Its hook could not send its report and stopped before `exec`: it exited with
+    /// `UNSENT_EXIT` (`leaf.rs`). The program never ran.
+    ReportUnsent,
     /// Its `write` to `cgroup.procs` failed with this errno.
     WriteFailed(i32),
 }
@@ -190,6 +193,10 @@ impl fmt::Display for NotEntered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             NotEntered::NotReported => PlacementReport::NotReported.fmt(f),
+            NotEntered::ReportUnsent => f.write_str(
+                "the child could not send its placement report to this process, and stopped \
+                 before exec",
+            ),
             NotEntered::WriteFailed(errno) => PlacementReport::WriteFailed(errno).fmt(f),
         }
     }
@@ -232,6 +239,19 @@ pub(crate) enum NotPlaced {
         /// As in [`NotPlaced::Absent`]: the leaf's report, not `pid`'s in general.
         report: NotEntered,
     },
+}
+
+impl NotPlaced {
+    /// What the child reported, which is why it is not in the leaf.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the linux-gated attach")
+    )]
+    pub(crate) fn report(&self) -> NotEntered {
+        match self {
+            NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. } => *report,
+        }
+    }
 }
 
 impl fmt::Display for NotPlaced {

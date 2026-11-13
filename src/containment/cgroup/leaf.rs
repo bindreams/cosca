@@ -69,6 +69,45 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
+/// Whether `child`, which sent no report, exited with [`UNSENT_EXIT`]: its hook could not send one,
+/// and stopped before `exec`. A child that cannot be looked at is not shown to have: it is a child
+/// that died before reporting for a reason this does not know.
+///
+/// A report channel with no copy of its child's end left reads as closed as the child exits, a
+/// moment before the exit is visible on the pidfd (the kernel closes a dying process's files before
+/// it publishes the exit), so a child still unexited here is waited for. That wait is on a child
+/// that has closed its end without reporting, which can only be one that is exiting: the hook sends
+/// its report before `exec`. A pidfd the look cannot be made through (`ECHILD` and the like) is not
+/// waited on.
+#[cfg(target_os = "linux")]
+fn exited_unsent(child: crate::containment::ChildHandle<'_>) -> bool {
+    use crate::os_process::child::{ExitRecord, PeekOutcome};
+    use crate::wait::exit_only::{peek, Target};
+    use rustix::event::{PollFd, PollFlags};
+
+    let target = Target::PidFd(child.pidfd);
+    let mut seen = peek(&target);
+    if matches!(seen, Ok(PeekOutcome::Running)) {
+        let mut fds = [PollFd::new(&child.pidfd, PollFlags::IN)];
+        if let Err(e) = crate::wait::poll_ready(&mut fds) {
+            panic!("poll on the pidfd of a child that closed its report channel failed: {e}");
+        }
+        seen = peek(&target);
+    }
+    match seen {
+        Ok(PeekOutcome::Exit(ExitRecord::Status(status))) => status.code() == Some(UNSENT_EXIT),
+        Ok(_) => false,
+        Err(e) => {
+            log::debug!(
+                "cgroup leaf: how pid {pid} exited cannot be looked at: {report}",
+                pid = child.pid,
+                report = crate::error::Report(&e)
+            );
+            false
+        }
+    }
+}
+
 /// The state letter of `child`, or `None` when it is unknown; the cause is logged at debug (see
 /// [`StateUnknown`]). Only the pidfd says `Z`: the child exited, which separates "the placement
 /// write failed" from "the child exited before membership was checked".
@@ -363,7 +402,13 @@ impl CgroupLeaf {
         };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(&crate::identity::HostKernel, child);
-        Err(match self.dir.read("cgroup.procs") {
+        let procs = self.dir.read("cgroup.procs");
+        // Last, after the reads that diagnose a child still alive: this one may wait for its exit.
+        let report = match report {
+            NotEntered::NotReported if exited_unsent(child) => NotEntered::ReportUnsent,
+            other => other,
+        };
+        Err(match procs {
             Ok(procs) => NotPlaced::Absent {
                 pid: child.pid,
                 path,
@@ -1798,15 +1843,23 @@ pub(crate) const ABANDONED_EXIT: i32 = 125;
 #[cfg(target_os = "linux")]
 pub(crate) const REFUSED_EXIT: i32 = 124;
 
+/// The status a child exits with from inside its hook when it could not send its placement report
+/// and its slot is not [`refusing`](ReportSlot::refusing). Unlike the other two, the parent reads
+/// it: a child that exits with it never ran the program, and its spawn fails
+/// ([`NotEntered::ReportUnsent`]).
+#[cfg(target_os = "linux")]
+pub(crate) const UNSENT_EXIT: i32 = 123;
+
 /// The placement hook a contained spawn registers: close the forked child's inherited copy of the
 /// parent's end, then place the child (see [`place_self_in_cgroup_pre_exec`]).
 ///
-/// A spawn the parent abandoned makes the child `_exit` here, with [`ABANDONED_EXIT`], instead of
-/// returning an error to `std`; so does a [`refusing`](ReportSlot::refusing) slot's child whose
-/// placement failed, with [`REFUSED_EXIT`]. A child that never execs needs no error channel, and
-/// `std` would write its error record to the number its channel had — which, once `std`'s spawn
-/// returned early because two of fds 0–2 were closed, is one of the child's own stdio slots. The
-/// parent reads a refusal's cause from the leaf's report, never from `std`.
+/// It never returns an error to `std`. A child that never execs needs no error channel, and `std`
+/// would write its error record to the number its channel had — which, once `std`'s spawn returned
+/// early because two of fds 0–2 were closed, is one of the child's own stdio slots. So every
+/// failure `_exit`s here: a spawn the parent abandoned with [`ABANDONED_EXIT`], a
+/// [`refusing`](ReportSlot::refusing) slot's with [`REFUSED_EXIT`] (the parent reads the cause from
+/// the leaf's report), and a report that cannot be sent with [`UNSENT_EXIT`]. `Ok` is a child that
+/// goes on to `exec`.
 ///
 /// # Safety
 /// As [`place_self_in_cgroup_pre_exec`], in a forked child only.
@@ -1820,7 +1873,9 @@ pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Re
         Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => unsafe { libc::_exit(ABANDONED_EXIT) },
         // Safety: as above.
         Err(_) if slot.refusing => unsafe { libc::_exit(REFUSED_EXIT) },
-        other => other,
+        // Safety: as above.
+        Err(_) => unsafe { libc::_exit(UNSENT_EXIT) },
+        ok => ok,
     }
 }
 

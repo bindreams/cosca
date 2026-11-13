@@ -2905,6 +2905,63 @@ fn a_child_whose_refusing_placement_failed_exits_from_its_hook() {
     assert_eq!(channel.shut().placement(), PlacementReport::WriteFailed(libc::EBADF));
 }
 
+/// A lenient child whose report cannot be sent exits from its hook with `UNSENT_EXIT` instead of
+/// returning an error to `std`: with fds 0 and 2 closed, `std`'s status pipe takes the child's
+/// stderr number and `std` returns before the hook runs, so an error record would be written into
+/// the caller's stderr target (a file here, which must stay empty). Runs in a process of its own,
+/// since closing fds is process-wide.
+///
+/// Mutant: the hook returns the send error to `std`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_lenient_child_whose_report_cannot_be_sent_exits_without_writing_into_its_stdio() {
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+    use crate::test_stdio::RestoreStdio;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let Some(done) = own_process(
+        test_path!(a_lenient_child_whose_report_cannot_be_sent_exits_without_writing_into_its_stdio),
+        spawn,
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stderr_file = dir.path().join("stderr");
+    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
+    // The child's end is not open, so the first send fails with EBADF.
+    let slot = crate::containment::cgroup::ReportSlot {
+        fd: -1,
+        parent_fd: -1,
+        refusing: false,
+    };
+    let mut cmd = std::process::Command::new("/bin/true");
+    // Opened before the close, so they land above stdio.
+    cmd.stdin(std::fs::File::open("/dev/null").expect("open /dev/null"));
+    cmd.stdout(std::fs::File::open("/dev/null").expect("open /dev/null"));
+    cmd.stderr(std::fs::File::create(&stderr_file).expect("create the stderr file"));
+    // SAFETY: the closure runs between fork and exec; the hook performs only async-signal-safe calls.
+    unsafe { cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot)) };
+
+    let restore = RestoreStdio::close(&done, &[0, 2]);
+    let spawned = spawn(&mut cmd);
+    drop(restore);
+
+    let mut child = spawned.expect("std returns before the hook runs, with fds 0 and 2 closed");
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::into_raw(status),
+        crate::containment::cgroup::UNSENT_EXIT << 8,
+        "the child exits from its hook"
+    );
+    assert_eq!(
+        std::fs::read(&stderr_file).expect("read the stderr file"),
+        b"",
+        "the child wrote into its stderr"
+    );
+}
+
 /// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
 /// parent would misread as never placed.
 #[cfg(target_os = "linux")]
