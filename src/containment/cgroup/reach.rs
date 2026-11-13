@@ -168,9 +168,9 @@ impl PlacedAtRemoval {
 
 /// A leaf's subtree, captured while the leaf exists, so a task can be placed in it even once the
 /// leaf is removed: the leaf's own cgroup id (`None` if unreadable: tasks are then placed through
-/// `/proc`), its directory, its unified-hierarchy path, the ids of the cgroups its sweep removed,
-/// its front's place before its removal, and whether a kill through it has landed (the leaf's own
-/// record).
+/// `/proc`), its directory, its unified-hierarchy path, the ids of the cgroups known to be under it
+/// (see [`Swept`](super::Swept)), its front's place before its removal, and whether a kill through
+/// it has landed (the leaf's own record).
 #[derive(Debug)]
 pub(crate) struct Subtree {
     leaf_id: Option<u64>,
@@ -204,7 +204,7 @@ impl Subtree {
     /// keeps its cgroup until it is freed, so a killed task on its way out, or a zombie, still has
     /// the leaf's id, and a task moved out has its new cgroup's. Where the kernel gives a pidfd's
     /// cgroup id (6.13+) and the leaf's own id is known, the task is in the subtree if that id is the
-    /// leaf's, or one the leaf's sweep removed, or one a walk of the leaf's descendants finds;
+    /// leaf's, or one known to be under it, or one a walk of the leaf's descendants finds;
     /// outside if the walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise,
     /// before 6.13 or when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
     /// unified-hierarchy path (a test leaf) holds nothing that read would place.
@@ -212,12 +212,13 @@ impl Subtree {
         self.holds_seen(pid, pidfd, None).map(|(inside, _)| inside)
     }
 
-    /// [`holds`](Self::holds), also giving the cgroup id that placed the task (the leaf's, a swept
+    /// [`holds`](Self::holds), also giving the cgroup id that placed the task (the leaf's, a known
     /// one, one the walk found under the leaf, or `seen`; `None` where `/proc` placed it or it is
     /// outside), and told `seen`, the id the task had when an id placed it in this subtree: a task
     /// still in that cgroup is where it was, so no walk of the leaf's descendants is made for it, and
-    /// the leaf's own id is not needed. The pidfd route also answers when the leaf's id is
-    /// unknown, from `seen`; an `ESRCH` from it is the task's exit and is returned.
+    /// the leaf's own id is not needed. Where the leaf's id is unknown, the pidfd route answers only
+    /// from `seen` or a known id, and `/proc` places any other task; an `ESRCH` from the pidfd is the
+    /// task's exit and is returned.
     pub(crate) fn holds_seen(
         &self,
         pid: u32,
@@ -226,19 +227,22 @@ impl Subtree {
     ) -> io::Result<(bool, Option<u64>)> {
         let mut elsewhere = false;
         let id = match pidfd {
-            Some(pidfd) if self.leaf_id.is_some() || seen.is_some() => match pidfd_cgroup_id(pidfd) {
-                Ok(id) => id,
-                // With no leaf id the pidfd's only shortcuts to `seen`: a refusal places by `/proc`,
-                // as a task with no `seen` is. `ESRCH` is the task's exit, which the caller reads.
-                Err(e) if self.leaf_id.is_none() && e.raw_os_error() != Some(libc::ESRCH) => {
-                    log::debug!(
-                        "the cgroup id of pid {pid} could not be read ({report}), so it is placed through /proc",
-                        report = crate::error::Report(&e)
-                    );
-                    None
+            Some(pidfd) if self.leaf_id.is_some() || seen.is_some() || !self.swept.is_empty() => {
+                match pidfd_cgroup_id(pidfd) {
+                    Ok(id) => id,
+                    // With no leaf id the pidfd's only shortcuts to `seen` or a known id: a refusal
+                    // places by `/proc`, as a task with neither is. `ESRCH` is the task's exit, which
+                    // the caller reads.
+                    Err(e) if self.leaf_id.is_none() && e.raw_os_error() != Some(libc::ESRCH) => {
+                        log::debug!(
+                            "the cgroup id of pid {pid} could not be read ({report}), so it is placed through /proc",
+                            report = crate::error::Report(&e)
+                        );
+                        None
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
+            }
             _ => None,
         };
         if let Some(id) = id {

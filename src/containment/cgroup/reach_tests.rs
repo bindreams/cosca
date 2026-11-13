@@ -384,6 +384,61 @@ fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_the_leafs_id() {
         .expect_err("a task that moved is placed through the hidden /proc");
 }
 
+/// A task in a cgroup known to be under the leaf is placed by that id alone: a subtree with no leaf
+/// id places it without a walk or `/proc`, and places one in no known cgroup through `/proc`,
+/// hidden here, and so not at all.
+///
+/// Mutant: with no leaf id, the set of known cgroups is not asked.
+#[skuld::test]
+fn cgroup_a_task_in_a_known_cgroup_is_placed_without_the_leafs_id(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::dir_walk_tests::{id_at, Scratch};
+    let scratch = Scratch::new("reach-known");
+    let known_id = id_at(&scratch.make("a"));
+    let known = crate::containment::cgroup::Swept::default();
+    let (_, failure) = crate::containment::cgroup::procs_under(scratch.fd().as_fd(), &known);
+    assert!(failure.is_none(), "{failure:?}");
+    let leaf = Subtree::new(
+        None,
+        None,
+        Some("/stand-in-leaf".to_owned()),
+        known,
+        super::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let _hidden = fault::hide_proc();
+    let pidfd = own_pidfd();
+    let pid = std::process::id();
+
+    {
+        let _id = fault::force_pidfd_cgroup_id(known_id);
+        let (inside, by) = leaf
+            .holds_seen(pid, Some(pidfd.as_fd()), None)
+            .expect("no walk and no /proc read");
+        assert!(inside);
+        assert_eq!(by, Some(known_id), "the known cgroup's id placed it");
+    }
+    let _id = fault::force_pidfd_cgroup_id(known_id + 1);
+    leaf.holds_seen(pid, Some(pidfd.as_fd()), None)
+        .expect_err("a task in no known cgroup is placed through the hidden /proc");
+}
+
+/// A task whose cgroup the leaf's set lacks is placed by a walk even when a cgroup under the leaf has
+/// an unreadable id: the walk visits the task's cgroup before the unreadable one, and finds it.
+///
+/// Mutant: an unreadable id anywhere under the leaf skips the walk.
+#[skuld::test]
+fn cgroup_a_task_is_found_by_the_walk_before_a_cgroup_whose_id_cannot_be_read(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::dir_walk_tests::{id_at, Scratch};
+    use crate::containment::cgroup::WalkStep;
+    let scratch = Scratch::new("reach-unreadable");
+    let target = id_at(&scratch.make("a"));
+    scratch.make("a/b");
+    let leaf = subtree_of(scratch.fd(), crate::containment::cgroup::Swept::default());
+    let _refused = fault::fail_walk_step("./a/b", WalkStep::Id, libc::EIO);
+
+    assert!(holds_hidden(&leaf, target).expect("found by the walk, no /proc read"));
+}
+
 /// A subtree with no leaf id, asked about a task seen in a cgroup, falls through to `/proc` when its
 /// pidfd's cgroup id cannot be read, as it did with no `seen`: the refusal is not the placement's
 /// failure. `/proc` is hidden, so the error that comes back is `/proc`'s, not the id's.
