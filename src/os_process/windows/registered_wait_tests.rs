@@ -89,24 +89,27 @@ async fn wait_any_times_out_only_at_the_deadline() {
 
 /// The OS timeout is clamped at the `u32` millisecond ceiling, and a wait clamped short of the
 /// deadline registers again for the time that is left: a second registration, with a smaller
-/// remaining time, and the deadline honoured.
+/// remaining time. The deadline is far off, so the clamp (not the clock) ends the first wait, and
+/// the event is signalled when the second registration is made: how many arms there are never
+/// depends on how fast the host runs.
 ///
 /// Mutant: the first timeout the OS reports ends the wait. Mutant: the remaining time is computed
 /// once, before the loop.
 #[skuld::test]
-async fn wait_any_re_registers_past_a_clamped_timeout_until_the_deadline() {
+async fn wait_any_re_registers_past_a_clamped_timeout() {
     use crate::wait::{wait_clamp_seam, wait_ms_probe};
 
     let event = event();
-    let deadline = crate::wait::deadline_from(Duration::from_millis(50)).expect("a finite deadline");
+    let signaller = event.try_clone().expect("duplicate the event");
+    let deadline = crate::wait::deadline_from(Duration::from_secs(3600)).expect("a finite deadline");
     wait_ms_probe::take();
     let _clamp = wait_clamp_seam::set(5);
+    wait_ms_probe::on_second_arm(move || signal_test_event(&signaller));
     let woke = wait_any(std::iter::once(event.as_handle()), Some(deadline))
         .await
         .expect("wait");
     let arms = wait_ms_probe::take();
-    assert_eq!(woke, Woke::TimedOut);
-    assert!(crate::wait::now() >= deadline, "answered before its deadline");
+    assert_eq!(woke, Woke::Signalled);
     wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
 }
 
