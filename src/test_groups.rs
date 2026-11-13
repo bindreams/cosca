@@ -204,9 +204,19 @@ test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attach
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
 test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");
 test_group!(PIDFD_GROUP_SIGNAL => pidfd_group_signal, env = "COSCA_TEST_PIDFD_GROUP_SIGNAL", precondition = kernel_signals_groups_through_pidfds);
+test_group!(PIDFD_GET_INFO => pidfd_get_info, env = "COSCA_TEST_PIDFD_GET_INFO", precondition = kernel_answers_pidfd_get_info);
 test_group!(CLONE3 => clone3, env = "COSCA_TEST_CLONE3");
 test_group!(STRAY_SIGNAL => stray_signal, env = "COSCA_TEST_STRAY_SIGNAL", consent = "may signal an unrelated process (a number no live process of the test pins, or a walk from a reaped root's pid)");
 test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
+
+/// A pidfd of this process, for the kernel preconditions to query.
+#[cfg(target_os = "linux")]
+fn own_pidfd() -> std::io::Result<std::os::fd::OwnedFd> {
+    Ok(rustix::process::pidfd_open(
+        rustix::process::getpid(),
+        rustix::process::PidfdFlags::empty(),
+    )?)
+}
 
 /// The `PIDFD_GROUP_SIGNAL` group's precondition: the kernel takes `PIDFD_SIGNAL_PROCESS_GROUP`
 /// (Linux 6.9+). Asked by a signal-0 send through this process's own pidfd, which signals nothing; a
@@ -221,30 +231,91 @@ fn kernel_signals_groups_through_pidfds(enabled_var: &str) -> Result<(), String>
     };
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a plain syscall.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-        if pidfd < 0 {
-            return Err(lacks(format!(
-                "pidfd_open failed ({})",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: `pidfd` is the pidfd just opened, and a null `siginfo_t` asks for the defaults.
+        use std::os::fd::AsRawFd as _;
+        // Other failures (seccomp/LSM refusal, `ENOSYS`) are the probe's own.
+        let probe_failed = |what: String| {
+            format!(
+                "the PIDFD_GROUP_SIGNAL group could not ask the kernel whether it takes PIDFD_SIGNAL_PROCESS_GROUP \
+                 ({what}); set {enabled_var}=0 to turn it off"
+            )
+        };
+        let pidfd = own_pidfd().map_err(|e| probe_failed(format!("pidfd_open failed: {e}")))?;
+        // SAFETY: `pidfd` is open, and a null `siginfo_t` asks for the defaults.
         let sent = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                pidfd,
+                pidfd.as_raw_fd(),
                 0,
                 std::ptr::null::<libc::siginfo_t>(),
                 libc::PIDFD_SIGNAL_PROCESS_GROUP,
             )
         };
-        let errno = std::io::Error::last_os_error();
-        // SAFETY: closes the pidfd opened above, which nothing else holds.
-        unsafe { libc::close(pidfd as libc::c_int) };
-        // Any other answer (`ESRCH`: this process leads no group) comes from a kernel that took the flag.
-        if sent < 0 && errno.raw_os_error() == Some(libc::EINVAL) {
-            return Err(lacks(format!("this kernel refused the flag ({errno})")));
+        if sent < 0 {
+            let errno = std::io::Error::last_os_error();
+            return match errno.raw_os_error() {
+                Some(libc::EINVAL) => Err(lacks(format!("this kernel refused the flag ({errno})"))),
+                // This process leads no group: the answer of a kernel that took the flag.
+                Some(libc::ESRCH) => Ok(()),
+                _ => Err(probe_failed(format!("the send failed: {errno}"))),
+            };
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(lacks("this host is not Linux".to_owned()))
+}
+
+/// The library's `PIDFD_GET_INFO_VER0` request (`containment::cgroup::reach`), repeated because integration roots
+/// cannot name it.
+#[cfg(target_os = "linux")]
+const PIDFD_GET_INFO_VER0: libc::Ioctl = libc::_IOWR::<[u8; libc::PIDFD_INFO_SIZE_VER0 as usize]>(0xFF, 11);
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<libc::pidfd_info>() >= libc::PIDFD_INFO_SIZE_VER0 as usize);
+
+/// The `PIDFD_GET_INFO` group's precondition: the kernel answers `PIDFD_GET_INFO` with a cgroup id
+/// (Linux 6.13+). Asked by the ioctl on this process's own pidfd; a kernel before 6.13 refuses it with `ENOTTY` or
+/// `EINVAL`. It does not call the library's
+/// `pidfd_cgroup_id`, so a defect there cannot read as a missing kernel feature.
+#[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
+fn kernel_answers_pidfd_get_info(enabled_var: &str) -> Result<(), String> {
+    let lacks = |why: String| {
+        format!(
+            "the group needs Linux 6.13+, whose pidfds answer PIDFD_GET_INFO with a cgroup id, and {why}; \
+             set {enabled_var}=0 to turn it off"
+        )
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        // Any other failure (a seccomp or LSM refusal, `ENOSYS`) is the probe's own, not the kernel's.
+        let probe_failed = |what: String| {
+            format!(
+                "the PIDFD_GET_INFO group could not ask the kernel whether it answers PIDFD_GET_INFO ({what}); \
+                 set {enabled_var}=0 to turn it off"
+            )
+        };
+        let pidfd = own_pidfd().map_err(|e| probe_failed(format!("pidfd_open failed: {e}")))?;
+        // SAFETY: all-zero is a valid `pidfd_info` (plain integers).
+        let mut info: libc::pidfd_info = unsafe { std::mem::zeroed() };
+        info.mask = u64::from(libc::PIDFD_INFO_CGROUPID);
+        // SAFETY: `pidfd` is open, and `info` is a valid, writable `struct pidfd_info`, at least as large as the first
+        // version the request encodes.
+        let rc = unsafe {
+            libc::ioctl(
+                pidfd.as_raw_fd(),
+                PIDFD_GET_INFO_VER0,
+                &mut info as *mut libc::pidfd_info,
+            )
+        };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error();
+            return match errno.raw_os_error() {
+                Some(libc::ENOTTY | libc::EINVAL) => Err(lacks(format!("this kernel refused the ioctl ({errno})"))),
+                _ => Err(probe_failed(format!("the ioctl failed: {errno}"))),
+            };
+        }
+        if info.mask & u64::from(libc::PIDFD_INFO_CGROUPID) == 0 {
+            return Err(lacks("this kernel's answer carries no cgroup id".to_owned()));
         }
         Ok(())
     }
