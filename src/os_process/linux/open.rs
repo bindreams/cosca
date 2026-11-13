@@ -212,7 +212,7 @@ fn verify_pidfd_target(
                 None,
             ));
         }
-        Err(why) => return Err(unassessable(id, &why.reason, why.source, None)),
+        Err(why) => return Err(view_unreadable(id, why, None)),
     }
     // A pid recycled before open means the original is already gone. An unassessable pid
     // (hidepid, EPERM) is NOT gone and must not be treated as one.

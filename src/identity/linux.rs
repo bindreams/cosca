@@ -57,17 +57,17 @@ fn signal_probe(kernel: &dyn Kernel, pid: RawPid) -> SignalProbe {
     }
 }
 
-/// `pid`'s `stat` through a `/proc` that is shown to describe this process's own pid namespace,
-/// else `Unknown` unless `kill(pid, 0)` says the pid is gone: an outer namespace's `/proc/<pid>`
-/// names another process, so what it says is no answer about `pid`.
+/// [`read_stat_explained`] without the cause.
 fn read_stat(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Vec<u8>> {
     read_stat_explained(kernel, pid).0
 }
 
-/// [`read_stat`], and the unusable view that made it `Unknown`, when one did.
-fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
+/// [`read_in`] through a `/proc` that is shown to describe this process's own pid namespace. Any
+/// other `/proc` leaves the read `Unknown`, and the unusable view is its cause: an outer
+/// namespace's `/proc/<pid>` names another process, so what it says is no answer about `pid`.
+fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, UnknownCause) {
     match proc_view::proc_view_with(kernel).into_dir() {
-        Ok(dir) => (stat_by_pid(kernel, &dir, pid), None),
+        Ok(dir) => read_in(kernel, &dir, pid),
         Err(why) => (
             resolve_unreadable(
                 kernel,
@@ -77,18 +77,31 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
                     report = crate::error::Report(&why)
                 ),
             ),
-            Some(why),
+            UnknownCause::of_view(Some(why)),
         ),
     }
 }
 
-/// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup. A failed read is `Gone`
-/// only when `kill(pid, 0)` says so ([`resolve_unreadable`]); a whole-table scan has the other
-/// policy (`pid_stat::read_in_scan`).
-fn stat_by_pid(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
-    match pid_stat::read_stat_file(kernel, proc_dir, pid) {
-        Ok(bytes) => Resolved::Found(bytes),
-        Err(e) => resolve_unreadable(kernel, pid, crate::error::Report(&e)),
+/// The one by-pid read of `pid`'s `stat`, via `openat` on `dir`, not a `/proc` path lookup. A failed
+/// read is `Gone` only when `kill(pid, 0)` says so ([`resolve_unreadable`]), else `Unknown`, and
+/// `Unknown` carries what the read knows: a refusal or an unreadable `stat`, as
+/// [`pid_stat::failed_read`] classes it, and no cause for an absence (`hidepid`, a racing exit). A
+/// whole-table scan has the other policy for `Gone` (`pid_stat::read_in_scan`).
+fn read_in(kernel: &dyn Kernel, dir: &ProcDir, pid: RawPid) -> (Resolved<Vec<u8>>, UnknownCause) {
+    let e = match pid_stat::read_stat_file(kernel, dir, pid) {
+        Ok(bytes) => return (Resolved::Found(bytes), UnknownCause::default()),
+        Err(e) => e,
+    };
+    match resolve_unreadable(kernel, pid, crate::error::Report(&e)) {
+        Resolved::Unknown => {
+            let cause = match pid_stat::failed_read(kernel, dir, pid, "stat", e) {
+                Ok(pid_stat::PidStat::Refused(refusal)) => UnknownCause::of_refusal(refusal),
+                Ok(_) => UnknownCause::default(),
+                Err(unreadable) => UnknownCause::of_unreadable(unreadable),
+            };
+            (Resolved::Unknown, cause)
+        }
+        resolved => (resolved, UnknownCause::default()),
     }
 }
 
@@ -262,8 +275,8 @@ fn key_of(kernel: &dyn Kernel, pid: RawPid, look: Look) -> (Resolved<Key>, Unkno
         Look::Gone => (Resolved::Gone, UnknownCause::default()),
         Look::Unknown(cause) => (Resolved::Unknown, cause),
         Look::Ticks => {
-            let (stat, view) = read_stat_explained(kernel, pid);
-            (ticks_from(pid, stat).map(Key::Ticks), UnknownCause::of_view(view))
+            let (stat, cause) = read_stat_explained(kernel, pid);
+            (ticks_from(pid, stat).map(Key::Ticks), cause)
         }
     }
 }
@@ -289,15 +302,12 @@ pub(super) fn of_stat(
         Look::Gone => (Resolved::Gone, UnknownCause::default()),
         Look::Unknown(cause) => (Resolved::Unknown, cause),
         Look::Ticks => {
-            let (stat, view) = read_stat_explained(kernel, pid);
+            let (stat, cause) = read_stat_explained(kernel, pid);
             let bytes = match &stat {
                 Resolved::Found(bytes) => bytes.clone(),
                 _ => Vec::new(),
             };
-            (
-                ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)),
-                UnknownCause::of_view(view),
-            )
+            (ticks_from(pid, stat).map(|ticks| (Key::Ticks(ticks), bytes)), cause)
         }
     }
 }
@@ -334,11 +344,8 @@ pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Ke
 pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, UnknownCause) {
     match key {
         Key::Ticks(ticks) => {
-            let (stat, view) = read_stat_explained(kernel, pid);
-            (
-                existence_of_ticks(ticks_from(pid, stat), ticks),
-                UnknownCause::of_view(view),
-            )
+            let (stat, cause) = read_stat_explained(kernel, pid);
+            (existence_of_ticks(ticks_from(pid, stat), ticks), cause)
         }
         Key::Pidfs(ino) => match prove::prove(kernel, pid, ino) {
             Proof::Holds { .. } => (Existence::Present, UnknownCause::default()),
@@ -351,7 +358,7 @@ pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, 
 /// [`exists`], reading through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
 pub(super) fn exists_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Existence {
     match key {
-        Key::Ticks(ticks) => existence_of_ticks(ticks_from(pid, stat_by_pid(kernel, proc_dir, pid)), ticks),
+        Key::Ticks(ticks) => existence_of_ticks(ticks_from(pid, read_in(kernel, proc_dir, pid).0), ticks),
         Key::Pidfs(_) => exists(kernel, pid, key).0,
     }
 }
@@ -387,11 +394,11 @@ fn ticks_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<u64> {
 /// `stat` read between is its own; the other order would let a reuser's `stat` through. `Gone` when
 /// the proof finds another process.
 fn bracketed_stat(kernel: &dyn Kernel, pid: RawPid, ino: u64) -> (Resolved<Vec<u8>>, UnknownCause) {
-    let (stat, view) = read_stat_explained(kernel, pid);
+    let (stat, cause) = read_stat_explained(kernel, pid);
     let stat = match stat {
         Resolved::Found(stat) => stat,
-        Resolved::Gone => return (Resolved::Gone, UnknownCause::of_view(view)),
-        Resolved::Unknown => return (Resolved::Unknown, UnknownCause::of_view(view)),
+        Resolved::Gone => return (Resolved::Gone, cause),
+        Resolved::Unknown => return (Resolved::Unknown, cause),
     };
     match prove::prove(kernel, pid, ino) {
         Proof::Holds { .. } => (Resolved::Found(stat), UnknownCause::default()),
@@ -445,7 +452,7 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, key: Key) -> Liveness
 /// [`is_running`], read through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
 pub(super) fn is_running_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Liveness {
     match key {
-        Key::Ticks(ticks) => liveness_of(stat_by_pid(kernel, proc_dir, pid), ticks),
+        Key::Ticks(ticks) => liveness_of(read_in(kernel, proc_dir, pid).0, ticks),
         Key::Pidfs(_) => is_running(kernel, pid, key),
     }
 }
@@ -505,6 +512,16 @@ pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
             detail: format!("{subject} identity could not be read: {}", call.name()),
             source: Some(Error::io_cause(std::io::Error::from(call.errno()))),
         })
+}
+
+/// The error for a by-pid identity read of `subject` whose `stat` could not be read, beyond absence
+/// and refusal: [`Error::Unassessable`] with the unreadable `stat` (which names the pid, and holds
+/// the errno below it) as its source.
+pub(crate) fn unreadable_error(subject: &str, unreadable: pid_stat::Unreadable) -> Error {
+    Error::Unassessable {
+        detail: format!("{subject} identity could not be read"),
+        source: Some(std::sync::Arc::new(unreadable.into_cause())),
+    }
 }
 
 fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>) -> Error {
