@@ -29,7 +29,7 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
 use crate::os_process::fake::ReapAnswer;
-use crate::test_groups::{cgroup, Group};
+use crate::test_groups::{cgroup, pidfd_get_info, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
@@ -1454,7 +1454,10 @@ fn leaf_of(child: &crate::Child) -> &crate::containment::cgroup::CgroupLeaf {
 /// A front killed through its leaf stays in it, by its pidfd's cgroup id, until it is freed: as a
 /// zombie too, and with `/proc` unreadable (`hidepid`).
 #[skuld::test]
-fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
     let release = release_after_cgroup_kill(stdin);
@@ -1466,7 +1469,7 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(#[fixture(cgroup)] _
     let names = child.tree.would_reach(pid, child.proc.pidfd());
     drop(hidden);
     assert!(
-        names.expect("the pidfd read needs no /proc"),
+        names.expect("PIDFD_GET_INFO reads the place with /proc hidden"),
         "a killed front stays in its leaf"
     );
 }
@@ -1508,7 +1511,7 @@ fn cgroup_a_leaf_holding_the_child_reaches_it_only_once_a_kill_landed(#[fixture(
         child
             .tree
             .would_reach(pid, child.proc.pidfd())
-            .expect("the pidfd read needs no /proc"),
+            .expect("the front's place is readable"),
         "the leaf holds the child"
     );
     assert!(
@@ -1525,7 +1528,10 @@ fn cgroup_a_leaf_holding_the_child_reaches_it_only_once_a_kill_landed(#[fixture(
 
 /// A front moved out of its leaf is outside it, by its pidfd's cgroup id.
 #[skuld::test]
-fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
     move_out_of_its_leaf(pid);
@@ -1533,16 +1539,19 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(#[fixture(cgroup
     let names = child.tree.would_reach(pid, child.proc.pidfd());
     drop(hidden);
     assert!(
-        !names.expect("the pidfd read needs no /proc"),
+        !names.expect("PIDFD_GET_INFO reads the place with /proc hidden"),
         "a moved front is outside its leaf"
     );
 }
 
-/// A front moved into a cgroup nested under its leaf is in the leaf's subtree: by the walk of the
-/// leaf's descendants with `PIDFD_GET_INFO`, whatever `/proc` hides; without it by its path, which a
-/// hidden `/proc` does not give (such a host refuses the spawn, see `front_placement`).
+/// With `PIDFD_GET_INFO` missing, a front nested under its leaf is placed by its path, and a hidden `/proc` places
+/// nothing (such a host refuses the spawn, see `front_placement`).
 #[skuld::test]
-fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hides_it(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    // Held first, so that on a kernel with `PIDFD_GET_INFO` too the place is read through `/proc`.
+    let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
     move_under_its_leaf(pid);
@@ -1550,17 +1559,39 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(#[fixture(cgroup)] _group
     assert!(names().expect("/proc is readable here"));
     {
         let _hidden = crate::containment::cgroup::fault::hide_proc();
-        assert!(names().expect("the walk needs no /proc"), "found by the walk");
-        let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
         names().expect_err("a hidden path places nothing");
     }
+    // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
+}
+
+/// A front moved into a cgroup nested under its leaf is in the leaf's subtree by the walk of the leaf's
+/// descendants with `PIDFD_GET_INFO`, whatever `/proc` hides.
+#[skuld::test]
+fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
+    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.pid();
+    move_under_its_leaf(pid);
+    let _hidden = crate::containment::cgroup::fault::hide_proc();
+    assert!(
+        child
+            .tree
+            .would_reach(pid, child.proc.pidfd())
+            .expect("the walk by cgroup id reads with /proc hidden"),
+        "found by the walk"
+    );
     // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
 }
 
 /// A front in a cgroup nested under its leaf, on a host whose `/proc` hides it: its kill goes
 /// through the leaf, which reaches it, and is `Ok`, and the front dies of it.
 #[skuld::test]
-fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     move_under_its_leaf(child.pid());
     {
@@ -1581,7 +1612,10 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
 /// leaf's kill reaches it, and its sweep removes the nested cgroups before the teardown asks, so the
 /// sweep's record places it; the teardown waits for it and reaps it.
 #[skuld::test]
-fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
     assert_killed_by_the_leaf(&failures);
 }
