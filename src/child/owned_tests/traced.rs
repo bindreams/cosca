@@ -208,7 +208,7 @@ fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(trace
 /// [`OwnedChild::exited_by`](crate::child::owned::OwnedChild::exited_by) with no deadline): the
 /// attach's `SIGSTOP` wakes the watch on its own kqueue, its look finds another process holding the
 /// child, and the watch ends once the tracer holds the child's zombie. XNU sends that `NOTE_EXIT` to
-/// the tracer alone. This is the exit-wait twin of `a_tracer_that_attaches_during_a_wait_wakes_it`.
+/// the tracer alone.
 ///
 /// Mutant: the exit wait registers no `NOTE_SIGNAL`, or blocks on the shared exit kqueue, whose
 /// `NOTE_EXIT` is withheld: the watch never returns.

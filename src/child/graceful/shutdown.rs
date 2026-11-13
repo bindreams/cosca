@@ -127,7 +127,6 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     // A watch failure must not strand the child between the soft signal and the escalation: the
     // kill and the reap still run, then the failure surfaces.
     let watch = w.root_exited(grace).await;
-    // The escalation is `kill`, with the `SIGTERM` named as already sent.
     let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
@@ -182,7 +181,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     } else if w.child().tree.drain_edge().is_some() {
         match w.tree_drained(grace).await {
             Ok(verdict) if verdict.permits_skipping_sweep() => (true, true, None),
-            // One look: a zero grace arms no wait, and so no kqueue.
+            // A zero grace is one look.
             Ok(_) => match w.root_exited(Duration::ZERO).await {
                 Ok(exited) => (false, exited, None),
                 Err(e) => (false, false, Some(e)),

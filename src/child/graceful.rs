@@ -155,13 +155,11 @@ impl Child {
     /// only through a cgroup that holds it. Outside one it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     ///
-    /// The grace watch reaps nothing: a root that exited within it, even one whose zombie a tracer or
-    /// launchd holds or whose reap another process took, is not escalated against, and the reap that
-    /// follows answers for it. A zombie a tracer holds is waited on until the tracer hands it back,
-    /// and then the reap returns its status. A root reaped elsewhere has no exit status to collect:
-    /// the call returns [`Error::Unassessable`](crate::error::Error::Unassessable) saying so, with
-    /// the `ECHILD` as its `source()` and no warn, as
-    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) does.
+    /// The grace watch reaps nothing: a root that exited within it, however it is held or reaped
+    /// elsewhere, is not killed, and the reap that follows answers for it. A tracer-held zombie is
+    /// waited on until the tracer hands it back. A root reaped elsewhere returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) with the `ECHILD` as its
+    /// `source()` and no warn, as [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) does.
     ///
     /// **macOS, a root launchd holds** is refused by the cooperative half, as for
     /// [`kill`](Child::kill). A root launchd comes to hold during the call is not killed or waited

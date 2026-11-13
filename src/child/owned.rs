@@ -403,13 +403,12 @@ impl OwnedChild {
 
     /// Whether the child has exited by `deadline` (`None`: for ever), read through the OS's own look
     /// ([`OsProcess::exited`](crate::os_process::OsProcess::exited)): a zombie its tracer holds
-    /// counts, and so does one launchd holds. On macOS XNU withholds `NOTE_EXIT` from a parent that
-    /// does not hold the child (`p_oppid` set, `kern_event.c:1203-1210`), so while another process is
-    /// the parent the look reads the zombie itself and the wait re-looks with the driver's backoff. A
-    /// tracer that attaches during the wait wakes it, through the wait's own kqueue
+    /// counts, and so does one launchd holds. On macOS, while another process is the parent the look
+    /// reads the zombie itself and the wait re-looks with the driver's backoff (`MacChild::exited`
+    /// says why). A tracer that attaches during the wait wakes it, through the wait's own kqueue
     /// ([`OsProcess::exit_wait`](crate::os_process::OsProcess::exit_wait)).
     /// Reaps nothing: during a graceful tree shutdown the root stays an unreaped zombie until the
-    /// group kill is done, so its pid names no one else (principle 4). Takes no lock, so it may run
+    /// group kill is done, so its pid names no one else. Takes no lock, so it may run
     /// while another thread waits.
     pub(crate) fn exited_by(&self, deadline: Option<Instant>) -> Result<bool, Error> {
         crate::os_process::drive::exited_until(&*self.os, deadline)

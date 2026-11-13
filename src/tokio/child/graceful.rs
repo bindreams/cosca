@@ -123,13 +123,7 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     ///
-    /// The grace watch reaps nothing: a root that exited within it, even one whose reap another
-    /// process took, is not escalated against, and the reap that follows answers for it, as for the
-    /// sync [`graceful_shutdown`](crate::Child::graceful_shutdown).
-    ///
-    /// **macOS, a root launchd holds** is answered as for the sync
-    /// [`graceful_shutdown`](crate::Child::graceful_shutdown): refused by the cooperative half, and
-    /// a root launchd comes to hold during the call is not killed or waited on, with no warn.
+    /// Behaves as the sync [`graceful_shutdown`](crate::Child::graceful_shutdown), awaiting each wait.
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         crate::child::graceful::shutdown::shutdown_lone(self, grace).await
     }

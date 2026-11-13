@@ -26,8 +26,7 @@ fn orphan_next_peek(fake: &FakeProcess) -> impl FnOnce() + 'static {
     move || drop(fake.peeks([Untrusted::Unpinned.result()]))
 }
 
-/// The hook that makes the next reap of `fake`'s root answer that launchd holds its zombie: the
-/// reap is where a root orphaned late is found out.
+/// The reap is where a root orphaned late is found out.
 fn orphan_next_reap(fake: &FakeProcess) -> impl FnOnce() + 'static {
     let fake = fake.clone();
     move || drop(fake.reaps([ReapAnswer::Foreign(Foreign::Orphaned)]))
@@ -112,8 +111,8 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 /// A root that exited and is held by launchd is neither killed nor looked at before the reap, and
 /// nothing warns that the zombie is not ours to reap: the grace watch ends at once on the exit, with
 /// the grace unspent, and the reap's own answer, that launchd holds it, is the refusal, saying the
-/// exit status cannot be collected. The reap's answer is stated by the fake root; its exit watch
-/// reading past `NOTE_EXIT` for a parent that is launchd is pinned beside `MacChild::exited`.
+/// exit status cannot be collected. The root's exit watch reading past `NOTE_EXIT` for a parent that
+/// is launchd is pinned beside `MacChild::exited`.
 ///
 /// Mutants: the grace watch or the reap warns that the zombie is not ours to reap; the call looks
 /// at the root before the reap instead of asking the reap; the escalation kills an exited root; the

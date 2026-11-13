@@ -273,7 +273,11 @@ impl ExitWatch {
             reap: false,
         };
         #[cfg(test)]
-        let forced = kqueue::test_hooks::take_forced_esrch_registration(kqueue::test_hooks::Registration::ExitWatch);
+        if kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::SilentExitWatch) {
+            return Ok(Self::new(kq));
+        }
+        #[cfg(test)]
+        let forced = kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::ExitWatch);
         #[cfg(not(test))]
         let forced = false;
         let subscribed = if forced {

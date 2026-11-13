@@ -90,7 +90,7 @@ impl OsProcess for MacChild {
 
     /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it
     /// ([`ExitWatch::look`]), and also when the watch cannot say: XNU withholds `NOTE_EXIT` from a
-    /// parent that does not hold the child (`p_oppid` set, `kern_event.c` `filt_procevent`), so a
+    /// parent that does not hold the child (`p_oppid` set), so a
     /// child whose parent is another process, a tracer or launchd, may be a zombie with its watch
     /// unfired. Then the zombie read decides: `Exited` for a zombie or gone, `Recheck` for a child
     /// still running, since no event will come while another process is the parent. A child whose
