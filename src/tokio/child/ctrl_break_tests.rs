@@ -4,7 +4,7 @@
 use std::net::TcpStream;
 use std::time::Duration;
 
-use super::fault as term_fault;
+use crate::child::graceful::fault as term_fault;
 use crate::containment::Containment;
 use crate::test_child::ctrl_break::{
     self, assert_acked, assert_in_our_console, kill_release_reap_async, Grandchild, Handler, STATUS_CONTROL_C_EXIT,

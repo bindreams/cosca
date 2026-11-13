@@ -149,6 +149,81 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
     crate::test_child::assert_killed("the escalated child", status);
 }
 
+/// A reap that fails after the kill is the answer, and the grace wait's failure beside it is logged
+/// at warn, naming the call: the reap's failure is an `Io`, which holds nothing.
+///
+/// Mutant: the watch failure is dropped when the reap fails.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failed_lone_reap_is_the_answer_and_the_watch_failure_a_warn_naming_the_call() {
+    use crate::child::spawn::failure::seams;
+    use crate::error::Error;
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (child, stdin) = kill_only_blocker();
+    fault::set_force_watch_error(true);
+    let _armed = seams::fail_the_next_wait();
+
+    let err = child.graceful_shutdown(Duration::ZERO).expect_err("the reap failed");
+
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains(seams::FAILURE)),
+        "{err:?}"
+    );
+    let logged = crate::log_capture::records_since_on_current_thread(mark, "forced grace-watch failure");
+    let call = format!("graceful_shutdown({})", child.pid());
+    assert!(
+        matches!(&logged[..], [(log::Level::Warn, line)] if line.starts_with(&call)),
+        "{logged:?}"
+    );
+    // The kill landed: the seam consumed, this wait reaps what it killed.
+    let status = child.wait().expect("reap the killed child");
+    crate::test_child::assert_killed("the escalated child", status);
+    drop(stdin);
+}
+
+/// A root reaped behind the handle's back has exited, as the grace watch (which reaps nothing) sees it:
+/// no escalation follows, and the answer is the reap's own `ECHILD`, with no warn beside it.
+///
+/// Mutant: the grace watch reaps, so the foreign reap is its failure, and the escalation and a warn
+/// for it follow.
+#[cfg(unix)]
+#[skuld::test]
+fn graceful_lone_shutdown_of_a_root_reaped_elsewhere_answers_the_reaps_echild_alone() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use crate::test_child::reaped_elsewhere::{kill_own_child, reap_behind, session_cat};
+
+    crate::log_capture::install();
+    let mut child = session_cat().spawn().expect("spawn");
+    let _stdin = child.stdin().expect("stdin pipe");
+    let pid = child.pid();
+    kill_own_child(pid);
+    reap_behind(pid);
+    let escalated = Arc::new(AtomicBool::new(false));
+    let _hook = term_fault::at(term_fault::HookPoint::BeforeEscalation, {
+        let escalated = Arc::clone(&escalated);
+        move || escalated.store(true, Ordering::Relaxed)
+    });
+    let mark = crate::log_capture::mark();
+
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("a root reaped elsewhere has no exit status");
+
+    assert!(
+        matches!(&err, crate::error::Error::Io(e) if e.raw_os_error() == Some(libc::ECHILD)),
+        "{err:?}"
+    );
+    assert!(
+        !escalated.load(Ordering::Relaxed),
+        "a root the watch saw exit was escalated against"
+    );
+    assert_eq!(crate::log_capture::warns_since(mark, ""), Vec::<String>::new());
+}
+
 // The graceful path: an uncontained `cat` dies to `SIGTERM`'s default disposition within the
 // grace. Its stdin is released via `release_at` after `terminate` returns; a `terminate` that sent
 // nothing yields exit 0 and fails the assertion.
