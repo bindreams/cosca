@@ -152,7 +152,9 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. Without
 /// `openat2` (Linux < 5.6, or a seccomp or LSM refusal) no view can be checked: `ErrorKind::Unsupported`. A `stat`
 /// read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
-/// (`EACCES`, or `EPERM` while the checked directory still answers). A member whose pidfd cannot
+/// (`EACCES`, or `EPERM` while the checked directory still answers). A refused `openat2` mid-scan
+/// (`ENOSYS`/`ENODEV` from the read, or `EPERM` beside a directory that refuses `self/stat` too) is
+/// `ErrorKind::Unsupported`, as at view-open time. A member whose pidfd cannot
 /// be opened fails the listing too (`ErrorKind::Unsupported` for a refused `pidfd_open`, `Other`
 /// for a transient one such as `EMFILE`): its identity is told through the pidfd, and leaving it out
 /// could clear a live group.
@@ -165,11 +167,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         crate::identity::proc_view_with(kernel)
             .into_dir()
             .map_err(|why| match why.openat2_requirement() {
-                Some(requirement) => listing_error(
-                    std::io::ErrorKind::Unsupported,
-                    format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
-                    why.source.map(Into::into),
-                ),
+                Some(requirement) => refused_listing(pgid, &requirement, why.source.map(Into::into)),
                 None => {
                     let message = format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
@@ -191,6 +189,15 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                     report = crate::error::Report(&e)
                 );
                 continue;
+            }
+            // A refusal mid-scan is the `Unsupported` a refused view-open is.
+            Ok(crate::identity::pid_stat::PidStat::Refused(call)) => {
+                let requirement = call.requirement().expect("read_in_scan reports only refusals");
+                return Err(refused_listing(
+                    pgid,
+                    &requirement,
+                    Some(Box::new(std::io::Error::from(call.errno()))),
+                ));
             }
             // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc),
             // and the failure that came with its read is its peer: both are causes of the listing.
@@ -267,6 +274,21 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
         out.push(Member { id, system: false });
     }
     Ok(out)
+}
+
+/// The listing failure of an `openat2` that was refused, whether opening the view or reading in it:
+/// `ErrorKind::Unsupported` saying `requirement`, with `cause` as its source.
+#[cfg(target_os = "linux")]
+fn refused_listing(
+    pgid: i32,
+    requirement: &str,
+    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+) -> std::io::Error {
+    listing_error(
+        std::io::ErrorKind::Unsupported,
+        format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
+        cause,
+    )
 }
 
 /// A listing failure of `kind` that says `message` and keeps `cause`, the failed call's errno, as

@@ -714,7 +714,6 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         libc::ENFILE,
         libc::ENOMEM,
         libc::EIO,
-        libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
         let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
@@ -737,39 +736,64 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 }
 
 /// EPERM is `hidepid`'s answer, and also a seccomp filter's for `openat2` installed mid-scan. Only
-/// the checked directory answering afterwards tells them apart: if it refuses too, this is a
-/// refusal, not a hidden pid, and the pid's `EPERM` is the source. A re-check that fails otherwise
-/// is the re-check's error. Mutant: "exclude EPERM without the re-check"; "every failed re-check is
-/// a refusal".
+/// the checked directory answering afterwards tells them apart. A re-check that fails without
+/// refusing (`EMFILE`, `ENOMEM`, `EIO`) is the re-check's own error, with the pid's `EPERM` kept as
+/// a second cause. Mutant: "exclude EPERM without the re-check"; "every failed re-check is a
+/// refusal".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
-    for (recheck, refused, below, peer) in [
-        (libc::EPERM, true, libc::EPERM, libc::EPERM),
-        (libc::ENOSYS, true, libc::EPERM, libc::ENOSYS),
-        (libc::EMFILE, false, libc::EMFILE, libc::EPERM),
-    ] {
+fn members_is_an_error_for_eperm_when_the_checked_directory_fails_without_refusing() {
+    for recheck in [libc::EMFILE, libc::ENOMEM, libc::EIO] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         let err =
             members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
         let text = crate::error::Report(&err).to_string();
-        assert!(text.contains("self/stat"), "{recheck}: {text}");
-        assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
-        assert_eq!(
-            text.contains("re-check of self/stat failed"),
-            !refused,
-            "{recheck}: {text}"
-        );
-        assert_eq!(crate::error::first_os_code(&err), Some(below), "{recheck}: {text}");
-        // The other failure of the pair is a second cause, not dropped: the pid's own `EPERM` beside
-        // a failed re-check, the re-check's error beside the pid's refusal.
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{recheck}: {text}");
+        assert!(text.contains("re-check of self/stat failed"), "{recheck}: {text}");
+        assert_eq!(crate::error::first_os_code(&err), Some(recheck), "{recheck}: {text}");
         let (_, second) = text
             .split_once("(2) ")
             .unwrap_or_else(|| panic!("{recheck}: the second failure is kept: {text}"));
         assert!(
-            second.contains(&std::io::Error::from_raw_os_error(peer).to_string()),
-            "{recheck}: the peer's error ({peer}) is the second cause: {text}"
+            second.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+            "{recheck}: the pid's EPERM is the second cause: {text}"
+        );
+    }
+}
+
+/// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
+/// condition as a refused view-open: `ErrorKind::Unsupported` naming `openat2`, with the refusing
+/// errno as the source. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or as
+/// `EPERM` beside a checked directory that refuses `self/stat` too. Mutant: "a refusal mid-scan is
+/// `Other`"; "the pid's `EPERM` is the source of a refusal the directory made".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
+    // The pid's `stat` answer, the `self/stat` answer where there is one, and the refusing errno.
+    for (stat, recheck, refusing) in [
+        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
+        (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+        (libc::EPERM, Some(libc::ENODEV), libc::ENODEV),
+        (libc::ENOSYS, None, libc::ENOSYS),
+        (libc::ENODEV, None, libc::ENODEV),
+    ] {
+        let mut kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, stat);
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", Err(recheck));
+        }
+        let err = members(&kernel, i32::MAX).expect_err("a refused openat2 lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Unsupported,
+            "{stat}/{recheck:?}: {text}"
+        );
+        assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
+        assert_eq!(
+            crate::error::first_os_code(&err),
+            Some(refusing),
+            "{stat}/{recheck:?}: {text}"
         );
     }
 }

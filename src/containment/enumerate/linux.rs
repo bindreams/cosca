@@ -12,18 +12,12 @@ use crate::identity::RawPid;
 /// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]).
 pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
-    let dir = crate::identity::proc_view_with(kernel).into_dir().map_err(|why| {
-        match why.unsupported("listing the process table") {
-            Some(unsupported) => {
-                log::warn!(
-                    "enumerate::process_parents: {report}",
-                    report = crate::error::Report(&unsupported)
-                );
-                unsupported
-            }
+    let dir = crate::identity::proc_view_with(kernel)
+        .into_dir()
+        .map_err(|why| match why.unsupported(OP_NAME) {
+            Some(unsupported) => warned(unsupported),
             None => unassessable(&why.reason, why.source),
-        }
-    })?;
+        })?;
     let pids = kernel
         .pids(&dir)
         .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
@@ -37,6 +31,10 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
                     report = crate::error::Report(&e)
                 );
                 continue;
+            }
+            Ok(PidStat::Refused(call)) => {
+                let unsupported = call.unsupported(OP_NAME);
+                return Err(warned(unsupported.expect("read_in_scan reports only refusals")));
             }
             Err(unreadable) => return Err(stat_unreadable(unreadable)),
         };
@@ -59,6 +57,18 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
 /// parse is [`Error::Unassessable`] naming the pid, never an absence.
 fn ppid_of_stat(pid: RawPid, stat: &[u8]) -> Result<RawPid, Error> {
     parse_ppid(stat).ok_or_else(|| unassessable(&format!("{pid}/stat has no parseable ppid field"), None))
+}
+
+/// What the snapshot's [`Error::Unsupported`] names as its `op`.
+const OP_NAME: &str = "listing the process table";
+
+/// `unsupported`, a refused `openat2` that ended the snapshot, logged at `warn`.
+fn warned(unsupported: Error) -> Error {
+    log::warn!(
+        "enumerate::process_parents: {report}",
+        report = crate::error::Report(&unsupported)
+    );
+    unsupported
 }
 
 fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {

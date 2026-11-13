@@ -100,7 +100,6 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
         libc::ENFILE,
         libc::ENOMEM,
         libc::EIO,
-        libc::ENOSYS,
     ] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
         let error = match process_parents(&kernel) {
@@ -148,29 +147,19 @@ fn the_warn_of_a_failed_stat_read_says_the_os_error() {
 }
 
 /// `EPERM` is `hidepid`'s answer and also a seccomp filter's for an `openat2` installed mid-scan;
-/// only the checked directory still answering tells them apart. A re-check that refuses is
-/// "refused self/stat too" over the pid's `EPERM`; one that fails otherwise says the re-check failed,
-/// over its own errno. Mutant: "skip `EPERM` without the re-check"; "every failed re-check is a
-/// refusal".
+/// only the checked directory still answering tells them apart. A re-check that fails without
+/// refusing says the re-check failed, over its own errno, with the pid's `EPERM` kept as a second
+/// cause. Mutant: "skip `EPERM` without the re-check"; "every failed re-check is a refusal".
 #[skuld::test]
-fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
-    for (recheck, refused, below) in [
-        (libc::EPERM, true, libc::EPERM),
-        (libc::ENOSYS, true, libc::EPERM),
-        (libc::EMFILE, false, libc::EMFILE),
-    ] {
+fn eperm_is_unassessable_when_the_checked_directory_fails_without_refusing() {
+    for recheck in [libc::EMFILE, libc::ENOMEM, libc::EIO] {
         let kernel =
             FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
         match process_parents(&kernel) {
             Err(error @ crate::error::Error::Unassessable { .. }) => {
                 let text = crate::error::Report(&error).to_string();
-                assert_eq!(text.contains("refused self/stat too"), refused, "{recheck}: {text}");
-                assert_eq!(
-                    text.contains("re-check of self/stat failed"),
-                    !refused,
-                    "{recheck}: {text}"
-                );
-                assert_eq!(crate::error::first_os_code(&error), Some(below), "{recheck}: {text}");
+                assert!(text.contains("re-check of self/stat failed"), "{recheck}: {text}");
+                assert_eq!(crate::error::first_os_code(&error), Some(recheck), "{recheck}: {text}");
                 // The failure that came with it is kept as a second cause, not only worded.
                 let crate::error::Error::Unassessable {
                     source: Some(source), ..
@@ -181,12 +170,52 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
                 let crate::error::Error::Several(causes) = &**source else {
                     panic!("{recheck}: expected Several, got {source:?}");
                 };
-                let peer = if refused { recheck } else { libc::EPERM };
                 let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
-                assert_eq!(codes, [Some(below), Some(peer)], "{recheck}: {text}");
+                assert_eq!(codes, [Some(recheck), Some(libc::EPERM)], "{recheck}: {text}");
             }
             other => panic!("{recheck}: expected Unassessable, got {other:?}"),
         }
+    }
+}
+
+/// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
+/// condition as a refused view-open: `Unsupported` naming `openat2`, with the refusing errno as the
+/// source, and warned about. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or as
+/// `EPERM` beside a checked directory that refuses `self/stat` too. Mutant: "a refusal mid-scan is
+/// `Unassessable`"; "the pid's `EPERM` is the source of a refusal the directory made".
+#[skuld::test]
+fn a_refused_openat2_mid_scan_is_unsupported_naming_the_refusing_errno() {
+    // The pid's `stat` answer, the `self/stat` answer where there is one, and the refusing errno.
+    for (stat, recheck, refusing) in [
+        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
+        (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
+        (libc::EPERM, Some(libc::ENODEV), libc::ENODEV),
+        (libc::ENOSYS, None, libc::ENOSYS),
+        (libc::ENODEV, None, libc::ENODEV),
+    ] {
+        let mut kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, stat);
+        if let Some(recheck) = recheck {
+            kernel = kernel.on_read("self/stat", Err(recheck));
+        }
+        let (got, records) = snapshot_with(&kernel);
+        match got {
+            Err(error @ crate::error::Error::Unsupported { .. }) => {
+                let text = crate::error::Report(&error).to_string();
+                assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
+                assert_eq!(
+                    crate::error::first_os_code(&error),
+                    Some(refusing),
+                    "{stat}/{recheck:?}: {text}"
+                );
+            }
+            other => panic!("{stat}/{recheck:?}: expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            records
+                .iter()
+                .any(|(level, line)| *level == log::Level::Warn && line.contains("requires openat2")),
+            "{stat}/{recheck:?}: {records:?}"
+        );
     }
 }
 
