@@ -287,6 +287,10 @@ pub enum Error {
     },
     /// A containment mechanism could not be established, or could not tear the tree down: a member
     /// confirmed running, a failed `killpg` or kill write, or the mechanism's own stale bookkeeping.
+    ///
+    /// A [`Strongest`](crate::ContainMode::Strongest) spawn returns it, on Linux and macOS, when
+    /// the mechanism the host offers cannot be set up (the cgroup leaf, or the fd marker): the
+    /// program did not run, and `detail` names the mechanism.
     Containment {
         detail: String,
         source: Option<Arc<Error>>,

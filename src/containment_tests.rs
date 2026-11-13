@@ -43,3 +43,39 @@ fn contain_mode_session_is_distinct_from_strongest_and_treewalk() {
     assert_ne!(ContainMode::Session, ContainMode::Strongest);
     assert_ne!(ContainMode::Session, ContainMode::TreeWalk);
 }
+
+/// `BestEffort` contains a child on every platform, whatever the host offers, and `kill_tree` tears
+/// it down.
+#[skuld::test]
+fn best_effort_contains_a_child_and_kill_tree_ends_it() {
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    cmd.contain_with(ContainMode::BestEffort);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+
+    assert!(child.containment().can_teardown(), "got {}", child.containment());
+    child.kill_tree().expect("kill_tree");
+    drop(stdin);
+    assert!(!child.wait().expect("wait").success(), "the child was killed");
+}
+
+/// [`best_effort_contains_a_child_and_kill_tree_ends_it`] for the async `Command`.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn best_effort_contains_an_async_child_and_kill_tree_ends_it() {
+    let mut cmd = crate::test_child::tokio_command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    cmd.contain_with(ContainMode::BestEffort);
+    let mut child = cmd.spawn().await.expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+
+    assert!(child.containment().can_teardown(), "got {}", child.containment());
+    child.kill_tree().await.expect("kill_tree");
+    drop(stdin);
+    assert!(!child.wait().await.expect("wait").success(), "the child was killed");
+}
