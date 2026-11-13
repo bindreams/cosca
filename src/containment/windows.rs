@@ -2062,7 +2062,7 @@ fn earliest_created(times: impl IntoIterator<Item = (u64, u32)>) -> Earliest {
 ///
 /// `GetProcessId` answers 0 on failure, and a walk filtered to owner 0 would match the System
 /// Idle process instead of the child.
-fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
+pub(super) fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
     // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
     let pid = unsafe { GetProcessId(raw_handle) };
     if pid == 0 {

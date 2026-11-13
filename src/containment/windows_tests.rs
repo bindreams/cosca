@@ -875,6 +875,78 @@ fn a_kill_wait_names_a_member_it_may_not_wait_on_once() {
     );
 }
 
+/// A root whose wait failed (it refuses the wait's open) is reported once, though it is still in the
+/// job's snapshot: the edge's confirmation does not name it again.
+///
+/// Mutant: a failed root wait leaves the root's identity out of what the kill's wait settled.
+#[skuld::test]
+fn a_kill_wait_reports_a_root_whose_wait_failed_once() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_kill_wait_reports_a_root_whose_wait_failed_once),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    assert_the_failed_root_is_the_one_error(&done, false);
+}
+
+/// [`a_kill_wait_reports_a_root_whose_wait_failed_once`] for a root whose start time the snapshot cannot
+/// read (a forced failure): it is settled by its pid.
+///
+/// Mutant: a failed root wait leaves the root's pid out of what the kill's wait reported.
+#[skuld::test]
+fn a_kill_wait_reports_a_root_whose_wait_failed_once_when_the_snapshot_cannot_read_its_identity() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            a_kill_wait_reports_a_root_whose_wait_failed_once_when_the_snapshot_cannot_read_its_identity
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    assert_the_failed_root_is_the_one_error(&done, true);
+}
+
+fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Completion, unreadable: bool) {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::containment::drain_edge::DrainEdge;
+    use crate::containment::TreeKill;
+    use crate::error::Error;
+
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(done);
+    let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
+        .expect("the restricted member's identity");
+    let root = crate::os_process::windows::WindowsProcess::open(id)
+        .expect("open the restricted member")
+        .expect("a live process opens with QUERY alone");
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+    let _failed = unreadable.then(|| {
+        super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, member.pid())
+    });
+    let forced = super::fault::force_job_pid_list(Vec::new());
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        Vec::new(),
+        Vec::new(),
+        DrainEdge::Job(&job),
+    )
+    .split();
+
+    let verdict = wait.with_root(&root, true).wait();
+
+    drop(forced);
+    let error = verdict.expect_err("a root whose exit cannot be observed is not a drain");
+    assert!(
+        matches!(&error, Error::Unassessable { detail, source: Some(source) }
+            if detail.starts_with("the root was killed") && !matches!(&**source, Error::Several(_))),
+        "the root is the one error: {error:?}"
+    );
+}
+
 /// An empty listing is the drain only once the members the snapshot names are signalled: the list
 /// drops a member before its process object signals. The second member is alive, in the job, when
 /// the second listing (forced) comes back empty; the wait must block on it, and the hook ends it

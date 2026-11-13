@@ -91,9 +91,9 @@ impl Unnamed {
 /// it again. Only a Job's edge reads it, so it is kept on Windows alone.
 ///
 /// A snapshot entry with a readable identity is settled iff that identity is one of the `members`,
-/// each of which the wait saw exit or reported. An entry whose identity cannot be read is settled iff
-/// its pid is one of the `reported`: the pid of a member whose wait failed, or of one the listing
-/// could not name. The pid of a member whose exit was seen is never matched: an exited process is not
+/// each of which the wait saw exit or reported (the root too, when its handle reads an identity). An
+/// entry whose identity cannot be read is settled iff its pid is one of the `reported`: the pid of a
+/// member or the root whose wait failed, or of one the listing could not name. The pid of a member whose exit was seen is never matched: an exited process is not
 /// in a snapshot, so that pid names another process.
 #[derive(Default)]
 pub(crate) struct Settled {
@@ -263,7 +263,11 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        let members: Vec<ProcessId> = once_each(members).collect();
+        #[cfg_attr(
+            not(windows),
+            allow(unused_mut, reason = "only a Job's edge reads the root's settlement")
+        )]
+        let mut members: Vec<ProcessId> = once_each(members).collect();
         #[cfg(windows)]
         let mut reported = reported_pids(&unnamed);
         let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
@@ -275,7 +279,10 @@ impl<'a> KillWait<'a> {
             }
         }
         if let RootEnd::Waited(root) = root {
-            if let Err(why) = wait_for_exit(root) {
+            let waited = wait_for_exit(root);
+            #[cfg(windows)]
+            settle_root(root, waited.is_err(), &mut members, &mut reported);
+            if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
         }
@@ -304,7 +311,11 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
-        let members: Vec<ProcessId> = once_each(members).collect();
+        #[cfg_attr(
+            not(windows),
+            allow(unused_mut, reason = "only a Job's edge reads the root's settlement")
+        )]
+        let mut members: Vec<ProcessId> = once_each(members).collect();
         #[cfg(windows)]
         let mut reported = reported_pids(&unnamed);
         let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
@@ -316,7 +327,10 @@ impl<'a> KillWait<'a> {
             }
         }
         if let RootEnd::Waited(root) = root {
-            if let Err(why) = wait_for_exit_async(root).await {
+            let waited = wait_for_exit_async(root).await;
+            #[cfg(windows)]
+            settle_root(root, waited.is_err(), &mut members, &mut reported);
+            if let Err(why) = waited {
                 unobserved.push(root_unobserved(why));
             }
         }
@@ -338,6 +352,26 @@ impl<'a> KillWait<'a> {
 #[cfg(windows)]
 fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
     unnamed.iter().filter_map(|unnamed| unnamed.pid).collect()
+}
+
+/// Settle the root, once its wait ended: its identity, if its handle can read one, is a settled member
+/// (it is matched by identity alone, never by its pid), and its pid is `reported` when the wait `failed`,
+/// so a snapshot entry for the root whose identity cannot be read is not named again. A handle that
+/// names no process (a fake's) settles nothing.
+#[cfg(windows)]
+fn settle_root(root: &dyn OsProcess, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let raw = windows::Win32::Foundation::HANDLE(root.os_handle().as_raw_handle());
+    let Ok(pid) = crate::containment::windows::process_pid_of(raw) else {
+        return;
+    };
+    if failed {
+        reported.push(pid);
+    }
+    if let Ok(id) = crate::identity::windows_identity_from_handle_result(raw, pid) {
+        members.push(id);
+    }
 }
 
 /// `members`, each one once, in the order they were reached.
