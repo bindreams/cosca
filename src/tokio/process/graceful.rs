@@ -25,8 +25,8 @@ impl Process {
         self.terminate()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
-        let call = format!("graceful_shutdown({})", self.id().pid());
-        crate::graceful::after_grace(&call, self.wait_timeout(grace).await, || self.kill())
+        let call = || format!("graceful_shutdown({})", self.id().pid());
+        crate::graceful::after_grace(call, self.wait_timeout(grace).await, || self.kill())?.map_or(Ok(()), Err)
     }
 
     /// Cooperative-then-forced shutdown of the foreign process's tree: `SIGTERM`-walk, wait

@@ -11,7 +11,7 @@ type EveryRoundHook = Box<dyn FnMut(u32)>;
 thread_local! {
     static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
-    static FORCE_ESRCH_REGISTRATION: Cell<Option<Registration>> = const { Cell::new(None) };
+    static FORCED_REGISTRATION: Cell<Option<Registration>> = const { Cell::new(None) };
     static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
@@ -39,7 +39,7 @@ pub(crate) fn take_events() -> Vec<(i16, u32)> {
     AWAIT_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
 }
 
-/// Which `EVFILT_PROC` registration a forced `ESRCH` is for.
+/// Which `EVFILT_PROC` registration a forced outcome is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Registration {
     /// The reap registration (`await_reapable`'s `register`), which `await_reapable` makes for a
@@ -48,18 +48,22 @@ pub(crate) enum Registration {
     /// An exit watch's (`ExitWatch::proc_exit`): the process reads as exited, as one past
     /// `P_REF_DEAD` does before it is a zombie.
     ExitWatch,
+    /// An exit watch's, which is made and never subscribed: it never fires, as the shared watch of a
+    /// child whose `NOTE_EXIT` has not reached it yet reads, while another kqueue has the event.
+    SilentExitWatch,
 }
 
-/// The next `EVFILT_PROC` registration of kind `which` on this thread is answered `ESRCH` without
-/// calling `kevent`. A registration of the other kind leaves it armed.
-pub(crate) fn force_proc_registration_esrch_once(which: Registration) -> ForcedOnce {
-    FORCE_ESRCH_REGISTRATION.with(|f| f.set(Some(which)));
-    ForcedOnce(|| FORCE_ESRCH_REGISTRATION.with(|f| f.set(None)))
+/// The next `EVFILT_PROC` registration of kind `which` on this thread is forced without calling
+/// `kevent`: answered `ESRCH`, or for [`Registration::SilentExitWatch`] not made. A registration of
+/// another kind leaves it armed.
+pub(crate) fn force_proc_registration_once(which: Registration) -> ForcedOnce {
+    FORCED_REGISTRATION.with(|f| f.set(Some(which)));
+    ForcedOnce(|| FORCED_REGISTRATION.with(|f| f.set(None)))
 }
 
 /// Whether the registration of kind `which` is the forced one, which it then consumes.
-pub(crate) fn take_forced_esrch_registration(which: Registration) -> bool {
-    FORCE_ESRCH_REGISTRATION.with(|f| {
+pub(crate) fn take_forced_registration(which: Registration) -> bool {
+    FORCED_REGISTRATION.with(|f| {
         let forced = f.get() == Some(which);
         if forced {
             f.set(None);

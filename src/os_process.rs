@@ -39,8 +39,18 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     /// Look at the process once, without blocking. A [`Exit::Running`] look carries what to wait
     /// on for the next change; the wait ends on any change, so look again after it. On macOS
     /// [`Exit::Exited`] means the process is a zombie or gone, not merely that its `NOTE_EXIT` has
-    /// fired; [`ProcessId::is_alive`] never reads `Alive` afterwards.
+    /// fired; [`ProcessId::is_alive`] never reads `Alive` afterwards. A child another process holds
+    /// (its tracer, or launchd) gets no `NOTE_EXIT` until it is handed back, so its look reads the zombie
+    /// itself.
     fn exited(&self) -> Result<Exit<'_>, Error>;
+
+    /// What one wait for the process's exit loops on ([`drive::exited_until`]): its own `Waitable`,
+    /// which may own the readiness source it blocks on, since a source that is read has one reader.
+    /// The default looks with [`exited`](OsProcess::exited) and waits on what that returns. It
+    /// is made before the wait's first look, so a source it arms misses no change after it.
+    fn exit_wait(&self) -> Result<ExitWait<'_>, Error> {
+        Ok(Box::new(drive::ProcessExit(self)))
+    }
 
     /// The OS object that names the process, lent to platform-only consumers (Job Objects, resume,
     /// cgroup attach). A fake lends its own wake fd or event, which names no process: code that
@@ -49,13 +59,17 @@ pub(crate) trait OsProcess: Send + Sync + fmt::Debug {
     fn os_handle(&self) -> child::OsHandle<'_>;
 }
 
+/// The wait [`OsProcess::exit_wait`] makes: `Send`, so the asynchronous driver's future is.
+pub(crate) type ExitWait<'a> = Box<dyn drive::Waitable<Output = ()> + Send + 'a>;
+
 /// What one look at a process found.
 #[derive(Debug)]
 pub(crate) enum Exit<'a> {
     Exited,
     Running(WaitFor<'a>),
-    /// macOS: the exit edge has fired, but the process is not yet a zombie (or gone), and nothing
-    /// will signal the change: look again after a backoff. A look that only asks whether it runs
+    /// macOS: the exit edge has fired but the process is not yet a zombie (or gone), or no edge will
+    /// come (another process holds the child), and nothing will signal the change: look again after a
+    /// backoff. A look that only asks whether it runs
     /// reads this as running.
     #[cfg_attr(
         not(target_os = "macos"),
@@ -69,7 +83,9 @@ pub(crate) enum Exit<'a> {
 #[derive(Debug)]
 pub(crate) enum WaitFor<'a> {
     /// Unix: a descriptor that polls readable once the process has exited, and that nothing reads:
-    /// the pidfd on Linux, a kqueue armed for the exit on macOS.
+    /// the pidfd on Linux, a kqueue armed for the exit on macOS. A macOS [`OsProcess::exit_wait`]
+    /// hands out another: the kqueue it owns, readable on any change it armed for (exit, signal,
+    /// reap), which only that wait reads, draining it before each look.
     #[cfg(unix)]
     Readable(BorrowedFd<'a>),
     /// Windows: the process handle; signalled once the process has exited.

@@ -114,12 +114,12 @@ pub(crate) fn is_unpinned(state: impl FnOnce() -> RootState) -> bool {
     }
 }
 
-/// The root of `op` is [`RootState::Unpinned`] at the end of it: the tree was signalled, but the
+/// The root of `op` is [`RootState::Unpinned`] at the end of it: its signals went out, but the
 /// exit status of a zombie launchd holds cannot be collected.
 #[cfg(target_os = "macos")]
 pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
     crate::error::Error::Unassessable {
-        detail: format!("pid {pid}: {op} signalled the tree, but its exit status cannot be collected: {UNPINNED_WHY}"),
+        detail: format!("pid {pid}: {op} sent its signals, but its exit status cannot be collected: {UNPINNED_WHY}"),
         source: None,
     }
 }

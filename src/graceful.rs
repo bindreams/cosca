@@ -145,20 +145,21 @@ pub(crate) fn joined(call: &str, first: Error, peers: impl IntoIterator<Item = E
 /// What a graceful shutdown does once its grace wait has returned, for a lone process. `watch` is
 /// the wait's result: `Ok(true)` means the process exited in time and `kill` is not called.
 /// Otherwise (the grace ran out, or the wait itself failed, so the grace was unobservable)
-/// `kill` runs. A kill error is the answer, with a watch error below it as its peer; a watch error
-/// alone surfaces after the kill succeeded. `call` is as for [`joined`].
+/// `kill` runs. A kill error is the answer, with a watch error below it as its peer; with the kill
+/// done, a watch error is handed back for the caller to surface once it has finished (`Ok(Some)`).
+/// `call` names the call as for [`joined`], built only for a kill error.
 pub(crate) fn after_grace(
-    call: &str,
+    call: impl FnOnce() -> String,
     watch: Result<bool, Error>,
     kill: impl FnOnce() -> Result<(), Error>,
-) -> Result<(), Error> {
+) -> Result<Option<Error>, Error> {
     if matches!(watch, Ok(true)) {
-        return Ok(());
+        return Ok(None);
     }
     let watch = watch.err();
     match kill() {
-        Ok(()) => watch.map_or(Ok(()), Err),
-        Err(e) => Err(joined(call, e, watch)),
+        Ok(()) => Ok(watch),
+        Err(e) => Err(joined(&call(), e, watch)),
     }
 }
 
@@ -190,14 +191,14 @@ pub(crate) fn after_sweep(call: &str, sweep: Result<(), Error>, watch: Result<bo
 /// else the watch failure alone, else the status. A reap that succeeded follows a sweep that proved the
 /// tree clear, which supersedes the refusal.
 pub(crate) fn after_reap(
-    call: &str,
+    call: impl FnOnce() -> String,
     waited: Result<std::process::ExitStatus, Error>,
     refusal: Option<Error>,
     watch: Option<Error>,
 ) -> Result<std::process::ExitStatus, Error> {
     match waited {
         Ok(status) => watch.map_or(Ok(status), Err),
-        Err(e) => Err(joined(call, e, refusal.into_iter().chain(watch))),
+        Err(e) => Err(joined(&call(), e, refusal.into_iter().chain(watch))),
     }
 }
 
