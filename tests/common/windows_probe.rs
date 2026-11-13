@@ -11,6 +11,11 @@ use std::path::Path;
 
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 
+/// The marker directory of `windows_shell_execute.rs` and `windows_path_resolution.rs`.
+pub(crate) const CANARY_MARKERS_ENV: &str = "COSCA_CANARY_MARKERS";
+/// The marker directory of `windows_elevation_routes.rs` and `windows_shell_resolution.rs`.
+pub(crate) const PROBE_MARKERS_ENV: &str = "COSCA_PROBE_MARKERS";
+
 /// Record that the current test ran to a real conclusion, as a file named after the test's thread
 /// in the directory `env_var` names, when that variable is set — a no-op otherwise. Each probe
 /// file's own CI job requires this marker to fail a run whose test filter matched nothing.

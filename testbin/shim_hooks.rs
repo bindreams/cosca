@@ -6,15 +6,14 @@
 //! that sets these variables and execs the test binary. A seam the environment asks for and that
 //! cannot be honoured panics, naming the path or the name and the error.
 //!
-//! - `COSCA_SEAM_LOG`: a path (a FIFO whose reader is already open, or a file) the shim's log lines
-//!   are appended to.
-//! - `COSCA_SEAM_GATE_<NAME>`: a FIFO the shim opens and reads one byte from when it reaches the
+//! - [`LOG_ENV`] (`COSCA_SEAM_LOG`): a path (a FIFO whose reader is already open, or a file) the shim's
+//!   log lines are appended to.
+//! - [`gate_env`] (`COSCA_SEAM_GATE_<NAME>`): a FIFO the shim opens and reads one byte from when it reaches the
 //!   gate; the test releases the gate by opening the FIFO for writing. `NAME` is the gate's
 //!   name in upper case with `_` for `-`.
-//! - `COSCA_SEAM_INJECT`: a comma-separated list of injection names.
-//! - `COSCA_SEAM_CHILD_GATE`, `COSCA_SEAM_LOOP_FAILURE`: paths, as the hooks' docs say.
-//! - `COSCA_SEAM_CHILD_FAULT`: `1`.
-//! - `COSCA_SEAM_EXHAUST_FDS`: `1`.
+//! - [`INJECT_ENV`] (`COSCA_SEAM_INJECT`): a comma-separated list of injection names.
+//! - [`CHILD_GATE_ENV`] (`COSCA_SEAM_CHILD_GATE`), [`LOOP_FAILURE_ENV`] (`COSCA_SEAM_LOOP_FAILURE`): paths, as the hooks' docs say.
+//! - [`CHILD_FAULT_ENV`] (`COSCA_SEAM_CHILD_FAULT`), [`EXHAUST_FDS_ENV`] (`COSCA_SEAM_EXHAUST_FDS`): `1`.
 //!
 //! [`init`] is what the test binaries call first in `main`. Two variables change what it does:
 //!
@@ -42,6 +41,19 @@ pub const SHIM_SHIPPED_ENV: &str = "COSCA_TESTCFG_SHIM_SHIPPED";
 /// Set in a process's environment to make [`init`] print whether `cosca::installed()` held before and
 /// after `cosca::init()`, and exit.
 pub const INIT_PROBE_ENV: &str = "COSCA_TESTCFG_INIT_PROBE";
+
+/// The seam variables, as the module doc describes them.
+pub const LOG_ENV: &str = "COSCA_SEAM_LOG";
+pub const INJECT_ENV: &str = "COSCA_SEAM_INJECT";
+pub const CHILD_GATE_ENV: &str = "COSCA_SEAM_CHILD_GATE";
+pub const CHILD_FAULT_ENV: &str = "COSCA_SEAM_CHILD_FAULT";
+pub const LOOP_FAILURE_ENV: &str = "COSCA_SEAM_LOOP_FAILURE";
+pub const EXHAUST_FDS_ENV: &str = "COSCA_SEAM_EXHAUST_FDS";
+
+/// The variable that holds `gate`'s FIFO.
+pub fn gate_env(gate: Gate) -> String {
+    format!("COSCA_SEAM_GATE_{}", gate.name().to_uppercase().replace('-', "_"))
+}
 
 pub static HOOKS: EnvHooks = EnvHooks { log: OnceLock::new() };
 
@@ -82,7 +94,7 @@ pub fn init() {
 
 impl ShimTestHooks for EnvHooks {
     fn gate(&self, gate: Gate) {
-        let name = format!("COSCA_SEAM_GATE_{}", gate.name().to_uppercase().replace('-', "_"));
+        let name = gate_env(gate);
         let Some(fifo) = var(&name) else { return };
         // Blocks until the test opens the FIFO for writing, then until it writes or closes.
         let mut f = std::fs::File::open(&fifo)
@@ -95,14 +107,14 @@ impl ShimTestHooks for EnvHooks {
     }
 
     fn inject(&self, what: Inject) -> bool {
-        let Some(list) = var("COSCA_SEAM_INJECT") else {
+        let Some(list) = var(INJECT_ENV) else {
             return false;
         };
         let list = list.to_string_lossy();
         for name in list.split(',') {
             assert!(
                 Inject::ALL.iter().any(|known| known.name() == name),
-                "COSCA_SEAM_INJECT names {name:?}, which is not an injection: {:?}",
+                "{INJECT_ENV} names {name:?}, which is not an injection: {:?}",
                 Inject::ALL.map(Inject::name)
             );
         }
@@ -111,38 +123,38 @@ impl ShimTestHooks for EnvHooks {
 
     fn log_fd(&self) -> Option<RawFd> {
         *self.log.get_or_init(|| {
-            let path = var("COSCA_SEAM_LOG")?;
+            let path = var(LOG_ENV)?;
             let file = OpenOptions::new()
                 .append(true)
                 .custom_flags(libc::O_CLOEXEC)
                 .open(&path)
-                .unwrap_or_else(|e| panic!("COSCA_SEAM_LOG: cannot open {}: {e}", path.to_string_lossy()));
+                .unwrap_or_else(|e| panic!("{LOG_ENV}: cannot open {}: {e}", path.to_string_lossy()));
             Some(file.into_raw_fd())
         })
     }
 
     fn child_gate(&self) -> Option<PathBuf> {
-        let path = PathBuf::from(var("COSCA_SEAM_CHILD_GATE")?);
+        let path = PathBuf::from(var(CHILD_GATE_ENV)?);
         // The child opens it with raw calls and cannot report a failure to.
         let meta = std::fs::metadata(&path)
-            .unwrap_or_else(|e| panic!("COSCA_SEAM_CHILD_GATE: cannot stat {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("{CHILD_GATE_ENV}: cannot stat {}: {e}", path.display()));
         assert!(
             meta.file_type().is_fifo(),
-            "COSCA_SEAM_CHILD_GATE: {} is not a FIFO",
+            "{CHILD_GATE_ENV}: {} is not a FIFO",
             path.display()
         );
         Some(path)
     }
 
     fn child_fault(&self) -> bool {
-        flag("COSCA_SEAM_CHILD_FAULT")
+        flag(CHILD_FAULT_ENV)
     }
 
     fn loop_failure(&self) -> Option<PathBuf> {
-        var("COSCA_SEAM_LOOP_FAILURE").map(PathBuf::from)
+        var(LOOP_FAILURE_ENV).map(PathBuf::from)
     }
 
     fn exhaust_fds(&self) -> bool {
-        flag("COSCA_SEAM_EXHAUST_FDS")
+        flag(EXHAUST_FDS_ENV)
     }
 }

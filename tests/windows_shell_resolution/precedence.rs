@@ -14,7 +14,7 @@ use windows::Win32::Foundation::ERROR_NO_ASSOCIATION;
 use crate::harness::{
     plant_batch, read_self_report, read_self_report_image, shell_execute_bounded, shell_execute_with, LaunchOutcome,
 };
-use crate::windows_probe::{mark_test_passed, same_file};
+use crate::windows_probe::{mark_test_passed, same_file, PROBE_MARKERS_ENV};
 
 /// The `.bat` self-reports its own path (`%~f0`) into its marker, and the extensionless copy of
 /// `cosca_testbin_image` self-reports the image it loaded via `--report-to` — each into its own
@@ -116,7 +116,7 @@ fn does_pathext_outrank_an_existing_extensionless_file(#[fixture(shell_probes)] 
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// Companion to the precedence probe above, with no `.bat` in the directory to compete: does an
@@ -219,5 +219,5 @@ fn does_an_existing_extensionless_file_ever_launch_directly(#[fixture(shell_prob
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }

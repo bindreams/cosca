@@ -12,7 +12,7 @@ use crate::harness::{
     plant_batch, probe_dir, read_self_report, read_self_report_image, shell_execute, shell_execute_with,
     BoundedCallState, LaunchOutcome,
 };
-use crate::windows_probe::{mark_test_passed, same_file};
+use crate::windows_probe::{mark_test_passed, same_file, PROBE_MARKERS_ENV};
 
 /// An elevated argv[0] such as `C:\dir\tool` reaches `ShellExecuteEx` as an
 /// `lpFile` that is absolute, extensionless and quite possibly nonexistent. If `ShellExecuteEx`
@@ -71,7 +71,7 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile(#[fixture
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// Control for the probe above: an absolute path to a real `.bat` must launch. If this does not
@@ -113,7 +113,7 @@ fn control_an_absolute_batch_path_does_launch(#[fixture(shell_probes)] _group: &
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// The other half of the elevated hazard, re-measured rather than inherited: a PATH-LESS `lpFile`
@@ -171,7 +171,7 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile(#[fixture(shell_pr
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// Same question as the probe above, but with `SEE_MASK_CLASSNAME`/`lpClass = "exefile"` set,
@@ -281,5 +281,5 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile(#[fixtu
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }

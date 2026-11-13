@@ -59,6 +59,14 @@ use std::io::Write as _;
 
 use crate::test_child::Console;
 
+/// The variables the helper and the tracee fixture take their inputs from (see the module doc).
+const ROLE_ENV: &str = "COSCA_UH_ROLE";
+const MODE_ENV: &str = "COSCA_UH_MODE";
+const FORCE_ENV: &str = "COSCA_UH_FORCE";
+const TRACE_ENV: &str = "COSCA_UH_TRACE";
+const MARKER_ENV: &str = "COSCA_UH_MARKER";
+const KIND_ENV: &str = "COSCA_UH_KIND";
+
 mod attach;
 mod machine;
 mod sys;
@@ -352,17 +360,17 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     cmd.args(crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
         uh_helper_entry
     )))
-    .env("COSCA_UH_ROLE", "helper")
-    .env("COSCA_UH_MODE", mode.as_env())
-    .env("COSCA_UH_MARKER", &marker)
+    .env(ROLE_ENV, "helper")
+    .env(MODE_ENV, mode.as_env())
+    .env(MARKER_ENV, &marker)
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     // Inherited: the probe's lines and a failing helper's messages reach this test's stderr.
     .stderr(std::process::Stdio::inherit());
     match force {
-        Some(force) => cmd.env("COSCA_UH_TRACE", "1").env("COSCA_UH_FORCE", force),
+        Some(force) => cmd.env(TRACE_ENV, "1").env(FORCE_ENV, force),
         // Not inherited from the test's own environment into a client's helper.
-        None => cmd.env_remove("COSCA_UH_TRACE").env_remove("COSCA_UH_FORCE"),
+        None => cmd.env_remove(TRACE_ENV).env_remove(FORCE_ENV),
     };
     // Under `spawn_lock()` (via `test_spawn`): macOS pipes get `FD_CLOEXEC` after `pipe()`, so a
     // concurrent fork could otherwise inherit this helper's pipe ends.
@@ -597,8 +605,8 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
         .args(crate::test_child::fixture_argv(crate::test_child::fixture_path!(
             uh_tracee_fixture
         )))
-        .env("COSCA_UH_ROLE", "tracee")
-        .env("COSCA_UH_KIND", format!("{kind:?}"));
+        .env(ROLE_ENV, "tracee")
+        .env(KIND_ENV, format!("{kind:?}"));
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
@@ -629,7 +637,7 @@ fn await_ready(tracee: &mut crate::Child) -> Ready {
 /// `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
 #[skuld::test]
 fn uh_tracee_fixture() {
-    if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
+    if std::env::var(ROLE_ENV).as_deref() != Ok("tracee") {
         return;
     }
     extern "C" fn exit_on_sigterm(_: libc::c_int) {
@@ -639,7 +647,7 @@ fn uh_tracee_fixture() {
     let own_group = || {
         nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).expect("setpgid");
     };
-    let kind = std::env::var("COSCA_UH_KIND").expect("COSCA_UH_KIND is set by spawn_tracee");
+    let kind = std::env::var(KIND_ENV).unwrap_or_else(|_| panic!("{KIND_ENV} is set by spawn_tracee"));
     match kind.as_str() {
         "Plain" => {}
         "OwnGroup" => own_group(),
@@ -683,7 +691,7 @@ fn uh_tracee_fixture() {
         "OwnSession" => {
             nix::unistd::setsid().expect("setsid");
         }
-        other => panic!("unknown COSCA_UH_KIND {other:?}"),
+        other => panic!("unknown {KIND_ENV} {other:?}"),
     }
     let blocked = nix::sys::signal::SigSet::thread_get_mask().expect("read the signal mask");
     let blocked: libc::sigset_t = *blocked.as_ref();
@@ -724,9 +732,9 @@ fn reexec_as(kind: &str) -> ! {
     let exe = c(std::env::current_exe().expect("current_exe").as_os_str().as_bytes());
     let argv: Vec<_> = std::env::args_os().map(|arg| c(arg.as_bytes())).collect();
     let env: Vec<_> = std::env::vars_os()
-        .filter(|(key, _)| key != "COSCA_UH_KIND")
+        .filter(|(key, _)| key != KIND_ENV)
         .map(|(key, value)| c(&[key.as_bytes(), b"=", value.as_bytes()].concat()))
-        .chain([c(format!("COSCA_UH_KIND={kind}").as_bytes())])
+        .chain([c(format!("{KIND_ENV}={kind}").as_bytes())])
         .collect();
     let e = nix::unistd::execve(&exe, &argv, &env).unwrap_err();
     panic!("re-execute the tracee fixture: {e}")
@@ -735,7 +743,7 @@ fn reexec_as(kind: &str) -> ! {
 /// The helper's entry point. A no-op unless `COSCA_UH_ROLE=helper`.
 #[skuld::test]
 fn uh_helper_entry() {
-    if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("helper") {
+    if std::env::var(ROLE_ENV).as_deref() != Ok("helper") {
         return;
     }
     machine::main();

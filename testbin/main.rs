@@ -2,7 +2,7 @@
 //! exceptions that use the `cosca` crate: the `report-nested-kill-tree` mode, to exercise
 //! the real nested-member `kill_tree` path, `spawn-dump-env-block` and `spawn-with-null-std`, to
 //! spawn through each Windows backend, the frozen-spawn modes of `frozen.rs`, and the measurement
-//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by `COSCA_TESTBIN_MODE`
+//! modes (`handles-probe`, `std-loads`, `std-loads-dup`). Behavior is selected by [`env_names::TESTBIN_MODE_ENV`]
 //! when set, else by argv[1]; the variable keeps the mode when a test shifts argv (`dump-argv`).
 
 #[cfg(target_os = "macos")]
@@ -135,11 +135,11 @@ fn fake_pkexec(args: &[String]) {
     writeln!(f, "{line}").expect("append to the log");
 }
 
+#[path = "env_names.rs"]
+mod env_names;
 #[cfg(unix)]
-#[path = "drop_to.rs"]
-mod drop_to;
-#[cfg(unix)]
-use drop_to::DROP_TO_ENV;
+use env_names::DROP_TO_ENV;
+use env_names::TESTBIN_MODE_ENV;
 
 /// If root, become the `uid:gid` the test names in [`DROP_TO_ENV`]: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
@@ -376,9 +376,9 @@ fn main() {
         fake_pkexec(&args);
         return;
     }
-    let mode_var = std::env::var_os("COSCA_TESTBIN_MODE").map(|v| {
+    let mode_var = std::env::var_os(TESTBIN_MODE_ENV).map(|v| {
         v.into_string()
-            .unwrap_or_else(|v| panic!("COSCA_TESTBIN_MODE is not Unicode: {v:?}"))
+            .unwrap_or_else(|v| panic!("{TESTBIN_MODE_ENV} is not Unicode: {v:?}"))
     });
     let mode = mode_var
         .as_deref()

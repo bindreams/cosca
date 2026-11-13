@@ -232,37 +232,34 @@ impl ShimRig {
             .args(&argv[1..])
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("COSCA_SEAM_LOG", &work_log)
+            .env(crate::shim_env_hooks::LOG_ENV, &work_log)
             .stdin(if spec.stdin_held { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut gates = HashMap::new();
         for gate in &spec.gates {
             let fifo = self.fifo(&format!("gate-{}", gate.name()));
-            command.env(
-                format!("COSCA_SEAM_GATE_{}", gate.name().to_uppercase().replace('-', "_")),
-                &fifo,
-            );
+            command.env(crate::shim_env_hooks::gate_env(*gate), &fifo);
             gates.insert(*gate, hold_open(&fifo));
         }
         if !spec.injects.is_empty() {
             let names: Vec<&str> = spec.injects.iter().map(|i| i.name()).collect();
-            command.env("COSCA_SEAM_INJECT", names.join(","));
+            command.env(crate::shim_env_hooks::INJECT_ENV, names.join(","));
         }
         let child_gate = spec.child_gate.then(|| self.fifo("child-gate"));
         if let Some(path) = &child_gate {
-            command.env("COSCA_SEAM_CHILD_GATE", path);
+            command.env(crate::shim_env_hooks::CHILD_GATE_ENV, path);
         }
         let child_gate = child_gate.map(|path| hold_open(&path));
         if spec.child_fault {
-            command.env("COSCA_SEAM_CHILD_FAULT", "1");
+            command.env(crate::shim_env_hooks::CHILD_FAULT_ENV, "1");
         }
         let loop_failure = spec.loop_failure.then(|| self.fifo("loop-failure"));
         if let Some(path) = &loop_failure {
-            command.env("COSCA_SEAM_LOOP_FAILURE", path);
+            command.env(crate::shim_env_hooks::LOOP_FAILURE_ENV, path);
         }
         if spec.exhaust_fds {
-            command.env("COSCA_SEAM_EXHAUST_FDS", "1");
+            command.env(crate::shim_env_hooks::EXHAUST_FDS_ENV, "1");
         }
         if spec.shipped {
             command.env(crate::shim_env_hooks::SHIM_SHIPPED_ENV, "1");

@@ -102,7 +102,7 @@ use std::time::Duration;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::sys::{self, Stop};
-use super::{Mode, Until};
+use super::{Mode, Until, FORCE_ENV, MARKER_ENV, MODE_ENV, TRACE_ENV};
 use crate::os_process::macos::kqueue::{Event, Kqueue};
 
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
@@ -112,14 +112,14 @@ const MAX_BACKOFF: Duration = Duration::from_millis(50);
 pub(super) const MALFORMED_PID_LINE: i32 = 3;
 
 pub(super) fn main() {
-    let marker = std::env::var("COSCA_UH_MARKER").expect("COSCA_UH_MARKER is set by the client");
-    let mode = match std::env::var("COSCA_UH_MODE").as_deref() {
+    let marker = std::env::var(MARKER_ENV).unwrap_or_else(|_| panic!("{MARKER_ENV} is set by the client"));
+    let mode = match std::env::var(MODE_ENV).as_deref() {
         Ok("auto") => Mode::Auto,
         Ok("hold") => Mode::Hold,
-        other => panic!("COSCA_UH_MODE must be auto or hold, got {other:?}"),
+        other => panic!("{MODE_ENV} must be auto or hold, got {other:?}"),
     };
-    let trace = std::env::var("COSCA_UH_TRACE").as_deref() == Ok("1");
-    let mut forces = Forces::parse(&std::env::var("COSCA_UH_FORCE").unwrap_or_default());
+    let trace = std::env::var(TRACE_ENV).as_deref() == Ok("1");
+    let mut forces = Forces::parse(&std::env::var(FORCE_ENV).unwrap_or_default());
     let note_exit_seen = match forces.take("seed").as_deref() {
         None => false,
         Some("NOTE_EXIT") => true,
@@ -237,10 +237,10 @@ impl Forces {
                 .map(|entry| {
                     let (tag, directive) = entry
                         .split_once(':')
-                        .unwrap_or_else(|| panic!("COSCA_UH_FORCE entry {entry:?} is not <tag>:<directive>"));
+                        .unwrap_or_else(|| panic!("{FORCE_ENV} entry {entry:?} is not <tag>:<directive>"));
                     assert!(
                         FORCE_TAGS.contains(&tag),
-                        "COSCA_UH_FORCE entry {entry:?} has an unknown tag; known: {FORCE_TAGS:?}"
+                        "{FORCE_ENV} entry {entry:?} has an unknown tag; known: {FORCE_TAGS:?}"
                     );
                     (tag.to_string(), directive.to_string())
                 })
@@ -293,7 +293,7 @@ fn errno_named(name: &str) -> i32 {
         "EINVAL" => libc::EINVAL,
         number => number
             .parse()
-            .unwrap_or_else(|_| panic!("COSCA_UH_FORCE: unknown errno {number:?}")),
+            .unwrap_or_else(|_| panic!("{FORCE_ENV}: unknown errno {number:?}")),
     }
 }
 

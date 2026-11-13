@@ -18,7 +18,7 @@ pub(crate) fn canary(subject: &'static str, body: impl FnOnce(&mut Disagreements
 /// when that is set. The workflow fails a run that leaves no marker, so a test-name filter that
 /// selects only surveys, or nothing, cannot pass having asserted nothing.
 fn mark_canary_passed() {
-    let Some(dir) = std::env::var_os("COSCA_CANARY_MARKERS") else {
+    let Some(dir) = std::env::var_os(crate::windows_probe::CANARY_MARKERS_ENV) else {
         return;
     };
     let name = std::thread::current()

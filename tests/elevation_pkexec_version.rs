@@ -13,10 +13,6 @@
 mod common;
 
 #[cfg(target_os = "linux")]
-#[path = "../testbin/drop_to.rs"]
-mod drop_to;
-
-#[cfg(target_os = "linux")]
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
@@ -125,7 +121,7 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         Launch::RawBinTrue => testbin.args(["raw", "/bin/true"]),
     };
     if let Some((uid, gid)) = drop_to {
-        testbin.env(drop_to::DROP_TO_ENV, format!("{uid}:{gid}"));
+        testbin.env(common::DROP_TO_ENV, format!("{uid}:{gid}"));
     }
     let out = common::output_locked(&mut testbin).expect("run the testbin");
     assert!(

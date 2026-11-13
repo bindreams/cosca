@@ -18,7 +18,7 @@ use crate::harness::{
     plant_batch, probe_dir, read_self_report, read_self_report_image, shell_execute, shell_execute_bounded,
     shell_execute_with, LaunchOutcome,
 };
-use crate::windows_probe::{mark_test_passed, same_file};
+use crate::windows_probe::{mark_test_passed, same_file, PROBE_MARKERS_ENV};
 
 /// Half one: does a trailing dot SUPPRESS the PATHEXT extension that `pathext.rs`'s
 /// `does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile` measured? That undotted
@@ -120,7 +120,7 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile(#[fixture(shell_pr
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }
 
 /// Half two: does a trailing dot still OPEN the extensionless file it names? Uses a copy of
@@ -226,5 +226,5 @@ fn does_a_trailing_dot_still_open_the_extensionless_file(#[fixture(shell_probes)
             }
         }
     }
-    mark_test_passed("COSCA_PROBE_MARKERS");
+    mark_test_passed(PROBE_MARKERS_ENV);
 }

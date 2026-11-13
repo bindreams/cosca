@@ -439,7 +439,7 @@ fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
 
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
+    windows_probe::mark_test_passed(windows_probe::CANARY_MARKERS_ENV);
 }
 
 #[cfg(windows)]
@@ -474,7 +474,7 @@ fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) 
     }
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
+    windows_probe::mark_test_passed(windows_probe::CANARY_MARKERS_ENV);
 }
 
 #[cfg(windows)]
@@ -483,18 +483,19 @@ fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) 
 /// directory literally named that, not `…\exp\…`.
 #[skuld::test]
 fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
+    const PCT_ENV: &str = "COSCA_PROBE_PCT";
     let Some(done) = own_process(test_path!(exefile_takes_percent_literally), common::spawn_locked) else {
         return;
     };
     let l = layout();
-    let literal_name = "%COSCA_PROBE_PCT%";
-    let (literal, expanded) = (l.root.path().join(literal_name), l.root.path().join("exp"));
+    let literal_name = format!("%{PCT_ENV}%");
+    let (literal, expanded) = (l.root.path().join(&literal_name), l.root.path().join("exp"));
     let source = env!("CARGO_BIN_EXE_cosca_testbin_image");
     for dir in [&literal, &expanded] {
         std::fs::create_dir(dir).expect("mkdir");
         std::fs::copy(source, dir.join("cosca_probe_pct.exe")).expect("copy the payload");
     }
-    let pct = EnvVar::set(&done, "COSCA_PROBE_PCT", |_| "exp".into());
+    let pct = EnvVar::set(&done, PCT_ENV, |_| "exp".into());
     let file = literal.join("cosca_probe_pct.exe");
     let by_file = run(
         &l,
@@ -529,7 +530,7 @@ fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
     }
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
-    windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
+    windows_probe::mark_test_passed(windows_probe::CANARY_MARKERS_ENV);
 }
 
 #[cfg(windows)]
