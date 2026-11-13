@@ -1544,13 +1544,12 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(
     );
 }
 
-/// A front moved into a cgroup nested under its leaf is in the leaf's subtree: by the walk of the
-/// leaf's descendants with `PIDFD_GET_INFO`, whatever `/proc` hides; without it by its path, which a
-/// hidden `/proc` does not give (such a host refuses the spawn, see `front_placement`).
+/// A front moved into a cgroup nested under its leaf is in the leaf's subtree, whatever the kernel: with a
+/// readable `/proc` it is placed, and without `PIDFD_GET_INFO` a hidden `/proc` places nothing, since its path is
+/// all that is left (such a host refuses the spawn, see `front_placement`).
 #[skuld::test]
-fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(
+fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hides_it(
     #[fixture(cgroup)] _group: &Group,
-    #[fixture(pidfd_get_info)] _info: &Group,
 ) {
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let pid = child.pid();
@@ -1559,13 +1558,30 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(
     assert!(names().expect("/proc is readable here"));
     {
         let _hidden = crate::containment::cgroup::fault::hide_proc();
-        assert!(
-            names().expect("the walk by cgroup id reads with /proc hidden"),
-            "found by the walk"
-        );
         let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
         names().expect_err("a hidden path places nothing");
     }
+    // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
+}
+
+/// A front moved into a cgroup nested under its leaf is in the leaf's subtree by the walk of the leaf's
+/// descendants with `PIDFD_GET_INFO`, whatever `/proc` hides.
+#[skuld::test]
+fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(
+    #[fixture(cgroup)] _group: &Group,
+    #[fixture(pidfd_get_info)] _info: &Group,
+) {
+    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.pid();
+    move_under_its_leaf(pid);
+    let _hidden = crate::containment::cgroup::fault::hide_proc();
+    assert!(
+        child
+            .tree
+            .would_reach(pid, child.proc.pidfd())
+            .expect("the walk by cgroup id reads with /proc hidden"),
+        "found by the walk"
+    );
     // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
 }
 
