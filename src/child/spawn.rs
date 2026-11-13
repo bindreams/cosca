@@ -906,14 +906,7 @@ fn spawn_reported(
             // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
             // dying, and is waited for (`tear_down_held`).
             #[cfg(target_os = "linux")]
-            let (
-                detail,
-                Torn {
-                    fate: child_fate,
-                    unreaped,
-                    cleanup,
-                },
-            ) = held_teardown::tear_down_held(
+            let (detail, torn) = held_teardown::tear_down_held(
                 owned,
                 held_teardown::HeldTeardown {
                     front,
@@ -925,21 +918,11 @@ fn spawn_reported(
                 &mut why,
             );
             // A child the leaf's refusal stopped before `exec` never ran the program: the spawn says
-            // so, as for every other child the spawn ends before it ran. Its teardown has said how
-            // it went in its one warn.
+            // so, as for every other child the spawn ends before it ran, unless its teardown has
+            // something to hand back or report. What failed in the attach's own cleanup comes first:
+            // it happened before the teardown.
             #[cfg(target_os = "linux")]
-            if not_started {
-                return Err(SpawnFailure::NotStartedWithChild {
-                    cause: error,
-                    fate: child_fate,
-                });
-            }
-            // What failed in the attach's own cleanup comes first: it happened before the teardown.
-            #[cfg(target_os = "linux")]
-            return Err(SpawnFailure::started(error, child_fate, unreaped)
-                .with_detail(detail)
-                .with_cleanup(attach_cleanup)
-                .with_cleanup(cleanup));
+            return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
             #[cfg(windows)]
             {
                 let Torn {

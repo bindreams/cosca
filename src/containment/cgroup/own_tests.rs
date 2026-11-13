@@ -75,17 +75,22 @@ fn offered_under(root: &Path) -> Result<Option<OwnCgroup>, LeafError> {
     offered_in(Ok("0::/own\n".to_owned()), root)
 }
 
-/// What the check of an access says of it: a refusal, or a path that is not there, is "not
-/// offered", and nothing else is. `ENOSYS` is its own error, which says why.
+/// What the check of an access says of it: a mode-bit refusal (`EACCES`), a read-only filesystem
+/// or a path that is not there is "not offered", and nothing else is. `EPERM` is an immutable file
+/// or a seccomp refusal, which `access(2)` never gives for mode bits, so it is an error, as is
+/// `ENOSYS`, which says why.
+///
+/// Mutant: `EPERM` reads as "not offered".
 #[skuld::test]
 fn only_a_refusal_or_a_missing_path_means_a_cgroup_is_not_offered() {
     let path = Path::new("/sys/fs/cgroup/own");
 
     assert!(matches!(grants(Ok(()), path), Ok(true)));
-    for refused in [Errno::ACCESS, Errno::PERM, Errno::ROFS, Errno::NOENT] {
+    for refused in [Errno::ACCESS, Errno::ROFS, Errno::NOENT] {
         assert!(matches!(grants(Err(refused), path), Ok(false)), "{refused}");
     }
     for failed in [
+        Errno::PERM,
         Errno::IO,
         Errno::NOMEM,
         Errno::LOOP,

@@ -69,45 +69,6 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
-/// Whether `child`, which sent no report, exited with [`UNSENT_EXIT`]: its hook could not send one,
-/// and stopped before `exec`. A child that cannot be looked at is not shown to have: it is a child
-/// that died before reporting for a reason this does not know.
-///
-/// A report channel with no copy of its child's end left reads as closed as the child exits, a
-/// moment before the exit is visible on the pidfd (the kernel closes a dying process's files before
-/// it publishes the exit), so a child still unexited here is waited for. That wait is on a child
-/// that has closed its end without reporting, which can only be one that is exiting: the hook sends
-/// its report before `exec`. A pidfd the look cannot be made through (`ECHILD` and the like) is not
-/// waited on.
-#[cfg(target_os = "linux")]
-fn exited_unsent(child: crate::containment::ChildHandle<'_>) -> bool {
-    use crate::os_process::child::{ExitRecord, PeekOutcome};
-    use crate::wait::exit_only::{peek, Target};
-    use rustix::event::{PollFd, PollFlags};
-
-    let target = Target::PidFd(child.pidfd);
-    let mut seen = peek(&target);
-    if matches!(seen, Ok(PeekOutcome::Running)) {
-        let mut fds = [PollFd::new(&child.pidfd, PollFlags::IN)];
-        if let Err(e) = crate::wait::poll_ready(&mut fds) {
-            panic!("poll on the pidfd of a child that closed its report channel failed: {e}");
-        }
-        seen = peek(&target);
-    }
-    match seen {
-        Ok(PeekOutcome::Exit(ExitRecord::Status(status))) => status.code() == Some(UNSENT_EXIT),
-        Ok(_) => false,
-        Err(e) => {
-            log::debug!(
-                "cgroup leaf: how pid {pid} exited cannot be looked at: {report}",
-                pid = child.pid,
-                report = crate::error::Report(&e)
-            );
-            false
-        }
-    }
-}
-
 /// The state letter of `child`, or `None` when it is unknown; the cause is logged at debug (see
 /// [`StateUnknown`]). Only the pidfd says `Z`: the child exited, which separates "the placement
 /// write failed" from "the child exited before membership was checked".
@@ -402,13 +363,7 @@ impl CgroupLeaf {
         };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(&crate::identity::HostKernel, child);
-        let procs = self.dir.read("cgroup.procs");
-        // Last, after the reads that diagnose a child still alive: this one may wait for its exit.
-        let report = match report {
-            NotEntered::NotReported if exited_unsent(child) => NotEntered::ReportUnsent,
-            other => other,
-        };
-        Err(match procs {
+        Err(match self.dir.read("cgroup.procs") {
             Ok(procs) => NotPlaced::Absent {
                 pid: child.pid,
                 path,
@@ -1844,9 +1799,8 @@ pub(crate) const ABANDONED_EXIT: i32 = 125;
 pub(crate) const REFUSED_EXIT: i32 = 124;
 
 /// The status a child exits with from inside its hook when it could not send its placement report
-/// and its slot is not [`refusing`](ReportSlot::refusing). Unlike the other two, the parent reads
-/// it: a child that exits with it never ran the program, and its spawn fails
-/// ([`NotEntered::ReportUnsent`]).
+/// and its slot is not [`refusing`](ReportSlot::refusing). The parent does not read it: a child
+/// that sent no report never ran the program ([`PlacementReport::NotReported`]).
 #[cfg(target_os = "linux")]
 pub(crate) const UNSENT_EXIT: i32 = 123;
 

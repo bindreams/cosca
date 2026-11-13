@@ -111,8 +111,9 @@ fn offered_from(found: Result<OwnCgroup, LeafError>) -> Result<Option<OwnCgroup>
 }
 
 /// What the answer of `faccessat(AT_EACCESS)` for `path` says of whether the access is granted:
-/// `Ok(false)` for a refusal (`EACCES`, `EPERM`, `EROFS`) or a path that is not there (`ENOENT`),
-/// and an error for any other answer, which says nothing of what is granted.
+/// `Ok(false)` for a refusal (`EACCES`, which `access(2)` gives for mode bits, or `EROFS`) or a path
+/// that is not there (`ENOENT`), and an error for any other answer, which says nothing of what is
+/// granted. `EPERM` is one of those: an immutable file, or a seccomp filter's refusal.
 ///
 /// `ENOSYS` is the kernel having no `faccessat2` (before Linux 5.8). `rustix` then checks with the
 /// plain `faccessat`, which is exact for a process whose effective ids are its real ones, so the
@@ -121,7 +122,7 @@ fn grants(answer: Result<(), Errno>, path: &Path) -> Result<bool, LeafError> {
     let path = || path.to_path_buf();
     match answer {
         Ok(()) => Ok(true),
-        Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::NOENT) => Ok(false),
+        Err(Errno::ACCESS | Errno::ROFS | Errno::NOENT) => Ok(false),
         Err(source @ Errno::NOSYS) => Err(LeafError::CheckAccessUnavailable {
             path: path(),
             source: source.into(),

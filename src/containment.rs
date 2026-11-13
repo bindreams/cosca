@@ -224,6 +224,12 @@ pub enum ContainMode {
     /// Windows) rather than to no containment. A fallback is logged at `warn` (on Windows it is
     /// not, yet), and [`Child::containment`](crate::Child::containment) reports what the spawn
     /// got.
+    ///
+    /// On Linux, a child that sends no report of its placement in the leaf never ran its program
+    /// (its hook ends it before `exec`), so that spawn fails with [`Error::Containment`], as under
+    /// `Strongest`, instead of handing back a child that never ran.
+    ///
+    /// [`Error::Containment`]: crate::error::Error::Containment
     BestEffort,
     /// Identity-aware process-tree walk at teardown — selectable directly (e.g.
     /// for a child known to `setsid` out of a process group). The spawn fails if the OS refuses to

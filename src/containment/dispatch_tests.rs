@@ -2406,6 +2406,8 @@ fn uac_elevated_attachment_has_no_in_process_route() {
 enum ChildReport {
     Placed,
     WriteFailed,
+    /// The write failed with this errno, which the child reported.
+    WriteFailedWith(i32),
     NotReported,
 }
 
@@ -2434,6 +2436,8 @@ fn decide_for(
             // no-op. The slot's pipe lives as long as `leaf`.
             _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
         }
+        // SAFETY: the slot's pipe lives as long as `leaf`.
+        ChildReport::WriteFailedWith(errno) => unsafe { leaf.placement_slot().report_write_failed_for_test(errno) },
         ChildReport::NotReported => {}
     }
     let prepared = super::Prepared {
@@ -2523,54 +2527,86 @@ fn a_failed_write_degrades_a_best_effort_spawn_and_removes_the_leaf() {
 }
 
 /// The same child under `Strongest`: the attach fails as a spawn that did not start (the program
-/// never ran: the child's report proves it), the error names the leaf and keeps the placement's
-/// cause as its source, and the empty leaf is removed. The failed attach's teardown ends the child.
+/// never ran: the child's report proves it), the error names the leaf, says what was found of the
+/// child, and keeps the placement write's errno as its source, and the empty leaf is removed. The
+/// failed attach's teardown ends the child.
+///
+/// Mutants: the source is the whole diagnosis as one message, so the errno is not on the chain;
+/// the failure is not a not-started one.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_write_fails_a_strongest_attach_and_removes_the_leaf() {
-    for report in [ChildReport::WriteFailed, ChildReport::NotReported] {
+    for errno in [libc::EBADF, libc::EBUSY] {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-decision-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
 
-        let failure = decide_for(crate::containment::ContainMode::Strongest, &leaf_path, report)
-            .expect_err("a Strongest root the leaf did not take fails its attach");
+        let failure = decide_for(
+            crate::containment::ContainMode::Strongest,
+            &leaf_path,
+            ChildReport::WriteFailedWith(errno),
+        )
+        .expect_err("a Strongest root the leaf did not take fails its attach");
 
         assert!(failure.not_started, "the program never ran: {failure:?}");
         let crate::error::Error::Containment { detail, source } = &failure.cause else {
             panic!("{failure:?}");
         };
-        assert_eq!(
-            detail,
-            &format!(
-                "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run",
-                leaf_path.display()
-            ),
-            "the detail says only this layer"
+        let placed = format!(
+            "cgroup v2: the child could not be placed in its leaf cgroup {}, so the program did not run: ",
+            leaf_path.display()
         );
-        let source = source.as_deref().expect("the placement's cause is the source");
-        // `cgroup.procs` is absent from this leaf, so the diagnosis read failed too: its OS error
-        // is further down the source chain, not folded into the detail.
-        let causes = std::iter::successors(Some(source as &(dyn std::error::Error + 'static)), |e| e.source())
-            .filter_map(|e| e.downcast_ref::<std::io::Error>())
-            .filter_map(std::io::Error::raw_os_error)
-            .collect::<Vec<_>>();
+        assert!(detail.starts_with(&placed), "{detail:?}");
         assert!(
-            causes.contains(&libc::ENOENT),
-            "the unreadable cgroup.procs: {causes:?}"
+            detail.contains(&format!("errno {errno}")),
+            "the detail says what the child reported: {detail:?}"
         );
-        if matches!(report, ChildReport::WriteFailed) {
-            let said = crate::error::Report(source).to_string();
-            assert!(said.contains("errno 9"), "the write's errno: {said}");
-        }
+        let source = source.as_deref().expect("the write's errno is the source");
+        assert!(matches!(source, crate::error::Error::Io(e) if e.raw_os_error() == Some(errno)));
+        assert_eq!(crate::error::first_os_code(&failure.cause), Some(errno));
         assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
     }
 }
 
-/// A child whose placement report cannot be sent stops in its hook, before `exec`, and the spawn
-/// fails as one that did not start, under `BestEffort` too: the program never ran, and the
-/// child's exit tells the parent so (a child that died before reporting for another reason is
-/// still a degrade).
+/// A child that sent no report never ran the program, whatever the mode: the attach fails as one
+/// that did not start, saying that no report came (not that the child "could not be placed"), with
+/// no cause beneath it, and the leaf is removed.
+///
+/// Mutants: `BestEffort` degrades it, the text says the placement failed, or it has a source.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unreported_child_fails_the_attach_in_every_mode() {
+    for mode in [
+        crate::containment::ContainMode::Strongest,
+        crate::containment::ContainMode::BestEffort,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-decision-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+
+        let failure = decide_for(mode, &leaf_path, ChildReport::NotReported)
+            .expect_err("a child that sent no report never ran, so the spawn fails");
+
+        assert!(failure.not_started, "{mode:?}: the program never ran: {failure:?}");
+        let crate::error::Error::Containment { detail, source } = &failure.cause else {
+            panic!("{mode:?}: {failure:?}");
+        };
+        assert_eq!(
+            detail,
+            &format!(
+                "cgroup v2: the child did not report its placement in leaf cgroup {}, so the program did not run",
+                leaf_path.display()
+            ),
+            "{mode:?}"
+        );
+        assert!(source.is_none(), "{mode:?}: {source:?}");
+        assert!(!leaf_path.exists(), "{mode:?}: the failed attach must remove the leaf");
+    }
+}
+
+/// A child whose placement report cannot be sent stops in its hook, before `exec`, and sent no
+/// report, so the spawn fails as one that did not start, under `BestEffort` too: the program never
+/// ran.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn an_unsent_report_fails_a_best_effort_attach_as_a_spawn_that_did_not_start() {
@@ -2606,15 +2642,19 @@ fn an_unsent_report_fails_a_best_effort_attach_as_a_spawn_that_did_not_start() {
     assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
     let failure = result.expect_err("an unsent report fails the attach");
     assert!(failure.not_started, "the program never ran: {failure:?}");
-    assert!(matches!(failure.cause, crate::error::Error::Io(_)), "{failure:?}");
+    assert!(
+        matches!(failure.cause, crate::error::Error::Containment { .. }),
+        "{failure:?}"
+    );
     let said = crate::error::Report(&failure.cause).to_string();
-    assert!(said.contains("could not send"), "{said}");
+    assert!(said.contains("did not report its placement"), "{said}");
     assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
 }
 
 /// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf
 /// will not go away: whatever is in it, cosca did not put there. The leaf left behind is
-/// reported.
+/// reported. A failed write degrades under `BestEffort`; a child that sent no report fails the
+/// attach, and its leaf is left alone the same way.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_degrade_never_kills_through_the_leaf() {
@@ -2625,9 +2665,15 @@ fn a_degrade_never_kills_through_the_leaf() {
         let leaf_path = leaf_listing_another_pid(dir.path());
 
         let mark = crate::log_capture::mark();
-        let tree = decide_for(crate::containment::ContainMode::BestEffort, &leaf_path, report).expect("attach_tree");
+        let decided = decide_for(crate::containment::ContainMode::BestEffort, &leaf_path, report);
 
-        assert_eq!(tree.containment(), crate::containment::Containment::ProcessGroup);
+        match (report, decided) {
+            (ChildReport::WriteFailed, Ok(tree)) => {
+                assert_eq!(tree.containment(), crate::containment::Containment::ProcessGroup);
+            }
+            (ChildReport::NotReported, Err(failure)) => assert!(failure.not_started, "{failure:?}"),
+            (_, other) => panic!("not the answer for this report: {other:?}"),
+        }
         assert!(
             !leaf_path.join("cgroup.kill").exists(),
             "a degrade wrote cgroup.kill: it would kill a tree cosca had just been asked to contain"

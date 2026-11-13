@@ -1409,8 +1409,9 @@ pub(crate) struct AttachFailure {
     pub(crate) cause: Error,
     pub(crate) cleanup: Option<Failures>,
     /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
-    /// before `exec` because its placement in its leaf was refused. Every other failure may have
-    /// started the program. Only Linux places a child after its spawn, so only it sets and reads
+    /// before `exec` because its placement in its leaf was refused, or a child (in any mode) sent
+    /// no report, which its hook only leaves unsent by ending the child before `exec`. Every other
+    /// failure may have started the program. Only Linux places a child after its spawn, so only it sets and reads
     /// this.
     #[cfg_attr(
         not(target_os = "linux"),
@@ -1512,39 +1513,47 @@ fn attach_tree(
                         // process group set pre-spawn is the real container; the leaf is
                         // removed without writing cgroup.kill.
                         Err(reason) => {
-                            // `Strongest` fails the spawn: the failed attach's teardown ends the
-                            // child. A `Strongest` child stops before `exec` when it is not placed,
-                            // so the program never ran, on every path: the spawn says so.
-                            if prepared.mode.is_some_and(ContainMode::is_strict) {
-                                let detail = format!(
-                                    "cgroup v2: the child could not be placed in its leaf cgroup {}, so the \
-                                     program did not run",
-                                    leaf.path().display()
-                                );
+                            use crate::containment::cgroup::NotEntered;
+                            let path = leaf.path().display();
+                            // The program never ran, so the spawn fails as one that did not start
+                            // (the failed attach's teardown ends the child), when:
+                            // - the child sent no report: its hook ends the child before `exec`
+                            //   after every report it can send, so one that sent none never ran
+                            //   the program, in every mode;
+                            // - its placement write failed under `Strongest`, whose child stops
+                            //   before `exec` when it is not placed.
+                            // A failed write under `BestEffort` is a child that went on to run
+                            // in the process group set before the spawn: a degrade.
+                            let not_started = match reason.report() {
+                                NotEntered::NotReported => Some(Error::Containment {
+                                    detail: format!(
+                                        "cgroup v2: the child did not report its placement in leaf cgroup \
+                                         {path}, so the program did not run"
+                                    ),
+                                    source: None,
+                                }),
+                                NotEntered::WriteFailed(errno) if prepared.mode.is_some_and(ContainMode::is_strict) => {
+                                    Some(Error::Containment {
+                                        detail: format!(
+                                            "cgroup v2: the child could not be placed in its leaf cgroup \
+                                             {path}, so the program did not run: {reason}"
+                                        ),
+                                        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+                                    })
+                                }
+                                NotEntered::WriteFailed(_) => None,
+                            };
+                            let Some(cause) = not_started else {
+                                crate::containment::cgroup::log_degrade(&reason);
                                 leaf.remove_unentered();
-                                return Err(AttachFailure {
-                                    cause: Error::Containment {
-                                        detail,
-                                        source: Some(Arc::new(Error::Io(std::io::Error::other(reason)))),
-                                    },
-                                    cleanup: None,
-                                    not_started: true,
-                                });
-                            }
-                            // A child whose hook could not send its report stopped before `exec`,
-                            // whatever the mode: the spawn fails as one that did not start, not as
-                            // a degrade that hands back a child that never ran.
-                            if matches!(reason.report(), crate::containment::cgroup::NotEntered::ReportUnsent) {
-                                leaf.remove_unentered();
-                                return Err(AttachFailure {
-                                    cause: Error::Io(std::io::Error::other(reason)),
-                                    cleanup: None,
-                                    not_started: true,
-                                });
-                            }
-                            crate::containment::cgroup::log_degrade(&reason);
+                                return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
+                            };
                             leaf.remove_unentered();
-                            return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
+                            return Err(AttachFailure {
+                                cause,
+                                cleanup: None,
+                                not_started: true,
+                            });
                         }
                     }
                 }

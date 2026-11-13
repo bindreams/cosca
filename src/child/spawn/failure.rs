@@ -218,6 +218,38 @@ pub(crate) fn failed_after_teardown(cause: Error, behind_front: bool, torn_down:
     failed_after_the_spawn(cause, torn, behind_front)
 }
 
+/// The failure of a spawn whose attach failed with `cause` after its child was torn down as `torn`
+/// says, which `detail` and `attach_cleanup` add to (see [`Error::MayHaveStarted`]). `not_started`:
+/// the attach says the program never ran.
+///
+/// A teardown that has nothing to report leaves that answer as it is. One that does (a child it
+/// could not end, which comes back, or a failure beside the cause) has nowhere to put it in a
+/// not-started error, which is the cause alone; the failure is then a [`MayHaveStarted`], like every
+/// other failed spawn's, whose cause still says the program did not run.
+///
+/// [`MayHaveStarted`]: SpawnFailure::MayHaveStarted
+#[cfg(target_os = "linux")]
+pub(crate) fn failed_attach(
+    not_started: bool,
+    cause: Error,
+    detail: Option<String>,
+    attach_cleanup: Option<Failures>,
+    torn: Torn,
+) -> SpawnFailure {
+    let Torn {
+        fate,
+        unreaped,
+        cleanup,
+    } = torn;
+    if not_started && unreaped.is_none() && cleanup.is_none() && detail.is_none() && attach_cleanup.is_none() {
+        return SpawnFailure::NotStartedWithChild { cause, fate };
+    }
+    SpawnFailure::started(cause, fate, unreaped)
+        .with_detail(detail)
+        .with_cleanup(attach_cleanup)
+        .with_cleanup(cleanup)
+}
+
 // Only the Unix tests take a `SpawnFailure` apart; the rest read the public `Error`.
 #[cfg(all(test, unix))]
 impl SpawnFailure {

@@ -182,9 +182,6 @@ impl fmt::Display for PlacementReport {
 pub(crate) enum NotEntered {
     /// It exited before reporting its placement outcome (see [`PlacementReport::NotReported`]).
     NotReported,
-    /// Its hook could not send its report and stopped before `exec`: it exited with
-    /// `UNSENT_EXIT` (`leaf.rs`). The program never ran.
-    ReportUnsent,
     /// Its `write` to `cgroup.procs` failed with this errno.
     WriteFailed(i32),
 }
@@ -193,10 +190,6 @@ impl fmt::Display for NotEntered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             NotEntered::NotReported => PlacementReport::NotReported.fmt(f),
-            NotEntered::ReportUnsent => f.write_str(
-                "the child could not send its placement report to this process, and stopped \
-                 before exec",
-            ),
             NotEntered::WriteFailed(errno) => PlacementReport::WriteFailed(errno).fmt(f),
         }
     }

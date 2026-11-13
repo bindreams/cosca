@@ -393,6 +393,17 @@ impl ReportSlot {
         let sent = unsafe { self.send_report(REPORT_PLACED) }.expect("send the report");
         assert_eq!(sent, Delivery::Queued, "the parent must still be listening");
     }
+
+    /// Report a placement write that failed with `errno`, which no file a test can open fails with
+    /// on demand (`EBUSY`).
+    ///
+    /// # Safety
+    /// As [`ReportSlot::send`].
+    pub(crate) unsafe fn report_write_failed_for_test(self, errno: i32) {
+        // Safety: the caller guarantees the channel is open.
+        let sent = unsafe { self.send_report(errno) }.expect("send the report");
+        assert_eq!(sent, Delivery::Queued, "the parent must still be listening");
+    }
 }
 
 #[cfg(test)]

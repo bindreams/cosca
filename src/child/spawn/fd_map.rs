@@ -53,7 +53,7 @@
 //! caller's mapping onto it — closing std's error channel before the child ever calls `exec`. A
 //! dup2 or exec failure after that point (including the out-of-range case above) writes std's
 //! errno bytes into the caller's mapped fd instead of reaching the parent, and `spawn()` wrongly
-//! returns `Ok`. Not fixed here: filed as #192, to land with a cosca-owned error channel.
+//! returns `Ok`. Not fixed here: to land with a cosca-owned error channel (#383).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
