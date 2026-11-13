@@ -1359,12 +1359,17 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
         Some(libc::EMFILE),
         "the error carries the errno the child reported: {err:?}"
     );
-    assert_eq!(
-        fault::take_probe_steps(),
-        [
-            ProbeStep::Kill(libc::SIGKILL),
-            ProbeStep::Reap(ProbeEnd::Exit(super::ABANDONED))
-        ]
+    // The child's own exit and the probe's kill race to end it; the answer is the same for both.
+    let steps = fault::take_probe_steps();
+    assert!(
+        matches!(
+            steps[..],
+            [
+                ProbeStep::Kill(libc::SIGKILL),
+                ProbeStep::Reap(ProbeEnd::Exit(super::ABANDONED) | ProbeEnd::Signal(libc::SIGKILL))
+            ]
+        ),
+        "{steps:?}"
     );
     let warns = warns_since(mark, "");
     assert!(
@@ -1373,6 +1378,25 @@ fn a_probe_child_that_cannot_close_its_descriptors_is_reported_abandoned() {
             .any(|w| w.contains(&format!("child {pid}")) && w.contains("ABANDONED")),
         "a warn names the probe's child {pid} and its status: {warns:?}"
     );
+}
+
+/// A probe child that reported `SETUP_FAILED` ended `ABANDONED` whether it exited itself or the
+/// probe's kill reached it first; no other end is rewritten. The kill cannot be made to land
+/// between the child's report and its exit, so the reap's two outcomes are given.
+#[skuld::test]
+fn a_setup_failed_child_ends_abandoned_whether_it_exited_or_was_killed() {
+    let failed = super::ProbeRead::SetupFailed(libc::EMFILE);
+    let killed = ProbeEnd::Signal(libc::SIGKILL);
+    let abandoned = ProbeEnd::Exit(super::ABANDONED);
+    assert_eq!(super::settled_end(&failed, killed), abandoned);
+    assert_eq!(super::settled_end(&failed, abandoned), abandoned);
+    assert_eq!(
+        super::settled_end(&failed, ProbeEnd::Signal(libc::SIGSEGV)),
+        ProbeEnd::Signal(libc::SIGSEGV)
+    );
+    assert_eq!(super::settled_end(&failed, ProbeEnd::Elsewhere), ProbeEnd::Elsewhere);
+    assert_eq!(super::settled_end(&super::ProbeRead::Gone("x"), killed), killed);
+    assert_eq!(super::settled_end(&super::ProbeRead::Answer(Ok(())), killed), killed);
 }
 
 /// The errnos by which `openat2` is refused (see `identity::Refusal`).

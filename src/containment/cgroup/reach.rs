@@ -872,6 +872,17 @@ fn describe_end(end: ProbeEnd) -> String {
     }
 }
 
+/// How the probe's child ended, as the probe answers it. A child that reported [`SETUP_FAILED`] was
+/// exiting [`ABANDONED`] by itself when the probe's kill arrived, and which of the two the reap saw
+/// depends on the scheduler, so the report decides: that child ended `ABANDONED`. Any other end is
+/// as the reap saw it.
+fn settled_end(read: &ProbeRead, end: ProbeEnd) -> ProbeEnd {
+    match (read, end) {
+        (ProbeRead::SetupFailed(_), ProbeEnd::Signal(libc::SIGKILL)) => ProbeEnd::Exit(ABANDONED),
+        _ => end,
+    }
+}
+
 /// Logs how the probe's child `pid` ended: `debug` for the ends the probe makes (the kill, the
 /// release), `warn` for any other, which is the child's own doing.
 fn log_probe_end(pid: libc::pid_t, end: ProbeEnd) {
@@ -987,7 +998,7 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Ok(_) => ProbeRead::Gone("the probe's child died before it was ready"),
         Err(e) => ProbeRead::Answer(Err(Unreadable::Probe(e))),
     };
-    let end = probe.end().map_err(Unreadable::Probe)?;
+    let end = settled_end(&read, probe.end().map_err(Unreadable::Probe)?);
     log_probe_end(pid, end);
     match read {
         ProbeRead::Answer(answer) => answer,
