@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
-    assert_descendant_dies, assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity,
-    assert_tree_refused, group_blocker, orphan, session_tree, walked_blocker, Untrusted, BOTH,
+    assert_descendant_dies, assert_holders_only, assert_nothing_sent, assert_refused, assert_refused_caused_by,
+    assert_sent_by_identity, assert_tree_refused, assert_tree_refused_caused_by, group_blocker, orphan, session_tree,
+    walked_blocker, Cause, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::log_capture::warns_since;
@@ -102,7 +103,8 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 }
 
 /// The grace wait itself observes the orphaned root: it stays quiet, and the escalation's refusal is
-/// the only report.
+/// the only report. The wait's `ECHILD` (a zombie launchd holds answers no wait) is the refusal's
+/// source: the call's other failure, carried below it.
 ///
 /// Mutant: the grace wait warns that the zombie is not ours to reap.
 #[skuld::test]
@@ -124,7 +126,7 @@ fn graceful_shutdown_wait_that_sees_an_orphaned_root_is_quiet() {
 
     fake.assert_peeks_exhausted();
     assert_eq!(fake.looks(), 1, "the grace wait looked once");
-    assert_refused(&err, "kill");
+    assert_refused_caused_by(&err, "kill", Cause::Echild);
     assert_eq!(
         sends.entries(),
         vec![(pid, Sig::Term, Via::Identity)],
@@ -361,7 +363,8 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
         .expect_err("a root this process does not pin is not swept");
 
     fake.assert_peeks_exhausted();
-    assert_tree_refused(&err, "graceful_shutdown_tree", Untrusted::Unpinned);
+    // The cooperative signal's forced failure is the sweep refusal's source.
+    assert_tree_refused_caused_by(&err, "graceful_shutdown_tree", Untrusted::Unpinned, Cause::ForcedTerm);
     assert!(
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"

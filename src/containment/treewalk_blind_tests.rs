@@ -139,7 +139,8 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
         let result = walk(&process);
         drop(forced);
         assert!(
-            matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("edge buffer")),
+            matches!(&result, Err(e @ Error::Unassessable { .. })
+                if crate::error::said(e).contains("an edge buffer could not be allocated")),
             "{name}: {result:?}"
         );
         release(child);

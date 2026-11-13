@@ -1226,7 +1226,7 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     drop(cmd);
     let marker = super::Marker::new(prepared, inert_root(), None);
 
-    crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
+    crate::containment::enumerate::force_blind_snapshots(1);
     let result = marker.hard_kill(
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut Vec::new(),

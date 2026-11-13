@@ -16,7 +16,7 @@ use crate::test_child::Console;
 /// for why that is not reliably provisionable on macOS: SIP). This instead drives the group
 /// channel's OTHER real, privilege-free refusal path: `containment::unix::signal_group`'s
 /// `pgid <= 0` guard, reached via `Child::test_force_fdmarker_pgid` the same way this codebase's
-/// other otherwise-untriggerable branches already are (`force_blind_snapshot_for_next_call` and
+/// other otherwise-untriggerable branches already are (`force_blind_snapshots` and
 /// friends).
 #[cfg(target_os = "macos")]
 #[skuld::test]

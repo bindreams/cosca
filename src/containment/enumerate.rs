@@ -40,8 +40,8 @@ pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
 /// (a different module) needs it to exercise `Marker::sweep`'s `incomplete`/`Err` path
 /// end-to-end, and `backend` is private to this file.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn force_blind_snapshot_for_next_call(force: bool) {
-    backend::force_blind_snapshot_for_next_call(force)
+pub(crate) fn force_blind_snapshots(count: usize) {
+    backend::force_blind_snapshots(count)
 }
 
 /// Test-only re-export of the backend's fault seams, for the tree-walk propagation tests.

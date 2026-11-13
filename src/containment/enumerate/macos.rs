@@ -275,14 +275,18 @@ fn fill_all() -> std::io::Result<Filled> {
 
 /// Every pid the kernel will list, or why it would not.
 ///
-/// Test-only fault seam: [`force_blind_snapshot_for_next_call`] arms a thread-local that makes
-/// the NEXT call on the calling thread fail without touching the real syscall, as if
+/// Test-only fault seam: [`force_blind_snapshots`] arms a thread-local that makes
+/// the NEXT calls on the calling thread fail without touching the real syscall, as if
 /// `proc_listallpids` itself had failed. This exists so `Marker::sweep`'s `incomplete`/`Err`
 /// path can be exercised end-to-end through the real public `hard_kill()`/`terminate()` API
 /// with a genuinely blind pass, rather than a synthetic in-process mock of `sweep`'s internals.
 fn try_all_pids() -> std::io::Result<Vec<libc::c_int>> {
     #[cfg(test)]
-    if FORCE_BLIND.with(|c| c.take()) {
+    if FORCE_BLIND.with(|c| {
+        let armed = c.get();
+        c.set(armed.saturating_sub(1));
+        armed > 0
+    }) {
         log::warn!(
             "proc_listallpids sizing call returned 0 (test fault injected); every containment \
              teardown channel that reads the process table is blind this round"
@@ -312,15 +316,16 @@ fn all_pids() -> Vec<libc::c_int> {
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_BLIND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Arms (`true`) or disarms (`false`) the blind-snapshot fault for the next [`all_pids`] call
-/// (via [`snapshot`]/[`process_parents`]) on the CALLING thread only — consumed automatically
-/// on that one call, so a test does not need to remember to disarm it afterward.
+/// Arms the blind-snapshot fault for the next `count` [`all_pids`] calls (via
+/// [`snapshot`]/[`process_parents`]) on the CALLING thread only; `0` disarms it. Each call consumes
+/// one, so a test does not need to remember to disarm it afterward. The fd-marker sweep runs a
+/// second pass after a first that found the root, so a test that keeps a sweep blind arms two.
 #[cfg(test)]
-pub(crate) fn force_blind_snapshot_for_next_call(force: bool) {
-    FORCE_BLIND.with(|c| c.set(force));
+pub(crate) fn force_blind_snapshots(count: usize) {
+    FORCE_BLIND.with(|c| c.set(count));
 }
 
 /// Join pids to `(pid, ppid)` edges, filtering non-positive pids first. Pure and taking its
@@ -469,14 +474,14 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             DENIED.with(|d| d.borrow_mut().clear());
             JOIN_ALLOC_FAILS.with(|f| f.set(false));
-            super::FORCE_BLIND.with(|c| c.set(false));
+            super::FORCE_BLIND.with(|c| c.set(0));
         }
     }
 
-    /// [`force_blind_snapshot_for_next_call`](super::force_blind_snapshot_for_next_call) disarmed
+    /// [`force_blind_snapshots`](super::force_blind_snapshots)`(1)` disarmed
     /// by the guard, so a test that panics first cannot leave it armed.
     pub(crate) fn force_blind_snapshot() -> Forced {
-        super::force_blind_snapshot_for_next_call(true);
+        super::force_blind_snapshots(1);
         Forced(())
     }
 
