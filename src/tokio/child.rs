@@ -364,7 +364,7 @@ impl Child {
     /// on a failure (`SweepFailure`), and the wait for what the kill reached, which the caller
     /// awaits ([`wait_async`](Swept::wait_async)).
     pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Swept<'_> {
-        self.inner.kill_tree_after(op, earlier)
+        self.inner.kill_tree_after(op, earlier, None)
     }
 
     /// Send the graceful termination signal to the contained group — `SIGTERM` via

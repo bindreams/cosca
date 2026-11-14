@@ -818,7 +818,7 @@ fn standing_of(state: &super::TreeState) -> Standing {
             Standing::Left(
                 held.iter()
                     .map(|left| match left {
-                        Left::Resolved(id) => id.pid(),
+                        Left::Resolved(id) | Left::Termed(id) => id.pid(),
                         Left::Unread { pid, .. } => *pid,
                     })
                     .collect(),
@@ -1555,6 +1555,62 @@ fn members_a_cooperative_walk_reached_are_killed_by_identity_when_the_root_is_go
     crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
 }
 
+/// A call whose own `SIGTERM` walk listed the held members stands on that listing when the root has
+/// exited: every one gone or killed leaves the tree vouched for and the answer `Ok`; an empty listing
+/// is a listing. A member the listing does not name (another call's), no listing at all, and an
+/// unvouched state do not vouch.
+///
+/// Mutants: the listing is ignored; a held member outside it is vouched; an empty listing is none.
+#[skuld::test]
+fn a_gone_root_over_the_calls_own_listing_is_vouched_only_when_it_names_every_held_member() {
+    use super::{TreeKillOutcome, TreeKilled};
+    let gone_root = || TreeKillOutcome::NoRoot(ROOT_PID);
+
+    // An empty listing over a tree never settled.
+    let killed = TreeKilled::default();
+    killed
+        .settle_listing(Some(&walker()), gone_root(), true, Some(&[]))
+        .answer
+        .expect("an empty listing is a listing");
+    assert_eq!(standing(&killed), Standing::Killed);
+    // No listing: the gone root's own answer.
+    let killed = TreeKilled::default();
+    killed
+        .settle_listing(Some(&walker()), gone_root(), true, None)
+        .answer
+        .expect_err("no listing, no walk");
+    assert_eq!(standing(&killed), Standing::Never);
+
+    // A held member the listing names is killed by identity, and the tree is vouched for.
+    let (named, named_stdin) = crate::test_child::held_uncontained_blocker(false);
+    let named_id = named.id().expect(crate::test_child::IDENTITY_READ);
+    let killed = TreeKilled::default();
+    killed.hold(vec![named_id]);
+    let settled = killed.settle_listing(Some(&walker()), gone_root(), true, Some(&[named_id]));
+    settled.answer.expect("every member the listing names is killed");
+    assert_eq!(settled.killed_again, vec![named_id]);
+    assert_eq!(standing(&killed), Standing::Killed);
+
+    // A held member another call walked is killed, and the tree is not vouched for.
+    let (other, other_stdin) = crate::test_child::held_uncontained_blocker(false);
+    let other_id = other.id().expect(crate::test_child::IDENTITY_READ);
+    let killed = TreeKilled::default();
+    killed.hold(vec![other_id]);
+    let settled = killed.settle_listing(Some(&walker()), gone_root(), true, Some(&[]));
+    settled.answer.expect_err("the held member is not in the listing");
+    assert_eq!(settled.killed_again, vec![other_id]);
+    assert_eq!(
+        standing(&killed),
+        Standing::Unvouched(super::UnvouchedKind::HeldMembersGone)
+    );
+
+    // Released after the kills: a settlement that sent nothing lets a member exit on EOF, which fails
+    // the assertion instead of leaving a wait unbounded.
+    drop((named_stdin, other_stdin));
+    crate::test_child::assert_killed("the listed member", named.wait().expect("reap the member"));
+    crate::test_child::assert_killed("the other member", other.wait().expect("reap the member"));
+}
+
 /// Mutant: the answer is `no_root_error`, or says the members were killed again, or changes with the
 /// second call.
 #[skuld::test]
@@ -1861,7 +1917,7 @@ fn swept_in(
 ) -> crate::error::Error {
     let root_ended = backstop.is_ok();
     let tree = crate::containment::Tree::contained(mechanism);
-    super::SweepFailure::of(&tree, walk, backstop, 1, root_ended)
+    super::SweepFailure::of(&tree, walk, backstop, 1, root_ended, None)
         .answer
         .expect_err("a member was left")
         .error

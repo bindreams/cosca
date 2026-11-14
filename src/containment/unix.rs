@@ -477,6 +477,7 @@ pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOu
                 result: Ok(()),
                 earlier: None,
                 termed: Vec::new(),
+                complete: true,
             }
         }
         look => {

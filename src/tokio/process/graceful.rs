@@ -40,13 +40,18 @@ impl Process {
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
     /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
-        self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
+        // SIGTERM-walk (Windows: Unsupported, early return); see the sync call for the listing.
+        let listed = crate::Process::listing_of(self.inner.terminate_walk(&crate::identity::HostKernel)?);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         let watch = self.wait_timeout(grace).await;
         let swept = self
             .inner
-            .kill_tree_with_async("graceful_shutdown_tree", &crate::identity::HostKernel)
+            .kill_tree_listing_async(
+                "graceful_shutdown_tree",
+                &crate::identity::HostKernel,
+                listed.as_deref(),
+            )
             .await;
         let call = format!("graceful_shutdown_tree({})", self.id().pid());
         crate::graceful::after_sweep(&call, swept, watch)

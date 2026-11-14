@@ -372,12 +372,15 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
         ),
         "a gone root has no tree to walk"
     );
-    super::terminate(
+    let termed = super::terminate(
         &root_changed_hands(),
         root(),
         &super::ByIdentity::new(&root_changed_hands(), root()),
-    )
-    .expect("a gone root is Ok");
+    );
+    assert!(
+        matches!(termed, Ok(super::Terminated::RootExited(_))),
+        "a gone root sends nothing"
+    );
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
         assert_eq!(children.expect("a gone root is Ok"), vec![], "{recursive:?}");

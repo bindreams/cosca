@@ -144,3 +144,101 @@ fn foreign_graceful_shutdown_graceful_path() {
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
+
+/// A std tree on one stdin pipe: a root that a `SIGTERM` ends, and below it a subshell and its `cat`
+/// that ignore `SIGTERM`. Its descendants exist once the readiness line is read. The `Process` is open
+/// on the root, and `members` are the descendants' identities.
+struct SurvivorTree {
+    child: std::process::Child,
+    _stdout: std::process::ChildStdout,
+    process: crate::Process,
+    members: Vec<crate::identity::ProcessId>,
+}
+
+fn survivor_tree() -> SurvivorTree {
+    let argv = crate::test_child::TERM_SURVIVOR_TREE_ARGV;
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("the readiness line");
+    let process = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    let members = process
+        .id()
+        .children(crate::Recursive::Yes)
+        .expect("the root's descendants");
+    assert!(!members.is_empty(), "the subshell is a descendant of the root");
+    SurvivorTree {
+        child,
+        _stdout: stdout,
+        process,
+        members,
+    }
+}
+
+// The root ends on the `SIGTERM` and a member that ignores it is left, reparented. The sweep kills the
+// members the call's own walk found, by identity, waits for them, and answers `Ok`: the call's listing
+// is clear. A root that was waited for as a zombie shows its own status.
+//
+// Mutant: the sweep walks from the exited root, finds nothing, and answers `Ok` with the member running.
+#[skuld::test]
+fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_the_root_exits() {
+    let mut tree = survivor_tree();
+
+    tree.process
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("every member the walk found is killed");
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} ignored the SIGTERM and is killed by identity"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+}
+
+// A walk from an exited root finds nothing, so `kill_tree` says it could not see the tree.
+//
+// Mutant: the empty walk is `Ok`.
+#[skuld::test]
+fn foreign_kill_tree_over_an_exited_unreaped_root_is_unassessable() {
+    let mut tree = survivor_tree();
+    tree.child.kill().expect("kill the root alone");
+    crate::test_child::wait_until_zombie(tree.child.id());
+
+    let err = tree
+        .process
+        .kill_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    tree.child.wait().expect("reap the root");
+}
+
+// `terminate_tree` over an exited root whose walk finds no member is `Unassessable` and sends nothing.
+//
+// Mutant: the empty walk is `Ok`.
+#[skuld::test]
+fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sends_nothing() {
+    let mut child = foreign::blocker();
+    let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    child.kill().expect("kill the root");
+    crate::test_child::wait_until_zombie(child.id());
+    let sends = Capture::start();
+
+    let err = p
+        .terminate_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(sends.entries(), vec![], "nothing was sent");
+    child.wait().expect("reap the root");
+}

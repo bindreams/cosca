@@ -109,6 +109,7 @@ impl Contains for FakeContains {
             result: Ok(()),
             earlier: Some("the SIGTERM"),
             termed: Vec::new(),
+            complete: true,
         }
     }
 

@@ -29,7 +29,7 @@ fn walks() -> [(&'static str, Walk); 4] {
         }),
         ("terminate", |p| {
             let hk = &crate::identity::HostKernel;
-            super::terminate(hk, p.id(), &super::ByIdentity::new(hk, p.id())).map(drop)
+            super::terminate(hk, p.id(), &super::ByIdentity::new(hk, p.id())).and_then(super::Terminated::into_result)
         }),
         ("kill_tree", |p| p.kill_tree()),
         ("terminate_tree", |p| p.terminate_tree()),
@@ -148,8 +148,8 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
 }
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own, and are never signalled. `terminate` is `Ok`; `hard_kill` killed nothing, and is
-/// `Unassessable`. Mutants: "walk without an anchor"; "a kill that found no root is `Ok`". A stale
+/// its own, and are never signalled. `terminate` sends nothing (`RootExited`); `hard_kill` killed
+/// nothing, and is `Unassessable`. Mutants: "walk without an anchor"; "a kill that found no root is `Ok`". A stale
 /// identity cannot be opened, so only the identity-level walks run.
 #[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unassessable() {
@@ -167,6 +167,10 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
 
     let (child, _) = live_member();
     let result = super::terminate(&kernel, stale, &super::ByIdentity::new(&kernel, stale));
-    assert!(result.is_ok(), "terminate: {result:?}");
+    assert!(
+        matches!(result, Ok(super::Terminated::RootExited(_))),
+        "terminate sends nothing: {:?}",
+        result.map(drop)
+    );
     release(child);
 }

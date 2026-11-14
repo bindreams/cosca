@@ -40,13 +40,15 @@
 //! # A root that has exited (Unix)
 //!
 //! The kernel reparents a process's children at its exit, before anything reaps it, so a walk from the
-//! pid of an exited root finds none of them, and an empty walk says nothing of the tree. A handle's
-//! kill ([`kill_tree`]) whose walk finds no member from such a root, reaped or not, is
-//! [`TreeKillOutcome::NoRoot`] (`root_exited`), not an empty success. The members a [`terminate`] walk
-//! reached while the root ran are the exception: the handle holds them by identity, and its next kill
-//! kills them without a walk (`TreeKilled::hold`). A foreign [`Process`](crate::Process) holds no
-//! settlement to keep them in, so its walk keeps its word. Windows never reparents, so a walk from an
-//! exited root still finds its children, and nothing changes there.
+//! pid of an exited root finds none of them, and an empty walk says nothing of the tree. A kill
+//! ([`hard_kill`]) whose walk finds no member from such a root, reaped or not, is
+//! [`TreeKillOutcome::NoRoot`] (`root_exited`), and a [`terminate`] is [`Terminated::RootExited`] with
+//! nothing sent: neither is an empty success. The members a [`terminate`] walk reached while the root
+//! ran are the exception to the kill: a handle holds them by identity (`TreeKilled::hold`) and its next
+//! kill kills them without a walk, and the call that walked them stands on its own listing
+//! (`TreeKilled::settle_listing`; a foreign [`Process`](crate::Process)'s `graceful_shutdown_tree`
+//! keeps it in the call). Windows never reparents, so a walk from an exited root still finds its
+//! children, and nothing changes there.
 //!
 //! # The parent-order rule (Windows only)
 //!
@@ -626,18 +628,13 @@ fn root_exited(kernel: &dyn Kernel, root: ProcessId) -> bool {
 /// handle opened by its identity. The [`TreeKill`] names every descendant whose kill was sent
 /// (each re-opened by identity, through `kernel`, when a caller waits), and whether the root's landed.
 ///
+/// A root that has exited but is not reaped, whose walk finds no member, is [`TreeKillOutcome::NoRoot`]
+/// too: its children were reparented at its exit, so an empty walk says nothing of the tree
+/// (`root_exited`). A handle that holds its tree's settlement can still kill the members it knows by
+/// identity ([`TreeKilled::hold`](crate::containment::dispatch::TreeKilled::hold)).
+///
 /// [`Tree::settle`]: crate::containment::Tree::settle
 pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn Root) -> TreeKill<'a> {
-    kill_walked(kernel, root, held, false)
-}
-
-/// [`hard_kill`], and when `refuse_exited_root`, a root that has exited but is not reaped whose walk
-/// finds no member is [`TreeKillOutcome::NoRoot`] too: its children were reparented at its exit, so
-/// an empty walk says nothing of the tree (`root_exited`). A handle that holds its tree's
-/// settlement asks for that, so it can still kill the members it knows by identity
-/// ([`TreeKilled::hold`](crate::containment::dispatch::TreeKilled::hold)); a foreign
-/// [`Process`](crate::Process) holds none, and takes the walk's word.
-fn kill_walked<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn Root, refuse_exited_root: bool) -> TreeKill<'a> {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     // Test-only fault seam: skip the root's kill (take semantics — see `fault`).
     #[cfg(test)]
@@ -678,12 +675,7 @@ fn kill_walked<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn Root, ref
             left.push(forced_error(root.pid().wrapping_add(1)));
         }
     }
-    if refuse_exited_root
-        && descendants.is_empty()
-        && left.is_empty()
-        && root_left.is_none()
-        && root_exited(kernel, root)
-    {
+    if descendants.is_empty() && left.is_empty() && root_left.is_none() && root_exited(kernel, root) {
         return TreeKill::of(TreeKillOutcome::NoRoot(root.pid())).through(kernel);
     }
     let mut resolved = Vec::new();
@@ -746,6 +738,9 @@ pub(crate) enum Left {
     /// the member it was first reported as, [`Error::MemberNotKilled`] with this `source` (the same
     /// `Arc`).
     Unread { pid: RawPid, source: Arc<Error> },
+    /// A `SIGTERM` walk reached it while the root ran, and nothing has refused it: a later kill, which
+    /// cannot walk to it once the root has exited, kills it by identity.
+    Termed(ProcessId),
 }
 
 impl Left {
@@ -776,7 +771,7 @@ impl Left {
 
     pub(crate) fn pid(&self) -> RawPid {
         match self {
-            Left::Resolved(id) => id.pid(),
+            Left::Resolved(id) | Left::Termed(id) => id.pid(),
             Left::Unread { pid, .. } => *pid,
         }
     }
@@ -813,7 +808,9 @@ pub(crate) fn with_earlier(
     let mut killed = Vec::new();
     for left in earlier.into_iter().filter(|left| !named.contains(&left.pid())) {
         match left {
-            Left::Resolved(id) => {
+            // A member a `SIGTERM` walk reached that this kill refuses becomes a refused one: the
+            // next kill finds it `Resolved`.
+            Left::Resolved(id) | Left::Termed(id) => {
                 #[cfg(any(unix, windows))]
                 {
                     let outcome = kill_one(kernel, id);
@@ -1061,34 +1058,85 @@ pub(crate) mod fault {
 ///
 /// The members it found, the root apart, are what it returns (none on Windows): once the root exits
 /// they are reparented out of every later walk, so a later kill can reach them only by these
-/// identities ([`TerminateOutcome::Sent`]).
-pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> Result<Vec<ProcessId>, Error> {
+/// identities ([`TerminateOutcome::Sent`]). A root that has exited, reaped or not, whose walk finds no
+/// member sends nothing: its children were reparented at its exit, so `Ok` would say nothing of the
+/// tree ([`Terminated::RootExited`]).
+pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> Result<Terminated, Error> {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     {
         let parents = crate::containment::enumerate::process_parents(kernel)?;
         let Some(walk) = walk_from(kernel, root, &parents, Recursive::Yes)? else {
-            return Ok(Vec::new());
+            return Ok(Terminated::RootExited(exited_root_error(root.pid())));
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
+        if walk.members.is_empty() && walk.unassessed.is_empty() && root_exited(kernel, root) {
+            return Ok(Terminated::RootExited(exited_root_error(root.pid())));
+        }
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
         warn_if_not_attempted(root, Signal::SIGTERM, &KillOutcome::of(held.signal(Sig::Term)));
         for id in &walk.members {
             warn_if_not_attempted(*id, Signal::SIGTERM, &kill_by_identity(kernel, *id, Signal::SIGTERM));
         }
-        Ok(walk.members)
+        Ok(Terminated::Walked {
+            complete: walk.unassessed.is_empty(),
+            members: walk.members,
+        })
     }
     #[cfg(windows)]
     {
         let _ = (kernel, held);
-        crate::containment::windows::terminate(root.pid()).map(|()| Vec::new())
+        crate::containment::windows::terminate(root.pid()).map(|()| Terminated::Walked {
+            members: Vec::new(),
+            complete: true,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (kernel, root, held);
-        Ok(Vec::new())
+        Ok(Terminated::Walked {
+            members: Vec::new(),
+            complete: true,
+        })
+    }
+}
+
+/// What [`terminate`]'s walk did, once the process table was read (an unreadable table is its `Err`).
+pub(crate) enum Terminated {
+    /// The `SIGTERM`s went out to the root and to the members the walk found, the root apart.
+    /// `complete`: the walk assessed every candidate, so `members` list the tree whole as the walk saw
+    /// it; one it could not read is warned of, and a listing without it cannot vouch for the tree.
+    Walked { members: Vec<ProcessId>, complete: bool },
+    /// Nothing was sent: the root has exited and the walk found no member.
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "Windows never reparents, so an exited root's walk stands")
+    )]
+    RootExited(Error),
+}
+
+impl Terminated {
+    /// The answer of a `terminate_tree` call: `Ok` once the signals went out, the error of a root that
+    /// had exited otherwise.
+    pub(crate) fn into_result(self) -> Result<(), Error> {
+        match self {
+            Terminated::Walked { .. } => Ok(()),
+            Terminated::RootExited(exited) => Err(exited),
+        }
+    }
+}
+
+/// The error of a `SIGTERM` that sent nothing because the root `pid` has exited.
+#[cfg(unix)]
+fn exited_root_error(pid: u32) -> Error {
+    Error::Unassessable {
+        detail: format!(
+            "the root (pid {pid}) has exited, so its descendants were reparented and a walk from its pid finds \
+             none: nothing was sent"
+        ),
+        source: None,
     }
 }
 
@@ -1129,7 +1177,7 @@ pub(crate) fn kill_tree<'a>(root: ProcessId, owner: Option<&dyn Root>) -> TreeKi
         Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip)),
         None => {
             let kernel = &crate::identity::HostKernel;
-            kill_walked(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)), true)
+            hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)))
         }
     }
 }
@@ -1143,11 +1191,13 @@ pub(crate) fn terminate_tree(kernel: &dyn Kernel, root: ProcessId, owner: Option
             // read or the walk made (Unix), or the break could not be sent (Windows). A failed signal to
             // the root or a member is only warned of, so it is `Sent { Ok }`.
             match terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))) {
-                Ok(termed) => TerminateOutcome::Sent {
+                Ok(Terminated::Walked { members, complete }) => TerminateOutcome::Sent {
                     result: Ok(()),
                     earlier: Some("the SIGTERM"),
-                    termed,
+                    termed: members,
+                    complete,
                 },
+                Ok(Terminated::RootExited(error)) => TerminateOutcome::RootExited(error),
                 Err(not_sent) => TerminateOutcome::NotSent(not_sent),
             }
         }

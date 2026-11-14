@@ -214,11 +214,12 @@ impl Tree {
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                let mut outcome = mechanism.send_terminate(pid, root);
+                let outcome = mechanism.send_terminate(pid, root);
                 // The members a walk reached are held for the next kill, which cannot walk to them once
-                // the root has exited.
-                if let TerminateOutcome::Sent { termed, .. } = &mut outcome {
-                    self.killed.hold(std::mem::take(termed));
+                // the root has exited. The outcome keeps them: the call that walked them may vouch for
+                // them ([`TreeKilled::settle_listing`]).
+                if let TerminateOutcome::Sent { termed, .. } = &outcome {
+                    self.killed.hold(termed.clone());
                 }
                 outcome
             }
@@ -352,12 +353,25 @@ impl Tree {
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left.
+    #[cfg(unix)]
     pub(crate) fn settle_for_kill_tree(
         &self,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
         self.killed.settle_for_kill_tree(self.named_by(), outcome, root_ended)
+    }
+
+    /// [`settle_for_kill_tree`](Self::settle_for_kill_tree) for a call whose own `SIGTERM` walk listed
+    /// the members `listed` ([`TreeKilled::settle_listing`]).
+    pub(crate) fn settle_for_kill_tree_listing(
+        &self,
+        outcome: impl Into<TreeKillOutcome>,
+        root_ended: bool,
+        listed: Option<&[crate::identity::ProcessId]>,
+    ) -> Settled<Result<(), Error>> {
+        self.killed
+            .settle_for_kill_tree_listing(self.named_by(), outcome, root_ended, listed)
     }
 
     /// [`Contains::root_left`] of this tree's mechanism. A tree that holds none is not reached:

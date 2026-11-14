@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use super::Process;
+use crate::containment::treewalk::Terminated;
 use crate::error::Error;
 
 impl Process {
@@ -48,8 +49,9 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is killed, the root included. Also when the root is gone, or no longer
-    /// holds its pid: no walk ran, and nothing was killed.
+    /// be queried: nothing is killed, the root included. Also when the root has exited, reaped or not
+    /// (its children were reparented at its exit, so a walk from its pid says nothing of the tree), or
+    /// no longer holds its pid, and the walk finds no member: no walk ran, and nothing was killed.
     ///
     /// [`Error::MembersLeft`] when the walk killed what it could and left members running, each a
     /// [`Error::MemberNotKilled`] naming it and why: its identity could not be read, or its kill was
@@ -73,7 +75,18 @@ impl Process {
     /// [`kill_tree`](Self::kill_tree) for the call `op`, which a warn about its failed wait names,
     /// reading through `kernel`.
     pub(crate) fn kill_tree_with(&self, op: &str, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        let (answer, wait) = self.sweep(kernel);
+        self.kill_tree_listing(op, kernel, None)
+    }
+
+    /// [`kill_tree_with`](Self::kill_tree_with) for a call whose own `SIGTERM` walk listed the members
+    /// `listed` (see [`sweep`](Self::sweep)).
+    pub(crate) fn kill_tree_listing(
+        &self,
+        op: &str,
+        kernel: &dyn crate::identity::Kernel,
+        listed: Option<&[crate::identity::ProcessId]>,
+    ) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel, listed);
         let waited = wait.wait();
         crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
@@ -85,25 +98,55 @@ impl Process {
         op: &str,
         kernel: &dyn crate::identity::Kernel,
     ) -> Result<(), Error> {
-        let (answer, wait) = self.sweep(kernel);
+        self.kill_tree_listing_async(op, kernel, None).await
+    }
+
+    /// [`kill_tree_listing`](Self::kill_tree_listing), awaited, with no runtime thread blocked.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn kill_tree_listing_async(
+        &self,
+        op: &str,
+        kernel: &dyn crate::identity::Kernel,
+        listed: Option<&[crate::identity::ProcessId]>,
+    ) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel, listed);
         let waited = wait.wait_async().await;
         crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
 
     /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
     pub(crate) fn send_kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        self.sweep(kernel).0
+        self.sweep(kernel, None).0
     }
 
     /// The walk's kills, the answer they come to, and the wait for what they reached: the members, and
     /// the root through this handle once its kill landed.
+    ///
+    /// A root that has exited, reaped or not, whose walk finds no member answers [`Error::Unassessable`]:
+    /// its children were reparented at its exit. `listed` are the members the call's own `SIGTERM` walk
+    /// found while the root ran and listed whole (`graceful_shutdown_tree`): they stand for the walk the
+    /// exited root cannot make, and are killed by identity and waited for, so the call is `Ok` when
+    /// every one is gone or killed. What a member forked after the listing is the limit
+    /// [`kill_tree`](Process::kill_tree) states.
     fn sweep<'a>(
         &'a self,
         kernel: &'a dyn crate::identity::Kernel,
+        listed: Option<&[crate::identity::ProcessId]>,
     ) -> (Result<(), Error>, crate::containment::KillWait<'a>) {
-        let (outcome, wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
+        use crate::containment::dispatch::TreeKillOutcome;
+        use crate::containment::treewalk::Left;
+
+        let (outcome, mut wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
         // No handle backstop: the root is left as any member is, and the error holds every member.
-        let answer = outcome.into_result().or_else(|left| left.unsettled(false));
+        let answer = match (&outcome, listed) {
+            (TreeKillOutcome::NoRoot(_), Some(listed)) => {
+                let termed = listed.iter().copied().map(Left::Termed).collect();
+                let (answer, killed) = crate::containment::treewalk::with_earlier(kernel, termed, Ok(()));
+                wait.reaching(killed);
+                answer.or_else(|left| left.unsettled(false))
+            }
+            _ => outcome.into_result().or_else(|left| left.unsettled(false)),
+        };
         let landed = wait.root_killed();
         (answer, wait.with_root(&*self.os, self.id.pid(), landed))
     }
@@ -117,17 +160,24 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is signalled.
+    /// be queried: nothing is signalled. Also when the root has exited, reaped or not, and its walk
+    /// finds no member: its children were reparented at its exit, so a walk from its pid says nothing
+    /// of the tree, and nothing is signalled.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }
 
     /// [`terminate_tree`](Self::terminate_tree), reading through `kernel`.
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        self.terminate_walk(kernel).and_then(Terminated::into_result)
+    }
+
+    /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it
+    /// listed, which a graceful shutdown stands on ([`sweep`](Self::sweep)).
+    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> Result<Terminated, Error> {
         #[cfg(unix)]
         {
-            // A foreign process holds no settlement, so the members the walk reached are not kept.
-            crate::containment::treewalk::terminate(kernel, self.id, self).map(drop)
+            crate::containment::treewalk::terminate(kernel, self.id, self)
         }
         #[cfg(windows)]
         {
@@ -145,7 +195,20 @@ impl Process {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (kernel, self.id);
-            Ok(())
+            Ok(Terminated::Walked {
+                members: Vec::new(),
+                complete: true,
+            })
+        }
+    }
+
+    /// What the call's own `SIGTERM` walk lists for its sweep to stand on: the members it found while
+    /// the root ran and read whole. `None` for a walk that could not read every candidate, or that
+    /// found its root already exited and sent nothing.
+    pub(crate) fn listing_of(walked: Terminated) -> Option<Vec<crate::identity::ProcessId>> {
+        match walked {
+            Terminated::Walked { members, complete } => complete.then_some(members),
+            Terminated::RootExited(_) => None,
         }
     }
 
@@ -160,14 +223,27 @@ impl Process {
     /// it as a peer, as for [`graceful_shutdown`](Process::graceful_shutdown). The sweep's errors
     /// are those of [`kill_tree`](Process::kill_tree); one that left members running carries the watch
     /// failure in its `others`.
+    ///
+    /// A root that exits within the grace reparents its children, so the sweep cannot walk to them: the
+    /// members the call's own `SIGTERM` walk found, while the root ran, are its listing. It kills those
+    /// still running by their identities, waits for them, and is `Ok` when every one is gone or killed;
+    /// a root with no descendants is an empty listing. The limit is `kill_tree`'s: a process forked
+    /// after the listing is not seen. A root that had exited before the call is
+    /// [`Error::Unassessable`], as for [`terminate_tree`](Process::terminate_tree).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
-        self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
+        // SIGTERM-walk (Windows: Unsupported, early return). A root that exited before the call sent
+        // nothing and has no listing: the sweep answers as `kill_tree` does.
+        let listed = Self::listing_of(self.terminate_walk(&crate::identity::HostKernel)?);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
         let call = format!("graceful_shutdown_tree({})", self.id.pid());
         crate::graceful::after_tree_grace(&call, self.wait_timeout(grace), || {
-            self.kill_tree_with("graceful_shutdown_tree", &crate::identity::HostKernel)
+            self.kill_tree_listing(
+                "graceful_shutdown_tree",
+                &crate::identity::HostKernel,
+                listed.as_deref(),
+            )
         })
     }
 }

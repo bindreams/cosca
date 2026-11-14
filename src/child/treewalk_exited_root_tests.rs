@@ -110,21 +110,36 @@ fn dropping_a_tree_walk_child_whose_root_exited_warns_once_naming_the_pid() {
     drop(stdin);
 }
 
+/// What a root that a `SIGTERM` ended leaves as its status.
+fn assert_sigtermed(status: std::process::ExitStatus) {
+    use std::os::unix::process::ExitStatusExt as _;
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+}
+
+/// The warns of dropping `child`: none when the call that came before vouched for the tree.
+fn drop_warns(child: crate::Child) -> Vec<String> {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    drop(child);
+    crate::log_capture::warns_since(mark, "Child::drop")
+}
+
 /// The root ends on the `SIGTERM` and its descendants that ignore it are left. The sweep that follows
-/// the grace cannot walk from the exited root, so it kills the members the `SIGTERM` walk found while
-/// the root was alive, by identity, and answers that the tree could not be vouched for.
+/// the grace cannot walk from the exited root, so it kills the members the call's own `SIGTERM` walk
+/// found while the root was alive, by identity, and waits for them: the call's listing is then clear,
+/// and it answers the root's status. The drop afterwards has nothing to warn of.
 ///
-/// Mutant: the sweep walks from the exited root, finds nothing and answers `Ok`, with the members
-/// running.
+/// Mutants: the sweep walks from the exited root, finds nothing and answers `Ok` with the members
+/// running; the held members are killed and the call still answers `Unassessable`.
 #[skuld::test]
 fn graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_root_exits() {
     let (child, stdin, survivors) = survivor_tree();
 
-    let err = child
+    let status = child
         .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect_err("the tree cannot be vouched for");
+        .expect("every member its walk found is killed");
 
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_sigtermed(status);
     for survivor in &survivors {
         assert_eq!(
             survivor.is_alive(),
@@ -132,23 +147,131 @@ fn graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_roo
             "{survivor:?} ignored the SIGTERM and must be killed by identity"
         );
     }
+    assert_eq!(drop_warns(child), Vec::<String>::new());
     drop(stdin);
 }
 
-/// A tree every member of which ends on the `SIGTERM` is no different: the root's exit leaves the
-/// sweep nothing to walk, and what the members forked since the `SIGTERM` walk was never looked for.
-/// The call is `Unassessable` with the whole tree gone.
+/// A tree every member of which ends on the `SIGTERM` is the common case: the call answers the root's
+/// status, and the drop does not warn.
+///
+/// Mutant: the root's exit leaves the call `Unassessable`, with the status lost.
 #[skuld::test]
-fn graceful_shutdown_tree_of_a_tree_that_ends_on_the_sigterm_is_unassessable_too() {
+fn graceful_shutdown_tree_of_a_tree_that_ends_on_the_sigterm_is_ok_with_the_roots_status() {
     let (child, stdin, members) = tree_of(crate::test_child::CAT_TREE_ARGV);
+
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("the tree ended on the SIGTERM");
+
+    assert_sigtermed(status);
+    for member in &members {
+        assert_eq!(member.is_alive(), Liveness::Dead, "{member:?} ends on the SIGTERM");
+    }
+    assert_eq!(drop_warns(child), Vec::<String>::new());
+    drop(stdin);
+}
+
+/// A root with no descendants that exits within the grace is an empty listing, not an unwalkable
+/// tree: the call answers its status.
+///
+/// Mutant: an empty `SIGTERM` walk holds nothing, so the sweep over the exited root answers
+/// `Unassessable`.
+#[skuld::test]
+fn graceful_shutdown_tree_of_a_root_with_no_descendants_is_ok_with_its_status() {
+    let (child, stdin) = crate::test_child::held_treewalk_blocker();
+
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("the root ended on the SIGTERM");
+
+    assert_sigtermed(status);
+    assert_eq!(drop_warns(child), Vec::<String>::new());
+    drop(stdin);
+}
+
+/// The vouching holds inside the one call. Members a separate `terminate_tree` reached are held, and a
+/// `kill_tree` met after the root exited kills them by identity and still cannot vouch for what they
+/// forked: `Unassessable`.
+///
+/// Mutant: held members vouch outside the call that walked them.
+#[skuld::test]
+fn kill_tree_after_a_separate_terminate_tree_kills_the_held_members_and_is_unassessable() {
+    let (child, stdin, survivors) = survivor_tree();
+    child.terminate_tree().expect("the walk found the whole tree");
+    wait_until_zombie(child.pid());
+
+    let err = child.kill_tree().expect_err("the held members are all it can name");
+
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    for survivor in &survivors {
+        assert_eq!(
+            survivor.is_alive(),
+            Liveness::Dead,
+            "{survivor:?} is killed by identity"
+        );
+    }
+    drop(stdin);
+    child.wait().expect("reap the root");
+}
+
+/// The drop of such a child warns once, as for any tree it cannot vouch for.
+///
+/// Mutant: a held member that is gone excuses the drop.
+#[skuld::test]
+fn dropping_a_child_after_a_separate_terminate_tree_and_the_roots_exit_warns_once() {
+    let (child, stdin, _survivors) = survivor_tree();
+    child.terminate_tree().expect("the walk found the whole tree");
+    wait_until_zombie(child.pid());
+
+    assert_eq!(drop_warns(child).len(), 1);
+
+    // The drop only sends, so the members end on their own once the stdin they read closes.
+    drop(stdin);
+}
+
+/// `terminate_tree` over a root that has exited, whose walk finds no member, answers
+/// `Unassessable` and sends nothing: its children were reparented, so a walk from its pid says
+/// nothing of the tree.
+///
+/// Mutant: the empty walk is `Ok`.
+#[skuld::test]
+fn terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sends_nothing() {
+    let (child, stdin) = crate::test_child::held_treewalk_blocker();
+    child.kill().expect("kill the root");
+    wait_until_zombie(child.pid());
+    let sends = crate::send_log::Capture::start();
+
+    let err = child
+        .terminate_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(sends.entries(), vec![], "nothing was sent");
+    drop(stdin);
+    child.wait().expect("reap the root");
+}
+
+/// A `graceful_shutdown_tree` whose root exited before the call does not end at the refused `SIGTERM`:
+/// it answers what `kill_tree` answers, so the members an earlier `terminate_tree` reached are killed.
+///
+/// Mutant: the refused `SIGTERM` ends the call with the held members running.
+#[skuld::test]
+fn graceful_shutdown_tree_over_an_exited_root_kills_the_held_members() {
+    let (child, stdin, survivors) = survivor_tree();
+    child.terminate_tree().expect("the walk found the whole tree");
+    wait_until_zombie(child.pid());
 
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect_err("the tree cannot be vouched for");
+        .expect_err("a root that exited before the call cannot vouch for the tree");
 
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    for member in &members {
-        assert_eq!(member.is_alive(), Liveness::Dead, "{member:?} ends on the SIGTERM");
+    for survivor in &survivors {
+        assert_eq!(
+            survivor.is_alive(),
+            Liveness::Dead,
+            "{survivor:?} is killed by identity"
+        );
     }
     drop(stdin);
 }

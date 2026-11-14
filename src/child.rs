@@ -676,7 +676,7 @@ impl Child {
     /// once the others have been waited for. [`send_kill_tree`](Child::send_kill_tree) is the call
     /// that only sends.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        self.kill_tree_after("kill_tree", None)
+        self.kill_tree_after("kill_tree", None, None)
             .wait()
             .map_err(|failure| failure.error)
     }
@@ -697,19 +697,33 @@ impl Child {
     /// what it reports. The [`Swept`] has the answer, which says whether the root is dead all the same
     /// on a failure ([`SweepFailure`]), and the wait for what the kill reached: a caller that waits
     /// [`wait`](Swept::wait)s, and one that sends alone takes the [`answer`](Swept::answer).
-    pub(crate) fn kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Swept<'_> {
-        self.sweep(op, earlier, KillTree::Waiting)
+    /// `listed`: the members the call's own `SIGTERM` walk found while the root ran and listed whole
+    /// (`graceful_shutdown_tree`), which stand for the walk a root that has exited cannot make
+    /// ([`TreeKilled::settle_listing`](crate::containment::dispatch::TreeKilled::settle_listing)).
+    pub(crate) fn kill_tree_after(
+        &self,
+        op: &'static str,
+        earlier: Option<&str>,
+        listed: Option<&[ProcessId]>,
+    ) -> Swept<'_> {
+        self.sweep(op, earlier, listed, KillTree::Waiting)
     }
 
     /// [`kill_tree_after`](Self::kill_tree_after) for a caller that sends and does not wait: the tree
     /// is killed without reading its members first, and the answer is what the kill left.
     pub(crate) fn send_kill_tree_after(&self, op: &'static str, earlier: Option<&str>) -> Result<(), SweepFailure> {
-        self.sweep(op, earlier, KillTree::SendOnly).answer()
+        self.sweep(op, earlier, None, KillTree::SendOnly).answer()
     }
 
     /// The sweep behind both: the kill, its settlement and the root's backstop. Only the
     /// [`Waiting`](KillTree::Waiting) one reads the members its kill will reach.
-    fn sweep(&self, op: &'static str, earlier: Option<&str>, kind: KillTree) -> Swept<'_> {
+    fn sweep(
+        &self,
+        op: &'static str,
+        earlier: Option<&str>,
+        listed: Option<&[ProcessId]>,
+        kind: KillTree,
+    ) -> Swept<'_> {
         #[cfg(not(unix))]
         let _ = earlier;
         if let Err(e) = self.require_contained() {
@@ -809,7 +823,7 @@ impl Child {
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
-        let settled = SweepFailure::of(&self.tree, group_result, backstop, self.pid(), root_ended);
+        let settled = SweepFailure::of(&self.tree, group_result, backstop, self.pid(), root_ended, listed);
         wait.reaching(settled.killed_again);
         // A root launchd holds is not ours to wait on: nothing of ours killed it.
         Swept::new(
@@ -894,6 +908,12 @@ impl Child {
     /// `Ok`. Otherwise the root is sent the `SIGTERM` through its pidfd, which names it exactly,
     /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
+    ///
+    /// **`TreeWalk`: a root that has exited**, reaped or not, whose walk finds no member is
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) with nothing sent: its children were
+    /// reparented at its exit, so the walk says nothing of the tree. The members a walk that did run
+    /// reached are held by the handle, and a later [`kill_tree`](Child::kill_tree) or the drop kills
+    /// them by identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // The mechanism looks at the root as for `kill_tree`, and on Unix this handle's reaps are held
@@ -906,7 +926,7 @@ impl Child {
             let call = self.skip_call("terminate_tree", TreeSignal::Term, None);
             match outcome {
                 TerminateOutcome::Sent { result, .. } => result,
-                TerminateOutcome::NotSent(not_sent) => Err(not_sent),
+                TerminateOutcome::NotSent(not_sent) | TerminateOutcome::RootExited(not_sent) => Err(not_sent),
                 // A `SIGTERM` settles nothing, so nothing is killed again and nothing waited for.
                 TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
                     call.answer(&self.tree, skip, None).answer
@@ -921,7 +941,7 @@ impl Child {
         match outcome {
             TerminateOutcome::Sent { result, .. } => result,
             TerminateOutcome::NotSent(not_sent) => Err(not_sent),
-            _ => unreachable!("only a Unix mechanism skips by the root's number"),
+            _ => unreachable!("only a Unix mechanism skips by the root's number or finds its root exited"),
         }
     }
 
