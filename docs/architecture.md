@@ -160,7 +160,13 @@ In order:
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
    `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
    those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
-   [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes the Windows
+   [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes
+   `containment::cgroup::fault::hide_proc` and `hide_proc_as`, a thread-local hook that makes the
+   `<pid>/cgroup` reads of `proc_names` and of the placement probe fail through a `FakeKernel` of their own: the
+   `Kernel` is carried through spawn, the leaf and `Subtree`, and those tests state `FakeKernel` rows
+   (tech-debt deputy, 2026-11-14). The probe's tests need a read row for its child's `<pid>/cgroup`,
+   a pid unknown before the fork: a row that matches the child's `cgroup` by its pid once forked,
+   not a fixed path. Beside them goes the Windows
    exiting-refusal hook (`identity::windows_fault::refuse_next_terminate_as_exiting`), which answers
    in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
    enter with their first caller, and those tests state rows (owner, 2026-11-06).

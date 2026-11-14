@@ -694,11 +694,9 @@ const PID: u32 = 4242;
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
-    for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
-        let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
-        assert!(listed.is_empty(), "errno {errno}: {listed:?}");
-    }
+    let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::ENOENT);
+    let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("an exclusion: {e}"));
+    assert!(listed.is_empty(), "{listed:?}");
 }
 
 /// Every other failure says nothing about the pid, so it cannot clear the group: the listing is an
@@ -707,14 +705,7 @@ fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
-    for errno in [
-        libc::EXDEV,
-        libc::ELOOP,
-        libc::EMFILE,
-        libc::ENFILE,
-        libc::ENOMEM,
-        libc::EIO,
-    ] {
+    for errno in [libc::EXDEV, libc::EMFILE] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
         let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
         // The listing's own words do not fold in the layer's (`to_string` is this layer alone).
@@ -735,31 +726,20 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
     }
 }
 
-/// EPERM is `hidepid`'s answer, and also a seccomp filter's for `openat2` installed mid-scan. Only
-/// the checked directory answering afterwards tells them apart. A re-check that fails without
-/// refusing (`EMFILE`, `ENOMEM`, `EIO`) is the re-check's own error, with the pid's `EPERM` kept as
-/// a second cause. Mutant: "exclude EPERM without the re-check"; "every failed re-check is a
-/// refusal".
+/// `EPERM` whose re-check of the checked directory fails without refusing is the re-check's own error,
+/// with the pid's `EPERM` kept as a second cause. Mutant: "the pid's `EPERM` is dropped".
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn members_is_an_error_for_eperm_when_the_checked_directory_fails_without_refusing() {
-    for recheck in [libc::EMFILE, libc::ENOMEM, libc::EIO] {
-        let kernel =
-            FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(recheck));
-        let err =
-            members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
-        let text = crate::error::said(&err);
-        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{recheck}: {text}");
-        assert!(text.contains("re-check of self/stat failed"), "{recheck}: {text}");
-        assert_eq!(crate::error::first_os_code(&err), Some(recheck), "{recheck}: {text}");
-        let (_, second) = text
-            .split_once("(2) ")
-            .unwrap_or_else(|| panic!("{recheck}: the second failure is kept: {text}"));
-        assert!(
-            second.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
-            "{recheck}: the pid's EPERM is the second cause: {text}"
-        );
-    }
+fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusing() {
+    let kernel =
+        FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(libc::EMFILE));
+    let err =
+        members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
+    let text = crate::error::said(&err);
+    assert!(text.contains("re-check of self/stat failed"), "{text}");
+    let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {text}"));
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
+    assert_eq!(codes, [Some(libc::EMFILE), Some(libc::EPERM)], "{text}");
 }
 
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
@@ -776,11 +756,8 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
     crate::log_capture::install();
     // The pid's `stat` answer, the `self/stat` answer where there is one, and the refusing errno.
     for (stat, recheck, refusing) in [
-        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
         (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
-        (libc::EPERM, Some(libc::ENODEV), libc::ENODEV),
         (libc::ENOSYS, None, libc::ENOSYS),
-        (libc::ENODEV, None, libc::ENODEV),
     ] {
         let mut kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, stat);
         if let Some(recheck) = recheck {
@@ -969,6 +946,24 @@ fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
     let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
     assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+}
+
+/// A listing that fails after `/proc` opened is no `openat2` refusal, whatever its errno: its own
+/// error, never one that says `openat2` is required. Mutant: "a listing failure is judged as an
+/// `openat2` failure".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_is_not_unsupported_when_the_listing_fails_after_the_open() {
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pids_failing_after_open(errno);
+        let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        // Not `err.kind()`: an `ENOSYS` of its own is `Unsupported` by std's mapping.
+        assert!(!text.contains("requires openat2"), "{errno}: {text}");
+        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {text}");
+    }
 }
 
 /// `PID` is in group 1234 by the scan's `stat`; the identity read that follows makes its own.

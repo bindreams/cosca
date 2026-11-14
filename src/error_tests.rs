@@ -191,6 +191,43 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
+/// An `Error::Io` cause is unwrapped into the plain `io_context`: its kind is kept, and no layer of a
+/// cosca `Error` ("an I/O operation failed") is added. Mutant: "the cause is held whole, as a layer".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn io_context_over_an_io_error_is_io_context() {
+    let cause = Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
+    let e = crate::error::io_context_over("ctx", cause);
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        said(&e),
+        format!("ctx: {}", std::io::Error::from_raw_os_error(libc::ENOENT))
+    );
+    assert!(chain(&e).all(|layer| layer.downcast_ref::<Error>().is_none()));
+    assert_eq!(first_os_code(&e), Some(libc::ENOENT));
+}
+
+/// A list cause stays a layer of the chain, so every member is reported: std's `io::Error` would
+/// skip a list held as its payload and show the first member only. Mutant: "the list is held as
+/// the `io::Error`'s payload".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn io_context_over_a_list_keeps_every_member() {
+    let list = Error::Several(Failures::new(
+        Error::io_cause(std::io::Error::from_raw_os_error(libc::EIO)),
+        [Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))],
+    ));
+    let e = crate::error::io_context_over("ctx", list);
+    let members = crate::error::several_in(&e).expect("the list is a layer");
+    let codes: Vec<_> = members.iter().map(|member| first_os_code(*member)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EPERM)]);
+    let text = said(&e);
+    assert!(
+        text.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+        "{text}"
+    );
+}
+
 /// Mutant: the hand-out is rebuilt from the code or from the text, so the words or the code are lost.
 #[skuld::test]
 fn a_shared_io_context_cause_reports_as_the_original_and_keeps_its_code() {

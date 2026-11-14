@@ -2,7 +2,7 @@
 //! (`identity::linux::proc_view_with`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
 
 use crate::error::Error;
-use crate::identity::pid_stat::{self, PidStat};
+use crate::identity::pid_file::{self, ReadOutcome};
 use crate::identity::stat_parse::parse_ppid;
 use crate::identity::Kernel;
 use crate::identity::RawPid;
@@ -10,7 +10,7 @@ use crate::identity::{warn_refused, Refusal};
 
 /// An outer pid namespace's `/proc` lists pids that mean nothing to the caller, and the tree walk
 /// signals by pid, so it is an error, not a snapshot. So is every `stat` read that is not an
-/// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_stat`]). A
+/// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_file`]). A
 /// [`Refusal`], wherever in the snapshot it is met, is [`Error::Unsupported`], warned about once.
 pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
@@ -20,22 +20,24 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
             Some(refusal) => refused(&refusal),
             None => unassessable(&why.reason, why.source),
         })?;
-    let pids = kernel.pids(&dir).map_err(|e| match pid_stat::refusal(&e) {
-        Some(refusal) => refused(&refusal),
-        None => unassessable("/proc could not be listed", Some(e)),
-    })?;
+    let pids = kernel
+        .pids(&dir)
+        .map_err(|failure| match pid_file::open_refusal(&failure) {
+            Some(refusal) => refused(&refusal),
+            None => unassessable("/proc could not be listed", Some(failure.into_io())),
+        })?;
     for pid in pids {
-        let stat = match pid_stat::read_in_scan(kernel, &dir, pid) {
-            Ok(PidStat::Read(stat)) => stat,
+        let stat = match pid_file::read(kernel, &dir, pid, "stat") {
+            Ok(ReadOutcome::Read(stat)) => stat,
             // The process exited between the listing and the read, or `hidepid` hides it.
-            Ok(PidStat::Skipped(e)) => {
+            Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => {
                 log::debug!(
                     "enumerate::process_parents: {pid}/stat unreadable ({report}); omitting it",
                     report = crate::error::Report(&e)
                 );
                 continue;
             }
-            Ok(PidStat::Refused(refusal)) => return Err(refused(&refusal)),
+            Ok(ReadOutcome::Refused(refusal)) => return Err(refused(&refusal)),
             Err(unreadable) => return Err(stat_unreadable(unreadable)),
         };
         match ppid_of_stat(pid, &stat) {
@@ -67,7 +69,7 @@ fn refused(refusal: &Refusal) -> Error {
     warn_refused("enumerate::process_parents", refusal.unsupported(OP_NAME))
 }
 
-fn stat_unreadable(unreadable: pid_stat::Unreadable) -> Error {
+fn stat_unreadable(unreadable: pid_file::Unreadable) -> Error {
     snapshot_failed(
         "the process snapshot could not be taken".to_owned(),
         Some(std::sync::Arc::new(unreadable.into_cause())),
