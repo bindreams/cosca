@@ -1145,30 +1145,27 @@ fn drain_round_watches_a_pid_the_second_look_proves_a_member() {
     assert!(watched, "the proved member is watched");
 }
 
-/// A wait open that was refused (for another process, which held the pid then) of a pid a member the
-/// caller can wait on holds now: the member is watched, with the handle of the retry made while the
-/// membership proof holds the pid, not blamed for the first open's refusal.
+/// The first wait open of a listed pid is refused (as another process's hold on the number would have
+/// it) while a member the caller can wait on holds it now: the round watches that member, with the
+/// handle of the retry made while the membership proof holds the pid, and does not answer for the
+/// first open's refusal.
 ///
 /// Mutant: the first open's refusal is the member's, returned at once.
 #[skuld::test]
 fn a_refused_wait_open_of_a_pid_a_waitable_member_holds_now_is_that_member() {
-    use windows::core::HRESULT;
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
     let (child, job) = spawn_job_member();
-    let refused = Err(windows::core::Error::from_hresult(HRESULT::from_win32(
-        ERROR_ACCESS_DENIED.0,
-    )));
+    let refused = super::fault::force_next_for_thread(super::fault::Step::WaitOpen, ERROR_ACCESS_DENIED.0, child.id());
 
-    let standing = super::member_to_watch_for_wait(child.id(), job.raw, refused);
+    let round = super::drain_round(job.raw, false);
 
+    drop(refused);
+    let watched = matches!(&round, Ok(super::Round::Watch(watch)) if watch.handles.len() == 1);
+    drop(round);
     job.hard_kill().expect("end the member");
     let_member_exit(child);
-    let Ok(super::Standing::Member(held)) = standing else {
-        panic!("a member the caller can wait on is watched: {standing:?}");
-    };
-    // SAFETY: opened by `member_to_watch_for_wait`, kept nowhere else.
-    _ = unsafe { windows::Win32::Foundation::CloseHandle(held) };
+    assert!(watched, "a member the caller can wait on is watched");
 }
 
 /// The pids a listing left unproved, each with a refusal, for [`super::settle_unproved`].
@@ -1178,7 +1175,7 @@ fn unproved_pids(pids: &[u32]) -> Vec<(u32, std::io::Error)> {
         .collect()
 }
 
-/// A failed settling listing is `ListingFailed`, with its own cause.
+/// A failed settling listing is its own `Err`, with its own cause.
 ///
 /// Mutant: it is read as an empty listing.
 #[skuld::test]
@@ -1191,7 +1188,7 @@ fn settle_unproved_reports_a_failed_listing() {
     let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
 
     drop(forced);
-    let super::SettleOutcome::ListingFailed(cause) = outcome else {
+    let Err(cause) = outcome else {
         panic!("the failed listing is reported");
     };
     assert_eq!(
@@ -1201,19 +1198,21 @@ fn settle_unproved_reports_a_failed_listing() {
     );
 }
 
-/// An empty settling listing is `Empty`: the caller must not read it as a listing that names no
+/// An empty settling listing is `Break`: the caller must not read it as a listing that names no
 /// unproved pid, because it is the drain's confirmation.
 ///
-/// Mutant: it is `Named` with no pids.
+/// Mutant: it is `Continue` with no pids.
 #[skuld::test]
 fn settle_unproved_reports_an_empty_listing() {
+    use std::ops::ControlFlow;
+
     let job = super::JobHandle::create_empty_for_test();
     let forced = super::fault::force_job_pid_list(Vec::new());
 
     let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
 
     drop(forced);
-    assert!(matches!(outcome, super::SettleOutcome::Empty));
+    assert!(matches!(outcome, Ok(ControlFlow::Break(()))));
 }
 
 /// The settling listing keeps the unproved pids it names again, in order, and drops the others (a
@@ -1228,15 +1227,15 @@ fn settle_unproved_keeps_only_the_unproved_pids_the_listing_names_again() {
     let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5, 6, 7]));
 
     drop(forced);
-    let super::SettleOutcome::Named(named) = outcome else {
+    let Ok(std::ops::ControlFlow::Continue(named)) = outcome else {
         panic!("a non-empty listing names pids");
     };
     assert_eq!(named, vec![5, 7]);
 }
 
-/// A non-empty settling listing that names none of the unproved pids is `Named` with none.
+/// A non-empty settling listing that names none of the unproved pids is `Continue` with none.
 ///
-/// Mutant: it is `Empty`, which the drain confirms as drained.
+/// Mutant: it is `Break`, which the drain confirms as drained.
 #[skuld::test]
 fn settle_unproved_reports_a_listing_that_names_none_of_them() {
     let job = super::JobHandle::create_empty_for_test();
@@ -1245,7 +1244,7 @@ fn settle_unproved_reports_a_listing_that_names_none_of_them() {
     let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
 
     drop(forced);
-    assert!(matches!(outcome, super::SettleOutcome::Named(named) if named.is_empty()));
+    assert!(matches!(outcome, Ok(std::ops::ControlFlow::Continue(named)) if named.is_empty()));
 }
 
 /// The round's own settling listing, when it is empty, is confirmed at once, on any round, with no
@@ -1273,6 +1272,39 @@ fn drain_round_confirms_an_empty_settling_listing() {
         drop(first_look);
         assert!(matches!(round, Ok(super::Round::Confirm)), "last round: {last_round}");
     }
+}
+
+/// A last round whose settling listing names a pid the second look proves a member answers
+/// `MembersRemain` and opens no wait handle for it: the armed `WaitOpen` is not consumed.
+///
+/// Mutant: the last round's second look opens the member for a wait it drops.
+#[skuld::test]
+fn drain_round_opens_no_wait_handle_in_a_last_rounds_second_look() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE};
+
+    let (child, job) = spawn_job_member();
+    let pid = child.id();
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let wait_open = super::fault::force_next_for_thread(super::fault::Step::WaitOpen, ERROR_ACCESS_DENIED.0, pid);
+    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
+
+    let round = super::drain_round(job.raw, true);
+
+    assert_eq!(super::fault::job_pid_list_queries(), 2);
+    let untouched = super::fault::forced_is_armed();
+    drop(forced);
+    drop(wait_open);
+    drop(first_look);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+    assert!(
+        matches!(
+            round,
+            Ok(super::Round::Answer(crate::containment::TreeDrain::MembersRemain))
+        ),
+        "the member remains"
+    );
+    assert!(untouched, "no wait handle was opened");
 }
 
 /// A last round whose settling listing names the unproved pid again, still unprovable, answers
